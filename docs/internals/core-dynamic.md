@@ -290,7 +290,13 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   `YamlWideStringTooLong`); the encoder prints an over-bound frame as it is. A
   `wstring<=N` bound is kept apart (`max_wstring_units`) and counts UTF-16 code units,
   not the UTF-8 bytes the wire carries.
-- Neither direction is a publish path (both allocate); the module is outside the
+- **Missing fields**: `yaml_to_message_with` takes `YamlDecodeOptions`; under
+  `MissingFields::Zero` (the Android app's JSON publish) a left-out field is its zero
+  value at any depth. A fixed field keeps the builder's zeroed bytes; a variable one is
+  built from its empty form (`""`, `[]`, a mapping with every field left out, a fixed
+  array of those), so the bytes equal what spelling the zeros out writes. A given value
+  and an unknown key are checked as under the default `Required`.
+- Neither direction is a node's publish path (both allocate); the module is outside the
   hot-path allocation sweep.
 
 | Class | `DynamicError` variant |

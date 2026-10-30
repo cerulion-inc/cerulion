@@ -11,7 +11,9 @@
 //! - A message is a block mapping, one key per field, in the schema's
 //!   DECLARATION order (the order of the `.msg` / schema YAML). A message
 //!   with no fields is `{}`.
-//! - Every field is required on input; an unknown key is an error.
+//! - Every field is required on input; an unknown key is an error. A
+//!   caller can opt into reading a left-out field as its zero value
+//!   ([`MissingFields::Zero`]); the CLI does not.
 //! - Integers are decimal. Floats use the shortest form that reads back to
 //!   the same value (`1.0`, `0.1`, `1e-7`), plus `.nan`, `.inf`, `-.inf`;
 //!   an integer is accepted for a float field. Every NaN is written `.nan`
@@ -44,18 +46,42 @@
 //! `poses[2].position.x`, `(message)` for the root) and the expected type
 //! or bound.
 //!
-//! Neither direction is on a publish path: both allocate (`String`, `Vec`),
-//! and both run once per command in a CLI, never per frame inside a node.
+//! Neither direction is on a node's publish path: both allocate (`String`,
+//! `Vec`), and both run once per command in a CLI or once per message an
+//! app publishes from JSON (the Android app's convenience path), never per
+//! frame inside a node.
 
 mod decode;
 mod encode;
 mod parse;
 mod scan;
 
-pub use decode::yaml_to_message;
+pub use decode::{yaml_to_message, yaml_to_message_with};
 pub use encode::{message_to_yaml, message_to_yaml_with, YamlEncodeOptions};
 
 use crate::codegen::FieldType;
+
+/// Options for [`yaml_to_message_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct YamlDecodeOptions {
+    /// What a field left out of the input means. The default,
+    /// [`MissingFields::Required`], is the form above.
+    pub missing_fields: MissingFields,
+}
+
+/// What [`yaml_to_message_with`] does with a field the input leaves out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingFields {
+    /// Refuse it with [`crate::dynamic::DynamicError::YamlMissingField`].
+    #[default]
+    Required,
+    /// Write its zero value, at any depth: `0`, `false` and `0.0` for
+    /// numbers and booleans, an empty `string`, `string_fixed[n]`, byte
+    /// array or dynamic array, a fixed array whose every element is its
+    /// zero value, and a nested message with every field left out. A field that is given is checked
+    /// as under `Required`, and an unknown key is still refused.
+    Zero,
+}
 
 /// The tag that marks an array cut short for display (`!truncated 57472`).
 pub const YAML_TRUNCATED_TAG: &str = "!truncated";

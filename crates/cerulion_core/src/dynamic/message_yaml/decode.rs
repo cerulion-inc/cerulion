@@ -7,8 +7,8 @@ use super::encode::format_f32;
 use super::parse::{parse, wide_integer};
 use super::scan::find_anchor_or_alias;
 use super::{
-    push_field, push_index, shown, type_name, MAX_YAML_ARRAY_DEPTH, MAX_YAML_DEPTH,
-    MAX_YAML_INPUT_BYTES, YAML_TRUNCATED_TAG,
+    push_field, push_index, shown, type_name, MissingFields, YamlDecodeOptions,
+    MAX_YAML_ARRAY_DEPTH, MAX_YAML_DEPTH, MAX_YAML_INPUT_BYTES, YAML_TRUNCATED_TAG,
 };
 use crate::codegen::element_codec::{CanonicalBodyBuilder, MAX_BODY_BYTES};
 use crate::codegen::layout::WireLayout;
@@ -54,16 +54,48 @@ pub fn yaml_to_message(
     yaml: &[u8],
     timestamp_ns: u64,
 ) -> Result<Vec<u8>, DynamicError> {
-    yaml_to_message_capped(walker, schema, yaml, timestamp_ns, MAX_YAML_INPUT_BYTES)
+    yaml_to_message_with(
+        walker,
+        schema,
+        yaml,
+        timestamp_ns,
+        YamlDecodeOptions::default(),
+    )
 }
 
-/// [`yaml_to_message`] with the input cap as a parameter, so tests can
-/// reach it with small inputs.
+/// [`yaml_to_message`] with decode options: under
+/// [`MissingFields::Zero`] a field the input leaves out is written as its
+/// zero value instead of refused.
+///
+/// # Errors
+///
+/// As [`yaml_to_message`]; [`DynamicError::YamlMissingField`] only under
+/// [`MissingFields::Required`].
+pub fn yaml_to_message_with(
+    walker: &FrameWalker,
+    schema: &str,
+    yaml: &[u8],
+    timestamp_ns: u64,
+    options: YamlDecodeOptions,
+) -> Result<Vec<u8>, DynamicError> {
+    yaml_to_message_capped(
+        walker,
+        schema,
+        yaml,
+        timestamp_ns,
+        options,
+        MAX_YAML_INPUT_BYTES,
+    )
+}
+
+/// [`yaml_to_message_with`] with the input cap as a parameter, so tests
+/// can reach it with small inputs.
 pub(super) fn yaml_to_message_capped(
     walker: &FrameWalker,
     schema: &str,
     yaml: &[u8],
     timestamp_ns: u64,
+    options: YamlDecodeOptions,
     max_bytes: usize,
 ) -> Result<Vec<u8>, DynamicError> {
     // One slot gives both halves (see `FrameWalker::schema_for_name`).
@@ -93,6 +125,7 @@ pub(super) fn yaml_to_message_capped(
     };
     let mut builder = Builder {
         walker,
+        missing: options.missing_fields,
         path: String::new(),
         array_depth: 0,
         held: 0,
@@ -167,6 +200,7 @@ type Target<'w> = (&'w WireLayout, &'w MessageSchema);
 
 struct Builder<'w> {
     walker: &'w FrameWalker,
+    missing: MissingFields,
     path: String,
     /// How many elements of variable-message arrays enclose the value
     /// being built.
@@ -279,12 +313,14 @@ impl<'w> Builder<'w> {
 
     /// The values of `schema`'s fields from the mapping `v`, in declaration
     /// order. Refuses a non-mapping, a key that is not a field (first in
-    /// document order) and a missing field (first in declaration order).
+    /// document order) and, under [`MissingFields::Required`], a missing
+    /// field (first in declaration order). Under [`MissingFields::Zero`] a
+    /// missing field is `None`.
     fn fields<'v>(
         &self,
         schema: &MessageSchema,
         v: &'v Value,
-    ) -> Result<Vec<&'v Value>, DynamicError> {
+    ) -> Result<Vec<Option<&'v Value>>, DynamicError> {
         let qname = schema.qualified_name();
         let map = match self.untagged(v)? {
             Value::Mapping(m) => m,
@@ -322,15 +358,17 @@ impl<'w> Builder<'w> {
         schema
             .fields
             .iter()
-            .map(|f| {
-                map.get(f.name.as_str()).ok_or_else(|| {
+            .map(|f| match (map.get(f.name.as_str()), self.missing) {
+                (Some(value), _) => Ok(Some(value)),
+                (None, MissingFields::Zero) => Ok(None),
+                (None, MissingFields::Required) => {
                     let mut path = self.path.clone();
                     push_field(&mut path, &f.name);
-                    DynamicError::YamlMissingField {
+                    Err(DynamicError::YamlMissingField {
                         path,
                         schema: qname.clone(),
-                    }
-                })
+                    })
+                }
             })
             .collect()
     }
@@ -360,8 +398,20 @@ impl<'w> Builder<'w> {
         for (field, value) in schema.fields.iter().zip(values) {
             let mark = self.path.len();
             push_field(&mut self.path, &field.name);
-            self.within_bounds(field, value)?;
+            if let Some(value) = value {
+                self.within_bounds(field, value)?;
+            }
             if field.field_type.is_variable() {
+                // A left-out variable field is built from its empty form,
+                // which writes the same bytes as its zero value.
+                let empty;
+                let value = match value {
+                    Some(value) => value,
+                    None => {
+                        empty = empty_form(&field.field_type);
+                        &empty
+                    }
+                };
                 let bytes = self.variable(&field.field_type, value, parent, depth)?;
                 self.hold(bytes.len())?;
                 builder
@@ -370,9 +420,13 @@ impl<'w> Builder<'w> {
             } else {
                 let fl = &layout.fixed_fields[fixed_idx];
                 fixed_idx += 1;
-                let range = fl.offset..fl.offset + fl.size;
-                let dst = &mut builder.fixed_mut()[range];
-                self.fixed(&field.field_type, value, dst, parent, depth)?;
+                // The builder zeroes the fixed section, so a left-out fixed
+                // field is already its zero value.
+                if let Some(value) = value {
+                    let range = fl.offset..fl.offset + fl.size;
+                    let dst = &mut builder.fixed_mut()[range];
+                    self.fixed(&field.field_type, value, dst, parent, depth)?;
+                }
             }
             self.path.truncate(mark);
         }
@@ -515,6 +569,11 @@ impl<'w> Builder<'w> {
                 let (target, schema) = self.nested(schema_name, package, parent)?;
                 let values = self.fields(schema, v)?;
                 for (field, value) in schema.fields.iter().zip(values) {
+                    // `dst` lies in the zeroed fixed section, so a left-out
+                    // field is already its zero value.
+                    let Some(value) = value else {
+                        continue;
+                    };
                     let fl = target
                         .fixed_fields
                         .iter()
@@ -639,6 +698,7 @@ impl<'w> Builder<'w> {
                 push_index(&mut path, i);
                 let at = Builder {
                     walker: self.walker,
+                    missing: self.missing,
                     path,
                     array_depth: self.array_depth,
                     held: self.held,
@@ -820,6 +880,24 @@ impl<'w> Builder<'w> {
                 field_type: type_name(ft),
             }),
         }
+    }
+}
+
+/// The value whose bytes are the zero value of the variable field type
+/// `ft`: an empty string or sequence, a mapping with every field left out,
+/// and a fixed array of `length` such elements. Only
+/// [`MissingFields::Zero`] reaches here, so the empty mapping is filled.
+/// A fixed array holds at most [`crate::dynamic::MAX_FIXED_ARRAY_LEN`]
+/// elements, which bounds the sequence built.
+fn empty_form(ft: &FieldType) -> Value {
+    match ft {
+        FieldType::String => Value::String(String::new()),
+        FieldType::Nested { .. } => Value::Mapping(Mapping::new()),
+        FieldType::FixedArray {
+            element_type,
+            length,
+        } => Value::Sequence(vec![empty_form(element_type); *length]),
+        _ => Value::Sequence(Vec::new()),
     }
 }
 

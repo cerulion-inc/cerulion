@@ -181,7 +181,9 @@ effort: [1.5]
 
 - **Keys.** One key per field, in the order the `.msg` or schema YAML
   declares them. Every field is required on input, and a key that is not a
-  field of the type is an error. A message type with no fields is `{}`
+  field of the type is an error. A program can ask the reader to write a
+  left-out field as its zero value instead (`yaml_to_message_with` with
+  `MissingFields::Zero`); the Android app's JSON publish does. A message type with no fields is `{}`
   (empty input is accepted for it).
 - **Numbers.** Integers are decimal. An integer that does not fit its
   field is refused as out of range at that field; past 128 bits YAML reads
