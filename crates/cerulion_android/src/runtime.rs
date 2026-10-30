@@ -36,7 +36,7 @@ use serde::Serialize;
 use crate::config::{validate_robot_name, EmbeddedConfig, RemoteRelay};
 use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
-use crate::remote::{BoundRemote, RemoteStart};
+use crate::remote::{HostedPlane, RemoteStart};
 use crate::subscribe::{Subscription, SubscriptionCounts};
 
 /// The listen endpoints, connect locators and robot name the first start
@@ -429,7 +429,7 @@ pub struct EmbeddedRuntime {
 struct Run {
     /// The remote plane: bound by the build, served by the commit, stopped
     /// first by the teardown.
-    remote: Option<Box<dyn BoundRemote>>,
+    remote: Option<HostedPlane>,
     graph: Option<GraphWorker>,
     gateway: Option<GatewayWorker>,
     recorder: Option<RecorderWorker>,
@@ -1899,7 +1899,7 @@ fn commit(
                 }
             }
         }
-        let remote = match run.remote.as_mut() {
+        let remote = match run.remote.as_mut().map(HostedPlane::plane) {
             Some(remote) => {
                 let thread_status = Arc::clone(status);
                 let thread_gate = Arc::clone(&gate);
@@ -2311,6 +2311,8 @@ fn recorded_failure(status: &Status) -> EmbedError {
         Some(codes::NETWORK) => EmbedError::Network(message),
         Some(codes::RECORDER) => EmbedError::Recorder(message),
         Some(codes::SPAWN) => EmbedError::Spawn(message),
+        Some(codes::REMOTE_NOT_PROVISIONED) => EmbedError::RemoteNotProvisioned(message),
+        Some(codes::REMOTE) => EmbedError::Remote(message),
         Some(code) => EmbedError::Panic(format!("component failure (code {code}): {message}")),
         None => EmbedError::Panic(message),
     }
@@ -3290,6 +3292,8 @@ nodes:
             (codes::NETWORK, codes::NETWORK),
             (codes::RECORDER, codes::RECORDER),
             (codes::SPAWN, codes::SPAWN),
+            (codes::REMOTE_NOT_PROVISIONED, codes::REMOTE_NOT_PROVISIONED),
+            (codes::REMOTE, codes::REMOTE),
             (codes::PANIC, codes::PANIC),
         ] {
             let mut status = Status::new("t".to_string());

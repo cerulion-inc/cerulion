@@ -17,6 +17,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cerulion_core::{SchemaServing, TransportManager};
@@ -109,8 +110,59 @@ pub fn register_host(host_impl: Box<dyn RemoteHost>) -> Result<(), EmbedError> {
     Ok(())
 }
 
-/// Bind the plane through the registered host.
-pub(crate) fn bind(start: RemoteStart) -> Result<Box<dyn BoundRemote>, EmbedError> {
+/// Set while one runtime in this process hosts a remote plane.
+static REMOTE_HOSTED: AtomicBool = AtomicBool::new(false);
+
+/// The one remote plane a process hosts. Every runtime reads the same device
+/// key, so two planes would answer under one endpoint id for two different
+/// runs; a second runtime with the plane enabled is refused while one holds
+/// this lease.
+struct RemoteLease(());
+
+impl RemoteLease {
+    fn acquire() -> Result<Self, EmbedError> {
+        REMOTE_HOSTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(()))
+            .map_err(|_| {
+                EmbedError::Remote(
+                    "another embedded runtime in this process hosts the remote plane; stop it \
+                     before starting a runtime with remote.enabled"
+                        .to_string(),
+                )
+            })
+    }
+}
+
+impl Drop for RemoteLease {
+    fn drop(&mut self) {
+        REMOTE_HOSTED.store(false, Ordering::Release);
+    }
+}
+
+/// A bound plane and the process's remote plane lease, which is freed only
+/// once the plane has stopped.
+pub(crate) struct HostedPlane {
+    plane: Box<dyn BoundRemote>,
+    _lease: RemoteLease,
+}
+
+impl HostedPlane {
+    pub(crate) fn plane(&mut self) -> &mut dyn BoundRemote {
+        self.plane.as_mut()
+    }
+
+    /// Stop the plane, then free the lease.
+    pub(crate) fn stop(self) -> Result<(), String> {
+        let HostedPlane { plane, _lease } = self;
+        plane.stop()
+    }
+}
+
+/// Take the process's remote plane lease and bind the plane through the
+/// registered host.
+pub(crate) fn bind(start: RemoteStart) -> Result<HostedPlane, EmbedError> {
+    let lease = RemoteLease::acquire()?;
     let slot = host();
     let Some(host_impl) = slot.as_ref() else {
         return Err(EmbedError::Remote(
@@ -120,5 +172,9 @@ pub(crate) fn bind(start: RemoteStart) -> Result<Box<dyn BoundRemote>, EmbedErro
                 .to_string(),
         ));
     };
-    host_impl.bind(start).map_err(EmbedError::from)
+    let plane = host_impl.bind(start).map_err(EmbedError::from)?;
+    Ok(HostedPlane {
+        plane,
+        _lease: lease,
+    })
 }

@@ -913,23 +913,30 @@ The plane reads its keys and trust state from `remoted/` under `state_dir`:
 `device_key` (the 32-byte device secret, whose public half is the endpoint
 id), `trust_store.mac_key`, `trust_store` and `device_index.json`, the same
 files `cerulion-remoted` keeps under its state root. The plane never creates
-them. Provision them on a host you trust and copy them into the app's private
-files directory, for example with `adb`:
+them. Provision them on a host you trust and stream each one straight into
+the app's private files directory, for example with `adb` and a debuggable
+build:
 
 ```sh
-adb push remoted /data/local/tmp/remoted
-adb shell run-as com.example.app mkdir -p files/remote
-adb shell run-as com.example.app cp -r /data/local/tmp/remoted files/remote/
-adb shell rm -r /data/local/tmp/remoted
+adb shell run-as com.example.app mkdir -p files/remote/remoted
+for file in device_key trust_store.mac_key trust_store device_index.json; do
+  adb exec-in run-as com.example.app sh -c "cat > files/remote/remoted/$file" < "remoted/$file"
+done
 ```
+
+Do not stage the keys in a shared directory such as `/data/local/tmp` on the
+way: another process that can read it could copy them and answer as the
+device.
 
 A start reads them before it builds anything else. When a file is missing or
 does not verify (a fresh install, a trust store bound to another device key),
 the start fails: `status` reports `state` `failed` with `last_error.code` 17
 (`REMOTE_NOT_PROVISIONED`), nothing runs and nothing is served. Any other
 plane failure is code 18 (`REMOTE`): an app library that links no host, an
-endpoint that cannot bind, or a plane that stops serving on its own while the
-app runs, which also sets `state` to `failed`. The plane serves only once the
+endpoint that cannot bind, a second runtime in the same process with
+`remote.enabled` while another runtime's plane serves (one process hosts one
+plane, since both would answer under one device key), or a plane that stops
+serving on its own while the app runs, which also sets `state` to `failed`. The plane serves only once the
 start completes, and `stop` stops it before any other component.
 
 While it serves, `status` reports it:

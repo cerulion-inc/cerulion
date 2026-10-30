@@ -880,9 +880,12 @@ hosted_start() {
 device "run-as '$APP' rm -rf files/remote"
 # `start` only queues the start: its result is the status the sample logs.
 hosted_start "hosted plane, fresh install" '"last_error":\{"code":17,'
-grep -q '"state":"failed"' <<<"$hosted_line" && grep -q '"remote":null' <<<"$hosted_line" ||
+if ! grep -q '"state":"failed"' <<<"$hosted_line" || ! grep -q '"remote":null' <<<"$hosted_line"; then
   fail "hosted plane, fresh install" "the failed start reports another state or a plane: $hosted_line"
+fi
 pass "hosted plane, fresh install" "state=failed last_error.code=17 (REMOTE_NOT_PROVISIONED) remote=null"
+# The desk tool's keys come from fixed seeds and serve this test only, so
+# writing them under the device scratch directory first is harmless.
 desk_out="$(device "'$DEV_HOSTED_DESK' provision '$DEV/hosted-state'" 2>&1)" ||
   fail "hosted plane provisioning" "$desk_out"
 device "run-as '$APP' mkdir -p files/remote/remoted"
@@ -906,8 +909,9 @@ desk_out="$(device "'$DEV_HOSTED_DESK' read '$hosted_eid' '$hosted_port' /app/he
   desk_rc=$?
 printf 'rc=%s\n%s\n' "$desk_rc" "$desk_out" > "$OUT/hosted-desk.txt"
 desk_fact="$(tr -d '\r' <<<"$desk_out" | grep '^hosted_desk mode=read ' || true)"
-(( desk_rc == 0 )) && [[ "$desk_fact" == 'hosted_desk mode=read topic=/app/heartbeat catalog_schema=std_msgs/String frames=1 endpoint=provisioned' ]] ||
+if (( desk_rc != 0 )) || [[ "$desk_fact" != 'hosted_desk mode=read topic=/app/heartbeat catalog_schema=std_msgs/String frames=1 endpoint=provisioned' ]]; then
   fail "hosted plane paired read" "rc=$desk_rc output=$desk_out"
+fi
 pass "hosted plane paired read" "${desk_fact#hosted_desk }"
 device "am force-stop '$APP'"
 device "run-as '$APP' rm -rf files/remote"

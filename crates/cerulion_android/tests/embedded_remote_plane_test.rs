@@ -286,6 +286,24 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
     // connect locators leaves the LAN gateway free.
     assert!(!cerulion_android::runtime::gateway_owned_for_test());
 
+    // One process hosts one plane: every runtime reads the same device key,
+    // so a second runtime with the plane enabled is refused before its host
+    // is asked to bind.
+    let other_files = tempdir().unwrap();
+    let mut other = EmbeddedRuntime::new(other_files.path().to_path_buf(), ROBOT.into()).unwrap();
+    let error = other
+        .start(&config(&topics, enabled.clone()))
+        .expect_err("a second plane in the process is refused");
+    assert_eq!(error.code(), codes::REMOTE);
+    assert!(
+        error
+            .to_string()
+            .contains("another embedded runtime in this process hosts the remote plane"),
+        "{error}"
+    );
+    assert_eq!(log(&fake), ["remote.bind", "remote.serve"]);
+    drop(other);
+
     // Serving that ends on its own fails the run with the remote code and
     // withdraws the endpoint from status.
     let exit = fake
