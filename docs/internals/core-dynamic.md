@@ -290,14 +290,23 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   `YamlWideStringTooLong`); the encoder prints an over-bound frame as it is. A
   `wstring<=N` bound is kept apart (`max_wstring_units`) and counts UTF-16 code units,
   not the UTF-8 bytes the wire carries.
-- Neither direction is a publish path (both allocate); the module is outside the
+- **Missing fields**: `yaml_to_message_with` takes `YamlDecodeOptions`; under
+  `MissingFields::Zero` (the Android app's JSON publish) a left-out field is its zero
+  value at any depth. A fixed field keeps the builder's zeroed bytes; a variable one is
+  built from its empty form (`""`, `[]`, a mapping with every field left out, a fixed
+  array of those), so the bytes equal what spelling the zeros out writes. A given value
+  and an unknown key are checked as under the default `Required`. `max_body_bytes`
+  lowers the cap `held` is checked against (`YamlBodyTooLarge` names the limit), so
+  left-out messages cannot build a frame past what the caller will send; the count
+  leaves out alignment padding, so the caller still checks the finished length.
+- Neither direction is a node's publish path (both allocate); the module is outside the
   hot-path allocation sweep.
 
 | Class | `DynamicError` variant |
 |---|---|
 | input bytes / parse / anchor | `YamlInputTooLarge`, `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
 | value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlWideStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
-| schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
+| schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge`, `YamlBodyTooLarge` |
 | encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |
 
 `YamlSyntax` text past its `message YAML does not parse: ` prefix is serde_yaml's own

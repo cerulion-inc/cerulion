@@ -1736,11 +1736,26 @@ fn input_past_the_cap_is_refused_before_it_is_parsed() {
     let w = set.walker();
     let echoed = format!("# seq=0 ts=0ns schema=0x0 size=80\n# Probe\n{PROBE_TEXT}---\n");
     let len = echoed.len();
-    let at_cap = yaml_to_message_capped(w, "Probe", echoed.as_bytes(), TS, len).unwrap();
+    let at_cap = yaml_to_message_capped(
+        w,
+        "Probe",
+        echoed.as_bytes(),
+        TS,
+        YamlDecodeOptions::default(),
+        len,
+    )
+    .unwrap();
     assert_eq!(at_cap, probe_frame(set.schema_hash("Probe").unwrap()));
     // One byte past the cap is refused even when it would not parse.
     let past = format!("{echoed}[");
-    match yaml_to_message_capped(w, "Probe", past.as_bytes(), TS, len) {
+    match yaml_to_message_capped(
+        w,
+        "Probe",
+        past.as_bytes(),
+        TS,
+        YamlDecodeOptions::default(),
+        len,
+    ) {
         Err(e) => assert_eq!(
             e.to_string(),
             format!(
@@ -2461,4 +2476,272 @@ fn arrays_of_messages_count_toward_the_depth_bound_both_ways() {
         Ok(t) => panic!("must be refused, got {t}"),
     }
     assert_eq!(decode_err(set.walker(), "C0", &fixed_chain_text(33)), want);
+}
+
+const ZERO: YamlDecodeOptions = YamlDecodeOptions {
+    missing_fields: MissingFields::Zero,
+    max_body_bytes: None,
+};
+
+/// `PoseStamped` with only `pose.position.x` given, the rest left out:
+///
+/// ```text
+/// fixed: pose @0..56 (position x y z, orientation x y z w)
+/// table: header #0 at [56, 64)                        (data floor 64)
+/// header body @64, 16 B: stamp @0..8, table frame_id @8..16 -> (16, 0)
+/// ```
+#[test]
+fn zero_missing_fields_fill_a_partial_nested_message() {
+    let walker = builtin_walker();
+    let hash = walker
+        .layout_for_name("geometry_msgs/PoseStamped")
+        .unwrap()
+        .schema_hash;
+    let mut want = header(hash, 120, 96, 1);
+    want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0xF8, 0x3F]); // position.x 1.5
+    want.extend_from_slice(&[0; 48]); // y, z, orientation
+    want.extend_from_slice(&[64, 0, 0, 0, 16, 0, 0, 0]); // header @64 len 16
+    want.extend_from_slice(&[0; 8]); // header.stamp
+    want.extend_from_slice(&[16, 0, 0, 0, 0, 0, 0, 0]); // frame_id @16 len 0
+    let text = br#"{"pose":{"position":{"x":1.5}}}"#;
+    assert_eq!(
+        yaml_to_message_with(&walker, "geometry_msgs/PoseStamped", text, TS, ZERO).unwrap(),
+        want
+    );
+}
+
+/// One field of every kind, all left out.
+///
+/// ```text
+/// fixed: flag @0, 7 B pad, f @8..16, t @16..19, 1 B pad, p @20..28,
+///        fa @28..36, 4 B tail pad                      (fixed_size 40)
+/// table: s blob ia sa pd td n sf nf, 9 entries at [40, 112)
+/// payloads: sa count 0 @112, td count 0 @116, n body @120 (8 B),
+///           sf count 2 + two empty strings @128 (12 B),
+///           nf count 1 + one 8 B body @140 (16 B)        (end 156)
+/// ```
+#[test]
+fn zero_missing_fields_write_every_field_kind_as_zero_or_empty() {
+    let set = set_from_yaml(
+        "\
+schemas:
+  Pt:
+    fields:
+      float32 x: {}
+      float32 y: {}
+  Tag:
+    fields:
+      string name: {}
+  Zeroes:
+    fields:
+      bool flag: {}
+      float64 f: {}
+      string_fixed[3] t: {}
+      Pt p: {}
+      float32[2] fa: {}
+      string s: {}
+      bytes blob: {}
+      int32[] ia: {}
+      string[] sa: {}
+      Pt[] pd: {}
+      Tag[] td: {}
+      Tag n: {}
+      string[2] sf: {}
+      Tag[1] nf: {}
+",
+    );
+    let mut want = header(set.schema_hash("Zeroes").unwrap(), 196, 80, 9);
+    want.extend_from_slice(&[0; 40]);
+    for (offset, len) in [
+        (112u32, 0u32),
+        (112, 0),
+        (112, 0),
+        (112, 4),
+        (116, 0),
+        (116, 4),
+        (120, 8),
+        (128, 12),
+        (140, 16),
+    ] {
+        want.extend_from_slice(&offset.to_le_bytes());
+        want.extend_from_slice(&len.to_le_bytes());
+    }
+    want.extend_from_slice(&[0; 4]); // sa: no elements
+    want.extend_from_slice(&[0; 4]); // td: no elements
+    want.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]); // n: name @8 len 0
+    want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // sf
+    want.extend_from_slice(&[1, 0, 0, 0, 8, 0, 0, 0]); // nf: one 8 B body
+    want.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(want.len(), 196);
+    for text in ["{}", "", "null"] {
+        assert_eq!(
+            yaml_to_message_with(set.walker(), "Zeroes", text.as_bytes(), TS, ZERO).unwrap(),
+            want,
+            "{text:?}"
+        );
+    }
+}
+
+/// Zero-filling changes only what a left-out field means: a given value is
+/// checked as before, and an unknown key is still refused first.
+#[test]
+fn zero_missing_fields_still_check_given_values_and_unknown_keys() {
+    let walker = builtin_walker();
+    let pose = |text: &str| {
+        yaml_to_message_with(
+            &walker,
+            "geometry_msgs/PoseStamped",
+            text.as_bytes(),
+            TS,
+            ZERO,
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    assert_eq!(
+        pose(r#"{"pose":{"position":{"x":"a"}}}"#),
+        "pose.position.x: expected float64, got string"
+    );
+    assert_eq!(
+        pose(r#"{"pose":{"positon":{}}}"#),
+        "pose.positon: unknown field; geometry_msgs/Pose has fields: position, orientation"
+    );
+    assert_eq!(
+        pose(r#"{"header":{"stamp":{"sec":2147483648}}}"#),
+        "header.stamp.sec: 2147483648 is out of range for int32 (-2147483648 to 2147483647)"
+    );
+}
+
+/// The default options keep every field required, as `yaml_to_message`.
+#[test]
+fn default_decode_options_keep_every_field_required() {
+    let walker = builtin_walker();
+    let text = br#"{"pose":{"position":{"x":1.5}}}"#;
+    let want = "header: missing field required by geometry_msgs/PoseStamped";
+    for result in [
+        yaml_to_message(&walker, "geometry_msgs/PoseStamped", text, TS),
+        yaml_to_message_with(
+            &walker,
+            "geometry_msgs/PoseStamped",
+            text,
+            TS,
+            YamlDecodeOptions::default(),
+        ),
+    ] {
+        assert_eq!(result.unwrap_err().to_string(), want);
+    }
+}
+
+/// A body limit refuses while the frame is built, at the first value past
+/// it, so a few bytes of input naming many left-out messages cannot build
+/// a large frame. `PoseArray` with every pose left out:
+///
+/// ```text
+/// table: header #0, poses #1 at [0, 16)               (data floor 16)
+/// header body 16 B (stamp 8, frame_id row 8), then 56 B per pose
+/// 72 poses: 16 + 16 + 72 * 56 = 4064 B
+/// ```
+#[test]
+fn a_body_limit_refuses_while_the_frame_is_built() {
+    let walker = builtin_walker();
+    let limited = |max| YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(max),
+    };
+    let poses = |n: usize| format!("{{\"poses\":[{}]}}", vec!["{}"; n].join(","));
+    let read = |n, max| {
+        yaml_to_message_with(
+            &walker,
+            "geometry_msgs/PoseArray",
+            poses(n).as_bytes(),
+            TS,
+            limited(max),
+        )
+    };
+    assert_eq!(
+        read(72, 4064).unwrap().len(),
+        crate::wire::WireHeader::SIZE + 4064
+    );
+    assert_eq!(
+        read(72, 4096).unwrap().len(),
+        crate::wire::WireHeader::SIZE + 4064
+    );
+    assert_eq!(
+        read(72, 4063).unwrap_err().to_string(),
+        "poses[71]: the message body is larger than the 4063-byte limit"
+    );
+    assert_eq!(
+        read(73, 4096).unwrap_err().to_string(),
+        "poses[72]: the message body is larger than the 4096-byte limit"
+    );
+    // A limit at or past the frame cap is the frame cap.
+    let huge = read(1, usize::MAX).unwrap();
+    assert_eq!(huge.len(), crate::wire::WireHeader::SIZE + 16 + 16 + 56);
+}
+
+/// A left-out fixed array of strings is refused against the body limit
+/// before its elements are made: each element adds at least its 4-byte
+/// length row, so `string[1000]` needs at least 4000 bytes past the 8-byte
+/// table.
+#[test]
+fn a_left_out_fixed_array_past_the_body_limit_is_refused_before_it_is_made() {
+    let set = set_from_yaml("schemas:\n  Names:\n    fields:\n      string[1000] names: {}\n");
+    let limited = YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(100),
+    };
+    assert_eq!(
+        yaml_to_message_with(set.walker(), "Names", b"{}", TS, limited)
+            .unwrap_err()
+            .to_string(),
+        "names: the message body is larger than the 100-byte limit"
+    );
+}
+
+/// The early refusal never refuses a left-out fixed array that fits:
+///
+/// ```text
+/// string[3] names: table 8, count 4, three empty strings 3 * 4  = 24 B
+/// Tag[2] tags:     table 8, count 4, two (length 4 + body 8)    = 36 B
+/// ```
+///
+/// A limit under the least the array can take refuses at the field, before
+/// any element is made.
+#[test]
+fn a_left_out_fixed_array_that_fits_its_body_limit_is_written() {
+    let set = set_from_yaml(
+        "\
+schemas:
+  Tag:
+    fields:
+      string name: {}
+  Names:
+    fields:
+      string[3] names: {}
+  Tags:
+    fields:
+      Tag[2] tags: {}
+",
+    );
+    let limited = |max| YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(max),
+    };
+    let read = |schema, max| yaml_to_message_with(set.walker(), schema, b"{}", TS, limited(max));
+    assert_eq!(
+        read("Names", 24).unwrap()[crate::wire::WireHeader::SIZE..],
+        [8, 0, 0, 0, 16, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let mut tags = vec![8, 0, 0, 0, 28, 0, 0, 0, 2, 0, 0, 0];
+    for _ in 0..2 {
+        tags.extend_from_slice(&[8, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    assert_eq!(
+        read("Tags", 36).unwrap()[crate::wire::WireHeader::SIZE..],
+        tags[..]
+    );
+    assert_eq!(
+        read("Tags", 15).unwrap_err().to_string(),
+        "tags: the message body is larger than the 15-byte limit"
+    );
 }

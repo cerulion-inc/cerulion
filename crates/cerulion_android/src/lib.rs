@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Embedded runtime and JNI support for Android applications.
 //!
-//! Publishing parses JSON and polling builds JSON text; both allocate. They
-//! are an app-side convenience path, not the zero-copy node path.
+//! Publishing reads JSON with the message YAML reader `cerulion` uses (see
+//! [`encode`]) and polling builds JSON text; both allocate. They are an
+//! app-side convenience path, not the zero-copy node path.
 
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 

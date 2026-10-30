@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Decoder for the JSON poll output surface, the counterpart of
-//! [`crate::encode`]. It reads the same flat field types publish accepts.
+//! [`crate::encode`]. It reads only the flat field types: the primitives,
+//! `String`, `StringFixed(n)` and byte arrays (publish takes every type).
 use cerulion_core::codegen::FieldType;
 use cerulion_core::dynamic::{FrameView, WireLayout};
 
@@ -171,20 +172,49 @@ mod tests {
     use super::*;
     use crate::encode::encode_json;
     use cerulion_core::codegen::parse_rosmsg;
+    use cerulion_core::dynamic::SchemaSet;
     use cerulion_core::wire::WireHeader;
 
-    fn layout(text: &str, name: &str, package: &str) -> WireLayout {
-        let schema = parse_rosmsg(text, name, Some(package)).unwrap();
-        let (schemas, _) = cerulion_core::dynamic::SchemaSet::from_schemas(vec![schema]).unwrap();
-        schemas
-            .layout(&format!("{package}/{name}"))
-            .unwrap()
-            .clone()
+    /// One schema in a set of its own, which publish encodes against.
+    struct Schema {
+        set: SchemaSet,
+        name: String,
     }
 
-    fn decode(layout: &WireLayout, frame: &[u8]) -> Result<String, EmbedError> {
+    impl Schema {
+        fn layout(&self) -> &WireLayout {
+            self.set.layout(&self.name).unwrap()
+        }
+
+        fn encode(
+            &self,
+            json: &str,
+            max_payload_bytes: usize,
+            timestamp_ns: u64,
+            sequence: u32,
+        ) -> Result<Vec<u8>, EmbedError> {
+            encode_json(
+                self.set.walker(),
+                &self.name,
+                json,
+                max_payload_bytes,
+                timestamp_ns,
+                sequence,
+            )
+        }
+    }
+
+    fn layout(text: &str, name: &str, package: &str) -> Schema {
+        let schema = parse_rosmsg(text, name, Some(package)).unwrap();
+        Schema {
+            set: SchemaSet::from_schemas(vec![schema]).unwrap().0,
+            name: format!("{package}/{name}"),
+        }
+    }
+
+    fn decode(schema: &Schema, frame: &[u8]) -> Result<String, EmbedError> {
         let mut out = String::new();
-        decode_json_into(layout, frame, &mut out)?;
+        decode_json_into(schema.layout(), frame, &mut out)?;
         Ok(out)
     }
 
@@ -193,7 +223,7 @@ mod tests {
         let layout = layout("string data\n", "String", "std_msgs");
         // The encoder's oracle frame for {"data":"hello"}, pinned byte for
         // byte in `encode::tests::encodes_string_to_hand_written_frame`.
-        let frame = encode_json(&layout, r#"{"data":"hello"}"#, 64, 7, 42).unwrap();
+        let frame = layout.encode(r#"{"data":"hello"}"#, 64, 7, 42).unwrap();
         assert_eq!(
             &frame[WireHeader::SIZE..],
             &[8, 0, 0, 0, 5, 0, 0, 0, b'h', b'e', b'l', b'l', b'o']
@@ -201,17 +231,17 @@ mod tests {
         assert_eq!(decode(&layout, &frame).unwrap(), r#"{"data":"hello"}"#);
     }
 
-    /// Every type publish accepts comes back as the JSON publish took, field
+    /// Every flat type poll reads comes back as the JSON publish took, field
     /// for field: integers at their extremes, floats, escapes, bytes.
     #[test]
-    fn every_publish_type_round_trips_to_hand_written_json() {
+    fn every_flat_type_round_trips_to_hand_written_json() {
         let layout = layout(
             "bool flag\nint8 a\nuint8 b\nint16 c\nuint16 d\nint32 e\nuint32 f\nint64 g\nuint64 h\nfloat32 x\nfloat64 y\nfloat32 tenth\nstring name\nuint8[] blob\n",
             "Everything",
             "test_msgs",
         );
         let json = r#"{"flag":true,"a":-128,"b":255,"c":-32768,"d":65535,"e":-2147483648,"f":4294967295,"g":-9223372036854775808,"h":18446744073709551615,"x":1.5,"y":-0.25,"tenth":0.1,"name":"tab\t\"q\" é","blob":[0,1,255]}"#;
-        let frame = encode_json(&layout, json, 256, 0, 0).unwrap();
+        let frame = layout.encode(json, 256, 0, 0).unwrap();
         assert_eq!(decode(&layout, &frame).unwrap(), json);
     }
 
@@ -222,30 +252,23 @@ mod tests {
             "Vector3",
             "geometry_msgs",
         );
-        let frame = encode_json(&vector, r#"{"x":10.0}"#, 64, 0, 0).unwrap();
+        let frame = vector.encode(r#"{"x":10.0}"#, 64, 0, 0).unwrap();
         assert_eq!(
             decode(&vector, &frame).unwrap(),
             r#"{"x":10.0,"y":0.0,"z":0.0}"#
         );
         let bytes = layout("uint8[] data\nstring note\n", "Bytes", "test_msgs");
-        let frame = encode_json(&bytes, "{}", 64, 0, 0).unwrap();
+        let frame = bytes.encode("{}", 64, 0, 0).unwrap();
         assert_eq!(decode(&bytes, &frame).unwrap(), r#"{"data":[],"note":""}"#);
     }
 
-    fn fixed_name_layout() -> WireLayout {
-        WireLayout {
-            qualified_name: "test_msgs/FixedName".into(),
-            schema_hash: 0,
-            fixed_size: 4,
-            fixed_align: 1,
-            fixed_fields: vec![cerulion_core::dynamic::FieldLayout {
-                name: "name".into(),
-                offset: 0,
-                size: 4,
-                align: 1,
-                field_type: FieldType::StringFixed(4),
-            }],
-            variable_fields: vec![],
+    fn fixed_name_layout() -> Schema {
+        let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+        set.add_yaml_str("schemas:\n  FixedName:\n    fields:\n      string_fixed[4] name: {}\n")
+            .unwrap();
+        Schema {
+            set,
+            name: "FixedName".to_string(),
         }
     }
 
@@ -257,7 +280,7 @@ mod tests {
             (r#"{"name":"four"}"#, r#"{"name":"four"}"#),
             ("{}", r#"{"name":""}"#),
         ] {
-            let frame = encode_json(&fixed, json, 64, 0, 0).unwrap();
+            let frame = fixed.encode(json, 64, 0, 0).unwrap();
             assert_eq!(decode(&fixed, &frame).unwrap(), want, "{json}");
         }
     }
@@ -267,7 +290,7 @@ mod tests {
     #[test]
     fn a_non_finite_float_reads_as_null() {
         let layout = layout("float32 a\nfloat64 b\nfloat64 c\n", "Floats", "test_msgs");
-        let mut frame = encode_json(&layout, r#"{"c":2.0}"#, 64, 0, 0).unwrap();
+        let mut frame = layout.encode(r#"{"c":2.0}"#, 64, 0, 0).unwrap();
         let body = WireHeader::SIZE;
         frame[body..body + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         frame[body + 8..body + 16].copy_from_slice(&f64::NEG_INFINITY.to_le_bytes());
@@ -277,7 +300,7 @@ mod tests {
         );
     }
 
-    fn decode_error(layout: &WireLayout, frame: &[u8]) -> String {
+    fn decode_error(layout: &Schema, frame: &[u8]) -> String {
         let error = decode(layout, frame).expect_err("the frame must not decode");
         assert_eq!(error.code(), crate::error::codes::DECODE);
         error.to_string()
@@ -291,7 +314,7 @@ mod tests {
             "Vector3",
             "geometry_msgs",
         );
-        let frame = encode_json(&vector, r#"{"x":1.0}"#, 64, 0, 0).unwrap();
+        let frame = vector.encode(r#"{"x":1.0}"#, 64, 0, 0).unwrap();
         let message = decode_error(&string, &frame);
         assert!(message.contains("does not match layout"), "{message}");
     }
@@ -299,7 +322,7 @@ mod tests {
     #[test]
     fn refuses_a_truncated_frame() {
         let string = layout("string data\n", "String", "std_msgs");
-        let frame = encode_json(&string, r#"{"data":"hello"}"#, 64, 0, 0).unwrap();
+        let frame = string.encode(r#"{"data":"hello"}"#, 64, 0, 0).unwrap();
         decode_error(&string, &frame[..frame.len() - 1]);
         decode_error(&string, &frame[..WireHeader::SIZE - 1]);
     }
@@ -307,7 +330,7 @@ mod tests {
     #[test]
     fn refuses_invalid_utf8_and_a_bool_byte_other_than_0_or_1() {
         let string = layout("string data\n", "String", "std_msgs");
-        let mut frame = encode_json(&string, r#"{"data":"hi"}"#, 64, 0, 0).unwrap();
+        let mut frame = string.encode(r#"{"data":"hi"}"#, 64, 0, 0).unwrap();
         let last = frame.len() - 1;
         frame[last] = 0xFF;
         assert_eq!(
@@ -315,7 +338,9 @@ mod tests {
             "field 'data' is not valid UTF-8 (valid up to byte 1)"
         );
 
-        let mut fixed = encode_json(&fixed_name_layout(), r#"{"name":"ab"}"#, 64, 0, 0).unwrap();
+        let mut fixed = fixed_name_layout()
+            .encode(r#"{"name":"ab"}"#, 64, 0, 0)
+            .unwrap();
         fixed[WireHeader::SIZE + 1] = 0xFF;
         assert_eq!(
             decode_error(&fixed_name_layout(), &fixed),
@@ -323,7 +348,7 @@ mod tests {
         );
 
         let boolean = layout("bool value\n", "Boolean", "test_msgs");
-        let mut frame = encode_json(&boolean, r#"{"value":true}"#, 64, 0, 0).unwrap();
+        let mut frame = boolean.encode(r#"{"value":true}"#, 64, 0, 0).unwrap();
         frame[WireHeader::SIZE] = 2;
         assert_eq!(
             decode_error(&boolean, &frame),
@@ -334,19 +359,21 @@ mod tests {
     #[test]
     fn decoding_is_deterministic_and_reuses_the_buffer() {
         let layout = layout("string data\n", "String", "std_msgs");
-        let long = encode_json(&layout, r#"{"data":"a longer message"}"#, 64, 1, 1).unwrap();
-        let short = encode_json(&layout, r#"{"data":"x"}"#, 64, 2, 2).unwrap();
+        let long = layout
+            .encode(r#"{"data":"a longer message"}"#, 64, 1, 1)
+            .unwrap();
+        let short = layout.encode(r#"{"data":"x"}"#, 64, 2, 2).unwrap();
         let mut out = String::new();
-        decode_json_into(&layout, &long, &mut out).unwrap();
+        decode_json_into(layout.layout(), &long, &mut out).unwrap();
         let first = out.clone();
-        decode_json_into(&layout, &short, &mut out).unwrap();
+        decode_json_into(layout.layout(), &short, &mut out).unwrap();
         assert_eq!(out, r#"{"data":"x"}"#);
-        decode_json_into(&layout, &long, &mut out).unwrap();
+        decode_json_into(layout.layout(), &long, &mut out).unwrap();
         assert_eq!(out, first);
         // A frame that fails leaves the buffer empty, never a partial object,
         // and keeps its capacity.
         let capacity = out.capacity();
-        decode_json_into(&layout, &long[..WireHeader::SIZE], &mut out).unwrap_err();
+        decode_json_into(layout.layout(), &long[..WireHeader::SIZE], &mut out).unwrap_err();
         assert_eq!(out, "");
         assert_eq!(out.capacity(), capacity);
     }
@@ -354,15 +381,15 @@ mod tests {
     #[test]
     fn names_the_first_field_poll_cannot_decode() {
         let flat = layout("bool a\nstring b\nuint8[] c\n", "Flat", "test_msgs");
-        assert!(unsupported_field(&flat).is_none());
+        assert!(unsupported_field(flat.layout()).is_none());
         let nested = layout("geometry_msgs/Point point\n", "Pose", "geometry_msgs");
         assert_eq!(
-            unsupported_field(&nested).map(|(name, _)| name),
+            unsupported_field(nested.layout()).map(|(name, _)| name),
             Some("point")
         );
         let array = layout("int32 ok\nfloat64[] values\n", "Values", "test_msgs");
         assert_eq!(
-            unsupported_field(&array).map(|(name, _)| name),
+            unsupported_field(array.layout()).map(|(name, _)| name),
             Some("values")
         );
     }
@@ -376,7 +403,9 @@ mod tests {
             "Mixed",
             "test_msgs",
         );
-        let frame = encode_json(&layout, r#"{"a":"s","b":2,"c":[3],"d":true}"#, 64, 0, 0).unwrap();
+        let frame = layout
+            .encode(r#"{"a":"s","b":2,"c":[3],"d":true}"#, 64, 0, 0)
+            .unwrap();
         assert_eq!(
             decode(&layout, &frame).unwrap(),
             r#"{"b":2,"d":true,"a":"s","c":[3]}"#
@@ -388,13 +417,14 @@ mod tests {
     #[test]
     fn reads_hand_written_little_endian_numbers() {
         let layout = layout("int16 a\nuint32 b\nfloat32 c\n", "Numbers", "test_msgs");
-        let mut frame = encode_json(&layout, "{}", 64, 0, 0).unwrap();
+        let mut frame = layout.encode("{}", 64, 0, 0).unwrap();
         for (name, bytes) in [
             ("a", &[0xFE, 0xFF][..]),
             ("b", &[4, 3, 2, 1][..]),
             ("c", &[0, 0, 0xC0, 0x3F][..]),
         ] {
             let field = layout
+                .layout()
                 .fixed_fields
                 .iter()
                 .find(|field| field.name == name)
