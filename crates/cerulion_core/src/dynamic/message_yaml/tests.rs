@@ -2480,6 +2480,7 @@ fn arrays_of_messages_count_toward_the_depth_bound_both_ways() {
 
 const ZERO: YamlDecodeOptions = YamlDecodeOptions {
     missing_fields: MissingFields::Zero,
+    max_body_bytes: None,
 };
 
 /// `PoseStamped` with only `pose.position.x` given, the rest left out:
@@ -2629,4 +2630,118 @@ fn default_decode_options_keep_every_field_required() {
     ] {
         assert_eq!(result.unwrap_err().to_string(), want);
     }
+}
+
+/// A body limit refuses while the frame is built, at the first value past
+/// it, so a few bytes of input naming many left-out messages cannot build
+/// a large frame. `PoseArray` with every pose left out:
+///
+/// ```text
+/// table: header #0, poses #1 at [0, 16)               (data floor 16)
+/// header body 16 B (stamp 8, frame_id row 8), then 56 B per pose
+/// 72 poses: 16 + 16 + 72 * 56 = 4064 B
+/// ```
+#[test]
+fn a_body_limit_refuses_while_the_frame_is_built() {
+    let walker = builtin_walker();
+    let limited = |max| YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(max),
+    };
+    let poses = |n: usize| format!("{{\"poses\":[{}]}}", vec!["{}"; n].join(","));
+    let read = |n, max| {
+        yaml_to_message_with(
+            &walker,
+            "geometry_msgs/PoseArray",
+            poses(n).as_bytes(),
+            TS,
+            limited(max),
+        )
+    };
+    assert_eq!(
+        read(72, 4064).unwrap().len(),
+        crate::wire::WireHeader::SIZE + 4064
+    );
+    assert_eq!(
+        read(72, 4096).unwrap().len(),
+        crate::wire::WireHeader::SIZE + 4064
+    );
+    assert_eq!(
+        read(72, 4063).unwrap_err().to_string(),
+        "poses[71]: the message body is larger than the 4063-byte limit"
+    );
+    assert_eq!(
+        read(73, 4096).unwrap_err().to_string(),
+        "poses[72]: the message body is larger than the 4096-byte limit"
+    );
+    // A limit at or past the frame cap is the frame cap.
+    let huge = read(1, usize::MAX).unwrap();
+    assert_eq!(huge.len(), crate::wire::WireHeader::SIZE + 16 + 16 + 56);
+}
+
+/// A left-out fixed array of strings is refused against the body limit
+/// before its elements are made: each element adds at least its 4-byte
+/// length row, so `string[1000]` needs at least 4000 bytes past the 8-byte
+/// table.
+#[test]
+fn a_left_out_fixed_array_past_the_body_limit_is_refused_before_it_is_made() {
+    let set = set_from_yaml("schemas:\n  Names:\n    fields:\n      string[1000] names: {}\n");
+    let limited = YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(100),
+    };
+    assert_eq!(
+        yaml_to_message_with(set.walker(), "Names", b"{}", TS, limited)
+            .unwrap_err()
+            .to_string(),
+        "names: the message body is larger than the 100-byte limit"
+    );
+}
+
+/// The early refusal never refuses a left-out fixed array that fits:
+///
+/// ```text
+/// string[3] names: table 8, count 4, three empty strings 3 * 4  = 24 B
+/// Tag[2] tags:     table 8, count 4, two (length 4 + body 8)    = 36 B
+/// ```
+///
+/// A limit under the least the array can take refuses at the field, before
+/// any element is made.
+#[test]
+fn a_left_out_fixed_array_that_fits_its_body_limit_is_written() {
+    let set = set_from_yaml(
+        "\
+schemas:
+  Tag:
+    fields:
+      string name: {}
+  Names:
+    fields:
+      string[3] names: {}
+  Tags:
+    fields:
+      Tag[2] tags: {}
+",
+    );
+    let limited = |max| YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(max),
+    };
+    let read = |schema, max| yaml_to_message_with(set.walker(), schema, b"{}", TS, limited(max));
+    assert_eq!(
+        read("Names", 24).unwrap()[crate::wire::WireHeader::SIZE..],
+        [8, 0, 0, 0, 16, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let mut tags = vec![8, 0, 0, 0, 28, 0, 0, 0, 2, 0, 0, 0];
+    for _ in 0..2 {
+        tags.extend_from_slice(&[8, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    assert_eq!(
+        read("Tags", 36).unwrap()[crate::wire::WireHeader::SIZE..],
+        tags[..]
+    );
+    assert_eq!(
+        read("Tags", 15).unwrap_err().to_string(),
+        "tags: the message body is larger than the 15-byte limit"
+    );
 }

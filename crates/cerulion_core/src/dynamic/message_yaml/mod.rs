@@ -67,6 +67,14 @@ pub struct YamlDecodeOptions {
     /// What a field left out of the input means. The default,
     /// [`MissingFields::Required`], is the form above.
     pub missing_fields: MissingFields,
+    /// The most bytes the message body (the frame after its header) may
+    /// hold while it is built: the reader refuses with
+    /// [`crate::dynamic::DynamicError::YamlBodyTooLarge`] at the first value
+    /// past it, before building more. The count leaves out the alignment
+    /// padding between variable payloads, so a finished body can be up to
+    /// seven bytes per variable field longer. `None` (the default), or a
+    /// limit past the 1 GiB frame cap, is the frame cap.
+    pub max_body_bytes: Option<usize>,
 }
 
 /// What [`yaml_to_message_with`] does with a field the input leaves out.

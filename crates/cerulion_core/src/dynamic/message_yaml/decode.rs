@@ -70,7 +70,8 @@ pub fn yaml_to_message(
 /// # Errors
 ///
 /// As [`yaml_to_message`]; [`DynamicError::YamlMissingField`] only under
-/// [`MissingFields::Required`].
+/// [`MissingFields::Required`], and [`DynamicError::YamlBodyTooLarge`] when
+/// the body passes [`YamlDecodeOptions::max_body_bytes`].
 pub fn yaml_to_message_with(
     walker: &FrameWalker,
     schema: &str,
@@ -126,6 +127,7 @@ pub(super) fn yaml_to_message_capped(
     let mut builder = Builder {
         walker,
         missing: options.missing_fields,
+        max_body: options.max_body_bytes.filter(|&max| max < MAX_BODY_BYTES),
         path: String::new(),
         array_depth: 0,
         held: 0,
@@ -201,15 +203,17 @@ type Target<'w> = (&'w WireLayout, &'w MessageSchema);
 struct Builder<'w> {
     walker: &'w FrameWalker,
     missing: MissingFields,
+    /// The caller's body limit, when it is below [`MAX_BODY_BYTES`].
+    max_body: Option<usize>,
     path: String,
     /// How many elements of variable-message arrays enclose the value
     /// being built.
     array_depth: usize,
     /// Bytes the unfinished bodies and arrays on the build stack already
     /// hold. Every one of them ends up in the frame, so the sum is kept
-    /// under [`MAX_BODY_BYTES`] as it grows: a few bytes of YAML (unset
-    /// `string_fixed` fields, say) cannot make the reader hold more than
-    /// one frame's worth before it refuses.
+    /// under [`MAX_BODY_BYTES`] (or `max_body`) as it grows: a few bytes of
+    /// YAML (unset `string_fixed` fields, say) cannot make the reader hold
+    /// more than one frame's worth before it refuses.
     held: usize,
 }
 
@@ -218,12 +222,54 @@ impl<'w> Builder<'w> {
         shown(&self.path)
     }
 
-    /// Refuse when `n` more bytes would take the frame past the cap.
+    /// Refuse when `n` more bytes would take the frame past the cap, or
+    /// the body past the caller's limit.
     fn room(&self, n: usize) -> Result<(), DynamicError> {
-        if self.held.checked_add(n).is_none_or(|t| t > MAX_BODY_BYTES) {
-            return Err(DynamicError::YamlMessageTooLarge { path: self.here() });
+        let cap = self.max_body.unwrap_or(MAX_BODY_BYTES);
+        if self.held.checked_add(n).is_none_or(|t| t > cap) {
+            return Err(match self.max_body {
+                Some(max_bytes) => DynamicError::YamlBodyTooLarge {
+                    path: self.here(),
+                    max_bytes,
+                },
+                None => DynamicError::YamlMessageTooLarge { path: self.here() },
+            });
         }
         Ok(())
+    }
+
+    /// Refuse a left-out fixed array of strings or variable messages that
+    /// cannot fit before [`empty_form`] makes its elements: each element
+    /// adds at least its 4-byte length row, or its fixed size when the
+    /// message turns out fixed.
+    fn room_for_empty_form(
+        &self,
+        ft: &FieldType,
+        parent: Option<&str>,
+    ) -> Result<(), DynamicError> {
+        let FieldType::FixedArray {
+            element_type,
+            length,
+        } = ft
+        else {
+            return Ok(());
+        };
+        let per_element = match element_type.as_ref() {
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => {
+                let (layout, _) = self.nested(schema_name, package, parent)?;
+                if layout.is_fixed() {
+                    layout.fixed_size
+                } else {
+                    4
+                }
+            }
+            _ => 4,
+        };
+        self.room(length.saturating_mul(per_element))
     }
 
     /// Count `n` more bytes as held, refusing past the cap. A function that
@@ -408,6 +454,7 @@ impl<'w> Builder<'w> {
                 let value = match value {
                     Some(value) => value,
                     None => {
+                        self.room_for_empty_form(&field.field_type, parent)?;
                         empty = empty_form(&field.field_type);
                         &empty
                     }
@@ -699,6 +746,7 @@ impl<'w> Builder<'w> {
                 let at = Builder {
                     walker: self.walker,
                     missing: self.missing,
+                    max_body: self.max_body,
                     path,
                     array_depth: self.array_depth,
                     held: self.held,
