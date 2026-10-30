@@ -26,18 +26,16 @@ const JSON_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 /// Byte offset of `sequence` in the wire header (see [`WireHeader`]).
 const SEQUENCE_OFFSET: usize = 20;
 
-const PUBLISH_OPTIONS: YamlDecodeOptions = YamlDecodeOptions {
-    missing_fields: MissingFields::Zero,
-};
-
 /// Encode a JSON object as one message of `schema` (a qualified name
 /// `walker` knows) into a wire frame stamped `timestamp_ns` and numbered
 /// `sequence`.
 ///
 /// The JSON text is refused before the message reader runs when it is
 /// longer than `max_payload_bytes * 8 + 65536` bytes, is not an object or
-/// is not strict JSON (`invalid publish JSON: ...`), and the frame is
-/// refused when its payload is longer than `max_payload_bytes`.
+/// is not strict JSON (`invalid publish JSON: ...`, a number no `float64`
+/// holds included). The reader refuses as soon as the body it builds holds
+/// more than `max_payload_bytes`, and the finished payload, alignment
+/// padding included, is checked against it again.
 pub fn encode_json(
     walker: &FrameWalker,
     schema: &str,
@@ -67,17 +65,15 @@ pub fn encode_json(
     }
     // The reader takes YAML-only forms too (`.nan`, comments, unquoted
     // text); publish takes JSON only.
-    serde_json::from_str::<serde::de::IgnoredAny>(object)
+    serde_json::from_str::<StrictJson>(object)
         .map_err(|error| EmbedError::Encode(format!("invalid publish JSON: {error}")))?;
     let object = yaml_safe_json(object);
-    let mut frame = yaml_to_message_with(
-        walker,
-        schema,
-        object.as_bytes(),
-        timestamp_ns,
-        PUBLISH_OPTIONS,
-    )
-    .map_err(|error| EmbedError::Encode(error.to_string()))?;
+    let options = YamlDecodeOptions {
+        missing_fields: MissingFields::Zero,
+        max_body_bytes: Some(max_payload_bytes),
+    };
+    let mut frame = yaml_to_message_with(walker, schema, object.as_bytes(), timestamp_ns, options)
+        .map_err(|error| EmbedError::Encode(error.to_string()))?;
     let payload_len = frame.len().saturating_sub(WireHeader::SIZE);
     if payload_len > max_payload_bytes {
         return Err(EmbedError::Encode(format!(
@@ -87,6 +83,65 @@ pub fn encode_json(
     // The reader writes sequence 0; the app's publisher numbers its frames.
     frame[SEQUENCE_OFFSET..SEQUENCE_OFFSET + 4].copy_from_slice(&sequence.to_le_bytes());
     Ok(frame)
+}
+
+/// A JSON value that is read and dropped, like [`serde::de::IgnoredAny`],
+/// except that every number is parsed: `serde_json` then refuses a number
+/// no `float64` holds (`1e999`), which YAML would read as a string. It
+/// keeps nothing, so a check allocates no value tree.
+struct StrictJson;
+
+impl<'de> serde::Deserialize<'de> for StrictJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJson;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_unit<E>(self) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<StrictJson, A::Error> {
+        while seq.next_element::<StrictJson>()?.is_some() {}
+        Ok(StrictJson)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<StrictJson, A::Error> {
+        while map
+            .next_entry::<serde::de::IgnoredAny, StrictJson>()?
+            .is_some()
+        {}
+        Ok(StrictJson)
+    }
 }
 
 /// `object` (valid JSON) rewritten so the YAML reader reads every string
@@ -295,12 +350,53 @@ mod tests {
         assert_eq!(error.code(), crate::error::codes::ENCODE);
         assert_eq!(
             error.to_string(),
-            "encoded payload length 4105 exceeds max_payload_bytes 4104"
+            "data: the message body is larger than the 4104-byte limit"
         );
         let exact = format!(r#"{{"data":"{}"}}"#, "x".repeat(4096));
         let frame = encode_json(string.walker(), "std_msgs/String", &exact, 8 + 4096, 0, 0)
             .expect("at the limit");
         assert_eq!(frame.len(), WireHeader::SIZE + 8 + 4096);
+    }
+
+    /// The reader counts no alignment padding, so a payload it lets through
+    /// can still pass the limit; the finished length is checked again.
+    /// `string s` + `float64[] v`: table 16 B, `s` @16 (1 B), `v` aligned up
+    /// to @24 (8 B), 32 B in all, of which the reader counts 25.
+    #[test]
+    fn a_payload_past_the_limit_by_its_padding_is_refused() {
+        let schema = layout("string s\nfloat64[] v\n", "Padded", "test_msgs");
+        let json = r#"{"s":"a","v":[1.0]}"#;
+        let encode = |max| encode_json(schema.walker(), "test_msgs/Padded", json, max, 0, 0);
+        assert_eq!(encode(32).unwrap().len(), WireHeader::SIZE + 32);
+        assert_eq!(
+            encode(31).unwrap_err().to_string(),
+            "encoded payload length 32 exceeds max_payload_bytes 31"
+        );
+    }
+
+    /// A few bytes of JSON can name many left-out messages: the reader stops
+    /// at the first one past the payload limit instead of building them all.
+    /// `PoseArray`: table 16 B, header body 16 B, then 56 B per pose, so
+    /// 4096 B hold 72 poses (4064 B) and the 73rd is refused.
+    #[test]
+    fn many_left_out_messages_are_refused_at_the_payload_limit() {
+        let set = builtins();
+        let poses = |n: usize| format!(r#"{{"poses":[{}]}}"#, vec!["{}"; n].join(","));
+        let encode = |n| {
+            encode_json(
+                set.walker(),
+                "geometry_msgs/PoseArray",
+                &poses(n),
+                4096,
+                0,
+                0,
+            )
+        };
+        assert_eq!(encode(72).unwrap().len(), WireHeader::SIZE + 4064);
+        assert_eq!(
+            encode(30_000).unwrap_err().to_string(),
+            "poses[72]: the message body is larger than the 4096-byte limit"
+        );
     }
 
     #[test]
@@ -583,17 +679,21 @@ mod tests {
                 "{json:?}: {error}"
             );
         }
-        // JSON has the number, but no float holds it: refused at its field.
-        let error = encode_json(
-            set.walker(),
-            "geometry_msgs/Vector3",
-            r#"{"x": 1e999}"#,
-            64,
-            0,
-            0,
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "x: expected float64, got string");
+        // A number no float64 holds would read as a string in YAML, so a
+        // string field would take its digits: it is refused as JSON.
+        let huge_integer = format!(r#"{{"data": 1{}}}"#, "0".repeat(400));
+        for (schema, json) in [
+            ("geometry_msgs/Vector3", r#"{"x": 1e999}"#),
+            ("std_msgs/String", r#"{"data": 1e999}"#),
+            ("std_msgs/String", r#"{"data": -1e999}"#),
+            ("std_msgs/String", huge_integer.as_str()),
+        ] {
+            let error = encode_json(set.walker(), schema, json, 1024, 0, 0).expect_err(json);
+            assert!(
+                error.to_string().starts_with("invalid publish JSON: "),
+                "{json}: {error}"
+            );
+        }
     }
 
     /// JSON lets a string hold these characters raw, but YAML reads NEL, LS
@@ -647,9 +747,7 @@ mod tests {
         let error = encode("{\"data\":\"\\ud83d\"}").unwrap_err();
         assert_eq!(error.code(), crate::error::codes::ENCODE);
         assert!(
-            error
-                .to_string()
-                .starts_with("message YAML does not parse: "),
+            error.to_string().starts_with("invalid publish JSON: "),
             "{error}"
         );
         // An escaped backslash before `ud83d` is text, not an escape.
@@ -670,19 +768,17 @@ mod tests {
                 "{json}"
             );
         }
-        // A high surrogate not followed by a low one spells no character.
+        // A surrogate escape that is not half of a pair spells no character.
         for json in [
             r#"{"data":"\ud83dA"}"#,
-            r#"{"data":"\ud83dA"}"#,
+            r#"{"data":"\ud83d\u0041"}"#,
             r#"{"data":"\ud83d\ud83d"}"#,
             r#"{"data":"\ude00"}"#,
         ] {
             let error = encode(json).unwrap_err();
             assert_eq!(error.code(), crate::error::codes::ENCODE, "{json}");
             assert!(
-                error
-                    .to_string()
-                    .starts_with("message YAML does not parse: "),
+                error.to_string().starts_with("invalid publish JSON: "),
                 "{json}: {error}"
             );
         }

@@ -560,13 +560,15 @@ top-level publish value must be a JSON object, and unknown fields are rejected.
 A field the JSON leaves out, at any depth, is written as its zero value: `0`,
 `false`, an empty string or array, or a fixed array of zero values. An error
 names the field path, for example `pose.position.x: expected float64, got
-string`. The text must be strict JSON (no comments, `NaN` or unquoted
-keys), and a duplicate key is refused. A bare `-0` reads as `0`; write
-`-0.0` for a negative zero float. The JSON text is limited to
-`max_payload_bytes * 8 + 65536` bytes before it is parsed. This allows for
-escaped strings, byte arrays, field names, and whitespace while bounding the
-input size. Publish allocates for each message: it is the app's convenience
-path, not the zero-copy path a node publishes on.
+string`. The text must be strict JSON (no comments, `NaN`, unquoted keys
+or a number past the `float64` range), and a duplicate key is refused. A
+bare `-0` reads as `0`; write `-0.0` for a negative zero float. The JSON text
+is limited to `max_payload_bytes * 8 + 65536` bytes before it is parsed. This
+allows for escaped strings, byte arrays, field names, and whitespace while
+bounding the input size. A message is refused as soon as it passes
+`max_payload_bytes` while it is built, so a short text that leaves out many
+fields cannot build a large message. Publish allocates for each message: it
+is the app's convenience path, not the zero-copy path a node publishes on.
 
 Subscribe schemas must have only the field types poll reads: `Bool`, `I8`
 through `U64`, `F32`, `F64`, `String`, `Bytes`, and `StringFixed(n)`; a schema
