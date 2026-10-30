@@ -957,6 +957,11 @@ start with `remote.enabled` in that process fails with code 18 too, since the
 old plane may still answer under the device key. Restart the app process to
 host the plane again.
 
+While it binds, the plane's iroh endpoint asks the kernel for the details of
+every network interface. Android refuses that netlink read to apps, so logcat
+shows one `avc: denied { nlmsg_readpriv }` line for `netlink_route_socket` from
+the `cerulion-remote` thread; the plane works without it.
+
 The plane reads the app's topics on the app's own transport, so the app runs
 no network daemon. It serves every topic of the app's transport to a paired
 desk; `egress` applies to LAN peers only. A desk can read; it cannot publish

@@ -919,8 +919,16 @@ device "run-as '$APP' rm -rf files/remote"
 "${ADB[@]}" logcat -d > "$OUT/logcat-open.txt" 2>&1
 app_log="$(tr -d '\r' < "$OUT/logcat-open.txt")"
 grep -q 'start=0' <<<"$app_log" || fail "app start" "start=0 absent"
-denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
+# Android refuses apps the netlink read of other interfaces' details
+# (RTM_GETLINK, its own tag b/155595000). The hosted remote plane's iroh
+# endpoint asks for it while it watches the network and carries on without
+# it, as the paired read above shows; that one denial is expected, and only
+# that one.
+netlink_link_read='avc: denied { nlmsg_readpriv } .*tclass=netlink_route_socket .*b/155595000'
+app_denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
   grep 'avc: denied' | grep 'scontext=u:r:untrusted_app' | grep -v 'runas_app' || true)"
+denials="$(grep -Ev "$netlink_link_read" <<<"$app_denials" || true)"
+netlink_reads="$(grep -cE "$netlink_link_read" <<<"$app_denials" || true)"
 [[ -z "$denials" ]] || fail "app SELinux" "untrusted_app denial was logged: $denials"
-pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open, restart and connect runs (no dlopen or execute denial)"
+pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open, restart, connect and hosted runs (no dlopen or execute denial; netlink link reads refused as Android does for apps: $netlink_reads)"
 echo "android e2e: $CHECKS checks passed"

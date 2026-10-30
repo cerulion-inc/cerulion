@@ -22,6 +22,8 @@
 //! daemon. A desk reads the catalog, schemas and topic frames; it cannot
 //! publish into the app, and `restart` and `engage-estop` are refused.
 
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
