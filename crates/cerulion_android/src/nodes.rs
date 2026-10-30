@@ -151,8 +151,8 @@ pub fn on_load(vm: *mut c_void, reserved: *mut c_void, nodes: &[LinkedNode]) -> 
 
 /// [`on_load`] that also registers a remote plane host, the body of the
 /// `JNI_OnLoad` that `embed_nodes! { remote: <host>, ... }` makes. A host
-/// registration error is logged like a node registration error; a start
-/// with the plane enabled then reports that no host is linked.
+/// registered before (a second load) is kept, and the refusal of this one
+/// is logged like a node registration error.
 pub fn on_load_with_remote_host(
     _vm: *mut c_void,
     _reserved: *mut c_void,

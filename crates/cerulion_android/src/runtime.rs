@@ -1848,12 +1848,15 @@ fn build_into(
 }
 
 /// Make a built run visible: open LAN access to the configured posture,
-/// replay the announces the paired build withheld, report the run and raise
-/// the beacon. The only step of a start that does so. On an error the
-/// caller shuts the run down, which closes LAN access first.
+/// replay the announces the paired build withheld, start the bound remote
+/// plane serving, report the run and raise the beacon. The only step of a
+/// start that does so. On an error the caller shuts the run down, which
+/// stops the remote plane and closes LAN access first.
 ///
 /// The run's commit gate is held from the last worker-failure check through
-/// the posture write, the announce replay and the switch to Running. A
+/// the posture write, the announce replay, the remote plane's serve and the
+/// switch to Running; a plane that ends on its own records its failure under
+/// the same gate, so its exit never runs inside `serve`. A
 /// worker records its failure under that same gate, so a failure either
 /// lands first (the commit refuses and LAN access never opens) or lands
 /// after the run is Running (a failure of a started run). A failed start

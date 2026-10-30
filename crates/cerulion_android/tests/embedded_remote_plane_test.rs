@@ -41,7 +41,7 @@ enum Answer {
     Fail,
 }
 
-/// What a `bind` was handed, with the transport compared by identity.
+/// What a `bind` was handed, apart from the transport.
 #[derive(Debug, PartialEq)]
 struct Handed {
     state_root: std::path::PathBuf,

@@ -904,7 +904,8 @@ The start enables it with the `remote` key:
 relays and discovery service of the iroh project, so a desk dials the app by
 its endpoint id alone; use it for development only, because the project runs
 them as a public service with no availability promise. `"disabled"` uses no
-relay and no discovery, so a desk dials the address in `status`. A list of
+relay and no discovery, so a desk dials the device's address with the port in
+`status`. A list of
 URLs uses relays you run. A URL that does not parse fails the start with error
 code 18.
 
@@ -924,18 +925,23 @@ adb shell rm -r /data/local/tmp/remoted
 
 A start reads them before it builds anything else. When a file is missing or
 does not verify (a fresh install, a trust store bound to another device key),
-the start fails with error code 17 (`REMOTE_NOT_PROVISIONED`), nothing runs
-and nothing is served. Any other plane failure is error code 18 (`REMOTE`):
-an app library that links no host, an endpoint that cannot bind, or a plane
-that stops serving on its own while the app runs, which also sets `state` to
-`failed`. The plane serves only once the start completes, and `stop` stops it
-before any other component.
+the start fails: `status` reports `state` `failed` with `last_error.code` 17
+(`REMOTE_NOT_PROVISIONED`), nothing runs and nothing is served. Any other
+plane failure is code 18 (`REMOTE`): an app library that links no host, an
+endpoint that cannot bind, or a plane that stops serving on its own while the
+app runs, which also sets `state` to `failed`. The plane serves only once the
+start completes, and `stop` stops it before any other component.
 
 While it serves, `status` reports it:
 
 ```json
 "remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"]}
 ```
+
+An unspecified address (`0.0.0.0` or `[::]`) means every interface: a desk
+dials the device's own address with that port. A stop waits up to 5 seconds
+for the plane to close its endpoint; when the plane does not stop cleanly,
+`status` reports `state` `failed` with `last_error.code` 18.
 
 The plane reads the app's topics on the app's own transport, so the app runs
 no network daemon. It serves every topic of the app's transport to a paired

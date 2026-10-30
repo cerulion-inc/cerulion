@@ -40,7 +40,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-/// How long a stop waits for the plane to close its endpoint.
+/// How long a stop waits, in all, for the plane to close its endpoint and
+/// for its runtime to shut down.
 const STOP_BUDGET: Duration = Duration::from_secs(5);
 
 /// The iroh remote plane host. Register it with `embed_nodes!` (see the
@@ -123,10 +124,33 @@ enum State {
     Serving {
         stop: oneshot::Sender<()>,
         stopping: Arc<AtomicBool>,
-        task: JoinHandle<()>,
+        task: JoinHandle<Result<(), String>>,
     },
     /// Only while `serve` swaps the state.
     Moving,
+}
+
+/// Wait for the serve task to end. When nothing asked it to stop, report how
+/// it ended through `exit` and return `Ok`; after a stop, return how it ended
+/// for the stop to report, and never call `exit`.
+async fn watch(
+    serving: JoinHandle<Result<(), RemotedError>>,
+    stopping: Arc<AtomicBool>,
+    exit: RemoteExit,
+) -> Result<(), String> {
+    let ended = match serving.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(format!("the plane task ended: {error}")),
+    };
+    if stopping.load(Ordering::SeqCst) {
+        return ended;
+    }
+    exit(match ended {
+        Ok(()) => "the endpoint closed".to_string(),
+        Err(reason) => reason,
+    });
+    Ok(())
 }
 
 struct Hosted {
@@ -146,8 +170,11 @@ impl BoundRemote for Hosted {
     }
 
     fn serve(&mut self, exit: RemoteExit) -> Result<(), String> {
-        let State::Bound(bound) = std::mem::replace(&mut self.state, State::Moving) else {
+        if !matches!(self.state, State::Bound(_)) {
             return Err("the remote plane is already serving".to_string());
+        }
+        let State::Bound(bound) = std::mem::replace(&mut self.state, State::Moving) else {
+            unreachable!("the state was checked above");
         };
         let (stop, stopped) = oneshot::channel::<()>();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -157,17 +184,7 @@ impl BoundRemote for Hosted {
         let serving = self.runtime.spawn(bound.serve(async move {
             let _ = stopped.await;
         }));
-        let task = self.runtime.spawn(async move {
-            let result = serving.await;
-            // A stop that asked for this exit is not a failure.
-            if !task_stopping.load(Ordering::SeqCst) {
-                exit(match result {
-                    Ok(Ok(())) => "the endpoint closed".to_string(),
-                    Ok(Err(error)) => error.to_string(),
-                    Err(error) => format!("the plane task ended: {error}"),
-                });
-            }
-        });
+        let task = self.runtime.spawn(watch(serving, task_stopping, exit));
         self.state = State::Serving {
             stop,
             stopping,
@@ -178,6 +195,7 @@ impl BoundRemote for Hosted {
 
     fn stop(self: Box<Self>) -> Result<(), String> {
         let Hosted { state, runtime, .. } = *self;
+        let deadline = std::time::Instant::now() + STOP_BUDGET;
         let result = match state {
             State::Serving {
                 stop,
@@ -188,7 +206,10 @@ impl BoundRemote for Hosted {
                 let _ = stop.send(());
                 // The timer is made inside the runtime: it needs its clock.
                 match runtime.block_on(async { tokio::time::timeout(STOP_BUDGET, task).await }) {
-                    Ok(Ok(())) => Ok(()),
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    Ok(Ok(Err(reason))) => {
+                        Err(format!("the remote plane did not stop cleanly: {reason}"))
+                    }
                     Ok(Err(error)) => Err(format!("the remote plane task failed: {error}")),
                     Err(_) => Err(format!(
                         "the remote plane did not close its endpoint within {} s",
@@ -204,7 +225,7 @@ impl BoundRemote for Hosted {
             }
             State::Moving => Ok(()),
         };
-        runtime.shutdown_timeout(STOP_BUDGET);
+        runtime.shutdown_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         result
     }
 }
@@ -212,6 +233,62 @@ impl BoundRemote for Hosted {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `watch` over a serve task that ends with `ends`, after a stop or not:
+    /// what it returns and every reason it passed to `exit`.
+    fn watched(
+        ends: impl std::future::Future<Output = Result<(), RemotedError>> + Send + 'static,
+        stopped: bool,
+    ) -> (Result<(), String>, Vec<String>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&exits);
+        let exit: RemoteExit = Box::new(move |reason| seen.lock().unwrap().push(reason));
+        let result = runtime.block_on(async {
+            let serving = tokio::spawn(ends);
+            watch(serving, Arc::new(AtomicBool::new(stopped)), exit).await
+        });
+        let exits = exits.lock().unwrap().clone();
+        (result, exits)
+    }
+
+    #[test]
+    fn a_plane_that_ends_on_its_own_is_reported_through_exit() {
+        assert_eq!(
+            watched(async { Ok(()) }, false),
+            (Ok(()), vec!["the endpoint closed".to_string()])
+        );
+        assert_eq!(
+            watched(
+                async { Err(RemotedError::Ops("no receipt log".into())) },
+                false
+            ),
+            (Ok(()), vec!["ops plane: no receipt log".to_string()])
+        );
+        let (result, exits) = watched(async { panic!("serve broke") }, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(exits.len(), 1);
+        assert!(
+            exits[0].starts_with("the plane task ended: ") && exits[0].contains("panicked"),
+            "{exits:?}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_plane_never_calls_exit_and_returns_how_it_ended() {
+        assert_eq!(watched(async { Ok(()) }, true), (Ok(()), Vec::new()));
+        assert_eq!(
+            watched(
+                async { Err(RemotedError::Ops("close failed".into())) },
+                true
+            ),
+            (Err("ops plane: close failed".to_string()), Vec::new())
+        );
+    }
 
     fn code(error: RemotedError) -> &'static str {
         match start_error(error) {

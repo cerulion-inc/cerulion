@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The remote plane hosted as a library: [`RemotePlane`] over a temporary state
 //! root, a [`KeyProvider`] that holds its keys in memory (no key file is
-//! written), and an injected local network daemon control socket.
+//! written), and its schema metadata from an injected local network daemon
+//! control socket or, for `RemotePlane::in_process`, an in-process
+//! `SchemaSource`.
 //!
 //! Every endpoint is loopback iroh with the relay disabled and every await is
 //! bounded. Keys come from fixed seeds; each expected value is a hand-written
