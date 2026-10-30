@@ -44,8 +44,9 @@ ONE iroh endpoint per robot (the device key's PUBLIC half IS the `EndpointId`, i
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - `RemotePlane` (`host.rs`) is the ONE serving entry: the daemon's `run` and a
   library host both bind and serve through it, so a serving change lands once.
-  State root, keys (`KeyProvider`) and the control socket are injected; never read
-  a key file or the default socket path inside the serving core. A library host
+  State root, keys (`KeyProvider`) and the control socket are injected; `serve_core`
+  never reads a key file or the default socket path (only `RemotePlane::daemon` and
+  the `serve_endpoint` test seam resolve the default socket). A library host
   refuses `restart` and `engage-estop` by name (`remote_plane_library_test.rs`).
 - Metadata reads the EXISTING local netd serving snapshot, its SHM namespace checked
   first; it never starts netd or queries discovery. Catalog and Schema reauthorize

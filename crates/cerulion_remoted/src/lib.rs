@@ -26,7 +26,7 @@
 //! - [`host`]: the serving entry. [`RemotePlane::bind`] loads the trust state
 //!   through a [`KeyProvider`] and binds the endpoint; [`BoundPlane::serve`] runs
 //!   the accept loop. The daemon's [`run`] serves
-//!   [`RemotedConfig::remote_plane`] with the [`KeyFiles`] provider; a library
+//!   [`RemotedConfig::daemon_plane`] with the [`KeyFiles`] provider; a library
 //!   host refuses the daemon-only `restart` and `engage-estop` verbs by name.
 //! - [`daemon`]: the kill switch, then the serving core: the `accept_one` loop dispatching on
 //!   the negotiated protocol. Each accepted connection is classified by the

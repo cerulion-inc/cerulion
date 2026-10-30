@@ -93,8 +93,8 @@ fn public(seed: u8) -> PublicKey {
 /// Write a claimed trust store bound to `robot` and a side map that pairs the
 /// desk with the owner, both MAC'd with the provider's key, under `root`.
 fn provision(root: &Path, robot: PublicKey) {
-    let config = RemotedConfig::from_state_root(root, RelayConfig::Disabled, false);
-    std::fs::create_dir_all(config.store_file.parent().unwrap()).unwrap();
+    let remoted = root.join("remoted");
+    std::fs::create_dir_all(&remoted).unwrap();
     let mut store = TrustStore::provision(
         ROBOT_ID,
         robot,
@@ -103,14 +103,41 @@ fn provision(root: &Path, robot: PublicKey) {
         0,
     )
     .unwrap()
-    .with_path(&config.store_file);
+    .with_path(remoted.join("trust_store"));
     store
         .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
         .unwrap();
     store.save(MAC_KEY).unwrap();
-    let mut index = DeviceAccountIndex::new().with_path(&config.index_file);
+    let mut index = DeviceAccountIndex::new().with_path(remoted.join("device_index.json"));
     index.bind(public(DESK_SEED), OWNER);
     index.save(MAC_KEY).unwrap();
+}
+
+/// [`RemotePlane::bind`] under the step bound.
+trait BindBounded {
+    async fn bind_bounded(self, keys: &dyn KeyProvider) -> Result<BoundPlane, RemotedError>;
+}
+
+impl BindBounded for RemotePlane {
+    async fn bind_bounded(self, keys: &dyn KeyProvider) -> Result<BoundPlane, RemotedError> {
+        bounded("bind", self.bind(keys)).await
+    }
+}
+
+/// Every file under `<root>/remoted/` with its bytes, sorted by name.
+fn state_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let Ok(entries) = std::fs::read_dir(root.join("remoted")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read(&path).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// A bound plane serving on its own task until [`Hosted::stop`].
@@ -203,8 +230,7 @@ async fn ops_calls(
 
 /// Each receipt's verb and outcome, in log order.
 fn receipt_rows(root: &Path) -> Vec<(String, ReceiptOutcome)> {
-    let config = RemotedConfig::from_state_root(root, RelayConfig::Disabled, false);
-    read_all(&config.receipt_file)
+    read_all(&root.join("remoted").join("receipts.log"))
         .unwrap()
         .into_iter()
         .map(|receipt| (receipt.verb, receipt.outcome))
@@ -253,14 +279,29 @@ async fn a_library_host_serves_the_catalog_through_the_injected_control_socket()
     let keys = MemoryKeys::new(ROBOT_SEED);
     let bound = RemotePlane::new(root.path(), ROBOT, netd.path.clone(), RelayConfig::Disabled)
         .with_transport(netd.manager.clone())
-        .bind(&keys)
+        .bind_bounded(&keys)
         .await
         .expect("the library entry binds");
     assert_eq!(*bound.endpoint_id().as_bytes(), public(ROBOT_SEED).0);
+    // bind publishes the public endpoint facts under the injected root.
+    let facts: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("remoted").join("beacon_facts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(facts["eid"], hex::encode(public(ROBOT_SEED).0));
+    assert_eq!(facts["claimable"], "0", "the store is claimed");
     let plane = Hosted::start(bound);
     let desk = disabled_endpoint([DESK_SEED; 32]).await;
 
-    let replies = wire_requests(&desk, &plane, &[WireRequest::Catalog, WireRequest::Catalog]).await;
+    let schema = WireRequest::Schema {
+        topic: TOPIC.into(),
+    };
+    let replies = wire_requests(
+        &desk,
+        &plane,
+        &[WireRequest::Catalog, WireRequest::Catalog, schema],
+    )
+    .await;
     let WireResponse::Catalog(catalog) = serde_json::from_slice(&replies[0]).unwrap() else {
         panic!(
             "expected a catalog: {}",
@@ -280,6 +321,21 @@ async fn a_library_host_serves_the_catalog_through_the_injected_control_socket()
         replies[0], replies[1],
         "a repeated catalog is byte-identical"
     );
+    // The schema route reads the same daemon: it knows the topic's type and has
+    // no custom closure for it.
+    let WireResponse::Schema(schema) = serde_json::from_slice(&replies[2]).unwrap() else {
+        panic!(
+            "expected a schema reply: {}",
+            String::from_utf8_lossy(&replies[2])
+        );
+    };
+    assert_eq!(
+        (schema.robot.as_str(), schema.requested.as_str()),
+        (ROBOT, TOPIC)
+    );
+    assert!(schema.docs.is_empty());
+    let error = schema.error.unwrap_or_default();
+    assert!(error.contains("no custom schema closure"), "error: {error}");
 
     plane.stop().await;
     netd.shutdown();
@@ -294,7 +350,7 @@ async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_e
     let keys = MemoryKeys::new(ROBOT_SEED);
     let bound = RemotePlane::new(root.path(), ROBOT, absent, RelayConfig::Disabled)
         .with_transport(manager)
-        .bind(&keys)
+        .bind_bounded(&keys)
         .await
         .unwrap();
     let plane = Hosted::start(bound);
@@ -321,7 +377,7 @@ async fn a_library_host_refuses_the_daemon_only_verbs_by_name() {
         root.path().join("no-daemon.sock"),
         RelayConfig::Disabled,
     )
-    .bind(&keys)
+    .bind_bounded(&keys)
     .await
     .unwrap();
     let plane = Hosted::start(bound);
@@ -355,16 +411,24 @@ async fn a_library_host_refuses_the_daemon_only_verbs_by_name() {
         message.contains("engage-estop is served only by the cerulion-remoted daemon"),
         "message: {message}"
     );
+    assert!(
+        message.contains("stop through the host's own stop path"),
+        "message: {message}"
+    );
 
     // The authorizer still runs first: an unpaired key is denied, not refused.
     let stranger = disabled_endpoint([STRANGER_SEED; 32]).await;
     let (_, results) = ops_calls(
         &stranger,
         &plane,
-        vec![("engage-estop", serde_json::json!({}))],
+        vec![
+            ("restart", serde_json::json!({"graph": "demo"})),
+            ("engage-estop", serde_json::json!({})),
+        ],
     )
     .await;
     assert_eq!(remote_error(&results[0]).0, "denied");
+    assert_eq!(remote_error(&results[1]).0, "denied");
     plane.stop().await;
 
     // Every call is receipted; a refusal is an error outcome with no intent row.
@@ -375,6 +439,7 @@ async fn a_library_host_refuses_the_daemon_only_verbs_by_name() {
             ("inventory".into(), ReceiptOutcome::Ok),
             ("restart".into(), unsupported()),
             ("engage-estop".into(), unsupported()),
+            ("restart".into(), ReceiptOutcome::Denied),
             ("engage-estop".into(), ReceiptOutcome::Denied),
         ]
     );
@@ -386,7 +451,7 @@ async fn the_daemon_configuration_serves_the_real_restart_verb() {
     provision(root.path(), public(ROBOT_SEED));
     let config = RemotedConfig::from_state_root(root.path(), RelayConfig::Disabled, false);
     let keys = MemoryKeys::new(ROBOT_SEED);
-    let bound = config.remote_plane().bind(&keys).await.unwrap();
+    let bound = config.daemon_plane().bind_bounded(&keys).await.unwrap();
     let plane = Hosted::start(bound);
     let desk = disabled_endpoint([DESK_SEED; 32]).await;
 
@@ -414,16 +479,22 @@ async fn a_key_provider_error_surfaces_from_bind_before_any_other_key_is_read() 
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
     let keys = MemoryKeys::refusing("the host keystore is locked");
+    let before = state_files(root.path());
     let error = RemotePlane::new(
         root.path(),
         ROBOT,
         root.path().join("s"),
         RelayConfig::Disabled,
     )
-    .bind(&keys)
+    .bind_bounded(&keys)
     .await
     .err()
     .expect("bind fails");
+    assert_eq!(
+        state_files(root.path()),
+        before,
+        "a refused bind changes no state file"
+    );
     assert!(
         matches!(&error, RemotedError::DeviceKey(reason) if reason == "the host keystore is locked"),
         "error: {error:?}"
@@ -435,16 +506,22 @@ async fn a_key_provider_error_surfaces_from_bind_before_any_other_key_is_read() 
 async fn the_mac_key_is_required_only_when_trust_state_exists() {
     let fresh = tempfile::tempdir().unwrap();
     let keys = MemoryKeys::new(ROBOT_SEED);
+    let before = state_files(fresh.path());
     let error = RemotePlane::new(
         fresh.path(),
         ROBOT,
         fresh.path().join("s"),
         RelayConfig::Disabled,
     )
-    .bind(&keys)
+    .bind_bounded(&keys)
     .await
     .err()
     .expect("a fresh root has no trust store");
+    assert_eq!(
+        state_files(fresh.path()),
+        before,
+        "a refused bind changes no state file"
+    );
     assert!(matches!(error, RemotedError::Store(_)), "error: {error:?}");
     assert_eq!(keys.asked_mac(), vec![false]);
 
@@ -457,7 +534,7 @@ async fn the_mac_key_is_required_only_when_trust_state_exists() {
         provisioned.path().join("s"),
         RelayConfig::Disabled,
     )
-    .bind(&keys)
+    .bind_bounded(&keys)
     .await
     .unwrap();
     assert_eq!(keys.asked_mac(), vec![true]);
@@ -469,16 +546,22 @@ async fn a_device_key_that_is_not_the_stores_key_is_refused() {
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
     let keys = MemoryKeys::new(STRANGER_SEED);
+    let before = state_files(root.path());
     let error = RemotePlane::new(
         root.path(),
         ROBOT,
         root.path().join("s"),
         RelayConfig::Disabled,
     )
-    .bind(&keys)
+    .bind_bounded(&keys)
     .await
     .err()
     .expect("a store for another device is refused");
+    assert_eq!(
+        state_files(root.path()),
+        before,
+        "a refused bind changes no state file"
+    );
     assert!(
         matches!(error, RemotedError::ProvisioningMismatch(_)),
         "error: {error:?}"
@@ -501,16 +584,22 @@ impl KeyProvider for EmptyMacKeys {
 async fn an_empty_mac_key_for_existing_trust_state_is_a_mac_key_error() {
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
+    let before = state_files(root.path());
     let error = RemotePlane::new(
         root.path(),
         ROBOT,
         root.path().join("s"),
         RelayConfig::Disabled,
     )
-    .bind(&EmptyMacKeys)
+    .bind_bounded(&EmptyMacKeys)
     .await
     .err()
     .expect("an empty key cannot verify the existing store");
+    assert_eq!(
+        state_files(root.path()),
+        before,
+        "a refused bind changes no state file"
+    );
     match error {
         RemotedError::MacKey(message) => {
             assert!(

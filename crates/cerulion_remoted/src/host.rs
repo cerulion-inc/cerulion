@@ -39,7 +39,8 @@
 //!   the ops receipt log, writes the public beacon facts at bind, and polls for
 //!   revocation epochs that a sync worker leaves next to the trust store
 //!   (`epoch.pending`), asking for one early (`epoch.request`) when a key it has
-//!   not seen recently connects.
+//!   not seen recently connects. `CERULION_REMOTED_EPOCH_RECHECK_S` sets how long
+//!   a key counts as recently seen, as on the daemon.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,9 @@ pub trait KeyProvider: Send + Sync {
     fn device_key(&self) -> Result<[u8; 32], RemotedError>;
 
     /// The key that authenticates the trust store and the device side map.
+    ///
+    /// An error is returned to the caller of [`RemotePlane::bind`] as is, so it
+    /// must never carry key bytes.
     ///
     /// `required` is `true` when a trust store or a side map already exists under
     /// the state root, so the key is needed to verify them; an empty key is then
@@ -104,6 +108,15 @@ pub(crate) enum OpsHost {
     /// A library host: `restart` and `engage-estop` are refused by name, so it
     /// has no lease to engage.
     Embedded,
+}
+
+impl OpsHost {
+    /// The daemon's verb set over a fresh control lease.
+    pub(crate) fn daemon() -> Self {
+        OpsHost::Daemon {
+            lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
+        }
+    }
 }
 
 /// The kind of host a plane is bound for; the daemon's lease is made at serve.
@@ -156,7 +169,7 @@ impl RemotePlane {
     pub fn new(
         state_root: impl AsRef<Path>,
         robot: impl Into<String>,
-        control_socket: PathBuf,
+        control_socket: impl Into<PathBuf>,
         relay: RelayConfig,
     ) -> Self {
         let layout = RemotedConfig::from_state_root(state_root, relay, false);
@@ -164,7 +177,7 @@ impl RemotePlane {
             files: PlaneFiles::of(&layout),
             relay: layout.relay,
             robot: robot.into(),
-            control_socket,
+            control_socket: control_socket.into(),
             transport: None,
             host: HostKind::Embedded,
         }
@@ -211,6 +224,9 @@ impl RemotePlane {
         // the absent store reports its own provisioning gap below.
         let mac_required = self.files.store_file.exists() || self.files.index_file.exists();
         let mac_key = keys.store_mac_key(mac_required)?;
+        // An empty key authenticates nothing, and the live trust state cannot
+        // persist a claim or pair with it, so existing trust state is never
+        // served under one.
         if mac_required && mac_key.is_empty() {
             return Err(RemotedError::MacKey(
                 "the key provider returned an empty trust-store MAC key, but a trust store \
@@ -299,13 +315,14 @@ impl BoundPlane {
         }
         .with_local_schema_provider(plane.control_socket);
         let (ops_host, server_name) = match plane.host {
-            HostKind::Daemon => (
-                OpsHost::Daemon {
-                    lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
-                },
-                DAEMON_SERVER_NAME,
-            ),
-            HostKind::Embedded => (OpsHost::Embedded, EMBEDDED_SERVER_NAME),
+            HostKind::Daemon => (OpsHost::daemon(), DAEMON_SERVER_NAME),
+            HostKind::Embedded => {
+                tracing::info!(
+                    "cerulion_remoted: serving as a library host; restart and engage-estop \
+                     are refused (daemon only)"
+                );
+                (OpsHost::Embedded, EMBEDDED_SERVER_NAME)
+            }
         };
         let result = crate::daemon::serve_core(
             &plane.files,
@@ -327,14 +344,15 @@ impl BoundPlane {
 }
 
 impl RemotedConfig {
-    /// The `cerulion-remoted` daemon's own entry, which [`run`](crate::daemon::run)
-    /// serves; a host embeds [`RemotePlane::new`] instead. The daemon's plane over this configuration: its state files and relay,
-    /// the robot identity from the environment (`CERULION_ROBOT_IDENTITY`, else
-    /// the hostname), the default control socket, and every ops verb including
-    /// `restart` and `engage-estop`. [`run`](crate::daemon::run) serves it with
-    /// [`RemotedConfig::key_files`].
+    /// The `cerulion-remoted` daemon's plane over this configuration.
+    ///
+    /// It uses the configured state files and relay, the robot identity from the
+    /// environment (`CERULION_ROBOT_IDENTITY`, else the hostname), the default
+    /// control socket, and every ops verb including `restart` and `engage-estop`.
+    /// [`run`](crate::daemon::run) serves it with [`RemotedConfig::key_files`].
+    /// A host embeds [`RemotePlane::new`] instead.
     #[doc(hidden)]
-    pub fn remote_plane(&self) -> RemotePlane {
+    pub fn daemon_plane(&self) -> RemotePlane {
         RemotePlane::daemon(self)
     }
 

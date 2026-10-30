@@ -13,10 +13,9 @@
 //!   [`AcceptDecision`] so the classification stays observable end-to-end.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use cerud::lease::ControlLease;
 use cerulion_core::TransportManager;
 use cerulion_link::{
     accept_frame_stream, accept_one, read_frame, write_frame, Accepted, Connection, Endpoint,
@@ -60,7 +59,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// Honors the `--network off` / `CERULION_NETWORK=off` kill-switch: if
 /// engaged, it logs loudly and exits cleanly WITHOUT binding an endpoint.
 /// Otherwise it serves the same library entry a host embeds
-/// ([`RemotedConfig::remote_plane`] with the [`RemotedConfig::key_files`]
+/// ([`RemotedConfig::daemon_plane`] with the [`RemotedConfig::key_files`]
 /// provider), which keeps `restart` and `engage-estop`.
 pub async fn run(
     config: RemotedConfig,
@@ -79,7 +78,7 @@ pub async fn run(
     // live in the entry: `bind` refuses a store bound to another device, `serve`
     // closes the endpoint however serving ends.
     config
-        .remote_plane()
+        .daemon_plane()
         .bind(&config.key_files())
         .await?
         .serve(shutdown)
@@ -124,9 +123,7 @@ pub async fn serve_endpoint(
     };
     serve_core(
         &PlaneFiles::of(config),
-        OpsHost::Daemon {
-            lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
-        },
+        OpsHost::daemon(),
         DAEMON_SERVER_NAME,
         trust_store,
         device_index,
@@ -564,6 +561,10 @@ pub(crate) fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
 /// - **not `expected` + present-but-unreadable** → still a LOUD
 ///   [`RemotedError::MacKey`]: a broken secure-storage secret is never silently
 ///   swallowed, even when no artifact currently requires it.
+///
+/// A present but EMPTY file loads as an empty key; when `expected`,
+/// [`crate::RemotePlane::bind`] then refuses it with [`RemotedError::MacKey`] (an
+/// empty key verifies nothing and cannot persist a mutation).
 pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
