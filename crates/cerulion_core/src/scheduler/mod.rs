@@ -2805,11 +2805,12 @@ impl Scheduler {
                 Some(slot) => {
                     return Err(refuse(
                         node_id,
+                        // hot-path-alloc-ok: cold: replay fire-plan install ERROR arm.
                         &format!(
                             "it fires {} times, not the cap of {cap}, and has no pre-fire check",
                             slot.fire_count
                         ),
-                    ))
+                    ));
                 }
                 None => return Err(refuse(node_id, "it has no planned fire at this step")),
             }
