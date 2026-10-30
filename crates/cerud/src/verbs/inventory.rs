@@ -137,7 +137,7 @@ fn kernel_release() -> Option<String> {
         .release
         .iter()
         .take_while(|&&c| c != 0)
-        .map(|&c| c as u8 as char)
+        .map(|&c| char::from(c.to_ne_bytes()[0]))
         .collect();
     if release.is_empty() {
         None
