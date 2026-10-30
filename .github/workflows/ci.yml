@@ -728,8 +728,8 @@ jobs:
         run: ./tools/scripts/test_verify_published.sh
 
       # The release attaches the Android Java facade as an archive this script
-      # builds; the release workflow runs it only on a tag, so its oracle
-      # table runs here on every pull request.
+      # builds; the release workflow runs it only outside pull requests, so
+      # its oracle table runs here on every pull request.
       - name: Android Java facade asset self-test
         run: python3 -I tools/scripts/test_package_android_java.py
 
