@@ -1616,6 +1616,9 @@ jobs:
       - name: local-transport publish stamp tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_publish_stamp_test -- --test-threads=1
+      - name: local-transport nested publish tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_nested_publish_test -- --test-threads=1
       - name: local-transport LAN ingress tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test lan_ingress_test -- --test-threads=1
@@ -2756,6 +2759,9 @@ jobs:
       - name: cerulion_android publish stamp integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_publish_stamp_test -- --test-threads=1
+      - name: cerulion_android nested publish integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test sample_graph_asset_test
