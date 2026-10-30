@@ -363,17 +363,6 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
     let failed = status(&runtime);
     assert_eq!((failed.state, failed.remote), (RuntimeState::Failed, None));
 
-    // A plane that does not stop cleanly fails the stop: the state is not
-    // `stopped` while an endpoint may still be open.
-    answer(&fake, Answer::BindStopFails);
-    runtime
-        .start(&config(&topics, enabled.clone()))
-        .expect("the plane serves");
-    let error = runtime.stop().expect_err("the plane did not stop");
-    assert_eq!(error.code(), codes::REMOTE);
-    let failed = status(&runtime);
-    assert_eq!((failed.state, failed.remote), (RuntimeState::Failed, None));
-
     // A graph that finished on its own keeps its plane serving until the
     // next start; a refused restart still stops it and withdraws it.
     answer(&fake, Answer::Bind);
@@ -410,7 +399,7 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
         events.lock().unwrap().log.push("graph.exit".into());
     });
     runtime
-        .start(&config(&topics, enabled))
+        .start(&config(&topics, enabled.clone()))
         .expect("a provisioned plane starts again");
     assert_eq!(
         fake.lock().unwrap().handed[0].state_root,
@@ -424,4 +413,27 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
     let stopped = status(&runtime);
     assert_eq!(stopped.state, RuntimeState::Stopped);
     assert_eq!(stopped.remote, None);
+
+    // A plane that does not stop cleanly fails the stop: the state is not
+    // `stopped` while an endpoint may still be open, and no plane binds
+    // again in this process, since the old one may still answer under the
+    // device key. This step comes last: it holds for the process lifetime.
+    answer(&fake, Answer::BindStopFails);
+    runtime
+        .start(&config(&topics, enabled.clone()))
+        .expect("the plane serves");
+    let error = runtime.stop().expect_err("the plane did not stop");
+    assert_eq!(error.code(), codes::REMOTE);
+    let failed = status(&runtime);
+    assert_eq!((failed.state, failed.remote), (RuntimeState::Failed, None));
+    answer(&fake, Answer::Bind);
+    let error = runtime
+        .start(&config(&topics, enabled))
+        .expect_err("no plane binds after one failed to stop");
+    assert_eq!(error.code(), codes::REMOTE);
+    assert!(
+        error.to_string().contains("did not stop cleanly"),
+        "{error}"
+    );
+    assert_eq!(log(&fake), Vec::<String>::new());
 }

@@ -17,7 +17,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cerulion_core::{SchemaServing, TransportManager};
@@ -110,33 +110,57 @@ pub fn register_host(host_impl: Box<dyn RemoteHost>) -> Result<(), EmbedError> {
     Ok(())
 }
 
-/// Set while one runtime in this process hosts a remote plane.
-static REMOTE_HOSTED: AtomicBool = AtomicBool::new(false);
+/// No runtime in this process hosts a remote plane.
+const PLANE_FREE: u8 = 0;
+/// One runtime in this process hosts a remote plane.
+const PLANE_HELD: u8 = 1;
+/// A plane in this process did not stop cleanly and may still answer, so no
+/// other plane may bind for the rest of the process.
+const PLANE_UNSTOPPED: u8 = 2;
+
+/// Whether a runtime in this process hosts a remote plane.
+static REMOTE_HOSTED: AtomicU8 = AtomicU8::new(PLANE_FREE);
 
 /// The one remote plane a process hosts. Every runtime reads the same device
 /// key, so two planes would answer under one endpoint id for two different
 /// runs; a second runtime with the plane enabled is refused while one holds
-/// this lease.
+/// this lease, and every one is refused after a plane failed to stop.
 struct RemoteLease(());
 
 impl RemoteLease {
     fn acquire() -> Result<Self, EmbedError> {
-        REMOTE_HOSTED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Self(()))
-            .map_err(|_| {
-                EmbedError::Remote(
-                    "another embedded runtime in this process hosts the remote plane; stop it \
-                     before starting a runtime with remote.enabled"
-                        .to_string(),
-                )
-            })
+        match REMOTE_HOSTED.compare_exchange(
+            PLANE_FREE,
+            PLANE_HELD,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(Self(())),
+            Err(PLANE_UNSTOPPED) => Err(EmbedError::Remote(
+                "a remote plane in this process did not stop cleanly and may still answer under \
+                 this device key; restart the app process before starting a runtime with \
+                 remote.enabled"
+                    .to_string(),
+            )),
+            Err(_) => Err(EmbedError::Remote(
+                "another embedded runtime in this process hosts the remote plane; stop it \
+                 before starting a runtime with remote.enabled"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Keep the process refusing every later plane: the plane this lease
+    /// guarded may still be serving.
+    fn keep_unstopped(self) {
+        REMOTE_HOSTED.store(PLANE_UNSTOPPED, Ordering::Release);
+        std::mem::forget(self);
     }
 }
 
 impl Drop for RemoteLease {
     fn drop(&mut self) {
-        REMOTE_HOSTED.store(false, Ordering::Release);
+        REMOTE_HOSTED.store(PLANE_FREE, Ordering::Release);
     }
 }
 
@@ -152,11 +176,29 @@ impl HostedPlane {
         self.plane.as_mut()
     }
 
-    /// Stop the plane, then free the lease.
+    /// Stop the plane, then free the lease. A plane that does not stop
+    /// cleanly keeps the process from binding another one.
     pub(crate) fn stop(self) -> Result<(), String> {
-        let HostedPlane { plane, _lease } = self;
-        plane.stop()
+        let HostedPlane {
+            plane,
+            _lease: lease,
+        } = self;
+        let result = plane.stop();
+        if result.is_err() {
+            lease.keep_unstopped();
+        }
+        result
     }
+}
+
+/// TEST SEAM: `plane` as the process's hosted plane, under its lease, with
+/// no host involved.
+#[cfg(test)]
+pub(crate) fn hosted_for_test(plane: Box<dyn BoundRemote>) -> Result<HostedPlane, EmbedError> {
+    Ok(HostedPlane {
+        plane,
+        _lease: RemoteLease::acquire()?,
+    })
 }
 
 /// Take the process's remote plane lease and bind the plane through the

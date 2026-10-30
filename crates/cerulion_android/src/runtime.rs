@@ -1847,14 +1847,14 @@ fn build_into(
     Ok(())
 }
 
-/// Make a built run visible: open LAN access to the configured posture,
-/// replay the announces the paired build withheld, start the bound remote
-/// plane serving, report the run and raise the beacon. The only step of a
+/// Make a built run visible: start the bound remote plane serving, open LAN
+/// access to the configured posture, replay the announces the paired build
+/// withheld, report the run and raise the beacon. The only step of a
 /// start that does so. On an error the caller shuts the run down, which
 /// stops the remote plane and closes LAN access first.
 ///
 /// The run's commit gate is held from the last worker-failure check through
-/// the posture write, the announce replay, the remote plane's serve and the
+/// the remote plane's serve, the posture write, the announce replay and the
 /// switch to Running; a plane that ends on its own records its failure under
 /// the same gate, so its exit never runs inside `serve`. A
 /// worker records its failure under that same gate, so a failure either
@@ -1878,27 +1878,8 @@ fn commit(
                 return Err(recorded_failure(&status));
             }
         }
-        if let Some(gateway) = &plan.gateway {
-            let network = run.manager.network().ok_or_else(|| {
-                EmbedError::Network("the gateway's transport manager has no network".to_string())
-            })?;
-            network.set_lan_access(gateway.lan_access);
-            if gateway.lan_access == LanAccess::Open {
-                // Read AFTER the posture opened: a topic registered before
-                // this read is replayed here, and one registered after it
-                // announces itself. A second announce of a topic is a no-op.
-                let registered = run
-                    .manager
-                    .bridge_manager()
-                    .registered_topics()
-                    .map_err(|error| EmbedError::Network(error.to_string()))?;
-                for (topic, _flag) in registered {
-                    run.manager
-                        .announce_egress_topic(&topic)
-                        .map_err(|error| EmbedError::Network(error.to_string()))?;
-                }
-            }
-        }
+        // The paired plane serves before LAN access opens: a plane that
+        // refuses to serve fails the start while the LAN is still paired.
         let remote = match run.remote.as_mut().map(HostedPlane::plane) {
             Some(remote) => {
                 let thread_status = Arc::clone(status);
@@ -1925,6 +1906,27 @@ fn commit(
             }
             None => None,
         };
+        if let Some(gateway) = &plan.gateway {
+            let network = run.manager.network().ok_or_else(|| {
+                EmbedError::Network("the gateway's transport manager has no network".to_string())
+            })?;
+            network.set_lan_access(gateway.lan_access);
+            if gateway.lan_access == LanAccess::Open {
+                // Read AFTER the posture opened: a topic registered before
+                // this read is replayed here, and one registered after it
+                // announces itself. A second announce of a topic is a no-op.
+                let registered = run
+                    .manager
+                    .bridge_manager()
+                    .registered_topics()
+                    .map_err(|error| EmbedError::Network(error.to_string()))?;
+                for (topic, _flag) in registered {
+                    run.manager
+                        .announce_egress_topic(&topic)
+                        .map_err(|error| EmbedError::Network(error.to_string()))?;
+                }
+            }
+        }
         let mut status = lock_status(status);
         // A graph that already finished on its own keeps Finished.
         if !matches!(status.state, RuntimeState::Finished) {
@@ -3567,6 +3569,82 @@ nodes:
         let result = commit(&mut run, &plan, &status, "t");
 
         assert!(matches!(result, Err(EmbedError::Graph(_))), "{result:?}");
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    /// A remote plane that refuses to serve fails the commit while LAN access
+    /// is still paired: the plane serves before the posture opens.
+    #[test]
+    fn a_remote_plane_that_cannot_serve_fails_the_commit_before_lan_access_opens() {
+        struct Refusing {
+            manager: Arc<TransportManager>,
+            seen: Arc<Mutex<Option<LanAccess>>>,
+        }
+        impl crate::remote::BoundRemote for Refusing {
+            fn endpoint_id(&self) -> String {
+                "refusing".to_string()
+            }
+            fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+                Vec::new()
+            }
+            fn serve(&mut self, _exit: crate::remote::RemoteExit) -> Result<(), String> {
+                *self.seen.lock().unwrap() = self.manager.network().map(|n| n.lan_access());
+                Err("the plane refused to serve".to_string())
+            }
+            fn stop(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let _serial = gateway_test_lock();
+        let manager = network_manager("commitremote");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
+        let plan = StartPlan {
+            graph: None,
+            graph_name: None,
+            nodes: 0,
+            schemas,
+            publishes: Vec::new(),
+            subscribes: Vec::new(),
+            recorded_topics: None,
+            recorded_graph_topics: None,
+            listen: Vec::new(),
+            connect: Vec::new(),
+            inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
+            gateway: Some(GatewayStartPlan {
+                plan: GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: Vec::new(),
+                    ingress: Vec::new(),
+                },
+                serving: SchemaServing::default(),
+                lan_access: LanAccess::Open,
+                mdns: false,
+            }),
+            remote: None,
+            recorder: None,
+            graph_exit: None,
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.remote = Some(
+            crate::remote::hosted_for_test(Box::new(Refusing {
+                manager: Arc::clone(&manager),
+                seen: Arc::clone(&seen),
+            }))
+            .expect("the remote plane lease"),
+        );
+
+        let result = commit(&mut run, &plan, &status, "t");
+
+        assert!(matches!(result, Err(EmbedError::Remote(_))), "{result:?}");
+        assert_eq!(*seen.lock().unwrap(), Some(LanAccess::Paired));
         assert_eq!(network.lan_access(), LanAccess::Paired);
         let (_, error) = run.shutdown();
         assert!(error.is_none(), "{error:?}");

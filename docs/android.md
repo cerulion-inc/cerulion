@@ -952,7 +952,10 @@ While it serves, `status` reports it:
 An unspecified address (`0.0.0.0` or `[::]`) means every interface: a desk
 dials the device's own address with that port. A stop waits up to 5 seconds
 for the plane to close its endpoint; when the plane does not stop cleanly,
-`status` reports `state` `failed` with `last_error.code` 18.
+`status` reports `state` `failed` with `last_error.code` 18, and every later
+start with `remote.enabled` in that process fails with code 18 too, since the
+old plane may still answer under the device key. Restart the app process to
+host the plane again.
 
 The plane reads the app's topics on the app's own transport, so the app runs
 no network daemon. It serves every topic of the app's transport to a paired

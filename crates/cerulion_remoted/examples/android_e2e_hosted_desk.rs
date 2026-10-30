@@ -11,7 +11,8 @@
 //! `read <endpoint id> <port> <topic> <schema>` dials the app's plane on
 //! loopback with the relay disabled, as the paired desk. The endpoint id must
 //! be the provisioned device key's public half. The catalog must list `<topic>`
-//! as `<schema>`, and a demand for it must stream one frame.
+//! as `<schema>`, and a demand for it must stream one whole wire frame whose
+//! header names its size and the catalog's schema hash.
 //!
 //! It prints ONE fact line and exits 0 when every check holds:
 //!
@@ -140,6 +141,7 @@ async fn read(endpoint: &str, port: u16, topic: &str, schema: &str) -> Result<St
         )
         .into());
     };
+    let catalog_hash = row.schema_hash;
     if row.schema_name.as_deref() != Some(schema) {
         return Err(format!(
             "catalog: {topic} schema name {:?}, expected {schema}",
@@ -167,8 +169,26 @@ async fn read(endpoint: &str, port: u16, topic: &str, schema: &str) -> Result<St
         read_frame(&mut stream, DEFAULT_MAX_FRAME_LEN),
     )
     .await??;
-    if frame.len() <= WireHeader::SIZE {
-        return Err(format!("frame: {} bytes, no body after the header", frame.len()).into());
+    // The frame must be one whole wire frame of the topic's schema: its header
+    // names its own size and, when the catalog saw the topic's frames, the
+    // same schema hash.
+    let Some(header) = WireHeader::read_from_buf(&frame) else {
+        return Err(format!("frame: {} bytes, shorter than a wire header", frame.len()).into());
+    };
+    if frame.len() <= WireHeader::SIZE || header.total_size as usize != frame.len() {
+        return Err(format!(
+            "frame: {} bytes, but its header says {} (a body must follow the header)",
+            frame.len(),
+            header.total_size
+        )
+        .into());
+    }
+    if header.schema_hash == 0 || catalog_hash.is_some_and(|hash| hash != header.schema_hash) {
+        return Err(format!(
+            "frame: schema hash {:#x}, the catalog row says {catalog_hash:?}",
+            header.schema_hash
+        )
+        .into());
     }
     connection.close(0u32.into(), b"desk finished");
     bounded("desk endpoint close", desk.close()).await?;

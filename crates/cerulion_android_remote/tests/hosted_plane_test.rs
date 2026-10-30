@@ -285,6 +285,11 @@ fn a_paired_desk_reads_the_hosted_catalog_and_a_topic_and_a_fresh_install_serves
         .unwrap();
     assert_eq!(sequence, 0);
     assert_eq!(frame.len(), WireHeader::SIZE + 4, "{frame:?}");
+    assert_eq!(
+        WireHeader::read_from_buf(&frame).map(|header| header.total_size),
+        Some(44),
+        "the header names the whole frame"
+    );
     assert_eq!(&frame[WireHeader::SIZE..], 7i32.to_le_bytes());
 
     // A desk cannot write into the app: the plane has no publish verb.
