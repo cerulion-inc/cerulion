@@ -11,9 +11,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Robot-side daemon that owns the robot's single iroh endpoint and serves the wire (cerulion/wire/1) and ops (cerulion/ops/1) protocols on it, gating every connection through a deny-by-default pairing check against the offline cerulion_pairing trust store."
-# Not published to crates.io: a robot-side daemon binary, not a library
-# dependency, with path-only internal deps.
+description = "Robot-side daemon (and its embeddable serving entry) that owns the robot's single iroh endpoint and serves the wire (cerulion/wire/1) and ops (cerulion/ops/1) protocols on it, gating every connection through a deny-by-default pairing check against the offline cerulion_pairing trust store."
+# Not published to crates.io: the robot-side daemon binary, and its serving
+# entry for hosts that link it by path, with path-only internal deps.
 publish = false
 
 [lints]

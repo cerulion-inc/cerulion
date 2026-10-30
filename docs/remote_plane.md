@@ -17,7 +17,9 @@ its engager; it does not stop motion by itself, and the state is held in the
 daemon's memory, so a daemon restart clears it. Nothing outside the daemon can
 read that state yet: an engage returns a reply to the caller, writes a warning
 to the log, and asks Flashback to save a recording. A robot still needs its own
-stop path (a hardwired e-stop) to stop motion. The `teleop` verb is classified
+stop path (a hardwired e-stop) to stop motion. Only the `cerulion-remoted`
+daemon serves `engage-estop` and `restart`: a process that hosts the remote plane
+as a library refuses both with an `unsupported_host` error. The `teleop` verb is classified
 (it needs `CAP_TELEOP` and at least the operator role) but has no handler yet,
 and the daemon does not run the deadman yet. The deadman and renewal rules below
 are the contract a teleop handler runs under.

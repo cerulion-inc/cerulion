@@ -1,10 +1,11 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-The robot-side remote-plane daemon: ONE iroh endpoint per robot (the device key's
-PUBLIC half IS the `EndpointId`, its 32-byte secret also seeds the pairing identity)
-multiplexing `cerulion/wire/2` and `cerulion/ops/1`. It also carries the family-wide
-rules for `cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`,
-`cerulion_connectd`, `cerud`, `cerulion_accountd` and `cerulion-wire`.
+The robot-side remote plane, run by the daemon or embedded through `RemotePlane`:
+ONE iroh endpoint per robot (the device key's PUBLIC half IS the `EndpointId`, its
+32-byte secret also seeds the pairing identity) multiplexing `cerulion/wire/2` and
+`cerulion/ops/1`. It also carries the family-wide rules for `cerulion_pairing`,
+`cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerud`,
+`cerulion_accountd` and `cerulion-wire`.
 
 ## Invariants
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
@@ -41,6 +42,11 @@ rules for `cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`,
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
+- `RemotePlane` (`host.rs`) is the ONE serving entry: the daemon's `run` and a
+  library host both bind and serve through it, so a serving change lands once.
+  State root, keys (`KeyProvider`) and the control socket are injected; never read
+  a key file or the default socket path inside the serving core. A library host
+  refuses `restart` and `engage-estop` by name (`remote_plane_library_test.rs`).
 - Metadata reads the EXISTING local netd serving snapshot, its SHM namespace checked
   first; it never starts netd or queries discovery. Catalog and Schema reauthorize
   CAP_OBSERVE after async provider work (`local_schema_provider_test`).

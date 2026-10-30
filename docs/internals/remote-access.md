@@ -24,7 +24,27 @@ seed is never the public half. iroh multiplexes both ALPNs on that endpoint
 ops verbs; the trailing `/1` is each plane's protocol-version boundary). Exactly
 one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accept
 (`daemon::handle_accepted`; pinned over real loopback endpoints by
-`crates/cerulion_remoted/tests/loopback_test.rs`).
+`crates/cerulion_remoted/tests/loopback_test.rs`), or a host process that embeds
+the same entry instead of running the daemon.
+
+- **One entry, two hosts** (`host.rs`). `RemotePlane::bind` loads the trust state
+  through a `KeyProvider` and binds the endpoint; `BoundPlane::serve` runs the
+  accept loop. Its inputs are injected: the state root (files under
+  `<root>/remoted/`), the keys (device key and trust-store MAC key), the robot
+  identity, the local network daemon's control socket (the `catalog`/`schema`
+  metadata reads, each deadline-bounded) and optionally the transport manager.
+  The daemon's `run` checks the kill switch, then serves
+  `RemotedConfig::remote_plane()` with the `KeyFiles` provider; `serve_endpoint`
+  (`#[doc(hidden)]`, tests only) shares the same serving core. A library host
+  (`RemotePlane::new`) refuses the daemon-only verbs by name with
+  `unsupported_host`: `restart` (it restarts a systemd unit) and `engage-estop`
+  (it engages the daemon's control lease and incident capture; a host that served
+  it would report an e-stop that stops nothing). The authorizer still runs first,
+  so an unpaired caller is denied as on the daemon. A library host announces
+  `cerulion-remote-plane` in the ops handshake, not `cerulion-remoted`, does not
+  read the `--network` / `CERULION_NETWORK` kill switch (the host decides
+  whether to serve), and still runs the epoch poll on its state root. Pinned by
+  `remote_plane_library_test.rs` and the verb-name pin in `ops.rs`.
 
 - **Always-on from boot.** Ops + pairing must be reachable when NO graph is
   running, so the endpoint host is a robot-level service, not the per-run
@@ -580,9 +600,11 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   `grants/`, `auth.json`, `peers.json` (LAN discovery; see
   `network-daemons.md`).
 - Robot inventory (state root, `remoted/` subdir; `remoted::config`):
-  `device_key`, `trust_store` + `trust_store.mac_key` (the daemon loads the
-  trust-store MAC key from this file, so robot setup must provision and protect
-  it; there is no secure-storage backend and no enforcing test),
+  `device_key`, `trust_store` + `trust_store.mac_key` (the daemon's `KeyFiles`
+  provider loads both keys from these files, so robot setup must provision and
+  protect them; there is no secure-storage backend and no enforcing test; a
+  library host supplies both keys through its own `KeyProvider` and writes no
+  key file),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
   root), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
@@ -621,6 +643,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/device_index_test.rs` | Side-map MAC integrity: no forged key→owner binding |
 | `crates/cerulion_remoted/tests/beacon_facts_test.rs` | Beacon-facts atomic write/round-trip/claimable flip |
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
+| `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket, daemon-only verbs refused, key provider error arms |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |
