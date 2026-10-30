@@ -79,10 +79,15 @@ request carries the random id so the events from before the login are joined
 to the account; the CLI also sends a `$create_alias` event for the join.
 Events sent under the random id carry `$process_person_profile: false`, so
 PostHog keeps no person profile for them; the alias still attributes them to
-the account's person, as PostHog's person processing describes
-(https://posthog.com/handbook/engineering/person-processing). A
-CI run never joins: its login carries no id and sends no alias. Nothing else
-is added to the login. A machine that signed out keeps its account on record
+the account's person. PostHog's person processing describes how a later
+`$identify` links personless events to a person through a person override
+(https://posthog.com/handbook/engineering/person-processing); its ingestion
+pipeline handles `$create_alias` almost the same way as `$identify`
+(https://posthog.com/docs/how-posthog-works/ingestion-pipeline), and its
+identify guide says an alias merges past and future events into one user
+(https://posthog.com/docs/product-analytics/identify). A CI run never
+joins: its login carries no id and sends no alias. Nothing else is added to
+the login. A machine that signed out keeps its account on record
 and carries nothing. If that first login happens in the run that printed the
 notice, which sends nothing, an empty `telemetry_alias_pending` file next to
 the consent file marks the join as owed, and the next run outside CI that

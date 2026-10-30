@@ -80,10 +80,15 @@ fn ci_run() -> bool {
 /// surface on the machine such as the vizd daemon. Those events are
 /// personless (`$process_person_profile: false`); PostHog ingests them under a
 /// person id derived from the distinct id, and the `$create_alias` that names
-/// the id links them to the account's person through a person override
-/// (<https://posthog.com/handbook/engineering/person-processing>). CI runs
-/// send under their own per-process id ([`consent::event_anon_id`]), so this
-/// never joins them.
+/// the id links them to the account's person through a person override.
+/// PostHog's handbook describes that override for `$identify`
+/// (<https://posthog.com/handbook/engineering/person-processing>), the
+/// ingestion pipeline handles `$create_alias` almost the same way
+/// (<https://posthog.com/docs/how-posthog-works/ingestion-pipeline>), and an
+/// alias merges past and future events into one person
+/// (<https://posthog.com/docs/product-analytics/identify>). CI runs send under
+/// their own per-process id ([`consent::event_anon_id`]), so this never joins
+/// them.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
@@ -103,9 +108,9 @@ const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 pub const NOTICE: &str = "Cerulion sends usage telemetry; turn it off with \
 `cerulion telemetry off` (details: https://cerulion.com/telemetry).";
 
-/// What is sent, in full: a short address that redirects to
-/// `docs/telemetry.md`, printed by `cerulion telemetry status`. [`NOTICE`]
-/// carries the same address.
+/// The page that lists what is sent, in full: a short address that redirects
+/// to `docs/telemetry.md`. `cerulion telemetry status` prints it and
+/// [`NOTICE`] carries it.
 const DETAILS_URL: &str = "https://cerulion.com/telemetry";
 
 /// Verbs that record no `cli_command_run`: the consent verb itself (an
