@@ -9,9 +9,25 @@
 //!   desk.key                     legacy name of the machine key (a hard link to, or equal copy of, identity/device.key)
 //!   identity/                    0700
 //!     device.key                 the 32-byte ed25519 seed, 0600
+//!     active_team                the team directory name this machine opens sessions with, one line
 //!     <team>/                    0700, one directory per team (one DNS label)
 //!       high_water               clock, bundle generation and status sequence floors, MAC'd
+//!       leaf.der                 this machine's team leaf certificate, DER, 0600
+//!       bundle                   the team trust bundle, postcard `SignedTeamTrustBundle`, 0600
 //! ```
+//!
+//! ## Team credentials
+//!
+//! [`IdentityLayout::write_team_credentials`] writes a team's leaf and bundle
+//! (each replaced atomically) and [`IdentityLayout::set_active_team`] names
+//! the team. [`IdentityLayout::load_team_credentials`] reads the active team
+//! back and accepts it only when the bundle verifies against one of the root
+//! sets it is given, the leaf satisfies the team profile and is signed by the
+//! bundle's current issuing CA, the leaf certifies this machine's key, and a
+//! leaf other than a robot's has not passed its notAfter. With no
+//! `active_team` file it returns `None`. It reads no high-water: whether the
+//! bundle's generation is newer than one this machine already accepted is the
+//! caller's `team::rollback` decision.
 //!
 //! ## The one machine key
 //!
@@ -63,6 +79,12 @@ pub const DEVICE_KEY_FILENAME: &str = "device.key";
 pub const LEGACY_DESK_KEY_FILENAME: &str = "desk.key";
 /// The high-water file name inside a team directory.
 pub const HIGH_WATER_FILENAME: &str = "high_water";
+/// The team leaf certificate file name inside a team directory.
+pub const LEAF_FILENAME: &str = "leaf.der";
+/// The team trust bundle file name inside a team directory.
+pub const BUNDLE_FILENAME: &str = "bundle";
+/// The file inside [`IDENTITY_SUBDIR`] naming the active team.
+pub const ACTIVE_TEAM_FILENAME: &str = "active_team";
 /// The length of an encoded high-water file.
 pub const HIGH_WATER_LEN: usize = HIGH_WATER_FRAMED_LEN + 32;
 
@@ -204,6 +226,21 @@ impl IdentityLayout {
     /// `<config>/identity/<team>/high_water`.
     pub fn high_water_path(&self, team: &TeamDirName) -> PathBuf {
         self.team_dir(team).join(HIGH_WATER_FILENAME)
+    }
+
+    /// `<config>/identity/<team>/leaf.der`.
+    pub fn leaf_path(&self, team: &TeamDirName) -> PathBuf {
+        self.team_dir(team).join(LEAF_FILENAME)
+    }
+
+    /// `<config>/identity/<team>/bundle`.
+    pub fn bundle_path(&self, team: &TeamDirName) -> PathBuf {
+        self.team_dir(team).join(BUNDLE_FILENAME)
+    }
+
+    /// `<config>/identity/active_team`.
+    pub fn active_team_path(&self) -> PathBuf {
+        self.identity_dir().join(ACTIVE_TEAM_FILENAME)
     }
 
     /// Load the machine key, creating it when no key exists (see the module
@@ -350,6 +387,231 @@ impl IdentityLayout {
         drop(lock);
         Ok(raised)
     }
+}
+
+// ===========================================================================
+// Team credentials
+// ===========================================================================
+
+/// A machine's team credentials as [`IdentityLayout::load_team_credentials`]
+/// accepted them.
+#[derive(Debug)]
+pub struct TeamCredentials {
+    /// The team directory name.
+    pub team: TeamDirName,
+    /// This machine's key.
+    pub key: MachineKey,
+    /// The leaf certificate, DER.
+    pub leaf_der: Vec<u8>,
+    /// What the leaf names.
+    pub leaf: crate::team::LeafFacts,
+    /// The verified team trust bundle.
+    pub bundle: crate::team::Verified<crate::team::SignedTeamTrustBundle>,
+}
+
+impl IdentityLayout {
+    /// Write `team`'s leaf, then its bundle, each replaced atomically,
+    /// creating the team directory (0700) when it is missing. Nothing is
+    /// checked here; the reader checks, and refuses a leaf that is not of the
+    /// bundle's current generation, so a crash between the two writes leaves
+    /// credentials that fail to load rather than mismatched ones that load.
+    ///
+    /// # Errors
+    ///
+    /// [`PairingError::IdentityIo`], or [`PairingError::TeamCredentials`] for
+    /// a bundle that does not encode.
+    pub fn write_team_credentials(
+        &self,
+        team: &TeamDirName,
+        leaf_der: &[u8],
+        bundle: &crate::team::SignedTeamTrustBundle,
+    ) -> Result<(), PairingError> {
+        create_secret_dir(&self.team_dir(team))?;
+        let encoded = postcard::to_allocvec(bundle).map_err(|_| PairingError::TeamCredentials {
+            path: self.bundle_path(team),
+            reason: "the bundle does not encode".into(),
+        })?;
+        write_private_atomic(&self.leaf_path(team), leaf_der)?;
+        write_private_atomic(&self.bundle_path(team), &encoded)
+    }
+
+    /// Name `team` as the team this machine opens sessions with.
+    ///
+    /// # Errors
+    ///
+    /// [`PairingError::IdentityIo`].
+    pub fn set_active_team(&self, team: &TeamDirName) -> Result<(), PairingError> {
+        create_secret_dir(&self.identity_dir())?;
+        write_private_atomic(
+            &self.active_team_path(),
+            format!("{}\n", team.as_str()).as_bytes(),
+        )
+    }
+
+    /// The active team, or `None` when no `active_team` file exists.
+    ///
+    /// # Errors
+    ///
+    /// [`PairingError::IdentityIo`], or [`PairingError::InvalidTeamName`] for a
+    /// file that does not hold one team directory name.
+    pub fn active_team(&self) -> Result<Option<TeamDirName>, PairingError> {
+        let path = self.active_team_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => TeamDirName::new(text.trim_end_matches('\n')).map(Some),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err("reading", &path, e)),
+        }
+    }
+
+    /// Load and check the active team's credentials (see the module docs).
+    /// `now_ns` is the time the bundle's intermediate and a non-robot leaf's
+    /// notAfter are checked at.
+    ///
+    /// # Errors
+    ///
+    /// [`PairingError::TeamCredentials`] naming the file and what is wrong
+    /// with it, [`PairingError::IdentityIo`], or the machine key errors of
+    /// [`IdentityLayout::load_machine_key`].
+    pub fn load_team_credentials(
+        &self,
+        root_sets: &[crate::format::RootSet],
+        now_ns: u64,
+    ) -> Result<Option<TeamCredentials>, PairingError> {
+        use crate::team::{check_team_ca, verify_leaf_issued_by, verify_team_trust_bundle};
+        let team = match self.active_team() {
+            Ok(Some(team)) => team,
+            Ok(None) => return Ok(None),
+            Err(PairingError::InvalidTeamName(name)) => {
+                return Err(PairingError::TeamCredentials {
+                    path: self.active_team_path(),
+                    reason: format!(
+                        "the active_team file holds '{name}', which is not a team name; sign in to the team again (a development build: cerulion-dev-issuer init)"
+                    ),
+                })
+            }
+            Err(e) => return Err(e),
+        };
+        let refuse = |path: PathBuf, reason: String| PairingError::TeamCredentials { path, reason };
+        let key = self.load_machine_key()?.ok_or_else(|| {
+            refuse(
+                self.device_key_path(),
+                "there is no machine key; the team leaf certifies a key this machine no longer has"
+                    .into(),
+            )
+        })?;
+        let read = |path: PathBuf| -> Result<Vec<u8>, PairingError> {
+            std::fs::read(&path).map_err(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    refuse(
+                        path.clone(),
+                        format!(
+                            "missing; the active team is '{}', so sign in to it again",
+                            team.as_str()
+                        ),
+                    )
+                } else {
+                    io_err("reading", &path, e)
+                }
+            })
+        };
+        let bundle_path = self.bundle_path(&team);
+        let signed: crate::team::SignedTeamTrustBundle =
+            postcard::from_bytes(&read(bundle_path.clone())?).map_err(|_| {
+                refuse(
+                    bundle_path.clone(),
+                    "does not decode as a team trust bundle".into(),
+                )
+            })?;
+        if signed.bundle.team_short.as_str() != team.as_str() {
+            return Err(refuse(
+                bundle_path,
+                format!(
+                    "names team '{}', not the active team '{}'",
+                    signed.bundle.team_short,
+                    team.as_str()
+                ),
+            ));
+        }
+        let mut failures = Vec::new();
+        let mut verified = None;
+        for roots in root_sets {
+            match verify_team_trust_bundle(roots, &signed, now_ns) {
+                Ok(v) => {
+                    verified = Some(v);
+                    break;
+                }
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        let bundle = verified.ok_or_else(|| {
+            refuse(
+                bundle_path.clone(),
+                if failures.is_empty() {
+                    "cannot be checked: this build trusts no root set".into()
+                } else {
+                    format!(
+                        "does not verify against a trusted root set ({} tried: {})",
+                        failures.len(),
+                        failures.join("; ")
+                    )
+                },
+            )
+        })?;
+        let leaf_path = self.leaf_path(&team);
+        let leaf_der = read(leaf_path.clone())?;
+        let ca = check_team_ca(&bundle.get().bundle.issuing_ca_der)
+            .map_err(|e| refuse(bundle_path, format!("its issuing CA: {e}")))?;
+        let leaf = verify_leaf_issued_by(&leaf_der, &ca).map_err(|e| {
+            refuse(
+                leaf_path.clone(),
+                format!("is not a leaf of the bundle's current generation: {e}"),
+            )
+        })?;
+        if leaf.device_key.0 != key.public_key() {
+            return Err(refuse(
+                leaf_path,
+                format!(
+                    "certifies another machine's key; this machine's key is {}",
+                    key.short_fingerprint()
+                ),
+            ));
+        }
+        // A robot leaf ends only by revocation, never by a clock; every other
+        // role's leaf has a notAfter, compared with `now_ns` here.
+        if leaf.role != crate::team::TeamRole::Robot
+            && now_ns / 1_000_000_000 > leaf.not_after_unix_secs
+        {
+            return Err(refuse(
+                leaf_path,
+                format!(
+                    "expired at {} (Unix seconds {}); sign in to the team again",
+                    unix_date(leaf.not_after_unix_secs),
+                    leaf.not_after_unix_secs
+                ),
+            ));
+        }
+        Ok(Some(TeamCredentials {
+            team,
+            key,
+            leaf_der,
+            leaf,
+            bundle,
+        }))
+    }
+}
+
+/// `YYYY-MM-DD` for Unix seconds (proleptic Gregorian, UTC).
+pub fn unix_date(unix_secs: u64) -> String {
+    let z = (unix_secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 // ===========================================================================
@@ -578,7 +840,7 @@ pub fn decode_high_water(bytes: &[u8], key: &MachineKey) -> Result<HighWater, Pa
 // Private files
 // ===========================================================================
 
-fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> PairingError {
+pub(crate) fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> PairingError {
     PairingError::IdentityIo {
         op,
         path: path.to_path_buf(),
@@ -588,7 +850,7 @@ fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> PairingError
 
 /// Create `dir` and any missing parents with mode 0700 on Unix. Existing
 /// directories keep their mode.
-fn create_secret_dir(dir: &Path) -> Result<(), PairingError> {
+pub(crate) fn create_secret_dir(dir: &Path) -> Result<(), PairingError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -716,7 +978,7 @@ fn sync_parent(path: &Path) -> Result<(), PairingError> {
 /// (`AlreadyExists`), and never visible with fewer than all of `bytes`: the
 /// bytes go to a synced sibling that is then hard-linked into place. Where the
 /// file system has no hard links, `create_new` on `path` itself is the fallback.
-fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
+pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
     let tmp = write_sibling(path, "new", bytes)?;
     let linked = std::fs::hard_link(&tmp, path);
     remove_quietly(&tmp);
@@ -739,7 +1001,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
 
 /// Replace `path` with `bytes` atomically: a synced 0600 sibling renamed over
 /// it, then the directory synced.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
     let tmp = write_sibling(path, "tmp", bytes)?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         remove_quietly(&tmp);

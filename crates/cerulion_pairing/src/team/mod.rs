@@ -31,6 +31,8 @@
 //! statement is newer than what a node already holds.
 
 mod der;
+#[cfg(feature = "dev-issuer")]
+pub mod dev_issuer;
 pub mod rollback;
 mod statement;
 mod x509;
@@ -49,8 +51,35 @@ pub use x509::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::format::PublicKey;
+use crate::format::{PublicKey, RootSet};
 use crate::PairingError;
+
+/// True when this build has the `dev-issuer` feature: it then trusts team
+/// credentials from a development issuer (see [`trusted_root_sets`]).
+pub const DEV_ISSUER_COMPILED: bool = cfg!(feature = "dev-issuer");
+
+/// The root sets compiled into this build that team trust bundles chain to.
+/// Empty, so a build without `dev-issuer` accepts no team credentials.
+pub fn release_root_sets() -> Vec<RootSet> {
+    Vec::new()
+}
+
+/// The root sets team credentials are checked against: the release root sets.
+/// A `dev-issuer` build adds the development root set of `layout`.
+///
+/// # Errors
+///
+/// None in this build; the `dev-issuer` build can fail reading its state file.
+#[cfg(not(feature = "dev-issuer"))]
+pub fn trusted_root_sets(
+    layout: &crate::identity::IdentityLayout,
+) -> Result<Vec<RootSet>, PairingError> {
+    let _ = layout;
+    Ok(release_root_sets())
+}
+
+#[cfg(feature = "dev-issuer")]
+pub use dev_issuer::trusted_root_sets;
 
 /// The fixed suffix every team name ends with.
 pub const NAME_SUFFIX: &str = "cerulion.invalid";
