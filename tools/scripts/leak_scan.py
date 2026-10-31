@@ -2663,7 +2663,11 @@ def run_messages(sc, git, args, env):
                                  (body_label, getattr(args, 'body_env', None), None)):
         body = None
         if envname:
-            body = env.get(envname, '')
+            # The workflows set these variables in the step's own shell, so an
+            # unset one is a handoff that broke, never an empty body to call clean.
+            if envname not in env:
+                raise NoRun('the %s variable %s is not set' % (what, envname))
+            body = env[envname]
         elif fname:
             try:
                 with open(fname, 'r', encoding='utf-8', errors='replace') as fh:
@@ -3506,7 +3510,7 @@ R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-foun
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 259
+EXPECTED_ARMS = 263
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -3536,6 +3540,123 @@ def _workflow_triggers(path):
     except OSError:
         return None
     return set(TRIGGER_RX.findall(m.group(1))) if m else None
+
+
+def _workflow_folded_value(path, name):
+    """The folded (`>-`) value that workflow gives the key `name`, as YAML
+    reads it: the lines under the key joined with single spaces. None when the
+    file or the key cannot be read, so the caller fails the arm rather than
+    testing a value the workflow does not ship."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            lines = fh.read().split('\n')
+    except OSError:
+        return None
+    key = re.compile(r'^( *)' + re.escape(name) + r': >-$')
+    for i, line in enumerate(lines):
+        m = key.match(line)
+        if not m:
+            continue
+        parts = []
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and len(nxt) - len(nxt.lstrip(' ')) <= len(m.group(1)):
+                break
+            if nxt.strip():
+                parts.append(nxt.strip())
+        return ' '.join(parts) or None
+    return None
+
+
+# Text people write around the repository, as an expression can reach it: a
+# body or a title by name in any rendering (`body`, `body_html`, `body_text`;
+# property names are not case sensitive), the old text an `edited` event
+# carries under `changes`, a whole object that holds such text
+# (`toJSON(github.event)`), or index syntax, which this reader cannot follow
+# and so counts. A `github` inside a longer name (`steps.github-app`,
+# `inputs.github-token`) is not the context, and quoted literals are removed
+# before the match, so a compare with `'github-actions[bot]'` reads nothing.
+EVENT_TEXT_RX = re.compile(
+    r'(?i)(?<![\w.-])github\.event\.(?:(?:comment|issue|pull_request|review|discussion)'
+    r'\.(?:body|title)\w*|changes)\b'
+    r'|(?<![\w.-])github(?:\.event(?:\.(?:comment|issue|pull_request|review|discussion))?)?'
+    r'(?![\w.\[-])'
+    r'|(?<![\w.-])github(?:\.event(?:\.\w+)*)?\s*\[')
+# One `${{ }}` expression. It ends at the first `}}` outside a quoted literal,
+# the way the runner finds the end: a `}}` inside `'...'` is text, and every
+# quote opens or closes a literal, so the escaped quote `''` is the close of
+# one literal and the open of the next.
+EXPR_RX = re.compile(r"\$\{\{((?:'[^']*'|[^'])*?)\}\}", re.S)
+QUOTED_RX = re.compile(r"'(?:[^']|'')*'")
+BLOCK_KEY_RX = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z_][\w-]*):\s*[|>][-+0-9]*(?:\s+#.*)?\s*$')
+# A JOB's condition: four spaces under `jobs: <id>:`, no list dash.
+JOB_IF_RX = re.compile(r'^    if:')
+# Any other condition: a step's, written with or without `${{ }}`.
+STEP_IF_RX = re.compile(r'^(\s*(?:-\s+)?if:\s*)(.*)$')
+
+
+def _as_expression(value):
+    """A condition's text as the `${{ }}` expression it is evaluated as."""
+    return value if '${{' in value or not value.strip() else '${{ ' + value + ' }}'
+
+
+def _printed_event_text(text):
+    """The 1-based lines of one workflow where an expression reads text people
+    write (see EVENT_TEXT_RX) into a value the run log prints. A step's `env:`
+    values, an action's `with:` inputs, a `run:` script and a step's condition
+    (traced with its values when a run is debug logged; it is an expression
+    with or without `${{ }}`) are printed with every expression already
+    expanded, so a copy of the text lands in the public log and outlives an
+    edit or a delete of the text itself. Only a JOB's `if:` is evaluated where
+    no log prints it: the service evaluates it before a runner takes the job,
+    and the job the runner receives carries its steps' conditions but no job
+    condition, so nothing the runner logs, debug or not, can trace it. It may
+    read the text; so may a YAML comment. A shell comment inside a `run:`
+    block is still part of the printed script and counts."""
+    lines = text.replace('\r\n', '\n').split('\n')
+    printed = []
+    block = None  # (column of the key, 'job-if' | 'step-if' | None) inside a block scalar
+    for line in lines:
+        indent = len(line) - len(line.lstrip(' '))
+        if block is not None:
+            if line.strip() == '' or indent > block[0]:
+                printed.append('' if block[1] == 'job-if'
+                               else _as_expression(line) if block[1] == 'step-if' else line)
+                continue
+            block = None
+        if line.strip().startswith('#'):
+            printed.append('')
+            continue
+        m = BLOCK_KEY_RX.match(line)
+        job_if = bool(JOB_IF_RX.match(line))
+        if m:
+            block = (m.start(2), 'job-if' if job_if
+                     else 'step-if' if m.group(2) == 'if' else None)
+        s = STEP_IF_RX.match(line)
+        if job_if:
+            printed.append('')
+        elif s and not m:
+            printed.append(s.group(1) + _as_expression(s.group(2)))
+        else:
+            printed.append(line)
+    joined = '\n'.join(printed)
+    return sorted({joined.count('\n', 0, m.start()) + 1
+                   for m in EXPR_RX.finditer(joined)
+                   if EVENT_TEXT_RX.search(QUOTED_RX.sub("''", m.group(1)))})
+
+
+def _workflows_printing_event_text(wf_dir):
+    """`file:line` for every place a workflow under wf_dir prints text people
+    write (see _printed_event_text). None when the folder cannot be read, so
+    the caller fails the arm rather than passing on a tree it never saw."""
+    try:
+        names = sorted(n for n in os.listdir(wf_dir) if n.endswith(('.yml', '.yaml')))
+        found = []
+        for n in names:
+            with open(os.path.join(wf_dir, n), 'r', encoding='utf-8') as fh:
+                found += ['%s:%d' % (n, ln) for ln in _printed_event_text(fh.read())]
+    except OSError:
+        return None
+    return found if names else None
 
 
 def _eval_condition(cond, event, login, body):
@@ -5358,6 +5479,141 @@ def self_test(out, base_env, argv0):
             cond is not None and not why and triggers == want_triggers
             and got == [(n, want) for n, ev, lg, b, want in cases],
             detail)
+        # The run log prints a step's `env:` values, an action's `with:` inputs,
+        # the `run:` script and (debug logged) a step's condition with every
+        # expression expanded, so a body or a title interpolated there is copied
+        # into a public log that outlives an edit or a delete of it, the guard's
+        # own delete included. The reader is pinned on hand-written workflow
+        # text first: each line says whether the log prints the text on it.
+        e = '${{ github.event.'
+        rows = [
+            ('on: issue_comment', False),
+            ('jobs:', False),
+            ('  a:', False),
+            ('    if: >-', False),                                  # a job's condition
+            ('      contains(' + e + 'comment.body }}, \'x\')', False),
+            ('    steps:', False),
+            ('      # ' + e + 'issue.body }} in a YAML comment', False),
+            ('      - if: ' + e + 'pull_request.title }} != \'\'', True),  # a step's condition
+            ('        env:', False),
+            ('          B: ' + e + 'comment.body || github.event.issue.body }}', True),
+            ('          N: ' + e + 'comment.id }}', False),
+            ('          J: ${{ toJSON(github.event) }}', True),
+            ('          O: ' + e + 'changes.body.from }}', True),
+            ('          I: ${{ github.event[\'comment\'][\'body\'] }}', True),
+            ('          C: ' + e + 'Comment.Body }}', True),
+            ('          K: ${{ github.event_name }} ${{ secrets.GITHUB_TOKEN }}', False),
+            ('          A: ${{ github.actor == \'github-actions[bot]\' }}', False),  # a literal
+            ('          L: ${{ format(\'{0} on github\', github.run_id) }}', False),  # a literal
+            ('          T: ${{ steps.github-app.outputs.token }} ${{ inputs.github-token }}', False),
+            # A `}}` inside a quoted literal does not end the expression ...
+            ('          Q: ${{ \'}}\' && github.event.comment.body }}', True),
+            ('          F: ${{ format(\'{0}}}\', github.run_id) }}', False),  # ... nor start one
+            # The other renderings of a body or a title are the same text.
+            ('          H: ' + e + 'comment.body_html }} ' + e + 'issue.body_text }}', True),
+            ('        run: |', False),
+            ('          # ' + e + 'review.body }}', True),           # a shell comment is printed
+            ('          echo "$B"', False),
+            ('      - uses: some/action@v1', False),
+            ('        with:', False),
+            ('          t: ${{', True),
+            ('            github.event.pull_request.title }}', False),
+            ('      - run: echo ' + e + 'pull_request.head.ref }}', False),
+            ('      - if: >-', False),                                # a block condition first ...
+            ('          always()', False),
+            ('        run: echo ' + e + 'issue.title }}', True),     # ... ends at its sibling key
+            ('      - run: | # a note', False),
+            ('          # ' + e + 'discussion.body }}', True),
+            ('        # ' + e + 'issue.body }} beside the step keys', False),  # the block ended
+            ('      - if: contains(github.event.comment.body, \'x\')', True),  # no braces
+            ('        run: echo hi', False),
+            ('      - if: >-', False),
+            ('          success() &&', False),
+            ('          github.event.issue.title != \'\'', True),     # a block condition, no braces
+            ('        run: echo hi', False),
+        ]
+        sample = '\n'.join(r for r, _ in rows) + '\n'
+        want = [i + 1 for i, (_, hit) in enumerate(rows) if hit]
+        got = _printed_event_text(sample)
+        arm('workflow-text-reader-finds-what-the-run-log-prints',
+            got == want and _printed_event_text(sample.replace('\n', '\r\n')) == want,
+            'got %s, want %s' % (got, want))
+        found = _workflows_printing_event_text(os.path.dirname(wf))
+        arm('workflows-never-print-a-body-or-title-into-the-run-log', found == [],
+            'unreadable workflow folder' if found is None else ', '.join(found))
+        # So the workflows read the text out of the event payload file with jq.
+        # Those filters are read OUT of the shipped YAML and run, with the flags
+        # the workflows pass, on hand-written payloads. A body the forge sends
+        # as `null`, an issue or a pull request opened with no description, is
+        # an empty body. A body that is absent, a comment with no text, an
+        # unreadable payload, is a read that failed, never an empty body to
+        # call clean, and the comment's own text is never swapped for the
+        # issue's.
+        main_wf = os.path.join(os.path.dirname(wf), 'leak-guard.yml')
+        filters = {name: _workflow_folded_value(path, name)
+                   for path, name in ((wf, 'LG_BODY_JQ'), (main_wf, 'LG_PR_TITLE_JQ'),
+                                      (main_wf, 'LG_PR_BODY_JQ'))}
+        comment = '{"action":"%s","comment":%s,"issue":{"body":"the issue"}}'
+        pr = '{"pull_request":%s}'
+        jq_rows = [
+            ('LG_BODY_JQ', comment % ('created', '{"body":"a comment"}'), 'a comment'),
+            ('LG_BODY_JQ', comment % ('deleted', '{"body":"a comment"}'), 'a comment'),
+            ('LG_BODY_JQ', comment % ('edited', '{"body":""}'), ''),
+            ('LG_BODY_JQ', comment % ('edited', '{"body":null}'), None),
+            ('LG_BODY_JQ', comment % ('edited', '{"id":7}'), None),
+            ('LG_BODY_JQ', comment % ('edited', 'null'), None),
+            ('LG_BODY_JQ', '{"comment":{"body":"a review note"},"pull_request":{}}',
+             'a review note'),
+            ('LG_BODY_JQ', '{"issue":{"body":"line one\\r\\nline two \\u00e9"}}',
+             'line one\r\nline two é'),
+            ('LG_BODY_JQ', '{"issue":{"title":"t","body":null}}', ''),
+            ('LG_BODY_JQ', '{"issue":{"title":"t"}}', None),
+            ('LG_BODY_JQ', '{"issue":null}', None),
+            ('LG_BODY_JQ', '{}', None),
+            ('LG_BODY_JQ', 'null', None),
+            ('LG_BODY_JQ', '', None),
+            ('LG_PR_TITLE_JQ', pr % '{"title":"fix: a title","body":null}', 'fix: a title'),
+            ('LG_PR_TITLE_JQ', pr % '{"title":null,"body":"b"}', None),
+            ('LG_PR_TITLE_JQ', pr % '{"body":"b"}', None),
+            ('LG_PR_TITLE_JQ', pr % 'null', None),
+            ('LG_PR_TITLE_JQ', '{"merge_group":{"head_sha":"a"}}', ''),
+            ('LG_PR_TITLE_JQ', '{"before":"a","after":"b"}', ''),
+            ('LG_PR_TITLE_JQ', 'null', None),
+            ('LG_PR_TITLE_JQ', '', None),
+            ('LG_PR_BODY_JQ', pr % '{"title":"t","body":"a body\\n"}', 'a body\n'),
+            ('LG_PR_BODY_JQ', pr % '{"title":"t","body":null}', ''),
+            ('LG_PR_BODY_JQ', pr % '{"title":"t"}', None),
+            ('LG_PR_BODY_JQ', pr % 'null', None),
+            ('LG_PR_BODY_JQ', '{"merge_group":{"head_sha":"a"}}', ''),
+            ('LG_PR_BODY_JQ', '{"before":"a","after":"b"}', ''),
+            ('LG_PR_BODY_JQ', 'null', None),
+            ('LG_PR_BODY_JQ', '', None),
+        ]
+        payload = os.path.join(tmp, 'event.json')
+        jq_bad = [n for n, f in sorted(filters.items()) if f is None]
+        for i, (name, text, want) in enumerate(jq_rows if not jq_bad else []):
+            with open(payload, 'w', encoding='utf-8') as fh:
+                fh.write(text)
+            try:
+                p = subprocess.run(['jq', '-e', '-j', filters[name], payload],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                got = p.stdout.decode('utf-8') if p.returncode == 0 else None
+            except OSError as exc:
+                jq_bad.append('jq could not run: %s' % exc)
+                break
+            if got != want:
+                jq_bad.append('row %d %s: got %r, want %r' % (i, name, got, want))
+        arm('workflows-read-the-payload-text-and-fail-closed-on-a-missing-body',
+            not jq_bad, 'unreadable or wrong: ' + '; '.join(jq_bad))
+        # The workflows set the body variables in the step's own shell, so
+        # a variable the flag names but nobody set is a broken handoff: the run
+        # must not happen, never scan an empty body and call it clean.
+        unset_env = {k: v for k, v in refenv.items() if k != 'LG_UNSET_PROBE'}
+        arm('messages-an-unset-body-variable-is-no-run-never-a-clean-body',
+            all(run(['messages', flag, 'LG_UNSET_PROBE', '--no-allow'] + extra + mine,
+                    unset_env, repo_ref)[0] == EXIT_NORUN
+                for flag, extra in (('--body-env', ['--body-label', 'comment-body']),
+                                    ('--pr-title-env', []), ('--pr-body-env', []))))
         # The code-span exemption is the REFERENCE classes' alone. A host, a
         # login, an address or a private-tier name is as visible to a reader in
         # backticks as in prose, so every other class still reads the body whole.

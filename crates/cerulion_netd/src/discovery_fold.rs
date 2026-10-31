@@ -13,7 +13,10 @@
 //! netd learns them. At daemon start, before `TransportManager::init`,
 //! [`fold_discovered_peers`] builds the connect set from, in order:
 //!
-//! 1. [`crate::net::CONNECT_ENV`] — explicit, first, and VERBATIM (see below).
+//! 1. [`crate::net::CONNECT_ENV`], explicit, first and VERBATIM (see below;
+//!    the one exception is `CERULION_UNENCRYPTED_QUIC=on`, under which an
+//!    explicit `udp/<host>:<port>?rel=1` that does not answer the QUIC probe is
+//!    dialled as `tcp/<host>:<port>`, see [`crate::quic_first`]).
 //! 2. One bounded `_cerulion._tcp` browse ([`MDNS_FOLD_BUDGET`], one query,
 //!    [`cerulion_mdns::browse_rung`]): every gateway that answers, one locator
 //!    per IPv4 address in its answer (IPv6 only when it carries no IPv4).
@@ -215,7 +218,9 @@ pub fn fold_from_candidates_at(
 pub fn fold_discovered_peers(
     cfg: cerulion_core::transport::network::NetworkConfig,
 ) -> (cerulion_core::transport::network::NetworkConfig, PeerFold) {
-    let mut browsed = cerulion_mdns::browse_rung(MDNS_FOLD_BUDGET);
+    let report = cerulion_mdns::browse_rung_report(MDNS_FOLD_BUDGET);
+    let udp_rel = report.udp_rel;
+    let mut browsed = report.peers;
     // This machine's own gateway processes answer under its identity on its own
     // addresses.
     if let Some(own) = cfg.robot_identity.as_deref() {
@@ -233,7 +238,51 @@ pub fn fold_discovered_peers(
              mDNS answers only"
         );
     }
-    fold_discovered_peers_at(cfg, browsed, cache.as_deref())
+    let switch = cerulion_discovery::unencrypted_quic::unencrypted_quic_from_env();
+    let (cfg, fold, _) = fold_discovered_peers_unencrypted_quic_at(
+        cfg,
+        browsed,
+        &udp_rel,
+        cache.as_deref(),
+        switch,
+        |locators| {
+            crate::quic_probe::probe_quic_locators(
+                locators,
+                crate::quic_probe::quic_probe_timeout_from_env(),
+            )
+        },
+    );
+    (cfg, fold)
+}
+
+/// [`fold_discovered_peers_at`], then the `CERULION_UNENCRYPTED_QUIC` opt-in
+/// ([`crate::quic_first::apply_unencrypted_quic`]) over its result: `udp_rel`
+/// lists the browsed peers that advertised an unencrypted QUIC port, `switch` is
+/// the opt-in, and `probe` checks a set of `udp/` locators. With
+/// [`UnencryptedQuic::Off`] the config and fold are exactly
+/// [`fold_discovered_peers_at`]'s and `probe` is never called.
+///
+/// [`UnencryptedQuic::Off`]: cerulion_discovery::unencrypted_quic::UnencryptedQuic::Off
+pub fn fold_discovered_peers_unencrypted_quic_at(
+    cfg: cerulion_core::transport::network::NetworkConfig,
+    browsed: Vec<DiscoveredPeer>,
+    udp_rel: &[cerulion_discovery::unencrypted_quic::UdpRelTwin],
+    cache: Option<&Path>,
+    switch: cerulion_discovery::unencrypted_quic::UnencryptedQuic,
+    probe: impl FnOnce(
+        &[String],
+    ) -> std::collections::HashMap<String, crate::quic_probe::QuicProbeOutcome>,
+) -> (
+    cerulion_core::transport::network::NetworkConfig,
+    PeerFold,
+    crate::quic_first::QuicFirstOutcome,
+) {
+    let explicit = cfg.connect_endpoints.clone();
+    let (mut cfg, mut fold) = fold_discovered_peers_at(cfg, browsed, cache);
+    let outcome = crate::quic_first::apply_unencrypted_quic(
+        &mut cfg, &mut fold, &explicit, udp_rel, switch, probe,
+    );
+    (cfg, fold, outcome)
 }
 
 /// The cache-only fold: [`fold_discovered_peers_at`] with no mDNS candidates.

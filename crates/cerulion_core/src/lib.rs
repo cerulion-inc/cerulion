@@ -822,6 +822,7 @@ pub use transport::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
+pub use transport::egress_send::{EgressStats, EgressTopicStats};
 pub use transport::events::PubSubEvent;
 pub use transport::gateway::{
     GatewayDriveStats, GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime,
@@ -839,6 +840,7 @@ pub use transport::network::{
 pub use transport::output_proxy::OutputProxy;
 pub use transport::publisher::CerulionPublisher;
 pub use transport::subscriber::{CerulionSubscriber, ReceivedMessage};
+pub use transport::team_auth::{NetworkAuth, TeamAnchors, TeamAuth, TeamAuthError};
 pub use transport::uds_write::{prepare_accepted_stream, write_line_bounded, UdsWriteOutcome};
 pub use transport::{
     ix_config_shm_identity_from_json, IceoryxShmIdentity, NetworkPosture, TopicRequirements,

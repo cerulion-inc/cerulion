@@ -27,12 +27,15 @@ use cerulion_pairing::pop::{
 
 use crate::codec;
 use crate::config::SEC_NS;
-use crate::db::{RevocationTarget, UserRow};
+use crate::db::{RevocationTarget, SessionLookup, UserRow};
 use crate::device_code::{poll_outcome, should_record_poll, DeviceCodeSnapshot, PollOutcome};
 use crate::error::{AccountdError, Result};
 use crate::hash::hash_token;
 use crate::rng;
-use crate::session::{authenticate_session, evaluate_refresh, RefreshDecision, SessionAuth};
+use crate::session::{
+    authenticate_session, derive_rotated_pair, evaluate_refresh, reuse_window_open,
+    RefreshDecision, SessionAuth,
+};
 use crate::AppState;
 
 /// How many fresh `user_code` candidates `device/start` tries before giving up on
@@ -479,11 +482,31 @@ async fn refresh(
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<TokenResponse>> {
     let now = state.clock.now_ns();
-    let old_refresh_hash = hash_token(&req.refresh_token);
-    let lookup = state
-        .db
-        .session_by_refresh_hash(&old_refresh_hash)?
-        .ok_or(AccountdError::Unauthorized("unknown refresh token"))?;
+    refresh_tokens(&state, &req.refresh_token, now).map(Json)
+}
+
+/// The refresh exchange: rotate a current refresh token, or replay the latest
+/// rotation for the token it replaced.
+fn refresh_tokens(state: &AppState, presented: &str, now: u64) -> Result<TokenResponse> {
+    let presented_hash = hash_token(presented);
+    let Some(lookup) = state.db.session_by_refresh_hash(&presented_hash)? else {
+        // Not a current refresh token: it may be the one the latest rotation
+        // replaced, replayed inside the reuse window.
+        return replay_rotation(state, presented, &presented_hash, now)?
+            .ok_or(AccountdError::Unauthorized("unknown refresh token"));
+    };
+    rotate_from(state, presented, &presented_hash, &lookup, now)
+}
+
+/// Rotate the session `lookup` read for `presented`, or, when a concurrent
+/// rotation of the same token committed after that read, replay it.
+fn rotate_from(
+    state: &AppState,
+    presented: &str,
+    presented_hash: &str,
+    lookup: &SessionLookup,
+    now: u64,
+) -> Result<TokenResponse> {
     // Fast-path rejection on a clearly expired/revoked snapshot (the CAS below is
     // the authoritative guard under concurrency).
     match evaluate_refresh(&lookup.snapshot, now) {
@@ -496,34 +519,101 @@ async fn refresh(
     // Rotate both tokens onto the existing session row via an atomic CAS: the
     // rotation only succeeds if the row is STILL un-revoked and STILL carries the
     // OLD refresh hash. This makes refresh single-use (two concurrent refreshes
-    // with the same token → one wins) and closes the concurrent-revoke clobber
-    // (Findings 3 + 4). The loser is Unauthorized.
-    let (
-        new_session_hash,
-        new_refresh_hash,
-        session_token,
-        refresh_token,
-        session_exp,
-        refresh_exp,
-    ) = mint_tokens(&state, now)?;
+    // with the same token → one rotates) and closes the concurrent-revoke clobber
+    // (Findings 3 + 4). The new pair is derived from a fresh salt, the presented
+    // token and the in-memory rotation key, so a replay inside the reuse window
+    // recomputes it.
+    let reuse_salt = rng::fill::<32>()?;
+    let (session_token, refresh_token) =
+        derive_rotated_pair(state.rotation_key()?, &reuse_salt, presented);
     let won = state.db.rotate_session(
         &lookup.id,
-        &old_refresh_hash,
-        &new_session_hash,
-        &new_refresh_hash,
-        session_exp,
-        refresh_exp,
+        presented_hash,
+        &hash_token(&session_token),
+        &hash_token(&refresh_token),
+        now.saturating_add(state.config.session_ttl_ns),
+        now.saturating_add(state.config.refresh_ttl_ns),
+        now,
+        &reuse_salt,
     )?;
     if !won {
-        return Err(AccountdError::Unauthorized(
-            "refresh token already used or session revoked",
-        ));
+        // A concurrent refresh with the same token rotated first (or a revoke
+        // landed). Inside the window this request gets the pair that rotation
+        // issued, so both callers hold one session.
+        return replay_rotation(state, presented, presented_hash, now)?.ok_or(
+            AccountdError::Unauthorized("refresh token already used or session revoked"),
+        );
     }
-    Ok(Json(TokenResponse {
+    Ok(TokenResponse {
         session_token,
         refresh_token,
         token_type: "Bearer",
         expires_in: state.config.session_ttl_ns / SEC_NS,
+    })
+}
+
+/// Replay the latest rotation for a refresh token it replaced: `Some` with the
+/// pair that rotation issued when the token is the session's most recently
+/// replaced one, the rotation is within `refresh_reuse_window_ns` of `now`, the
+/// session is not revoked, the replay was neither spent nor closed by a revoke,
+/// and this process holds the key the rotation used; `None` otherwise, which the
+/// caller rejects with the same 401 as before the window existed.
+///
+/// The replay mints nothing: the pair is recomputed and checked against the
+/// stored hashes, so the session keeps exactly one live pair.
+fn replay_rotation(
+    state: &AppState,
+    presented_refresh: &str,
+    presented_hash: &str,
+    now: u64,
+) -> Result<Option<TokenResponse>> {
+    let Some(prev) = state.db.previous_rotation(presented_hash)? else {
+        return Ok(None);
+    };
+    if !reuse_window_open(
+        prev.rotated_at_ns,
+        now,
+        state.config.refresh_reuse_window_ns,
+    ) {
+        tracing::warn!(
+            user_id = %prev.user_id,
+            "a replaced refresh token was presented outside its reuse window; rejected"
+        );
+        return Ok(None);
+    }
+    let Some(key) = state.existing_rotation_key() else {
+        tracing::warn!(
+            user_id = %prev.user_id,
+            "a replaced refresh token was presented, but its rotation predates this \
+             process; rejected"
+        );
+        return Ok(None);
+    };
+    if !state.db.claim_refresh_reuse(&prev.id, presented_hash)? {
+        tracing::warn!(
+            user_id = %prev.user_id,
+            "a replaced refresh token was presented after its one replay, a revoke, or \
+             for a revoked or re-rotated session; rejected"
+        );
+        return Ok(None);
+    }
+    let (session_token, refresh_token) =
+        derive_rotated_pair(key, &prev.reuse_salt, presented_refresh);
+    if hash_token(&session_token) != prev.session_token_hash
+        || hash_token(&refresh_token) != prev.refresh_token_hash
+    {
+        tracing::warn!(
+            user_id = %prev.user_id,
+            "a replaced refresh token's pair does not recompute under this process's \
+             rotation key (a restart since that rotation); rejected"
+        );
+        return Ok(None);
+    }
+    Ok(Some(TokenResponse {
+        session_token,
+        refresh_token,
+        token_type: "Bearer",
+        expires_in: prev.session_expires_at_ns.saturating_sub(now) / SEC_NS,
     }))
 }
 
@@ -537,9 +627,11 @@ async fn revoke(
     Json(req): Json<RevokeRequest>,
 ) -> Result<StatusCode> {
     // RFC 7009: revocation is idempotent — an unknown token still returns success.
-    let _ = state
-        .db
-        .revoke_session_by_token_hash(&hash_token(&req.token))?;
+    let hash = hash_token(&req.token);
+    let _ = state.db.revoke_session_by_token_hash(&hash)?;
+    // A refresh token a rotation replaced revokes nothing (the session it led to
+    // may be held by another client), but it can no longer be replayed.
+    let _ = state.db.close_refresh_reuse(&hash)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1052,6 +1144,8 @@ async fn register_robot(
 struct RobotResponse {
     robot_id: String,
     hostname: String,
+    /// Hex transport public key, used to authenticate the robot's endpoint.
+    robot_transport_key: String,
     /// `base64url(AccountId)` of the owner.
     owner_account_id: String,
     org_id: Option<String>,
@@ -1079,6 +1173,7 @@ async fn get_robot(
     Ok(Json(RobotResponse {
         robot_id: URL_SAFE_NO_PAD.encode(robot.robot_id),
         hostname: robot.hostname,
+        robot_transport_key: crate::codec::encode_transport_key_hex(&robot.robot_transport_key),
         owner_account_id: URL_SAFE_NO_PAD.encode(robot.owner_account_id),
         org_id: robot.org_id,
         created_at_ns: robot.created_at_ns,
@@ -1112,6 +1207,7 @@ async fn list_robots(
         .map(|r| RobotResponse {
             robot_id: URL_SAFE_NO_PAD.encode(r.robot_id),
             hostname: r.hostname,
+            robot_transport_key: crate::codec::encode_transport_key_hex(&r.robot_transport_key),
             owner_account_id: URL_SAFE_NO_PAD.encode(r.owner_account_id),
             org_id: r.org_id,
             created_at_ns: r.created_at_ns,
@@ -1418,4 +1514,88 @@ async fn robot_revoke(
     let now = state.clock.now_ns();
     add_robot_revocation(&state, &robot_id_b, target, now)?;
     Ok(Json(build_access_response(&state, &robot_id_b)?))
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use crate::{Ca, CapturingEmailSender, Clock, ServiceConfig, UnconfiguredResolver};
+
+    fn state(window_ns: u64) -> AppState {
+        let config = ServiceConfig {
+            refresh_reuse_window_ns: window_ns,
+            ..ServiceConfig::default()
+        };
+        AppState::dev(
+            config,
+            Clock::Fixed(1_700_000_000 * SEC_NS),
+            Arc::new(CapturingEmailSender::new()),
+            Arc::new(UnconfiguredResolver),
+        )
+        .unwrap()
+    }
+
+    fn session(state: &AppState) -> String {
+        let now = state.clock.now_ns();
+        let minted = issue_session(state, "user-1", now).unwrap();
+        minted.refresh_token
+    }
+
+    /// The CAS loser, deterministically: the loser read the session while its
+    /// token was current, then a concurrent refresh of the same token rotated
+    /// before the loser's CAS. The loser gets the winner's pair through the window.
+    #[test]
+    fn a_cas_loser_inside_the_window_gets_the_winners_pair() {
+        let state = state(60 * SEC_NS);
+        let now = state.clock.now_ns();
+        let token = session(&state);
+        let hash = hash_token(&token);
+        let stale = state.db.session_by_refresh_hash(&hash).unwrap().unwrap();
+        let winner = refresh_tokens(&state, &token, now).unwrap();
+        let loser = rotate_from(&state, &token, &hash, &stale, now).unwrap();
+        assert_eq!(
+            (loser.session_token.as_str(), loser.refresh_token.as_str()),
+            (winner.session_token.as_str(), winner.refresh_token.as_str())
+        );
+        // The one replay is spent.
+        assert!(rotate_from(&state, &token, &hash, &stale, now).is_err());
+    }
+
+    #[test]
+    fn a_cas_loser_with_the_window_off_is_rejected() {
+        let state = state(0);
+        let now = state.clock.now_ns();
+        let token = session(&state);
+        let hash = hash_token(&token);
+        let stale = state.db.session_by_refresh_hash(&hash).unwrap().unwrap();
+        refresh_tokens(&state, &token, now).unwrap();
+        let Err(err) = rotate_from(&state, &token, &hash, &stale, now) else {
+            panic!("a CAS loser with the window off must be rejected");
+        };
+        assert!(err.to_string().contains("already used"), "{err}");
+    }
+
+    /// A rotation from before a restart (a different rotation key) is not
+    /// replayable: the recomputed pair does not match and nothing is returned.
+    #[test]
+    fn a_rotation_under_another_key_is_not_replayed() {
+        let state = state(60 * SEC_NS);
+        let now = state.clock.now_ns();
+        let token = session(&state);
+        refresh_tokens(&state, &token, now).unwrap();
+        // Same database, fresh process state (no key yet): rejected.
+        let restarted = AppState::new(
+            Ca::dev_provision(state.config.ca.clone(), now).unwrap(),
+            state.db.clone(),
+            state.config.clone(),
+            state.clock.clone(),
+            Arc::new(UnconfiguredResolver),
+            Arc::new(CapturingEmailSender::new()),
+        );
+        assert!(refresh_tokens(&restarted, &token, now).is_err());
+        // A key drawn after the restart does not recompute the old pair either.
+        let other = session(&restarted);
+        refresh_tokens(&restarted, &other, now).unwrap();
+        assert!(refresh_tokens(&restarted, &token, now).is_err());
+    }
 }

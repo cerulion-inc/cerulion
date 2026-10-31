@@ -69,6 +69,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::demand_authorizer::LanAccess;
+use super::egress_send::{EgressLanes, EgressStats, EnqueueOutcome, LossReport};
 use super::liveness::{DrainObservation, TopicLiveness, TopicLivenessObserver};
 use super::network::{
     canonical_topic, CatalogSource, DemandGetState, GetDemandState, PermissiveShmProbe, RunSource,
@@ -739,11 +740,26 @@ pub struct GatewayRuntime {
     /// Canonical announce topic → its active egress tap (present only while the
     /// topic's bridge flag is ON). The observable [`Self::active_tap_topics`].
     taps: HashMap<String, DataOnlySubscriber>,
-    /// Canonical announce topic → cumulative SUCCESSFULLY-forwarded frame count
-    /// (Principle #3). Interior-mutable so the forward path holds only `&self`.
-    forwarded: HashMap<String, AtomicU64>,
-    /// Canonical announce topic → first-warn-then-debug latch for repeated zenoh
-    /// put failures (a persistently unreachable peer must not flood the log).
+    /// Canonical announce topic → its egress send queue and sender thread,
+    /// opened when the topic's first egress tap attaches. The drive loop only
+    /// QUEUES frames here; each topic's own sender thread makes the zenoh put,
+    /// so a reliable put waiting on a full zenoh transmit queue does not hold
+    /// up this loop (except while a LAN close waits for that put) or topics
+    /// sent to other peers. Topics sent to the same peer share its transmit
+    /// queue. The per-topic counters (forwarded, dropped,
+    /// refused, failed, discarded) live on the lanes; see [`Self::egress_stats`].
+    egress_lanes: EgressLanes,
+    /// The LAN access epoch read at the start of the current drive pass;
+    /// every frame the pass queues carries it. A pass that reads a newer
+    /// epoch first detaches every tap and empties every send queue.
+    pass_lan_epoch: u64,
+    /// The periodic WARN (refused or failed) or INFO (best-effort drops) for
+    /// topics whose egress lost frames, checked at the
+    /// end of each drive pass (one clock read; a counter read every
+    /// `LOSS_REPORT_INTERVAL`).
+    loss_report: LossReport,
+    /// Canonical announce topic → first-warn-then-debug latch for repeated tap
+    /// DRAIN failures (a wedged tap must not flood the log).
     forward_warn: HashMap<String, AtomicBool>,
     /// Canonical announce topic → cumulative tap ATTACH failure count
     /// (Principle #3: a topic that cannot egress because its tap never attaches
@@ -1039,12 +1055,10 @@ impl GatewayRuntime {
         //     dirty-check stays stable) even if `plan.announce` carried a
         //     canonical duplicate.
         let registered = manager.bridge_manager().registered_topics()?;
-        let mut forwarded = HashMap::new();
         let mut forward_warn = HashMap::new();
         let mut attach_failures = HashMap::new();
         let mut attach_warn = HashMap::new();
         for (canonical, _) in &registered {
-            forwarded.insert(canonical.clone(), AtomicU64::new(0)); // hot-path-alloc-ok: boot
             forward_warn.insert(canonical.clone(), AtomicBool::new(false)); // hot-path-alloc-ok: boot
             attach_failures.insert(canonical.clone(), AtomicU64::new(0)); // hot-path-alloc-ok: boot
             attach_warn.insert(canonical.clone(), AtomicBool::new(false)); // hot-path-alloc-ok: boot
@@ -1277,7 +1291,9 @@ impl GatewayRuntime {
             egress_flags,
             boot_topics,
             taps: HashMap::new(),
-            forwarded,
+            egress_lanes: EgressLanes::new(),
+            pass_lan_epoch: 0,
+            loss_report: LossReport::default(),
             forward_warn,
             attach_failures,
             attach_warn,
@@ -1388,11 +1404,11 @@ impl GatewayRuntime {
     }
 
     /// Run the gateway until `exit` flips true. Each pass drives egress
-    /// once; a pass that forwarded nothing yields the CPU for one
-    /// `GATEWAY_IDLE_POLL` tick (backlog-aware pacing), one that forwarded
+    /// once; a pass that queued no frame yields the CPU for one
+    /// `GATEWAY_IDLE_POLL` tick (backlog-aware pacing), one that queued frames
     /// loops again immediately to drain a backlog. Ingress runs on the zenoh
     /// callback thread and needs no drive.
-    /// A pass that forwarded nothing now calls [`Self::idle_wait`],
+    /// A pass that queued no frame calls [`Self::idle_wait`],
     /// which paces at `GATEWAY_IDLE_POLL` while any demand is ON and BLOCKS on the
     /// demand signal when none is. Consequence for teardown, stated because it is
     /// real: `exit` is an external flag this loop cannot be woken by, so a
@@ -1402,8 +1418,8 @@ impl GatewayRuntime {
     /// (netd's egress plane does).
     pub fn run(&mut self, exit: &AtomicBool) -> TransportResult<()> {
         while !exit.load(Ordering::Relaxed) {
-            let forwarded = self.drive_once()?;
-            if forwarded == 0 {
+            let queued = self.drive_once()?;
+            if queued == 0 {
                 self.idle_wait();
             }
         }
@@ -1487,8 +1503,11 @@ impl GatewayRuntime {
     /// One egress drive pass — the single-iteration test seam of
     /// [`Self::run`]. For every announce topic: attach a tap if its bridge flag
     /// is ON and none exists, drain the tap and forward each frame to zenoh, or
-    /// drop the tap if the flag is OFF. Returns the number of frames
-    /// SUCCESSFULLY forwarded this pass.
+    /// drop the tap if the flag is OFF. Returns the number of frames this pass
+    /// handed to their topic's send queue (a frame a full reliable queue
+    /// refused is not counted). The topic's sender thread puts them on zenoh
+    /// after this returns, so [`Self::forwarded_count`] can trail the frames
+    /// this returns.
     ///
     /// Per-topic failures are NON-FATAL: a
     /// routine per-topic transient — a producer worker restart re-creating its
@@ -1506,12 +1525,24 @@ impl GatewayRuntime {
     /// the SHM probe) joins the tap set here with no restart.
     pub fn drive_once(&mut self) -> TransportResult<usize> {
         // Hold the egress-pass rendezvous SHARED for the whole pass (every
-        // flag load through the last forward): `set_lan_access(Paired)` takes it
-        // exclusively after closing so no pass that loaded `true` just before
-        // the close forwards its drained batch after the close returns. Scoped
-        // to THIS call: the run loop's idle/demand wait never holds it.
+        // flag load through the last queued frame): `set_lan_access(Paired)`
+        // takes it exclusively after closing, so no pass that loaded `true`
+        // just before the close queues its drained batch after the close
+        // returns. Scoped to THIS call: the run loop's idle/demand wait never
+        // holds it.
         let manager = Arc::clone(&self.manager);
         let _egress_pass = manager.bridge_manager().egress_pass();
+        // Read before any flag load. Frames this pass queues carry this
+        // epoch; a sender puts a frame only while the epoch is unchanged.
+        let epoch = manager.bridge_manager().lan_epoch();
+        if epoch != self.pass_lan_epoch {
+            // LAN access closed since the last pass: every attached tap may
+            // hold frames published before the close, and every send queue
+            // frames queued before it. Detach the taps and empty the queues;
+            // a demanded topic re-attaches a fresh tap below.
+            self.detach_egress_after_lan_close();
+            self.pass_lan_epoch = epoch;
+        }
         // One bump per pass (Principle #3): the observable a
         // zero-demand CEILING is asserted on, and the only way to tell "paced by
         // the demand wait" from "spinning" without a profiler (the
@@ -1559,7 +1590,14 @@ impl GatewayRuntime {
                     // ~1 kHz drive pass while the observer only re-attaches once
                     // per 200 ms sweep.
                     self.liveness.release_own_tap(topic);
-                    match self.manager.create_data_only_subscriber(topic) {
+                    let attached =
+                        self.manager
+                            .create_data_only_subscriber(topic)
+                            .and_then(|tap| {
+                                self.open_egress_lane(topic, flag, tap.buffer_size())?;
+                                Ok(tap)
+                            });
+                    match attached {
                         Ok(tap) => {
                             self.record_attach_success(topic);
                             tracing::debug!(topic = %topic, "gateway egress tap attached");
@@ -1606,9 +1644,12 @@ impl GatewayRuntime {
                 // producer.
                 let drained = drain.frames;
                 for frame in pending {
-                    if self.forward_frame(topic, frame) {
+                    if self.queue_frame(topic, frame) {
                         forwarded_total += 1;
                     }
+                }
+                if drain_err.is_none() && drained > 0 {
+                    self.record_forward_success(topic);
                 }
                 // The egress tap IS this topic's liveness observer while
                 // demand lasts — the frames it just drained are the observation, so
@@ -1670,6 +1711,12 @@ impl GatewayRuntime {
                 if self.taps.remove(topic).is_some() {
                     tracing::debug!(topic = %topic, "gateway egress tap detached — demand ended");
                 }
+                // Empties the send queue on every pass that reads the flag
+                // off, with or without a tap: a drain error drops the tap and
+                // leaves the frames the drive pass queued from it.
+                if let Some(lane) = self.egress_lanes.get(topic) {
+                    lane.discard_queued();
+                }
             }
         }
         // Sweep the observer's own taps. The throttle is a FLOOR, not a
@@ -1679,6 +1726,8 @@ impl GatewayRuntime {
         // Runs AFTER the egress loop so this pass's external-observation hand-offs
         // are already reflected and the sweep never double-taps a demanded topic.
         self.liveness.sweep();
+        self.loss_report
+            .tick(std::time::Instant::now(), self.egress_lanes.stats_ref());
         Ok(forwarded_total)
     }
 
@@ -1788,9 +1837,6 @@ impl GatewayRuntime {
         for (canonical, _) in &registered {
             // hot-path-alloc-ok: once per newly-registered topic (a runtime
             // registration), never per forwarded frame.
-            self.forwarded
-                .entry(canonical.clone())
-                .or_insert_with(|| AtomicU64::new(0));
             self.forward_warn
                 .entry(canonical.clone())
                 .or_insert_with(|| AtomicBool::new(false));
@@ -2305,34 +2351,77 @@ impl GatewayRuntime {
         Ok(newly)
     }
 
-    /// Forward one drained wire frame to zenoh under `topic`. Returns `true` on
-    /// success (and bumps the per-topic counter + clears the failure latch);
-    /// a put failure is COUNTED-and-latched, never a panic (`&self` — the
-    /// counters + latch are interior-mutable). The `network()` is `Some` by
-    /// [`Self::new`]'s guarantee.
-    fn forward_frame(&self, topic: &str, frame: Vec<u8>) -> bool {
-        let Some(network) = self.manager.network() else {
-            return false;
+    /// Open `topic`'s egress send queue and start its sender thread, unless
+    /// one is open. The queue's bound is the topic's declared `send_queue`
+    /// ([`NetworkManager::egress_send_queue`](super::network::NetworkManager::egress_send_queue)),
+    /// else `tap_depth`, the receive-queue depth of the topic's egress tap. The
+    /// `network()` is `Some` by [`Self::new`]'s guarantee.
+    fn open_egress_lane(
+        &mut self,
+        topic: &str,
+        flag: &Arc<AtomicBool>,
+        tap_depth: usize,
+    ) -> TransportResult<()> {
+        if self.egress_lanes.get(topic).is_some() {
+            return Ok(());
+        }
+        let Some(network) = self.manager.network_arc() else {
+            return Err(TransportError::Internal {
+                reason: "gateway egress needs a network-configured transport manager".to_string(),
+            });
         };
-        match network.publish_to_network(topic, frame) {
-            Ok(()) => {
-                if let Some(counter) = self.forwarded.get(topic) {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                self.record_forward_success(topic);
-                true
-            }
-            Err(e) => {
-                self.record_forward_failure(topic, Some(&e));
-                false
-            }
+        let capacity = network
+            .egress_send_queue(topic)
+            .map_or(tap_depth.max(1), std::num::NonZeroUsize::get);
+        let reliability = network.egress_reliability(topic);
+        self.egress_lanes.open(
+            topic,
+            reliability,
+            capacity,
+            network,
+            self.manager.bridge_manager_arc(),
+            Arc::clone(flag),
+        )
+    }
+
+    /// Detach every egress tap and discard every queued egress frame, the
+    /// state a demand transition to "no demand" leaves for one topic, for all
+    /// topics at once.
+    // hot-path-alloc-ok-fn: once per LAN access close, not per frame.
+    fn detach_egress_after_lan_close(&mut self) {
+        let topics: Vec<String> = self.taps.keys().cloned().collect();
+        for topic in &topics {
+            self.taps.remove(topic);
+            self.liveness.set_externally_observed(topic, false);
+        }
+        self.egress_lanes.discard_all_queued();
+        if !topics.is_empty() {
+            tracing::debug!(
+                taps = topics.len(),
+                "gateway egress taps detached and send queues emptied after LAN access closed"
+            );
         }
     }
 
+    /// Hand one drained wire frame to `topic`'s send queue. Returns `true`
+    /// when the queue took it (a full best-effort queue takes it by dropping
+    /// its oldest frame), `false` when a full reliable queue refused it, the
+    /// queue is closed, or the topic has no queue. The lane counts each case.
+    fn queue_frame(&self, topic: &str, frame: Vec<u8>) -> bool {
+        let Some(lane) = self.egress_lanes.get(topic) else {
+            return false;
+        };
+        matches!(
+            lane.enqueue(self.pass_lan_epoch, frame),
+            EnqueueOutcome::Queued | EnqueueOutcome::ReplacedOldest
+        )
+    }
+
     /// First failure of a run logs `warn!`, repeats `debug!` (flood suppression,
-    /// the [`super::network`] ingress-latch discipline). Covers the zenoh-put
-    /// and tap-DRAIN failure classes (attach failures have their own latch —
-    /// [`Self::attach_failure_count`]). `error` is `Some` for a transport
+    /// the [`super::network`] ingress-latch discipline). Covers the tap-DRAIN
+    /// failure class (attach failures have their own latch,
+    /// [`Self::attach_failure_count`]; zenoh put failures are counted and
+    /// latched by the topic's send queue). `error` is `Some` for a transport
     /// failure; `None` reserved for a future poison class.
     fn record_forward_failure(&self, topic: &str, error: Option<&TransportError>) {
         let already = self
@@ -2343,23 +2432,24 @@ impl GatewayRuntime {
             (false, Some(e)) => tracing::warn!(
                 topic = %topic,
                 error = %e,
-                "gateway egress forward failed — dropped this frame (repeats log at debug)"
+                "gateway egress tap drain failed; frames still in the tap are lost and the tap \
+                 re-attaches next pass (repeats log at debug)"
             ),
             (true, Some(e)) => tracing::debug!(
                 topic = %topic,
                 error = %e,
-                "gateway egress forward failed (repeat — see the first warning)"
+                "gateway egress tap drain failed (repeat; see the first warning)"
             ),
-            (_, None) => tracing::warn!(topic = %topic, "gateway egress forward failed"),
+            (_, None) => tracing::warn!(topic = %topic, "gateway egress tap drain failed"),
         }
     }
 
-    /// A successful forward ends any failure run: clear the latch and report the
-    /// recovery once (the `DrainWarnLatch::on_success` shape).
+    /// A drain that returned frames ends any drain-failure run: clear the latch
+    /// and report the recovery once (the `DrainWarnLatch::on_success` shape).
     fn record_forward_success(&self, topic: &str) {
         if let Some(w) = self.forward_warn.get(topic) {
             if w.swap(false, Ordering::Relaxed) {
-                tracing::info!(topic = %topic, "gateway egress recovered — forwarding again");
+                tracing::info!(topic = %topic, "gateway egress tap draining again");
             }
         }
     }
@@ -2465,14 +2555,19 @@ impl GatewayRuntime {
         topics
     }
 
-    /// Observable state (Principle #3): cumulative frames SUCCESSFULLY forwarded for
-    /// `topic` (canonical-keyed; `0` for an unannounced topic).
+    /// Observable state (Principle #3): cumulative frames of `topic` whose zenoh
+    /// put returned `Ok` (canonical-keyed; `0` for a topic that has not been
+    /// demanded). The topic's sender thread counts them, so this can trail the
+    /// frames [`Self::drive_once`] queued.
     pub fn forwarded_count(&self, topic: &str) -> u64 {
-        let canonical = canonical_topic(topic).into_owned();
-        self.forwarded
-            .get(&canonical)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        self.egress_stats().topic(topic).map_or(0, |s| s.forwarded)
+    }
+
+    /// Observable state (Principle #3): every egress send queue's counters,
+    /// shared as an `Arc` so a caller can keep reading them after the gateway
+    /// moves onto a drive thread (`cerulion-netd` reports them in `status`).
+    pub fn egress_stats(&self) -> Arc<EgressStats> {
+        self.egress_lanes.stats()
     }
 
     /// Observable state (Principle #3): cumulative tap ATTACH failures for `topic`
@@ -2590,6 +2685,14 @@ impl GatewayRuntime {
         self.get_demand_state.wire_header_refusal_count()
     }
 
+    /// Observable state (Principle #3): demand GETs the producer queryable
+    /// refused for the wire header whose demanded topic was longer than 256
+    /// bytes, so their log lines share the overflow latch instead of their own.
+    pub fn demand_wire_header_refusal_latch_overlong_count(&self) -> u64 {
+        self.get_demand_state
+            .wire_header_refusal_latch_overlong_count()
+    }
+
     /// Observable state (Principle #3): cumulative GET-expiry disables the reconciler
     /// thread applied (a topic released because its last GET aged past the TTL
     /// AND liveliness was also absent — the composition rule).
@@ -2638,6 +2741,17 @@ impl GatewayRuntime {
         self.demand_get_state
             .as_ref()
             .map(|s| s.wire_header_refused_ack_count())
+            .unwrap_or(0)
+    }
+
+    /// Observable state (Principle #3): "refused:wire-header" (or legacy
+    /// grant) acks the DEMANDER received whose peer name or topic was longer
+    /// than 256 bytes, so their log lines share the overflow latch instead of
+    /// their own. `0` on a pure-egress gateway.
+    pub fn demand_wire_header_refused_ack_latch_overlong_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.wire_header_refused_ack_latch_overlong_count())
             .unwrap_or(0)
     }
 
@@ -2781,6 +2895,15 @@ impl GatewayRuntime {
             }
             None => false,
         }
+    }
+}
+
+impl Drop for GatewayRuntime {
+    /// Close every egress send queue and join its sender thread while the
+    /// transport manager is still alive, then log each topic's totals.
+    fn drop(&mut self) {
+        self.egress_lanes.shutdown();
+        self.egress_lanes.stats_ref().log_totals();
     }
 }
 

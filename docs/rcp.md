@@ -47,10 +47,13 @@ journal:                # optional; these are the defaults
 state:                  # optional
   - name: arm
     topic: /arm/state
+limits:                 # optional; these are the defaults
+  estop_clear: agent    # agent | operator
+  irreversible: allow   # allow | refuse
 tools:                  # optional
   - name: arm.step
     description: Advance the arm one control period toward a joint target.
-    safety_class: reversible    # read | reversible
+    safety_class: reversible    # read | reversible | irreversible
     timeout_ms: 2000            # optional, 1..=60000, default 2000
     input_schema:
       type: object
@@ -73,21 +76,45 @@ list, or one used on a type it does not apply to, is refused when the manifest
 loads, so a schema never states a constraint the daemon skips. An `integer` is
 any number without a fractional part. Tool and state names are 1 to 128
 characters from `[A-Za-z0-9_.-]`, and the calls, results and state topics must
-all differ. A `safety_class` of
-`irreversible` is refused too: such a tool needs a human's confirmation, which
-this version does not implement.
+all differ.
+
+`limits` holds two switches:
+
+| Key | Values | Effect |
+|---|---|---|
+| `estop_clear` | `agent` (default), `operator` | `agent`: the built-in `estop_clear` tool is listed and clears the e-stop. `operator`: `estop_clear` is not listed, a call to it is refused (`estop_clear_disabled`), and only deleting the latch file and restarting the daemon clears the e-stop. |
+| `irreversible` | `allow` (default), `refuse` | `allow`: a tool whose `safety_class` is `irreversible` is served. `refuse`: the manifest fails to load, naming the first such tool, and the daemon exits with status 1. |
+
+## Safety classes
+
+| `safety_class` | Intent receipt | While e-stopped | `tools/list` annotations |
+|---|---|---|---|
+| `read` | no | runs | `readOnlyHint: true`, `destructiveHint: false` |
+| `reversible` | yes | refused | `readOnlyHint: false`, `destructiveHint: false` |
+| `irreversible` | yes | refused | `readOnlyHint: false`, `destructiveHint: true` |
+
+Every manifest tool also carries `openWorldHint: false`, and its listed
+description ends with `(safety class: <class>)`. Every result of a manifest
+tool call after the name lookup, success or refusal, carries
+`"safety_class"`. `estop` and `estop_clear` are listed with
+`idempotentHint: true` and `openWorldHint: false`; `estop_clear` also
+carries `destructiveHint: true`. Receipt lines
+record the tool name as `verb`; the class of a verb is the one its manifest
+declares.
 
 ## Tools
 
-`tools/list` returns the manifest's tools and the built-in `estop`. Nothing
-else can be called. A call runs these steps in order:
+`tools/list` returns the manifest's tools, the built-in `estop`, and, under
+`limits.estop_clear: agent`, the built-in `estop_clear`. Nothing else can be
+called. A call runs these steps in order:
 
 1. A name the manifest does not declare is refused (`not_in_manifest`).
 2. The arguments are checked against `input_schema` (`invalid_args`).
 3. A call whose frame would exceed 63 KiB is refused (`args_too_large`).
-4. While the e-stop is engaged a `reversible` tool is refused (`estopped`).
-   `read` tools skip this step.
-5. A `reversible` tool appends an `intent` receipt and syncs it to disk.
+4. While the e-stop is engaged a `reversible` or `irreversible` tool is
+   refused (`estopped`). `read` tools skip this step.
+5. A `reversible` or `irreversible` tool appends an `intent` receipt and
+   syncs it to disk.
 6. The call is published on `journal.calls_topic` as one `std_msgs/String`
    frame, `{"call_id": N, "tool": "...", "args": {...}}`, and the daemon waits
    up to `timeout_ms` for a frame on `journal.results_topic` whose JSON carries
@@ -98,19 +125,64 @@ else can be called. A call runs these steps in order:
 7. An `ok` or `error:<class>` receipt closes the call.
 
 A successful call returns one text block,
-`{"call_id": N, "receipt": {"seq", "hash", "prev"}, "result": <the graph's answer>}`.
+`{"call_id": N, "receipt": {"seq", "hash", "prev"}, "result": <the graph's answer>, "safety_class": "..."}`.
 A refused call returns `isError: true` with
 `{"error": {"code", "message"}, "receipt": ...}`. Calls other than `estop`
 are handled one at a time, in the order they arrive.
+
+## E-stop
 
 `estop` takes an optional `reason` (cut to 200 characters). It closes the
 latch before anything else, without waiting for a call in flight; publishes
 its own frame ahead of anything queued; and returns `estopped: true` with
 `graph_acknowledged` saying whether the graph answered. While the latch is
-closed, `reversible` calls are refused, including one already accepted but
-not yet published. The latch is also written to `<receipts>.estop`, and a
-daemon that starts and finds that file starts with the latch closed: an
-operator clears the e-stop by deleting the file and restarting the daemon.
+closed, `reversible` and `irreversible` calls are refused, including one
+already accepted but not yet published. A `reversible` or `irreversible`
+call whose MCP request is cancelled before it is published is never
+published. The latch is also written to `<receipts>.estop`, and a daemon
+that starts and finds that file starts with the latch closed (so does one
+that cannot tell whether the file exists).
+
+`estop_clear` takes the same optional `reason` (at most 200 characters; any
+other argument is refused as `invalid_args`). It waits behind a call in
+flight, then:
+
+1. refuses with `estop_overtaken`, receipted `error:estop_overtaken` with
+   nothing changed, when an `estop` was called after the clear was
+   requested; otherwise appends an `intent` receipt and syncs it to disk;
+2. deletes `<receipts>.estop` and opens the latch (a file that cannot be
+   deleted leaves the latch closed and returns `clear_failed`, receipted
+   `error:clear_failed`);
+3. when the latch was closed, publishes
+   `{"call_id": N, "tool": "estop_clear", "args": {"reason": ...}}` on the
+   calls topic, latch-gated like a motion call, and waits up to 2 s for the
+   graph's answer; when it was open, publishes nothing;
+4. appends `ok`; `error:graph_unacknowledged` when no answer came; or
+   `error:estop_overtaken` when an `estop` closed the latch after step 2 and
+   before the frame was published, which returns the `estop_overtaken` error and leaves the
+   `estop` frame as the graph's last.
+
+It returns `estopped` (the latch after the clear), `was_estopped`, and
+`graph_acknowledged`; the latch stays open whether or not the graph
+answered. A later `estop` closes the latch and writes the file again.
+`estop` closes the latch, then, inside a lock, closes it again, writes the
+file and its `intent` receipt, and queues its frame ahead of everything else,
+so a clear that follows it publishes after that frame; `estop_clear` writes
+its `intent`, deletes the
+file and opens the latch inside the same lock. The receipt log therefore
+orders engages and clears as they took effect. An `estop` that lands while
+a clear holds that lock closes the latch at once and publishes its frame
+after the clear's receipt write.
+
+A latch-gated call (a motion call or `estop_clear`) whose MCP request was
+already cancelled when the journal takes it from its queue is dropped, not
+published. A
+cancelled `estop_clear` that already opened the latch leaves it open without
+an `estop_clear` frame on the calls topic.
+Deleting the file and restarting the daemon clears the e-stop under either
+`limits.estop_clear` value.
+
+## Receipts
 
 Each receipt line records `seq`, `timestamp_ns`, `caller`, `verb`, the
 SHA-256 of the canonical arguments, the `outcome`, `prev_hash` and

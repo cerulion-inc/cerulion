@@ -1,0 +1,19 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Library only, with no `cdylib` feature: this node runs linked into the
+# app's runtime library and is never loaded as a library of its own.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+cerulion_core = { path = "../../../../../cerulion_core" }
+native_ros2_messages = { path = "../../../../../native_ros2_messages" }
+
+# The node macro writes `#[cfg(feature = "cdylib")]` around its C exports;
+# declare the name so a crate without that feature compiles without a warning.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cdylib"))'] }

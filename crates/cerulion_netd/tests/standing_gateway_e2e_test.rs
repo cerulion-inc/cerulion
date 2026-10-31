@@ -310,6 +310,7 @@ fn a_standing_daemon_never_idle_self_exits_and_the_default_pair_does() {
 fn real_binary_local_only_wins_over_listen_and_still_idle_exits() {
     let (dir, sock) = unique_socket("bin");
     let mut child = Command::new(env!("CARGO_BIN_EXE_cerulion-netd"))
+        .env("CERULION_HOME", dir.join("empty-login"))
         .env("CERULION_NETD_SOCK", &sock)
         .env("CERULION_NETD_LISTEN", "tcp/127.0.0.1:0")
         .env("CERULION_NETD_NETWORK", "off")

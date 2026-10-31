@@ -10,10 +10,13 @@
 //! state:                # optional; each entry is served as robot://state/{name}
 //!   - name: arm
 //!     topic: /arm/state
-//! tools:                # optional; only listed tools exist (estop always does)
+//! limits:               # optional; these are the defaults
+//!   estop_clear: agent  # agent | operator
+//!   irreversible: allow # allow | refuse
+//! tools:                # optional; only listed tools and the built-ins exist
 //!   - name: arm.step
 //!     description: Advance the arm one control period toward a joint target.
-//!     safety_class: reversible
+//!     safety_class: reversible # read | reversible | irreversible
 //!     timeout_ms: 2000
 //!     input_schema: { type: object, properties: { ... }, required: [ ... ] }
 //! ```
@@ -39,6 +42,9 @@ pub struct RcpManifest {
     /// Where tool calls are journaled and answered.
     #[serde(default)]
     pub journal: JournalConfig,
+    /// Who may clear the e-stop, and whether irreversible tools load.
+    #[serde(default)]
+    pub limits: Limits,
     /// String topics served as `robot://state/{name}` resources.
     #[serde(default)]
     pub state: Vec<StateResource>,
@@ -76,6 +82,44 @@ fn default_results_topic() -> String {
     String::from("/rcp/results")
 }
 
+/// The `limits` section: who may clear the e-stop latch, and whether
+/// `irreversible` tools load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    /// Who clears the e-stop latch.
+    #[serde(default)]
+    pub estop_clear: EstopClear,
+    /// Whether a tool whose `safety_class` is `irreversible` loads.
+    #[serde(default)]
+    pub irreversible: IrreversibleTools,
+}
+
+/// Who clears the e-stop latch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstopClear {
+    /// The built-in `estop_clear` tool is listed and clears the latch; an
+    /// operator can also delete the latch file and restart the daemon.
+    #[default]
+    Agent,
+    /// `estop_clear` is not listed and a call to it is refused: only deleting
+    /// the latch file and restarting the daemon clears the latch.
+    Operator,
+}
+
+/// Whether a tool whose `safety_class` is `irreversible` loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrreversibleTools {
+    /// The tool loads and is served, labelled irreversible in `tools/list`
+    /// and in every call result.
+    #[default]
+    Allow,
+    /// The manifest is refused at load, naming the tool.
+    Refuse,
+}
+
 /// One `robot://state/{name}` resource: the newest frame on a String topic.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,12 +138,23 @@ pub enum SafetyClass {
     Read,
     /// Moves the robot in a way a later call can undo.
     Reversible,
-    /// Needs a human's confirmation. Refused at load: confirmation is not
-    /// implemented, and a tool that cannot be confirmed is not served.
+    /// Changes the robot or its surroundings in a way no later call undoes.
+    /// Served like `reversible` (intent receipt, refused while e-stopped)
+    /// with `destructiveHint: true`; refused at load under
+    /// `limits.irreversible: refuse`.
     Irreversible,
 }
 
 impl SafetyClass {
+    /// The class as the manifest spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Reversible => "reversible",
+            Self::Irreversible => "irreversible",
+        }
+    }
+
     /// Whether calls write an intent receipt and are refused while e-stopped.
     pub fn is_mutating(self) -> bool {
         !matches!(self, Self::Read)
@@ -134,6 +189,8 @@ pub struct LoadedManifest {
     pub identity: RobotIdentity,
     /// The call and result topics.
     pub journal: JournalConfig,
+    /// The `limits` section.
+    pub limits: Limits,
     /// The state resources.
     pub state: Vec<StateResource>,
     /// The declared tools, in manifest order.
@@ -204,12 +261,14 @@ impl RcpManifest {
             reason,
         })?;
         let journal = manifest.journal.clone();
+        let limits = manifest.limits;
         let state = manifest.state.clone();
         let tools = manifest.tools.clone();
         let identity = manifest.resolve(path.parent().unwrap_or_else(|| Path::new("")))?;
         Ok(LoadedManifest {
             identity,
             journal,
+            limits,
             state,
             tools,
         })
@@ -242,13 +301,20 @@ impl RcpManifest {
                     crate::tools::ESTOP_TOOL
                 ));
             }
+            if tool.name == crate::tools::ESTOP_CLEAR_TOOL {
+                return Err(format!(
+                    "`{}` is built in and cannot be declared",
+                    crate::tools::ESTOP_CLEAR_TOOL
+                ));
+            }
             if !names.insert(tool.name.as_str()) {
                 return Err(format!("tool {:?} is declared twice", tool.name));
             }
-            if tool.safety_class == SafetyClass::Irreversible {
+            if tool.safety_class == SafetyClass::Irreversible
+                && self.limits.irreversible == IrreversibleTools::Refuse
+            {
                 return Err(format!(
-                    "tool {:?} is irreversible: human confirmation is not implemented, \
-                     so irreversible tools are refused",
+                    "tool {:?} is irreversible and `limits.irreversible` is `refuse`",
                     tool.name
                 ));
             }

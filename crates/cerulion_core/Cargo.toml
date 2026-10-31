@@ -192,6 +192,9 @@ cerulion_macros = { workspace = true }
 # - `transport_udp`: compiles zenoh-link-udp, which carries the
 #   `udp/<ip>:<port>?rel=1;mixed_rel=1` spelling: QUIC with encryption and peer
 #   authentication switched off, for a WireGuard overlay that already supplies both.
+# - `transport_tls`: the `tls/` link (TLS 1.3 over TCP). A team session listens on
+#   `quic/` and `tls/` with the same certificates and mutual authentication, and
+#   `tls/` is the link where UDP does not get through (transport/team_auth.rs).
 # - `unstable`: exposes `PublicationBuilder::reliability`, the one unstable call
 #   this crate's library makes (`NetworkManager::publish_to_network_with`); its
 #   tests also read `Sample::reliability`.
@@ -201,12 +204,25 @@ zenoh = { version = "1.10.1", default-features = false, features = [
     "transport_quic",
     "transport_quic_datagram",
     "transport_udp",
+    "transport_tls",
     "unstable",
 ] }
 # Reads a `quic/` listener's certificate at session open to refuse a CA:TRUE
 # certificate, which webpki rejects as an end entity at handshake time
 # (`apply_tls` in transport/network.rs). The version zenoh-link-commons already uses.
 x509-parser = "0.18"
+# Team certificate profile and names (`transport/team_auth.rs`): a team session
+# checks its leaf and issuing CA certificates with the same code that issues them.
+cerulion_pairing = { workspace = true }
+# PEM text for the in-memory certificates and key a team session hands zenoh
+# (`*_base64` keys); 0.22 is the line zenoh-link-commons 1.10 resolves.
+base64 = "0.22"
+# Clears the in-memory PKCS#8 key of a team session on drop.
+zeroize = "1"
+# Sign and derive the keys of test team certificates in `transport::test_ca`
+# (`test-helpers` only); the same lines cerulion_pairing resolves.
+ed25519-dalek = { version = "2", optional = true }
+sha2 = { version = "0.10", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 # Stable get_or_try_init (std::sync::OnceLock version is nightly-only)
 once_cell = "1"
@@ -259,7 +275,7 @@ debug-logging = ["tracing/max_level_trace"]
 # Expose test-only helpers (e.g. `ClosureNodeEntry`) outside `#[cfg(test)]`.
 # Enabled automatically for integration tests via the dev-dependencies self
 # reference below (Part B).
-test-helpers = []
+test-helpers = ["dep:ed25519-dalek", "dep:sha2"]
 # Uses process-local transport for single-process apps. Do not enable in the CLI
 # or daemons, which may need cross-process shared memory.
 local-transport = []

@@ -35,6 +35,7 @@ fn common() -> Common {
         env: "prod".into(),
         app_version: "0.1.0".into(),
         channel: Some("stable".into()),
+        ci: false,
     }
 }
 
@@ -143,6 +144,7 @@ fn golden_capture_event_is_guarded_at_construction() {
             "env": "prod",
             "app_version": "0.1.0",
             "channel": "stable",
+            "ci": false,
             "command": "graph run",
             "duration_ms": 42,
             "is_tty": true
@@ -295,6 +297,7 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
                     "surface": "cli",
                     "env": "prod",
                     "app_version": "0.1.0",
+                    "ci": false,
                     "$process_person_profile": false,
                     "is_tty": false
                 }
@@ -310,6 +313,7 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
                     "surface": "cli",
                     "env": "prod",
                     "app_version": "0.1.0",
+                    "ci": false,
                     "alias": "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8"
                 }
             },
@@ -324,6 +328,7 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
                     "surface": "cli",
                     "env": "prod",
                     "app_version": "0.1.0",
+                    "ci": false,
                     "$set_once": {
                         "first_surface": "cli",
                         "first_cli_login_at": "2026-09-09T21:00:00.000Z"
@@ -338,7 +343,7 @@ fn golden_anonymous_alias_and_set_once_events_in_one_batch() {
 #[test]
 fn reserved_common_keys_cannot_be_spoofed_even_when_allowlisted() {
     let _turn = counter_turn();
-    const LEAKY: Allowlist = &["surface", "env", "app_version", "channel", "command"];
+    const LEAKY: Allowlist = &["surface", "env", "app_version", "channel", "ci", "command"];
     const SPEC: EventSpec = EventSpec {
         name: "x",
         allowlist: LEAKY,
@@ -354,17 +359,19 @@ fn reserved_common_keys_cannot_be_spoofed_even_when_allowlisted() {
             ("env".into(), Value::from("dev")),
             ("app_version".into(), Value::from("9.9.9")),
             ("channel".into(), Value::from("nightly")),
+            ("ci".into(), Value::from(true)),
             ("command".into(), Value::from("ok")),
         ],
     )
     .expect("well-formed sub passes the guard");
-    assert_eq!(guard::dropped_count(), before + 4);
+    assert_eq!(guard::dropped_count(), before + 5);
     let json = event_json(&event, &common());
     let p = &json["properties"];
     assert_eq!(p["surface"], "cli");
     assert_eq!(p["env"], "prod");
     assert_eq!(p["app_version"], "0.1.0");
     assert_eq!(p["channel"], "stable");
+    assert_eq!(p["ci"], false);
     assert_eq!(p["command"], "ok");
     for key in guard::RESERVED_KEYS {
         assert_eq!(
@@ -459,6 +466,7 @@ fn common_values_that_fail_the_guard_are_not_stamped() {
         env: "/home/bob".into(),
         app_version: "https://example.com".into(),
         channel: Some("x".repeat(129)),
+        ci: false,
     };
     let event = Event::capture(CMD, SUB, U.into(), T.into(), Vec::new()).expect("valid event");
     let json = event_json(&event, &leaky);
@@ -479,4 +487,43 @@ fn a_scheme_less_web_host_is_url_like() {
         );
     }
     assert_eq!(guard::check_str("install.sh"), Ok(()));
+}
+
+#[test]
+fn a_ci_run_is_tagged_and_creates_no_person_profile() {
+    let ci = Common {
+        ci: true,
+        ..common()
+    };
+    let signed_in = Event::capture(CMD, SUB, U.into(), T.into(), Vec::new()).expect("valid event");
+    let p = &event_json(&signed_in, &ci)["properties"];
+    assert_eq!(p["ci"], true);
+    assert_eq!(p["$process_person_profile"], false);
+    let local = event_json(&signed_in, &common());
+    assert_eq!(local["properties"]["ci"], false);
+    assert!(
+        local["properties"].get("$process_person_profile").is_none(),
+        "a signed-in event outside CI keeps its person profile"
+    );
+}
+
+#[test]
+fn ci_detection_reads_the_ci_service_variables() {
+    use cerulion_telemetry::ci::detect;
+    let only = |name: &'static str, value: &'static str| {
+        move |k: &str| (k == name).then(|| value.to_owned())
+    };
+    assert!(!detect(|_| None));
+    assert!(detect(only("CI", "true")));
+    assert!(detect(only("CI", "1")));
+    assert!(!detect(only("CI", "false")));
+    assert!(!detect(only("CI", " FALSE ")));
+    assert!(!detect(only("CI", "0")));
+    assert!(!detect(only("CI", "no")));
+    assert!(!detect(only("CI", "Off")));
+    assert!(!detect(only("CI", "")));
+    assert!(detect(only("GITHUB_ACTIONS", "true")));
+    assert!(detect(only("JENKINS_URL", "http://ci.invalid/")));
+    assert!(!detect(only("GITLAB_CI", "")));
+    assert!(!detect(only("NOT_A_CI_VAR", "true")));
 }

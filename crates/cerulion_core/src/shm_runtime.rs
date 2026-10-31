@@ -291,6 +291,41 @@ pub fn u64s_as_bytes(words: &[u64]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) }
 }
 
+/// Alignment of a wire frame and of the payload inside it.
+///
+/// [`WireHeader`](crate::wire::WireHeader) is `#[repr(C, align(8))]` and 40
+/// bytes long, so a payload starts 8-aligned whenever its frame does. A
+/// payload is laid out against that base: the fixed section's alignment is at
+/// most 8 and every primitive array is placed at a multiple of its element
+/// size counted from `payload[0]`. A generated variable-schema reader reads
+/// its source in place when the source is aligned to its own `READ_ALIGN`
+/// (at most this value) and otherwise from a copy made by
+/// [`aligned_read_copy`].
+pub const FRAME_ALIGN: usize = 8;
+
+/// Copy `bytes` into a zeroed, 8-aligned buffer of at least `min_len` bytes.
+///
+/// The fallback of `<Name>Shm::from_bytes` for a source it cannot read in
+/// place: one whose address is not a multiple of the reader's `READ_ALIGN` (a nested
+/// sub-frame a writer placed at an odd offset, a frame copied into an
+/// arbitrary buffer) or one shorter than the reader's fixed section plus
+/// offset table (`min_len`). Bytes past `bytes.len()` are zero, which the
+/// readers treat as unset: the fixed section reads zero there and the offset
+/// table entries read `(0, 0)`.
+///
+/// The buffer is a `Vec` rather than a `Box<[u64]>` because the reader
+/// stores it next to a raw pointer into it and is returned by value. Rust's
+/// aliasing model treats a `Box` passed or returned by value as a unique
+/// pointer to its block, which would invalidate that raw pointer; a `Vec`
+/// carries no such assertion.
+#[cold]
+#[inline(never)]
+pub fn aligned_read_copy(bytes: &[u8], min_len: usize) -> Vec<u64> {
+    let mut words = vec![0u64; bytes.len().max(min_len).div_ceil(8)];
+    u64s_as_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(bytes);
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

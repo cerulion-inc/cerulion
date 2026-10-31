@@ -31,7 +31,7 @@
 4 crates/cerulion_bagd/src/capture.rs
 6 crates/cerulion_bagd/src/discovery.rs
 3 crates/cerulion_bagd/src/discovery_scan.rs
-28 crates/cerulion_bagd/src/flashback_plane.rs
+27 crates/cerulion_bagd/src/flashback_plane.rs
 200 crates/cerulion_bagd/src/lib.rs
 3 crates/cerulion_bagd/src/producer_labeling.rs
 13 crates/cerulion_bagd/src/schema_resolve.rs
@@ -156,7 +156,7 @@
 21 crates/cerulion_core/src/transport/discovery.rs
 1 crates/cerulion_core/src/transport/fill_from.rs
 4 crates/cerulion_core/src/transport/frame_drop_latch.rs
-16 crates/cerulion_core/src/transport/gateway.rs
+13 crates/cerulion_core/src/transport/gateway.rs
 6 crates/cerulion_core/src/transport/ingress_build.rs
 60 crates/cerulion_core/src/transport/liveness.rs
 24 crates/cerulion_core/src/transport/mirror_registry.rs
@@ -189,7 +189,7 @@
 2 crates/cerulion_macros/src/parse.rs
 8 crates/cerulion_macros/src/state_derive.rs
 7 crates/cerulion_macros/src/validate.rs
-6 crates/cerulion_mdns/src/lib.rs
+5 crates/cerulion_mdns/src/lib.rs
 9 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
 16 crates/cerulion_netd/src/client.rs
@@ -199,7 +199,7 @@
 7 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
 11 crates/cerulion_netd/src/iroh_plane.rs
-11 crates/cerulion_netd/src/main.rs
+9 crates/cerulion_netd/src/main.rs
 9 crates/cerulion_netd/src/mirror.rs
 3 crates/cerulion_netd/src/net.rs
 2 crates/cerulion_netd/src/protocol.rs

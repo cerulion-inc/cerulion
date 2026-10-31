@@ -3933,8 +3933,8 @@ impl RunNetwork {
 ///
 /// EVERY normal real-clock live run: `graph run` (monolith AND multi-process),
 /// `node run`'s temp single-node graph, and `ros2 attach`'s bridge graph (the
-/// flagship automagic surface). There is deliberately NO entry-point gating —
-/// the permissive suppressors above are the complete list.
+/// flagship automagic surface). They share this network decision; actual serving
+/// additionally requires a saved prior login at the execution boundary.
 ///
 /// `graph profile` is the one deliberate EXCEPTION: a bounded MEASUREMENT run,
 /// not a deployment, so it stays LOCAL-ONLY BY DESIGN — [`graph_profile`]
@@ -4054,6 +4054,8 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         // The permissive default listens on tcp/ only and puts every topic
         // reliable.
         tls: None,
+        // The permissive default opens no team session.
+        auth: None,
         egress_qos: Vec::new(),
     })
 }
@@ -4118,8 +4120,8 @@ struct GatewayNetworkParams {
     listen_endpoints: Vec<String>,
     multicast_scouting: bool,
     gossip_scouting: bool,
-    /// `quic/` certificate files (`#[serde(default)]`: a handoff without the
-    /// field boots with none).
+    /// `quic/` and `tls/` certificate files (`#[serde(default)]`: a handoff
+    /// without the field boots with none).
     #[serde(default)]
     tls: Option<cerulion_core::NetworkTls>,
     /// Per-topic egress put policy (`#[serde(default)]`: a handoff without the
@@ -4156,6 +4158,9 @@ impl From<&GatewayNetworkParams> for cerulion_core::NetworkConfig {
             // this rebuild — the handoff carries identity exactly once.
             robot_identity: None,
             tls: p.tls.clone(),
+            // The handoff carries no team credentials (`spawn_gateway` refuses
+            // a config that sets them).
+            auth: None,
             egress_qos: p.egress_qos.clone(),
         }
     }
@@ -4546,6 +4551,14 @@ fn spawn_gateway(
     workspace_root: &Path,
     ix_config_json: Option<String>,
 ) -> CliResult<GatewayChild> {
+    // The handoff file carries no team credentials, so a team session would
+    // reach the child without its certificates or access policy.
+    if launch.network.auth.is_some() {
+        return Err(CliError::Validation(format!(
+            "graph run: the network gateway handoff for graph '{graph_name}' cannot carry team \
+             credentials yet; this run's network config sets them"
+        )));
+    }
     let handoff = GatewayHandoff {
         graph_name: graph_name.to_string(),
         robot: launch.robot.clone(),
@@ -4984,7 +4997,14 @@ fn establish_network_egress(
         );
     } else {
         match register_egress_with_netd(launch, graph_name, ix_config_json.as_deref()) {
-            Ok(guard) => return Some(NetworkEgressHandle::Netd(guard)),
+            Ok(guard) => {
+                crate::tcp_idle_warning::warn_if_tcp_egress_idle_resets(
+                    graph_name,
+                    crate::tcp_idle_warning::EgressRoute::Netd,
+                    &launch.plan,
+                );
+                return Some(NetworkEgressHandle::Netd(guard));
+            }
             Err(e) => {
                 tracing::warn!(
                     graph = %graph_name,
@@ -4995,8 +5015,13 @@ fn establish_network_egress(
             }
         }
     }
-    spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)
-        .map(NetworkEgressHandle::Child)
+    let child = spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)?;
+    crate::tcp_idle_warning::warn_if_tcp_egress_idle_resets(
+        graph_name,
+        crate::tcp_idle_warning::EgressRoute::Child(&launch.network),
+        &launch.plan,
+    );
+    Some(NetworkEgressHandle::Child(child))
 }
 
 /// An AddrInUse-class session-open failure — the ONLY class the
@@ -5067,6 +5092,7 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             handoff_path.display()
         ))
     })?;
+    crate::login_cmd::require_serving_login()?;
     let graph_name = handoff.graph_name.clone();
     let permissive = handoff.posture == GatewayPostureCarrier::PermissiveDefault;
 
@@ -5236,8 +5262,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     // interval) late — well inside the signal-matrix arms' seconds-scale exit
     // bounds, and nothing an operator can perceive.
     while running.load(Ordering::Relaxed) {
-        let forwarded = gateway.drive_once()?;
-        if forwarded == 0 {
+        let queued = gateway.drive_once()?;
+        if queued == 0 {
             gateway.idle_wait();
         }
     }
@@ -5936,22 +5962,25 @@ pub fn graph_run(
         )));
     }
 
-    // Resolve the network DECISION EARLY — before the auto-partition
+    // Resolve the network DECISION EARLY, before the auto-partition
     // pre-flight can write the graph file (the rule: a refused run leaves
     // the file byte-untouched). Networked multi-process is FIRST-CLASS,
     // so run SHAPE is NOT an input; the ONE
-    // decision drives both run shapes. The only hard refusal here is record-plus-ingress
-    // (`--record` + a declared-`ingress:` network block — surfaced via `?`),
-    // which must fail before any file mutation. The graph/worker processes
+    // decision drives both run shapes. Recording with a declared `ingress:`
+    // network block, and serving with no prior login, both refuse before any
+    // file mutation. The graph/worker processes
     // stay network-free (`network: None`); the separate GATEWAY process owns
     // the network plane. The `network:` block is unaffected by partitioning, so
     // deciding on the pre-preflight config is stable.
     let run_network = resolve_run_network(&config, network_off, time_source, record.is_some())?;
+    if run_network.network_config().is_some() {
+        crate::login_cmd::require_serving_login()?;
+    }
     // The permissive default applies to every normal
     // real-clock live run reaching this function — `graph run`, `node run`'s
     // temp single-node graph, AND `ros2 attach` (the flagship automagic surface:
-    // attach a robot and it is network-viewable with zero config). There is NO
-    // entry-point gating; the only permissive suppressors are `--network off` /
+    // attach a robot and it is network-viewable with zero config). Serving
+    // requires a saved prior login; network suppressors are `--network off` /
     // `CERULION_NETWORK=off`, the virtual/external clocks, and the
     // record+declared-ingress refusal — all already folded into `run_network`
     // above. (`graph profile` never routes through this function — see the
@@ -6471,8 +6500,8 @@ pub fn graph_run(
     // factories via `info(&self)` — it never consumes them). `None` for a
     // LOCAL-ONLY run (`Off`/`Inert`). Both the record path and the Real live
     // arm spawn from this; the Virtual arm is always `Off`/`Inert` (network is
-    // replay-inert), so this stays `None` there. No entry-point gating (by
-    // design — see the `run_network` resolution above).
+    // replay-inert), so this stays `None` there. The shared serving-login check
+    // already ran after network resolution, before any partition writes.
     let gateway_launch = resolve_gateway_launch(
         &run_network,
         &config,
@@ -23441,7 +23470,7 @@ nodes:
         assert!(lean.schema_hashes.is_empty());
     }
 
-    /// The `quic/` certificate files and the per-topic egress reliability ride
+    /// The `quic/` and `tls/` certificate files and the per-topic egress reliability ride
     /// the handoff into the gateway child's `NetworkConfig`, and a handoff
     /// written without either field rebuilds with none.
     #[test]
@@ -23451,10 +23480,18 @@ nodes:
             certificate: Some("/etc/cerulion/me.pem".into()),
             private_key: Some("/etc/cerulion/me.key".into()),
         };
-        let qos = vec![cerulion_core::EgressQos {
-            topic: "/r/scan".to_string(),
-            reliability: cerulion_core::EgressReliability::BestEffort,
-        }];
+        let qos = vec![
+            cerulion_core::EgressQos {
+                topic: "/r/scan".to_string(),
+                reliability: cerulion_core::EgressReliability::BestEffort,
+                send_queue: None,
+            },
+            cerulion_core::EgressQos {
+                topic: "/r/cam".to_string(),
+                reliability: cerulion_core::EgressReliability::Reliable,
+                send_queue: std::num::NonZeroUsize::new(8),
+            },
+        ];
         let cfg = cerulion_core::NetworkConfig {
             listen_endpoints: vec!["quic/0.0.0.0:7447?mixed_rel=1".to_string()],
             tls: Some(tls.clone()),
@@ -25285,7 +25322,7 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let ready = tmp.path().join("never.ready");
         let running = AtomicBool::new(true);
-        let mut guard = spawn_fake("sleep 30");
+        let mut guard = spawn_fake("exec sleep 30");
         let err = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_millis(200))
             .expect_err("a never-ready child must time out");
         assert!(
@@ -25322,7 +25359,7 @@ nodes:
         let running = AtomicBool::new(true);
         // The fake child writes the sentinel itself then sleeps (still alive
         // when ready is observed — the production shape).
-        let mut guard = spawn_fake(&format!("touch {} && sleep 30", ready.display()));
+        let mut guard = spawn_fake(&format!("touch {} && exec sleep 30", ready.display()));
         let outcome = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_secs(10))
             .expect("sentinel must yield Ready");
         assert_eq!(outcome, BagdReadyWait::Ready);
@@ -25335,7 +25372,7 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let ready = tmp.path().join("never.ready");
         let running = AtomicBool::new(false); // Ctrl-C already observed
-        let mut guard = spawn_fake("sleep 30");
+        let mut guard = spawn_fake("exec sleep 30");
         let outcome = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_secs(10))
             .expect("Ctrl-C is NOT an error");
         assert_eq!(outcome, BagdReadyWait::CtrlC, "user abort → CtrlC, not Err");
@@ -25352,7 +25389,7 @@ nodes:
             other => panic!("a fast-exiting child must report Exited, got {other:?}"),
         }
         // TimedOut arm (child still running at the deadline).
-        let mut slow = spawn_fake("sleep 30");
+        let mut slow = spawn_fake("exec sleep 30");
         match wait_for_child_bounded(&mut slow, Duration::from_millis(150)) {
             ChildExitWait::TimedOut => {}
             other => panic!("a still-running child must report TimedOut, got {other:?}"),
@@ -27380,7 +27417,7 @@ nodes:
         );
 
         // TimedOut → the finalize-deadline message (kills + reaps the child).
-        let mut slow_guard = spawn_fake("sleep 30");
+        let mut slow_guard = spawn_fake("exec sleep 30");
         let err = report_bagd_outcome("g", &out, ChildExitWait::TimedOut, &mut slow_guard)
             .expect_err("a finalize timeout must be an error");
         let msg = err.to_string();

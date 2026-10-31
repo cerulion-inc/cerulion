@@ -76,4 +76,7 @@ pub struct Common {
     pub app_version: String,
     /// Release channel where one exists (`stable`, `nightly`).
     pub channel: Option<String>,
+    /// The process runs under CI ([`crate::ci::detected`]). Sent as `ci` on
+    /// every event; a CI capture also creates no person profile.
+    pub ci: bool,
 }

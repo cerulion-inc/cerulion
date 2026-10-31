@@ -462,7 +462,7 @@ impl ::std::fmt::Display for MaxSliceLen {
 ///    (a derivation, not a free value).
 /// 2. Reader path: `max_capacity == 0` (sentinel — no setter calls
 ///    allowed; if invoked anyway, `PayloadTooLarge` attributes the
-///    misuse via the sentinel `<read-only>` topic).
+///    misuse to [`crate::message::READ_ONLY_TOPIC`]).
 ///
 /// The newtype makes the construction explicit:
 /// - `MaxPayloadCapacity::from_max_slice_len(MaxSliceLen)` produces the

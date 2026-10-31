@@ -14,14 +14,16 @@
 //! verb split): everything after `run` / `launch` is forwarded to the native
 //! `ros2 <verb>` untouched — hyphenated tokens, the package form, and any
 //! future native flag work by construction, because this module never parses
-//! the forwarded arguments. ONE exception, and it is leading-position-only:
-//! Cerulion's own [`ADOPT_TAKE_FLAG`] (`--adopt-take`) is split
-//! off the FRONT of the args before forwarding; from the first
-//! non-Cerulion token on, the verbatim guarantee holds unchanged — and
-//! since the launcher-refusal rule that flag is refused here (exit
-//! 69): `ros2` spawns the node as a grandchild with `close_fds=True`, so
-//! the descriptor-bound heap hook cannot reach it. The verbs' ENTIRE job
-//! is:
+//! the forwarded arguments. The exceptions are Cerulion's own flags, and
+//! they are leading-position-only: they are split off the FRONT of the args
+//! before forwarding, and from the first non-Cerulion token on the verbatim
+//! guarantee holds unchanged. [`ADOPT_TAKE_FLAG`] (`--adopt-take`) is one,
+//! and since the launcher-refusal rule it is refused here (exit 69): `ros2`
+//! spawns the node as a grandchild with `close_fds=True`, so the
+//! descriptor-bound heap hook cannot reach it. The delivery-log flags
+//! ([`RECORD_DELIVERIES_FLAG`], [`REPLAY_DELIVERIES_FLAG`]) are the others:
+//! each is staged as an environment variable, which survives that spawn. The
+//! verbs' ENTIRE job is:
 //!
 //! 1. validate the runtime (the rmw cdylib the child needs exists),
 //! 2. assemble the child environment (`RMW_IMPLEMENTATION=rmw_cerulion`, an
@@ -51,7 +53,7 @@
 //! | code | meaning |
 //! |------|---------|
 //! | —    | success is unreachable — a successful `exec()` BECOMES `ros2`, inheriting its exit code |
-//! | 2    | usage error (clap's own: a missing/unknown `cerulion ros2` subcommand; or `CERULION_RMW_ADOPT_TAKE` set in the environment without `--adopt-take`) |
+//! | 2    | usage error (clap's own: a missing/unknown `cerulion ros2` subcommand; `CERULION_RMW_ADOPT_TAKE` set in the environment without `--adopt-take`; or a refused `--record-deliveries` / `--replay-deliveries`) |
 //! | 69   | required Cerulion library missing, or `--adopt-take` given (`EX_UNAVAILABLE`) |
 //! | 127  | `ros2` not found on `PATH` |
 //! | 1    | any other pre-exec failure |
@@ -130,6 +132,174 @@ pub const ADOPT_TAKE_FLAG: &str = "--adopt-take";
 /// ambient value on every Cerulion-spawned child, so a launcher-staged
 /// child never carries it.
 pub const ADOPT_TAKE_CHILD_ENV: &str = "CERULION_RMW_ADOPT_TAKE";
+
+/// `--record-deliveries <DIR>`: a leading Cerulion flag on `cerulion ros2 run`
+/// and `cerulion ros2 launch`. Every ROS 2 process the verb starts records its
+/// deliveries into `<DIR>/<exe>-<pid>.rdl.mcap` ([`DELIVERY_LOG_CHILD_ENV`]).
+/// Unlike the heap hook, an environment variable survives `ros2`'s subprocess
+/// spawn, so the flag reaches the node.
+pub const RECORD_DELIVERIES_FLAG: &str = "--record-deliveries";
+
+/// `--replay-deliveries <LOG>`: a leading Cerulion flag on `cerulion ros2 run`
+/// only. The process replays the recorded delivery log and writes
+/// `<LOG>.verdict.json` ([`REPLAY_CHILD_ENV`]). `launch` refuses it: a replay
+/// is one process, and a launch file starts several.
+pub const REPLAY_DELIVERIES_FLAG: &str = "--replay-deliveries";
+
+/// The variable `rmw_cerulion` records deliveries under (a directory).
+pub const DELIVERY_LOG_CHILD_ENV: &str = "CERULION_RMW_DELIVERY_LOG";
+
+/// The variable `rmw_cerulion` replays a delivery log under (a file).
+pub const REPLAY_CHILD_ENV: &str = "CERULION_RMW_REPLAY";
+
+/// The suffix the replaying rmw appends to the log path for its verdict.
+pub const VERDICT_SUFFIX: &str = ".verdict.json";
+
+/// Prefix of every delivery-flag usage refusal ([`classify`] maps it to
+/// [`EXIT_USAGE`]).
+const DELIVERY_FLAG_USAGE_PREFIX: &str = "delivery-log flag";
+
+/// What the leading delivery flags ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryRequest {
+    /// Record into this directory.
+    Record(PathBuf),
+    /// Replay this log.
+    Replay(PathBuf),
+}
+
+/// Split the LEADING delivery flags (`--record-deliveries <DIR>`,
+/// `--replay-deliveries <LOG>`, either also as `--flag=value`) off `args`.
+/// Everything from the first other token on is returned verbatim. Pure: no
+/// filesystem or environment access.
+///
+/// Refused (usage, exit 2): a flag without a value (or with a value that
+/// starts with `-`, which is the next flag, not a path), a flag given twice,
+/// both flags, and `--replay-deliveries` on `launch`.
+pub fn split_delivery_flags(
+    verb: Ros2NativeVerb,
+    args: &[String],
+) -> CliResult<(Option<DeliveryRequest>, Vec<String>)> {
+    let mut req: Option<DeliveryRequest> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let token = args[i].as_str();
+        let (flag, inline) = match token.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (token, None),
+        };
+        let record = flag == RECORD_DELIVERIES_FLAG;
+        if !record && flag != REPLAY_DELIVERIES_FLAG {
+            break;
+        }
+        let value = match inline {
+            Some(v) => v.to_string(),
+            None => {
+                i += 1;
+                args.get(i).cloned().unwrap_or_default()
+            }
+        };
+        if value.is_empty() || value.starts_with('-') {
+            return Err(CliError::Validation(format!(
+                "{DELIVERY_FLAG_USAGE_PREFIX} {flag} needs a value: {}",
+                if record {
+                    "the directory each ROS 2 process writes its delivery log into"
+                } else {
+                    "the delivery log file to replay"
+                }
+            )));
+        }
+        if req.is_some() {
+            return Err(CliError::Validation(format!(
+                "{DELIVERY_FLAG_USAGE_PREFIX}s: {RECORD_DELIVERIES_FLAG} and \
+                {REPLAY_DELIVERIES_FLAG} take one value each and exclude each other: a process \
+                either records its deliveries or replays a log"
+            )));
+        }
+        if !record && verb == Ros2NativeVerb::Launch {
+            return Err(CliError::Validation(format!(
+                "{DELIVERY_FLAG_USAGE_PREFIX} {REPLAY_DELIVERIES_FLAG} replays ONE process and \
+                `ros2 launch` starts several: replay each recorded process on its own with \
+                `cerulion ros2 run {REPLAY_DELIVERIES_FLAG} <its .rdl.mcap> <pkg> <exe> ...`"
+            )));
+        }
+        let path = PathBuf::from(value);
+        req = Some(if record {
+            DeliveryRequest::Record(path)
+        } else {
+            DeliveryRequest::Replay(path)
+        });
+        i += 1;
+    }
+    Ok((req, args[i..].to_vec()))
+}
+
+/// The child env pair a delivery request stages, with its path made absolute
+/// (the node's working directory is `ros2`'s choice, not ours). Refuses a
+/// replay log that is not a file, and an ambient value of the OTHER variable
+/// (the rmw would refuse both set; the launcher says so before anything
+/// starts).
+pub fn delivery_child_env(req: &DeliveryRequest) -> CliResult<(String, String)> {
+    let absolute = |p: &Path| -> CliResult<PathBuf> {
+        std::path::absolute(p).map_err(|e| {
+            CliError::Validation(format!(
+                "{DELIVERY_FLAG_USAGE_PREFIX}: cannot resolve `{}`: {e}",
+                p.display()
+            ))
+        })
+    };
+    let ambient = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty());
+    match req {
+        DeliveryRequest::Record(dir) => {
+            if let Some(v) = ambient(REPLAY_CHILD_ENV) {
+                return Err(CliError::Validation(format!(
+                    "{DELIVERY_FLAG_USAGE_PREFIX} {RECORD_DELIVERIES_FLAG}: \
+                    {REPLAY_CHILD_ENV}={} is set in the environment, and a process cannot \
+                    record and replay at once; unset it",
+                    v.to_string_lossy()
+                )));
+            }
+            Ok((
+                DELIVERY_LOG_CHILD_ENV.to_string(),
+                absolute(dir)?.display().to_string(),
+            ))
+        }
+        DeliveryRequest::Replay(log) => {
+            if let Some(v) = ambient(DELIVERY_LOG_CHILD_ENV) {
+                return Err(CliError::Validation(format!(
+                    "{DELIVERY_FLAG_USAGE_PREFIX} {REPLAY_DELIVERIES_FLAG}: \
+                    {DELIVERY_LOG_CHILD_ENV}={} is set in the environment, and a process \
+                    cannot record and replay at once; unset it",
+                    v.to_string_lossy()
+                )));
+            }
+            let log = absolute(log)?;
+            if !log.is_file() {
+                return Err(CliError::Validation(format!(
+                    "{DELIVERY_FLAG_USAGE_PREFIX} {REPLAY_DELIVERIES_FLAG}: `{}` is not a file \
+                    (a delivery log is the `<exe>-<pid>.rdl.mcap` a {RECORD_DELIVERIES_FLAG} \
+                    run wrote)",
+                    log.display()
+                )));
+            }
+            Ok((REPLAY_CHILD_ENV.to_string(), log.display().to_string()))
+        }
+    }
+}
+
+/// One line for the operator about a staged record or replay, or `None`.
+pub fn delivery_notice(plan: &Ros2Plan) -> Option<String> {
+    let value = |k: &str| plan.env.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+    if let Some(dir) = value(DELIVERY_LOG_CHILD_ENV) {
+        return Some(format!(
+            "cerulion: recording the deliveries of every ROS 2 process into {dir} (one \
+            <exe>-<pid>.rdl.mcap per process)"
+        ));
+    }
+    value(REPLAY_CHILD_ENV).map(|log| {
+        format!("cerulion: replaying {log}; the verdict is written to {log}{VERDICT_SUFFIX}")
+    })
+}
 
 /// Preload control for the ros2 child:
 /// - unset → AUTO: prepend [`HEAPHOOK_FILENAME`] iff it exists in the lib
@@ -1258,7 +1428,10 @@ pub fn stage_ament_prefix_under(state_dir: &Path, lib_dir: &Path) -> CliResult<P
 #[cfg(unix)]
 pub fn plan_ros2_passthrough(verb: Ros2NativeVerb, args: &[String]) -> CliResult<Ros2Plan> {
     let lib_dir = resolve_lib_dir()?;
-    refuse_adopt_take_if_requested(args, &lib_dir)?;
+    // The delivery flags lead; the adopt-take refusal is decided on what
+    // follows them, still before anything is staged.
+    let (_, rest) = split_delivery_flags(verb, args)?;
+    refuse_adopt_take_if_requested(&rest, &lib_dir)?;
     let ament_prefix = stage_ament_prefix(&lib_dir)?;
     build_ros2_passthrough_plan(verb, args, &lib_dir, &ament_prefix)
 }
@@ -1317,13 +1490,19 @@ pub fn build_ros2_passthrough_plan_for_host(
     ament_prefix: &Path,
     host: HostAbi,
 ) -> CliResult<Ros2Plan> {
-    if split_adopt_take_flag(args).0 {
+    // Cerulion's leading delivery flags come off first; everything after them
+    // is handled exactly as before (`--adopt-take` refused, the rest verbatim).
+    let (delivery, args) = split_delivery_flags(verb, args)?;
+    if split_adopt_take_flag(&args).0 {
         return Err(refuse_adopt_take_under_the_ros2_cli(
             lib_dir,
             Some(ament_prefix),
         ));
     }
-    build_plan_with_adopt_gate(verb, args, lib_dir, ament_prefix, host)
+    let delivery_env = delivery.as_ref().map(delivery_child_env).transpose()?;
+    let mut plan = build_plan_with_adopt_gate(verb, &args, lib_dir, ament_prefix, host)?;
+    plan.env.extend(delivery_env);
+    Ok(plan)
 }
 
 /// The retained `--adopt-take` launch gate, reached without the
@@ -2599,6 +2778,7 @@ pub fn classify(err: &CliError) -> u8 {
             EXIT_UNAVAILABLE
         }
         CliError::Validation(msg) if msg.starts_with(ADOPT_TAKE_ENV_CONFLICT_PREFIX) => EXIT_USAGE,
+        CliError::Validation(msg) if msg.starts_with(DELIVERY_FLAG_USAGE_PREFIX) => EXIT_USAGE,
         _ => EXIT_OTHER,
     }
 }

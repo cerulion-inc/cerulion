@@ -34,11 +34,11 @@ set -u
 #            int8 request guids cast, the C++ mirror in its pre-Iron shape under
 #            cfg(not(cerulion_has_is_key)));
 #   galactic: builds from generated bindings and its whole suite is green (the same 96-byte
-#             pre-Humble C++ mirror as foxy, and seven post-Galactic rmw entry points compiled
+#             pre-Humble C++ mirror as foxy, and nine post-Galactic rmw entry points compiled
 #             out whole, three fewer than foxy: Galactic declares the qos compatibility call and
 #             the two network flow calls);
 #   foxy:    builds from generated bindings and its whole suite is green (the C++ mirror in its
-#            96-byte pre-Humble shape under cfg(not(cerulion_has_fetch_function)), and the ten
+#            96-byte pre-Humble shape under cfg(not(cerulion_has_fetch_function)), and the twelve
 #            post-Foxy rmw entry points compiled out whole rather than stubbed).
 # Every `build` row also names the entry points the distro's headers do NOT declare, in
 # absent_symbols: the built library must define none of them. rcl resolves by name, so a defined
@@ -51,11 +51,11 @@ set -u
 # that row's first lane run (jazzy and lyrical 2026-09-23: 31 targets, 476 tests run; 33 and 479
 # with the two vendored-gate binaries) with margin for
 # targets that come and go; a lane that silently loses half its binaries lands below the floor.
-# The ten entry points Foxy's rmw headers do not declare: rmw_event_set_callback,
+# The twelve entry points Foxy's rmw headers do not declare: rmw_event_set_callback,
 # rmw_subscription_set_on_new_message_callback, rmw_service_set_on_new_request_callback and
 # rmw_client_set_on_new_response_callback (Humble), the two content filter calls (Humble),
-# rmw_feature_supported (Humble), and rmw_qos_profile_check_compatible plus the two network
-# flow calls (Galactic).
+# rmw_feature_supported (Humble), rmw_qos_profile_check_compatible plus the two network
+# flow calls (Galactic), and the two service endpoint info calls (Lyrical).
 foxy_absent_symbols="rmw_event_set_callback
 rmw_subscription_set_on_new_message_callback
 rmw_service_set_on_new_request_callback
@@ -65,13 +65,16 @@ rmw_subscription_get_content_filter
 rmw_publisher_get_network_flow_endpoints
 rmw_subscription_get_network_flow_endpoints
 rmw_qos_profile_check_compatible
-rmw_feature_supported"
+rmw_feature_supported
+rmw_get_clients_info_by_service
+rmw_get_servers_info_by_service"
 # Galactic's list is DERIVED from the same place the cfgs are: every guarded export sits behind
 # #[cfg(cerulion_has_<cap>)], and CAPABILITY_MIN_ERA in crates/rmw_cerulion/src/era_check.rs
 # gives each capability the era whose headers introduced it. A distro lacks exactly the exports
 # whose capability is LATER than its own era, so Galactic's list is Foxy's without the three
 # Galactic-era entry points (qos_compatibility, network_flow): the event_callback exports, the
-# content_filter_options exports and rmw_feature_supported (features), all Humble. Seven.
+# content_filter_options exports and rmw_feature_supported (features), all Humble, plus the two
+# service endpoint info calls (Lyrical). Nine.
 # crates/rmw_cerulion/tests/rmw_absent_export_table_test.rs recomputes every row's list from the
 # guarded exports and the era tables and fails on any difference.
 galactic_absent_symbols="rmw_event_set_callback
@@ -80,16 +83,26 @@ rmw_service_set_on_new_request_callback
 rmw_client_set_on_new_response_callback
 rmw_subscription_set_content_filter
 rmw_subscription_get_content_filter
-rmw_feature_supported"
+rmw_feature_supported
+rmw_get_clients_info_by_service
+rmw_get_servers_info_by_service"
+# The two entry points Jazzy's and Humble's rmw headers do not declare: the service endpoint
+# info calls (Lyrical, rmw/service_endpoint_info_array.h).
+pre_lyrical_absent_symbols="rmw_get_clients_info_by_service
+rmw_get_servers_info_by_service"
+# Exact-replay tests (rmw_replay_*_test.rs, each #[ignore]'d, run by name below in a fresh process):
+# runtime-tested on Humble only, the distro they were measured on; every other row compile-checks
+# them as part of its serial suite build and skips the run, saying so.
+replay_runtime_distros="humble"
 # No row is `refuse` today; the arm stays for the next distro that starts there, so its two inputs
 # carry inert defaults rather than being unset under `set -u`. The arm REFUSES those defaults
 # (refuse_row_pinned): an errors=0 or empty-marker row would pass vacuously.
 errors=0
 marker=""
 case "$distro" in
-    jazzy)   expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
+    jazzy)   expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$pre_lyrical_absent_symbols" ;;
     lyrical) expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
-    humble)  expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="" ;;
+    humble)  expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$pre_lyrical_absent_symbols" ;;
     galactic) expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$galactic_absent_symbols" ;;
     foxy)    expect=build; min_targets=25; min_tests=400; known_failures=""; absent_symbols="$foxy_absent_symbols" ;;
     *) echo "FATAL: no expected state for distro '$distro'"; exit 1 ;;
@@ -315,6 +328,81 @@ case "$expect" in
         grep -q -F "$GATE_WRONG_SENTINEL" "$splain" || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): the injected literal ($GATE_WRONG_SENTINEL) never appears in the exchange's failure output; the RED is not a proven payload mismatch"; echo "-- output tail:"; tail -n 40 "$splain"; exit 1; }
         echo "GATE SELF-TEST PASS (2a): $distro wrong payload ($GATE_WRONG_SENTINEL) crossed the exchange and the oracle REJECTED it ($s_fail failed; the literal is in the collected values)"
         rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+        # ===================================================================
+        # EXACT REPLAY (rmw_replay_*_test.rs): one ROS 2 process recorded with
+        # the delivery log and replayed alone, judged by its own callback log and
+        # the rmw's verdict file. Each named test runs in its OWN cargo
+        # invocation and must report exactly `1 passed; 0 failed` with its own
+        # `test <name> ... ok` line (rule 37). The rclcpp arms need
+        # demo_nodes_cpp, which ros-base does not ship: installed here; the
+        # rclcpp fixture (tests/fixtures/replay_probe_cpp) is built by colcon
+        # inside its test, so colcon must be on PATH.
+        # -------------------------------------------------------------------
+        case " $replay_runtime_distros " in
+        *" $distro "*)
+            if [ ! -x "/opt/ros/$distro/lib/demo_nodes_cpp/talker" ]; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "ros-$distro-demo-nodes-cpp" >/dev/null 2>&1 \
+                    || { echo "GATE FAIL: $distro replay - could not install ros-$distro-demo-nodes-cpp"; exit 1; }
+            fi
+            if ! command -v colcon >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-colcon-common-extensions build-essential cmake >/dev/null 2>&1 \
+                    || { echo "GATE FAIL: $distro replay - could not install colcon for the rclcpp replay fixture"; exit 1; }
+            fi
+            REPLAY_TIMEOUT="${REPLAY_TIMEOUT:-900}"
+            REPLAY_EXPECTED=19
+            replay_ok=0
+            for spec in \
+                rmw_replay_rclpy_probe_test:the_mixer_replays_byte_identical_five_times \
+                rmw_replay_rclpy_probe_test:a_wall_clock_read_is_named_as_the_divergence \
+                rmw_replay_rclcpp_probe_test:the_rclcpp_listener_replays_every_take_in_order \
+                rmw_replay_rclcpp_probe_test:the_rclcpp_wall_timer_talker_is_named \
+                rmw_replay_rclcpp_mixer_test:the_rclcpp_probe_replays_byte_identical_five_times \
+                rmw_replay_rclcpp_mixer_test:an_rclcpp_wall_clock_read_is_named_as_the_divergence \
+                rmw_replay_rclcpp_mixer_test:an_rclcpp_multithreaded_executor_is_refused_and_a_single_thread_is_not \
+                rmw_replay_refusal_test:an_rclpy_multithreaded_executor_is_refused_and_a_single_thread_is_not \
+                rmw_replay_refusal_test:both_variables_set_is_refused_by_name \
+                rmw_replay_refusal_test:a_log_of_another_process_is_refused \
+                rmw_replay_token_test:two_executors_on_two_threads_replay_identically \
+                rmw_replay_token_test:a_callback_blocked_on_the_other_executor_trips_the_watchdog \
+                rmw_replay_edges_test:a_log_torn_anywhere_replays_to_log_exhausted_early \
+                rmw_replay_edges_test:a_publishing_thread_outside_every_executor_is_refused \
+                rmw_replay_edges_test:a_serialized_take_is_refused_under_its_own_name \
+                rmw_replay_edges_test:a_replay_that_stops_taking_is_never_identical \
+                rmw_replay_edges_test:a_killed_replay_never_leaves_an_earlier_verdict \
+                rmw_replay_edges_test:an_rclpy_service_pair_replays_identically_on_both_sides \
+                rmw_replay_edges_test:the_rclcpp_add_two_ints_pair_replays_identically_on_both_sides; do
+                bin="${spec%%:*}"; name="${spec#*:}"
+                rlog="/tmp/rmw_replay_${distro}_${name}.log"
+                echo "== rmw exact replay on $distro: $bin $name (fresh process, --ignored) =="
+                timeout --kill-after=30 "$REPLAY_TIMEOUT" \
+                    env RMW_IMPLEMENTATION=rmw_cerulion \
+                        AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                        LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                    cargo test --locked -p rmw_cerulion --release --test "$bin" -- \
+                        --ignored --test-threads=1 --exact "$name" 2>&1 | tee "$rlog"
+                rc_replay=${PIPESTATUS[0]}
+                rclpy_timed_out "$rc_replay" "$distro" "replay '$name'" "$REPLAY_TIMEOUT" && exit 1
+                rplain="${rlog}.plain"; strip_ansi "$rlog" > "$rplain"
+                if crashed "$rplain"; then echo "GATE FAIL: $distro replay '$name' crashed or its target did not compile (rc=$rc_replay)"; exit 1; fi
+                rsum="$(grep -E '^test result: ' "$rplain" | tail -n 1)"
+                [ -n "$rsum" ] || { echo "GATE FAIL: $distro replay '$name' printed NO 'test result:' summary (rc=$rc_replay)"; tail -n 40 "$rplain"; exit 1; }
+                rpassed=$(printf '%s\n' "$rsum" | awk '{print $4}'); rfailed=$(printf '%s\n' "$rsum" | awk '{print $6}')
+                case "$rpassed" in ''|*[!0-9]*) echo "GATE FAIL: $distro replay '$name' - unparseable passed count: $rsum"; exit 1 ;; esac
+                case "$rfailed" in ''|*[!0-9]*) echo "GATE FAIL: $distro replay '$name' - unparseable failed count: $rsum"; exit 1 ;; esac
+                if [ "$rc_replay" -ne 0 ] || [ "$rfailed" -ne 0 ] || [ "$rpassed" -ne 1 ]; then
+                    echo "GATE FAIL: $distro replay '$name' rc=$rc_replay: $rsum"; exit 1
+                fi
+                grep -qE "^test ${name} \.\.\. ok$" "$rplain" || { echo "GATE FAIL: $distro replay '$name' passed but its own '^test ${name} ... ok' line is absent (rule 37)"; exit 1; }
+                echo "REPLAY OK ($distro): $bin $name"
+                replay_ok=$((replay_ok + 1))
+            done
+            [ "$replay_ok" -eq "$REPLAY_EXPECTED" ] || { echo "GATE FAIL: $distro ran $replay_ok/$REPLAY_EXPECTED replay tests (rule 37)"; exit 1; }
+            echo "GATE PASS (exact replay): $distro ran $replay_ok/$REPLAY_EXPECTED replay tests, each in a fresh process"
+            ;;
+        *)
+            echo "== exact-replay runtime tests SKIPPED on $distro: runtime-tested on [$replay_runtime_distros] only; the test targets compiled with the serial suite =="
+            ;;
+        esac
         # ===================================================================
         ;;
     refuse)

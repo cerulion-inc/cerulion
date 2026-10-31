@@ -259,6 +259,26 @@ impl Recorded {
         bag_snapshot(&self.bag).map_or(0, |s| s.frames_on(topic))
     }
 
+    /// Frames already recorded on `topic`, and the step boundaries already recorded
+    /// for each of `ranks` in order, read from one snapshot of the bag. Panics when
+    /// the bag or, with ranks asked for, its scheduler trace cannot be read, so an
+    /// unreadable bag never passes as a count of zero.
+    fn progress(&self, topic: &str, ranks: &[u32]) -> (usize, Vec<usize>) {
+        let snap = bag_snapshot(&self.bag).expect("the bag is readable mid-run");
+        if !ranks.is_empty() {
+            assert!(
+                snap.trace_error.is_none(),
+                "the scheduler trace is readable mid-run: {:?}",
+                snap.trace_error
+            );
+        }
+        let steps = ranks
+            .iter()
+            .map(|rank| snap.boundaries_for_rank(*rank))
+            .collect();
+        (snap.frames_on(topic), steps)
+    }
+
     /// Stop the run with the production Ctrl-C and return its log.
     fn stop(&mut self) -> String {
         send_signal(self.guard.id(), libc::SIGINT);
@@ -300,7 +320,11 @@ impl Recorded {
 
 /// Pause the run, hold it for [`PAUSE`], resume it, and wait for it to publish on
 /// `topic` again. The verbs' own output is checked on the way.
-fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
+///
+/// Every rank in `ranks` must also record no step boundary during the hold and at
+/// least twenty after the resume: its step counter stands still while paused and
+/// moves again once resumed.
+fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration, ranks: &[u32]) {
     let first = graph_verb(&run.home, "pause", &run.run_id);
     assert_eq!(first.code, Some(0), "pause: {}", first.stderr);
     assert!(
@@ -333,9 +357,14 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
     const SETTLE: Duration = Duration::from_secs(2);
     assert!(hold > SETTLE, "the hold must outlast the settle");
     std::thread::sleep(SETTLE);
-    let held_start = run.frames_on(topic);
+    let (held_start, steps_start) = run.progress(topic, ranks);
     std::thread::sleep(hold - SETTLE);
-    let held_end = run.frames_on(topic);
+    let (held_end, steps_end) = run.progress(topic, ranks);
+    assert_eq!(
+        steps_end, steps_start,
+        "a paused run must step no rank, but the step boundaries recorded for ranks {ranks:?} \
+         went from {steps_start:?} to {steps_end:?} during the hold"
+    );
     assert_eq!(
         held_end, held_start,
         "{topic}: a paused run must publish nothing, but the bag grew from {held_start} to \
@@ -363,13 +392,19 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration) {
     );
     assert!(again.stdout.contains("already running"), "{}", again.stdout);
 
-    // The run publishes again: waited for in the bag, not slept.
-    let before = run.frames_on(topic);
+    // The run publishes and steps again: waited for in the bag, not slept.
+    let (before, steps_before) = run.progress(topic, ranks);
     wait_for_bag_state(
         &run.bag,
-        "the ticker publishing again after the resume",
+        "the ticker publishing and every rank stepping again after the resume",
         RECORDED_WINDOW_TIMEOUT,
-        |snap| snap.frames_on(topic) >= before + 20,
+        |snap| {
+            snap.frames_on(topic) >= before + 20
+                && ranks
+                    .iter()
+                    .zip(&steps_before)
+                    .all(|(rank, n)| snap.boundaries_for_rank(*rank) >= n + 20)
+        },
     );
 }
 
@@ -381,7 +416,7 @@ fn a_pause_leaves_no_gap_and_no_burst_in_a_single_process_recording() {
     let mut run = Recorded::start(prefix, &["--single-process"], SpawnExecutionMode::Default);
     let topic = format!("/{prefix}/ticker/cmd");
 
-    pause_hold_resume(&run, &topic, PAUSE);
+    pause_hold_resume(&run, &topic, PAUSE, &[]);
     let log = run.stop();
     assert!(
         log.contains("run paused at a step boundary") && log.contains("run resumed"),
@@ -437,7 +472,7 @@ fn a_pause_holds_every_worker_of_a_free_run_deployment() {
     let mut run = Recorded::start(prefix, &[], SpawnExecutionMode::Default);
     let ticker = format!("/{prefix}/ticker/cmd");
 
-    pause_hold_resume(&run, &ticker, PAUSE);
+    pause_hold_resume(&run, &ticker, PAUSE, &[]);
     let log = run.stop();
     assert_eq!(
         log.matches("run paused at a step boundary").count(),
@@ -465,17 +500,17 @@ fn a_pause_longer_than_the_barrier_timeout_does_not_poison_a_lockstep_run() {
     let mut run = Recorded::start(prefix, &[], SpawnExecutionMode::Lockstep);
     let ticker = format!("/{prefix}/ticker/cmd");
 
-    pause_hold_resume(&run, &ticker, Duration::from_secs(7));
+    // Both workers' step counters stand still for the hold and move after it. A
+    // worker can take the pause at the top of its loop, or inside a step it began
+    // an instant before the pause, standing at that step's barrier for the whole
+    // hold without logging it. A rank records a step boundary when it begins a
+    // step, so either way it records none while held.
+    pause_hold_resume(&run, &ticker, Duration::from_secs(7), &[0, 1]);
     let log = run.stop();
     assert!(
         !log.contains("barrier boundary wait timed out")
             && !log.contains("barrier mid-level wait timed out"),
         "a held lockstep run must not be poisoned by its own pause; log was:\n{log}"
-    );
-    assert_eq!(
-        log.matches("run paused at a step boundary").count(),
-        2,
-        "BOTH lockstep workers hold; log was:\n{log}"
     );
     run.assert_no_gap_no_burst(&ticker);
 }

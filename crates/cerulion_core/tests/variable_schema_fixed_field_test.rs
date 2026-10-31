@@ -19,10 +19,13 @@
 //!   with `#[repr(C)]` trailing padding), not the packed 13-byte
 //!   sum. Symmetric with how fixed-only schemas source their wire
 //!   size from `size_of::<<Name>Shm>()`.
-//! - **`from_bytes` / `from_bytes_mut` panic invariants**:
+//! - **`from_bytes_mut` panic invariants**:
 //!     - undersized buffer → panic with the "buffer too small ...; need
 //!       fixed section + offset table" message.
 //!     - misaligned source pointer → panic with the alignment message.
+//! - **`from_bytes` reads every source**: an undersized or misaligned
+//!   source is read from an aligned copy, never a panic
+//!   (`unaligned_nested_read_test.rs` covers nested sub-frames).
 //! - **Snapshot determinism for canonical bool inputs** — round-trip is
 //!   bit-identical when bool fields are written as 0 or 1.
 //! - **Snapshot lossy normalization for non-canonical bool inputs** — the
@@ -396,13 +399,18 @@ fn from_bytes_mut_panics_when_buffer_lacks_offset_table() {
     );
 }
 
-/// Same panic from the read-side `from_bytes`.
+/// The read-side `from_bytes` does not panic on the same buffer: the missing
+/// offset table reads as zero, so every variable field reads empty.
 #[test]
-#[should_panic(expected = "need fixed section + offset table")]
-fn from_bytes_panics_when_buffer_lacks_offset_table() {
-    let buf = [0u64; 2];
-    let bytes = bytemuck::cast_slice::<u64, u8>(&buf);
-    let _shm = ImageShm::from_bytes(bytes);
+fn from_bytes_reads_a_buffer_that_lacks_the_offset_table() {
+    let mut buf = [0u64; 2];
+    let bytes = bytemuck::cast_slice_mut::<u64, u8>(&mut buf);
+    bytes[12..16].copy_from_slice(&7u32.to_le_bytes());
+    let shm = ImageShm::from_bytes(bytes);
+    assert_eq!(shm.height, 0);
+    assert_eq!(shm.step, 7);
+    assert_eq!(shm.encoding().unwrap(), "");
+    assert!(shm.data().is_empty());
 }
 
 /// Alignment assert: `from_bytes_mut` requires the source pointer
@@ -425,14 +433,16 @@ fn from_bytes_mut_panics_on_misaligned_pointer() {
     );
 }
 
-/// Same alignment panic from the read-side `from_bytes`.
+/// The read-side `from_bytes` does not panic on a misaligned pointer: it reads
+/// the fixed section from an aligned copy.
 #[test]
-#[should_panic(expected = "misaligned source pointer")]
-fn from_bytes_panics_on_misaligned_pointer() {
-    let buf = [0u64; 16];
-    let bytes = bytemuck::cast_slice::<u64, u8>(&buf);
+fn from_bytes_reads_a_misaligned_pointer() {
+    let mut buf = [0u64; 16];
+    let bytes = bytemuck::cast_slice_mut::<u64, u8>(&mut buf);
+    bytes[1..5].copy_from_slice(&480u32.to_le_bytes());
     let misaligned = &bytes[1..];
-    let _shm = ImageShm::from_bytes(misaligned);
+    let shm = ImageShm::from_bytes(misaligned);
+    assert_eq!(shm.height, 480);
 }
 
 // ============================================================
