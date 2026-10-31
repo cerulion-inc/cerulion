@@ -48,7 +48,9 @@ case "$(uname -m)/$target" in
     *) die "target $target does not match the container architecture $(uname -m); this build is native only" ;;
 esac
 
-glibc=$(ldd --version | head -n 1)
+# getconf, not `ldd --version | head`: head closes the pipe early, ldd takes
+# SIGPIPE, and pipefail ends the script with status 141 and nothing printed.
+glibc=$(getconf GNU_LIBC_VERSION)
 printf 'container glibc: %s\n' "$glibc"
 case "$glibc" in
     *" 2.31") ;;
