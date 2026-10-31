@@ -18,9 +18,9 @@
 //! The targets are the `quic/` and `udp/...?rel=1` connect locators of the
 //! workspace's graphs and every `--udp-target`. With none, the check is
 //! skipped: it never probes a host the user did not name. Endpoints are
-//! probed at the same time; each resolves its name and probes up to one
-//! address per IP family, and the check reports what has finished after
-//! [`CHECK_BUDGET`].
+//! probed at the same time; each resolves its name and probes the first
+//! address it resolves to, the one a `quic/` or `udp/...?rel=1` dial connects
+//! to, and the check reports what has finished after [`CHECK_BUDGET`].
 //!
 //! [`probe`], [`version_negotiation_probe`] and [`parse_version_negotiation`]
 //! are public.
@@ -50,8 +50,8 @@ pub const PROBE_LEN: usize = 1200;
 /// ([`cerulion_discovery::ladder::EXPLICIT_PROBE_TIMEOUT`]).
 pub const DEFAULT_WAIT: Duration = cerulion_discovery::ladder::EXPLICIT_PROBE_TIMEOUT;
 
-/// How long the check waits for its endpoints: one name resolution and one
-/// probe per IP family, each given [`DEFAULT_WAIT`].
+/// How long the check waits for its endpoints, three times [`DEFAULT_WAIT`]:
+/// each endpoint's name resolution and its one probe run inside it.
 pub const CHECK_BUDGET: Duration = DEFAULT_WAIT.saturating_mul(3);
 
 /// The probe datagram for the connection ids `dcid` and `scid` (each at most
@@ -195,7 +195,7 @@ pub(super) fn udp_endpoint(locator: &str) -> Option<String> {
 /// What one endpoint gave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum EndpointResult {
-    /// The best probe result over the endpoint's addresses.
+    /// The probe result of the endpoint's first address.
     Probed(UdpReachability),
     /// The name did not resolve.
     Unresolved(String),
@@ -208,21 +208,6 @@ pub(super) enum EndpointResult {
 pub(super) struct Probed {
     pub(super) endpoint: String,
     pub(super) result: EndpointResult,
-}
-
-/// The best of several probes of one endpoint: an answer, else a refusal,
-/// else silence, else the first send failure.
-pub(super) fn best(results: Vec<UdpReachability>) -> UdpReachability {
-    let rank = |r: &UdpReachability| match r {
-        UdpReachability::Answered { .. } => 0,
-        UdpReachability::Refused => 1,
-        UdpReachability::NoAnswer => 2,
-        UdpReachability::SendFailed(_) => 3,
-    };
-    results
-        .into_iter()
-        .min_by_key(rank)
-        .unwrap_or_else(|| UdpReachability::SendFailed("no address to probe".to_string()))
 }
 
 pub(super) fn decide(probed: &[Probed]) -> Outcome {
@@ -276,7 +261,7 @@ pub(super) fn decide(probed: &[Probed]) -> Outcome {
                 ));
                 fix(
                     "check the host name, or name the endpoint by its IP address; a name that \
-                     resolves slowly, or two silent address families, use up the fixed budget",
+                     resolves slowly uses up the fixed budget",
                 );
             }
         }
@@ -337,34 +322,18 @@ fn graph_connect_locators(graphs_dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Resolve `endpoint` and probe its first address of each IP family.
+/// Resolve `endpoint` and probe its first address. zenoh's `quic/` and
+/// `udp/...?rel=1` dials connect to the first address the name resolves to
+/// and to no other, so another address answering says nothing about the link.
 fn probe_endpoint(endpoint: &str) -> EndpointResult {
-    let addrs: Vec<SocketAddr> = match endpoint.to_socket_addrs() {
-        Ok(addrs) => addrs.collect(),
+    let first: Option<SocketAddr> = match endpoint.to_socket_addrs() {
+        Ok(mut addrs) => addrs.next(),
         Err(e) => return EndpointResult::Unresolved(e.to_string()),
     };
-    let picked: Vec<SocketAddr> = [
-        addrs.iter().find(|a| a.is_ipv4()),
-        addrs.iter().find(|a| a.is_ipv6()),
-    ]
-    .into_iter()
-    .flatten()
-    .copied()
-    .collect();
-    if picked.is_empty() {
-        return EndpointResult::Unresolved("no address".to_string());
+    match first {
+        Some(addr) => EndpointResult::Probed(probe(addr, DEFAULT_WAIT)),
+        None => EndpointResult::Unresolved("no address".to_string()),
     }
-    // One family answering settles the endpoint; the other is not probed.
-    let mut results = Vec::new();
-    for addr in picked {
-        let result = probe(addr, DEFAULT_WAIT);
-        let answered = matches!(result, UdpReachability::Answered { .. });
-        results.push(result);
-        if answered {
-            break;
-        }
-    }
-    EndpointResult::Probed(best(results))
 }
 
 fn run(ctx: &Context) -> Outcome {
@@ -594,26 +563,6 @@ mod tests {
             .fix
             .unwrap()
             .starts_with("start the quic/ or udp/...?rel=1 listener"));
-    }
-
-    #[test]
-    fn the_best_result_over_an_endpoints_addresses_wins() {
-        let answered = UdpReachability::Answered {
-            rtt: Duration::from_millis(1),
-            versions: vec![1],
-        };
-        assert_eq!(
-            best(vec![UdpReachability::NoAnswer, answered.clone()]),
-            answered
-        );
-        assert_eq!(
-            best(vec![
-                UdpReachability::SendFailed("x".into()),
-                UdpReachability::Refused
-            ]),
-            UdpReachability::Refused
-        );
-        assert!(matches!(best(vec![]), UdpReachability::SendFailed(_)));
     }
 
     #[test]
