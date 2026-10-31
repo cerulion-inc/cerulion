@@ -60,7 +60,7 @@ thiserror = "2"
 # Hex decode of the robot's 64-char `--eid` and (optional) the desk device key.
 hex = "0.4"
 # Generate the 32-byte EPHEMERAL desk device seed when no key file is given.
-getrandom = "0.2"
+getrandom = "0.4"
 # A4: resolve the desk's cloud account from the cached device cert
 # (`~/.cerulion/device.cert`) that `cerulion login` writes, so the netd WAN dial
 # config presents an account-bound identity. `cerulion_pairing` owns the
@@ -72,7 +72,7 @@ cerulion_pairing = { workspace = true }
 # The cached device cert is `base64url(postcard(SignedDeviceCert))` — the exact shape
 # `cerulion login` / `cerulion_cli_engine::device_binding` write + read. Match their
 # versions so the resolver decodes the identical bytes.
-base64 = "0.22"
+base64 = "0.23"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [dev-dependencies]

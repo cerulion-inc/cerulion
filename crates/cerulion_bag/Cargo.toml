@@ -39,7 +39,7 @@ libc = "0.2"
 crc32fast = "1.5"
 # Reader + independent test oracle only. Uncompressed bags only, so drop the
 # heavy zstd/lz4 C toolchains from the default feature set.
-mcap = { version = "0.25", default-features = false }
+mcap = { version = "0.26", default-features = false }
 # Memory fix: memory-map the bag on read so recorded payloads are served
 # as borrowed page-cache slices (kernel-evictable) instead of a full `fs::read`
 # heap copy — replay peak RSS becomes O(frame count) not O(bag size). memmap2 is
