@@ -70,6 +70,7 @@ jobs:
       # Same reclaim as examples-replay.yml: ~25 GB of
       # preinstalled SDKs this job never uses.
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /
