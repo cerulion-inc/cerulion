@@ -33,10 +33,11 @@ Cerulion topics (see the compatibility page), and `cerulion topic
 list` and `cerulion topic echo` are the tools that read the shared-memory
 plane.
 
-The package depends on `libc6 (>= 2.35)`, `libstdc++6` and `libgcc-s1`, so
-it installs only on Ubuntu 22.04+, Debian 12+, or another distribution with
-glibc 2.35 or newer; `apt` refuses the install on an older release. The hook
-needs glibc 2.34 or newer by design, which that floor already covers. ROS 2
+The package depends on `libc6 (>= 2.31)`, `libstdc++6` and `libgcc-s1`, so
+it installs only on Ubuntu 20.04+, Debian 11+, or another distribution with
+glibc 2.31 or newer; `apt` refuses the install on an older release. The
+programs and the hook are built on Ubuntu 20.04, and the release workflow
+refuses any of them that needs a glibc symbol newer than 2.31. ROS 2
 itself is a `Suggests` (`ros-jazzy-ros-base`), not a dependency: the library
 is loaded by a ROS 2 process and links no ROS library of its own, and a
 `Depends` would refuse the CLI on every host without the ROS apt repository.
@@ -182,7 +183,7 @@ permission.
 
 An atomic `Release`/`Release.gpg` pair is impossible on fixed S3 object keys:
 copying either object first exposes a mismatch window. Every APT since 2013
-prefers `InRelease`, and the Ubuntu 22.04 and 24.04 clients supported by this
+prefers `InRelease`, and the Ubuntu 20.04, 22.04 and 24.04 clients supported by this
 project always use it. Pre-`InRelease` clients fail closed on a missing
 signature rather than reporting `BADSIG`. The bucket has never
 published a detached signature, so no stale detached object can be served. The publish role

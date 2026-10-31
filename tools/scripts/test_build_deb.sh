@@ -315,7 +315,7 @@ for library in librmw_cerulion.so libcerulion_heaphook.so; do
     }
 done
 rmw_depends=$(dpkg-deb -f "$rmw_deb" Depends)
-for dependency in 'libc6 (>= 2.35)' libstdc++6 libgcc-s1; do
+for dependency in 'libc6 (>= 2.31)' libstdc++6 libgcc-s1; do
     case ", $rmw_depends, " in
         *", $dependency, "*) ;;
         *)

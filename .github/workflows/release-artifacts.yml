@@ -128,14 +128,23 @@ jobs:
     needs: rmw
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 45
+    env:
+      # The compiler of every leg: the runner's toolchain on macOS and the
+      # toolchain the Linux build container installs.
+      RELEASE_TOOLCHAIN: 1.95.0
+      # Ubuntu 20.04 (glibc 2.31), pinned to the multi-arch index digest the
+      # Linux legs build in and run the packaged programs on.
+      FOCAL_IMAGE: ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             runs_on: ubuntu-22.04
+          # Native arm64, like the rmw job: the Linux legs build inside an
+          # ubuntu:20.04 container of the runner's own architecture.
           - target: aarch64-unknown-linux-gnu
-            runs_on: ubuntu-22.04
+            runs_on: ubuntu-22.04-arm
           - target: x86_64-apple-darwin
             runs_on: macos-15-intel
           - target: aarch64-apple-darwin
@@ -167,24 +176,20 @@ jobs:
           tools/scripts/check_citation_release.sh "$version" "$tag_ref_name"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust 1.95.0
+      - name: Install Rust ${{ env.RELEASE_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.95.0
+          toolchain: ${{ env.RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      # The hosted image ships a packages.microsoft.com apt source; apt-get
-      # update exits 100 when that source refuses or fails its signature check,
-      # even though the package comes from the Ubuntu archives. Deleting its
-      # list first keeps that source out of the update; rm -f exits 0 when the
-      # file is absent.
-      - name: Install aarch64 linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
+      # The Linux legs build inside ubuntu:20.04 so the programs and the heap
+      # hook link against glibc 2.31 and run on Ubuntu 20.04 and later. Only
+      # this step runs in the container (a `docker run` rather than a job
+      # `container:`), so every other step of the matrix, the macOS legs
+      # included, runs on the runner as before. The container is native to
+      # the runner's architecture. The script installs RELEASE_TOOLCHAIN and
+      # writes target/<TARGET>/release/, with the `rustc -vV` of the compiler
+      # that built them in rustc-version.txt, where the steps below read it.
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
@@ -193,22 +198,23 @@ jobs:
           # secret is unset the artifacts carry no key and send nothing.
           CERULION_POSTHOG_KEY: ${{ secrets.CERULION_POSTHOG_KEY }}
         run: |
-          if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-          fi
-          cargo build --release --locked \
-            -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
-            --target "$TARGET"
           case "$TARGET" in
             *-unknown-linux-gnu)
-              # The heap hook, an LD_PRELOAD malloc interposer the CLI
-              # auto-injects into every ros2 child when it sits beside the
-              # binaries. Linux/GNU only; libc and tracing, no build script,
-              # no ROS headers, so it builds here natively (the aarch64 leg
-              # cross-compiles it with the linker above) and needs no
-              # container, unlike the rmw.
-              cargo build --release --locked -p cerulion_heaphook --target "$TARGET"
+              docker run --rm \
+                -e TARGET \
+                -e CERULION_POSTHOG_KEY \
+                -e CARGO_TERM_COLOR \
+                -e CERULION_RELEASE_TOOLCHAIN="$RELEASE_TOOLCHAIN" \
+                -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
+                -v "$GITHUB_WORKSPACE":/work \
+                "$FOCAL_IMAGE" \
+                bash /work/tools/scripts/build_release_linux_container.sh
+              ;;
+            *)
+              cargo build --release --locked \
+                -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
+                --target "$TARGET"
+              rustc -vV > "target/$TARGET/release/rustc-version.txt"
               ;;
           esac
 
@@ -250,19 +256,26 @@ jobs:
       # `librmw_cerulion.so` in its own directory and stages a minimal ament
       # prefix that links it, the same sibling rule `cerulion connect` uses
       # for `cerulion-connectd`.
-      # Every Linux archive must run on glibc 2.35 (Ubuntu 22.04, the Jetson
-      # generation of robots). The runners above are 22.04, and this check keeps
-      # it that way: a binary that needs a newer symbol version fails the build.
+      # Every Linux program and the heap hook must run on glibc 2.31 (Ubuntu
+      # 20.04 and later). The build step above links them in an
+      # ubuntu:20.04 container, and this check keeps it that way: an object
+      # that needs a newer symbol version fails the build. The rmw library is
+      # not checked here: it is built inside its distro's own image and needs
+      # that distro's glibc. The packaged rmw is the Jazzy build, which needs
+      # Ubuntu 24.04, so `cerulion ros2 run` and `cerulion ros2 launch` need a
+      # host where a supported ROS 2 distro and its rmw library run.
       - name: Verify Linux glibc compatibility
         if: runner.os == 'Linux'
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          python3 tools/scripts/check_release_glibc.py \
+          python3 -B tools/scripts/test_check_release_glibc.py
+          python3 -B tools/scripts/check_release_glibc.py \
             "target/$TARGET/release/cerulion" \
             "target/$TARGET/release/cerulion-netd" \
             "target/$TARGET/release/cerulion-connectd" \
-            "target/$TARGET/release/cerulion-remoted"
+            "target/$TARGET/release/cerulion-remoted" \
+            "target/$TARGET/release/libcerulion_heaphook.so"
 
       - name: Package archive
         env:
@@ -278,7 +291,7 @@ jobs:
           cp "target/$TARGET/release/cerulion-connectd" "$stage/cerulion-connectd"
           cp "target/$TARGET/release/cerulion-remoted" "$stage/cerulion-remoted"
           cp tools/scripts/install_rust.sh "$stage/install_rust.sh"
-          rustc -vV > "$stage/rustc-version.txt"
+          cp "target/$TARGET/release/rustc-version.txt" "$stage/rustc-version.txt"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
@@ -302,6 +315,30 @@ jobs:
           else
             (cd "$RUNNER_TEMP" && shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256")
           fi
+
+      # The packaged programs and the heap hook, from the staged archive tree,
+      # run on a stock Ubuntu 20.04. Each program prints its version. The hook
+      # is preloaded into `cerulion --version` with its debug breadcrumb on,
+      # and the run must print `won_malloc=1`: the loader refused nothing and
+      # the hook is the process's malloc.
+      - name: Run the packaged programs on Ubuntu 20.04
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          stage="$RUNNER_TEMP/cerulion-${VERSION}-${TARGET}"
+          docker run --rm -v "$stage":/s:ro "$FOCAL_IMAGE" sh -euxc '
+            ldd --version | head -n 1
+            for program in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
+              "/s/$program" --version
+            done
+            CERULION_HEAPHOOK_DEBUG=1 LD_PRELOAD=/s/libcerulion_heaphook.so \
+              /s/cerulion --version 2>/tmp/hook.err
+            cat /tmp/hook.err
+            grep -F "cerulion heap hook loaded: abi v" /tmp/hook.err | grep -Fq "won_malloc=1"
+            if grep -Fq "cannot be preloaded" /tmp/hook.err; then exit 1; fi
+          '
 
       - name: Check Debian package eligibility
         id: debian
