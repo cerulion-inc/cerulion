@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "android_e2e_demand_probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Test fixture: the Android emulator e2e's direct data demand probe. It sends a LAN data demand for one topic with a known schema, without reading a catalog first, and reports the demand acks and frames it received in a bounded window. Used only by tools/scripts/android_emulator_e2e.sh."
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "android-e2e-demand-probe"
+path = "src/main.rs"
+
+# The demand goes through the same demander a desk gateway runs for its ingress
+# topics (`GatewayRuntime` with one ingress entry), so the probe exercises the
+# production LAN demand path, not a hand-rolled zenoh GET.
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+
+[lints]
+workspace = true

@@ -46,11 +46,16 @@
 #   ci_test_shard.sh <package> <shard_index> <shard_count> [package_dir]
 #   ci_test_shard.sh --list  <package> <shard_index> <shard_count> [package_dir]
 #   ci_test_shard.sh --check [package] [shard_count] [package_dir]
+#   ci_test_shard.sh --selected <package>
 #
 #   run     — invoke `cargo nextest run --profile <p> -p <package> --lib?
 #             --test a --test b ...`
 #   --list  — print the cargo argument list and exit (no cargo, no build);
 #             what the CI log shows and what the tests assert against.
+#   --selected: answer whether <package> rides CI_SELECTED_PACKAGES, the same
+#             reading the run mode gates on, as an exit code (0 rides, 1 does
+#             not) plus one `selection:` line. For a workflow step that spends
+#             something before this script's run step is reached.
 #   --check — prove the partition is TOTAL and DISJOINT: the union of all
 #             shards equals the full file list exactly once. Defaults to the
 #             package + shard count CI actually uses, so a bare `--check` is
@@ -82,8 +87,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# The shipped configuration — the ONE place the defaults live, so `--check`
-# and the CI matrix cannot describe different partitions.
+# The shipped defaults: the package and the Linux shard count. A bare `--check`
+# (the Lint step) partitions at these; the macOS lane passes its own count, 3,
+# on its `run:` line, and the coverage test in cerulion_cli_engine checks each
+# lane's matrix against the count that lane passes.
 DEFAULT_PACKAGE=cerulion_core
 DEFAULT_SHARD_COUNT=4
 
@@ -112,7 +119,7 @@ DEFAULT_SHARD_COUNT=4
 # 227.0 s of that 228.7. Earlier: 545.2 s and 559.3 s
 # on two green main runs, ~97 % of that wall. The
 # RATIO is what has held across every sample — this one test is essentially the
-# whole of whichever quarter holds it, against 20-38 s for every other shard's.
+# whole of whichever shard holds it, against 20-38 s for every other shard's.
 # That cost is not addressable here: splitting it by expectation WITHIN the
 # same job costs +158 s of trybuild work and +2.4 min of shard-step wall,
 # so it stays whole.
@@ -120,7 +127,7 @@ DEFAULT_SHARD_COUNT=4
 # WHY PIN IT rather than let the round-robin place it. The round-robin is over
 # the SORTED file list, so the tail's shard is a function of how many
 # `cerulion_core/tests/*.rs` sort before it — i.e. adding ANY test file has a
-# ~1-in-4 chance of moving that whole block onto a different runner. It sat on
+# ~1-in-`count` chance of moving that whole block to another runner. It sat on
 # shard 1 for both runs above and moved to shard 2 on ONE added file. That
 # makes the fleet's critical path a lottery: no package-to-shard map can be
 # balanced against a load that relocates on an unrelated PR, and the observed
@@ -128,7 +135,7 @@ DEFAULT_SHARD_COUNT=4
 # Pinning converts the tail from a variable into a constant, which is what lets
 # the workflow's package map be packed around it: the tail is one FIXED term of
 # shard 2's measured wall, and the package steps are placed largest-first
-# around all four shards' fixed terms. See the map and its measurement in
+# around every shard's fixed term. See the map and its measurement in
 # `.github/workflows/ci.yml` above the package steps.
 #
 # WHAT IS NOT CHANGED. New test files still round-robin, automatically, with no
@@ -142,8 +149,10 @@ DEFAULT_SHARD_COUNT=4
 # that, the answer is the round-robin.
 #
 # PINNED_SHARD is taken `% count`, so the pin is always a valid index for any
-# shard count (the shipped count is 4; `--check cerulion_core 2` still
-# partitions). It is inert for any package that does not contain the file, so
+# shard count: `--check cerulion_core 2` still partitions. TWO counts ship, 4 on
+# Linux and 3 on macOS (each lane's `shard:` matrix and the count it passes to
+# this script in `.github/workflows/ci.yml`), and `2 % 4` and `2 % 3` both land
+# on shard 2. It is inert for any package that does not contain the file, so
 # `ci_test_shard.sh cerulion_bag …` is unaffected.
 PINNED_TEST=macro_compile_fail_test
 PINNED_SHARD=2
@@ -282,6 +291,126 @@ shard_filterset_terms() {
 }
 
 # --------------------------------------------------------------------------
+# THE SELECTION.
+#
+# `CI_SELECTED_PACKAGES` carries the `pkgs` output of ci.yml's `changes` job:
+# the JSON array of the packages a pull request's change can reach, the reverse
+# cargo closure unioned with the observation edges in
+# `tools/ci/observation_edges.tsv`. This script runs ONE package, so the
+# intersection of its member list with that array is either that package or
+# nothing, and nothing means this shard has no work to do.
+#
+# FAIL CLOSED, twice. An unset or empty variable RUNS: a shard invoked by hand
+# or by a job that publishes no selection must behave as it always did. A value
+# that is not a JSON array RUNS too: a selection this script cannot read is not
+# a selection it may act on, and the word `all` arrives here exactly that way.
+#
+# WHOLE TOKEN, quotes included, which is what keeps `cerulion_viz` and
+# `cerulion_vizd` apart: a bare substring test would report `cerulion_viz`
+# selected by an array holding only `cerulion_vizd`.
+#
+# READABLE MEANS A JSON ARRAY OF QUOTED NAMES, not merely a bracketed string.
+# `[cerulion_bag]` reads as a selection under a brackets-only test and holds no
+# quoted name, so the shard SKIPPED on a value no producer emits and no reader
+# can parse, which is the one direction this function is documented never to
+# take. Every shape below that is not `[]` or `["a"]` or `["a","b"]` is
+# unreadable and RUNS.
+selection_holds() {
+    # $1 is the package this shard runs, $2 the selection.
+    case "$2" in
+        "") return 0 ;;
+        \[*\]) ;;
+        *) return 0 ;;
+    esac
+    _sel_inner=${2#\[}
+    _sel_inner=${_sel_inner%\]}
+    _sel_found=1
+    _sel_rest=$_sel_inner
+    while [ -n "$_sel_rest" ]; do
+        _sel_tok=${_sel_rest%%,*}
+        case "$_sel_rest" in
+            *,*) _sel_rest=${_sel_rest#*,} ;;
+            *)   _sel_rest= ;;
+        esac
+        # JSON puts optional whitespace around a value, so the token is trimmed
+        # before it is judged: a producer that starts writing `["a", "b"]` must
+        # not silently stop being readable.
+        while :; do
+            case "$_sel_tok" in
+                " "*)  _sel_tok=${_sel_tok# } ;;
+                *" ")  _sel_tok=${_sel_tok% } ;;
+                *)     break ;;
+            esac
+        done
+        # A QUOTED NAME, and nothing else: opening and closing quote, at least
+        # one character between them, and no quote inside.
+        case "$_sel_tok" in
+            '"'*'"') ;;
+            *) return 0 ;;
+        esac
+        _sel_name=${_sel_tok#\"}
+        _sel_name=${_sel_name%\"}
+        case "$_sel_name" in
+            ''|*'"'*) return 0 ;;
+        esac
+        [ "$_sel_name" != "$1" ] || _sel_found=0
+    done
+    return "$_sel_found"
+}
+
+# The hand table `--check` holds `selection_holds` to.
+#
+# `<package>|<selection>|<runs>`. Written out rather than generated: the rows
+# say what the answer IS, so a reader that changed its mind fails here instead
+# of agreeing with itself.
+#
+# THE MALFORMED ROWS PAIR WITH A WELL-FORMED SKIP, and the pair differs only in
+# the quoting: `["cerulion_bag"]` is readable and skips `cerulion_core`, while
+# `[cerulion_bag]` is not a JSON array of quoted names, so it is unreadable and
+# RUNS. `[cerulion_core]` is the same shape naming the package itself, so the
+# answer cannot come from a match. The spaced rows say the trimming is real in
+# both directions.
+SELECTION_CASES='
+cerulion_core|["cerulion_core"]|yes
+cerulion_core|["cerulion_bag","cerulion_core"]|yes
+cerulion_core|["cerulion_bag"]|no
+cerulion_core|[]|no
+cerulion_core||yes
+cerulion_core|all|yes
+cerulion_core|not json|yes
+cerulion_core|[cerulion_bag]|yes
+cerulion_core|[cerulion_core]|yes
+cerulion_core|["cerulion_bag]|yes
+cerulion_core|[cerulion_bag,"cerulion_core"]|yes
+cerulion_core|[""]|yes
+cerulion_core|["cerulion_bag", "cerulion_viz"]|no
+cerulion_core|["cerulion_bag", "cerulion_core"]|yes
+cerulion_viz|["cerulion_viz"]|yes
+cerulion_viz|["cerulion_vizd"]|no
+cerulion_vizd|["cerulion_viz"]|no
+cerulion-wire|["cerulion-wire"]|yes
+'
+
+check_selection() {
+    _fails=0
+    while IFS= read -r _row; do
+        [ -n "$_row" ] || continue
+        _pkg=${_row%%|*}
+        _rest=${_row#*|}
+        _sel=${_rest%|*}
+        _want=${_rest##*|}
+        if selection_holds "$_pkg" "$_sel"; then _got=yes; else _got=no; fi
+        if [ "$_got" != "$_want" ]; then
+            printf 'VIOLATION: selection_holds %s "%s" -> %s, wanted %s\n' \
+                "$_pkg" "$_sel" "$_got" "$_want" >&2
+            _fails=$((_fails + 1))
+        fi
+    done <<< "$SELECTION_CASES"
+    [ "$_fails" -eq 0 ] || exit 1
+    printf 'ci_test_shard --check: OK, the selection reader agrees with its hand table.\n'
+}
+
+# --------------------------------------------------------------------------
 # --check: the partition is TOTAL and DISJOINT.
 #
 # A shard runner that silently DROPPED a test file would be worse than the
@@ -376,6 +505,8 @@ $_members"
 
     printf 'ci_test_shard --check: OK — %d test file(s) partitioned across %d shard(s) of %s, total and disjoint.\n' \
         "$_total" "$_count" "$_pkg"
+
+    check_selection
 }
 
 # --------------------------------------------------------------------------
@@ -387,8 +518,28 @@ MODE=run
 case "${1:-}" in
     --check) shift; do_check "${1:-}" "${2:-}" "${3:-}"; exit 0 ;;
     --list)  shift; MODE=list ;;
+    --selected)
+        # The SAME `selection_holds` the run mode below gates on, asked as a
+        # question by a workflow step that builds something BEFORE this script's
+        # own run step is reached. A second reading of the selection written in
+        # YAML would be free to drift from this one; a mode cannot, and
+        # `--check`'s table already pins the function's answers. rc 0 means the
+        # package rides this selection, rc 1 means it does not, and the line
+        # says which either way, because a command with no output proves nothing
+        # to whoever reads the log.
+        shift
+        [ $# -ge 1 ] || usage
+        if selection_holds "$1" "${CI_SELECTED_PACKAGES:-}"; then
+            printf 'selection: %s rides the selection (selected: %s)\n' \
+                "$1" "${CI_SELECTED_PACKAGES:-}"
+            exit 0
+        fi
+        printf 'selection: %s is not in the selection (selected: %s)\n' \
+            "$1" "${CI_SELECTED_PACKAGES:-}"
+        exit 1
+        ;;
     -h|--help) usage ;;
-    -*) die "unknown option '$1' (expected --check, --list or a package name)" ;;
+    -*) die "unknown option '$1' (expected --check, --list, --selected or a package name)" ;;
 esac
 
 [ $# -ge 3 ] || usage
@@ -401,6 +552,30 @@ require_index "shard index" "$INDEX"
 require_index "shard count" "$COUNT"
 [ "$COUNT" -ge 1 ] || die "shard count must be >= 1 (got '$COUNT')"
 [ "$INDEX" -lt "$COUNT" ] || die "shard index $INDEX is out of range for $COUNT shard(s)"
+
+# THE SELECTION, before anything is enumerated or built. One line with the fixed
+# `selection:` prefix, then exit 0 without invoking cargo.
+#
+# The workflow step that runs this shard is deliberately NOT gated by an `if:`:
+# `cerulion_core` observes the whole repository tree (its whole-tree walks,
+# `serial_discipline_test` among them, read every `.rs` file in the source tree), and
+# `tools/ci/observation_edges.tsv` records it as observing `all`; a package
+# observing `all` rides every selection that names a package. A pull request that
+# selects no package at all (one touching only a root markdown file that no
+# doc-pin marker names) reaches this step with the selection `[]`; the step then
+# prints its `selection:` line and exits without running the suite. Every step
+# gated on the selection naming its package skips for that change too, and each
+# package's companion step prints its own `selection:` line; the steps of the packages
+# observing `all` carry no selection condition and still run, the `cerulion_core`
+# doctests step among them (gated on the shard index alone), and among those only
+# this sharded suite skips, by the runner's own reading of the selection. The
+# intersection below is the mechanism for any package whose shard step is added
+# later and whose observation edges the walk can attribute.
+if [ "$MODE" = run ] && ! selection_holds "$PACKAGE" "${CI_SELECTED_PACKAGES:-}"; then
+    printf 'selection: skipped %s shard %s (selected: %s)\n' \
+        "$PACKAGE" "$INDEX" "${CI_SELECTED_PACKAGES:-}"
+    exit 0
+fi
 
 # ENUMERATE FIRST, IN THIS SHELL. `enumerate` is otherwise only ever reached
 # from inside a `$( … )`, where its `die` exits the SUBSHELL: a missing or
@@ -544,7 +719,7 @@ printf 'ci_test_shard: shard %s/%s of %s\n' "$INDEX" "$COUNT" "$PACKAGE"
 # rather than cargo's bare "no such command: nextest".
 command -v cargo-nextest >/dev/null 2>&1 || die \
     "cargo-nextest is not installed — this shard runs under nextest now.
-Install the pinned version with:  ./scripts/install_nextest.sh
+Install the pinned version with:  ./tools/scripts/install_nextest.sh
 (see .config/nextest.toml for the serial fence it applies)"
 # NO `--test-threads=1`. nextest runs each test in its own PROCESS, so the
 # process-global hazards that flag was defending (the cdylib `NODES` registry,

@@ -57,7 +57,7 @@ fn unique_topic(base: &str) -> String {
     format!("test/drain_owned/{base}/{nanos}/{id}")
 }
 
-/// Hand-build a wire frame: a valid 32-byte [`WireHeader`] (with `total_size`
+/// Hand-build a wire frame: a valid 40-byte [`WireHeader`] (with `total_size`
 /// set to the full frame length) followed by `body`.
 fn build_frame(schema_hash: u64, sequence: u32, timestamp_ns: u64, body: &[u8]) -> Vec<u8> {
     let total = WireHeader::SIZE + body.len();

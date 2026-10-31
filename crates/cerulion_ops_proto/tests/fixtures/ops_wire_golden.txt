@@ -1,0 +1,26 @@
+# Golden cerulion/ops/1 frames: each data line is `<case> <hex>`, the hex being
+# one whole frame (big-endian u32 payload length, then the JSON payload). The
+# `#` line above each case is that payload as text. The hex was produced from
+# the JSON text, not by the Rust encoder; the tests require the encoder to emit
+# exactly these bytes and the decoder to read them back to the same value.
+
+# hello_current (33 payload bytes): {"min_version":1,"max_version":1}
+hello_current 000000217b226d696e5f76657273696f6e223a312c226d61785f76657273696f6e223a317d
+# hello_range (33 payload bytes): {"min_version":2,"max_version":3}
+hello_range 000000217b226d696e5f76657273696f6e223a322c226d61785f76657273696f6e223a337d
+# handshake_ack (55 payload bytes): {"type":"ack","chosen_version":1,"server_name":"cerud"}
+handshake_ack 000000377b2274797065223a2261636b222c2263686f73656e5f76657273696f6e223a312c227365727665725f6e616d65223a226365727564227d
+# handshake_reject (130 payload bytes): {"type":"reject","server_min":1,"server_max":1,"message":"protocol version mismatch: server supports 1..=1, client offered 2..=3"}
+handshake_reject 000000827b2274797065223a2272656a656374222c227365727665725f6d696e223a312c227365727665725f6d6178223a312c226d657373616765223a2270726f746f636f6c2076657273696f6e206d69736d617463683a2073657276657220737570706f72747320312e2e3d312c20636c69656e74206f66666572656420322e2e3d33227d
+# request_inventory (39 payload bytes): {"id":0,"verb":"inventory","args":null}
+request_inventory 000000277b226964223a302c2276657262223a22696e76656e746f7279222c2261726773223a6e756c6c7d
+# request_log_tail (63 payload bytes): {"id":7,"verb":"log-tail","args":{"lines":50,"name":"app.log"}}
+request_log_tail 0000003f7b226964223a372c2276657262223a226c6f672d7461696c222c2261726773223a7b226c696e6573223a35302c226e616d65223a226170702e6c6f67227d7d
+# request_restart (49 payload bytes): {"id":2,"verb":"restart","args":{"graph":"demo"}}
+request_restart 000000317b226964223a322c2276657262223a2272657374617274222c2261726773223a7b226772617068223a2264656d6f227d7d
+# response_ok (71 payload bytes): {"status":"ok","id":7,"result":{"lines":["boot ok"],"truncated":false}}
+response_ok 000000477b22737461747573223a226f6b222c226964223a372c22726573756c74223a7b226c696e6573223a5b22626f6f74206f6b225d2c227472756e6361746564223a66616c73657d7d
+# response_err (115 payload bytes): {"status":"err","id":3,"kind":"denied","message":"authorization denied for caller 'desk' verb 'restart': no grant"}
+response_err 000000737b22737461747573223a22657272222c226964223a332c226b696e64223a2264656e696564222c226d657373616765223a22617574686f72697a6174696f6e2064656e69656420666f722063616c6c657220276465736b272076657262202772657374617274273a206e6f206772616e74227d
+# inventory (147 payload bytes): {"arch":"aarch64","os":"linux","kernel":"6.8.0","glibc":"2.39","cuda":null,"jetpack_l4t":null,"disk_free_bytes":1048576,"cerulion_version":"1.0.0"}
+inventory 000000937b2261726368223a2261617263683634222c226f73223a226c696e7578222c226b65726e656c223a22362e382e30222c22676c696263223a22322e3339222c2263756461223a6e756c6c2c226a65747061636b5f6c3474223a6e756c6c2c226469736b5f667265655f6279746573223a313034383537362c22636572756c696f6e5f76657273696f6e223a22312e302e30227d

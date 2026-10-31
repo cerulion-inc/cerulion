@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The desk-side re-inject worker: dial the robot's `cerulion/wire/1` ALPN, speak
+//! The desk-side re-inject worker: dial the robot's `cerulion/wire/2` ALPN, speak
 //! the `cerulion_q` catalog/demand/schema vocabulary over the bidi control
 //! stream, and spawn one per-topic re-inject reader per accepted demand
 //! ("remote = local").
@@ -844,6 +844,7 @@ mod tests {
 
     fn catalog(entries: Vec<(&str, Option<u64>)>) -> CatalogReply {
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION,
             robot: "robo".to_string(),
             entries: entries
@@ -901,6 +902,7 @@ mod tests {
     fn robot_display_neuters_and_bounds_the_peer_reported_name() {
         let summary = |robot: &str| ConnectSummary {
             catalog: CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 robot: robot.to_string(),
                 ..catalog(vec![])
             },
@@ -971,6 +973,7 @@ mod tests {
         let hostile = "x\u{1b}[2J\r\n\u{7}y";
         let summary = ConnectSummary {
             catalog: CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 robot: hostile.to_string(),
                 ..catalog(vec![])
             },

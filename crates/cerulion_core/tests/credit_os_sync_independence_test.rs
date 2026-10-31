@@ -7,7 +7,7 @@
 //! `barrier::wake_word_block_primitive_available`, whose macOS arm is
 //! `os_sync_active()` — and that ANDs in `CERULION_BARRIER_OS_SYNC`. So
 //! `CERULION_BARRIER_OS_SYNC=0` silently disabled the CREDIT tier as well,
-//! while `USER_API.md` promised the two switches were independent. The runtime
+//! while `docs/user-api.md` promised the two switches were independent. The runtime
 //! park path (`park_wait_credit`) had the SAME call and the same bug.
 //!
 //! **Why a subprocess.** Both switches are `OnceLock`-cached on first read, so

@@ -332,6 +332,7 @@ fn malformed_request_frames_are_skipped() {
         offset_table_count: 0,
         sequence: 1,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; total];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -481,6 +482,7 @@ fn reply_topic_guards_skip_foreign_and_wrong_hash_frames() {
             offset_table_count: 0,
             sequence: 1,
             timestamp_ns: 0,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; total];
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -603,6 +605,7 @@ fn service_frame(hash: u64, env_guid: [u8; 16], sequence: i64, body: &[u8]) -> V
         offset_table_count: 0,
         sequence: sequence as u32,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; total];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -1303,6 +1306,7 @@ fn short_envelope_frames_latch_separately_from_the_hash_regime() {
             offset_table_count: 0,
             sequence,
             timestamp_ns: 0,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; total];
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);

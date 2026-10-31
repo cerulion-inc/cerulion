@@ -94,6 +94,7 @@ pub unsafe extern "C" fn rmw_serialize(
                 return RMW_RET_ERROR;
             }
         };
+        let _downgrades = crate::rosidl_buffer::PublishScope::open("<rmw_serialize>");
         let frame = match bridge.flatten(ros_message, 0, 0) {
             Ok(f) => f,
             Err(e) => {
@@ -180,6 +181,22 @@ pub unsafe extern "C" fn rmw_deserialize(
             return RMW_RET_INVALID_ARGUMENT;
         }
         let payload = &bytes[cerulion_core::wire::WireHeader::SIZE..];
+        // A member this build's C++ typesupport gives no way to WRITE (a
+        // `bool[]` before Humble, at the top level or inside a nested
+        // message) is refused HERE, before `unflatten` writes the first
+        // field: this function decodes into a CALLER-owned message, so a
+        // decode that walked half of it and then failed would hand back
+        // `RMW_RET_ERROR` over a message the caller must now treat as
+        // garbage. No latch, for the reason the arm below gives: one-shot
+        // call, no entity, no stream to flood.
+        if let Some((_, path)) = bridge.unwritable_bool_seq() {
+            tracing::error!(
+                reason = %crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+                r#type = %bridge.qualified_name(),
+                "rmw_deserialize refused the buffer before writing anything"
+            );
+            return RMW_RET_ERROR;
+        }
         if bridge.unflatten(payload, ros_message) {
             RMW_RET_OK
         } else {
@@ -247,6 +264,26 @@ pub unsafe extern "C" fn rmw_serialized_message_resize(
 /// rmw ABI contract.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_publish_serialized_message(
+    publisher: *const ffi::rmw_publisher_t,
+    serialized_message: *const ffi::rmw_serialized_message_t,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_serialized_live(publisher, serialized_message, allocation);
+    }
+    crate::replay::output(
+        (*publisher).data as usize,
+        crate::replay::log::OutputKind::Publish,
+        || publish_serialized_live(publisher, serialized_message, allocation),
+    )
+}
+
+/// The live `rmw_publish_serialized_message`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish_serialized_message`].
+unsafe fn publish_serialized_live(
     publisher: *const ffi::rmw_publisher_t,
     serialized_message: *const ffi::rmw_serialized_message_t,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
@@ -354,6 +391,13 @@ pub unsafe extern "C" fn rmw_publish_serialized_message(
         header.timestamp_ns = now;
         header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
         let bytes = &frame[..];
+        if crate::replay::output_capture_armed() {
+            crate::replay::capture_output_body(
+                bytes
+                    .get(cerulion_core::wire::WireHeader::SIZE..)
+                    .unwrap_or(&[]),
+            );
+        }
         match inner.publisher.publish_raw(bytes) {
             Ok(_) => {
                 // Native history: publish_raw retained this
@@ -413,6 +457,9 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         }
         *taken = false;
         let data = &*((*subscription).data as *const crate::runtime::SubscriptionData);
+        // A serialized take bypasses the bridge: a recording marks its log not
+        // replayable.
+        crate::replay::report_serialized_take(&data.topic);
         // Poisoned = wedged: never re-enter torn iceoryx2 state.
         let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
             tracing::error!("entity wedged by an earlier panic; failing call");
@@ -460,8 +507,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
                     Err(_) => 0,
                 };
-                info.publication_sequence_number = seq;
-                info.reception_sequence_number = u64::MAX;
+                super::stamp_sequence_numbers(&mut info, seq);
             }
             info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
             info.from_intra_process = false;
@@ -769,12 +815,11 @@ pub unsafe extern "C" fn rmw_get_node_names(
         // nodes in different namespaces are distinct.
         let names: Vec<String> = graph.nodes.keys().map(|(_, n)| n.clone()).collect();
         let namespaces: Vec<String> = graph.nodes.keys().map(|(ns, _)| ns.clone()).collect();
-        // Use the default allocator embedded in the arrays (rcl pre-inits
-        // them with one).
-        let alloc_names = (*node_names).allocator;
-        let alloc_ns = (*node_namespaces).allocator;
-        let mut a1 = alloc_names;
-        let mut a2 = alloc_ns;
+        // rcl passes zero-initialized arrays (every allocator fn pointer
+        // NULL); those are filled with the default allocator, which the fill
+        // records in the array for `rcutils_string_array_fini`.
+        let mut a1 = ffi::effective_allocator((*node_names).allocator);
+        let mut a2 = ffi::effective_allocator((*node_namespaces).allocator);
         let ret = fill_string_array(node_names, &mut a1, &names);
         if ret != RMW_RET_OK {
             return ret;
@@ -817,19 +862,22 @@ pub unsafe extern "C" fn rmw_get_node_names_with_enclaves(
             let values: Vec<String> = graph.nodes.keys().map(|_| "/".to_string()).collect();
             (names, namespaces, values)
         };
-        let mut a1 = (*node_names).allocator;
+        // Zero-initialized arrays take the default allocator, as in
+        // `rmw_get_node_names`. The fill records the allocator it used in
+        // each array, so the rollback frees below read it back from there.
+        let mut a1 = ffi::effective_allocator((*node_names).allocator);
         let ret = fill_string_array(node_names, &mut a1, &names);
         if ret != RMW_RET_OK {
             return ret;
         }
-        let mut a2 = (*node_namespaces).allocator;
+        let mut a2 = ffi::effective_allocator((*node_namespaces).allocator);
         let ret = fill_string_array(node_namespaces, &mut a2, &namespaces);
         if ret != RMW_RET_OK {
             let mut a1 = (*node_names).allocator;
             free_string_array(node_names, &mut a1);
             return ret;
         }
-        let mut a3 = (*enclaves).allocator;
+        let mut a3 = ffi::effective_allocator((*enclaves).allocator);
         let ret = fill_string_array(enclaves, &mut a3, &values);
         if ret != RMW_RET_OK {
             let mut a1 = (*node_names).allocator;
@@ -875,11 +923,26 @@ pub unsafe extern "C" fn rmw_count_publishers(
     let Ok(key) = runtime::ros_topic_to_cerulion(topic) else {
         return RMW_RET_INVALID_ARGUMENT;
     };
-    count_in(
-        // The endpoint Vec IS the count — no parallel counter.
-        move |g| g.publishers.get(&key).map(|v| v.len()).unwrap_or(0),
-        count,
-    )
+    if count.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    let (ret, n) = crate::replay::graph(
+        crate::replay::log::GraphQuery::CountPublishers,
+        topic,
+        || {
+            let mut n = 0usize;
+            // The endpoint Vec IS the count: no parallel counter.
+            let ret = count_in(
+                move |g| g.publishers.get(&key).map(|v| v.len()).unwrap_or(0),
+                &mut n,
+            );
+            (ret, n as u64)
+        },
+    );
+    if ret == RMW_RET_OK {
+        *count = n as usize;
+    }
+    ret
 }
 
 /// # Safety
@@ -901,10 +964,25 @@ pub unsafe extern "C" fn rmw_count_subscribers(
     let Ok(key) = runtime::ros_topic_to_cerulion(topic) else {
         return RMW_RET_INVALID_ARGUMENT;
     };
-    count_in(
-        move |g| g.subscriptions.get(&key).map(|v| v.len()).unwrap_or(0),
-        count,
-    )
+    if count.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    let (ret, n) = crate::replay::graph(
+        crate::replay::log::GraphQuery::CountSubscribers,
+        topic,
+        || {
+            let mut n = 0usize;
+            let ret = count_in(
+                move |g| g.subscriptions.get(&key).map(|v| v.len()).unwrap_or(0),
+                &mut n,
+            );
+            (ret, n as u64)
+        },
+    );
+    if ret == RMW_RET_OK {
+        *count = n as usize;
+    }
+    ret
 }
 
 /// # Safety
@@ -1152,7 +1230,14 @@ unsafe fn fill_endpoint_info_array(
         (*slot).node_namespace = node_namespace;
         (*slot).topic_type = topic_type;
         (*slot).endpoint_type = endpoint_type;
-        (*slot).endpoint_gid = rec.endpoint_gid;
+        // RMW_GID_STORAGE_SIZE is 24 before Iron and 16 from Iron on (pinned
+        // per era in ffi/era_pins.rs): build the whole array zeroed, write our
+        // 16 bytes into it, then store it in ONE assignment through the raw
+        // pointer, so the tail is never uninitialized on a 24-byte era and no
+        // reference is ever formed to the slot (dangerous_implicit_autorefs).
+        let mut gid = [0u8; ffi::RMW_GID_STORAGE_SIZE as usize];
+        gid[..16].copy_from_slice(&rec.endpoint_gid);
+        (*slot).endpoint_gid = gid;
         (*slot).qos_profile = endpoint_qos_profile(&rec.qos);
     }
     arr.info_array = info_array;
@@ -1239,14 +1324,114 @@ pub unsafe extern "C" fn rmw_get_subscriptions_info_by_topic(
     })
 }
 
+/// The argument checks `rmw/get_service_endpoint_info.h` lists ahead of
+/// any query, in its order, then `RMW_RET_UNSUPPORTED` with `refusal` set
+/// as the rcutils error string. `GraphRegistry::services` and `::clients`
+/// hold one `(type name, count)` pair per service name and no per-endpoint
+/// node name, namespace, gid or QoS, so no `rmw_service_endpoint_info_t`
+/// can be filled from them.
+///
+/// # Safety
+/// `node`, `allocator`, `service_name` and `out` must each be null or
+/// point to a live object of its type.
+#[cfg(cerulion_has_service_endpoint_info)]
+unsafe fn service_endpoint_info_unsupported(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    out: *mut ffi::rmw_service_endpoint_info_array_t,
+    refusal: &'static std::ffi::CStr,
+) -> rmw_ret_t {
+    ffi::ffi_guard(RMW_RET_ERROR, || unsafe {
+        if node.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        // `rcutils_allocator_is_valid`: all four function pointers set.
+        let allocator_valid = !allocator.is_null() && {
+            let a = &*allocator;
+            a.allocate.is_some()
+                && a.deallocate.is_some()
+                && a.reallocate.is_some()
+                && a.zero_allocate.is_some()
+        };
+        if !allocator_valid || ffi::cstr(service_name).is_none() || out.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if (*out).size != 0 || !(*out).info_array.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if !ffi::is_our_identifier((*node).implementation_identifier) {
+            return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+        }
+        let _ = ffi::rcutils_set_error_state_cstr(refusal);
+        ffi::RMW_RET_UNSUPPORTED
+    })
+}
+
+/// Lyrical and later (`rmw/service_endpoint_info_array.h`): compiled out
+/// whole on a build whose headers lack
+/// `rmw_service_endpoint_info_array_t`. Validates its
+/// arguments, then answers `RMW_RET_UNSUPPORTED` with an rcutils error
+/// string naming the call: the runtime graph holds one `(type name,
+/// count)` pair per service and no per-client endpoint record.
+///
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_service_endpoint_info)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_get_clients_info_by_service(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    _no_mangle: bool,
+    clients_info: *mut ffi::rmw_service_endpoint_info_array_t,
+) -> rmw_ret_t {
+    service_endpoint_info_unsupported(
+        node,
+        allocator,
+        service_name,
+        clients_info,
+        c"rmw_get_clients_info_by_service is not supported by rmw_cerulion: it records no per-client endpoint information",
+    )
+}
+
+/// Lyrical and later; the server-side twin of
+/// [`rmw_get_clients_info_by_service`].
+///
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_service_endpoint_info)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_get_servers_info_by_service(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    _no_mangle: bool,
+    servers_info: *mut ffi::rmw_service_endpoint_info_array_t,
+) -> rmw_ret_t {
+    service_endpoint_info_unsupported(
+        node,
+        allocator,
+        service_name,
+        servers_info,
+        c"rmw_get_servers_info_by_service is not supported by rmw_cerulion: it records no per-server endpoint information",
+    )
+}
+
 // =====================================================================
 // QoS compatibility / misc
 // =====================================================================
 
 /// SHM pub/sub always matches (no QoS negotiation failure modes).
 ///
+/// Galactic and later: an older distro has no
+/// `rmw_qos_compatibility_type_t`, so the export is compiled away WHOLE
+/// rather than stubbed (the distro gate reads the built library with `nm`
+/// and fails if it is defined where the headers lack the type).
+///
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_qos_compatibility)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_qos_profile_check_compatible(
     _publisher_profile: ffi::rmw_qos_profile_t,
@@ -1274,8 +1459,12 @@ pub unsafe extern "C" fn rmw_set_log_severity(_severity: ffi::rmw_log_severity_t
     RMW_RET_OK
 }
 
+/// Humble and later (`rmw/features.h`): compiled away WHOLE on a build
+/// whose headers have no `rmw_feature_t`, never stubbed.
+///
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_features)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_feature_supported(feature: ffi::rmw_feature_t) -> bool {
     // MESSAGE_INFO timestamps are filled by take; everything else
@@ -1283,8 +1472,13 @@ pub unsafe extern "C" fn rmw_feature_supported(feature: ffi::rmw_feature_t) -> b
     feature == ffi::RMW_FEATURE_MESSAGE_INFO_PUBLICATION_SEQUENCE_NUMBER
 }
 
+/// Galactic and later: both network-flow exports are compiled away WHOLE
+/// on a build whose headers have no
+/// `rmw_network_flow_endpoint_array_t`, never stubbed.
+///
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_network_flow)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_publisher_get_network_flow_endpoints(
     _publisher: *const ffi::rmw_publisher_t,
@@ -1296,6 +1490,7 @@ pub unsafe extern "C" fn rmw_publisher_get_network_flow_endpoints(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_network_flow)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_get_network_flow_endpoints(
     _subscription: *const ffi::rmw_subscription_t,

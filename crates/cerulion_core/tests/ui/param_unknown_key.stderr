@@ -1,0 +1,11 @@
+error: unknown param attribute `step`. Supported: `default`, `min`, `max`, `description`.
+  --> tests/ui/param_unknown_key.rs:11:28
+   |
+11 |     #[param(default = 1.0, step = 0.1)]
+   |                            ^^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_unknown_key.rs:9:7
+  |
+9 |     #[output]
+  |       ^^^^^^

@@ -15,6 +15,7 @@ embeds in a desktop app.
 | `pake` | The CPace fallback ceremony (bounded attempts, short lifetime, single session) |
 | `pop` | Proof of possession: sign and verify a device-key challenge |
 | `client` | Device key handling, certificate carry and the pairing driver |
+| `team` | Team certificate profile, trust bundle, status list and anti-rollback rules |
 
 A robot trusts a set of root keys, verifies a certificate chain without calling
 any server, and keeps a local access list, so an established pairing keeps

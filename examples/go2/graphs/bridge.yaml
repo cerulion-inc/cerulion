@@ -61,7 +61,7 @@
 #     (the CycloneDDS fragmented-discovery constraint).
 #   * `--single-process` is RECOMMENDED, not required: networked
 #     multi-process runs are first-class, but this graph is only validated as
-#     one process, and the flag also skips the partition prompt.
+#     one process, and the flag also skips deriving a partition.
 #   * `camera_jpeg` MUST have been built WITH capture:
 #         cerulion node build camera_jpeg --release
 #     Its `gstreamer` feature is non-default (so the workspace builds on a host

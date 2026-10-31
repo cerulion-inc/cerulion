@@ -231,8 +231,27 @@ pub(crate) const PUMP_INTERVAL_MS: u64 = 20;
 /// Process the iceoryx2 events (SubscriberJoined → history delivery)
 /// of every live publisher in THIS process. Called from `rmw_wait`'s
 /// poll loop; throttled; `try_lock` so an application thread holding a
-/// publisher lock is never blocked (it will pump on its next publish
-/// anyway).
+/// publisher lock is never blocked (that publisher is pumped on the next
+/// interval instead).
+///
+/// This is the IDLE cadence, so it drives `pump_history_at`, the idle
+/// driver, and not `check_subscriber_events`, the publish-path drain.
+/// The publish-path drain is gated on a listener COUNT edge plus a call
+/// budget, and both are blind to the interleaving that matters here: one
+/// subscriber detaches while a replacement attaches, so the count returns
+/// to what the gate last recorded and no arming fires, while the budget
+/// was already spent servicing the first joiner. A publisher that keeps
+/// sending does not care, because iceoryx2's own `send_sample` calls
+/// `update_connections` and delivers the retained history to every newly
+/// connected subscriber. A LATCHED publisher that published its
+/// TRANSIENT_LOCAL sample and went quiet never sends again, so this pump
+/// is the only thing left, and with the publish-path drain it stranded the
+/// replacement joiner for the life of the process. `pump_history_at`
+/// carries the time bound that covers it.
+///
+/// The clock is read ONCE per pass and handed to every publisher, which is
+/// what `pump_history_at` exists for: the deadline only needs to know which
+/// pass this is, not which publisher within it.
 pub fn pump_publisher_events() -> bool {
     let Some(rt) = RUNTIME.get() else {
         return false;
@@ -250,11 +269,12 @@ pub fn pump_publisher_events() -> bool {
         return false; // another thread is pumping this interval
     }
     let publishers = rt.publishers.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
     for p in publishers.iter() {
         // SAFETY: pointers are live while registered (PublisherPtr).
         let data = unsafe { &*p.as_ptr() };
         if let Ok(mut inner) = data.inner.try_lock() {
-            inner.publisher.check_subscriber_events();
+            inner.publisher.pump_history_at(now);
         }
     }
     true
@@ -373,6 +393,11 @@ pub fn runtime() -> Result<&'static Runtime, String> {
         return Ok(rt);
     }
     install_tracing();
+    // This library runs inside a ROS 2 process whose own code may wait with
+    // `select()`: the soft open-file limit goes at most to FD_SETSIZE here, and
+    // the transport constructor below keeps that ceiling.
+    #[cfg(unix)]
+    cerulion_core::fd_limit::raise_open_file_limit_for_embedding_host();
     let transport = TransportManager::init(TransportConfig {
         node_name: format!("rmw_cerulion_{}", std::process::id()),
         ..Default::default()

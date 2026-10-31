@@ -279,6 +279,10 @@ fn views_for_archetype_pins_the_ruled_table_for_every_variant() {
         // view covers every marker with no extra blueprint work.
         // An absent `markers` array degrades to the dump.
         (A::MarkerArray, &[Spatial3d, TextDocument]),
+        // The live voxel map draws cubes, walls, edges and a trail on CHILD
+        // entities of the topic, so ONE spatial3d view rooted at the topic covers
+        // them; its arm never dumps, so no status pane.
+        (A::VoxelMap, &[Spatial3d]),
     ];
     assert_covers_every_archetype(oracle);
     for (kind, expected) in oracle {
@@ -380,6 +384,12 @@ fn archetype_components_pins_the_rendered_families_for_every_variant() {
                 "Clear",
             ],
         ),
+        // The live voxel map: per-tile cubes, the wall mesh, the wall outlines
+        // and trail, and the recursive Clear a new epoch logs.
+        (
+            A::VoxelMap,
+            &["VoxelGridMap", "Mesh3D", "LineStrips3D", "Clear"],
+        ),
     ];
     assert_covers_every_archetype(oracle);
     for (kind, expected) in oracle {
@@ -424,6 +434,7 @@ fn archetype_wire_name_pins_every_variants_protocol_string() {
         (A::PoseArray3D, "PoseArray3D"),
         (A::VideoStream, "VideoStream"),
         (A::MarkerArray, "MarkerArray"),
+        (A::VoxelMap, "VoxelMap"),
         (A::AnyValues, "AnyValues"),
     ];
     assert_covers_every_archetype(oracle);
@@ -495,7 +506,10 @@ fn degradable_archetypes_are_exactly_the_hand_oracle_set() {
             | A::Odometry
             | A::LaserScan
             | A::SportModeState
-            | A::TextLog => false,
+            | A::TextLog
+            // Classified by the probe its arm decodes with; an unknown op is
+            // skipped and warned, never dumped.
+            | A::VoxelMap => false,
         };
         assert_eq!(
             kind.can_degrade_to_dump(),

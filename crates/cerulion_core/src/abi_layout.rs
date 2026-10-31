@@ -98,7 +98,7 @@
 //!   cdylib are built together on one machine. Pinning their sizes here would
 //!   pin the platform, not the ABI.
 //! - **`crate::doorbell::Doorbell`** (held by value as `Option<Doorbell>` in
-//!   `CerulionPublisher`) — it has TWO `#[cfg]`-selected definitions with
+//!   `CerulionPublisher`) has THREE `#[cfg]`-selected definitions (linux, macos, neither) with
 //!   different field sets, so a portable field-set pin would need per-platform
 //!   tables. Its parent's field set is pinned; its own is not.
 //! - **The closure BELOW `TransportManager`.** The manager itself IS pinned
@@ -133,6 +133,22 @@
 //! every 64-bit target we build. A `const` assertion below refuses a 32-bit
 //! target outright rather than reporting a wall of confusing offset diffs.
 //!
+//! The ORDER a `FieldSetOnly` row is packed in IS pinned, on ONE target. The
+//! permutations are measured on aarch64-apple-darwin and the arm that judges them
+//! returns early everywhere else, printing what it skipped, so a re-pack on Linux
+//! or on a target with no wake primitive is seen by nothing here. What is judged
+//! on every target is the field SET of every row and the absolute offsets of the
+//! `Pinned` ones, so the gap is exactly a size-driven reordering of a row that
+//! claims order alone, never an added, removed or retyped field. Closing it needs
+//! the permutation measured per target and selected by `#[cfg]`, which is a
+//! measurement run on each target rather than a table edit.
+//!
+//! A row measured from an ENUM carries no field offsets, so both of those halves
+//! are empty for it and [`ENUM_PAYLOADS`] is what says why: either no variant
+//! holds a type this crate defines, or another row pins what the variants hold,
+//! or the payload is outside this table's closure. Its arm checks every named row
+//! exists, so an empty pair of brackets cannot read as "checked".
+//!
 //! Everything embedding an `iceoryx2` port, a `std::sync::Mutex` or a
 //! `Doorbell` is [`Layout::FieldSetOnly`]: its field NAMES and COUNT are
 //! pinned (portable, and enough to fail M1 with the bump instruction), its
@@ -147,8 +163,8 @@
 //! ## Toolchain dependence
 //!
 //! `repr(Rust)` field order is not guaranteed stable across rustc releases.
-//! Local rustc is 1.96; CI's test jobs track auto-updated `stable` (the MSRV
-//! 1.93 job only `cargo check`s). No drift has been observed, and a future
+//! CI's test jobs track auto-updated `stable` (the MSRV 1.95 job only
+//! `cargo check`s). No drift has been observed, and a future
 //! rustc that reorders fields would fail this pin with an offset diff on an
 //! unchanged tree — which is a *correct* signal to re-snapshot, not a false
 //! alarm.
@@ -265,10 +281,38 @@ enum Layout {
         /// Parallel to [`Expected::fields`].
         offsets: &'static [usize],
     },
-    /// Only the field NAMES and COUNT are pinned — the struct embeds a type
-    /// whose size differs per platform (see the module docs). `reason` is
-    /// printed on a mismatch so the next reader does not have to re-derive it.
-    FieldSetOnly { reason: &'static str },
+    /// The field NAMES, their COUNT, and the ORDER the compiler packs them in
+    /// are pinned; the absolute numbers are not, because the struct embeds a type
+    /// whose size differs per platform (see the module docs). The ORDER is pinned
+    /// on the REFERENCE TARGET alone, aarch64-apple-darwin, where the
+    /// permutations were measured. `reason` is printed on a mismatch so the next
+    /// reader does not have to re-derive it.
+    FieldSetOnly {
+        reason: &'static str,
+        /// The rank order of this struct's field OFFSETS, parallel to
+        /// [`Expected::fields`]: `ranks[i]` is the position of the i-th declared
+        /// field once the fields are sorted by offset, ties broken by declaration
+        /// order. It is therefore always a permutation of `0..fields.len()`,
+        /// including when two fields share an offset. Empty for an enum, which
+        /// carries no field offsets.
+        ///
+        /// Why the ORDER is pinned when the numbers cannot be: a re-pack is
+        /// invisible to the other two claims. A field whose TYPE changes can leave
+        /// the struct's size, its alignment and its field set exactly as they were
+        /// and still move every field after it, and a consumer built against the
+        /// older packing then reads a field where this core does not write one.
+        ///
+        /// What this cannot see: a re-pack that preserves the order. A field
+        /// growing or shrinking moves every later offset and leaves this
+        /// permutation identical, so a same-order size change is carried by
+        /// [`crate::CERULION_ABI_VERSION`] alone.
+        ///
+        /// What this does not REACH: any target but aarch64-apple-darwin. The arm
+        /// returns early elsewhere and says so, so a re-pack on Linux, or on a
+        /// target with no wake primitive, is judged by nothing. The field set and
+        /// the `Pinned` rows' offsets are judged everywhere by the sibling arm.
+        ranks: &'static [u8],
+    },
 }
 
 /// One row of the snapshot.
@@ -284,14 +328,14 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 22;
+const EXPECTED_ABI: u32 = 28;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
      modules";
 const IOX2_PORTS_AND_DOORBELL: &str =
-    "embeds iceoryx2 port types by value AND `Option<crate::doorbell::Doorbell>`, which has two \
-     `#[cfg]`-selected definitions";
+    "embeds iceoryx2 port types by value AND `Option<crate::doorbell::Doorbell>`, which has \
+     several `#[cfg]`-selected definitions";
 const IOX2_SAMPLE: &str = "embeds an iceoryx2 `Sample` / `UniquePublisherId` by value";
 const STD_MUTEX: &str = "embeds `std::sync::Mutex`, whose inner lock is platform-specific";
 const IOX2_NODE_AND_MUTEXES: &str =
@@ -334,12 +378,16 @@ static EXPECTED: &[Expected] = &[
         fields: &[],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS_AND_DOORBELL,
+            ranks: &[],
         },
     },
     Expected {
         name: "AnySubscriber",
         fields: &[],
-        layout: Layout::FieldSetOnly { reason: IOX2_PORTS },
+        layout: Layout::FieldSetOnly {
+            reason: IOX2_PORTS,
+            ranks: &[],
+        },
     },
     Expected {
         name: "CerulionPublisher",
@@ -348,6 +396,9 @@ static EXPECTED: &[Expected] = &[
             "publisher",
             "notifier",
             "listener",
+            "last_listener_count",
+            "self_drains_armed",
+            "next_self_drain_rearm",
             "sequence",
             "initial_sequence",
             "clock",
@@ -382,6 +433,14 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS_AND_DOORBELL,
+            // Re-measured at ABI 26 on aarch64-apple-darwin, the one target this
+            // row's arm judges: the doorbell field's rank moved from 19 to 3 and
+            // the sixteen fields ranked 3 to 18 each moved up by one. No other
+            // field moved, and the field SET did not change.
+            ranks: &[
+                8, 9, 0, 1, 12, 35, 6, 29, 30, 10, 28, 13, 14, 31, 15, 4, 5, 32, 16, 17, 18, 2, 19,
+                3, 11, 20, 21, 36, 33, 37, 22, 23, 24, 25, 26, 34, 7, 27,
+            ],
         },
     },
     Expected {
@@ -414,8 +473,22 @@ static EXPECTED: &[Expected] = &[
             "held_head_reoffers",
             "held_head_warned",
             "served_sequence",
+            // v24: the REPLAY read gate for this input's stage. A pointer
+            // added to a `repr(Rust)` struct, whose field placement this row
+            // does not pin (it is `FieldSetOnly`), NOT an additive change:
+            // `NodeContext` owns this struct through `AnySubscriber`, so a
+            // cdylib built against any earlier core would index it at stale
+            // offsets (the v24 lib.rs
+            // paragraph).
+            "replay_plan",
         ],
-        layout: Layout::FieldSetOnly { reason: IOX2_PORTS },
+        layout: Layout::FieldSetOnly {
+            reason: IOX2_PORTS,
+            ranks: &[
+                7, 10, 5, 0, 9, 6, 11, 12, 13, 8, 14, 19, 1, 2, 24, 20, 3, 4, 25, 15, 21, 22, 16,
+                23, 17, 18,
+            ],
+        },
     },
     Expected {
         name: "SampleGate",
@@ -481,6 +554,7 @@ static EXPECTED: &[Expected] = &[
         fields: &["id", "first_seq", "newest_seq", "newest_ts"],
         layout: Layout::FieldSetOnly {
             reason: IOX2_SAMPLE,
+            ranks: &[0, 2, 3, 1],
         },
     },
     // This row did NOT move when `BlockProbe` grew 72 -> 80.
@@ -504,6 +578,7 @@ static EXPECTED: &[Expected] = &[
         fields: &[],
         layout: Layout::FieldSetOnly {
             reason: IOX2_SAMPLE,
+            ranks: &[],
         },
     },
     Expected {
@@ -559,8 +634,29 @@ static EXPECTED: &[Expected] = &[
     },
     Expected {
         name: "ReadOutcomeStage",
-        fields: &["input_idx", "role", "capacity", "armed", "pending", "inner"],
-        layout: Layout::FieldSetOnly { reason: STD_MUTEX },
+        // Re-snapshot: `records_every_consult: AtomicBool` joins the field set
+        // (the consult rule a replay adopts from the bag's trace format), and
+        // the field ORDER moves with it (MEASURED via `dump_measured_table`,
+        // never hand computed): the new byte takes offset rank 5 and `role`
+        // moves from rank 5 to 6, while the other five fields keep the ranks
+        // they had. The order is this row's whole numeric claim, since a row
+        // that embeds a `std::sync::Mutex` pins no absolute offset. The VERSION
+        // that carries this field is the one the `PlanInner` row below states:
+        // the gate's own struct is pinned by OFFSET and gains the rule byte in
+        // the same change, and one version describes one shipped layout.
+        fields: &[
+            "input_idx",
+            "role",
+            "capacity",
+            "armed",
+            "records_every_consult",
+            "pending",
+            "inner",
+        ],
+        layout: Layout::FieldSetOnly {
+            reason: STD_MUTEX,
+            ranks: &[3, 6, 1, 4, 5, 2, 0],
+        },
     },
     Expected {
         name: "StageInner",
@@ -645,10 +741,123 @@ static EXPECTED: &[Expected] = &[
             offsets: &[],
         },
     },
+    // ---- the ENFORCEMENT side (v24) -------------------------------------
+    Expected {
+        name: "ReadPlanStage",
+        fields: &["key", "rim", "blocker", "armed", "now_step", "inner"],
+        // MEASURED via `dump_measured_table`, never hand computed: the field
+        // order this target packs the row in, as the permutation of its
+        // offsets. The row entered the table at v24 and its order is pinned
+        // from v25, the version that made a re-pack of this family visible.
+        layout: Layout::FieldSetOnly {
+            reason: STD_MUTEX,
+            ranks: &[0, 3, 4, 5, 1, 2],
+        },
+    },
+    Expected {
+        name: "PlanInner",
+        fields: &[
+            "step",
+            "installed",
+            "due",
+            "cursor",
+            "admitted_this_step",
+            "lifetime_admitted",
+            "refused_consults",
+            "unplanned_consults",
+            "violations",
+            "violations_dropped",
+            "mismatches",
+            "unusable",
+            "rule",
+        ],
+        // Re-snapshot (MEASURED via `dump_measured_table`, never hand
+        // computed): `rule: ConsultRule` (one byte) lands in the tail padding
+        // after the two bools, so the size stays 112 and no other field moves.
+        // Earlier in this family: `unplanned_consults: u64` grew the struct
+        // 104 -> 112 bytes and moved the two bools and `admitted_this_step` in
+        // the tail; `lifetime_held` was renamed `refused_consults`, a NAME
+        // change with no layout effect.
+        //
+        // The ABI VERSION is 27. Version 26 describes a different layout move,
+        // the macOS doorbell mapping that re-packs `CerulionPublisher`, and one
+        // number cannot describe two: a cdylib exports one version and a host
+        // compares one number, so a core that writes the rule byte and a library
+        // built against the doorbell packing would both read 26 and load each
+        // other. 27 is one above the highest number any shipped layout holds.
+        // This struct is pinned by OFFSET, so a host and a cdylib built from
+        // different trees read the rule byte at different places, and the rule
+        // decides whether a consult the step's plan holds no position for is a
+        // counted number or a replay divergence. The re-snapshot rule the
+        // `StagedReadOutcome` entry states covers a second change to a FIELD SET
+        // inside one release, not a field added to a pinned offset list.
+        layout: Layout::Pinned {
+            size: 112,
+            align: 8,
+            offsets: &[48, 108, 0, 56, 104, 64, 72, 80, 24, 88, 96, 109, 110],
+        },
+    },
+    Expected {
+        name: "DueRead",
+        fields: &["shape", "served_seq"],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 4,
+            offsets: &[8, 0],
+        },
+    },
+    Expected {
+        name: "DueShape",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 8,
+            align: 4,
+            offsets: &[],
+        },
+    },
+    Expected {
+        name: "ReplayReadViolation",
+        fields: &["key", "step", "kind"],
+        layout: Layout::Pinned {
+            size: 56,
+            align: 8,
+            offsets: &[0, 48, 32],
+        },
+    },
+    Expected {
+        name: "ReplayReadViolationKind",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 4,
+            offsets: &[],
+        },
+    },
+    Expected {
+        name: "GateBlocker",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 1,
+            align: 1,
+            offsets: &[],
+        },
+    },
+    Expected {
+        name: "ConsultRule",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 1,
+            align: 1,
+            offsets: &[],
+        },
+    },
     Expected {
         name: "QosEventStore",
         fields: &["expect", "promise", "liveliness"],
-        layout: Layout::FieldSetOnly { reason: STD_MUTEX },
+        layout: Layout::FieldSetOnly {
+            reason: STD_MUTEX,
+            ranks: &[0, 1, 2],
+        },
     },
     // ---- the two `Arc`-reached owners a cdylib's own code indexes --------
     Expected {
@@ -670,12 +879,16 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_NODE_AND_MUTEXES,
+            ranks: &[4, 0, 1, 5, 2, 12, 6, 7, 8, 9, 10, 11, 3],
         },
     },
     Expected {
         name: "PublishTrace",
         fields: &["depth", "entries", "bag"],
-        layout: Layout::FieldSetOnly { reason: STD_FILE },
+        layout: Layout::FieldSetOnly {
+            reason: STD_FILE,
+            ranks: &[2, 1, 0],
+        },
     },
     Expected {
         name: "PublishTraceEntry",
@@ -704,12 +917,18 @@ static EXPECTED: &[Expected] = &[
             "file_index",
             "current",
         ],
-        layout: Layout::FieldSetOnly { reason: STD_FILE },
+        layout: Layout::FieldSetOnly {
+            reason: STD_FILE,
+            ranks: &[1, 3, 0, 4, 2],
+        },
     },
     Expected {
         name: "CurrentFile",
         fields: &["path", "writer", "bytes_written"],
-        layout: Layout::FieldSetOnly { reason: STD_FILE },
+        layout: Layout::FieldSetOnly {
+            reason: STD_FILE,
+            ranks: &[0, 1, 2],
+        },
     },
     Expected {
         name: "BagRetention",
@@ -721,6 +940,86 @@ static EXPECTED: &[Expected] = &[
         },
     },
 ];
+
+/// What pins the PAYLOAD of a row whose field list is empty.
+///
+/// The macro measures no field offsets for an enum, so such a row carries an
+/// empty `fields` list and an empty `ranks` vector: the field-set half compares
+/// two empty lists and the order half permutes nothing. The bytes a cdylib reads
+/// through that enum are described by ANOTHER row, or by no row in this table, and
+/// this is which of the two.
+enum EnumPayload {
+    /// No variant holds a type this crate defines by value. Every payload is
+    /// absent, a primitive, or a `std` type, so the row's own size and align
+    /// bound the whole layout.
+    NothingFirstParty,
+    /// Each named row pins what a variant holds by value. The names are resolved
+    /// against [`EXPECTED`], so a payload row that is renamed or dropped fails
+    /// here instead of leaving this row pointing at nothing.
+    PinnedBy(&'static [&'static str]),
+    /// A variant holds a first-party type this table does not cover. `reason`
+    /// names the type and the scope rule that excludes it.
+    NotCovered(&'static str),
+}
+
+/// Every [`EXPECTED`] row with an empty field list, against what pins its variant
+/// payloads. Read by `every_enum_row_names_what_pins_its_payload`, which also
+/// refuses a row this list does not carry, so an enum added to the table cannot
+/// ship with its payload unstated.
+static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
+    (
+        "AnyPublisher",
+        EnumPayload::PinnedBy(&["CerulionPublisher"]),
+    ),
+    (
+        "AnySubscriber",
+        EnumPayload::PinnedBy(&["CerulionSubscriber"]),
+    ),
+    (
+        "BackpressureProbe",
+        EnumPayload::PinnedBy(&["SampleGate", "DropOldestProbe", "BlockProbe"]),
+    ),
+    (
+        "FrozenSlot",
+        EnumPayload::NotCovered(
+            "its `Sample` variant holds an `InboundSample`, which embeds an iceoryx2 \
+             `Sample` and is excluded as a third-party type held by value, and its `Err` \
+             variant holds a `TransportError`; neither carries a row here, so nothing in \
+             this table describes what this enum holds",
+        ),
+    ),
+    ("ConsumeMode", EnumPayload::NothingFirstParty),
+    ("ReadOutcomeKind", EnumPayload::NothingFirstParty),
+    ("ReadSiteRole", EnumPayload::NothingFirstParty),
+    ("ReadStageRole", EnumPayload::NothingFirstParty),
+    ("DueShape", EnumPayload::NothingFirstParty),
+    ("ReplayReadViolationKind", EnumPayload::NothingFirstParty),
+    ("GateBlocker", EnumPayload::NothingFirstParty),
+    ("ConsultRule", EnumPayload::NothingFirstParty),
+    ("HistoryDepth", EnumPayload::NothingFirstParty),
+];
+
+/// The rank order of `fields`' offsets: the position of each declared field once
+/// the fields are sorted by offset, ties broken by declaration order.
+///
+/// A permutation rather than the offsets themselves, because a row that reaches a
+/// vendored or configuration-selected type cannot claim absolute numbers on every
+/// platform, while the ORDER the compiler packs the fields in is what a consumer
+/// built against an older layout actually reads against.
+fn offset_ranks(fields: &[MeasuredField]) -> Vec<u8> {
+    assert!(
+        fields.len() <= u8::MAX as usize,
+        "abi_layout: a struct with more than {} fields needs a wider rank type",
+        u8::MAX
+    );
+    let mut order: Vec<usize> = (0..fields.len()).collect();
+    order.sort_by_key(|&i| (fields[i].offset, i));
+    let mut ranks = vec![0u8; fields.len()];
+    for (rank, &i) in order.iter().enumerate() {
+        ranks[i] = rank as u8;
+    }
+    ranks
+}
 
 /// Every FFI-crossing struct, measured in the module that defines it.
 fn measured() -> Vec<MeasuredStruct> {
@@ -783,7 +1082,8 @@ fn every_ffi_crossing_struct_matches_its_pinned_layout() {
         );
 
         match &expected.layout {
-            Layout::FieldSetOnly { reason } => {
+            Layout::FieldSetOnly { reason, ranks } => {
+                let _ = ranks;
                 // Absolute numbers are deliberately not claimed for this row
                 // (it {reason}); the field set above is the pin. See the
                 // module docs.
@@ -874,13 +1174,244 @@ fn the_staged_wire_discriminants_are_pinned() {
     );
 }
 
-/// Print the measured table in source form, for re-snapshotting after a
-/// deliberate ABI bump. `#[ignore]`d — it asserts nothing; it is the tool the
-/// two failure messages above point at.
+/// Every row with an empty field list says what pins its variant payloads, and
+/// every row it names is in this table.
+///
+/// The claim the other arms cannot make. An enum row's `fields` and `ranks` are
+/// both empty, so the field-set half compares two empty lists and the order half
+/// permutes nothing: both pass on a row that describes none of the bytes a cdylib
+/// reads through that enum. `ENUM_PAYLOADS` is the chain written down, and this
+/// arm is what keeps it from going stale: a payload row renamed or dropped fails
+/// here, an enum added to the table with its payload unstated fails here, and an
+/// entry whose row stopped being measured fails on the count.
+///
+/// What this cannot see: an entry that states the wrong KIND for its row. The
+/// kinds are a declaration about a variant LIST, which no measurement of size,
+/// align or offset recovers, so a payload that became first-party while the entry
+/// still reads `NothingFirstParty` is caught by the compile-time variant pin
+/// naming the new variant rather than by this. The one measured bound is below: a
+/// chain may not name a row LARGER than the enum, because a variant holds its
+/// payload by value.
 #[test]
-#[ignore = "re-snapshot helper: prints the table, asserts nothing"]
-fn dump_measured_table() {
+fn every_enum_row_names_what_pins_its_payload() {
+    let measured = measured();
+    let size_of_row = |name: &str| measured.iter().find(|m| m.name == name).map(|m| m.size);
+
+    let mut judged = 0usize;
+    let mut chained = 0usize;
+    for m in &measured {
+        let Some(expected) = EXPECTED.iter().find(|e| e.name == m.name) else {
+            continue;
+        };
+        if !expected.fields.is_empty() {
+            continue;
+        }
+        judged += 1;
+        let entries = ENUM_PAYLOADS.iter().filter(|(n, _)| *n == m.name).count();
+        assert_eq!(
+            entries, 1,
+            "abi_layout: `{}` has an empty field list and {entries} entries in \
+             ENUM_PAYLOADS. The macro measures no field offsets for an enum, so this row's \
+             field-set and field-order halves both pass on anything: exactly one entry must \
+             say whether another row pins what its variants hold.",
+            m.name
+        );
+        let (_, payload) = ENUM_PAYLOADS
+            .iter()
+            .find(|(n, _)| *n == m.name)
+            .expect("the count above is one");
+        let rows = match payload {
+            EnumPayload::NothingFirstParty => continue,
+            EnumPayload::NotCovered(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "abi_layout: `{}` is marked as carrying a payload this table does not \
+                     cover and gives no reason. The reason is what stops the next reader \
+                     re-deriving the scope rule.",
+                    m.name
+                );
+                continue;
+            }
+            EnumPayload::PinnedBy(rows) => rows,
+        };
+        assert!(
+            !rows.is_empty(),
+            "abi_layout: `{}` is marked as pinned through other rows and names none. Name \
+             them, or state the entry as NothingFirstParty or NotCovered.",
+            m.name
+        );
+        chained += 1;
+        for want in *rows {
+            assert!(
+                EXPECTED.iter().any(|e| e.name == *want),
+                "abi_layout: `{}`'s payload is declared pinned by `{want}`, which is no row \
+                 of this table. A cdylib reads that payload through this enum, so the row \
+                 describing it must exist: restore it, or re-state the entry.\
+                 {BUMP_INSTRUCTION}",
+                m.name
+            );
+            if let Some(inner) = size_of_row(want) {
+                assert!(
+                    m.size >= inner,
+                    "abi_layout: `{}` measures {} bytes and `{want}`, the row it names as \
+                     its payload, measures {inner}. A variant holds its payload BY VALUE, so \
+                     the enum cannot be the smaller of the two: the chain names the wrong \
+                     row.",
+                    m.name,
+                    m.size
+                );
+            }
+        }
+    }
+
+    for (name, _) in ENUM_PAYLOADS {
+        assert!(
+            EXPECTED
+                .iter()
+                .any(|e| e.name == *name && e.fields.is_empty()),
+            "abi_layout: ENUM_PAYLOADS carries `{name}`, which is no row of this table with \
+             an empty field list. A stale entry states a chain nobody walks."
+        );
+    }
+
+    // Rule: a gate reports what it judged, and the floor is DERIVED from the
+    // table rather than written here, so an enum that stopped being measured
+    // cannot land on a hand-copied number and pass.
+    let want = EXPECTED.iter().filter(|e| e.fields.is_empty()).count();
+    assert_eq!(
+        judged, want,
+        "abi_layout: judged {judged} empty-field rows, the table carries {want}. An \
+         unjudged row is an unpinned one: its struct left the measurement closure, or its \
+         module's `abi_layout_pins()` lost its entry."
+    );
+    assert!(
+        chained > 0,
+        "abi_layout: no empty-field row names a row that pins its payload, so the chain \
+         this arm exists to walk was not walked once."
+    );
+    println!(
+        "abi_layout: judged the payload statement of {judged} empty-field rows, {chained} of \
+         them chained to another row"
+    );
+}
+
+/// The one target the `FieldSetOnly` rank rows in [`EXPECTED`] are measured on.
+///
+/// rustc's `repr(Rust)` ordering key reads each field's SIZE as well as its
+/// alignment, and these rows embed types whose size differs between macOS and
+/// Linux, so a permutation taken on one target can differ on another for a reason
+/// that is not an ABI change. One name, read by the arm that asserts the ranks and
+/// by the helper that prints them.
+const REFERENCE_TARGET: &str = "aarch64-apple-darwin";
+
+/// Whether this build is [`REFERENCE_TARGET`].
+fn on_reference_target() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+/// Every `FieldSetOnly` row keeps the ORDER the compiler packs its fields in, on
+/// the reference target.
+///
+/// The claim the other two structurally cannot see. A struct that reaches a
+/// vendored type cannot claim absolute offsets, so its row claims the field set and
+/// this permutation; a re-pack leaves the size, the alignment and the field set
+/// untouched and moves fields past each other, which is exactly the shape that
+/// reaches a consumer compiled against the older packing as garbage at a stale
+/// offset.
+///
+/// Scoped to one target, for the same reason these rows claim no absolute numbers:
+/// rustc's `repr(Rust)` ordering key reads each field's SIZE as well as its
+/// alignment, and these are the rows whose embedded types change size between
+/// macOS and Linux, so a permutation taken on one can differ on the other for a
+/// reason that has nothing to do with the ABI. The table is measured on
+/// aarch64-apple-darwin; elsewhere the arm prints what it skipped and why rather
+/// than asserting a permutation it has no snapshot for.
+#[test]
+fn every_field_set_only_struct_keeps_its_pinned_field_order() {
+    if !on_reference_target() {
+        println!(
+            "abi_layout: field ORDER not judged on this target. The pinned permutations are \
+             measured on {REFERENCE_TARGET}, and rustc's field ordering reads each field's \
+             size, which these rows' embedded types change between platforms. The field SET \
+             and every `Pinned` row's absolute offsets are still judged by the sibling arm \
+             on every target."
+        );
+        return;
+    }
+    let measured = measured();
+    let mut judged = 0usize;
+    let mut with_fields = 0usize;
+    for m in &measured {
+        let Some(expected) = EXPECTED.iter().find(|e| e.name == m.name) else {
+            continue;
+        };
+        let Layout::FieldSetOnly { reason, ranks } = &expected.layout else {
+            continue;
+        };
+        judged += 1;
+        if !m.fields.is_empty() {
+            with_fields += 1;
+        }
+        let got = offset_ranks(&m.fields);
+        assert_eq!(
+            got.as_slice(),
+            *ranks,
+            "abi_layout: `{}` is packed in a different field ORDER than the table pins \
+             (expected {:?}, measured {:?}). Its size, alignment and field set can all be \
+             unchanged and still leave a field at a different offset: this row claims no \
+             absolute numbers because it {reason}.{BUMP_INSTRUCTION}",
+            m.name,
+            ranks,
+            got
+        );
+    }
+    // Rule: a gate reports what it judged, and zero judged is a finding. The
+    // count is DERIVED from the table rather than written here, so a row that stops
+    // being measured cannot land on a hand-copied floor and pass.
+    let want = EXPECTED
+        .iter()
+        .filter(|e| matches!(e.layout, Layout::FieldSetOnly { .. }))
+        .count();
+    assert_eq!(
+        judged, want,
+        "abi_layout: judged {judged} field-set-only rows, the table carries {want}. An \
+         unjudged row is an unpinned one: either its struct left the measurement closure or \
+         its module's `abi_layout_pins()` lost its entry."
+    );
+    assert!(
+        with_fields > 0,
+        "abi_layout: every field-set-only row judged was an enum, which carries no field \
+         offsets, so no field ORDER was checked at all."
+    );
+    println!(
+        "abi_layout: judged the field order of {judged} field-set-only rows, {with_fields} of \
+         them carrying fields"
+    );
+}
+
+/// The measured table in source form, or the reason this target may not print one.
+///
+/// `on_reference` is the caller's answer to [`on_reference_target`], taken as an
+/// argument so both verdicts can be read on one machine.
+///
+/// It REFUSES off the reference target. The rank rows this prints are a
+/// permutation rustc chose for THIS build's field sizes, so off the reference
+/// target they are true where they were measured and wrong to paste into
+/// [`EXPECTED`], which the sibling arm judges on the reference target alone. The
+/// text it does print names the target it measured, so a pasted row carries its
+/// provenance.
+fn measured_table_source(on_reference: bool) -> Result<String, String> {
+    if !on_reference {
+        return Err(format!(
+            "abi_layout: this helper prints the table for pasting into EXPECTED, whose \
+             field-order rows are measured on {REFERENCE_TARGET}, and refuses on any other \
+             target. rustc orders fields by their sizes and these rows embed types that \
+             change size between platforms, so the ranks this build would print are true \
+             here and wrong there. Re-snapshot on {REFERENCE_TARGET}."
+        ));
+    }
     let mut out = String::new();
+    out.push_str(&format!("// abi_layout: measured on {REFERENCE_TARGET}\n"));
     out.push_str("static EXPECTED: &[Expected] = &[\n");
     for m in measured() {
         let pinned = EXPECTED
@@ -899,12 +1430,67 @@ fn dump_measured_table() {
                 m.size, m.align, offsets
             ));
         } else {
-            out.push_str("        layout: Layout::FieldSetOnly { reason: /* keep */ },\n");
+            let ranks = offset_ranks(&m.fields);
+            out.push_str(&format!(
+                "        layout: Layout::FieldSetOnly {{ reason: /* keep */, ranks: &{ranks:?} }},\n"
+            ));
         }
         out.push_str("    },\n");
     }
     out.push_str("];\n");
-    // The whole point of this helper is to put text in front of a human under
-    // `--nocapture`; it is a test, not library code, so `println!` is correct.
-    println!("{out}");
+    Ok(out)
+}
+
+/// Print the measured table in source form, for re-snapshotting after a
+/// deliberate ABI bump. `#[ignore]`d, and it asserts nothing on the reference
+/// target: it is the tool the two failure messages above point at.
+///
+/// Off the reference target it fails instead of printing, which is
+/// [`measured_table_source`]'s refusal reaching the reader who asked for a table
+/// to paste.
+#[test]
+#[ignore = "re-snapshot helper: prints the table on the reference target, asserts nothing"]
+fn dump_measured_table() {
+    match measured_table_source(on_reference_target()) {
+        // The whole point of this helper is to put text in front of a human under
+        // `--nocapture`; it is a test, not library code, so `println!` is correct.
+        Ok(out) => println!("{out}"),
+        Err(why) => panic!("{why}"),
+    }
+}
+
+/// The dump helper's target gate, read on BOTH sides on one machine.
+///
+/// The arm the refusal needs: `dump_measured_table` is `#[ignore]`d, so no run of
+/// the suite reaches its gate, and the gate is the whole of what keeps a rank row
+/// measured elsewhere out of [`EXPECTED`]. Taking the verdict as an argument is
+/// what lets this arm read the refusal on the target that does not refuse.
+#[test]
+fn the_table_dump_refuses_off_the_reference_target() {
+    let refused = measured_table_source(false).expect_err(
+        "off the reference target the helper must refuse: the ranks it would print are a \
+         permutation of THIS build's field sizes, true here and wrong in the table",
+    );
+    assert!(
+        refused.contains(REFERENCE_TARGET),
+        "the refusal must name the target a re-snapshot belongs on; got: {refused}"
+    );
+    let printed = measured_table_source(true)
+        .expect("on the reference target the helper prints the table rather than refusing");
+    assert!(
+        printed.contains(REFERENCE_TARGET),
+        "the printed table must name the target it measured, so a row pasted out of it \
+         carries the provenance the ranks depend on"
+    );
+    assert!(
+        printed.contains("Layout::FieldSetOnly"),
+        "the printed table must carry at least one rank row, which is the output this gate \
+         is about; without one the refusal guards nothing"
+    );
+    println!(
+        "abi_layout: the table dump refused off the reference target and printed {} bytes on \
+         it; this build is {}{REFERENCE_TARGET}",
+        printed.len(),
+        if on_reference_target() { "" } else { "not " }
+    );
 }

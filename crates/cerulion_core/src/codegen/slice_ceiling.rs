@@ -147,7 +147,7 @@ fn typed_ceiling(bytes: usize) -> MaxSliceLen {
         .ok()
         .and_then(MaxSliceLen::try_new)
         .expect(
-            "the tier table returned a budget outside MaxSliceLen's bounds (>= 32 B, \
+            "the tier table returned a budget outside MaxSliceLen's bounds (>= 40 B, \
              <= u32::MAX) — the table and the wire bounds have drifted; fix the table",
         )
 }
@@ -213,7 +213,7 @@ impl SliceCeilingOverrides {
     ///   be a silently-inert override, so none is stored;
     /// * a bytes value that is not an unsigned integer, exceeds `u32::MAX`
     ///   (`WireHeader::total_size` is `u32` — the same bound
-    ///   [`MaxSliceLen`] enforces), or sits below the 32-byte wire-header
+    ///   [`MaxSliceLen`] enforces), or sits below the 40-byte wire-header
     ///   floor (zero included).
     ///
     /// Empty segments (a trailing comma, a blank value) are skipped silently —
@@ -301,7 +301,7 @@ impl SliceCeilingOverrides {
                 tracing::warn!(
                     entry = %entry,
                     "malformed {RMW_SLICE_CEILING_ENV} entry: the bytes value is \
-                     below the 32-byte wire-header floor (a slot must hold at least \
+                     below the 40-byte wire-header floor (a slot must hold at least \
                      the WireHeader; zero included); entry SKIPPED"
                 );
                 continue;
@@ -570,20 +570,20 @@ mod tests {
         });
     }
 
-    /// The wire-header floor, pinned on BOTH sides: 31 (and 0) rejected
-    /// loudly, 32 accepted exactly.
+    /// The wire-header floor, pinned on BOTH sides: 39 (and 0) rejected
+    /// loudly, 40 accepted exactly.
     #[traced_test]
     #[test]
     fn the_wire_header_floor_is_pinned_on_both_sides() {
-        let overrides = SliceCeilingOverrides::parse("a/B:0,c/D:31,e/F:32");
+        let overrides = SliceCeilingOverrides::parse("a/B:0,c/D:39,e/F:40");
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides.get("a/B"), None);
         assert_eq!(overrides.get("c/D"), None);
-        assert_eq!(overrides.get("e/F").map(MaxSliceLen::get), Some(32));
+        assert_eq!(overrides.get("e/F").map(MaxSliceLen::get), Some(40));
         logs_assert(|lines: &[&str]| {
-            match count_level(lines, "WARN", "below the 32-byte wire-header floor") {
+            match count_level(lines, "WARN", "below the 40-byte wire-header floor") {
                 2 => Ok(()),
-                n => Err(format!("expected 2 floor WARNs (0 and 31), got {n}")),
+                n => Err(format!("expected 2 floor WARNs (0 and 39), got {n}")),
             }
         });
     }

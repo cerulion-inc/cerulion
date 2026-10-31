@@ -302,17 +302,46 @@ impl TraceDrainState {
     /// either side of. It is the wrong rule, and it is wrong in the ACCEPTING
     /// direction, which is the direction this whole verdict exists to close.
     ///
-    /// A capture is ONE TIME WINDOW over every ring of a run, and those rings
-    /// step in LOCKSTEP: the cross-rank step boundaries of one
-    /// step are the same step, so a step number means the same instant on every
-    /// ring. If the capture covers steps 10 to 100 and ring A's records for
-    /// those steps were provably DESTROYED, the capture's trace is incomplete
-    /// for those steps — whichever ring happened to supply the record at 200
-    /// that fixes the upper bound. Judging A's hole against A's own thinner
-    /// bounds would UN-REFUSE exactly that capture, i.e. stamp resimmable on a
-    /// trace known to be missing in-window records. A false refusal costs an
-    /// operator one capture; a false acceptance replays a different run and says
-    /// nothing.
+    /// A capture is ONE TIME WINDOW over every ring of a run, and the trace it
+    /// carries is the UNION of what every ring contributed (see
+    /// [`gap_spanning`](Self::gap_spanning)), so a hole in ANY ring is a hole in
+    /// the capture's trace. If the capture covers steps 10 to 100 and ring A's
+    /// records for those steps were provably DESTROYED, the capture's trace is
+    /// incomplete for those steps, whichever ring happened to supply the record
+    /// at 200 that fixes the upper bound. Judging A's hole against A's own
+    /// thinner bounds would UN-REFUSE exactly that capture, i.e. stamp
+    /// resimmable on a trace known to be missing in-window records. A false
+    /// refusal costs an operator one capture; a false acceptance replays a
+    /// different run and says nothing.
+    ///
+    /// # What a STEP NUMBER means across rings, and why the rule holds anyway
+    ///
+    /// The bounds are step numbers, and how much one means across rings is
+    /// decided by the run's coordination mode, so the justification is stated
+    /// for both rather than for one. Under the `CERULION_EXECUTION_MODE=lockstep`
+    /// opt-out every rank advances the SAME handed quantum per step and the
+    /// recording's cross-rank boundary targets are EQUAL on every shared step
+    /// (the replay engine's boundary validation enforces exactly that, and
+    /// refuses a bag where it fails), so a step number names the same instant on
+    /// every ring and the capture-wide bounds are EXACT. Under the FREE-RUN
+    /// DEFAULT each rank's gating clock is placed at the shared
+    /// `real_ns()` GO epoch and then wall-follows ONCE per step on its own, with
+    /// no rendezvous holding the ranks together, so cross-rank targets differ on
+    /// essentially every step BY DESIGN and the same validation is mode-gated
+    /// OFF for such a bag. A step number there orders ONE ring's records and
+    /// says nothing about another ring's instant.
+    ///
+    /// The rule survives that, because it is not an equality argument. The
+    /// capture-wide bounds are a SUPERSET of any single ring's own (a `min` over
+    /// more records can only fall, a `max` can only rise), and
+    /// `TraceGap::spans` answers `min <= last_step_before && max >= after`, so
+    /// widening the pair can only turn that answer from false to true. The
+    /// capture-wide rule therefore refuses everything a per-ring rule would
+    /// refuse, in EITHER mode. What the free-run default costs is PRECISION,
+    /// entirely in the refusing direction: a capture whose holed ring was in
+    /// fact continuous over its own records can be refused because another
+    /// ring's steps widened the window. That is the trade the paragraph above
+    /// already takes deliberately.
     ///
     /// The divergence is also not reachable as a WRONG VERDICT on the shipping
     /// recorder, which is worth stating because it bounds what the rule can cost

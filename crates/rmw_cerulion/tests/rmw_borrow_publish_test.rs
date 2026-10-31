@@ -48,6 +48,7 @@ use rmw_cerulion::heaphook::{
     HookApi, TestHookGuard, RC_ERR_ALREADY_ARMED, RC_ERR_NOT_ARMED, RC_OK,
 };
 use rmw_cerulion::runtime::PublisherData;
+use rmw_cerulion::test_seams::capture_output_hash;
 use rmw_cerulion::*;
 
 const ROS_TYPE_FLOAT: u8 = 1;
@@ -218,6 +219,10 @@ struct CF32Seq {
     data: *mut f32,
     size: usize,
     capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -487,6 +492,10 @@ unsafe fn fill_adopted(msg: *mut c_void, angle: f32, ranges: &[f32], frame_id: &
         data: dst as *mut f32,
         size: ranges.len(),
         capacity: ranges.len(),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     set_heap_string(&mut m.frame_id, frame_id);
     dst - msg as usize
@@ -502,6 +511,10 @@ unsafe fn fill_escaped(msg: *mut c_void, angle: f32, ranges: &[f32], frame_id: &
         data: dst,
         size: ranges.len(),
         capacity: ranges.len(),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: false,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: false,
     };
     set_heap_string(&mut m.frame_id, frame_id);
 }
@@ -618,6 +631,67 @@ fn windowed_borrow_adopts_the_fill_and_publishes_zero_copy() {
         );
         assert_eq!(payload2, expected2, "second frame vs its own hand oracle");
         assert_eq!((*pdata).borrow_adopted_count(), 2);
+    }
+}
+
+/// Delivery log / replay compare a publish by the hash of its body. A
+/// windowed frame ships dead gap bytes (here an allocation inside the window
+/// that the fill does not own) and places the payload where the fill left
+/// it, so the hash is taken over the message's packed encoding: two zero-copy
+/// publishes of one message with different gap contents, and a copying
+/// publish of it, capture one hash.
+#[test]
+#[serial]
+fn a_windowed_publish_is_hashed_by_its_message_not_its_gap_bytes() {
+    reset_fake();
+    let _hook = TestHookGuard::install(fake_hook_api());
+    unsafe {
+        let (publisher, subscription, pdata) = setup_pair("hash");
+        let ranges = [1.5f32, -2.25, 3.0];
+        let frame_id = "lidar_link";
+        let mut hashes = Vec::new();
+        for garbage in [0xABu8, 0x5C] {
+            let mut msg: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                rmw_borrow_loaned_message(publisher, ts_ptr(), &mut msg),
+                RMW_RET_OK
+            );
+            let junk = fake_bump(48, 16).expect("the incidental allocation fits the window");
+            std::ptr::write_bytes(junk as *mut u8, garbage, 48);
+            fill_adopted(msg, -0.75, &ranges, frame_id);
+            let (ret, hash) = capture_output_hash(|| {
+                rmw_publish_loaned_message(publisher, msg, std::ptr::null_mut())
+            });
+            assert_eq!(ret, RMW_RET_OK);
+            let (_, payload) = take_raw(subscription);
+            assert!(
+                payload.windows(48).any(|w| w.iter().all(|&b| b == garbage)),
+                "the frame ships the gap bytes (the case under test)"
+            );
+            hashes.push(hash.expect("a windowed publish captures its body"));
+        }
+        assert_eq!(
+            (*pdata).borrow_adopted_count(),
+            2,
+            "both publishes were zero copy"
+        );
+        let mut plain: CScanish = std::mem::zeroed();
+        let plain_ptr = &mut plain as *mut CScanish as *mut c_void;
+        fill_escaped(plain_ptr, -0.75, &ranges, frame_id);
+        let (ret, copied) =
+            capture_output_hash(|| rmw_publish(publisher, plain_ptr, std::ptr::null_mut()));
+        assert_eq!(ret, RMW_RET_OK);
+        let _ = take_raw(subscription);
+        scanish_fini(plain_ptr);
+        let copied = copied.expect("a copying publish captures its body");
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the gap contents do not change the hash"
+        );
+        assert_eq!(
+            hashes[0], copied,
+            "a windowed publish hashes what a copying publish of the message sends"
+        );
     }
 }
 
@@ -825,6 +899,10 @@ fn without_a_hook_the_type_keeps_the_copy_path_and_borrow_is_unsupported() {
             data: heap,
             size: 2,
             capacity: 2,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         };
         set_heap_string(&mut m.frame_id, "plain");
         assert_eq!(
@@ -916,24 +994,18 @@ fn destroying_with_a_cross_thread_armed_window_leaks_the_slot_never_releases_it(
             Some(1),
             "the leaked publisher's iceoryx2 port must STAY registered on the topic"
         );
-        // The documented cost, pinned exactly: rmw topics are provisioned at
-        // iceoryx2's default `max_publishers = 2` (`default_topic_config`
-        // leaves the cap unset and declares `External`, so no single-writer
-        // pre-check fires), so a re-create on the same ROS topic still
-        // succeeds ONLY while the topic's other slot is free — here it is
-        // (the leaked port holds one of the two) — and it takes that slot;
-        // the NEXT is refused with a NULL publisher
-        // (`ExceedsMaxSupportedPublishers` inside the transport, logged as
-        // `publisher creation failed`). With another live publisher already
-        // on the topic, the FIRST re-create would be the refused one.
+        // The documented cost: the leaked port holds one of the topic's
+        // publisher slots for the life of this process. The service was
+        // created by an rmw endpoint, so it carries more than iceoryx2's
+        // default of 2: re-creates on the leaked topic still attach (the
+        // second and third ports beside the leaked one).
         let topic = CString::new(ros_topic()).expect("topic");
         let qos = default_qos();
         let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
         let second = rmw_create_publisher(node_ptr(), ts_ptr(), topic.as_ptr(), &qos, &pub_opts);
         assert!(
             !second.is_null(),
-            "with the topic's other slot free, one re-create on the leaked topic still \
-             succeeds (it takes the second of the two slots)"
+            "a re-create on the leaked topic attaches beside the leaked port"
         );
         assert_eq!(
             live_publisher_ports(),
@@ -942,10 +1014,12 @@ fn destroying_with_a_cross_thread_armed_window_leaks_the_slot_never_releases_it(
         );
         let third = rmw_create_publisher(node_ptr(), ts_ptr(), topic.as_ptr(), &qos, &pub_opts);
         assert!(
-            third.is_null(),
-            "a third publisher is refused (NULL): the leaked port holds one of the topic's \
-             two slots for the life of this process"
+            !third.is_null(),
+            "a third publisher attaches too: the rmw-created service is not capped at \
+             iceoryx2's default of 2 publishers"
         );
+        assert_eq!(live_publisher_ports(), Some(3));
+        assert_eq!(rmw_destroy_publisher(node_ptr(), third), RMW_RET_OK);
         // A CLEAN destroy releases ITS slot; the leaked port's stays held.
         assert_eq!(rmw_destroy_publisher(node_ptr(), second), RMW_RET_OK);
         assert_eq!(

@@ -896,6 +896,7 @@ fn build_channel_node(
         role.try_into().map_err(|e| TransportError::Internal {
             reason: format!("flashback channel: invalid node name '{role}': {e:?}"),
         })?;
+    crate::transport::refuse_unsupported_android_shm(role)?;
     iceoryx2::prelude::NodeBuilder::new()
         .name(&node_name)
         .config(&config)

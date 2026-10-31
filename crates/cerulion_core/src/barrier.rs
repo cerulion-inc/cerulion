@@ -18,7 +18,7 @@
 //! builds the counter / state machine ([`BarrierShared`]) AND the SHM page
 //! mapping ([`MappedBarrier`] — mmap'ing a [`BarrierShared`] into a `MAP_SHARED`
 //! page shared across processes) AND the blocking [`wait`](BarrierShared::wait)
-//! — on Linux a spin-then-block PROCESS-SHARED futex on the `generation` word,
+//! On Linux and Android a spin-then-block PROCESS-SHARED futex on the `generation` word,
 //! kernel-woken by the opener's `FUTEX_WAKE` right after its generation store
 //! (the earlier shallow CPU monitor-wait park was measured NOT to
 //! observe the cross-process store, costing a ~100µs timer backstop per
@@ -55,7 +55,7 @@
 //! that one is intra-process and not SHM-mappable). So `MappedBarrier` can place a
 //! [`BarrierShared`] directly in an mmap'd `MAP_SHARED` page and have two
 //! processes operate on the SAME physical atomics. Every operation is lock-free
-//! (atomic load / `fetch_sub` / `fetch_add` / store / `fetch_update`), so a
+//! (atomic load / `fetch_sub` / `fetch_add` / store / `try_update`), so a
 //! crashed participant can never leave the barrier holding a lock.
 //!
 //! # Count-down sense-reversing design
@@ -295,7 +295,7 @@ const _: () = assert!(
     core::mem::align_of::<BarrierShared>() >= 8,
     "BarrierShared must be >=8-byte aligned so its `generation` field (offset 0) is a valid 8-byte-aligned monitor-wait target"
 );
-// The Linux futex tier aliases the LOW 32 bits of the `generation`
+// The Linux and Android futex tier aliases the LOW 32 bits of the `generation`
 // AtomicU64 as the futex word (futexes are 32-bit). On a little-endian target
 // the low half sits at the field's base address, so `&generation as *const u32`
 // IS the low word — that aliasing is LE-only BY CONSTRUCTION. Both supported
@@ -345,7 +345,7 @@ impl BarrierShared {
     /// page (unlink-first + fresh `O_EXCL` create), unreachable by this segment's
     /// wake word by construction — so, exactly like `generation`, no wake is
     /// issued here.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     fn reinit(&self, expected: u32) {
         self.generation.store(0, Ordering::Release);
         self.remaining.store(expected, Ordering::Release);
@@ -498,13 +498,13 @@ impl BarrierShared {
             .store(self.expected.load(Ordering::Acquire), Ordering::Release);
         self.generation.store(my_gen + 1, Ordering::Release);
         // Kernel-wake every futex waiter parked on the generation word
-        // (Linux; no-op elsewhere). AFTER the store, so a woken waiter's re-poll
+        // (Linux and Android; no-op elsewhere). AFTER the store, so a woken waiter's re-poll
         // observes the new generation.
         self.wake_waiters();
     }
 
     /// Kernel-WAKE every waiter parked on the `generation`
-    /// word — the Linux futex tier AND the macOS os_sync tier of
+    /// word - the Linux and Android futex tier AND the macOS os_sync tier of
     /// [`wait`](Self::wait). Called after EVERY site that bumps
     /// `generation`: [`open_generation`](Self::open_generation) (the normal
     /// arrive opener AND `try_drop_participant`'s dead-peer opener route here)
@@ -514,7 +514,7 @@ impl BarrierShared {
     /// on a DIFFERENT physical page, unreachable by these address-keyed wakes by
     /// construction — so it deliberately does not wake.)
     ///
-    /// **Linux — plain `FUTEX_WAKE`**, deliberately NOT `FUTEX_PRIVATE_FLAG`:
+    /// **Linux and Android - plain `FUTEX_WAKE`**, deliberately NOT `FUTEX_PRIVATE_FLAG`:
     /// the word lives in `MAP_SHARED` memory crossing processes, and private
     /// futexes key on the virtual address within one mm; shared futexes key on
     /// the physical page, which is what makes the cross-process wake work.
@@ -549,7 +549,7 @@ impl BarrierShared {
         // is immaterial — both sides re-derive their own predicate on wake).
         self.wake_seq.fetch_add(1, Ordering::Release);
         self.wake_word_wake();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let futex_word = &self.generation as *const AtomicU64 as *const u32;
             // SAFETY: `futex_word` is the 4-byte-aligned (in fact 8-byte-aligned)
@@ -599,7 +599,7 @@ impl BarrierShared {
     /// wake side ([`wake_waiters`](Self::wake_waiters)) and the wait side
     /// ([`wait_os_sync`](Self::wait_os_sync)), so the address + size the opener
     /// wakes can never drift from the address + size a waiter blocks on. Same
-    /// low-32 LE aliasing as the Linux futex word (the layout const-assert pins
+    /// low-32 LE aliasing as the Linux and Android futex word (the layout const-assert pins
     /// little-endian; macOS aarch64 AND x86_64 are both LE). 8-byte alignment
     /// (from the `AtomicU64`) satisfies the 4-byte-size alignment os_sync
     /// requires.
@@ -645,7 +645,7 @@ impl BarrierShared {
 
     /// The kernel wake SYSCALL on the wake word — wake ALL
     /// parkers (they each re-derive `peers_waiting`; a spurious wake is a
-    /// bounded no-op re-park). Linux: shared `FUTEX_WAKE` on `wake_seq` (the
+    /// bounded no-op re-park). Linux and Android: shared `FUTEX_WAKE` on `wake_seq` (the
     /// same non-PRIVATE discipline as [`wake_waiters`](Self::wake_waiters)).
     /// macOS ≥ 14.4: `os_sync_wake_by_address_all` (gated on `os_sync_active` —
     /// when inactive, parkers never kernel-block on the word, so skipping the
@@ -654,7 +654,7 @@ impl BarrierShared {
     /// / errnos deliberately ignored (the wake is only latency).
     #[inline]
     fn wake_word_wake(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let word = &self.wake_seq as *const AtomicU32 as *const u32;
             // SAFETY: `word` is the live 4-byte `wake_seq` (offset-16
@@ -801,7 +801,7 @@ impl BarrierShared {
     /// never a correctness event (Principle #7 record-only).
     ///
     /// Tiers (mirrors [`wait`](Self::wait)'s shape):
-    /// - **Linux**: shared `FUTEX_WAIT` on `wake_seq` with compare `snapshot`,
+    /// - **Linux and Android**: shared `FUTEX_WAIT` on `wake_seq` with compare `snapshot`,
     ///   `cap`-bounded. Benign errnos (`EAGAIN` = word already moved — the
     ///   lost-wakeup guard; `EINTR`; `ETIMEDOUT`) return `true` silently; any
     ///   other errno warns once per distinct errno + sleeps a bounded 100µs
@@ -824,7 +824,7 @@ impl BarrierShared {
             // a zero-timeout kernel call risks EINVAL for no benefit.
             return false;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let word = &self.wake_seq as *const AtomicU32 as *const u32;
             let ts = libc::timespec {
@@ -922,7 +922,7 @@ impl BarrierShared {
             }
             true
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
             false
         }
@@ -930,7 +930,7 @@ impl BarrierShared {
 
     /// `true` once generation `my_gen` has opened — i.e. `generation > my_gen`
     /// (`Acquire` load). This is the poll predicate [`wait`](Self::wait)
-    /// re-checks after every wake (futex wake, slice timeout, or the non-Linux
+    /// re-checks after every wake (futex wake, slice timeout, or fallback
     /// recheck).
     pub fn is_open(&self, my_gen: u64) -> bool {
         self.generation.load(Ordering::Acquire) > my_gen
@@ -941,7 +941,7 @@ impl BarrierShared {
     /// [`is_open`](Self::is_open) becomes true, or [`WaitOutcome::TimedOut`] on
     /// deadline (see [`WaitOutcome::TimedOut`] — it is NOT a proceed signal).
     ///
-    /// **Wake mechanism (Linux):** spin-then-block on a PROCESS-SHARED
+    /// **Wake mechanism (Linux and Android):** spin-then-block on a PROCESS-SHARED
     /// futex over the low 32 bits of the barrier's own `generation` word (the
     /// SENSE). The unique opener's `generation.store(my_gen + 1)` (in
     /// `open_generation` / the vacuous CAS) is IMMEDIATELY followed by a
@@ -952,7 +952,7 @@ impl BarrierShared {
     /// word). A BOUNDED pre-block spin catches the fast-rendezvous case
     /// (opener already arriving) without a syscall — DEFAULT tier-resolved
     /// time-bounded (20µs on every kernel-wake tier —
-    /// Linux futex AND macOS os_sync — 150µs only on the macOS sleep-recheck
+    /// Linux and Android futex AND macOS os_sync - 150µs only on the macOS sleep-recheck
     /// fallback; `CERULION_BARRIER_SPIN_US` overrides,
     /// `=0` kills it back to a 50-iteration spin — see `barrier_spin_budget`);
     /// it is spin-then-block, never a busy-spin. (The earlier CPU monitor-wait
@@ -999,12 +999,12 @@ impl BarrierShared {
     /// **No busy-spin:** the pre-block spin is hard-bounded (the tier-resolved
     /// default budget — 20µs on the kernel-wake tiers, 150µs on the macOS
     /// sleep-recheck fallback — or a few hundred ns under
-    /// the `=0` kill switch); the block is a real kernel sleep (futex on Linux,
-    /// os_sync on macOS ≥ 14.4). On an OLDER macOS (or any other non-Linux
-    /// target — future Windows) with no kernel-wake primitive available the
+    /// the `=0` kill switch); the block is a real kernel sleep (futex on Linux and Android,
+    /// os_sync on macOS ≥ 14.4). On an older macOS or another target without a
+    /// kernel-wake primitive the
     /// ladder is: the SAME time-bounded boundary spin (phase 1, absorbing the
     /// fast lockstep rendezvous), then chunked ~100µs sleep-rechecks — also
-    /// never a busy-spin. See `wait_recheck_fallback` (cfg-gated off Linux).
+    /// never a busy-spin. See `wait_recheck_fallback` (cfg-gated off Linux and Android).
     ///
     /// **Unlink-while-parked safety:** a `wait` parked through a
     /// [`MappedBarrier`] stays VALID even if the OWNER tears the barrier down
@@ -1022,7 +1022,7 @@ impl BarrierShared {
     /// and `box_parked_waiter_still_wakes_after_owner_unlink` in `barrier_test.rs`.
     pub fn wait(&self, my_gen: u64, timeout: Duration) -> WaitOutcome {
         let deadline = Instant::now() + timeout;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.wait_futex(my_gen, deadline)
         }
@@ -1038,13 +1038,13 @@ impl BarrierShared {
                 self.wait_recheck_fallback(my_gen, deadline)
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
             self.wait_recheck_fallback(my_gen, deadline)
         }
     }
 
-    /// The Linux futex tier of [`wait`](Self::wait) — a process-shared
+    /// The Linux and Android futex tier of [`wait`](Self::wait) - a process-shared
     /// `FUTEX_WAIT` on the low 32 bits of `generation`, kernel-woken by
     /// `wake_waiters` after every generation bump. See `wait`'s doc for the
     /// wake-mechanism / no-lost-wake / wrap-around contracts.
@@ -1057,12 +1057,12 @@ impl BarrierShared {
     /// persistently-failing syscall degenerate to a silent ~100% busy loop for
     /// the whole deadline. Instead it `tracing::warn!`s ONCE per process (naming
     /// the errno) and sleeps a bounded 100µs recheck before re-looping — the
-    /// barrier degrades to bounded sleep-polling (mirroring the non-Linux
+    /// barrier degrades to bounded sleep-polling (mirroring the fallback
     /// tier's never-busy-spin guarantee), never a busy-spin. The classification
     /// is the pure [`futex_wait_errno_is_benign`] (oracle-tested); the
     /// warn+sleep arm itself has no syscall-injection seam (disproportionate
     /// for this unsafe hot path) and is checked by inspection.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn wait_futex(&self, my_gen: u64, deadline: Instant) -> WaitOutcome {
         // The barrier-boundary spin budget — DEFAULT-ON (per-OS; see
         // `barrier_spin_budget` for the measured knee + the
@@ -1083,7 +1083,7 @@ impl BarrierShared {
     /// the `=0` legacy arm is testable hermetically without env/`OnceLock`
     /// games. See `wait`'s doc for the wake-mechanism / no-lost-wake /
     /// wrap-around contracts.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn wait_futex_with_budget(
         &self,
         my_gen: u64,
@@ -1205,7 +1205,7 @@ impl BarrierShared {
 
     /// The TIME-bounded pre-block spin — the DEFAULT phase 1 of
     /// [`wait_futex`](Self::wait_futex) ([`barrier_spin_budget`] is
-    /// default-on, tier-resolved — 20µs on the kernel-wake tiers (Linux futex,
+    /// default-on, tier-resolved - 20µs on the kernel-wake tiers (Linux and Android futex,
     /// macOS os_sync), 150µs on the macOS sleep-recheck fallback;
     /// `CERULION_BARRIER_SPIN_US=0` is the kill switch
     /// that restores the 50-iter loop). Busy-polls the generation SENSE
@@ -1220,8 +1220,8 @@ impl BarrierShared {
     /// record-only progress polling — changes only WHEN the waiter proceeds,
     /// never any barrier state (a pure `&self` read loop).
     ///
-    /// No longer Linux-only — the macOS wait tier
-    /// (`wait_recheck_fallback`, cfg-gated off Linux) runs the SAME
+    /// No longer limited to the Linux futex tier: Android uses futex too, and the macOS wait tier
+    /// (`wait_recheck_fallback`, cfg-gated off Linux and Android) runs the SAME
     /// time-bounded boundary spin as its phase 1 before falling back to the
     /// chunked sleep-recheck.
     fn spin_for_budget(&self, my_gen: u64, spin_deadline: Instant) -> bool {
@@ -1241,15 +1241,15 @@ impl BarrierShared {
         }
     }
 
-    /// The non-Linux [`wait`](Self::wait) tier (on macOS this runs
+    /// The fallback [`wait`](Self::wait) tier (on macOS this runs
     /// over a REAL cross-process `MAP_SHARED` page — no futex, no UMWAIT/WFE).
     /// Since the os_sync tier landed this is the macOS FALLBACK, not the primary: on macOS ≥ 14.4
     /// [`wait`](Self::wait) prefers `wait_os_sync` (a real kernel wake; a plain
     /// code span since it is macOS-gated but this method compiles on every
-    /// non-Linux target), routing here only when the `os_sync_*` symbols are ABSENT
+    /// non-futex target), routing here only when the `os_sync_*` symbols are ABSENT
     /// (older macOS), the `CERULION_BARRIER_OS_SYNC=0` kill switch is set, or a
     /// latched `EINVAL`/`ENOTSUP` disabled the primitive — plus every other
-    /// non-Linux target (future Windows). The ladder, top to bottom — bounded at
+    /// non-futex target (future Windows). The ladder, top to bottom - bounded at
     /// every rung, NEVER an unbounded busy-spin:
     ///
     /// 1. **Boundary spin** — the SAME time-bounded
@@ -1279,7 +1279,7 @@ impl BarrierShared {
     /// `crate::monitor_wait::monitor_wait_until_addr` (a `pub(crate)` fn, so
     /// not an intra-doc link) is the awaited GENERATION VALUE (`gen_now`), NOT
     /// [`BarrierShared::expected`] (the participant COUNT).
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn wait_recheck_fallback(&self, my_gen: u64, deadline: Instant) -> WaitOutcome {
         let recheck = Duration::from_micros(100);
         // Spin-then-block phase 1: the boundary spin — one cached-OnceLock budget read,
@@ -1636,10 +1636,10 @@ impl BarrierShared {
         // `expected` 1→0 would read 0 and silently swallow a real desync.
         let old_expected = self
             .expected
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(1))
             })
-            // The closure always returns `Some`, so `fetch_update` always returns
+            // The closure always returns `Some`, so `try_update` always returns
             // `Ok(prev)`; extract the value from either arm without `.unwrap()`.
             .unwrap_or_else(|v| v);
 
@@ -1728,7 +1728,7 @@ impl BarrierShared {
     ///
     /// # Memory ordering (concurrent same-gen drop vs a live arrival)
     ///
-    /// `try_drop_participant` decrements `expected` (a `fetch_update`, `AcqRel`)
+    /// `try_drop_participant` decrements `expected` (a `try_update`, `AcqRel`)
     /// SEQUENCED-BEFORE its `remaining.fetch_sub` (`AcqRel`). A later opener's re-arm
     /// reads `expected` with an `Acquire` load; because the `remaining` `fetch_sub`
     /// chain is `AcqRel`, any arrival whose `fetch_sub` is ordered AFTER this drop's
@@ -1926,7 +1926,7 @@ pub fn park_enter_call_count_for_test() -> u64 {
 }
 
 /// Whether THIS host has a kernel-block PRIMITIVE for the
-/// step-start park's wake word — Linux always (shared futex), macOS iff the
+/// step-start park's wake word - Linux and Android always (shared futex), macOS iff the
 /// os_sync tier is active (resolved + not kill-switched + not latched off),
 /// other targets never.
 ///
@@ -1943,7 +1943,7 @@ pub fn park_enter_call_count_for_test() -> u64 {
 /// gate on this predicate correctly (they bypass the park routing). Also a
 /// CI-log diagnostic alongside [`barrier_wake_tier`].
 pub fn wake_word_block_primitive_available() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         true
     }
@@ -1951,7 +1951,7 @@ pub fn wake_word_block_primitive_available() -> bool {
     {
         os_sync_active()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         false
     }
@@ -1960,14 +1960,14 @@ pub fn wake_word_block_primitive_available() -> bool {
 /// The wake tier [`BarrierShared::wait`] selects on THIS host — a
 /// DIAGNOSTIC accessor for tests + CI logs, NEVER a control input (the wait path
 /// reads the tier machinery directly). One of:
-/// - `"linux-futex"` — the Linux process-shared `FUTEX_WAIT`/`FUTEX_WAKE` tier.
+/// - `"linux-futex"` - the Linux and Android process-shared `FUTEX_WAIT`/`FUTEX_WAKE` tier.
 /// - `"macos-os_sync"` — the macOS ≥ 14.4 `os_sync_wait_on_address` /
 ///   `os_sync_wake_by_address_all` tier (the backend resolved + is active).
 /// - `"macos-recheck-fallback"` — macOS < 14.4, the `CERULION_BARRIER_OS_SYNC=0`
 ///   kill switch, or a latched `EINVAL`/`ENOTSUP`: the chunked sleep-recheck.
 /// - `"recheck-fallback"` — any other OS (future Windows): sleep-recheck.
 pub fn barrier_wake_tier() -> &'static str {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         "linux-futex"
     }
@@ -1979,7 +1979,7 @@ pub fn barrier_wake_tier() -> &'static str {
             "macos-recheck-fallback"
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         "recheck-fallback"
     }
@@ -2015,7 +2015,7 @@ pub fn os_sync_disabled_from_env_uncached() -> bool {
 /// The DEFAULT barrier-boundary spin budget (µs) on a KERNEL-WAKE
 /// tier — the measured 20µs knee. Since the os_sync tier landed this is no longer a
 /// per-OS cfg split: 20µs is the default wherever a real kernel wake delivers
-/// the boundary open in µs — Linux (futex, both arches) AND macOS ≥ 14.4 with
+/// the boundary open in µs - Linux and Android (futex) AND macOS ≥ 14.4 with
 /// the os_sync tier active. Only the macOS sleep-recheck FALLBACK needs more
 /// (`MACOS_FALLBACK_SPIN_US` — macOS-gated, hence a plain code span keeping
 /// this all-OS const doc link-clean on Linux); the per-tier resolution lives
@@ -2033,7 +2033,7 @@ pub fn os_sync_disabled_from_env_uncached() -> bool {
 ///
 /// Override / kill via `CERULION_BARRIER_SPIN_US` (see
 /// [`barrier_spin_budget`]) — semantics identical on every OS and tier.
-/// Shared by ALL wait tiers — the Linux futex tier's pre-block spin,
+/// Shared by ALL wait tiers - the Linux and Android futex tier's pre-block spin,
 /// the macOS os_sync tier's pre-block spin, and the recheck tier's boundary
 /// spin.
 const DEFAULT_BARRIER_SPIN_US: u64 = 20;
@@ -2246,7 +2246,7 @@ fn resolve_barrier_spin_budget(raw: Option<&str>, default_us: u64) -> Duration {
 /// broken: the caller warns once and degrades to bounded sleep-polling so a
 /// persistently-failing syscall can never busy-spin. Pure, so the
 /// classification is oracle-testable without a syscall-injection seam.
-/// (`EWOULDBLOCK` is the same value as `EAGAIN` on Linux, so it is covered.)
+/// (`EWOULDBLOCK` is the same value as `EAGAIN` on Linux and Android, so it is covered.)
 ///
 /// `pub(crate)` so [`crate::credit`]'s producer park shares
 /// the ONE classification. The macOS family below (now extracted into
@@ -2254,7 +2254,7 @@ fn resolve_barrier_spin_budget(raw: Option<&str>, default_us: u64) -> Duration {
 /// — a second `dlsym` cache and a second `EINVAL`/`ENOTSUP` disable latch
 /// would let two words on one host disagree about whether the primitive
 /// works.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn futex_wait_errno_is_benign(errno: i32) -> bool {
     matches!(errno, libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT)
 }
@@ -2329,10 +2329,10 @@ fn resolve_os_sync_disabled(raw: Option<&str>) -> bool {
 /// of the same `(ns, id)` derive the same name → map the same page.
 ///
 /// Per-OS shape:
-/// - **Linux** — `barrier_shm_name_verbose`: `/cer_bar_<ns>_<fnv1a64(id)>`.
-///   The raw `<ns>` in the `/dev/shm` filename is a deliberate debuggability
-///   aid (a `ls /dev/shm` names the deployment).
-/// - **non-Linux (macOS)** — `barrier_shm_name_compact`:
+/// - **Linux and Android**: `barrier_shm_name_verbose`: `/cer_bar_<ns>_<fnv1a64(id)>`.
+///   The raw `<ns>` in the Linux `/dev/shm` filename and Android backing-file
+///   name is a deliberate debuggability aid.
+/// - **macOS**: `barrier_shm_name_compact`:
 ///   `/cer_bar_<fnv1a64(ns 0x1f id)>` (25 chars). macOS caps POSIX SHM names
 ///   at 31 chars (`PSHMNAMLEN`, incl. the leading slash — see
 ///   `shm_ring.rs`, which already lives under the same cap), and real
@@ -2343,19 +2343,19 @@ fn resolve_os_sync_disabled(raw: Option<&str>) -> bool {
 /// name; the compact form separates `ns`/`id` with a 0x1F unit separator so
 /// `("ab","c")` and `("a","bc")` can never alias).
 fn barrier_shm_name(ns: &str, id: &str) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         barrier_shm_name_verbose(ns, id)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         barrier_shm_name_compact(ns, id)
     }
 }
 
-/// The Linux name shape: `/cer_bar_<ns>_<fnv1a64(id):016x>` — `ns` verbatim
+/// The Linux and Android name shape: `/cer_bar_<ns>_<fnv1a64(id):016x>` - `ns` verbatim
 /// (deployment-visible in `/dev/shm`), `id` hashed. See [`barrier_shm_name`].
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn barrier_shm_name_verbose(ns: &str, id: &str) -> String {
     let h = fnv1a64(id.as_bytes());
     format!("/cer_bar_{ns}_{h:016x}")
@@ -2365,7 +2365,7 @@ fn barrier_shm_name_verbose(ns: &str, id: &str) -> String {
 /// — 25 chars, under the macOS 31-char `PSHMNAMLEN` cap for ANY `(ns, id)`.
 /// The 0x1F unit separator keeps the `(ns, id)` split unambiguous. See
 /// [`barrier_shm_name`].
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
 fn barrier_shm_name_compact(ns: &str, id: &str) -> String {
     // hot-path-alloc-ok: name derivation runs only at create/open (cold path).
     let mut key = Vec::with_capacity(ns.len() + 1 + id.len());
@@ -2799,7 +2799,7 @@ mod tests {
     /// would put a 100µs sleep on the HOT wake path; wrongly classifying
     /// `ENOSYS` as benign re-opens the silent busy loop). Oracle vector, both
     /// directions.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn futex_errno_classification_oracle() {
         // Benign: the expected wait-loop returns — silent, immediate re-loop.
@@ -3104,7 +3104,7 @@ mod tests {
     /// `arrive` `FUTEX_WAKE`s the parked waiter, which re-polls `is_open` and
     /// returns [`WaitOutcome::Opened`]. Guards the legacy else path
     /// the default (non-zero budget) never takes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn wait_futex_zero_budget_kill_switch_still_opens() {
         let b = std::sync::Arc::new(BarrierShared::new(1));
@@ -3291,7 +3291,7 @@ mod tests {
     // Hermetic (no SHM/iceoryx2); in the lib `mod tests` because they drive the
     // private/seam surface (`note_activity` sites via public ops, `reinit`,
     // `park_wait_activity`). Here the kernel block is the REAL primitive
-    // (os_sync on macOS ≥ 14.4, futex on Linux) — the same code both tiers.
+    // (os_sync on macOS ≥ 14.4, futex on Linux and Android) - the same code both tiers.
 
     /// Exact epoch-bump oracle per state-transition site —
     /// hand-counted deltas, NOT a self-compare. Pending arrive = 1 (the
@@ -3418,8 +3418,18 @@ mod tests {
     /// is WOKEN by a peer's ARRIVAL (a pure `Pending` arrival on a barrier(2) —
     /// no open, no generation bump; exactly the step-start signal). The
     /// REAL primitive on this machine (os_sync / futex). Oracle: the block returns
-    /// far inside its 5s cap (the arrival lands at ~5ms), and the parker's
-    /// re-derive sees `peers_waiting == true`.
+    /// far inside its 5s cap, and the parker's re-derive sees
+    /// `peers_waiting == true`.
+    ///
+    /// The arrival is ORDERED against the parker by an explicit handshake,
+    /// never by a sleep's timing: the parker publishes "about to block"
+    /// only after it has taken its wake-word snapshot and read the
+    /// precondition, so neither can be overtaken on a preempted machine.
+    /// The short pause that follows the handshake lets the armed parker
+    /// reach the kernel call; it carries no ordering, because an arrival
+    /// landing in the window between the signal and the block is exactly
+    /// what the snapshot exists for (the compare returns the block at once,
+    /// and all three oracles still hold).
     #[test]
     fn parked_waiter_on_wake_word_wakes_on_arrival() {
         if !wake_word_block_primitive_available() {
@@ -3427,17 +3437,48 @@ mod tests {
             return;
         }
         let b = std::sync::Arc::new(BarrierShared::new(2));
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
         let parker = {
             let b = std::sync::Arc::clone(&b);
             std::thread::spawn(move || {
                 let _g = ParkedRankGuard::enter(&b, 0).expect("rank 0 in-mask");
                 let snap = b.wake_seq_snapshot();
                 assert!(!b.peers_waiting(), "nobody has arrived yet");
+                armed_tx
+                    .send(())
+                    .expect("the arriver must still be waiting");
                 let start = Instant::now();
                 let performed = b.park_wait_activity(snap, Duration::from_secs(5));
                 (performed, start.elapsed(), b.peers_waiting())
             })
         };
+        // NO WALL, and no safety net is needed: this receive CANNOT hang.
+        //
+        // Proof, and it is why a timeout must not be reintroduced here. The
+        // parker owns the only sender. It reaches `send` on its success path,
+        // and on every failure path the panic unwinds OUT of the closure, which
+        // drops the sender; the thread cannot end while holding it. So the
+        // channel either delivers or disconnects, and `recv` returns either way,
+        // with the disconnect arm below surfacing the parker's own message.
+        //
+        // A deadline would add nothing and would cost the property this file is
+        // repairing: a ceiling a descheduled machine trips with the barrier
+        // behaving correctly.
+        if armed_rx.recv().is_err() {
+            // The sender is gone: the parker panicked before arming. Surface
+            // ITS message (the precondition) rather than a bare disconnect.
+            match parker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(_) => panic!("the parker dropped its handshake without arming"),
+            }
+        }
+        // ORDERING is the handshake's job; this pause only lets the armed
+        // parker reach the kernel call, which is the state the wake path
+        // exists to serve. It carries no correctness: an arrival that lands
+        // first is caught by the snapshot compare and every oracle below
+        // still holds, so a machine that overruns it loses sharpness, not a
+        // run. Measured: without it the suppressed-wake check passes about
+        // half the time.
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
             b.arrive(0),
@@ -3461,6 +3502,12 @@ mod tests {
     /// parker as a bounded no-op: the block returns promptly and the re-derive
     /// correctly reads `false` (the caller re-parks). Spurious-tolerance is the
     /// contract that lets the wake side over-signal freely.
+    ///
+    /// Ordered by the same handshake as the arrival twin above, and for a
+    /// sharper reason: a bump that lands before the parker's snapshot is
+    /// already IN that snapshot, so the block would have nothing to compare
+    /// against and would ride its full cap. The signal is sent after the
+    /// snapshot, so the bump can never get ahead of it.
     #[test]
     fn spurious_bump_wakes_parker_who_rederives_false() {
         if !wake_word_block_primitive_available() {
@@ -3468,16 +3515,38 @@ mod tests {
             return;
         }
         let b = std::sync::Arc::new(BarrierShared::new(2));
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
         let parker = {
             let b = std::sync::Arc::clone(&b);
             std::thread::spawn(move || {
                 let _g = ParkedRankGuard::enter(&b, 1).expect("rank 1 in-mask");
                 let snap = b.wake_seq_snapshot();
+                armed_tx.send(()).expect("the bumper must still be waiting");
                 let start = Instant::now();
                 let performed = b.park_wait_activity(snap, Duration::from_secs(5));
                 (performed, start.elapsed(), b.peers_waiting())
             })
         };
+        // NO WALL, same proof as the twin above: the parker owns the only
+        // sender, reaches `send` on its success path, and on any panic unwinds
+        // out of the closure and drops it, so the channel either delivers or
+        // disconnects and this receive always returns. Do not reintroduce a
+        // timeout as a safety net; there is nothing for it to catch.
+        if armed_rx.recv().is_err() {
+            // The sender is gone: the parker panicked before arming. Surface
+            // ITS message rather than a bare disconnect.
+            match parker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(_) => panic!("the parker dropped its handshake without arming"),
+            }
+        }
+        // ORDERING is the handshake's job; this pause only lets the armed
+        // parker reach the kernel call, which is the state the wake path
+        // exists to serve. It carries no correctness: an arrival that lands
+        // first is caught by the snapshot compare and every oracle below
+        // still holds, so a machine that overruns it loses sharpness, not a
+        // run. Measured: without it the suppressed-wake check passes about
+        // half the time.
         std::thread::sleep(Duration::from_millis(5));
         b.set_expected(2); // a bump with remaining == expected → predicate stays false
         let (performed, elapsed, saw_peers) = parker.join().expect("parker panicked");

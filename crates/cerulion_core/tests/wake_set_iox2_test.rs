@@ -65,7 +65,7 @@ fn manager(name: &str) -> Arc<TransportManager> {
     .expect("init isolated transport manager")
 }
 
-/// A valid wire frame (32-byte header + body) — `create_ingress_publisher`'s
+/// A valid wire frame (40-byte header + body), `create_ingress_publisher`'s
 /// `publish_raw` takes the caller's frame verbatim.
 fn wire_frame(seq: u32, body: &[u8]) -> Vec<u8> {
     let total = WireHeader::SIZE + body.len();

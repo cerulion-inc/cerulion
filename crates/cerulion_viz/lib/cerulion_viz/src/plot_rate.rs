@@ -98,7 +98,7 @@
 //! - A **remembered `Scalars` topic** (the target class, `/lowstate`
 //!   included) is dropped on its HEADER, before the walk: `classify_and_route`
 //!   consults the gate against `crate::sink::SinkState::plot_kind_hint`. Cost of a
-//!   refused frame ≈ a 32-byte header parse. The FIRST frame of such a topic still
+//!   refused frame ≈ a 40-byte header parse. The FIRST frame of such a topic still
 //!   pays a full classification — that is what records the hint.
 //! - A **`ScalarsWithText` topic** is dropped on its header too, but
 //!   only on a frame BOTH gates refuse: its dump rides [`DumpRefreshGate`], so a

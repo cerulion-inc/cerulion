@@ -1,0 +1,18 @@
+# The project's legal name, for tools/scripts/check_public_surface.sh (class
+# shipped-text). Every mention of this name in shipped text must read as it is
+# written here: exact in the letters, their case, the comma and the suffix word.
+# A final full stop is the one thing forgiven, and only in one direction: a page
+# that ADDS one is punctuating a sentence, a page that DROPS one is a finding.
+#
+# It is DECLARED here rather than read out of a notice or a licence, because a
+# notice is a list of OTHER people's copyright lines: a rule that parses one to
+# find its own input picks whichever line comes first, and a rename or a
+# reordering silently hands the rule a vendor's name to police instead.
+#
+# ONE line, holding the name and nothing else. No leading or trailing space,
+# and no character a reader cannot see: the spelling here is the spelling that
+# ships, and a name the rule cannot find is a rule that judges nothing. An
+# absent file, an empty one, a second line, a line carrying whitespace or an
+# invisible character, a name that is only a suffix, and a name the rule reads
+# as something shorter are each exit 3, never a guess.
+Cerulion Inc.

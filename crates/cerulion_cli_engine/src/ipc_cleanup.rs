@@ -30,13 +30,32 @@
 //! `graph_run` continues to call this explicitly even though
 //! iceoryx2's `NodeBuilder::create` ALSO runs the same sweep when
 //! `cleanup_dead_nodes_on_creation: true` is set (the iceoryx2
-//! default — see `iceoryx2-0.8.1/src/config.rs:189-204`). The
+//! default, see that release's `config.rs`). The
 //! explicit call is the load-bearing line: it keeps the dead-node
 //! sweep happening regardless of any user-supplied
 //! `iceoryx2.toml` that flips the on-creation default to `false`.
 //! The double-call is correct: a second sweep on a freshly-cleaned
 //! registry finds no `Dead` entries and is a directory walk plus
-//! constant work.
+//! constant work. Every sweep here builds its node through
+//! `dead_node_sweep::sweep_node_config`, which turns the implicit
+//! cleanup OFF, so the explicit call is the one that does the work
+//! and the counts it reports describe a sweep that happened.
+//!
+//! # Why there is no orphan port tag reclaim any more
+//!
+//! A separate reclaim pass once ran for one shape iceoryx2 could not clear: a
+//! publisher destroyed while one of its loaned samples was leaked deregistered
+//! its port but left the port tag on disk, so the node directory failed its
+//! final removal on every sweep, forever.
+//!
+//! 0.10 removes a dead port's tag with the rest of its stale resources
+//! (`service/stale_resource_cleanup.rs`, the port tag arm), where 0.9.1's
+//! sweep did not, so the shape cannot arise and the pass was deleted. What did
+//! NOT motivate the deletion, though an earlier message in this branch said so:
+//! the node identity still exposes its process id and creation stamp, through
+//! `UniqueNodeId::pid` and `UniqueNodeId::creation_time` (`identifiers.rs`).
+//! What changed is the DERIVED DEBUG RENDERING, which no longer carries either,
+//! and that is why the hand fixtures in this module had to be re-derived.
 //!
 //! # Why the STARTUP sweep is BOUNDED and `cerulion clean` is not
 //!
@@ -99,7 +118,8 @@ use core::time::Duration;
 
 use cerulion_core::iceoryx_logger::CapturedLog;
 use iceoryx2::config::Config;
-use iceoryx2::node::{CleanupState, Node};
+use iceoryx2::node::{CleanupState, DeadNodeView, Node, NodeBuilder, NodeState, NodeView};
+use iceoryx2::prelude::{CallbackProgression, LogLevel as IoxLogLevel};
 
 // Route stale-resource cleanup through the same
 // Service type the core transport now uses (`ipc_threadsafe::Service`). The
@@ -158,6 +178,170 @@ pub struct CleanupReport {
     /// also means the counters above are a LOWER bound: a dead node the walk
     /// never reached is still registered and appears in neither.
     pub registry_errors: Vec<String>,
+    /// Every DEAD node the walk classified, in walk order — the set the sweep
+    /// acted on under [`SweepMode::Remove`], and the set it WOULD have acted
+    /// on under [`SweepMode::ReportOnly`]. One classification produces both,
+    /// so the report a user reads names the same nodes the run that removes
+    /// them names.
+    ///
+    /// It is NOT a count of what succeeded: a refused node appears here and
+    /// in `failures` both, and a node the walk never reached appears in
+    /// neither.
+    pub dead_nodes: Vec<DeadNodeIdentity>,
+}
+
+/// What a registry sweep is allowed to DO with the dead nodes it classifies.
+///
+/// The mode is read BEFORE the walk, never after it, which is the whole point
+/// of the type: a boolean threaded past a call that has already removed
+/// something cannot un-remove it.
+///
+/// What this type does NOT promise. It governs the DEAD-NODE sweep and
+/// nothing else. It says nothing about the `/tmp/*.shm_state` population
+/// (that half is gated separately, by the same mode value, in
+/// `cerulion clean`), nothing about whether the registry could be read at
+/// all, and nothing about what a later sweep over the same registry would
+/// find: a node alive during a `ReportOnly` walk may be dead by the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepMode {
+    /// Classify only. No node's stale resources are removed, nothing on disk
+    /// is written or unlinked, and [`CleanupReport::cleanups`] and
+    /// [`CleanupReport::failed_cleanups`] are both zero because nothing was
+    /// attempted — not because nothing was refused.
+    ReportOnly,
+    /// Classify, then remove each dead node's stale resources.
+    Remove,
+}
+
+impl SweepMode {
+    /// Does this mode remove anything?
+    #[must_use]
+    pub const fn removes(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+
+    /// Is this mode a report that touches nothing?
+    ///
+    /// The complement of [`SweepMode::removes`], spelled out so a dry-run
+    /// argument reads as its own polarity rather than as a negation.
+    #[must_use]
+    pub const fn reports_only(self) -> bool {
+        matches!(self, Self::ReportOnly)
+    }
+}
+
+/// A dead node as the registry walk named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadNodeIdentity {
+    /// The node's ENTRY NAME under the registry directory: the decimal
+    /// `value` of its `UniqueSystemId`, which is exactly the filename
+    /// `UniqueNodeId::as_file_name` renders and the directory the sweep
+    /// removes. This is the name a reader can check against `ls`.
+    pub name: String,
+    /// iceoryx2's own `{:?}` rendering of the node id, verbatim
+    /// (`UniqueNodeId(UniqueSystemId { value: …, pid: …, creation_time: … })`).
+    /// Kept beside the name because it is the token every trace line about
+    /// the node carries, so a reader's grep against a raw trace matches.
+    pub token: String,
+}
+
+/// One node exactly as the registry walk classified it, before any sweep
+/// decision is taken.
+///
+/// `View` is the handle whose removal is the side effect — iceoryx2's
+/// `DeadNodeView` in production, and `()` (or a counter's token) in a test
+/// that drives the decision without a registry.
+#[derive(Debug)]
+pub enum SurveyedNode<View> {
+    /// Alive, inaccessible or undefined. A sweep never touches it, in either
+    /// mode, and makes no claim about it.
+    NotDead,
+    /// Dead: its stale resources are what a sweep removes.
+    Dead {
+        /// How the walk named it.
+        identity: DeadNodeIdentity,
+        /// The handle the removal consumes.
+        view: View,
+    },
+}
+
+/// What the sweep did with ONE node it classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeSweepOutcome {
+    /// The node was not dead. Carries nothing: the sweep neither touched it
+    /// nor counted it.
+    NotDead,
+    /// Dead, and classified ONLY — [`SweepMode::ReportOnly`] removed nothing.
+    /// This is the same set a [`SweepMode::Remove`] run over the same
+    /// registry would have attempted, and no claim about what that attempt
+    /// would have returned.
+    WouldRemove(DeadNodeIdentity),
+    /// Dead, and its stale resources were removed.
+    Removed(DeadNodeIdentity),
+    /// Dead, and the removal was refused. `failure` is iceoryx2's own `{:?}`
+    /// rendering of the error, never a re-spelling of it.
+    Refused {
+        /// How the walk named the node.
+        identity: DeadNodeIdentity,
+        /// iceoryx2's `{:?}` of the `NodeCleanupFailure`.
+        failure: String,
+    },
+}
+
+/// THE sweep decision, and the only place either mode reaches a dead node.
+///
+/// [`SweepMode::Remove`] is this classification FOLLOWED BY `remove`;
+/// [`SweepMode::ReportOnly`] is the same classification with `remove` never
+/// called. There is no second walk and no second predicate, so a report can
+/// never name a different set than the run that removes them.
+///
+/// `trace` receives the bookkeeping lines iceoryx2's own sweep loop emitted
+/// about each node, in the order it emitted them (detected, then removed or
+/// refused), so a caller that feeds them back through the log bridge keeps
+/// [`classify_cleanup_failures`] reading exactly the shapes it always read.
+/// A `ReportOnly` pass emits only the detection line: there is no removal to
+/// report and inventing one would be the defect this mode exists to close.
+pub fn sweep_one_node<View, Err, Remove, Trace>(
+    node: SurveyedNode<View>,
+    mode: SweepMode,
+    remove: Remove,
+    mut trace: Trace,
+) -> NodeSweepOutcome
+where
+    Err: core::fmt::Debug,
+    Remove: FnOnce(View) -> Result<(), Err>,
+    Trace: FnMut(IoxLogLevel, String),
+{
+    let SurveyedNode::Dead { identity, view } = node else {
+        return NodeSweepOutcome::NotDead;
+    };
+    trace(
+        IoxLogLevel::Debug,
+        format!("Dead node ({}) detected", identity.token),
+    );
+    if mode.reports_only() {
+        return NodeSweepOutcome::WouldRemove(identity);
+    }
+    match remove(view) {
+        Ok(()) => {
+            trace(
+                IoxLogLevel::Trace,
+                format!(
+                    "The dead node ({}) was successfully removed.",
+                    identity.token
+                ),
+            );
+            NodeSweepOutcome::Removed(identity)
+        }
+        Err(failure) => {
+            let failure = format!("{failure:?}");
+            trace(
+                IoxLogLevel::Trace,
+                format!("Unable to remove dead node {} ({failure}).", identity.token),
+            );
+            NodeSweepOutcome::Refused { identity, failure }
+        }
+    }
 }
 
 /// One dead node iceoryx2 could not remove, with the sub-causes it logged
@@ -165,8 +349,8 @@ pub struct CleanupReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedNodeCleanup {
     /// The node identity exactly as iceoryx2 rendered it in the
-    /// `Unable to remove dead node {id:?} (…)` line — for 0.9.1 that is
-    /// `UniqueNodeId(UniqueSystemId { value: …, pid: …, creation_time: … })`.
+    /// `Unable to remove dead node {id:?} (…)` line, on the pinned release
+    /// that is `UniqueNodeId(UniqueId { payload_value: …, unique_value: … })`.
     /// Kept verbatim: it is the token every other line about the node
     /// carries, and shortening it here would make a reader's grep against
     /// a raw trace miss.
@@ -324,16 +508,19 @@ fn is_sub_cause_line(log: &CapturedLog) -> bool {
         && (log.message.contains(" since ") || log.message.contains(" due to "))
 }
 
-/// The head of a node identity as iceoryx2 0.9.1 renders it under `{:?}`:
-/// `UniqueNodeId` is a tuple struct over `UniqueSystemId` with a derived
-/// `Debug` (`iceoryx2-0.9.1/src/identifiers.rs:163`), so every rendering —
-/// the refusal line's, a `DeadNodeView` origin's, a string origin's
-/// `{node_id:?}` — opens with this and closes at the paren that balances it.
+/// The head of a node identity as iceoryx2 renders it under `{:?}`:
+/// `UniqueNodeId` is a tuple struct with a derived `Debug`
+/// (`identifiers.rs`), so every rendering (the refusal line's, a
+/// `DeadNodeView` origin's, a string origin's `{node_id:?}`) opens with this
+/// and closes at the paren that balances it. The prefix is what the parser
+/// keys on, which is why it survived the inner type changing in 0.10; the
+/// live rendering is re-derived in
+/// `the_node_token_fixture_matches_the_live_rendering`.
 const NODE_TOKEN_PREFIX: &str = "UniqueNodeId(";
 
 /// Every node token embedded in `text`: each `UniqueNodeId(` … `)` span,
 /// closed at the paren that BALANCES its opener. The inner
-/// `UniqueSystemId { value, pid, creation_time: Time { … } }` carries braces
+/// `UniqueId { payload_value, unique_value }` carries braces
 /// but no parens, so balancing is what turns `Dead node (UniqueNodeId(…))
 /// detected` into the same token the refusal line prints. An unbalanced
 /// prefix (a truncated line) yields nothing rather than a guessed token.
@@ -370,7 +557,7 @@ fn carries_a_foreign_node_token(log: &CapturedLog, node: &str) -> bool {
 ///
 /// The variant is the LAST ` (…)` token — space-then-paren, because the node
 /// identity before it is itself full of parens and braces
-/// (`UniqueNodeId(UniqueSystemId { … })`) none of which follow a space, and
+/// (`UniqueNodeId(UniqueId { … })`) none of which follow a space, and
 /// every `NodeCleanupFailure` variant is a unit variant, so the token
 /// contains no parens of its own. A line with no such tail yields the whole
 /// remainder as the node and an EMPTY variant, never a guessed one.
@@ -586,13 +773,19 @@ pub fn classify_cleanup_failures(captured: &[CapturedLog]) -> ClassifiedFailures
     parts
 }
 
-/// Walk iceoryx2's node registry and remove the stale resources of
-/// every dead node. Same behaviour as
-/// [`cleanup_dead_iceoryx2_nodes`] but additionally captures
-/// iceoryx2's per-failure trace messages and classifies them by
-/// cause for actionable user-facing diagnostics.
+/// Walk iceoryx2's node registry ONCE, classifying every node, and — under
+/// [`SweepMode::Remove`] — removing each dead node's stale resources as it is
+/// classified. Live nodes are never touched in either mode.
 ///
-/// Replaces the opaque
+/// This is the whole of `cerulion clean`'s dead-node half, both ways round.
+/// The walk and the decision are shared: [`sweep_one_node`] is the only place
+/// a dead node is reached, so `--report-only` names exactly the nodes a bare
+/// run would have removed, and the destructive run is that classification
+/// followed by the removal rather than a second walk with a second predicate.
+///
+/// iceoryx2's per-failure trace messages are captured (via the
+/// [`cerulion_core::iceoryx_logger`] bridge) and classified by cause for
+/// actionable user-facing diagnostics, replacing the opaque
 /// "Cleaned N dead iceoryx2 node(s); M cleanup(s) failed (typically
 /// permission errors)" with a structured per-cause breakdown.
 /// Common causes:
@@ -600,9 +793,13 @@ pub fn classify_cleanup_failures(captured: &[CapturedLog]) -> ClassifiedFailures
 ///   by a different uid; user can't remove them. Run as the
 ///   owning user, or `chmod` the resources.
 /// - **version mismatch** — the dead node's on-disk state was
-///   produced by a different iceoryx2 version. Run
-///   `rm -rf /tmp/iceoryx2/` to recover (the live nodes will
-///   recreate their state).
+///   produced by a different iceoryx2 version, and only that
+///   version's tooling can reap it. Two versions sharing one root
+///   is a supported state (each keeps its own management
+///   segment), so removing the root would take a LIVE process's
+///   registry with it. Stop the older processes and reap their
+///   artifacts by prefix. `rm -rf /tmp/iceoryx2/` is safe only
+///   when no process of either version is running.
 /// - **lock contention** — another process is racing the same
 ///   cleanup. Retry; usually self-resolves on the next run.
 ///
@@ -611,28 +808,35 @@ pub fn classify_cleanup_failures(captured: &[CapturedLog]) -> ClassifiedFailures
 /// at process startup). Without the bridge, iceoryx2's traces
 /// go to its built-in console logger and the capture buffer
 /// stays empty, so this function falls back to the flat
-/// `CleanupState` counts and `unclassified` is empty.
-pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics() -> CleanupReport {
-    cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(Config::global_config())
+/// counters and `unclassified` is empty.
+///
+/// What a [`SweepMode::ReportOnly`] report does NOT promise: the sub-cause
+/// diagnostics are empty because nothing was attempted, so `failures`,
+/// `failures_by_cause` and `unclassified` say nothing about what a removal
+/// would have hit. `registry_errors` is still real — the walk itself can fail
+/// either way.
+pub fn sweep_dead_nodes(mode: SweepMode) -> CleanupReport {
+    sweep_dead_nodes_with_config(Config::global_config(), mode)
 }
 
-/// [`cleanup_dead_iceoryx2_nodes_with_diagnostics`] over an EXPLICIT iceoryx2
-/// config instead of the global one.
+/// [`sweep_dead_nodes`] over an EXPLICIT iceoryx2 config instead of the
+/// global one.
 ///
 /// The global config is what every CLI path wants; the explicit one is what
-/// lets the orphan-port-tag pin (`tests/clean_orphan_port_tag_test.rs`) run the
-/// SAME sweep-and-classify path over an isolated registry root, so a real
-/// dead node can be minted, refused, reclaimed and re-swept without touching
-/// the desk's `/tmp/iceoryx2`. Same log-level guard, same capture, same
-/// classifier — the global variant is this one applied to
+/// lets a test run the SAME sweep-and-classify path over an isolated registry
+/// root, so a real dead node can be minted, swept and re-swept without touching
+/// the machine's shared `/tmp/iceoryx2`. Same log-level guard, same capture,
+/// same classifier: the global variant is this one applied to
 /// `Config::global_config()`.
-pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config) -> CleanupReport {
-    use cerulion_core::iceoryx_logger::{capture_iceoryx_logs, init_iceoryx_log_level_from_env};
+pub fn sweep_dead_nodes_with_config(config: &Config, mode: SweepMode) -> CleanupReport {
+    use cerulion_core::iceoryx_logger::{
+        capture_iceoryx_logs, emit_iceoryx_log, init_iceoryx_log_level_from_env,
+    };
     use iceoryx2::prelude::{set_log_level, LogLevel};
 
     /// RAII guard: bumps iceoryx2's log level to Trace on
     /// construction and restores it on drop, even if the
-    /// scoped call panics. `Node::try_cleanup_dead_nodes` is documented
+    /// scoped call panics. A dead node's removal is documented
     /// to potentially panic on a registry corrupted by a non-iceoryx2
     /// writer; without the guard, that panic would leave the global
     /// log level pinned at Trace for the rest of the process
@@ -652,13 +856,57 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
 
     set_log_level(LogLevel::Trace);
     let _guard = LogLevelGuard;
-    let (state, captured) =
-        capture_iceoryx_logs(|| Node::<CerService>::try_cleanup_dead_nodes(config));
+    // The origin iceoryx2's own sweep loop stamped on its per-node
+    // bookkeeping lines, reproduced exactly: the classifier's
+    // foreign-token and adjacency rules read origins, and a line arriving
+    // under a different origin would be attributed differently.
+    let origin = format!(
+        "Node::<{}>::cleanup_dead_nodes()",
+        core::any::type_name::<CerService>()
+    );
+    let (walk, captured) = capture_iceoryx_logs(|| {
+        let mut walk = RegistryWalk::default();
+        // ONE walk. The callback classifies each node and — only under
+        // `Remove` — removes it, through the one shared decision.
+        let listed = Node::<CerService>::list(config, |state| {
+            let outcome = sweep_one_node(
+                surveyed(state),
+                mode,
+                // `Duration::ZERO` is what `Node::try_cleanup_dead_nodes`
+                // passes: wait for no other cleaner, refuse instead.
+                |dead: DeadNodeView<CerService>| {
+                    dead.blocking_remove_stale_resources(Duration::ZERO)
+                },
+                |level, message| emit_iceoryx_log(level, &origin, &message),
+            );
+            walk.record(outcome);
+            CallbackProgression::Continue
+        });
+        if let Err(e) = listed {
+            // The line iceoryx2's sweep entry logged when `Node::list`
+            // returned `Err`, verbatim — `is_registry_wide_line` reads this
+            // head, and a walk that aborted part-way must still be reported
+            // as a walk failure rather than as a clean registry.
+            emit_iceoryx_log(
+                LogLevel::Debug,
+                &origin,
+                &format!(
+                    "Unable to perform a full scan for dead nodes since the all existing nodes \
+                     could not be listed ({e:?})."
+                ),
+            );
+        }
+        walk
+    });
     // `_guard` restores the ENV-DERIVED level on drop at end-of-scope (or on
     // panic-unwind through `_guard`'s Drop) — `IOX2_LOG_LEVEL` if set, else
     // `error`. See the guard's own docs: a hardcoded `Error` restore here is
     // the inert-knob bug, not the contract.
 
+    // No node-creation refusal to fold in: the walk above needs no node of its
+    // own. `Node::list` reads the registry from the config, and the removal is
+    // injected per dead node, so the one failure mode left is the walk itself,
+    // which `classify_cleanup_failures` already reads out of the captured log.
     let ClassifiedFailures {
         failures_by_cause,
         unclassified,
@@ -667,12 +915,67 @@ pub fn cleanup_dead_iceoryx2_nodes_with_diagnostics_with_config(config: &Config)
     } = classify_cleanup_failures(&captured);
 
     CleanupReport {
-        cleanups: state.cleanups,
-        failed_cleanups: state.failed_cleanups,
+        cleanups: walk.cleanups,
+        failed_cleanups: walk.failed_cleanups,
         failures_by_cause,
         unclassified,
         failures,
         registry_errors,
+        dead_nodes: walk.dead_nodes,
+    }
+}
+
+/// Name one visited node the way the sweep's classification needs it.
+///
+/// `Alive`, `Inaccessible` and `Undefined` all collapse to
+/// [`SurveyedNode::NotDead`]: the sweep removes a node's resources only on
+/// the evidence that its process is gone, and "we could not tell" is not
+/// that evidence.
+fn surveyed(state: NodeState<CerService>) -> SurveyedNode<DeadNodeView<CerService>> {
+    match state {
+        NodeState::Dead(view) => {
+            let id = *view.id();
+            SurveyedNode::Dead {
+                identity: DeadNodeIdentity {
+                    // `UniqueNodeId::as_file_name` renders the decimal
+                    // `value`, so this is the directory name under the
+                    // registry root, checkable against `ls`.
+                    name: id.value().to_string(),
+                    token: format!("{id:?}"),
+                },
+                view,
+            }
+        }
+        NodeState::Alive(_) | NodeState::Inaccessible(_) | NodeState::Undefined(_) => {
+            SurveyedNode::NotDead
+        }
+    }
+}
+
+/// The counters and identities one walk accumulated.
+#[derive(Debug, Default)]
+struct RegistryWalk {
+    cleanups: u64,
+    failed_cleanups: u64,
+    dead_nodes: Vec<DeadNodeIdentity>,
+}
+
+impl RegistryWalk {
+    /// Fold one node's outcome in. The ONLY place the counters move, so a
+    /// report and a removal cannot count differently.
+    fn record(&mut self, outcome: NodeSweepOutcome) {
+        match outcome {
+            NodeSweepOutcome::NotDead => {}
+            NodeSweepOutcome::WouldRemove(identity) => self.dead_nodes.push(identity),
+            NodeSweepOutcome::Removed(identity) => {
+                self.cleanups += 1;
+                self.dead_nodes.push(identity);
+            }
+            NodeSweepOutcome::Refused { identity, .. } => {
+                self.failed_cleanups += 1;
+                self.dead_nodes.push(identity);
+            }
+        }
     }
 }
 
@@ -711,7 +1014,37 @@ pub fn cleanup_dead_iceoryx2_nodes() -> CleanupState {
     // reads and parses `iceoryx2.toml` on first use and can panic on a corrupt
     // file, and a panic there is exactly the advisory-sweep failure this wrap
     // exists to contain (pinned by `the_global_sweep_resolves_its_config_inside_the_panic_boundary`).
-    contained_sweep(|| Node::<CerService>::try_cleanup_dead_nodes(Config::global_config()))
+    // The sweep is a node method, so this mints a transient node on the global
+    // config inside the SAME panic boundary (see the diagnostics variant for
+    // why the node is needed and why its refusal must not read as a clean
+    // sweep). This entry point returns a bare `CleanupState` with nowhere to
+    // put a refusal, so a node that cannot be created is ONE loud warning: the
+    // advisory sweep did not run, and a caller that saw 0/0 must not conclude
+    // the namespace was clean.
+    contained_sweep(|| {
+        let sweep_config =
+            cerulion_core::transport::dead_node_sweep::sweep_node_config(Config::global_config());
+        match NodeBuilder::new()
+            .config(&sweep_config)
+            .create::<CerService>()
+        {
+            Ok(node) => node.try_cleanup_dead_nodes(),
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "dead-node sweep skipped: no iceoryx2 node could be created in the \
+                     namespace being swept, so stale resources were neither found nor \
+                     removed (this is not an empty registry). Run `cerulion clean` for \
+                     the classified report, or remove the stale iceoryx2 shared-memory \
+                     artifacts by hand"
+                );
+                CleanupState {
+                    cleanups: 0,
+                    failed_cleanups: 0,
+                }
+            }
+        }
+    })
 }
 
 /// The ONE panic boundary both sweep entry points share: run the sweep, and on
@@ -1291,17 +1624,34 @@ pub(crate) mod tests {
 
     use iceoryx2::prelude::LogLevel;
 
-    /// The sweep's own string origin (`iceoryx2-0.9.1/src/node/mod.rs:1215`).
+    /// The sweep's own string origin. Re-derived against the live library by
+    /// `the_sweep_origin_matches_the_live_rendering`.
     pub(crate) const SWEEP_ORIGIN: &str =
         "Node::<iceoryx2::service::ipc_threadsafe::Service>::cleanup_dead_nodes()";
 
-    /// A node token exactly as iceoryx2 0.9.1 renders `UniqueNodeId` under
-    /// `{:?}` — parens AND braces inside, which is why the refusal line is
-    /// parsed from its end.
-    pub(crate) fn node_token(value: u128, pid: u32) -> String {
+    /// A node token exactly as iceoryx2 renders `UniqueNodeId` under `{:?}`:
+    /// parens AND braces inside, which is why the refusal line is parsed from
+    /// its end.
+    ///
+    /// The inner type CHANGED in 0.10: `UniqueSystemId { value, pid,
+    /// creation_time: Time { .. } }` became `UniqueId { payload_value,
+    /// unique_value }`. Two fixed-width integers, no pid and no creation stamp.
+    /// That is exactly the drift that leaves a hand fixture describing a shape
+    /// the library no longer emits, and
+    /// `the_node_token_fixture_matches_the_live_rendering` builds a REAL node
+    /// and compares against it, so the next such rename fails a test instead of
+    /// quietly making every oracle built on this fictional.
+    /// The payload half of the identity. Arbitrary: the shape comparison in
+    /// `the_node_token_fixture_matches_the_live_rendering` collapses digit
+    /// runs, so only the SHAPE of this number is ever checked and any digits
+    /// would do. A captured sample from one machine sitting here unexplained
+    /// reads as meaningful when it is not, so it is a round number with the
+    /// reason beside it.
+    const FIXTURE_PAYLOAD_VALUE: u128 = 1_000_000_000_000_000_000;
+
+    pub(crate) fn node_token(value: u128) -> String {
         format!(
-            "UniqueNodeId(UniqueSystemId {{ value: {value}, pid: {pid}, creation_time: \
-             Time {{ clock_type: Monotonic, seconds: 91, nanoseconds: 12 }} }})"
+            "UniqueNodeId(UniqueId {{ payload_value: {FIXTURE_PAYLOAD_VALUE}, unique_value: {value} }})"
         )
     }
 
@@ -1309,6 +1659,101 @@ pub(crate) mod tests {
     /// rendering, which embeds the node token.
     pub(crate) fn view_origin(node: &str) -> String {
         format!("DeadNodeView(AliveNodeView {{ id: {node}, details: None, _service: PhantomData<iceoryx2::service::ipc_threadsafe::Service> }})")
+    }
+
+    /// The hand fixtures above describe text a LIBRARY emits, so they rot
+    /// silently when that text moves: the classifier keeps parsing, the tests
+    /// keep passing, and `cerulion clean` attributes a refusal to the wrong
+    /// node (or to none). These two arms re-derive both halves against the
+    /// linked iceoryx2 rather than against a comment.
+    ///
+    /// The id half is the one that actually moved: `UniqueNodeId` wrapped
+    /// `UniqueSystemId { value, pid, creation_time: Time { .. } }` and now
+    /// wraps `UniqueId { payload_value, unique_value }`. The parser survives it
+    /// because it balances
+    /// parens rather than matching the inner type, and this arm is what says
+    /// so out loud.
+    #[test]
+    fn the_node_token_fixture_matches_the_live_rendering() {
+        let config = iceoryx2::testing::generate_isolated_config();
+        let node = iceoryx2::node::NodeBuilder::new()
+            .config(&config)
+            .create::<CerService>()
+            .expect("a node on an isolated config");
+        let live = format!("{:?}", node.id());
+
+        assert!(
+            live.starts_with(NODE_TOKEN_PREFIX),
+            "the node identity no longer renders as `{NODE_TOKEN_PREFIX}…` but as \
+             `{live}`. Every refusal line, sub-cause origin and detection line is \
+             keyed on that prefix, so the classifier would stop attributing anything"
+        );
+
+        // The token the parser would lift out of a real refusal line is the
+        // WHOLE identity, not a prefix of it.
+        let refusal_line = format!("Unable to remove dead node {live} (InternalError).");
+        let lifted: Vec<&str> = node_tokens(&refusal_line).collect();
+        assert_eq!(
+            lifted,
+            vec![live.as_str()],
+            "paren balancing must lift the whole live identity out of a refusal line"
+        );
+        let (parsed_node, variant) =
+            parse_failure_line(&refusal_line).expect("a refusal line parses");
+        assert_eq!(
+            parsed_node, live,
+            "the parsed node must be the live identity"
+        );
+        assert_eq!(variant, "InternalError");
+
+        // And the hand fixture must be the same SHAPE, so every oracle built
+        // on it is still describing reality. Compared structurally (the live
+        // value is whatever the process was handed), not byte for byte.
+        let fixture = node_token(4242);
+        // Collapse each RUN of digits to one marker: the fixture's numbers are
+        // arbitrary and the live ones are whatever the process was handed, so
+        // comparing digit widths would fail on nothing but luck. What must
+        // match is the field names, their order and the punctuation around
+        // them, which is everything the parser walks.
+        let shape = |t: &str| -> String {
+            let mut out = String::new();
+            let mut in_digits = false;
+            for c in t.chars() {
+                if c.is_ascii_digit() {
+                    if !in_digits {
+                        out.push('#');
+                        in_digits = true;
+                    }
+                } else {
+                    in_digits = false;
+                    out.push(c);
+                }
+            }
+            out
+        };
+        assert_eq!(
+            shape(&fixture),
+            shape(&live),
+            "the hand node-token fixture no longer has the shape iceoryx2 renders \
+             (fixture `{fixture}`, live `{live}`). Re-derive it before trusting any \
+             oracle built on it"
+        );
+    }
+
+    /// The sweep's origin string, re-derived. It is `Node::<{type_name}>::\
+    /// cleanup_dead_nodes()` inside iceoryx2, so half of it is mechanical and
+    /// a `Service` swap on Cerulion's side moves it without touching iceoryx2.
+    #[test]
+    fn the_sweep_origin_matches_the_live_rendering() {
+        let derived = format!(
+            "Node::<{}>::cleanup_dead_nodes()",
+            core::any::type_name::<CerService>()
+        );
+        assert_eq!(
+            SWEEP_ORIGIN, derived,
+            "the sweep origin the fixtures build refusal lines with is not the one \
+             the linked iceoryx2 would print"
+        );
     }
 
     pub(crate) fn line(
@@ -1363,7 +1808,7 @@ pub(crate) mod tests {
     /// verbatim token and the bare variant name.
     #[test]
     fn one_internal_error_node_carries_its_two_preceding_sub_causes() {
-        let node = node_token(4242, 77);
+        let node = node_token(4242);
         let c1 = "corrupted service remainders to could not be removed due to an internal error (InternalError).";
         let c2 = "stale resources of the port PortId(9) could not be removed due to an internal failure.";
         let captured = vec![
@@ -1400,8 +1845,8 @@ pub(crate) mod tests {
     /// sub-causes, and the per-cause counts must both be 1.
     #[test]
     fn two_interleaved_nodes_are_kept_apart_by_their_ids() {
-        let a = node_token(1, 10);
-        let b = node_token(2, 20);
+        let a = node_token(1);
+        let b = node_token(2);
         let captured = vec![
             detected(&a),
             sub_cause(&a, "service tags could not be read due to an internal error."),
@@ -1452,8 +1897,8 @@ pub(crate) mod tests {
     /// service-layer line about this node) IS attributed by adjacency.
     #[test]
     fn a_permission_denied_node_takes_ownerless_lines_only_from_its_own_block() {
-        let earlier = node_token(5, 50);
-        let node = node_token(6, 60);
+        let earlier = node_token(5);
+        let node = node_token(6);
         let stray_before_boundary = line(
             LogLevel::Debug,
             "Service::remove_node",
@@ -1509,7 +1954,7 @@ pub(crate) mod tests {
     /// needs.
     #[test]
     fn an_unclassified_variant_is_reported_raw_and_still_attributed() {
-        let node = node_token(9, 90);
+        let node = node_token(9);
         // The VERBATIM line `ResourcesAlreadyCleanedUp` actually produces
         // (`acquire_cleaner_lock`, `mod.rs:762`) — not a `since the …` line
         // borrowed from another arm, which is how a `since the`-only
@@ -1558,7 +2003,7 @@ pub(crate) mod tests {
     /// a successful sweep that logged explanations produces no entry.
     #[test]
     fn sub_causes_without_a_refusal_produce_no_entry() {
-        let node = node_token(3, 30);
+        let node = node_token(3);
         let captured = vec![
             detected(&node),
             sub_cause(&node, "service itself is corrupted. Trying to remove the corrupted remainders of the service."),
@@ -1576,7 +2021,7 @@ pub(crate) mod tests {
     /// at all (`None`).
     #[test]
     fn the_refusal_line_parser_takes_the_last_parenthesised_token_as_the_variant() {
-        let node = node_token(11, 1);
+        let node = node_token(11);
         assert_eq!(
             parse_failure_line(&format!(
                 "Unable to remove dead node {node} (InternalError)."
@@ -1626,9 +2071,9 @@ pub(crate) mod tests {
     /// its entry must carry exactly its own explanation.
     #[test]
     fn a_non_refused_nodes_line_is_not_blamed_on_the_next_refusal() {
-        let other_user = node_token(31, 3100);
-        let alive_unreadable = node_token(32, 3200);
-        let stranded = node_token(33, 3300);
+        let other_user = node_token(31);
+        let alive_unreadable = node_token(32);
+        let stranded = node_token(33);
         let own = "port tags could not be read due to an internal error.";
         let captured = vec![
             line(
@@ -1672,7 +2117,7 @@ pub(crate) mod tests {
     /// origin they come from.
     #[test]
     fn the_same_walk_line_carrying_the_refused_nodes_own_token_is_attributed_by_id() {
-        let stranded = node_token(34, 3400);
+        let stranded = node_token(34);
         let own_walk_line = line(
             LogLevel::Debug,
             get_node_state_origin(&stranded),
@@ -1701,8 +2146,8 @@ pub(crate) mod tests {
     /// it).
     #[test]
     fn a_foreign_token_line_beside_an_ownerless_one_withholds_only_itself() {
-        let other = node_token(35, 3500);
-        let stranded = node_token(36, 3600);
+        let other = node_token(35);
+        let stranded = node_token(36);
         let ownerless = line(
             LogLevel::Debug,
             "Service::remove_node",
@@ -1742,7 +2187,7 @@ pub(crate) mod tests {
     /// (the id arm), so a guard reading the message would be wrong.
     #[test]
     fn a_monitor_state_line_about_a_visited_node_is_never_attributed_by_adjacency() {
-        let node = node_token(6, 60);
+        let node = node_token(6);
         let monitor_line = line(
             LogLevel::Debug,
             "Node::state_from_monitor(ProcessMonitor { state_path: FilePath { value: \"/tmp/iceoryx2/nodes/iox2_5.node_monitor\" }, owner_lock_path: FilePath { value: \"/tmp/iceoryx2/nodes/iox2_5.node_monitor_owner_lock\" }, context_path: FilePath { value: \"/tmp/iceoryx2/nodes/iox2_5.node_monitor_context\" } })",
@@ -1806,8 +2251,8 @@ pub(crate) mod tests {
     /// with no token — plus a truncated token, which yields nothing.
     #[test]
     fn node_tokens_extracts_each_balanced_unique_node_id_span() {
-        let a = node_token(41, 1);
-        let b = node_token(42, 2);
+        let a = node_token(41);
+        let b = node_token(42);
         let collect = |text: &str| node_tokens(text).map(str::to_string).collect::<Vec<_>>();
 
         assert_eq!(collect(&a), vec![a.clone()]);
@@ -1862,7 +2307,7 @@ pub(crate) mod tests {
     /// have (`mod.rs:269-282`).
     #[test]
     fn a_cleaner_lock_contention_refusal_carries_its_verbatim_explanation() {
-        let node = node_token(51, 5100);
+        let node = node_token(51);
         let captured = vec![
             detected(&node),
             line(
@@ -1923,7 +2368,7 @@ pub(crate) mod tests {
             (CLEANER_LOCK_INTERRUPT, "Interrupt", None),
         ];
         for (k, (message, variant, cause)) in rows.iter().enumerate() {
-            let node = node_token(60 + k as u128, 6000 + k as u32);
+            let node = node_token(60 + k as u128);
             let captured = vec![
                 detected(&node),
                 line(LogLevel::Debug, view_origin(&node), *message),
@@ -1959,12 +2404,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every distinct PER-NODE sub-cause shape iceoryx2 0.9.1 can log on the
-    /// way to a refusal — read off `mod.rs` 540-835
+    /// Every distinct PER-NODE sub-cause shape the LINKED iceoryx2 can log on
+    /// the way to a refusal, read off `node/mod.rs`
     /// (`remove_stale_resources_impl`, `acquire_cleaner_lock`, `remove_node`,
-    /// `blocking_remove_stale_resources`) and 1299-1391 (the per-node walk
-    /// helpers) plus `service/stale_resource_cleanup.rs`. Placeholders (`0ns`,
-    /// port `9`, `(InternalError)`) stand in for the `{:?}` interpolations.
+    /// `blocking_remove_stale_resources`, the per-node walk helpers) plus
+    /// `service/stale_resource_cleanup.rs`. Placeholders (`0ns`, port `9`,
+    /// `(InternalError)`) stand in for the `{:?}` interpolations.
+    ///
+    /// Re-derived against 0.10, because a corpus is a description of a library
+    /// and descriptions rot silently: six rows described text 0.9.1 emitted and
+    /// 0.10 does not (the three corrupted-service-remainder rows, the
+    /// `ServiceRemoveNodeError` row whose wording changed, and the two rows
+    /// carrying upstream's `insufficent` typo, since fixed), and the arms
+    /// 0.10 added were untested. Production classification never depended on
+    /// the rows, `is_sub_cause_line` is a two-substring heuristic, so this is
+    /// a corpus that had stopped describing the library, not a live defect.
     const PER_NODE_SUB_CAUSE_SHAPES: &[&str] = &[
         // remove_stale_resources_impl / blocking_remove_stale_resources
         "Unable to block until the stale resources of the dead node are removed since the adaptive wait builder could not be initiated.",
@@ -1975,16 +2429,18 @@ pub(crate) mod tests {
         IN_CLEANUP_SECTION_LINE,
         "Unable to remove stale resources since the monitor cleaner lock could not be acquired.",
         "Unable to remove stale resources since the dead node was using a different iceoryx2 version.",
-        "Unable to remove stale resources since the service itself is corrupted. Trying to remove the corrupted remainders of the service.",
-        "Unable to remove stale resources since the corrupted service remainders to could not be removed due to insufficient permissions.",
-        "Unable to remove stale resources since the corrupted service remainders to could not be removed due to an internal error (InternalError).",
-        "Unable to remove stale resources due to an internal error while removing the node from the service (InternalError).",
-        "Unable to remove stale resources since the service tags could not be read due to insufficent permissions.",
+        // The `ServiceRemoveNodeError` ladder 0.10 put in place of the
+        // corrupted-remainder block. Upstream emits the SAME text for the
+        // interrupt and the permission arm, so one row covers both.
+        "Unable to remove stale resources since an interrupt signal was raised while removing the node from the service.",
+        "Unable to remove stale resources since an internal failure occurred while removing the node from the service.",
+        "Unable to remove stale resources since the service tags could not be read due to insufficient permissions.",
         "Unable to remove stale resources since the service tags could not be read due to an internal error.",
         "Unable to remove stale resources since the stale resources of the port 9 could not be removed due to insufficient permissions.",
         "Unable to remove stale resources since the stale resources of the port 9 could not be removed since the iceoryx2 version does not match.",
         "Unable to remove stale resources since the stale resources of the port 9 could not be removed due to an internal failure.",
-        "Unable to remove stale resources since the port tags could not be read due to insufficent permissions.",
+        "Unable to remove stale resources since the stale resources of the port 9 could not be removed due to an interrupt signal.",
+        "Unable to remove stale resources since the port tags could not be read due to insufficient permissions.",
         "Unable to remove stale resources since the port tags could not be read due to an internal error.",
         "Unable to remove stale resources since the node itself could not be removed.",
         // acquire_cleaner_lock
@@ -2022,6 +2478,13 @@ pub(crate) mod tests {
         "Failed to remove stale port resources due to insufficient permissions to remove the port from its connections.",
         "Failed to remove stale port resources since the port could not be removed from its connection since iceoryx2 version does not match.",
         "Failed to remove stale port resources due to an internal error while removing the port from its connection.",
+        "Failed to remove stale port resources since an interrupt signal was raised.",
+        // The port TAG arms, new in 0.10. They are why the orphan port tag
+        // reclaim this crate used to carry is unreachable: a dead port's tag
+        // now goes with the rest of its stale resources.
+        "Failed to remove stale port resources since the port tag could not be removed due to insufficient permissions.",
+        "Failed to remove stale port resources since an interrupt signal was received while removing the port tag.",
+        "Failed to remove stale port resources since an internal error occurred while removing the port tag.",
     ];
 
     /// The five REGISTRY-WIDE lines, one per row of [`REGISTRY_WIDE_LINE_HEADS`]'s
@@ -2058,8 +2521,8 @@ pub(crate) mod tests {
     /// the registry guard in the adjacency arm load-bearing rather than
     /// redundant.
     #[test]
-    fn the_sub_cause_predicate_covers_every_0_9_1_shape_and_only_those() {
-        let node = node_token(70, 7000);
+    fn the_sub_cause_predicate_covers_every_linked_library_shape_and_only_those() {
+        let node = node_token(70);
         for shape in PER_NODE_SUB_CAUSE_SHAPES
             .iter()
             .copied()
@@ -2097,7 +2560,7 @@ pub(crate) mod tests {
                 "row {k}: not recognised as registry-wide: {shape}"
             );
         }
-        let node = node_token(71, 7100);
+        let node = node_token(71);
         for shape in PER_NODE_SUB_CAUSE_SHAPES {
             assert!(
                 !is_registry_wide_line(&line(LogLevel::Debug, view_origin(&node), *shape)),
@@ -2129,7 +2592,7 @@ pub(crate) mod tests {
     /// FIRST assertion.
     #[test]
     fn a_registry_wide_line_before_a_refusal_is_global_not_that_nodes_cause() {
-        let node = node_token(80, 8000);
+        let node = node_token(80);
         let (scan_origin, scan_shape) = REGISTRY_WIDE_SHAPES[0];
         let full_scan = line(LogLevel::Debug, scan_origin, scan_shape);
         let ownerless = line(
@@ -2212,7 +2675,7 @@ pub(crate) mod tests {
     /// the node with exactly its own cause, the walk with its two lines.
     #[test]
     fn an_aborted_walk_after_a_refusal_reports_both_halves_apart() {
-        let node = node_token(81, 8100);
+        let node = node_token(81);
         let own = "node itself could not be removed.";
         let (list_origin, list_shape) = REGISTRY_WIDE_SHAPES[2];
         let (scan_origin, _) = REGISTRY_WIDE_SHAPES[0];

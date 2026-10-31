@@ -10,6 +10,7 @@
 //! (extracting `inputs`, `outputs`, and an optional `policy`
 //! field with the same shape the cdylib FFI uses).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use cerulion_core::graph::node::BackpressurePolicy;
@@ -27,6 +28,15 @@ use crate::error::{CliError, CliResult};
 pub struct NodeMetadata {
     pub node_type: String,
     pub policy: Option<MacroPolicy>,
+    /// The node-level `throttle_ms = N` rate cap, when the type declares one.
+    ///
+    /// Read from SOURCE for the same reason the per-input `backpressure` below
+    /// is: a rate cap is a fire-deferral decision, the chain-fusion analysis
+    /// refuses to fuse a consumer that declares one, and that analysis runs
+    /// well ahead of the first node library load, so source is the only truth
+    /// available to it. Dropping the parsed value here would leave the rule
+    /// decidable in principle and never decided.
+    pub throttle_ms: Option<u64>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
 }
@@ -89,6 +99,7 @@ impl NodeMetadata {
         Self {
             node_type: node_type.to_string(),
             policy,
+            throttle_ms: None,
             inputs: vec![],
             outputs: vec![],
         }
@@ -272,8 +283,18 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                     let mut saw_backpressure = false;
                     let mut expect_bp_value = false;
                     let mut expect_sample_group = false;
+                    let mut accumulate =
+                        crate::node_metadata_accumulate::AccumulateGrammar::default();
+                    let accumulate_err = |why: String| {
+                        CliError::Validation(format!(
+                            "node `{node_type}` field `{port_name}`: {why}"
+                        ))
+                    };
                     for tt in meta_list.tokens.clone() {
                         match tt {
+                            t if accumulate.wants_token() => {
+                                accumulate.on_token(&t).map_err(accumulate_err)?;
+                            }
                             TokenTree::Group(g) if expect_sample_group => {
                                 if g.delimiter() != proc_macro2::Delimiter::Parenthesis {
                                     return Err(CliError::Validation(format!(
@@ -362,6 +383,12 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                     is_trigger = true;
                                 } else if ident == "backpressure" {
                                     saw_backpressure = true;
+                                } else if accumulate
+                                    .on_key(&ident.to_string())
+                                    .map_err(accumulate_err)?
+                                {
+                                    // `accumulate` or `cap`, checked in full
+                                    // once the attribute is read.
                                 } else if !matches!(
                                     ident.to_string().as_str(),
                                     "depth" | "expect_within_ms"
@@ -369,7 +396,7 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                     return Err(CliError::Validation(format!(
                                         "node `{node_type}` field `{port_name}`: unknown input \
                                          attribute `{ident}`. Supported: `trigger`, `depth`, \
-                                         `backpressure`, `expect_within_ms`."
+                                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`."
                                     )));
                                 }
                             }
@@ -416,6 +443,9 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                              parenthesized count — `backpressure = sample(N)`."
                         )));
                     }
+                    accumulate
+                        .finish(is_trigger, &backpressure)
+                        .map_err(accumulate_err)?;
                 }
             } else if attr.path().is_ident("output") {
                 is_output = true;
@@ -594,6 +624,7 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
     Ok(Some(NodeMetadata {
         node_type: node_type.to_string(),
         policy,
+        throttle_ms: macro_attr.and_then(macro_attr_throttle_ms),
         inputs,
         outputs,
     }))
@@ -604,6 +635,9 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
 /// extracting port names from the embedded JSON literal.
 ///
 /// Returns `Ok(None)` if no markers are found.
+/// Prefix of the line inside a Python node's INFO block that names its port schemas.
+pub(crate) const PORT_SCHEMAS_MARKER: &str = "// CERULION:PORT_SCHEMAS ";
+
 fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<NodeMetadata>> {
     let start_marker = "// CERULION:INFO_START";
     let end_marker = "// CERULION:INFO_END";
@@ -726,9 +760,31 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         #[serde(default)]
         inputs: Vec<RawInput>,
         #[serde(default)]
-        outputs: Vec<String>,
+        outputs: Vec<RawOutput>,
         #[serde(default)]
         policy: Option<PolicyJson>,
+        /// The node-level rate cap. Absent on a node that declares none, and
+        /// on an info block written before the key existed.
+        #[serde(default)]
+        throttle_ms: Option<u64>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RawOutput {
+        Name(String),
+        Full { name: String },
+    }
+    // Schema names of a Python node's ports, written by `cerulion node build`
+    // as one `// CERULION:PORT_SCHEMAS {"inputs":{..},"outputs":{..}}` line
+    // inside the INFO block. They stay out of INFO_BYTES: the runtime loader
+    // does not read them.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PortSchemas {
+        #[serde(default)]
+        inputs: BTreeMap<String, String>,
+        #[serde(default)]
+        outputs: BTreeMap<String, String>,
     }
     // The SECOND host parser of this document. `graph::node`'s
     // parser reports an unknown envelope key; this one reports it too, or
@@ -768,46 +824,82 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         ))
     })?;
     let policy = info.policy.and_then(PolicyJson::into_macro_policy);
+    let throttle_ms = info.throttle_ms;
     let (inputs, outputs) = (info.inputs, info.outputs);
+    let mut port_schemas = match block.lines().map(str::trim).find_map(|line| {
+        if line == PORT_SCHEMAS_MARKER.trim_end() {
+            Some("")
+        } else {
+            line.strip_prefix(PORT_SCHEMAS_MARKER)
+        }
+    }) {
+        Some(raw) => serde_json::from_str::<PortSchemas>(raw.trim()).map_err(|e| {
+            CliError::Validation(format!(
+                "node '{}' CERULION:PORT_SCHEMAS line failed to parse: {}",
+                node_type, e
+            ))
+        })?,
+        None => PortSchemas {
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        },
+    };
 
-    Ok(Some(NodeMetadata {
-        node_type: node_type.to_string(),
-        policy,
-        inputs: inputs
-            .into_iter()
-            .map(|entry| match entry {
-                RawInput::Name(name) => PortDef {
-                    name,
-                    schema: None,
-                    schema_alternatives: Vec::new(),
-                    trigger: false,
-                    backpressure: BackpressurePolicy::DropOldest,
-                },
-                RawInput::Full {
-                    name,
-                    trigger,
-                    backpressure,
-                } => PortDef {
-                    name,
-                    schema: None,
-                    schema_alternatives: Vec::new(),
-                    trigger,
-                    backpressure: backpressure
-                        .map(RawBackpressure::into_policy)
-                        .unwrap_or_default(),
-                },
-            })
-            .collect(),
-        outputs: outputs
-            .into_iter()
-            .map(|name| PortDef {
+    let inputs: Vec<PortDef> = inputs
+        .into_iter()
+        .map(|entry| match entry {
+            RawInput::Name(name) => PortDef {
+                schema: port_schemas.inputs.remove(&name),
                 name,
-                schema: None,
                 schema_alternatives: Vec::new(),
                 trigger: false,
                 backpressure: BackpressurePolicy::DropOldest,
-            })
-            .collect(),
+            },
+            RawInput::Full {
+                name,
+                trigger,
+                backpressure,
+            } => PortDef {
+                schema: port_schemas.inputs.remove(&name),
+                name,
+                schema_alternatives: Vec::new(),
+                trigger,
+                backpressure: backpressure
+                    .map(RawBackpressure::into_policy)
+                    .unwrap_or_default(),
+            },
+        })
+        .collect();
+    let outputs: Vec<PortDef> = outputs
+        .into_iter()
+        .map(|output| {
+            let (RawOutput::Name(name) | RawOutput::Full { name }) = output;
+            PortDef {
+                schema: port_schemas.outputs.remove(&name),
+                name,
+                schema_alternatives: Vec::new(),
+                trigger: false,
+                backpressure: BackpressurePolicy::DropOldest,
+            }
+        })
+        .collect();
+    if let Some(name) = port_schemas
+        .inputs
+        .keys()
+        .chain(port_schemas.outputs.keys())
+        .next()
+    {
+        return Err(CliError::Validation(format!(
+            "node '{}' CERULION:PORT_SCHEMAS names port '{}', which the INFO_BYTES document does not declare",
+            node_type, name
+        )));
+    }
+    Ok(Some(NodeMetadata {
+        node_type: node_type.to_string(),
+        policy,
+        throttle_ms,
+        inputs,
+        outputs,
     }))
 }
 
@@ -2431,6 +2523,43 @@ fn macro_attr_to_policy(attr: &syn::Attribute) -> Option<MacroPolicy> {
     None
 }
 
+/// Read the node-level `throttle_ms = N` rate cap off the
+/// `#[cerulion_node(...)]` attribute, or `None` when the node declares none.
+///
+/// A sibling of [`macro_attr_to_policy`] rather than part of it: a rate cap is
+/// not a trigger policy, it STACKS with one, and the macro rejects it only
+/// beside `period_ms`. Same token walk, same numeric-literal handling
+/// (underscores and a type suffix are both legal in the source).
+///
+/// A repeated `throttle_ms` reads as the LAST value, because the macro assigns
+/// each occurrence in sequence and the compiled node therefore carries the
+/// last one. Stopping at the first would let the report name a cap the node
+/// does not have.
+fn macro_attr_throttle_ms(attr: &syn::Attribute) -> Option<u64> {
+    let syn::Meta::List(meta_list) = &attr.meta else {
+        return None;
+    };
+    use proc_macro2::TokenTree;
+    let tokens: Vec<TokenTree> = meta_list.tokens.clone().into_iter().collect();
+    let mut found: Option<u64> = None;
+    for i in 0..tokens.len() {
+        let TokenTree::Ident(ident) = &tokens[i] else {
+            continue;
+        };
+        if ident != "throttle_ms" || i + 2 >= tokens.len() {
+            continue;
+        }
+        if let (TokenTree::Punct(p), TokenTree::Literal(lit)) = (&tokens[i + 1], &tokens[i + 2]) {
+            if p.as_char() == '=' {
+                if let Some(value) = parse_int_literal(&lit.to_string()) {
+                    found = Some(value);
+                }
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2492,6 +2621,70 @@ struct CameraNode {
     // co-location constraint — so a policy this parser drops is a partition
     // that splits a `block` edge and a worker that dies at graph build.
     // ======================================================================
+
+    /// A node-level rate cap is read off the macro attribute, beside the
+    /// trigger policy it stacks with.
+    ///
+    /// The chain-fusion census refuses to fuse a consumer that defers its own
+    /// fire, and it runs before any node library is loaded, so a cap this
+    /// parser dropped would leave that rule decidable and never decided.
+    #[test]
+    fn a_macro_nodes_rate_cap_is_read_beside_its_trigger_policy() {
+        let tmp = TempDir::new().unwrap();
+        let capped = r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(throttle_ms = 5)]
+#[derive(Default)]
+struct CappedNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#;
+        let node_dir = write_node(&tmp, "capped", capped);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.throttle_ms, Some(5));
+        // The cap STACKS: it does not replace the policy the trigger input
+        // synthesizes.
+        assert_eq!(
+            metadata.policy,
+            Some(MacroPolicy::DataTrigger {
+                input_name: "inp".to_string()
+            })
+        );
+
+        // Source-level numeric spellings the compiler accepts, which the
+        // policy walk already handles and this one must too.
+        let spelled = capped.replace(
+            "throttle_ms = 5",
+            "sync_window_ms = 25, throttle_ms = 1_000u64",
+        );
+        let node_dir = write_node(&tmp, "spelled", &spelled);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.throttle_ms, Some(1000));
+        assert_eq!(metadata.policy, Some(MacroPolicy::Sync { window_ms: 25 }));
+
+        // A REPEATED cap reads as the last value, because the macro assigns
+        // each occurrence in sequence and the compiled node carries the last
+        // one. Reading the first would make the report name a cap the node
+        // does not have.
+        let repeated = capped.replace("throttle_ms = 5", "throttle_ms = 5, throttle_ms = 9");
+        let node_dir = write_node(&tmp, "repeated", &repeated);
+        assert_eq!(
+            parse_node_metadata(&node_dir).unwrap().throttle_ms,
+            Some(9),
+            "a repeated rate cap must read as the value the compiled node carries"
+        );
+
+        // ANTI-TAUTOLOGY: a node that declares no cap reports none, so the
+        // arms above cannot be satisfied by a parser that always answers.
+        let bare = capped.replace("#[cerulion_node(throttle_ms = 5)]", "#[cerulion_node]");
+        let node_dir = write_node(&tmp, "bare", &bare);
+        assert_eq!(parse_node_metadata(&node_dir).unwrap().throttle_ms, None);
+    }
 
     #[test]
     fn a_macro_nodes_declared_backpressure_lands_on_its_port() {
@@ -2713,6 +2906,85 @@ pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
         );
     }
 
+    #[test]
+    fn raw_ffi_codegen_output_objects_are_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":1,\"max_slice_len_default\":null,\"promise_within_ms\":null,\"wire_fixed_size\":8,\"unknown_key\":\"ignored\"}]}\0";
+// CERULION:PORT_SCHEMAS {"outputs":{"out":"geometry_msgs/Vector3"}}
+
+#[no_mangle]
+pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
+    INFO_BYTES.as_ptr() as *const std::ffi::c_char
+}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_object", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.outputs.len(), 1);
+        assert_eq!(metadata.outputs[0].name, "out");
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+    }
+
+    #[test]
+    fn port_schemas_line_naming_an_undeclared_port_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[{\"name\":\"inp\",\"schema_hash\":0}],\"outputs\":[]}\0";
+// CERULION:PORT_SCHEMAS {"inputs":{"typo":"geometry_msgs/Vector3"}}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_schema_typo", src);
+        let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
+        assert!(err.contains("names port 'typo'"), "{err}");
+    }
+
+    #[test]
+    fn malformed_port_schemas_line_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[\"inp\"],\"outputs\":[]}\0";
+// CERULION:PORT_SCHEMAS {"inputz":{"inp":"geometry_msgs/Vector3"}}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_schema_bad", src);
+        let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
+        assert!(err.contains("PORT_SCHEMAS line failed to parse"), "{err}");
+    }
+
+    #[test]
+    fn empty_port_schemas_line_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = "\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[\\\"inp\\\"],\\\"outputs\\\":[]}\\0\";\n// CERULION:PORT_SCHEMAS \n// CERULION:INFO_END\n";
+        let node_dir = write_node(&tmp, "rawffi_schema_empty", src);
+        let err = parse_node_metadata(&node_dir).unwrap_err().to_string();
+        assert!(err.contains("PORT_SCHEMAS line failed to parse"), "{err}");
+    }
+
+    #[test]
+    fn port_schemas_line_sets_input_schema_on_bare_name_input() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[\"inp\"],\"outputs\":[\"out\"]}\0";
+// CERULION:PORT_SCHEMAS {"inputs":{"inp":"std_msgs/Float64"}}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawffi_schema_in", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("std_msgs/Float64")
+        );
+        assert_eq!(metadata.outputs[0].schema, None);
+    }
+
     /// CLI/engine invariant: the metadata parser must REJECT attr surface
     /// the macro rejects — otherwise `cerulion node info` would happily
     /// report metadata for source that cannot compile.
@@ -2734,8 +3006,10 @@ struct BadNode {
         let msg = err.to_string();
         assert!(
             msg.contains("unknown input attribute `newest_first`")
-                && msg
-                    .contains("Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`."),
+                && msg.contains(
+                    "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, \
+                         `accumulate`, `cap`."
+                ),
             "must mirror the macro's diagnostic — offending ident + accepted set; got: {msg}"
         );
     }
@@ -3237,6 +3511,127 @@ struct FusionNode {
         // Outputs are never triggers.
         assert_eq!(metadata.outputs.len(), 1);
         assert!(!metadata.outputs[0].trigger, "outputs are never triggers");
+    }
+
+    /// Parse a one-input period node whose input carries `attr`.
+    fn parse_accumulate_attr(attr: &str) -> CliResult<NodeMetadata> {
+        let tmp = TempDir::new().unwrap();
+        let src = format!(
+            "use cerulion_core::prelude::*;\n\n#[cerulion_node(period_ms = 10)]\n\
+             #[derive(Default)]\nstruct TfReader {{\n    #[input({attr})]\n    tf: u32,\n}}\n"
+        );
+        let node_dir = write_node(&tmp, "tf_reader", &src);
+        parse_node_metadata(&node_dir)
+    }
+
+    #[test]
+    fn parse_macro_node_accepts_every_accumulate_form_the_macro_compiles() {
+        for attr in [
+            "accumulate",
+            "accumulate, cap = 1",
+            "accumulate, cap = 64",
+            "accumulate, cap = 0x10",
+            "accumulate, cap = 8usize",
+            "cap = 4, accumulate",
+            "accumulate, cap = 4,",
+            "accumulate, backpressure = drop_oldest, expect_within_ms = 5",
+        ] {
+            let metadata = parse_accumulate_attr(attr)
+                .unwrap_or_else(|e| panic!("`#[input({attr})]` compiles, so it must parse: {e}"));
+            assert_eq!(metadata.inputs.len(), 1, "{attr}");
+            assert!(!metadata.inputs[0].trigger, "{attr}");
+        }
+    }
+
+    #[test]
+    fn parse_macro_node_refuses_every_accumulate_form_the_macro_refuses() {
+        const TAIL: &str = "With `accumulate` the accepted keys are `cap = N`, \
+                            `backpressure = drop_oldest` and `expect_within_ms = N`.";
+        let cases: [(&str, &str); 15] = [
+            (
+                "cap = 4",
+                "`cap` applies only to `#[input(accumulate)]`. For the queue size of a plain \
+                 input, use `depth = N`.",
+            ),
+            (
+                "accumulate, trigger",
+                "`#[input(accumulate)]` cannot be combined with `trigger`",
+            ),
+            (
+                "trigger, accumulate",
+                "`#[input(accumulate)]` cannot be combined with `trigger`",
+            ),
+            (
+                "accumulate, backpressure = block",
+                "`#[input(accumulate)]` cannot be combined with `backpressure = block`",
+            ),
+            (
+                "accumulate, backpressure = sample(5)",
+                "`#[input(accumulate)]` cannot be combined with `backpressure = sample(N)`",
+            ),
+            (
+                "accumulate, depth = 4",
+                "`#[input(accumulate)]` takes `cap = N`, not `depth`",
+            ),
+            ("accumulate, cap = 0", "`cap` must be in 1..=64 (got 0)."),
+            ("accumulate, cap = 65", "`cap` must be in 1..=64 (got 65)."),
+            ("accumulate, cap = 2, cap = 40", "`cap` given twice."),
+            ("accumulate, accumulate", "`accumulate` given twice."),
+            ("accumulate, cap", "`cap` requires a value: `cap = N`."),
+            ("accumulate, cap = x", "`cap` requires a value: `cap = N`."),
+            (
+                "accumulate, cap = 1 + 2",
+                "`cap = N` takes a single integer literal, got `+` after it.",
+            ),
+            (
+                "accumulate, cap = 1 2",
+                "`cap = N` takes a single integer literal, got `2` after it.",
+            ),
+            (
+                "cap = 4 accumulate",
+                "`cap = N` takes a single integer literal, got `accumulate` after it.",
+            ),
+        ];
+        for (attr, want) in cases {
+            let err = parse_accumulate_attr(attr)
+                .expect_err("the macro refuses this form, so the CLI must too")
+                .to_string();
+            assert!(
+                err.contains("node `tf_reader` field `tf`: ") && err.contains(want),
+                "`#[input({attr})]`: want `{want}`, got: {err}"
+            );
+            if attr != "cap = 4" {
+                assert!(
+                    err.ends_with(TAIL),
+                    "`#[input({attr})]` names the accepted set: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_macro_node_accumulate_input_is_a_non_trigger_input() {
+        // `#[input(accumulate, cap = 4)]` parses, and the port is a plain
+        // non-trigger input to the CLI (the buffer lives in the node).
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+use cerulion_core::prelude::*;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct TfReader {
+    #[input(accumulate, cap = 4)]
+    tf: u32,
+}
+"#;
+        let node_dir = write_node(&tmp, "tf_reader", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.inputs.len(), 1);
+        assert_eq!(metadata.inputs[0].name, "tf");
+        assert!(
+            !metadata.inputs[0].trigger,
+            "an accumulate input is not a trigger"
+        );
     }
 
     #[test]

@@ -100,8 +100,11 @@ use crate::viz_client::SchemaPushOutcome;
 ///    otherwise stall playback for ten minutes.
 /// 2. **Cross-epoch stamps.** `bagd` writes each message's MCAP `log_time` from
 ///    the frame's own `WireHeader::timestamp_ns`, i.e. the PRODUCING process's
-///    clock. Within one recorded graph run the workers advance in barrier
-///    lockstep so those stamps share a number line — but a bag that mixes
+///    clock. Within one recorded graph run the ranks share ONE number line by
+///    construction: under the free-run default every rank's recording clock is
+///    placed at the same `real_ns()` epoch, and under the
+///    `CERULION_EXECUTION_MODE=lockstep` opt-out every rank advances from 0 on
+///    the one handed quantum. A bag that mixes
 ///    producers from different clock epochs (a restarted worker, a mirror
 ///    re-injected from another machine) can carry deltas that are enormous or
 ///    NEGATIVE. Negative deltas play immediately; enormous ones are capped here.
@@ -175,7 +178,7 @@ pub struct ChannelScan {
     pub schema_hash: Option<u64>,
     /// Frames counted on this channel.
     pub frames: u64,
-    /// The largest frame (full wire frame: 32-byte header + payload) in bytes.
+    /// The largest frame (full wire frame: 40-byte header + payload) in bytes.
     pub max_frame_len: usize,
     /// The first and last MCAP `log_time` seen, in ns. `None` for an empty
     /// channel.
@@ -196,9 +199,19 @@ pub struct BagScan {
     /// epochs (see [`MAX_FRAME_GAP_NS`]); playback still runs, in recorded
     /// order.
     pub backwards_log_times: u64,
-    /// Frames whose 32-byte wire header would not parse. They are still
+    /// Frames whose 40-byte wire header would not parse. They are still
     /// republished verbatim; they contribute no timing.
     pub headerless_frames: u64,
+    /// User topics recorded with the 32-byte wire header (version 1), whose
+    /// frames every reader upgrades to the current layout as it reads them.
+    pub legacy_wire_header_topics: Vec<String>,
+    /// Version 1 frames served unchanged because they cannot be upgraded
+    /// (shorter than the header, or declaring a size past their end).
+    pub legacy_passthrough_frames: u64,
+    /// The bytes a frame walk of this bag holds upgraded in memory (its
+    /// version 1 user frames, each 8 bytes longer); 0 for a current bag.
+    /// Above [`cerulion_bag::LEGACY_UPGRADE_CAP_BYTES`] the walk refuses.
+    pub legacy_upgrade_bytes: u64,
     /// The longest span WITHIN any single channel, in ns — never a subtraction
     /// across channels, whose stamps share no number line.
     pub span_ns: Option<u64>,
@@ -274,6 +287,14 @@ pub struct PlaySummary {
     /// can read three orders of magnitude below a run's real overrun. Comparing
     /// this to [`PlaySummary::elapsed`] cannot be reset by anything.
     pub scheduled_span_ns: u64,
+    /// How long the recording SHOULD have taken from its first frame: the
+    /// longest PLAYED channel's cumulative scheduled advance, with no wall term.
+    ///
+    /// Every channel anchors at the run origin, the wall instant the first frame
+    /// was reached, so [`PlaySummary::scheduled_span_ns`] is that origin plus
+    /// this. The origin carries whatever the host spent opening the bag; this
+    /// carries only the recording's own deltas at this `--rate`.
+    pub scheduled_advance_ns: u64,
 }
 
 impl PlaySummary {
@@ -869,26 +890,30 @@ fn bag_err(path: &Path, what: &str, e: BagError) -> CliError {
 /// publisher's SHM slot ceiling), the time span, and the non-monotonic-stamp
 /// count.
 ///
-/// Runs on [`BagReader::user_frames`] — the streaming, index-free,
+/// Runs on [`BagReader::user_frames_as_recorded`]: the streaming, index-free,
 /// reserved-channel-skipping walk that borrows each frame straight out of the
-/// mmap. Nothing is copied and nothing is buffered: a 300 GB bag scans in
-/// bounded memory. The per-frame timestamps come from each frame's own
+/// mmap, without the version 1 upgrade. Nothing is copied and nothing is
+/// buffered, a 300 GB bag of either header version scans in bounded memory: a
+/// topic recorded with the 32-byte header is read in that layout here (its
+/// stamp sits at the same offset; its served length is 8 bytes longer, see
+/// `v1_served_len`), so the scan never builds the upgraded copy a version 1
+/// bag's playback walk needs and reports a bag past that copy's limit too. The per-frame timestamps come from each frame's own
 /// [`WireHeader`], which is the SAME number the recorder wrote into the MCAP
 /// `log_time` field (`cerulion_bagd` stamps `write_message(topic, seq, ts, ts,
 /// ..)` from `WireHeader::timestamp_ns`), so reading it out of the payload
 /// slice costs nothing and needs no message decode.
 pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
-    // Finalization is decided by whether the zero-copy walk can START, NOT by
-    // `BagReader::completeness()`.
+    // Finalization is decided by the footer probe (the precondition of every
+    // zero-copy walk), NOT by `BagReader::completeness()`.
     //
     // `completeness()` streams every message through `mcap::MessageStream`,
-    // which COPIES each payload to give its `Message` a `'static` lifetime —
+    // which COPIES each payload to give its `Message` a `'static` lifetime:
     // one heap allocation per frame (MEASURED: exactly 1/frame). That is a fine
     // price for `bag info`, which exists to classify a damaged bag, and a bad
     // one for `bag play`, whose setup would then allocate once per recorded
-    // frame before publishing anything. Opening the walk reads only the footer,
-    // so this costs nothing and answers the only question playback has.
-    let finalized = reader.user_frames().is_ok();
+    // frame before publishing anything. The probe reads only the footer, so
+    // this costs nothing and answers the only question playback has.
+    let finalized = reader.has_readable_footer();
     let completeness_text = if finalized {
         "finalized".to_string()
     } else {
@@ -931,11 +956,24 @@ pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
     // these, NOT a subtraction across channels (see below).
     let mut per_channel_span: BTreeMap<u16, (u64, u64)> = BTreeMap::new();
 
+    // The topics recorded with the 32-byte header, read in that layout below.
+    let legacy_wire_header_topics = if finalized {
+        reader
+            .legacy_wire_header_topics()
+            .map_err(|e| bag_err(path, "cannot read the channel table of bag", e))?
+    } else {
+        Vec::new()
+    };
+    let mut legacy_passthrough_frames = 0u64;
+    let mut legacy_upgrade_bytes = 0u64;
+    // Per scan slot: whether its topic is one of those.
+    let mut slot_is_v1: Vec<bool> = Vec::new();
+
     // A non-finalized bag has no footer, so the zero-copy walk cannot start.
     // Report the state (that is what `bag info` is for) instead of pretending.
     if finalized {
         let mut walk = reader
-            .user_frames()
+            .user_frames_as_recorded()
             .map_err(|e| bag_err(path, "cannot walk the frames of bag", e))?;
         while let Some((channel_id, span)) = walk
             .next_user_frame()
@@ -950,13 +988,41 @@ pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
                 None => {
                     let topic = walk.topic(channel_id).to_string();
                     let s = order.len();
+                    slot_is_v1.push(legacy_wire_header_topics.contains(&topic));
                     order.push(new_channel_scan(&topic, channel_meta.get(&topic)));
                     channel_slot.insert(channel_id, s);
                     s
                 }
             };
             let frame = reader.frame(&span);
-            let stamp = WireHeader::read_from_buf(frame).map(|h| h.timestamp_ns);
+            // A 32-byte-header frame the read path upgrades is served 8 bytes
+            // longer, its stamp at the same offset; one it cannot upgrade is
+            // served as recorded, so it is read like any served frame.
+            if slot_is_v1[slot] {
+                // Sized the way the upgraded copy is: every frame of the
+                // topic, 8 bytes longer.
+                legacy_upgrade_bytes +=
+                    (span.len + WireHeader::SIZE - cerulion_core::wire::V1_HEADER_SIZE) as u64;
+            }
+            let (stamp, served_len) = match slot_is_v1[slot].then(|| v1_served_len(frame)) {
+                Some(Some(len)) => (
+                    Some(u64::from_le_bytes(
+                        frame[24..32].try_into().expect("8 bytes"),
+                    )),
+                    len,
+                ),
+                Some(None) => {
+                    legacy_passthrough_frames += 1;
+                    (
+                        WireHeader::read_from_buf(frame).map(|h| h.timestamp_ns),
+                        span.len,
+                    )
+                }
+                None => (
+                    WireHeader::read_from_buf(frame).map(|h| h.timestamp_ns),
+                    span.len,
+                ),
+            };
             match stamp {
                 Some(ts) => {
                     // Counted PER CHANNEL: a backwards step against this
@@ -977,7 +1043,7 @@ pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
             total_frames += 1;
             let entry = &mut order[slot];
             entry.frames += 1;
-            entry.max_frame_len = entry.max_frame_len.max(span.len);
+            entry.max_frame_len = entry.max_frame_len.max(served_len);
             if let Some(ts) = stamp {
                 entry.first_log_time.get_or_insert(ts);
                 entry.last_log_time = Some(ts);
@@ -1017,10 +1083,29 @@ pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
         total_frames,
         backwards_log_times: backwards,
         headerless_frames: headerless,
+        legacy_wire_header_topics,
+        legacy_passthrough_frames,
+        legacy_upgrade_bytes,
         span_ns,
         completeness: completeness_text,
         finalized,
     })
+}
+
+/// The length the read path serves a frame recorded with the 32-byte header
+/// at: 8 bytes longer, once upgraded. `None` for a frame it cannot upgrade
+/// (shorter than the header, or declaring a `total_size` past its end or
+/// below the header), which is served as recorded: the same rule as
+/// [`cerulion_core::wire::upgrade_v1_frame_into`].
+fn v1_served_len(frame: &[u8]) -> Option<usize> {
+    use cerulion_core::wire::V1_HEADER_SIZE;
+    if frame.len() < V1_HEADER_SIZE {
+        return None;
+    }
+    let declared = u32::from_le_bytes(frame[8..12].try_into().expect("4 bytes")) as usize;
+    (V1_HEADER_SIZE..=frame.len())
+        .contains(&declared)
+        .then_some(frame.len() + WireHeader::SIZE - V1_HEADER_SIZE)
 }
 
 fn new_channel_scan(topic: &str, meta: Option<&BagChannel>) -> ChannelScan {
@@ -2504,7 +2589,15 @@ pub enum StateCoverageReading {
     /// The manifest is present but its JSON did not decode.
     Malformed(String),
     /// The manifest decoded.
-    Present(cerulion_bagd::StateCoverage),
+    //
+    // BOXED: `StateCoverage` is by far the widest variant here, and the two
+    // keys state record format version 1 adds (the ring-to-rank map and the
+    // record format version) pushed the gap past `large_enum_variant`'s
+    // threshold. Boxing is what clippy asks for and what the shape wants: this
+    // reading is produced ONCE per `bag info` and the other three variants are
+    // matched beside it, so carrying the whole manifest inline in all of them is
+    // the cost and one allocation on the present path is the fix.
+    Present(Box<cerulion_bagd::StateCoverage>),
 }
 
 /// Read the OPTIONAL state-coverage manifest out of a bag.
@@ -2515,7 +2608,7 @@ pub enum StateCoverageReading {
 fn read_state_coverage(reader: &BagReader, finalized: bool) -> StateCoverageReading {
     match reader.attachment(cerulion_bagd::STATE_COVERAGE_ATTACHMENT) {
         Ok(Some(att)) => match serde_json::from_slice::<cerulion_bagd::StateCoverage>(&att.data) {
-            Ok(state) => StateCoverageReading::Present(state),
+            Ok(state) => StateCoverageReading::Present(Box::new(state)),
             Err(e) => StateCoverageReading::Malformed(e.to_string()),
         },
         Ok(None) if finalized => StateCoverageReading::Absent,
@@ -3704,6 +3797,36 @@ pub fn render_scan(
             scan.headerless_frames
         ));
     }
+    if !scan.legacy_wire_header_topics.is_empty() {
+        out.push_str(&format!(
+            "note: {} topic(s) were recorded with the 32-byte wire header of an older release; \
+             their frames are upgraded to the current 40-byte header as they are read ({}).\n",
+            scan.legacy_wire_header_topics.len(),
+            scan.legacy_wire_header_topics.join(", ")
+        ));
+        let cap = cerulion_bag::LEGACY_UPGRADE_CAP_BYTES as u64;
+        if scan.legacy_upgrade_bytes > cap {
+            out.push_str(&format!(
+                "note: playing it would hold {} bytes of upgraded frames in memory, past the \
+                 {cap}-byte limit, so `bag play` refuses it; write a current copy with \
+                 `cerulion bag migrate <BAG>` and play that.\n",
+                scan.legacy_upgrade_bytes
+            ));
+        } else {
+            out.push_str(&format!(
+                "note: playing it holds {} bytes of upgraded frames in memory; `cerulion bag \
+                 migrate <BAG>` writes a current copy that needs none.\n",
+                scan.legacy_upgrade_bytes
+            ));
+        }
+    }
+    if scan.legacy_passthrough_frames > 0 {
+        out.push_str(&format!(
+            "note: {} frame(s) recorded with the 32-byte header cannot be upgraded (shorter than \
+             the header, or declaring a size past their end), so they are served unchanged.\n",
+            scan.legacy_passthrough_frames
+        ));
+    }
     out.push('\n');
     out.push_str(&format!(
         "{:<40} {:>9}  {:>10}  {}\n",
@@ -4395,6 +4518,12 @@ pub fn bag_play_with_manager(
         .map(|(_, c)| c.anchor_ns.unwrap_or(0).saturating_add(c.cumulative_ns))
         .max()
         .unwrap_or(0);
+    let scheduled_advance_ns = clocks
+        .iter()
+        .filter(|(ch, _)| played_channels.contains(*ch))
+        .map(|(_, c)| c.cumulative_ns)
+        .max()
+        .unwrap_or(0);
     let summary = PlaySummary {
         topics,
         passes,
@@ -4404,6 +4533,7 @@ pub fn bag_play_with_manager(
         slipped_frames,
         timeline_restarts,
         scheduled_span_ns,
+        scheduled_advance_ns,
         catchup_channels: catchup_channels.len() as u64,
     };
     tracing::info!(
@@ -5040,7 +5170,7 @@ impl Default for RecordOptions {
 /// and `bag info` can decode from the bag's own records into one they cannot
 /// (`NamedButUndecodable`). A bag is a record of what this machine knew; the
 /// place to state what a VIEWER will do with it is the reader-side
-/// report, which is [`bag_doc_is_viewable`]'s job and covers bags this recorder
+/// report, which is `bag_doc_is_viewable`'s job and covers bags this recorder
 /// never wrote.
 ///
 /// Never fails — an unreadable schema file is skipped with a `warn!` inside the
@@ -5048,7 +5178,7 @@ impl Default for RecordOptions {
 /// closure of the hashes actually recorded, not this whole corpus (see
 /// `BagSchemaCatalog::closure_for_hashes`), so a recording whose hashes resolve
 /// to nothing still writes no attachment at all.
-pub(crate) fn build_record_schema_catalog(
+pub fn build_record_schema_catalog(
     schemas_dir: Option<&Path>,
     bridge_config: Option<&Path>,
 ) -> Option<cerulion_bag::BagSchemaCatalog> {
@@ -8860,6 +8990,9 @@ mod tests {
             total_frames: topics.iter().map(|(_, n)| *n).sum(),
             backwards_log_times: 0,
             headerless_frames: 0,
+            legacy_wire_header_topics: Vec::new(),
+            legacy_passthrough_frames: 0,
+            legacy_upgrade_bytes: 0,
             span_ns: Some(1),
             completeness: "finalized".to_string(),
             finalized: true,
@@ -9222,6 +9355,7 @@ mod tests {
             slipped_frames: 2,
             timeline_restarts: 500,
             scheduled_span_ns: 10_000_000_000,
+            scheduled_advance_ns: 10_000_000_000,
             catchup_channels: 0,
         };
         assert_eq!(summary.wall_overrun_ns(), Some(20_000_000_000));
@@ -13069,6 +13203,10 @@ mod state_section {
             attached_mid_run: false,
             armed: None,
             rings_declared: 1,
+            ring_ranks: BTreeMap::new(),
+            state_record_format_version: Some(
+                cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION,
+            ),
             ranks_discovered: Vec::new(),
             ranks_missing: Vec::new(),
             rings_unavailable: BTreeMap::new(),
@@ -13089,7 +13227,7 @@ mod state_section {
     #[test]
     fn a_clean_manifest_names_every_node_and_its_resume_point() {
         let s = state_of(&[("alpha", node(2, 0, 0, Some(20)))]);
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(
             out.contains("node state: 4 record(s) across 1 node(s)"),
             "{out}"
@@ -13117,7 +13255,8 @@ mod state_section {
             ("alpha", node(1, 0, 0, Some(5))),
             ("beta", node(0, 0, 0, None)),
         ]);
-        let unarmed = render_state_coverage_section(&StateCoverageReading::Present(s.clone()));
+        let unarmed =
+            render_state_coverage_section(&StateCoverageReading::Present(Box::new(s.clone())));
         assert!(unarmed.contains("beta: 0 complete"), "{unarmed}");
         assert!(unarmed.contains("NO complete anchor"), "{unarmed}");
         assert!(
@@ -13131,7 +13270,7 @@ mod state_section {
             cadence_steps: 30_000,
             first_anchor_step: 1,
         });
-        let armed = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let armed = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(
             armed.contains("the capture plane was ARMED: every 30000 step(s) from step 1"),
             "{armed}"
@@ -13147,7 +13286,7 @@ mod state_section {
         let mut skipped = node(1, 0, 2, Some(5));
         skipped.skip_causes = [("contended".to_string(), 2u64)].into_iter().collect();
         let s = state_of(&[("t", torn), ("s", skipped)]);
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(out.contains("t: 1 complete, 1 TORN"), "{out}");
         assert!(
             out.contains("s: 1 complete, 2 skipped (contended x2)"),
@@ -13166,7 +13305,7 @@ mod state_section {
         let mut s = state_of(&[("alpha", node(1, 0, 0, Some(9)))]);
         s.attached_mid_run = true;
         s.head_records_discarded = 3;
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(out.contains("attached MID-RUN"), "{out}");
         assert!(out.contains("3 leading record(s)"), "{out}");
         assert!(out.contains("they are not loss"), "{out}");
@@ -13179,7 +13318,7 @@ mod state_section {
         let mut s = state_of(&[("alpha", node(1, 0, 0, Some(2)))]);
         s.rings_unavailable
             .insert("/cer_st_gone".into(), "No such file or directory".into());
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(out.contains("ring /cer_st_gone UNAVAILABLE"), "{out}");
         assert!(out.contains("No such file or directory"), "{out}");
         assert!(out.contains("CHECKPOINT COVERAGE INCOMPLETE"), "{out}");
@@ -13211,7 +13350,7 @@ mod state_section {
             format!("No such file\u{7}{CSI}"),
         );
 
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         assert!(
             !out.chars().any(|c| c.is_control() && c != '\n'),
             "a control byte from the bag reached the terminal: {out:?}"
@@ -14115,6 +14254,7 @@ mod state_section {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut frame[..WireHeader::SIZE]);
 
@@ -14449,7 +14589,7 @@ mod state_section {
         s.unattributed_indices
             .insert("/cer_st_b".into(), [(1, stray_b)].into_iter().collect());
 
-        let out = render_state_coverage_section(&StateCoverageReading::Present(s));
+        let out = render_state_coverage_section(&StateCoverageReading::Present(Box::new(s)));
         // The declared row, unchanged.
         assert!(
             out.contains("alpha: 1 complete, 1 TORN, 2 skipped (contended x2)"),

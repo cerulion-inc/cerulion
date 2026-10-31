@@ -349,18 +349,28 @@
 //! ## Why the comparison must not involve the observer's clock
 //!
 //! This is not fastidiousness — an attach-instant comparison is BROKEN on the
-//! shipping deployment. On the default multi-process `graph run` the
-//! publisher lives in a `graph run-worker` process whose
-//! [`VirtualClock`](crate::clock::VirtualClock) starts at 0 and advances by the
-//! handed logical quantum, while the observer runs inside the separate
-//! network GATEWAY process on a [`RealClock`](crate::clock::RealClock)
-//! reading nanoseconds since BOOT. Those are two unrelated number lines, and
-//! different workers each own an INDEPENDENT `VirtualClock`. "Is this frame
-//! stamped after the instant my tap attached" therefore has no meaning: on a
-//! robot that has been up a while every frame looks pre-attach (and the gate
-//! degrades to a blanket discard), while on a worker stepping faster than wall
-//! time every frame looks post-attach (and the gate is inert, re-opening the
-//! false-live hazard). Stamp-vs-stamp is immune to all of it: the single-writer
+//! shipping deployment, and a `graph run-worker` publisher has three shapes it
+//! is broken on differently. Under the `CERULION_EXECUTION_MODE=lockstep`
+//! opt-out the worker's [`VirtualClock`](crate::clock::VirtualClock) starts at
+//! 0 and advances by the handed logical quantum. Under the free-run default
+//! with its trace ring (the always-on ring, and `--record`) it is still a
+//! controlled `VirtualClock`, placed at the rank's own boot-monotonic anchor
+//! before the first step and then advanced once per step by that step's
+//! MEASURED wall elapsed. Only on the ring-less free-run arm (`--no-rings`) is
+//! the publisher on a [`RealClock`](crate::clock::RealClock) outright. The
+//! observer meanwhile runs inside the separate network GATEWAY process on a
+//! `RealClock` reading nanoseconds since BOOT, and nothing it holds says which
+//! of the three it is looking at.
+//!
+//! On the first two those are unrelated number lines, and each worker owns an
+//! INDEPENDENT controlled clock. "Is this frame stamped after the instant my
+//! tap attached" therefore has no meaning there: on a robot that has been up a
+//! while a quantum-timed worker's frames all look pre-attach (and the gate
+//! degrades to a blanket discard), while a worker stepping faster than wall
+//! time makes every frame look post-attach (and the gate is inert, re-opening
+//! the false-live hazard). On the third the subtraction would happen to be
+//! meaningful, which helps nobody when it cannot be told apart from the other
+//! two. Stamp-vs-stamp is immune to all of it: the single-writer
 //! contract means one publisher owns a graph topic, so successive stamps on one
 //! topic come from ONE clock whatever kind it is.
 //!
@@ -403,8 +413,13 @@
 //! answers it with the publisher's own commit SEQUENCE — a COUNT, which belongs
 //! to no clock and may therefore be divided by an observer-clock duration without
 //! comparing two clocks. The publisher's stamps could NOT serve as that
-//! denominator: a `graph run` worker's gating clock advances by a fixed LOGICAL
-//! quantum per step and its seconds are not wall seconds.
+//! denominator, and the reason is the three-shapes one above: a `graph run`
+//! worker's gating clock is a fixed logical quantum under the
+//! `CERULION_EXECUTION_MODE=lockstep` opt-out, a per-step measured wall elapsed
+//! from the rank's own epoch under the free-run default with its trace ring,
+//! and the machine's own `RealClock` on the ring-less free-run arm. Only the
+//! last would subtract into a wall duration, and nothing on the wire says a
+//! frame came from it.
 //!
 //! Counting sequences rather than frames is what makes the number worth showing.
 //! [`TopicLiveness::frames_observed`] is clipped by the tap depth, so a
@@ -1170,9 +1185,25 @@ pub struct TopicLiveness {
 /// The numerator is a COUNT — dimensionless, belonging to no clock — so dividing
 /// it by an observer-clock duration does not compare two clocks, and the module's
 /// clock rule is untouched. That matters more than it looks: the publisher's OWN
-/// stamps could not be used as the denominator, because a `graph run` worker's
-/// gating clock advances by a fixed LOGICAL quantum per step and its
-/// seconds are not wall seconds.
+/// stamps could not be used as the denominator, because WHICH clock a `graph
+/// run` worker stamps a frame with is a property of how that worker was
+/// launched, and no field on the wire tells the observer which. A publisher
+/// stamps its header from the transport's clock, and on a graph worker that is
+/// the same `Arc` as the gating clock, so there are three shipped answers.
+/// Under the `CERULION_EXECUTION_MODE=lockstep` opt-out the gating clock is a
+/// CONTROLLED clock whose value changes once per step by a fixed LOGICAL
+/// quantum, which is not wall time at all. Under the free-run default with its
+/// trace ring (the always-on ring, and `--record`) the gating clock is still
+/// CONTROLLED and its value still changes once per step, by the step's MEASURED
+/// wall elapsed from a shared epoch, so it tracks wall time in aggregate while
+/// every frame of one step carries that step's single value rather than the
+/// instant it was committed. Only the RING-LESS free-run arm (`--no-rings`, and
+/// every non-Unix worker) runs on the `RealClock` outright, where the stamp IS
+/// a live read at the publish instant. So a stamp difference is a wall duration
+/// on exactly one of the three shapes, and nothing the observer holds
+/// distinguishes that shape from the other two: the header carries a schema
+/// hash, a size, an offset table, a sequence and the stamp, and not the clock
+/// that produced it.
 ///
 /// The count is exact **whatever the observer tap could hold**. The tap keeps
 /// only [`LIVENESS_TAP_BUFFER_SIZE`] frames, so a 500 Hz topic delivers two

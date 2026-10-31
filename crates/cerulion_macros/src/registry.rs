@@ -84,6 +84,10 @@ pub struct NodePortEntry {
     /// `MacroPolicy::External` — this flag is only the macro-side coupling that
     /// gates the required-method check.
     pub external: bool,
+    /// The `#[input(accumulate)]` port names. Written by `#[cerulion_node]`,
+    /// read back by `#[cerulion_node_impl]`, which serves these ports'
+    /// frames instead of a latest-value view.
+    pub accumulate_inputs: Vec<String>,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, NodePortEntry>> {

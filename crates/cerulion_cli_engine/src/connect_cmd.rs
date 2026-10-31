@@ -170,35 +170,53 @@ fn warn_on_near_miss_robots_keys(text: &str) {
     }
 }
 
-/// The `~/.cerulion/robots.toml` path (None when there is no home directory).
+/// `<config>/robots.toml`, `<config>` being [`crate::auth::cerulion_config_dir`]
+/// (so `CERULION_HOME` moves it); `None` when no config dir resolves.
 pub fn robots_toml_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cerulion").join("robots.toml"))
+    Some(crate::auth::cerulion_config_dir()?.join("robots.toml"))
 }
 
-/// The well-known desk device key path `~/.cerulion/desk.key` (None when there is
-/// no home directory). This is the persistent desk identity `cerulion pair`
-/// creates and `cerulion connect` defaults `--key-file` to when it exists — so a
-/// paired desk connects with NO flags.
+/// The legacy name of this machine's key, `~/.cerulion/desk.key` under
+/// [`crate::auth::cerulion_config_dir`] (`None` when no config dir resolves).
+/// It names the same key as `identity/device.key`. With `CERULION_EPOCH_DIR`
+/// unset, the `epochs/` cache resolves next to it for the cache writer and for
+/// `cerulion connect` without an explicit `--key-file`.
 pub fn desk_key_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cerulion").join("desk.key"))
+    crate::auth::identity_layout().map(|l| l.legacy_desk_key_path())
 }
 
 /// The default `--key-file` to hand `cerulion-connectd connect` when the user
-/// passed none: the well-known `~/.cerulion/desk.key` IF it exists (a paired
-/// desk), else `None` (an unpaired desk → ephemeral key → the robot refuses it,
-/// which is the correct "pair first" signal). A `Some` here is logged at info so
-/// the auto-selection is never silent.
-fn default_connect_key_file() -> Option<PathBuf> {
-    let path = desk_key_path()?;
-    if path.exists() {
+/// passed none: this machine's key IF one exists (a paired desk), else `None`
+/// (an unpaired desk, so an ephemeral key the robot refuses, which is the
+/// correct "pair first" signal). Never generates a key; it may write the
+/// second name of an existing one (adoption, or the `desk.key` alias).
+///
+/// The path handed over is [`desk_key_path`], the legacy name of the key
+/// (reconciled with `identity/device.key` first), because connectd resolves its
+/// `epochs/` cache next to the key file and the cache writer anchors on that
+/// same path. A `Some` here is logged at info so the auto-selection is never
+/// silent.
+///
+/// # Errors
+///
+/// A machine key that cannot be read, is the wrong size, or disagrees with the
+/// legacy `desk.key`.
+fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
+    let Some(layout) = crate::auth::identity_layout() else {
+        return Ok(None);
+    };
+    let key = layout
+        .load_machine_key()
+        .map_err(|e| CliError::Validation(format!("cerulion connect: {e}")))?;
+    Ok(key.map(|key| {
+        let path = layout.legacy_desk_key_path();
         tracing::info!(
             path = %path.display(),
-            "cerulion connect: using the paired desk key ~/.cerulion/desk.key (pass --key-file to override)"
+            fingerprint = %key.short_fingerprint(),
+            "cerulion connect: using this machine's paired device key (pass --key-file to override)"
         );
-        Some(path)
-    } else {
-        None
-    }
+        path
+    }))
 }
 
 /// Load the `~/.cerulion/robots.toml` name→eid map (empty if the file is absent
@@ -564,8 +582,9 @@ pub fn resolve_connectd_bin() -> CliResult<PathBuf> {
 
 /// Resolve the full spawn plan: the robot eid + the argv + the binary path.
 ///
-/// When the user passed no `--key-file`, the paired desk key
-/// `~/.cerulion/desk.key` is used automatically IF it exists (see
+/// When the user passed no `--key-file`, this machine's paired key
+/// (`~/.cerulion/desk.key`, the same key as `identity/device.key`) is used
+/// automatically IF it exists (see
 /// `default_connect_key_file`) — so a desk paired via `cerulion pair` connects
 /// with no flags.
 pub fn plan(args: &ConnectArgs) -> CliResult<ConnectPlan> {
@@ -584,7 +603,7 @@ pub fn plan(args: &ConnectArgs) -> CliResult<ConnectPlan> {
     let robot_name = resolve_robot_name_with(args.robot.as_deref(), &eid, &robots);
     let mut args = args.clone();
     if args.key_file.is_none() {
-        args.key_file = default_connect_key_file();
+        args.key_file = default_connect_key_file()?;
     }
     let argv = build_connectd_argv(&eid, robot_name.as_deref(), &args);
     let bin = resolve_connectd_bin()?;
@@ -1543,10 +1562,17 @@ mod tests {
     #[test]
     fn plan_keys_the_epoch_cache_by_the_desk_verified_name_or_by_nothing() {
         let _lock = env_lock();
-        let _snap = EnvSnapshot::take(&["HOME", "CERULION_CONNECTD_BIN"]);
+        let _snap = EnvSnapshot::take(&[
+            "HOME",
+            "CERULION_HOME",
+            "CERULION_EPOCH_DIR",
+            "CERULION_CONNECTD_BIN",
+        ]);
 
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", home.path());
+        std::env::remove_var("CERULION_HOME");
+        std::env::remove_var("CERULION_EPOCH_DIR");
         // A real (empty) file standing in for the sibling binary, so `resolve_connectd_bin`
         // succeeds without a build.
         let bin = home.path().join("cerulion-connectd-stub");
@@ -1616,6 +1642,31 @@ mod tests {
         // …and the dial itself still proceeds (the epoch push is expendable, the dial is
         // not): the eid resolved and the argv is otherwise intact.
         assert_eq!(p.argv[..3], ["connect", "--eid", HEX64]);
+
+        // (e) With a machine key present, the default `--key-file` is its legacy
+        //     name in the config dir, so connectd's `epochs/` (next to the key
+        //     file) is the directory the epoch cache writer fills.
+        assert!(!p.argv.iter().any(|a| a == "--key-file"), "no key yet");
+        let layout = crate::auth::identity_layout().unwrap();
+        layout.load_or_create_machine_key().unwrap();
+        let p = plan(&ConnectArgs {
+            robot: Some("go2".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let key_file = p
+            .argv
+            .iter()
+            .position(|a| a == "--key-file")
+            .and_then(|i| p.argv.get(i + 1))
+            .map(PathBuf::from)
+            .expect("a paired desk passes its key");
+        assert_eq!(key_file, home.path().join(".cerulion").join("desk.key"));
+        let writer = crate::account_cmd::resolve_epoch_cache_path("go2").unwrap();
+        assert_eq!(
+            crate::account_cmd::resolve_epoch_dir(None, Some(&key_file)).as_deref(),
+            writer.parent()
+        );
     }
 }
 

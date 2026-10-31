@@ -7,7 +7,7 @@
 //!
 //! `libcerulion_heaphook.so` is an `LD_PRELOAD` payload the `cerulion ros2
 //! run|launch` launcher auto-injects (see `CERULION_ROS2_PRELOAD` in
-//! USER_API.md). While a thread-local BORROW WINDOW is armed over a loan
+//! docs/user-api.md). While a thread-local BORROW WINDOW is armed over a loan
 //! slot's tail, the hook bump-allocates every `malloc`-family request on that
 //! thread into the tail — so a stock node's `std::vector`/`std::string` fill
 //! lands directly in shared memory. This module resolves the hook at runtime

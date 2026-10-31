@@ -71,6 +71,8 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("sport_driver_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sport".to_string(),
             node_type: "sport_driver".to_string(),

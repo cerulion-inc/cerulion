@@ -9,7 +9,7 @@ use native_ros2_messages::std_msgs::Int32;
 // count, so there is no `period_ms` here. A sink declares no `#[output]`.
 #[cerulion_node]
 #[derive(Default)]
-struct PrinterNode {
+pub struct PrinterNode {
     #[input(trigger)]
     count: Int32,
 

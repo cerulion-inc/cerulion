@@ -8,7 +8,8 @@
 //! and the feature still dead if the `add =` attribute is on the wrong arg or
 //! missing.
 //!
-//! Everything here runs IN-PROCESS against the real `Cli::command()` and the
+//! Everything here runs IN-PROCESS against the real `families::cli_command()`
+//! (the `Commands` verbs plus every registered verb family) and the
 //! real `clap_complete::engine::complete()` — the same function the generated
 //! shell script calls back into — so a regression in the attributes fails here
 //! rather than only on a live TAB press.
@@ -26,10 +27,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use clap::CommandFactory;
 use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter, CompletionCandidate};
 
-use crate::cli::Cli;
+use crate::families::cli_command;
 
 /// Serializes the tests that mutate the process cwd / `HOME`.
 ///
@@ -37,7 +37,7 @@ use crate::cli::Cli;
 /// per-PROCESS, so two tests scaffolding different workspaces would see each
 /// other's. Poisoning is ignored — a panicking test leaves the guard poisoned
 /// but the state is fully re-established by the next `enter_workspace`.
-fn env_lock() -> MutexGuard<'static, ()> {
+pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
@@ -45,9 +45,18 @@ fn env_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Restores the process cwd and `HOME` when the test ends, panic or not.
-struct EnvGuard {
+pub(crate) struct EnvGuard {
     cwd: PathBuf,
     home: Option<OsString>,
+}
+
+impl EnvGuard {
+    pub(crate) fn capture() -> Self {
+        Self {
+            cwd: std::env::current_dir().expect("read cwd"),
+            home: std::env::var_os("HOME"),
+        }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -96,10 +105,7 @@ fn write(path: &Path, contents: &str) {
 /// move the process into it.
 fn enter_workspace() -> Fixture {
     let lock = env_lock();
-    let guard = EnvGuard {
-        cwd: std::env::current_dir().expect("read cwd"),
-        home: std::env::var_os("HOME"),
-    };
+    let guard = EnvGuard::capture();
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
 
@@ -162,7 +168,7 @@ fn enter_workspace() -> Fixture {
 /// This is the same entry point `Zsh::write_complete` / `Bash::write_complete`
 /// call, so a wiring regression shows up here exactly as it would on a TAB.
 fn complete(words: &[&str]) -> Vec<String> {
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     let args: Vec<OsString> = words.iter().map(OsString::from).collect();
     let index = args.len() - 1;
     let cwd = std::env::current_dir().ok();
@@ -413,7 +419,7 @@ fn wired_args() -> Vec<String> {
             walk(sub, &format!("{path} {}", sub.get_name()), out);
         }
     }
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     cmd.build();
     let mut out = Vec::new();
     walk(&cmd, "cerulion", &mut out);
@@ -465,9 +471,13 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         // The one arg whose source needs a LIVE iceoryx2 topic — behaviourally
         // unreachable in a hermetic test, so the structural pin is what covers
         // it. A live positive is in `topic hz`'s own e2e transcript.
+        "cerulion topic bw::topic",
         "cerulion topic echo::topic",
         "cerulion topic hz::topic",
         "cerulion topic info::topic",
+        "cerulion topic type::topic",
+        // `topic find` offers the known type names (`schema info`'s set).
+        "cerulion topic find::type_name",
         "cerulion schema delete::name",
         "cerulion schema info::name",
         "cerulion viz::robot",
@@ -500,7 +510,7 @@ fn the_help_text_quotes_the_same_install_line_the_hint_prints() {
     // of them are code, so pin them against each other: whatever
     // `install_hint` says must appear VERBATIM in the long help. (The doc file
     // is prose and cannot be pinned here; these two cannot drift.)
-    let mut cmd = crate::cli::Cli::command();
+    let mut cmd = cli_command();
     cmd.build();
     let long_about = cmd
         .get_subcommands()
@@ -552,7 +562,7 @@ fn args_completing_nothing() -> Vec<String> {
             walk(sub, &format!("{path} {}", sub.get_name()), out);
         }
     }
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     cmd.build();
     let mut out = Vec::new();
     walk(&cmd, "cerulion", &mut out);
@@ -601,6 +611,10 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // incident that has just happened.
         "cerulion flashback::note",
         "cerulion graph create::prefix",
+        // `name:=value` launch-argument overrides. The declared names live in
+        // the graph named by the PRECEDING positional, which a per-value
+        // completer cannot see, and the value half is the operator's choice.
+        "cerulion graph run::launch_args",
         "cerulion node run::id",
         "cerulion node run::prefix",
         "cerulion node stage::id",
@@ -631,6 +645,8 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion pair::addrs",
         "cerulion pair::relay_url",
         "cerulion ros2 attach::iface",
+        "cerulion topic find::connect",
+        "cerulion topic find::listen",
         "cerulion topic list::connect",
         "cerulion topic list::listen",
         "cerulion viz::connect",
@@ -684,6 +700,11 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // NAMES the alternatives when there are several), so the id is
         // copy-pasted from a refusal rather than typed.
         "cerulion bag record::run",
+        // ---- The same RUN ID (or graph name), for the same reason: `graph pause`
+        // and `graph resume` address a LIVE run, and the live-run set is behind a
+        // windowed transport listen a TAB press may not open.
+        "cerulion graph pause::run_id",
+        "cerulion graph resume::run_id",
         // ---- Numbers.
         // BAG-TIME bounds in seconds, not paths. (They replace
         // `--max-ticks`, which is deleted outright — no alias, no shim.)
@@ -699,6 +720,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion ros2 attach::domain",
         "cerulion ros2 attach::timeout",
         "cerulion topic echo::truncate_length",
+        "cerulion topic bw::window",
         "cerulion trace inspect::limit",
         // ---- `cerulion bagd` (the recorder daemon `graph run --record`
         // spawns). Its args live in `cerulion_bagd::BagdArgs`, so wiring a

@@ -77,6 +77,8 @@ fn producer_only_graph(
         identity: format!("{prefix}_{node_id}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: node_id.to_string(),
             node_type: "marker_producer".to_string(),
@@ -161,6 +163,8 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
         prefix: "gb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "bc_b".to_string(),
                 node_type: "marker_producer".to_string(),
@@ -174,6 +178,8 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "listener".to_string(),
                 node_type: "drain_all_tf_consumer".to_string(),
@@ -349,7 +355,7 @@ impl SeqProducer {
 }
 
 /// Decode (stream_id, seq) from a drained Vector3 body. `try_receive` strips
-/// the 32-byte `WireHeader`, so `payload` is the Vector3 fixed section
+/// the 40-byte `WireHeader`, so `payload` is the Vector3 fixed section
 /// (x,y,z f64); x = stream id at [0..8], y = seq at [8..16], little-endian.
 fn decode_stream_seq(payload: &[u8]) -> (u32, u32) {
     let x = f64::from_le_bytes(payload[0..8].try_into().unwrap());
@@ -398,6 +404,8 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
         prefix: "dc".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "seq_producer".to_string(),
@@ -411,6 +419,8 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "seq_producer".to_string(),
@@ -424,6 +434,8 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "draining_block_consumer".to_string(),
@@ -640,6 +652,8 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
         prefix: "ba".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "marker_producer".to_string(),
@@ -653,6 +667,8 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "marker_producer".to_string(),
@@ -666,6 +682,8 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "stalled".to_string(),
                 node_type: "stalled_block_consumer".to_string(),
@@ -783,6 +801,8 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
         prefix: "ev".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "quiet".to_string(),
                 node_type: "quiet_producer".to_string(),
@@ -796,6 +816,8 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "tiny_queue_consumer".to_string(),
@@ -951,6 +973,8 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
         prefix: "dp".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "quiet".to_string(),
                 node_type: "quiet_producer".to_string(),
@@ -964,6 +988,8 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "deep".to_string(),
                 node_type: "deep_consumer".to_string(),
@@ -1006,6 +1032,8 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
     // LISTENERs are provisioned on the EVENT service (`extra_event_listeners`),
     // not as subscriber slots, so they don't enter this subscriber-axis sum.
     let mut nodes = vec![NodeDef {
+        fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "quiet".to_string(),
         node_type: "quiet_producer".to_string(),
@@ -1028,6 +1056,8 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
     for i in 0..over_cap {
         let id = format!("sink_{i}");
         nodes.push(NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.clone(),
             node_type: "tiny_queue_consumer".to_string(),
@@ -1112,6 +1142,8 @@ fn quiet_listed_graph_with(
     consumers: &[(&str, &str)],
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let mut nodes = vec![NodeDef {
+        fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "quiet".to_string(),
         node_type: "quiet_producer".to_string(),
@@ -1128,6 +1160,8 @@ fn quiet_listed_graph_with(
     factories.insert("quiet".to_string(), Box::new(QuietProducerEntry::new()));
     for (id, node_type) in consumers {
         nodes.push(NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: (*id).to_string(),
             node_type: (*node_type).to_string(),
@@ -1258,6 +1292,8 @@ fn listed_provisioning_warns_and_infos_are_pinned() {
         identity: "consumed".to_string(),
         prefix: "co".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
             node_type: "tiny_queue_consumer".to_string(),
@@ -1316,7 +1352,10 @@ fn foreign_default_service_locks_out_listed_graph_with_multi_hint() {
     let _foreign = raw_node
         .service_builder(&data_name)
         .publish_subscribe::<[u8]>()
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign service at iceoryx2 defaults");
 
     let mgr = manager("foreign_lockout", ix);

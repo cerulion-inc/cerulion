@@ -232,6 +232,8 @@ fn run_capture(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "text_producer".to_string(),
@@ -245,6 +247,8 @@ fn run_capture(
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "portwrite".to_string(),
                 node_type: "port_write".to_string(),
@@ -261,6 +265,8 @@ fn run_capture(
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "capture".to_string(),
                 node_type: "image_capture".to_string(),
@@ -344,6 +350,10 @@ fn healthy_delivered_payload_matches_header_oracle_and_known_fields() {
 // 2. parity: cdylib FFI path vs in-process twin → byte-identical payload
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn cdylib_and_in_process_twin_produce_byte_identical_payloads() {

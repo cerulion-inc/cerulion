@@ -7,6 +7,8 @@
 # max_slice_len) or the mono-vs-split A/B is invalid; the split file's only
 # intended delta is the `process_groups:` block (the graph's name is its file
 # stem, so neither file carries a `name:` key).
+# graphs/rtt_bench_split3.yaml is the three-group sibling under the same
+# faithful-mirror rule (its only delta is its own `process_groups:` block).
 #
 # max_slice_len 17_000_000 (> 16 MiB = 16_777_216) covers the largest
 # payload in the pinned 10-size sweep. Trigger policy lives on the node

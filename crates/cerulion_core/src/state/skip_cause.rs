@@ -22,7 +22,7 @@
 //! still resolves unchanged.
 
 /// Why an anchor (or one node's part of it) was VOIDED, carried by a
-/// `RECORD_KIND_SKIP` record (`crate::state_ring`, whose constants are
+/// SKIP record (`crate::state_ring`, whose kind constants are
 /// unix-only; this type deliberately is not — see the module doc).
 ///
 /// The causes are the capture path's failure table. WHICH of them a carrier can mint, and whether

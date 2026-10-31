@@ -1,7 +1,11 @@
+args:
+  step: 2
 prefix: basic_timer
 nodes:
   - id: timer
     type: timer
+    params:
+      step: ${step}
     outputs:
       - name: count
         schema: std_msgs/Int32

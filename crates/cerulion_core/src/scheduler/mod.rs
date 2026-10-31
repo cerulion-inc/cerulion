@@ -39,6 +39,9 @@ pub mod node_death;
 /// The per-set Sync matcher (the pure verdict engine replacing
 /// `check_sync`).
 pub mod sync_match;
+// Capture-time Sync matching. Hidden: it has no user-facing opt-in yet.
+#[doc(hidden)]
+pub mod sync_stamp;
 pub mod trace_merge;
 pub mod trigger;
 // Inert for now: the wake-origin taxonomy the WaitSet reactor will consume.
@@ -268,7 +271,103 @@ struct WatchdogTracker {
 #[derive(Clone)]
 struct TriggerRefill {
     input: Arc<str>,
-    drain: Arc<dyn Fn() -> (u64, Option<u64>) + Send + Sync>,
+    drain: Arc<dyn Fn() -> RefillOutcome + Send + Sync>,
+}
+
+/// What one refill did, and WHY it found nothing when it found nothing.
+///
+/// The hook returned `(popped, latest_ts)` until the replay read gate existed.
+/// The pair was enough while the only reason a refill could come back empty was
+/// an empty queue; under enforcement an empty answer has a second cause, the
+/// gate withheld a frame that is queued and not yet due, and the two must not
+/// be reported as one, because the shortfall line says the recording holds a
+/// consumed frame this replay's input stream does not, which is FALSE for a
+/// withheld frame.
+///
+/// The cause is decided by the party that PERFORMED the drain, not probed for
+/// afterwards: an optional probe hook would make two authorities for one fact.
+///
+/// For the same reason the cause is DERIVED from the pop count rather than
+/// carried beside it: the field is private and every constructor goes through
+/// [`Self::drained`], which computes the cause from the very count the callers
+/// read, so an outcome with `popped > 0` cannot carry an empty cause. While the
+/// two fields were independent, an outcome pairing a pop with an empty cause was
+/// a served frame to the LIVE burst (which breaks on `popped == 0`) and an input
+/// SHORTFALL to the REPLAY burst (which branched on the cause alone), i.e. two
+/// answers for one drain. The shipped transport never minted that pair, and that
+/// is what made the disagreement invisible rather than harmless: the gate is
+/// consulted ONCE per drain before anything pops
+/// (`CerulionSubscriber::drain_with_accounting_impl`), so a refusal returns with
+/// nothing popped. What can mint it is any other hook answering for itself,
+/// which is what a refill hook is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefillOutcome {
+    /// Frames the refill consumed.
+    pub popped: u64,
+    /// The surviving frame's wire timestamp, `None` when nothing was consumed.
+    pub latest_ts: Option<u64>,
+    /// Why `popped` is 0, when it is. Private: see [`Self::drained`].
+    empty_cause: RefillEmptyCause,
+}
+
+/// Why a refill came back empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefillEmptyCause {
+    /// It did not: `popped > 0`.
+    NotEmpty,
+    /// The queue held no frame the refill could take.
+    Queue,
+    /// The REPLAY READ GATE withheld a queued frame that is not yet due. Not a
+    /// shortfall: the recording's read at this position consumed nothing, and
+    /// the gate reproducing that is the enforcement working.
+    EnforcedByReadPlan,
+}
+
+impl RefillOutcome {
+    /// What a refill that RAN answers. The ONE place the cause is decided:
+    /// `withheld_by_read_plan` is the caller's own witness that the replay read
+    /// gate refused a consult during this drain (the graph runtime reads the
+    /// gate's monotone refused-consult counter across the call), and it is
+    /// consulted only where it can mean anything, at a pop count of 0. So a
+    /// count above 0 is [`RefillEmptyCause::NotEmpty`] whatever the witness
+    /// says, and no caller can hand the bursts a pop that claims an empty cause.
+    #[must_use]
+    pub fn drained(popped: u64, latest_ts: Option<u64>, withheld_by_read_plan: bool) -> Self {
+        let empty_cause = if popped > 0 {
+            RefillEmptyCause::NotEmpty
+        } else if withheld_by_read_plan {
+            RefillEmptyCause::EnforcedByReadPlan
+        } else {
+            RefillEmptyCause::Queue
+        };
+        Self {
+            popped,
+            latest_ts,
+            empty_cause,
+        }
+    }
+
+    /// The empty answer a caller that consumed nothing and blames the QUEUE
+    /// gives, the fail-safe every non-gate path returns.
+    #[must_use]
+    pub fn empty_queue() -> Self {
+        Self::drained(0, None, false)
+    }
+
+    /// The empty answer the replay read gate's WITHHOLD gives: the recording's
+    /// read at this position consumed nothing, so this empty is the enforcement
+    /// working and never an input shortfall.
+    #[must_use]
+    pub fn withheld_by_read_plan() -> Self {
+        Self::drained(0, None, true)
+    }
+
+    /// Why this refill came back empty. Meaningful only at
+    /// `popped == 0`, which is the only place the bursts ask.
+    #[must_use]
+    pub fn empty_cause(&self) -> RefillEmptyCause {
+        self.empty_cause
+    }
 }
 
 /// The transport ops the per-set Sync matcher demands through its
@@ -292,10 +391,24 @@ pub enum SyncHeadOp {
     /// The NON-CONSUMING "has another frame arrived behind the head?" probe.
     ProbeNext,
     /// Pop the next frame into the staged slot and report its stamp.
-    PeekNext,
+    ///
+    /// Carries the ALIGN SITE, declared by the caller like every other site
+    /// discriminator on this path, because an EMPTY pop's read-log record is
+    /// site-dependent. A post-fire refill pass has no replayed twin:
+    /// `Scheduler::tick_replay_burst` fires the recorded count and runs no
+    /// align pass between its fires, so a record staged there would hold a
+    /// position the replayed log can never fill. A boundary pass runs on both
+    /// sides. See `CerulionSubscriber::sync_peek_next_stamp`.
+    PeekNext { site: SyncAlignSite },
     /// Pop past the head (the caller counts the skip) and refill from the
     /// staged next, or failing that from the queue.
-    Advance,
+    ///
+    /// Carries the ALIGN SITE for the reason [`Self::PeekNext`] does, and the
+    /// empty answer is reachable here with nothing staged: a `DiscardTie`
+    /// discards a head the window killed without peeking first, so its refill
+    /// reads the QUEUE and answers `Nothing` on an empty one. See
+    /// `CerulionSubscriber::sync_discard_head`.
+    Advance { site: SyncAlignSite },
     /// Serve a RESTORED head's read as "no frame" — the head names a stamp but
     /// no live frame, and a live queued frame belongs to the NEXT set.
     Void,
@@ -545,6 +658,13 @@ struct ScheduledNode {
     /// read via [`Scheduler::replay_refill_shortfalls`]. Zero on every live path
     /// (nothing but the Replay arm touches it).
     replay_refill_shortfalls: u64,
+    /// Refills whose empty answer the REPLAY READ GATE caused, a queued frame
+    /// the recording had not read yet. Split out from
+    /// [`Self::replay_refill_shortfalls`] rather than folded into it because
+    /// that counter's whole meaning is "the recording holds a consumed frame
+    /// this replay's input stream does not", which is false here. Read via
+    /// [`Scheduler::replay_enforced_empty_refills`]; zero on every live path.
+    replay_enforced_empty_refills: u64,
 
     /// This node's installed INTRA-STEP pauses for the current
     /// replayed step — see [`NodeReplayPauses`] for the contract and for why
@@ -829,6 +949,14 @@ struct ScheduledNode {
     /// reads a comment block above a line, and a doc block quoting the marker
     /// verbatim registers as an annotation on the field declaration.)
     node_death: Arc<crate::scheduler::node_death::NodeDeathLedger>,
+    /// Set by the node's tick callback when the node returned
+    /// `NodeError::Fatal`. Read once after every fire that returns: the first
+    /// fire that sees it set disables the node, so the scheduler never fires it
+    /// again. A fresh unshared flag on a bare scheduler (nothing sets it); the
+    /// runtime installs the one its callback writes
+    /// (`set_node_fatal_stop`). Deterministic: it is set by the tick's own
+    /// return value, which a resim reproduces at the same step.
+    fatal_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScheduledNode {
@@ -903,20 +1031,27 @@ impl ClockInner {
     /// Advance the per-step gating clock by `delta_ns` and return the new time.
     ///
     /// The `Virtual` arm is the GATING clock (Period nodes gate
-    /// against it), so it advances by a run-INDEPENDENT logical quantum — the
-    /// fixed polled delta OR a replay-bag RECORDED execution duration — NEVER a
-    /// wall-derived or max-of-peers value (that would break replay = live,
-    /// Principle #7). The dedicated `advance_by_recorded` call names that
+    /// against it). `delta_ns` is one of the THREE wired feeds: the fixed
+    /// polled quantum, the MEASURED wall elapsed of a recording step (the
+    /// free-run multi-process default and a `--record` monolith), or a
+    /// bag-recorded step-boundary difference on replay. A max-of-peers or
+    /// off-seam telemetry value is NOT among them and must never be passed:
+    /// the boundary this step pushes is the only thing replay can hand back,
+    /// so a delta that reaches no boundary record breaks replay = live
+    /// (Principle #7). The dedicated `advance_by_recorded` call names that
     /// contract at the seam; see [`VirtualClock::advance_by_recorded`] for the
     /// canonical text. The `Real` arm is the no-op live path.
     fn advance(&self, delta_ns: u64) -> u64 {
         match self {
             ClockInner::Virtual(c) => c.advance_by_recorded(delta_ns),
             // Mechanically identical to the `Virtual`
-            // arm. The contract on what `delta_ns` means here is enforced by the
-            // CALLER (the live loop): it hands the LIVE logical quantum,
-            // NOT wall elapsed. So the `Barrier` gating clock advances
-            // deterministically and is NEVER a no-op (unlike `Real`).
+            // arm. What `delta_ns` means here is the CALLER's (the live loop's)
+            // decision, and it is mode-dependent: under the lockstep opt-out it
+            // hands the fixed LIVE logical quantum, and on a free-run recording
+            // it hands the step's measured wall elapsed (the
+            // `gating_follows_wall` arm). Either way the clock is CONTROLLED and
+            // is NEVER a no-op (unlike `Real`), so the value is stamped into
+            // this step's boundary record and is re-advanceable in replay.
             ClockInner::Barrier(c) => c.advance_by_recorded(delta_ns),
             // Read-only clocks (RealClock / ExternalClock) are not advanced by
             // the scheduler — their time is driven externally (the kernel
@@ -2320,6 +2455,7 @@ impl Scheduler {
             throttle_ns: None,
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
+            replay_enforced_empty_refills: 0,
             // No pauses until a replay engine installs some.
             replay_pauses: NodeReplayPauses::default(),
             // Inherit whatever hook is installed NOW, so a node
@@ -2367,6 +2503,7 @@ impl Scheduler {
             // edge below records nothing at all until a runtime installs the
             // shared one AND a live loop arms it.
             node_death: Arc::new(crate::scheduler::node_death::NodeDeathLedger::new()),
+            fatal_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         self.nodes.insert(config.id, node);
@@ -2424,6 +2561,11 @@ impl Scheduler {
     /// Clears the `disabled` flag, resets the consecutive panic counter, and
     /// for Period nodes, advances `next_fire_ns` past the current time so
     /// the node doesn't catch up on fires missed while disabled.
+    ///
+    /// It also lifts a `NodeError::Fatal` stop: the fatal-stop flag is cleared,
+    /// so the node fires again and is stopped again only by a NEW fatal return.
+    /// The runtime's `node_fatal_errors()` keeps reporting the earlier stop,
+    /// because it records what happened in the run.
     // hot-path-alloc-ok-fn: cold: node reset — a build/teardown edit, never a step
     pub fn reset_node(&mut self, node_id: &str) -> TransportResult<()> {
         let current_time = match &self.clock {
@@ -2440,6 +2582,9 @@ impl Scheduler {
             })?;
         node.disabled = false;
         node.consecutive_panics = 0;
+        // Without this the flag stays latched: the next fire would disable the
+        // node again even when that tick succeeds.
+        node.fatal_stop.store(false, Ordering::Release);
 
         // For Period nodes, skip ahead to avoid catch-up burst.
         //
@@ -2654,6 +2799,18 @@ impl Scheduler {
     /// `ScheduledNode::replay_refill_shortfalls`. `None` for an unknown id.
     pub fn replay_refill_shortfalls(&self, node_id: &str) -> Option<u64> {
         self.nodes.get(node_id).map(|n| n.replay_refill_shortfalls)
+    }
+
+    /// How many times this node's trace-driven burst asked its refill hook for
+    /// the next FIFO frame and the REPLAY READ GATE withheld one, see
+    /// `ScheduledNode::replay_enforced_empty_refills`. `None` for an unknown id.
+    ///
+    /// A nonzero value is NOT a shortfall. Reporting it as one would name a
+    /// missing frame on an edge whose frame is present and correctly held.
+    pub fn replay_enforced_empty_refills(&self, node_id: &str) -> Option<u64> {
+        self.nodes
+            .get(node_id)
+            .map(|n| n.replay_enforced_empty_refills)
     }
 
     /// Install the engine's INTRA-STEP injection callback — the
@@ -3472,6 +3629,8 @@ impl Scheduler {
                 .map(|(input, head)| (input.clone(), head.ts))
                 .collect(),
             input_service: None,
+            sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         })
     }
 
@@ -3538,6 +3697,64 @@ impl Scheduler {
                 node.sync_heads
                     .insert(input.clone(), SyncHead::restored(*ts));
             }
+        }
+    }
+
+    /// Raise one `Sync` input's wire-stamp epoch high-water to at least `ts`
+    /// on a resumed run.
+    ///
+    /// The high-water is what an epoch reset is detected against, and it is
+    /// only ever set by a POP, so a resumed run starts with none: the first
+    /// frame after a clock restart would be filled as an ordinary head instead
+    /// of re-basing the node, and the held partner the live run voided would
+    /// discard it. A capture-time node therefore seeds this from the same
+    /// checkpointed capture stamps that seed its capture high-water, which is
+    /// what keeps the two layers deciding the same epoch.
+    ///
+    /// A value only ever raises the mark (several restore seams may each
+    /// state a stamp for the same input). A non-`Sync` or unknown node is
+    /// left alone, for the reason [`Self::restore_sync_input_timestamps`]
+    /// gives. Must be called BEFORE the first `step()`.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub(crate) fn restore_sync_stamp_high_water(&mut self, node_id: &str, input: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if !matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            return;
+        }
+        let high_water = node
+            .sync_stamp_high_water
+            .entry(input.to_string())
+            .or_insert(ts);
+        *high_water = (*high_water).max(ts);
+    }
+
+    /// The newest stamp of a `Sync` node's current clock epoch, once an epoch
+    /// reset has established one. `None` for any other node, and before the
+    /// node's first reset.
+    pub(crate) fn sync_epoch_floor(&self, node_id: &str) -> Option<u64> {
+        self.nodes.get(node_id)?.sync_epoch_floor
+    }
+
+    /// Set a `Sync` node's epoch floor on a resumed run.
+    ///
+    /// The floor is what a RE-BASED input (one an epoch reset removed the
+    /// high-water of) is tested against, and it is only ever set by a pop, so
+    /// a run resumed between a reset and that input's first in-band frame
+    /// starts with none and would fill an old-epoch straggler the live run
+    /// discards. The re-based input itself needs nothing restored: its
+    /// missing high-water already IS "awaiting re-base".
+    ///
+    /// A non-`Sync` or unknown node is left alone, for the reason
+    /// [`Self::restore_sync_input_timestamps`] gives. Must be called BEFORE
+    /// the first `step()`.
+    pub(crate) fn restore_sync_epoch_floor(&mut self, node_id: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            node.sync_epoch_floor = Some(ts);
         }
     }
 
@@ -4137,7 +4354,7 @@ impl Scheduler {
         drain: F,
     ) -> TransportResult<()>
     where
-        F: Fn() -> (u64, Option<u64>) + Send + Sync + 'static,
+        F: Fn() -> RefillOutcome + Send + Sync + 'static,
     {
         let node = self
             .nodes
@@ -4222,6 +4439,17 @@ impl Scheduler {
         })
     }
 
+    /// The node's shared Sync counters, for a graph-build seam that counts
+    /// on them from outside the scheduler (capture-time matching).
+    pub(crate) fn sync_counters(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::scheduler::handle::SyncCounters>> {
+        self.nodes
+            .get(id)
+            .map(|node| Arc::clone(&node.sync_counters))
+    }
+
     /// Hand the runtime liveliness sweep a clone of
     /// `node_id`'s per-node publisher-disconnect counter `Arc` so it can
     /// bump it lock-free on every `Lost` transition it observes on one of
@@ -4290,6 +4518,34 @@ impl Scheduler {
                 node_id: node_id.to_string(),
             })?;
         node.node_death = ledger;
+        Ok(())
+    }
+
+    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return or by the
+    /// consecutive-panic breaker? A disabled node never fires until
+    /// [`Self::reset_node`] re-enables it. `false` for an unknown id. One map
+    /// lookup, no allocation: the live loop reads it per external binding per
+    /// wait.
+    pub fn is_node_disabled(&self, node_id: &str) -> bool {
+        self.nodes.get(node_id).is_some_and(|n| n.disabled)
+    }
+
+    /// Install the fatal-stop flag `node_id`'s tick callback sets when the node
+    /// returns `NodeError::Fatal` (see the field doc). Unknown node id = a
+    /// wiring desync: loud `Err`.
+    // hot-path-alloc-ok-fn: cold: installs a node's fatal-stop flag ONCE at graph BUILD
+    pub(crate) fn set_node_fatal_stop(
+        &mut self,
+        node_id: &str,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        node.fatal_stop = flag;
         Ok(())
     }
 
@@ -4447,9 +4703,11 @@ impl Scheduler {
     /// shared by the flat `Scheduler::step` and the `GraphRuntime::step` level
     /// executor (and the live path via `live_step -> step`). On the gating
     /// (polled/replay) path `delta` MUST be a run-INDEPENDENT logical quantum —
-    /// the poll-loop's fixed delta OR a replay-bag recorded duration — NOT a
-    /// wall-derived or max-of-peers value, so replay is bit-for-bit identical to
-    /// the polled gating run (Principle #7). The advance routes through
+    /// the poll-loop's fixed delta, a recording step's measured wall elapsed, OR
+    /// a replay-bag recorded boundary difference, NOT a max-of-peers or
+    /// off-seam telemetry value, so a run is bit-for-bit reproducible from its
+    /// own record and a polled gating run is additionally identical run to run
+    /// (Principle #7). The advance routes through
     /// [`VirtualClock::advance_by_recorded`] via `ClockInner::advance`; see it
     /// for the canonical contract.
     pub(crate) fn begin_step(&mut self, delta: Duration) -> u64 {
@@ -4532,6 +4790,19 @@ impl Scheduler {
     /// creates a new word, so the old handle must not linger).
     pub fn attach_catchup_arm(&mut self, arm: Arc<dyn catchup_clamp::CatchupArm>) {
         self.catchup_arm = Some(arm);
+    }
+
+    /// Bump this rank's wedge-page step counter WITHOUT beginning a step.
+    ///
+    /// The counter is how a supervisor tells a rank that stopped stepping from one
+    /// that is only idle. A run held by a pause stops stepping on purpose, so the
+    /// hold keeps the counter moving, as a rank parked on exhausted credit does.
+    /// A no-op unless a worker installed a page.
+    #[cfg(unix)]
+    pub(crate) fn note_idle_progress(&self) {
+        if let Some(page) = self.wedge_page.as_ref() {
+            page.advance_step();
+        }
     }
 
     /// Install this rank's wedge page and bind each node to its SLOT.
@@ -6160,7 +6431,7 @@ impl Scheduler {
                     };
                 }
                 SyncStep::NeedStamp(i) => {
-                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::PeekNext);
+                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::PeekNext { site });
                     match answer {
                         SyncOpAnswer::Stamp(ts) => next[i] = NextInfo::Stamp(ts),
                         SyncOpAnswer::Nothing => next[i] = NextInfo::None,
@@ -6192,7 +6463,7 @@ impl Scheduler {
                         );
                         return AlignOutcome::Complete;
                     }
-                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance);
+                    let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance { site });
                     match answer {
                         SyncOpAnswer::Head(_) | SyncOpAnswer::Nothing => {
                             advances[i] += 1;
@@ -6254,7 +6525,7 @@ impl Scheduler {
                     let hi = heads.iter().flatten().map(|h| h.ts).max().unwrap_or(0);
                     for i in indices {
                         let head_ts = heads[i].map_or(0, |h| h.ts);
-                        let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance);
+                        let answer = (ops.op)(&ops.inputs[i], SyncHeadOp::Advance { site });
                         match answer {
                             SyncOpAnswer::Head(_) | SyncOpAnswer::Nothing => {
                                 Self::report_sync_unmatched(
@@ -7260,11 +7531,14 @@ impl Scheduler {
                 let Some(r) = refill.as_ref() else {
                     break; // Separate binding: the signalled count WAS the burst.
                 };
-                let (popped, latest_ts) = (r.drain)();
-                if popped == 0 {
-                    break; // queue empty — the burst is fully served
+                let outcome = (r.drain)();
+                if outcome.popped == 0 {
+                    // queue empty, the burst is fully served. The LIVE burst
+                    // does not read the cause: no gate is armed on a live
+                    // run, so the only cause reachable here is the queue.
+                    break;
                 }
-                Self::note_trigger_arrival(node, &r.input, latest_ts);
+                Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
                 remaining = 1; // the drain's pop-one contract
                 refilled_unfired = true;
             }
@@ -7379,20 +7653,43 @@ impl Scheduler {
         for i in 0..fire_count {
             if i > 0 {
                 if let Some(r) = refill.as_ref() {
-                    let (popped, latest_ts) = (r.drain)();
-                    if popped == 0 {
-                        node.replay_refill_shortfalls =
-                            node.replay_refill_shortfalls.saturating_add(1);
-                        tracing::debug!(
-                            node_id = %id,
-                            step,
-                            fire_index = i,
-                            "trace-driven fire found no frame to refill — the recording holds \
-                             a consumed frame this replay's input stream does not; firing \
-                             anyway (the fire schedule is the recording's)"
-                        );
-                    } else {
-                        Self::note_trigger_arrival(node, &r.input, latest_ts);
+                    let outcome = (r.drain)();
+                    // The POP COUNT first, exactly as the live burst reads it,
+                    // and the cause only where a zero pop leaves something to
+                    // explain. `NotEmpty` cannot pair with a zero pop outside
+                    // this module: the cause field is private and `drained`
+                    // mints that variant only above zero. So its arm is folded
+                    // into the queue's rather than given a fourth behaviour
+                    // nothing can reach.
+                    match (outcome.popped, outcome.empty_cause()) {
+                        (1.., _) => {
+                            Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
+                        }
+                        (0, RefillEmptyCause::Queue | RefillEmptyCause::NotEmpty) => {
+                            node.replay_refill_shortfalls =
+                                node.replay_refill_shortfalls.saturating_add(1);
+                            tracing::debug!(
+                                node_id = %id,
+                                step,
+                                fire_index = i,
+                                "trace-driven fire found no frame to refill, the recording holds \
+                                 a consumed frame this replay's input stream does not; firing \
+                                 anyway (the fire schedule is the recording's)"
+                            );
+                        }
+                        (0, RefillEmptyCause::EnforcedByReadPlan) => {
+                            node.replay_enforced_empty_refills =
+                                node.replay_enforced_empty_refills.saturating_add(1);
+                            tracing::debug!(
+                                node_id = %id,
+                                step,
+                                fire_index = i,
+                                "trace-driven fire found no frame to refill because the REPLAY \
+                                 READ GATE withheld one, the recording's read at this position \
+                                 consumed nothing; firing anyway (the fire schedule is the \
+                                 recording's)"
+                            );
+                        }
                     }
                 }
             }
@@ -8476,6 +8773,12 @@ impl Scheduler {
         match result {
             Ok(()) => {
                 node.consecutive_panics = 0;
+                // A node that returned `NodeError::Fatal` this fire is stopped:
+                // this fire stays in the trace (it ran), and no later fire
+                // happens. One atomic load per fire; no allocation.
+                if !node.disabled && node.fatal_stop.load(Ordering::Acquire) {
+                    node.disabled = true;
+                }
             }
             Err(panic_info) => {
                 let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
@@ -9954,6 +10257,206 @@ mod tests {
         );
     }
 
+    /// A Period node with the fatal-stop flag installed, whose callback counts
+    /// its calls and sets the flag on every call (the runtime's callback sets it
+    /// when the tick returned `NodeError::Fatal`).
+    fn add_fatal_period(
+        scheduler: &mut Scheduler,
+        id: &str,
+        sets_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Arc<AtomicU64>, Arc<std::sync::atomic::AtomicBool>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_cb = Arc::clone(&calls);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_cb = Arc::clone(&flag);
+        scheduler
+            .add_node(NodeConfig {
+                id: id.to_string(),
+                policy: TriggerPolicy::Period {
+                    interval: Duration::from_millis(10),
+                    max_catchup: None,
+                },
+                callback: Box::new(move || {
+                    calls_cb.fetch_add(1, Ordering::Relaxed);
+                    if sets_flag.load(Ordering::Relaxed) {
+                        flag_cb.store(true, Ordering::Release);
+                    }
+                }),
+            })
+            .unwrap();
+        scheduler
+            .set_node_fatal_stop(id, Arc::clone(&flag))
+            .expect("known node");
+        (calls, flag)
+    }
+
+    /// A fatal return on the FIRST fire of a catch-up burst stops the burst
+    /// there: one call, one trace entry, the node disabled. The panic breaker
+    /// test above pins the same loop for its own flag.
+    #[test]
+    fn the_collect_mirror_period_burst_stops_at_a_fatal_stop() {
+        const BURST: u32 = 10;
+        const INTERVAL_NS: u64 = 10_000_000;
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, _flag) = add_fatal_period(&mut scheduler, "fatal", always);
+
+        let mut sink: Vec<TraceEntry> = Vec::new();
+        let node = scheduler.nodes.get_mut("fatal").expect("node present");
+        Scheduler::tick_node_into(
+            "fatal",
+            node,
+            FireKind::Period {
+                first_fire_ns: INTERVAL_NS,
+                fire_count: BURST,
+                interval_ns: INTERVAL_NS,
+                current_time_ns: INTERVAL_NS * BURST as u64,
+            },
+            0,
+            0,
+            &mut sink,
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the burst stops at its first fire"
+        );
+        assert_eq!(sink.len(), 1, "one trace entry: the fatal fire ran");
+        assert!(node.disabled, "the fatal stop disabled the node");
+    }
+
+    /// The SERIAL twin of the test above: `tick_node`'s own Period burst loop
+    /// over the ring sink stops at the fatal fire too.
+    #[test]
+    fn the_serial_period_burst_stops_at_a_fatal_stop() {
+        const BURST: u32 = 10;
+        const INTERVAL_NS: u64 = 10_000_000;
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, _flag) = add_fatal_period(&mut scheduler, "fatal", always);
+
+        let mut trace: VecDeque<TraceEntry> = VecDeque::new();
+        let mut appended: u64 = 0;
+        let node = scheduler.nodes.get_mut("fatal").expect("node present");
+        Scheduler::tick_node(
+            "fatal",
+            node,
+            FireKind::Period {
+                first_fire_ns: INTERVAL_NS,
+                fire_count: BURST,
+                interval_ns: INTERVAL_NS,
+                current_time_ns: INTERVAL_NS * BURST as u64,
+            },
+            0,
+            0,
+            &mut trace,
+            None,
+            &mut appended,
+            None,
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the burst stops at its first fire"
+        );
+        assert_eq!(trace.len(), 1, "one trace entry: the fatal fire ran");
+        assert_eq!(appended, 1);
+        assert!(node.disabled, "the fatal stop disabled the node");
+    }
+
+    /// A trace-driven (replay) burst and a data-triggered burst stop at the
+    /// fatal fire as well: the recording's later fires in the same step are
+    /// not run, the same as live.
+    #[test]
+    fn the_replay_and_data_bursts_stop_at_a_fatal_stop() {
+        const BURST: u32 = 5;
+        const INTERVAL_NS: u64 = 10_000_000;
+        let kinds = [
+            (
+                "replay",
+                FireKind::Replay {
+                    first_fire_ns: INTERVAL_NS,
+                    fire_count: BURST,
+                    interval_ns: INTERVAL_NS,
+                },
+            ),
+            (
+                "data",
+                FireKind::Data {
+                    fire_time_ns: INTERVAL_NS,
+                    fire_count: BURST,
+                },
+            ),
+        ];
+        for (label, kind) in kinds {
+            let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+            let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (calls, _flag) = add_fatal_period(&mut scheduler, "fatal", always);
+            let mut sink: Vec<TraceEntry> = Vec::new();
+            let node = scheduler.nodes.get_mut("fatal").expect("node present");
+            Scheduler::tick_node_into("fatal", node, kind, 0, 0, &mut sink);
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{label}: one call");
+            assert_eq!(sink.len(), 1, "{label}: one trace entry");
+            assert!(node.disabled, "{label}: the fatal stop disabled the node");
+        }
+    }
+
+    /// `reset_node` lifts a fatal stop: the flag is cleared, so a later fire
+    /// whose tick does not set it again leaves the node enabled.
+    #[test]
+    fn reset_node_clears_the_fatal_stop_flag() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let sets = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, flag) = add_fatal_period(&mut scheduler, "fatal", Arc::clone(&sets));
+        let fire = |scheduler: &mut Scheduler| {
+            let mut sink: Vec<TraceEntry> = Vec::new();
+            let node = scheduler.nodes.get_mut("fatal").expect("node present");
+            Scheduler::tick_node_into(
+                "fatal",
+                node,
+                FireKind::Period {
+                    first_fire_ns: 10_000_000,
+                    fire_count: 1,
+                    interval_ns: 10_000_000,
+                    current_time_ns: 10_000_000,
+                },
+                0,
+                0,
+                &mut sink,
+            );
+        };
+        fire(&mut scheduler);
+        assert!(
+            scheduler.nodes["fatal"].disabled,
+            "stopped by the fatal fire"
+        );
+
+        // The tick is healthy from now on; the reset must not leave the flag latched.
+        sets.store(false, Ordering::Relaxed);
+        scheduler.reset_node("fatal").expect("known node");
+        assert!(!flag.load(Ordering::Acquire), "reset cleared the flag");
+        assert!(!scheduler.nodes["fatal"].disabled);
+        fire(&mut scheduler);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(
+            !scheduler.nodes["fatal"].disabled,
+            "a healthy fire after the reset keeps the node enabled"
+        );
+    }
+
+    /// An unknown node id is a wiring desync: `NodeNotFound` naming the id.
+    #[test]
+    fn set_node_fatal_stop_on_an_unknown_node_is_node_not_found() {
+        let mut scheduler = Scheduler::new();
+        let err = scheduler
+            .set_node_fatal_stop("nope", Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .expect_err("no such node");
+        assert!(
+            matches!(&err, TransportError::NodeNotFound { node_id } if node_id == "nope"),
+            "{err:?}"
+        );
+    }
+
     /// The scheduler-level refusals of
     /// `place_gating_epoch` are pinned at THIS layer, not only through the
     /// runtime (which refuses first on its own quantum check). A `VirtualClock`
@@ -9983,6 +10486,133 @@ mod tests {
             .expect_err("the placeable check refuses the same clock");
         assert!(err.to_string().contains("no CONTROLLED"), "{err}");
         assert_eq!(clock.now_ns(), 0);
+    }
+
+    /// **A refill that POPPED is never counted a shortfall, on either burst,
+    /// even when the outcome CLAIMS an empty cause.**
+    ///
+    /// [`RefillOutcome`] carried the pop count and the empty cause as two
+    /// independent fields, and the two bursts read them from opposite ends: the
+    /// LIVE burst continues while `popped > 0`, while the REPLAY burst branched
+    /// on the cause alone. One outcome was therefore a served frame to one burst
+    /// and an input SHORTFALL to the other, and a shortfall names the HARNESS
+    /// for a frame the recording read and this replay served.
+    ///
+    /// The disagreeing pair is minted BY HAND here, with the struct literal only
+    /// this module can still write: [`RefillOutcome::drained`] derives the cause
+    /// from the count, so no caller outside `scheduler` can build it at all.
+    /// Leg 1 pins that derivation and legs 2 and 3 drive the two bursts over the
+    /// hand-minted pair, which is what keeps the two guards separately tested: a
+    /// cause-first match passes leg 1, and a constructor that took the witness
+    /// first passes legs 2 and 3.
+    #[test]
+    fn a_refill_that_popped_is_no_shortfall_on_either_burst() {
+        // The pair the constructor refuses to mint: a pop carrying the QUEUE's
+        // empty cause. A plain item, not a closure, so both legs can call it.
+        fn disagreeing_pop() -> RefillOutcome {
+            RefillOutcome {
+                popped: 1,
+                latest_ts: Some(7),
+                empty_cause: RefillEmptyCause::Queue,
+            }
+        }
+
+        // ── LEG 1: the constructor derives the cause from the count.
+        assert_eq!(
+            RefillOutcome::drained(1, Some(42), true).empty_cause(),
+            RefillEmptyCause::NotEmpty,
+            "a pop is not an empty answer, whatever the withhold witness says"
+        );
+        assert_eq!(
+            RefillOutcome::drained(0, None, true).empty_cause(),
+            RefillEmptyCause::EnforcedByReadPlan,
+            "the witness decides only where a zero pop leaves something to explain"
+        );
+        assert_eq!(
+            RefillOutcome::drained(0, None, false).empty_cause(),
+            RefillEmptyCause::Queue,
+            "and an empty drain no gate withheld from is the queue's"
+        );
+
+        // ── LEG 2: the REPLAY burst over that pair. The two counters are the
+        // oracle: neither an input shortfall nor a gate-emptied refill.
+        let mut replay = Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+        add_data(&mut replay, "sink");
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_hook = Arc::clone(&calls);
+        replay
+            .set_trigger_refill("sink", "inp", move || {
+                calls_hook.fetch_add(1, Ordering::Relaxed);
+                disagreeing_pop()
+            })
+            .unwrap();
+        replay
+            .set_replay_fire_plan(
+                0,
+                &[ReplayFire {
+                    node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: 3,
+                    interval_ns: 1_000_000,
+                }],
+            )
+            .unwrap();
+        replay.step(Duration::from_millis(10));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the refill is asked once per fire after the first"
+        );
+        assert_eq!(
+            replay.replay_refill_shortfalls("sink"),
+            Some(0),
+            "a refill that POPPED is no shortfall: naming the harness here blames \
+             it for a frame the recording read and this replay served"
+        );
+        assert_eq!(
+            replay.replay_enforced_empty_refills("sink"),
+            Some(0),
+            "and no gate-emptied refill either: the drain delivered"
+        );
+
+        // ── LEG 3: the LIVE burst's side of the same fact. It must keep reading
+        // the COUNT: a supply of two disagreeing pops behind one signalled
+        // arrival serves three fires, where a burst that read the cause would
+        // stop at the first of them.
+        let fires = Arc::new(AtomicU64::new(0));
+        let fires_cb = Arc::clone(&fires);
+        let mut live = Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+        live.add_node(NodeConfig {
+            id: "sink".to_string(),
+            policy: TriggerPolicy::Data,
+            callback: Box::new(move || {
+                fires_cb.fetch_add(1, Ordering::Relaxed);
+            }),
+        })
+        .unwrap();
+        let left = Arc::new(AtomicU64::new(2));
+        let left_hook = Arc::clone(&left);
+        live.set_trigger_refill("sink", "inp", move || {
+            if left_hook.load(Ordering::Relaxed) == 0 {
+                return RefillOutcome::empty_queue();
+            }
+            left_hook.fetch_sub(1, Ordering::Relaxed);
+            disagreeing_pop()
+        })
+        .unwrap();
+        live.signal_data("sink").unwrap();
+        live.step(Duration::from_millis(1));
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            3,
+            "one signalled arrival plus the two refilled frames: the live burst \
+             reads the pop count and a popped frame is a frame"
+        );
+        assert_eq!(
+            left.load(Ordering::Relaxed),
+            0,
+            "the supply really was drained by the burst, not left behind"
+        );
     }
 }
 
@@ -10067,8 +10697,16 @@ mod align_driver_tests {
             }
             let input_matches =
                 self.fail_all_head_ops || self.fail_head_ops_for.as_deref() == Some(input);
-            let kind_matches =
-                self.fail_only_kinds.is_empty() || self.fail_only_kinds.contains(&op);
+            // By DISCRIMINANT, so the list names KINDS and the align site a
+            // list entry happens to spell is ignored. A `contains` would make
+            // the fault site-sensitive, and an arm that drives a refill pass
+            // against a list spelling `Boundary` would then fault nothing while
+            // still asserting a failure path ran.
+            let kind_matches = self.fail_only_kinds.is_empty()
+                || self
+                    .fail_only_kinds
+                    .iter()
+                    .any(|k| std::mem::discriminant(k) == std::mem::discriminant(&op));
             input_matches && kind_matches
         }
 
@@ -10082,7 +10720,7 @@ mod align_driver_tests {
             };
             if matches!(
                 op,
-                SyncHeadOp::ProbeNext | SyncHeadOp::PeekNext | SyncHeadOp::Advance
+                SyncHeadOp::ProbeNext | SyncHeadOp::PeekNext { .. } | SyncHeadOp::Advance { .. }
             ) {
                 self.descent_ops += 1;
             }
@@ -10100,7 +10738,7 @@ mod align_driver_tests {
                         SyncOpAnswer::Nothing
                     }
                 }
-                SyncHeadOp::PeekNext => {
+                SyncHeadOp::PeekNext { .. } => {
                     if state.staged.is_none() {
                         state.staged = state.queue.pop_front();
                     }
@@ -10109,7 +10747,7 @@ mod align_driver_tests {
                         None => SyncOpAnswer::Nothing,
                     }
                 }
-                SyncHeadOp::Advance => match state.refill() {
+                SyncHeadOp::Advance { .. } => match state.refill() {
                     Some(ts) => SyncOpAnswer::Head(ts),
                     None => SyncOpAnswer::Nothing,
                 },
@@ -10473,7 +11111,9 @@ mod align_driver_tests {
             None,
             None,
             true,
-            &[SyncHeadOp::PeekNext],
+            &[SyncHeadOp::PeekNext {
+                site: SyncAlignSite::Boundary,
+            }],
         );
         h.boundary();
         assert_eq!(

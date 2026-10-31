@@ -1,0 +1,6 @@
+# A local `cargo fuzz` run writes its findings here. The corpus is a product of
+# whoever ran it last, not of the tree: 2768 files once reached a pull request
+# this way, past the review bots, which skip a diff of more than a hundred files.
+corpus/
+artifacts/
+coverage/

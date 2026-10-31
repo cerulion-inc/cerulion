@@ -1,9 +1,15 @@
 [workspace]
 members = [
+    # The umbrella crate: one dependency that re-exports the runtime, the node
+    # macros and the ROS 2 message types, so a user project runs
+    # `cargo add cerulion` rather than naming three crates and keeping their
+    # versions in step. Re-exports only; it carries no logic.
+    "crates/cerulion",
     "crates/cerulion_core",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",
+    "crates/cerulion_android",
     # Local Studio workspace engine daemon. It links cli_engine, so it inherits
     # the workspace AGPL license rather than being a proprietary client library.
     "crates/cerulion_wsd",
@@ -39,9 +45,14 @@ members = [
     # Studio app can link the client lib. No iroh / no network I/O — pure
     # formats, crypto, and state machines.
     "crates/cerulion_pairing",
+    "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
+    "crates/cerulion_tf",        # pure SE(3) transform math (std + thiserror; no cerulion_core dep)
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
+    # Returns one chosen NodeError arm (env-selected) from init, a chosen
+    # tick, or shutdown: the typed error kind across the cdylib boundary.
+    "crates/test_fixtures/test_node_error_kind_cdylib",
     # Policy round-trip fixtures (one per MacroPolicy variant).
     "crates/test_fixtures/test_node_macro_period_cdylib",
     "crates/test_fixtures/test_node_macro_sync_cdylib",
@@ -71,6 +82,18 @@ members = [
     # Period cdylib with a plain non-trigger input, for
     # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
     "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # Library-only relay node (no cdylib target, no FFI exports): an app
+    # library links it as a plain dependency and runs it from the node registry.
+    "crates/test_fixtures/test_node_macro_relay_rlib",
+    # Four #[param] fields across the cdylib FFI: specs in the info JSON,
+    # values through the optional cerulion_node_init_with_params symbol.
+    "crates/test_fixtures/test_node_macro_param_cdylib",
+    # Raw-FFI cdylib whose info JSON declares a param but which exports no
+    # cerulion_node_init_with_params symbol; the host must refuse it at info time.
+    "crates/test_fixtures/test_node_params_no_symbol_cdylib",
+    # A period cdylib with an `#[input(accumulate)]` input, for the
+    # in-process vs cdylib parity pin of the keep-every-message read.
+    "crates/test_fixtures/test_node_macro_accumulate_cdylib",
     # ABI v8: #[input(depth = 32)] across the cdylib FFI; consumed
     # by cdylib_depth_ffi_test (parse pin + parity + e2e ceiling oracle).
     "crates/test_fixtures/test_node_macro_depth_cdylib",
@@ -183,12 +206,20 @@ members = [
     # ONLY through the preload, never a static link. Consumed by
     # `cerulion_heaphook/tests/heaphook_e2e_test.rs` (built first on Linux CI).
     "crates/test_fixtures/heaphook_probe",
+    # Compiled codegen fixture: .msg constants and string/array/all-zero
+    # defaults generated at build time; consumed by cerulion_core's
+    # codegen_defaults_compiled_test.
+    "crates/test_fixtures/codegen_fixture_msgs",
     # A trivial second malloc interposer preloaded AHEAD of the hook,
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
     "crates/test_fixtures/heaphook_shim",
-    # ── Cerulion visualization stack (root members; the root MSRV of 1.93
-    #    is what the `rerun` 0.34 SDK needs).
+    # The Android emulator e2e's direct data demand probe: an ingress-only
+    # gateway that demands one topic without reading a catalog first, so the
+    # e2e can show a paired app refuses a LAN data demand and sends no frame.
+    "crates/test_fixtures/android_e2e_demand_probe",
+    # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
+    #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
     #    DELIBERATELY excluded from `default-members` below — a plain
     #    `cargo build` stays rerun-free; the viz stack builds only via
@@ -214,6 +245,10 @@ members = [
     #    Build it via `cargo build -p cerulion_link` or `--workspace`.
     "crates/cerulion_wire", # permissive standalone wire-format decode seam (no cerulion_core dep)
     "crates/cerulion_link", # thin iroh dial-by-key QUIC wrapper (pulls iroh; NOT in default-members)
+    #  • `cerulion_ops_proto` is the `cerulion/ops/1` wire types and protocol
+    #    client (serde + serde_json + thiserror); `cerud` depends on it and
+    #    re-exports or wraps each item. Lean, so it goes in default-members.
+    "crates/cerulion_ops_proto",
     # The robot-level remote-plane daemon (AGPL). Owns the ONE
     # iroh endpoint and multiplexes the wire+ops ALPNs, gating every accept via a
     # deny-by-default PairingAuthorizer. Links cerulion_link (→ iroh) + cerud +
@@ -289,6 +324,10 @@ members = [
     # inverted whole-build tree `cargo tree -e normal -i axum` (empty on a default
     # build).
     "crates/cerulion_accountd",
+    # The Robot Context Protocol daemon: an MCP server over the live robot
+    # graph. Hosts streamable HTTP on hyper (already in the default build),
+    # not axum, so its only new crates are rmcp and its small helpers.
+    "crates/cerulion_rcpd",
 ]
 # default-members: the LEAN build set — every workspace member EXCEPT the
 # heavy-tree crates: the `cerulion_viz/*` crates (the `rerun` SDK, ~39 crates) AND
@@ -298,12 +337,18 @@ members = [
 # `-p`/`--workspace` operate on THIS set, so NEITHER the rerun SDK NOR the iroh tree
 # is compiled on a plain build. This is the feature-flag mechanism for the
 # viz stack (it is opt-in: `-p cerulion_viz`, `-p cerulion-vizd`, or
-# `--workspace`) AND the iroh-leanness invariant: the CLI + vizd stay
-# iroh-free because netd (default-on `wan`) is out of this set — pinned by the
-# `iroh-leanness` CI job (`cargo tree` asserts the default graph has no iroh AND the
-# per-package netd still ships wan). Globs expand the same way as `members`; every
+# `--workspace`) AND the iroh leanness invariant: the CLI + vizd stay
+# iroh-free because netd (default-on `wan`) is out of this set. Pinned by
+# `default_member_build_is_iroh_free` and
+# `netd_per_package_build_pulls_the_iroh_wan_plane` in
+# `crates/cerulion_hygiene/tests/dependency_rules_test.rs`: the default-members
+# resolve reaches no iroh-family package AND the per-package netd still ships wan.
+# Globs expand the same way as `members`; every
 # entry below is a member above.
 default-members = [
+    # Re-exports only; its whole closure (core, macros, messages) is already
+    # in this set, so it adds nothing to a plain build.
+    "crates/cerulion",
     "crates/cerulion_core",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
@@ -322,10 +367,19 @@ default-members = [
     "crates/rmw_cerulion",
     # Desk-half identity layer (light, permissive; no rerun/DDS pull).
     "crates/cerulion_pairing",
+    "crates/cerulion_telemetry",
     "crates/test_fixtures/*",
     # The tiny permissive wire decoder is lean (thiserror only), so it
     # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
     "crates/cerulion_wire",
+    # The permissive ops wire types (serde + serde_json + thiserror), a
+    # dependency of the default member `cerud`.
+    "crates/cerulion_ops_proto",
+    # Pure SE(3) transform math, std + thiserror only.
+    "crates/cerulion_tf",
+    # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
+    # default build: its HTTP side runs on hyper, already here.
+    "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
     # default-member netd would unify the iroh tree into the CLI + vizd via
@@ -343,6 +397,8 @@ exclude = [
     "examples/perception",
     "examples/realsense",
     "examples/v4l2_camera",
+    # The Python wheel (PyO3) is its own workspace with its own lockfile.
+    "crates/cerulion_py",
 ]
 resolver = "2"
 
@@ -355,20 +411,21 @@ edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cerulion-inc/cerulion"
 homepage = "https://github.com/cerulion-inc/cerulion"
-# MSRV 1.93 (set by the cerulion_viz members of the root
-# workspace). VERIFIED + ENFORCED: the `msrv` CI job in
-# .github/workflows/ci.yml runs `cargo +1.93.0 check --workspace --all-targets`
-# on every PR, so this value is a build-proven floor, not a survey.
-# Our own code needs only 1.87 (`usize::is_multiple_of`), and the non-viz
-# dependency tree floors at 1.88 (darling/time/time-core/home/instability
-# declare rust-version 1.88). The binding constraint is the `rerun` 0.34 SDK
-# (pulled by the `cerulion_viz` / `cerulion-vizd` members behind `default-members`).
-# `rerun` 0.34 declares `rust-version` 1.92, but its transitive `fixed` dep at
-# the current release (1.31.0) declares 1.93 — so 1.93 is rerun's REAL floor with
-# unpinned deps, and adopting it lets `fixed` resolve naturally to 1.31.0 (no
-# lockfile pin back to 1.30.0). 1.93 is the true minimum stable that checks the
-# WHOLE workspace clean.
-rust-version = "1.93"
+# MSRV 1.95, set by this workspace's own code: `cerulion_core` calls `try_update`
+# on the integer atomics (the same compare-exchange loop as its former name
+# `fetch_update`, stable since 1.95; Rust 1.99 deprecates the old name).
+# VERIFIED + ENFORCED: the `msrv` CI job in .github/workflows/ci.yml runs
+# `cargo +1.95.0 check --workspace --all-targets` on every pull request and every
+# push to `main` (it is excluded from the merge queue, where `main`'s push run is
+# the control), so this value is a build-proven floor, not a survey.
+# The dependency tree floors lower: the non-viz tree at 1.91 (`iroh` 1.0.2 and
+# its companion crates declare rust-version 1.91), and the `rerun` 0.34
+# SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93 (`rerun`
+# declares 1.92; its transitive `fixed` 1.31.0 declares 1.93, the highest
+# rust-version in the lockfile). The release compiler
+# (.github/workflows/release-artifacts.yml) is pinned at the same 1.95.0, so a
+# release binary and the nodes built against it share one compiler at the floor.
+rust-version = "1.95"
 
 # ───────────────────────────── Workspace lint table ────────────────────────
 # The one strict lint table (the project's strict linting rule). Every workspace
@@ -463,6 +520,7 @@ cerulion_core = { path = "crates/cerulion_core", version = "=1.0.0" }
 cerulion_bag = { path = "crates/cerulion_bag", version = "=1.0.0" }
 cerulion_bagd = { path = "crates/cerulion_bagd", version = "=1.0.0" }
 cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=1.0.0" }
+indexmap = "2.8"
 cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=1.0.0" }
 cerulion_dds = { path = "crates/cerulion_dds", version = "=1.0.0", default-features = false }
 cerulion_discovery = { path = "crates/cerulion_discovery", version = "=1.0.0" }
@@ -471,6 +529,7 @@ cerulion_link = { path = "crates/cerulion_link", version = "=1.0.0" }
 cerulion_mdns = { path = "crates/cerulion_mdns", version = "=1.0.0" }
 cerulion_netd = { path = "crates/cerulion_netd", version = "=1.0.0", default-features = false }
 cerulion_pairing = { path = "crates/cerulion_pairing", version = "=1.0.0" }
+cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=1.0.0" }
 cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=1.0.0" }
 native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0" }
 
@@ -509,7 +568,8 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # (SetStoreInfo / blueprint / statics) always takes the reliable path, and drops
 # are reported as `live_dropped` by `capture_memory`. `None` = stock behaviour.
 #
-# Upstream 0.34.1 + those two localized patches. The first is a
+# Upstream 0.34.1 + two localized `ServerOptions` patches and one test-only change
+# (THE THIRD CHANGE below). The first patch is a
 # `ServerOptions::drop_temporal_history` mode that
 # makes the per-client connect-history retain the scene skeleton (persistent +
 # static_) but NEVER buffer disposable/temporal frames — Cerulion Studio's
@@ -518,6 +578,16 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # no viewer-blueprint clobber). vizd sets it on; every other re_grpc_server user
 # gets stock behavior (default `false`). Version stays 0.34.1 so the whole re_*
 # graph stays lockstep (`cargo tree | grep re_grpc`).
+#
+# THE THIRD CHANGE (fork commit 92d8fee) adds no option. The forwarding loop behind
+# `spawn_with_recv` runs on a blocking-pool thread (`spawn_blocking` driving its
+# receive through `Handle::block_on`) instead of a runtime worker: its push into
+# the receiver it hands back is a thread-blocking send that waits with no timeout
+# once the channel has warned, so on the two-worker runtimes of the vizd liveness
+# tests a receiver left undrained filled that channel, the send parked a worker
+# and the viewer missed its deadline. `spawn_with_recv` is called only by those
+# tests; vizd hosts through `serve_from_channel`, whose send already ran on a
+# blocking thread.
 #
 # WHY A FORK — stock 0.34.1's two `ServerOptions` knobs (`playback_behavior`,
 # `memory_limit`) cannot express "deliver the scene skeleton to a late joiner but
@@ -528,18 +598,20 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # SPARSE-FORK MODEL — cerulion-inc/re_grpc_server is a single-crate fork (NOT a
 # fork of rerun's ~278MB monorepo — a cargo git-dep clones the whole repo per cold
 # CI job): branch `upstream` carries the crates.io tarball verbatim (tagged
-# `upstream/<ver>`), branch `main` = `upstream` + the patch (what this rev pins),
+# `upstream/<ver>`), branch `main` = `upstream` + the patches (what this rev pins),
 # mirroring the cerulion-inc/RustDDS precedent above. UPGRADE: in that repo run
 # `./import-upstream.sh <new-ver>` then `git merge upstream` on main, rebuild +
 # retest, and bump the `rev` here. See its README.md + CERULION-PATCH.md.
 #
-# EXIT CONDITION: drop this patch entirely (revert to the crates.io
+# EXIT CONDITION: drop this fork entirely (revert to the crates.io
 # re_grpc_server, prune this rev + the `deny.toml [sources]` entry) if upstream
 # re_grpc_server ever ships BOTH a statics-only / drop-temporal history mode
-# and a bounded, non-blocking live queue. Either alone is not
-# enough — the two patches bound two different buffers on the same path, and the
-# same wording is carried by `deny.toml [sources]` and the fork's
-# CERULION-PATCH.md "Exit condition".
+# and a bounded, non-blocking live queue, AND moves the `spawn_with_recv`
+# forwarder's send off its runtime workers. The first two alone are not enough: either capability
+# alone leaves one of the two buffers on that path unbounded, and without the
+# third an undrained receiver fills the forwarder's channel and its push parks a
+# runtime worker again. `deny.toml [sources]` carries the same three; the fork's
+# CERULION-PATCH.md "Exit condition" names the first two.
 #
 # LANDMINE: the added `ServerOptions` fields are safe ONLY because rerun's
 # `clap`/`run`/`web_viewer` features — which construct `ServerOptions` with
@@ -547,4 +619,93 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # `rerun` (sdk + server only) build. If a future workspace change enables any of
 # those features on `rerun`, those upstream literals would need the fields. Watch
 # on any `rerun` feature change.
-re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "29b38496264e4681844346aa49c770070097305e" }
+re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
+
+# A FORK of iceoryx2 0.10.0 with three fixes: it removes the process umask from
+# `UnixDatagramSocket::bind` (iceoryx2-bb-posix), fixes the macOS shm descriptor
+# table (iceoryx2-pal-posix, below) and initializes the node counter of the
+# global management segment (iceoryx2, below). It also adds Android support
+# (below). The revision is held by the tag
+# `cerulion-pin-282f479b` on the fork, so it does not depend on a branch.
+#
+# `bind` installed a process global umask of `!permission` for the duration of
+# the bind and restored it on scope exit. The umask is per PROCESS, so while one
+# thread binds, every other thread creates files and directories through that
+# mask; at the 0.10 `SOCKET_PERMISSIONS` of `OWNER_READ_WRITE` the mask clears
+# the owner SEARCH bit, so a directory made in that window comes out `0o600` and
+# every later stat of a path inside it fails with EACCES. The value also leaks
+# permanently: two threads binding at once each save what the other installed,
+# so the restore writes back a value that was never the original. MEASURED with
+# eight concurrent binds: the process mask reads `0o7177` after every thread has
+# joined, where it was `0o022` before (the setuid, setgid and sticky bits ride
+# along in the complement).
+#
+# We reach this on every listener creation, which is every subscriber and every
+# doorbell, so it is not a test-only hazard: any Cerulion process that creates a
+# listener while another thread makes a directory is exposed. It is why the vizd
+# and macOS suites went red on the 0.10 migration, on directories the tests had
+# created themselves.
+#
+# The fork applies the permission to the bound socket with chmod instead. 0.9.1
+# has the same umask handling and the same leak; it is silent there only because
+# its `SOCKET_PERMISSIONS` is `OWNER_ALL`, whose complement leaves the search bit
+# alone.
+#
+# The same revision also fixes the macOS shared-memory descriptor table in
+# `iceoryx2-pal-posix`. Each statically linked copy of iceoryx2 (the host and
+# every node cdylib) keeps its own table from a shm descriptor to its
+# `.shm_state` file, and a node cdylib drops the ports the host built for it, so
+# a host descriptor can be closed through the cdylib's copy and leave a stale
+# entry in the host's. The released 0.10.0 then refuses the reused number in
+# `shm_open` (ENFILE, so `graph run` stops at pre-create) and routes a regular
+# file's `fchmod`/`fstat` on that number into the stale side file. The fork
+# replaces a stale entry on `shm_open` and answers lookups only while the
+# descriptor is still a shm object. Pinned by
+# `crates/cerulion_core/tests/cdylib_shm_fd_handoff_iox2_test.rs`.
+#
+# The same revision also initializes the node counter in iceoryx2's global
+# management segment (upstream eclipse-iceoryx/iceoryx2#2143, merged after
+# 0.10.0). The released initializer returned success without writing the
+# segment, so the counter that goes into every node id in an iceoryx2 domain
+# started from whatever bytes the newly created segment held. The fork writes
+# the default state, a zero counter, when it creates the segment.
+#
+# The same revision also adds Android support: filesystem paths, file-backed
+# named shared memory with private-directory checks, abstract-namespace Unix
+# datagram sockets and POSIX timers for the watchdog.
+#
+# SCOPE: this reaches THIS workspace's builds only. `[patch.crates-io]` does not
+# follow our published crates, so anyone depending on a released `cerulion_core`
+# resolves the unpatched upstream until the fixes merge there. Node cdylibs
+# built outside this workspace keep the released copy; the host's fixed copy
+# recovers on its own.
+#
+# EXIT CONDITION: drop this entry when an iceoryx2 release carries every change
+# this fork revision adds: the three fixes and the Android support above.
+#
+# THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
+# build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
+# crates.io members keep theirs, and the same types then exist twice. Every
+# member the graph carries is listed so exactly one copy of each is resolved.
+iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }

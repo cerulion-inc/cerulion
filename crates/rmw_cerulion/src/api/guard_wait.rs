@@ -36,7 +36,7 @@
 //! (64 B ping-pong p50 178 → 203 µs) even though the same primitive under
 //! a C1 cap was 39.7 µs and under a C0 pin 13.9 µs: with no near timer the
 //! governor takes a deep C-state during the block and both hops pay the
-//! exit. So the block timeout is a LADDER on `FdWakeSet::wait` (Linux:
+//! exit. So the block timeout is a LADDER on `FdWakeSet::wait` (Linux and Android:
 //! `ppoll`, ns precision): first rung [`BLOCK_FIRST_RUNG_US`] (200 µs —
 //! measured identical latency to 100 at half the idle wake rate; a near
 //! timer keeps the core shallow the way the legacy sleep does by accident,
@@ -78,8 +78,8 @@
 //! hardware-instantly on the primary topic and within one slice on the
 //! rest; guard/service/client fds wake within one slice. The ladder rung
 //! still bounds every park, so the pump cadence and the idle backoff are
-//! tier-independent. Off Linux the doorbell is a no-op stub
-//! ([`DOORBELL_REAL`]): the park tier never engages and the fd block
+//! tier-independent. Off Linux no ring wakes this park
+//! ([`RING_WAKES_THE_PARK`]): the park tier never engages and the fd block
 //! serves everything — same observable behavior, µs-tier wakes via the
 //! fd instead of ns-tier via the line. rmw publishers open the bell
 //! UNOWNED and never unlink it (a ROS topic is provisioned at two
@@ -103,10 +103,11 @@
 //! out YIELDS the core (`park_yields`), and the horizon is platform-
 //! informed ([`park_policy`], the table on [`ParkHorizon`]): NO park on
 //! x86 — the fd/`ppoll` tier measured faster at 2 ms (27.7 vs 30.1 µs)
-//! AND 10 ms (19.8 vs 58.8) even against a one-rung park; `ThroughRung`
-//! on aarch64 `WFE` (74.8 vs 127.1 at 2 ms, 84.3 vs 135.7 at 10 ms — the
-//! park is what halves that wake). `CERULION_MONITOR_WAIT=1` forces the
-//! park on for x86 experiments (bounded to one rung per call).
+//! AND 10 ms (19.8 vs 58.8) even against a one-rung park; `FirstRungOnce`
+//! on aarch64 `WFE`: one park of at most the first rung per call, then the
+//! kernel fd block.
+//! `CERULION_MONITOR_WAIT=1` forces the park on for x86 experiments
+//! (bounded to one rung per call).
 //!
 //! # Fired-only drain and probe (why a wake costs O(fired), not O(set))
 //!
@@ -188,7 +189,7 @@
 //!   resolves, through the SAME classification
 //!   ([`cerulion_core::monitor_wait::classify_env_flag`]), applied to the
 //!   PLATFORM default ([`park_policy`] / [`resolve_park`]): unset ⇒ the
-//!   default (park on aarch64 `WFE`, OFF on x86 — measured, see
+//!   default (one-rung park on aarch64 `WFE`, OFF on x86; measured, see
 //!   [`ParkHorizon`]); `1` ⇒ force the park on (x86: the bounded one-rung
 //!   shape); `0` ⇒ off (the fd/`ppoll` block serves every wake); any
 //!   other non-empty value warns once and keeps the default.
@@ -332,40 +333,47 @@ enum Phase {
 /// | platform | 2 ms park ON / OFF | 10 ms park ON / OFF |
 /// |---|---|---|
 /// | x86 (WAITPKG) | 30.1 / **27.7** | 58.8 / **19.8** |
-/// | aarch64 (WFE) | **74.8** / 127.1 | **84.3** / 135.7 |
+/// | aarch64 (WFE), `ThroughRung` | **74.8** / 127.1 | **84.3** / 135.7 |
 ///
 /// On x86 the fd/`ppoll` tier beats the park at BOTH periods — even a
 /// one-rung park (the `FirstRungOnce` shape) lost 2.4 µs at
-/// 2 ms and 39 µs at 10 ms — while on ARM the park wins by ~50 µs at
-/// both. So the x86 default is NO park and the ARM default parks
-/// through the rung; `CERULION_MONITOR_WAIT=1` forces the park on
+/// 2 ms and 39 µs at 10 ms. The aarch64 row was measured with the park
+/// held through every block (`ThroughRung`). The x86 default is NO park;
+/// the aarch64 default is `FirstRungOnce`: a call parks its first block
+/// and then sleeps in the kernel fd block, so a wake later than the first
+/// rung arrives through the fd block. Under `ThroughRung` an idle
+/// subscriber on a Jetson Orin NX used one core (process CPU 1.00 s per
+/// 1 s of idle wait). `CERULION_MONITOR_WAIT=1` forces the park on
 /// anywhere it is real (the x86 experiment hatch, which then runs the
 /// bounded one-rung shape), `0` forces it off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkHorizon {
     /// No park tier: every block is the fd/`ppoll` kernel wait. The x86
     /// default (measured faster at 2 ms and 10 ms), Linux without a
-    /// primitive (a sleep-recheck park is pointless), and off Linux (the
-    /// doorbell is a stub).
+    /// primitive (a sleep-recheck park is pointless), and off Linux, where no
+    /// ring wakes this park (see `RING_WAKES_THE_PARK`, private to this module).
     NoPark,
     /// Park ONCE per call, for at most the ladder's first rung, then hand
     /// the rest of the idle to the fd/ppoll kernel block. The shape a
-    /// FORCED park takes on x86: measurement shows ANY busy waiter across an
-    /// idle ≥ ~5 ms costs a flat ~+30 µs versus the kernel-sleeping waiter
-    /// (a scheduler/topology effect around the peer's wake, not
-    /// frequency), so a long park is never the right x86 wait.
+    /// FORCED park takes on x86, and the aarch64 `WFE` default.
+    /// Measurement shows ANY busy waiter across an idle ≥ ~5 ms costs a
+    /// flat ~+30 µs versus the kernel-sleeping waiter (a scheduler/topology
+    /// effect around the peer's wake, not frequency), so a long park is
+    /// never the right x86 wait.
     FirstRungOnce,
     /// Park on every block for the full ladder rung, yielding per slice.
-    /// The aarch64 `WFE` default — the park is what halves that wake.
+    /// No platform default and no `CERULION_MONITOR_WAIT` value resolves
+    /// to it; an idle wait under it keeps its thread running.
     ThroughRung,
 }
 
 /// The shipped PLATFORM default (compile-time: Linux aarch64 is always
-/// `WFE`; Linux x86_64 is `UMWAIT` or nothing, both measured slower than
-/// the kernel wait; off Linux the doorbell is a stub).
+/// `WFE`, parked for the call's first rung only; Linux x86_64 is `UMWAIT`
+/// or nothing, both measured slower than the kernel wait; off Linux no
+/// ring wakes this park).
 pub fn park_policy() -> ParkHorizon {
     if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        ParkHorizon::ThroughRung
+        ParkHorizon::FirstRungOnce
     } else {
         ParkHorizon::NoPark
     }
@@ -395,6 +403,32 @@ pub fn resolve_park(
             }
         }
         EnvFlag::Auto | EnvFlag::NearMiss => default,
+    }
+}
+
+/// PURE: does THIS block of a call take the park tier, and what is the
+/// call's park allowance afterwards? The whole per-block rule, split out
+/// so it is pinnable by a hand oracle rather than only observable through
+/// a timing test.
+///
+/// `allowance` enters a call `true` only when the wait set mapped at least
+/// one topic doorbell; a wait set with none never parks, whatever the
+/// horizon. [`ParkHorizon::FirstRungOnce`] then SPENDS the allowance on
+/// the call's FIRST block by design (the aarch64 default and the x86
+/// hatch's bounded shape), so
+/// every LATER block of that same call takes the kernel fd block: on that
+/// horizon a nonzero `fd_blocks` is the designed outcome of a call that
+/// blocked more than once, never evidence that the park tier disengaged.
+/// [`ParkHorizon::ThroughRung`] keeps the allowance, so every block of the
+/// call parks and `fd_blocks` stays 0.
+pub fn block_parks(horizon: ParkHorizon, allowance: bool) -> (bool, bool) {
+    if !allowance {
+        return (false, false);
+    }
+    match horizon {
+        ParkHorizon::NoPark => (false, false),
+        ParkHorizon::FirstRungOnce => (true, false),
+        ParkHorizon::ThroughRung => (true, true),
     }
 }
 
@@ -457,6 +491,13 @@ pub(crate) fn create_guard_condition_raw() -> *mut ffi::rmw_guard_condition_t {
         data: Box::into_raw(state) as *mut std::os::raw::c_void,
         context: std::ptr::null_mut(),
     });
+    // Delivery log / replay: guards are named `gc#n` in creation order.
+    crate::replay::on_entity(
+        crate::replay::log::EntityKind::Guard,
+        gc.data as usize,
+        "",
+        "",
+    );
     Box::into_raw(gc)
 }
 
@@ -467,6 +508,7 @@ pub(crate) unsafe fn destroy_guard_condition_raw(gc: *mut ffi::rmw_guard_conditi
     if gc.is_null() {
         return;
     }
+    crate::replay::on_entity_destroyed((*gc).data as usize);
     drop(Box::from_raw((*gc).data as *mut GuardConditionState));
     drop(Box::from_raw(gc));
 }
@@ -564,6 +606,11 @@ pub struct WaitSetData {
     /// call (buffer reused across calls and iterations). Never contended:
     /// one wait per set at a time is the rcl contract.
     fd_set: Mutex<FdWakeSet>,
+    /// Delivery log / replay only: the index + 1 of the first thread that
+    /// waited on this wait set (0 = none yet). A second thread waiting here
+    /// is the rclcpp MultiThreadedExecutor mark (`replay::detect`). Never
+    /// touched with recording and replay off.
+    replay_owner: std::sync::atomic::AtomicU32,
     /// PER-CALL: a listener drain failed during this `rmw_wait`, so the fd
     /// path is untrustworthy for the rest of the call (an fd that cannot be
     /// drained may stay readable and would re-fire every block). Reset at
@@ -1227,18 +1274,24 @@ fn park_horizon_from_env() -> ParkHorizon {
                 value = %raw.as_deref().unwrap_or(""),
                 "ignoring unrecognized CERULION_MONITOR_WAIT value — only \"1\" \
                  (force the park on) and \"0\" (off) are honored; the rmw wait \
-                 keeps its platform default (park on aarch64, off on x86)"
+                 keeps its platform default (one-rung park on aarch64, off on x86)"
             );
         });
     }
     resolve_park(flag, park_policy())
 }
 
-/// The topic doorbell is REAL only on Linux (`cerulion_core::doorbell` is
-/// a no-op stub elsewhere) — the park tier is gated on it, because a park
-/// whose doorbell can never ring would trade the fd block's instant wake
-/// for a 100 µs recheck cadence and buy nothing.
-const DOORBELL_REAL: bool = cfg!(target_os = "linux");
+/// Does a ring WAKE this wait's park on this target? Only on Linux, where the
+/// CPU monitor-wait primitive the park arms is watching the doorbell line the
+/// ring stores into; on a Linux host whose CPU carries no such primitive this
+/// wait takes [`ParkHorizon::NoPark`] anyway. Android maps the real ring counter
+/// but has no wake primitive for this park. macOS maps a real doorbell page and a real wake word, but
+/// this wait has no kernel block on that word, so a park here would trade the
+/// fd block's instant wake for a 100 µs recheck cadence and buy nothing; the
+/// macOS wake-word block is the native live loop's rung
+/// (`cerulion_core::doorbell::wake_word_block_primitive_available`). Every
+/// other target has neither.
+const RING_WAKES_THE_PARK: bool = cfg!(target_os = "linux");
 
 /// The doorbell namespace both sides agree on: the SAME
 /// `default_namespace()` (`$USER`) on the arming side
@@ -1250,7 +1303,7 @@ fn doorbell_ns() -> &'static str {
 
 /// Tighten the calling thread's kernel timer slack to 1 ns.
 ///
-/// Linux stretches every non-RT timed block by the thread's
+/// Linux and Android stretch every non-RT timed block by the thread's
 /// `timer_slack_ns` (default 50 µs): the legacy 100 µs `POLL_INTERVAL`
 /// sleep really costs ~153 µs, and the event-driven ladder's 200 µs
 /// `ppoll` first rung would pay the same +50 µs on every empty rung.
@@ -1264,7 +1317,7 @@ fn doorbell_ns() -> &'static str {
 /// `arg2 <= 0` as "restore the 50 µs default" (kernel/sys.c:
 /// `current->timer_slack_ns = current->default_timer_slack_ns`), the
 /// exact opposite of the intent.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn set_timer_slack_once() {
     use std::cell::Cell;
     thread_local! {
@@ -1290,8 +1343,8 @@ fn set_timer_slack_once() {
     });
 }
 
-/// Timer slack is a Linux kernel concept; no-op elsewhere.
-#[cfg(not(target_os = "linux"))]
+/// Timer slack is a Linux and Android kernel concept; no-op elsewhere.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn set_timer_slack_once() {}
 
 /// How many entities the spin could actually OBSERVE: non-null handles
@@ -2020,6 +2073,64 @@ pub unsafe extern "C" fn rmw_wait(
     wait_set: *mut ffi::rmw_wait_set_t,
     wait_timeout: *const ffi::rmw_time_t,
 ) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live wait.
+    if !crate::replay::active() {
+        return rmw_wait_live(
+            subscriptions,
+            guard_conditions,
+            services,
+            clients,
+            events,
+            wait_set,
+            wait_timeout,
+        );
+    }
+    ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
+        if wait_set.is_null()
+            || !ffi::is_our_identifier((*wait_set).implementation_identifier)
+            || (*wait_set).data.is_null()
+        {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        let ws = &*((*wait_set).data as *const WaitSetData);
+        crate::replay::wait(
+            crate::replay::WaitArrays {
+                subscriptions,
+                guard_conditions,
+                services,
+                clients,
+            },
+            events,
+            &ws.replay_owner,
+            wait_timeout,
+            || {
+                rmw_wait_live(
+                    subscriptions,
+                    guard_conditions,
+                    services,
+                    clients,
+                    events,
+                    wait_set,
+                    wait_timeout,
+                )
+            },
+        )
+    })
+}
+
+/// The live `rmw_wait`: readiness from the transport, the caller's timeout.
+///
+/// # Safety
+/// Same contract as [`rmw_wait`].
+unsafe fn rmw_wait_live(
+    subscriptions: *mut ffi::rmw_subscriptions_t,
+    guard_conditions: *mut ffi::rmw_guard_conditions_t,
+    services: *mut ffi::rmw_services_t,
+    clients: *mut ffi::rmw_clients_t,
+    events: *mut ffi::rmw_events_t,
+    wait_set: *mut ffi::rmw_wait_set_t,
+    wait_timeout: *const ffi::rmw_time_t,
+) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
         if wait_set.is_null()
             || !ffi::is_our_identifier((*wait_set).implementation_identifier)
@@ -2053,7 +2164,7 @@ pub unsafe extern "C" fn rmw_wait(
         // Shared (not `&mut`) so a concurrent diagnostic READ of the
         // atomic counters is not an aliasing violation.
         let ws = &*((*wait_set).data as *const WaitSetData);
-        // 1 ns timer slack for this thread (Linux; else no-op): every timed
+        // 1 ns timer slack for this thread (Linux and Android; else no-op): every timed
         // block below — the ladder's ppoll rungs and the legacy sleep —
         // would otherwise pay the default 50 µs slack per wake.
         set_timer_slack_once();
@@ -2076,10 +2187,10 @@ pub unsafe extern "C" fn rmw_wait(
         // consults it, so the kill-switch path still touches no ladder state.
         let ladder = BLOCK_LADDER;
         // The park tier: the SHARED monitor-wait flag (auto = ON for the
-        // event path), the Linux-real doorbell, and at least one mapped
-        // bell (resolved after the fd/topic snapshot below).
+        // event path), a ring that wakes this park (Linux only), and at least
+        // one mapped bell (resolved after the fd/topic snapshot below).
         let park_policy = park_horizon_from_env();
-        let use_park_cfg = event_wait && DOORBELL_REAL && park_policy != ParkHorizon::NoPark;
+        let use_park_cfg = event_wait && RING_WAKES_THE_PARK && park_policy != ParkHorizon::NoPark;
         // The spin runs ONCE per call, on entry — data is most likely
         // imminent right after the executor finished a callback — and at
         // most ONE recovery spin after an fd wake whose probe found nothing
@@ -2319,11 +2430,10 @@ pub unsafe extern "C" fn rmw_wait(
             match strategy {
                 BlockStrategy::Fd => {
                     let budget = remaining.min(ws.ladder_rung(&ladder));
-                    let this_block_parks = park_allowance;
+                    let (this_block_parks, next_allowance) =
+                        block_parks(park_policy, park_allowance);
+                    park_allowance = next_allowance;
                     let outcome = if this_block_parks {
-                        if park_policy == ParkHorizon::FirstRungOnce {
-                            park_allowance = false;
-                        }
                         let park_budget = match park_policy {
                             ParkHorizon::FirstRungOnce => {
                                 budget.min(Duration::from_micros(PARK_HORIZON_US))
@@ -2438,8 +2548,20 @@ pub unsafe extern "C" fn rmw_event_fini(rmw_event: *mut ffi::rmw_event_t) -> rmw
     RMW_RET_OK
 }
 
+// =====================================================================
+// Listener callbacks (Humble and later)
+// =====================================================================
+// `rmw_event_callback_t` arrived with Humble, so these four exports do
+// not exist in the rmw API of an older distro. They are compiled away
+// WHOLE on a build whose headers lack the type, never stubbed: rcl looks
+// symbols up by name, and a symbol an rmw is not supposed to have is a
+// claim the header cannot back. The distro gate reads the built library
+// with `nm` and fails if one of them is defined where the headers lack
+// it.
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_event_set_callback(
     _event: *mut ffi::rmw_event_t,
@@ -2451,6 +2573,7 @@ pub unsafe extern "C" fn rmw_event_set_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_on_new_message_callback(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -2462,6 +2585,7 @@ pub unsafe extern "C" fn rmw_subscription_set_on_new_message_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_service_set_on_new_request_callback(
     _service: *mut ffi::rmw_service_t,
@@ -2473,6 +2597,7 @@ pub unsafe extern "C" fn rmw_service_set_on_new_request_callback(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_event_callback)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_client_set_on_new_response_callback(
     _client: *mut ffi::rmw_client_t,
@@ -2564,9 +2689,57 @@ mod tests {
         assert_eq!(BLOCK_LADDER.reset_rung_us(), 200);
     }
 
+    /// The per-block park rule, every input of it, against a HAND table
+    /// written from the horizon definitions rather than from the function:
+    /// no allowance never parks; `NoPark` never parks; `FirstRungOnce`
+    /// parks the first block and SPENDS the allowance, so the second block
+    /// of the same call takes the fd tier; `ThroughRung` parks every block
+    /// and keeps the allowance. The second row of the `FirstRungOnce` pair
+    /// is the one a timing test cannot state: it is why `fd_blocks` is
+    /// nonzero on x86 for a call that blocked twice, and why an oracle must
+    /// not read that as the park tier disengaging.
+    #[test]
+    fn a_calls_first_block_parks_and_only_through_rung_keeps_the_allowance() {
+        use ParkHorizon::{FirstRungOnce, NoPark, ThroughRung};
+        // (horizon, allowance in) -> (this block parks, allowance out)
+        let cases: &[(ParkHorizon, bool, bool, bool)] = &[
+            (NoPark, false, false, false),
+            (NoPark, true, false, false),
+            (FirstRungOnce, false, false, false),
+            (FirstRungOnce, true, true, false),
+            (ThroughRung, false, false, false),
+            (ThroughRung, true, true, true),
+        ];
+        for (horizon, allowance, parks, after) in cases {
+            assert_eq!(
+                block_parks(*horizon, *allowance),
+                (*parks, *after),
+                "horizon={horizon:?} allowance={allowance}"
+            );
+        }
+        // Walk a whole call the way `rmw_wait` does: three blocks, one
+        // allowance. FirstRungOnce parks exactly the first; ThroughRung
+        // parks all three.
+        for (horizon, want) in [
+            (FirstRungOnce, [true, false, false]),
+            (ThroughRung, [true, true, true]),
+            (NoPark, [false, false, false]),
+        ] {
+            let mut allowance = horizon != NoPark;
+            let mut got = [false; 3];
+            for slot in got.iter_mut() {
+                let (parks, next) = block_parks(horizon, allowance);
+                *slot = parks;
+                allowance = next;
+            }
+            assert_eq!(got, want, "a three-block call under {horizon:?}");
+        }
+    }
+
     /// The platform policy table, pinned per target (the ARM-meaningful
-    /// arm assertable on any desk): aarch64 Linux parks THROUGH the rung
-    /// (the `WFE` park is the halving); everything else — x86 included,
+    /// arm assertable on any desk): aarch64 Linux parks the call's first
+    /// rung only (a park through every block holds a core while idle);
+    /// everything else (x86 included),
     /// where the kernel wait measured faster at both periods — does not
     /// park by default. Plus the flag resolution: `0` always off; `1`
     /// forces the platform's own shape, or the bounded one-rung shape on
@@ -2576,7 +2749,7 @@ mod tests {
     fn park_policy_is_the_platform_table() {
         use cerulion_core::monitor_wait::EnvFlag;
         let expect = if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-            ParkHorizon::ThroughRung
+            ParkHorizon::FirstRungOnce
         } else {
             ParkHorizon::NoPark
         };

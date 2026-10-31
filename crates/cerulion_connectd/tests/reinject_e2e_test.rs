@@ -29,7 +29,7 @@ use cerulion_core::transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, SchemaDoc, SchemaEncoding, SchemaReply,
     CATALOG_WIRE_VERSION,
 };
-use cerulion_core::transport::subscriber::OwnedInboundSample;
+use cerulion_core::transport::subscriber::{DataOnlySubscriber, OwnedInboundSample};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
@@ -46,6 +46,19 @@ use cerulion_remoted::{
 };
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long a local tap waits for the connect client to CREATE a demanded
+/// topic's re-injection service. Its own budget, kept apart from
+/// [`TAP_COLLECT_TIMEOUT`]: it covers the loopback dial, the catalog fetch, the
+/// demand round trip and the iceoryx2 service creation, so a host that is slow
+/// at the handshake spends none of the frame budget on it and a late stream is
+/// never reported as an empty one.
+const TAP_READY_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long an attached tap drains for its frames, measured from the attach.
+const TAP_COLLECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// The outer bound on a collect step, which spends [`TAP_READY_TIMEOUT`] and
+/// then [`TAP_COLLECT_TIMEOUT`]. ABOVE their sum, so the inner refusal, which
+/// names WHICH half ran out and what the root listed, is the one that fires.
+const COLLECT_STEP_TIMEOUT: Duration = Duration::from_secs(50);
 const T_NOW: u64 = 1_000_000_000_000;
 const CHASSIS: &[u8] = b"connect-chassis-secret-not-serial-derived";
 const OWNER: AccountId = AccountId([10; 32]);
@@ -62,9 +75,16 @@ const MISMATCH_SCHEMA_HASH: u64 = 0x0BAD_0BAD_0BAD_0BAD_u64;
 fn ignore_catalog(_: &cerulion_core::transport::cerulion_q::CatalogReply) {}
 
 async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
-    match tokio::time::timeout(STEP_TIMEOUT, fut).await {
+    bounded_within(what, STEP_TIMEOUT, fut).await
+}
+
+/// [`bounded`] on an explicit limit, for a step whose own budget is larger than
+/// [`STEP_TIMEOUT`]: an outer bound below the step's own budget pre-empts the
+/// step's named refusal with a bare timeout that says nothing about the cause.
+async fn bounded_within<F: Future>(what: &str, limit: Duration, fut: F) -> F::Output {
+    match tokio::time::timeout(limit, fut).await {
         Ok(v) => v,
-        Err(_) => panic!("connect e2e: '{what}' timed out after {STEP_TIMEOUT:?}"),
+        Err(_) => panic!("connect e2e: '{what}' timed out after {limit:?}"),
     }
 }
 
@@ -149,6 +169,40 @@ fn test_manager(tag: &str) -> Arc<TransportManager> {
     .expect("init_for_test")
 }
 
+/// Two managers that share ONE iceoryx2 SHM root and hold SEPARATE iceoryx2
+/// nodes: `.0` is the manager [`run_connect`] re-injects into, `.1` is the one
+/// the desk-local tap attaches from.
+///
+/// The split is the point, and it is also the production shape: the connect
+/// client re-injects from its own process while `cerulion topic echo` or vizd
+/// taps from theirs. iceoryx2's service CREATE path publishes a service's
+/// dynamic config, which is what makes a concurrent `open()` on that service
+/// succeed, BEFORE it inserts the service into its own node's registry, and
+/// that insert aborts the process on a key already present. So an opener on the
+/// SAME node that finishes its `open()` inside that gap takes the key and the
+/// creator aborts. The registry is PER NODE, so a tap with its own node cannot
+/// reach the creator's key at all.
+fn manager_pair(tag: &str) -> (Arc<TransportManager>, Arc<TransportManager>) {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let injecting = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("connect_{tag}_{}", unique_id()),
+            ..Default::default()
+        },
+        ix.clone(),
+    )
+    .expect("init_for_test");
+    let tapping = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("connect_{tag}_tap_{}", unique_id()),
+            ..Default::default()
+        },
+        ix,
+    )
+    .expect("init_for_test");
+    (injecting, tapping)
+}
+
 // ---- The hand oracle: each frame is a deterministic function of its sequence. ----
 
 fn oracle_ts(seq: u32) -> u64 {
@@ -161,7 +215,7 @@ fn oracle_payload(seq: u32) -> Vec<u8> {
     p
 }
 
-/// Build a raw wire frame (32-byte LE header + payload). `publish_raw` publishes
+/// Build a raw wire frame (40-byte LE header + payload). `publish_raw` publishes
 /// these bytes VERBATIM, so the published bytes ARE the oracle bytes.
 fn make_wire_frame(schema_hash: u64, seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
     let header = WireHeader {
@@ -171,6 +225,7 @@ fn make_wire_frame(schema_hash: u64, seq: u32, ts: u64, payload: &[u8]) -> Vec<u
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -208,8 +263,50 @@ fn oracle_frame_tagged(tag: u8, seq: u32) -> Vec<u8> {
     )
 }
 
+/// Owns every oracle producer an arm spawned and reaps them on DROP.
+///
+/// A producer is a `std::thread`, so nothing reclaims it implicitly: it holds a
+/// cloned `Arc<TransportManager>` and keeps publishing into that manager for the
+/// rest of the test binary. Stopping and joining from `drop` puts the teardown on
+/// SCOPE EXIT, which unwinding runs, rather than on a line at the end of an arm's
+/// body, which a panic above it skips. A leaked producer keeps publishing at its
+/// own pace for the rest of the run, on cores the remaining arms are sharing.
+struct Producers {
+    stop: Arc<AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Producers {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            handles: Vec::new(),
+        }
+    }
+
+    /// The flag every producer this guard owns polls.
+    fn stop(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    /// Take ownership of a spawned producer.
+    fn adopt(&mut self, handle: std::thread::JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for Producers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Spawn a continuous producer publishing `oracle_frame(seq)` for seq = 0,1,2,…
-/// on `topic` until `stop` is set. Returns the join handle.
+/// on `topic` until `stop` is set. Returns once its publisher exists (see
+/// [`spawn_producer_with`]).
 fn spawn_producer(
     manager: Arc<TransportManager>,
     topic: String,
@@ -227,10 +324,36 @@ fn spawn_producer_tagged(
     tag: Option<u8>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    spawn_producer_with(manager, topic, tag, Duration::ZERO, stop)
+}
+
+/// Spawn a producer that sleeps `start_delay` before it creates its publisher,
+/// and return only once that publisher exists on `manager`'s root.
+///
+/// The robot's demand handler OPENS the demanded topic's data service and never
+/// creates it, so a demand that reaches the robot before this thread has
+/// created the service is refused as an unknown topic. The connect client then
+/// creates no re-inject service for it, and the desk-local tap waits out its
+/// whole readiness budget on a root that lists nothing. Blocking here until the
+/// publisher exists puts that ordering on the producer's own readiness signal.
+/// The wait is bounded by the start delay plus [`STEP_TIMEOUT`]; a producer
+/// that misses it is left detached rather than joined, since joining a thread
+/// stuck in creation would trade this refusal for a hang.
+fn spawn_producer_with(
+    manager: Arc<TransportManager>,
+    topic: String,
+    tag: Option<u8>,
+    start_delay: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let named = topic.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(start_delay);
         let mut publisher = manager
             .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
             .expect("producer");
+        let _ = ready_tx.send(());
         let mut seq = 0u32;
         while !stop.load(Ordering::Relaxed) {
             let frame = match tag {
@@ -241,49 +364,168 @@ fn spawn_producer_tagged(
             seq = seq.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(5));
         }
-    })
+    });
+    match ready_rx.recv_timeout(start_delay + STEP_TIMEOUT) {
+        Ok(()) => handle,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the producer for {named} did not create its publisher within {:?}",
+            start_delay + STEP_TIMEOUT
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            panic!(
+                "the producer for {named} exited before creating its publisher; \
+                 its own panic is printed above"
+            )
+        }
+    }
 }
 
-/// Attach a desk-local data-only tap on `topic` (poll-retry until the ingress
-/// service exists — connectd creates it on the first re-injected frame), then
-/// collect `n` full frames + their sequences. Blocking — runs under
-/// `spawn_blocking`.
-fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut tap = loop {
-        match manager.create_data_only_subscriber(topic) {
-            Ok(t) => break t,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => panic!("desk ingress service never appeared for {topic}: {e}"),
+/// Wait until `topic`'s re-injection service is LISTED on `manager`'s root,
+/// then attach the data-only tap. In that order, and the order carries the
+/// budget split: readiness ends when the connect client has published that
+/// service on the root, and the frame budget in [`collect_frames`] starts there.
+///
+/// [`TransportManager::list_topics`] is the readiness read because it opens no
+/// port and registers this node with no service: it enumerates the root's static
+/// service configs. A service is listed once its static config is unlocked,
+/// before its creator has made the dynamic config, and an open in that window
+/// waits for it only up to iceoryx2's `creation_timeout`; a creator slower than
+/// that fails the attach. The attach is therefore retried until the same
+/// deadline, and the last attach error is returned with the attempt count. The
+/// listing gates the first attach, so a topic nobody created reports readiness,
+/// never an iceoryx2 open error.
+fn attach_tap_when_listed(
+    manager: &TransportManager,
+    topic: &str,
+    ready_budget: Duration,
+) -> Result<DataOnlySubscriber, String> {
+    let deadline = Instant::now() + ready_budget;
+    loop {
+        let listed = manager
+            .list_topics()
+            .map_err(|e| format!("topic listing failed while waiting for {topic}: {e}"))?;
+        if listed.iter().any(|t| t == topic) {
+            break;
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the re-inject service for {topic} was not listed within \
+                 {ready_budget:?}; the root lists {listed:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match manager.create_data_only_subscriber(topic) {
+            Ok(tap) => return Ok(tap),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "the listed re-inject service for {topic} would not attach in \
+                     {attempts} attempt(s) within {ready_budget:?}: {e}"
+                ))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Tap reads grouped into RUNS, a run being every frame read between two empty
+/// reads, and a frame accepted only once its run has closed short of `depth`.
+///
+/// The tap's queue drops its oldest frame only when it is full, and the tap
+/// reads every frame of a full queue before it next reads empty, so a run that
+/// reached `depth` frames is the only place a drop can hide. Until a run closes
+/// its length is unknown, so its frames stay pending; a run that closes at
+/// `depth` or more discards itself and everything accepted before it.
+struct RunGate<T> {
+    depth: usize,
+    run_len: usize,
+    run: Vec<T>,
+    accepted: Vec<T>,
+    restarts: usize,
+}
+
+impl<T> RunGate<T> {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth: depth.max(1),
+            run_len: 0,
+            run: Vec::new(),
+            accepted: Vec::new(),
+            restarts: 0,
+        }
+    }
+
+    /// A non-empty read: `read` frames left the queue, `kept` of them carry a
+    /// wire header. The read count, not `kept`, measures the run.
+    fn on_read(&mut self, read: usize, kept: impl IntoIterator<Item = T>) {
+        self.run_len += read;
+        self.run.extend(kept);
+    }
+
+    /// An empty read closes the current run.
+    fn on_empty(&mut self) {
+        if self.run_len >= self.depth {
+            self.restarts += 1;
+            self.accepted.clear();
+            self.run.clear();
+        } else {
+            self.accepted.append(&mut self.run);
+        }
+        self.run_len = 0;
+    }
+}
+
+/// Attach the desk-local data-only tap on `topic` once its re-injection service
+/// is listed, then collect `n` full frames and their sequences. Blocking, so it
+/// runs under `spawn_blocking`.
+///
+/// The robot forwards frames while the desk is still accepting its streams, so
+/// the connect client's reader finds that backlog buffered on the stream and
+/// re-injects it back to back. A burst that lands while this tap sleeps between
+/// polls can fill its queue, and a full queue drops its oldest frame: a gap
+/// that is this observer's own overflow, not a loss in the re-inject path.
+/// [`RunGate`] accepts only frames from runs that closed short of the queue
+/// depth, so a gap in what it returns is a real loss.
+fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
+    let mut tap = match attach_tap_when_listed(manager, topic, TAP_READY_TIMEOUT) {
+        Ok(tap) => tap,
+        Err(reason) => panic!("{reason}"),
     };
     let budget = tap.max_borrowed_samples().max(1);
+    let depth = tap.buffer_size();
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(budget);
-    let mut collected: Vec<(u32, Vec<u8>)> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while collected.len() < n && Instant::now() < deadline {
+    let mut gate = RunGate::new(depth);
+    let deadline = Instant::now() + TAP_COLLECT_TIMEOUT;
+    while gate.accepted.len() < n && Instant::now() < deadline {
         batch.clear();
         match tap.drain_owned(budget, &mut batch) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(3)),
-            Ok(_) => {
-                for sample in batch.drain(..) {
-                    let seq = sample.wire_header().map(|h| h.sequence);
-                    let frame = sample.payload().to_vec();
-                    drop(sample);
-                    if let Some(s) = seq {
-                        collected.push((s, frame));
-                    }
-                }
+            Ok(0) => {
+                gate.on_empty();
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            Ok(read) => {
+                let kept = batch.drain(..).filter_map(|sample| {
+                    let seq = sample.wire_header().map(|h| h.sequence)?;
+                    Some((seq, sample.payload().to_vec()))
+                });
+                gate.on_read(read, kept);
             }
             Err(_) => std::thread::sleep(Duration::from_millis(3)),
         }
     }
     assert!(
-        collected.len() >= n,
-        "collected only {} of {n} frames for {topic}",
-        collected.len()
+        gate.accepted.len() >= n,
+        "collected only {} of {n} frames for {topic} within {TAP_COLLECT_TIMEOUT:?} \
+         ({} restart(s) after a run of {} or more frames between empty reads)",
+        gate.accepted.len(),
+        gate.restarts,
+        gate.depth
     );
-    collected
+    gate.accepted
 }
 
 /// The desk `ConnectConfig` dialing a robot at `daemon`, demanding `topics`.
@@ -341,11 +583,15 @@ fn spawn_robot(
 /// Run the full flow once and return the desk-collected (seq, frame) pairs.
 async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
     let manager_a = test_manager(&format!("{tag}A"));
-    let manager_b = test_manager(&format!("{tag}B"));
+    let (manager_b, tap_mgr) = manager_pair(&format!("{tag}B"));
     let topic = format!("/reinj/{tag}/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer = spawn_producer(manager_a.clone(), topic.clone(), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
 
     let daemon = disabled_endpoint([200; 32]).await;
     let authz = Arc::new(claimed_paired(desk_public_key()));
@@ -363,32 +609,33 @@ async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         },
     ));
 
-    // Collect the re-injected frames off the desk-local SHM (bounded).
-    let reader_mgr = manager_b.clone();
+    // Collect the re-injected frames off the desk-local SHM (bounded), from the
+    // tap's OWN node on that SHM root.
+    let reader_mgr = tap_mgr.clone();
     let reader_topic = topic.clone();
-    let collected = bounded(
+    let collected = bounded_within(
         "collect",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&reader_mgr, &reader_topic, n)),
     )
     .await
     .expect("reader join");
 
-    // Tear down: shutdown the desk, stop the producer, reap the robot.
+    // Tear down: shutdown the desk and reap the robot; the producer guard
+    // stops and joins the producer at scope exit.
     let _ = shutdown_tx.send(());
     let summary = bounded("desk join", desk)
         .await
         .expect("desk join")
         .expect("run_connect ok");
     assert!(
-        summary
-            .per_topic
-            .iter()
-            .any(|s| s.topic == topic && s.reinjected >= n as u64),
-        "summary must report the re-injected topic: {:?}",
+        summary.per_topic.iter().any(|s| s.topic == topic
+            && s.reinjected >= n as u64
+            && s.rejected == 0
+            && s.reinject_failed == 0),
+        "summary must report the re-injected topic with nothing refused or failed: {:?}",
         summary.per_topic
     );
-    stop.store(true, Ordering::Relaxed);
-    let _ = producer.join();
     let _ = bounded("robot join", robot).await;
 
     collected
@@ -441,8 +688,12 @@ async fn schema_closure_is_materialized_into_the_desk_store() {
     let manager_b = test_manager("schemaB");
     let topic = format!("/reinj/schema/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer = spawn_producer(manager_a.clone(), topic.clone(), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
 
     // The robot serves a two-doc closure for the topic.
     let root_text = "acme/Sub sub\nuint32 seq\n";
@@ -512,8 +763,6 @@ async fn schema_closure_is_materialized_into_the_desk_store() {
 
     let _ = shutdown_tx.send(());
     let _ = bounded("desk join", desk).await;
-    stop.store(true, Ordering::Relaxed);
-    let _ = producer.join();
     let _ = bounded("robot join", robot).await;
 }
 
@@ -587,6 +836,15 @@ async fn run_reader_over_uni(tag: &str, good: usize, bad: usize) -> (u64, u64) {
         bounded("write bad", write_frame(&mut send, &bad_frame))
             .await
             .expect("write bad");
+    }
+    if good > 0 {
+        bounded("first-frame mirror identity", async {
+            while counters.reinjected() < good as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(manager.is_network_mirror(&topic).unwrap());
     }
     let _ = send.finish();
 
@@ -707,11 +965,15 @@ async fn reinject_registers_mirror_provenance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
     let manager_a = test_manager("teardownA");
-    let manager_b = test_manager("teardownB");
+    let (manager_b, tap_mgr) = manager_pair("teardownB");
     let topic = format!("/reinj/teardown/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer = spawn_producer(manager_a.clone(), topic.clone(), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
 
     let daemon = disabled_endpoint([202; 32]).await;
     let authz = Arc::new(claimed_paired(desk_public_key()));
@@ -737,11 +999,13 @@ async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
         },
     ));
 
-    // Let some frames flow (the ingress service comes up on the first frame).
-    let reader_mgr = manager_b.clone();
+    // Let some frames flow (the ingress service comes up on the first frame),
+    // read from the tap's OWN node on the same SHM root.
+    let reader_mgr = tap_mgr.clone();
     let reader_topic = topic.clone();
-    let _flowed = bounded(
+    let _flowed = bounded_within(
         "collect a few",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&reader_mgr, &reader_topic, 2)),
     )
     .await
@@ -765,9 +1029,6 @@ async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
     manager_b
         .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
         .expect("a fresh ingress injector attaches after teardown");
-
-    stop.store(true, Ordering::Relaxed);
-    let _ = producer.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -836,15 +1097,23 @@ fn assert_tagged_oracle_and_gap_free(collected: &[(u32, Vec<u8>)], tag: u8) {
 
 async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32, Vec<u8>)>) {
     let manager_a = test_manager(&format!("{tag}A"));
-    let manager_b = test_manager(&format!("{tag}B"));
+    let (manager_b, tap_mgr) = manager_pair(&format!("{tag}B"));
     let topic_a = format!("/reinj/{tag}/A/{}", unique_id());
     let topic_b = format!("/reinj/{tag}/B/{}", unique_id());
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let prod_a =
-        spawn_producer_tagged(manager_a.clone(), topic_a.clone(), Some(0xAA), stop.clone());
-    let prod_b =
-        spawn_producer_tagged(manager_a.clone(), topic_b.clone(), Some(0xBB), stop.clone());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer_tagged(
+        manager_a.clone(),
+        topic_a.clone(),
+        Some(0xAA),
+        producers.stop(),
+    ));
+    producers.adopt(spawn_producer_tagged(
+        manager_a.clone(),
+        topic_b.clone(),
+        Some(0xBB),
+        producers.stop(),
+    ));
 
     let daemon = disabled_endpoint([211; 32]).await;
     let authz = Arc::new(claimed_paired(desk_public_key()));
@@ -866,17 +1135,19 @@ async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32,
         },
     ));
 
-    // Collect BOTH topics off desk-local SHM concurrently (bounded).
-    let (mgr_a, ta) = (manager_b.clone(), topic_a.clone());
-    let (mgr_b, tb) = (manager_b.clone(), topic_b.clone());
-    let got_a = bounded(
+    // Collect BOTH topics off desk-local SHM (bounded), from the tap's OWN node.
+    let (mgr_a, ta) = (tap_mgr.clone(), topic_a.clone());
+    let (mgr_b, tb) = (tap_mgr.clone(), topic_b.clone());
+    let got_a = bounded_within(
         "collect A",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&mgr_a, &ta, n)),
     )
     .await
     .expect("collect A join");
-    let got_b = bounded(
+    let got_b = bounded_within(
         "collect B",
+        COLLECT_STEP_TIMEOUT,
         tokio::task::spawn_blocking(move || collect_frames(&mgr_b, &tb, n)),
     )
     .await
@@ -893,9 +1164,14 @@ async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32,
         "both topics streamed: {:?}",
         summary.per_topic
     );
-    stop.store(true, Ordering::Relaxed);
-    let _ = prod_a.join();
-    let _ = prod_b.join();
+    assert!(
+        summary
+            .per_topic
+            .iter()
+            .all(|s| s.rejected == 0 && s.reinject_failed == 0),
+        "nothing refused or failed on either topic: {:?}",
+        summary.per_topic
+    );
     let _ = bounded("robot join", robot).await;
     (got_a, got_b)
 }
@@ -915,6 +1191,7 @@ async fn multi_topic_interleaved_reinject_byte_identical_per_topic() {
 /// A single-topic catalog (the misbehaving robot lists the topic it will ACK).
 fn single_topic_catalog(robot: &str, topic: &str) -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
@@ -1119,6 +1396,7 @@ async fn catalog_then_stop_reading_robot(daemon: Endpoint, robot: &str) {
     // Answer exactly ONE request (the catalog), then never read again.
     let _ = read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN).await;
     let reply = WireResponse::Catalog(CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![],
@@ -1721,4 +1999,180 @@ async fn no_cache_dir_wins_over_no_desk_name_in_the_reported_reason() {
         "the session still completed"
     );
     assert_eq!(probe_access(&shared), cerulion_remoted::KeyAccess::Unpaired);
+}
+
+// ---------------------------------------------------------------------------
+// (7) HARNESS CONTRACT: the tap's own node, and readiness before the attach.
+// ---------------------------------------------------------------------------
+
+/// [`manager_pair`] hands back one SHM root and two iceoryx2 nodes: the service
+/// one manager creates is visible to the other, and the tap never shares the
+/// node registry the creator inserts its key into.
+#[test]
+fn the_manager_pair_shares_one_shm_root_and_holds_two_nodes() {
+    let (injecting, tapping) = manager_pair("pair");
+    let topic = format!("/reinj/pair/{}", unique_id());
+    let _injector = injecting
+        .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
+        .expect("ingress injector");
+    assert!(
+        tapping
+            .list_topics()
+            .expect("topic listing")
+            .iter()
+            .any(|t| t == &topic),
+        "ONE root: the tapping manager reads the re-injecting manager's services"
+    );
+    assert!(
+        !Arc::ptr_eq(&injecting, &tapping),
+        "TWO nodes: the tap attaches from its own node, never the re-injecting one"
+    );
+    let _tap = attach_tap_when_listed(&tapping, &topic, Duration::from_millis(0))
+        .expect("the listed service attaches from the second node");
+}
+
+/// A tap on a topic nobody created reports the READINESS budget, never an
+/// iceoryx2 open failure. The last assertion is the one that holds the order
+/// down: an attach-first `attach_tap_when_listed` answers with
+/// `PublishSubscribeOpenError::DoesNotExist` instead, which is the blind open
+/// that spends the frame budget on the handshake.
+#[test]
+fn a_tap_on_an_unlisted_topic_reports_readiness_not_an_attach_failure() {
+    let manager = test_manager("tapready");
+    let topic = format!("/reinj/tapready/{}", unique_id());
+    // `DataOnlySubscriber` carries no `Debug`, so the Ok arm is spelled out
+    // rather than reached through `expect_err`.
+    let reason = match attach_tap_when_listed(&manager, &topic, Duration::from_millis(200)) {
+        Ok(_) => panic!("nothing created this topic, so no tap can attach to it"),
+        Err(reason) => reason,
+    };
+    assert!(
+        reason.contains("was not listed within 200ms"),
+        "readiness names its own budget: {reason}"
+    );
+    assert!(
+        reason.contains(&topic),
+        "readiness names the topic it waited for: {reason}"
+    );
+    assert!(
+        !reason.contains("PublishSubscribeOpenError"),
+        "the listing read must gate the attach: an attach-first order reports \
+         iceoryx2's open error instead: {reason}"
+    );
+}
+
+/// The overflow path a per-read counter misses: two frames, an empty read, then a
+/// burst that overflowed the queue during the sleep. Frames read from the burst
+/// before its run closes stay pending, so they never complete a collection
+/// across the gap; once the run closes at the queue depth, it and everything
+/// before it are discarded, and the next short run is accepted.
+#[test]
+fn the_run_gate_holds_a_run_until_it_closes_short_of_the_queue_depth() {
+    let mut gate = RunGate::new(16);
+    gate.on_read(2, [11u32, 12]);
+    gate.on_empty();
+    assert_eq!(
+        gate.accepted,
+        vec![11, 12],
+        "a closed short run is accepted"
+    );
+
+    // The queue overflowed while the tap slept: it now holds 25..=40.
+    gate.on_read(2, [25, 26]);
+    gate.on_read(2, [27, 28]);
+    assert_eq!(
+        gate.accepted,
+        vec![11, 12],
+        "an open run is never accepted, so 6 frames cannot be reached across the gap"
+    );
+    for pair in (29..=40).collect::<Vec<u32>>().chunks(2) {
+        gate.on_read(pair.len(), pair.iter().copied());
+    }
+    gate.on_empty();
+    assert!(
+        gate.accepted.is_empty(),
+        "a run that reached the depth discards itself and all before it: {:?}",
+        gate.accepted
+    );
+    assert_eq!(gate.restarts, 1);
+
+    gate.on_read(1, [41]);
+    gate.on_empty();
+    gate.on_read(1, [42]);
+    gate.on_empty();
+    assert_eq!(
+        gate.accepted,
+        vec![41, 42],
+        "live runs after the burst are accepted"
+    );
+}
+
+/// A run one short of the depth cannot have overflowed and is kept whole; a
+/// header-less frame counts toward the run but is not returned.
+#[test]
+fn the_run_gate_keeps_a_run_below_the_depth_and_counts_unkept_reads() {
+    let mut gate = RunGate::new(4);
+    gate.on_read(3, [1u32, 2, 3]);
+    gate.on_empty();
+    assert_eq!(gate.accepted, vec![1, 2, 3]);
+    assert_eq!(gate.restarts, 0);
+
+    gate.on_read(4, [4, 5, 6]);
+    gate.on_empty();
+    assert_eq!(
+        gate.restarts, 1,
+        "four reads reach the depth even with three kept"
+    );
+    assert!(gate.accepted.is_empty());
+}
+
+/// A spawned producer's topic exists on the robot's root by the time the spawn
+/// returns, however late the thread creates its publisher, so a demand sent
+/// after it is not refused as an unknown topic.
+#[test]
+fn a_spawned_producer_exists_before_the_spawn_returns() {
+    let manager = test_manager("lateprod");
+    let topic = format!("/reinj/lateprod/{}", unique_id());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer_with(
+        manager.clone(),
+        topic.clone(),
+        None,
+        Duration::from_millis(500),
+        producers.stop(),
+    ));
+    let listed = manager.list_topics().expect("topic listing");
+    assert!(
+        listed.iter().any(|t| t == &topic),
+        "the producer's service exists once the spawn returns: {listed:?}"
+    );
+}
+
+/// Scope exit stops and JOINS every producer the guard owns, so no publisher
+/// thread outlives the scope that spawned it. The thread's own exit flag is the
+/// oracle: it is set only after the stop flag was seen, and the join returns
+/// only after that.
+#[test]
+fn producers_are_reaped_when_their_scope_ends() {
+    let exited = Arc::new(AtomicBool::new(false));
+    {
+        let mut producers = Producers::new();
+        let stop = producers.stop();
+        let reached_exit = exited.clone();
+        producers.adopt(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            reached_exit.store(true, Ordering::Relaxed);
+        }));
+        assert!(
+            !exited.load(Ordering::Relaxed),
+            "the producer runs while its guard is in scope"
+        );
+        // NO stop-and-join line here on purpose: the guard IS the teardown.
+    }
+    assert!(
+        exited.load(Ordering::Relaxed),
+        "scope exit set the stop flag and joined, so nothing outlives the scope"
+    );
 }

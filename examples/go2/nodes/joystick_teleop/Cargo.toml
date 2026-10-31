@@ -25,7 +25,7 @@ default = ["cdylib"]
 cerulion_core = { workspace = true }
 native_ros2_messages = { workspace = true }
 # Pure-Rust gamepad input: evdev backend on Linux (the Jetson path), also
-# macOS/Windows backends. gilrs 0.11.2 has MSRV 1.84 (≤ the workspace's 1.88).
+# macOS/Windows backends. gilrs 0.11.2 has MSRV 1.84 (under the root's 1.95 floor).
 # Third-party dep declared CRATE-LOCALLY (not a examples/go2 workspace dep).
 gilrs = "0.11"
 # Structured logging in the hardware pump (disconnect warns, gilrs-init warn).

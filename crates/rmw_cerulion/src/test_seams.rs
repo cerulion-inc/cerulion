@@ -377,6 +377,32 @@ pub(crate) fn maybe_panic_in_init_announce() {
 
 static BAKED_DISTRO_OVERRIDE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
+/// The runtime `ROS_DISTRO` a given baked claim ADMITS: the ONE
+/// derivation every fixture in this crate builds itself under, so the lib
+/// arms and the integration arms cannot drift onto two answers.
+///
+/// A fixture must name an admitted runtime rather than leave `ROS_DISTRO`
+/// unset: the guard sits in `rmw_init_options_init` itself, so a generated
+/// post-Jazzy build refuses an unnamed runtime and the fixture call would
+/// fail before the arm's real assertion ran. A concrete claim names
+/// itself; the unclaimed vendored marker names a member of the snapshot's
+/// own era, the only names it admits; an `era:<token>` claim is a CLAIM,
+/// not a runtime name, so it yields the first member of that era's
+/// admitted set. Every branch reads the table the guard itself consults,
+/// never a literal.
+pub fn admitted_runtime_for(claim: &'static str) -> &'static str {
+    let token = if claim == crate::era::VENDORED_DEV_DISTRO {
+        crate::era_check::VENDORED_SNAPSHOT_ERA_TOKEN
+    } else if let Some(token) = claim.strip_prefix(crate::era_check::ERA_CLAIM_PREFIX) {
+        token
+    } else {
+        return claim;
+    };
+    crate::era_check::era_claim_members(token)
+        .and_then(|members| members.first().copied())
+        .unwrap_or_else(|| panic!("the build bakes `{claim}` but era.rs admits no member for it"))
+}
+
 /// RAII override of [`crate::era::baked_distro`]: while held, every
 /// guarded init export compares the injected distro against the runtime
 /// `ROS_DISTRO` instead of the build-baked value. Dropped (normally or
@@ -726,6 +752,15 @@ pub(crate) fn maybe_clear_release_callback_in_adopt_report_window() {
         ADOPT_REPORT_WINDOW_CLEARS_FIRED.fetch_add(1, Ordering::SeqCst);
         crate::adopt_take::clear_release_callback_for_seam();
     }
+}
+
+/// Run `f` (an rmw publish or send) with this thread's delivery-log output
+/// capture armed, as it is for an output under recording or replay, and
+/// return the FNV-1a hash and length of the payload body the output path
+/// captured (`None` when it captured none). Replay compares outputs by this
+/// hash, so two publishes of equal messages must capture equal hashes.
+pub fn capture_output_hash<R>(f: impl FnOnce() -> R) -> (R, Option<(u64, u32)>) {
+    crate::replay::capture_output_for_test(f)
 }
 
 #[cfg(test)]

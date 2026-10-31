@@ -310,7 +310,7 @@ impl Corpus {
         builder.finish().expect("canonical body")
     }
 
-    /// The whole wire frame: 32-byte `WireHeader` + canonical body. This is the
+    /// The whole wire frame: 40-byte `WireHeader` + canonical body. This is the
     /// number `MAX_SLICE_LEN` must cover.
     fn envelope(&mut self, qualified: &str, sc: &Scenario) -> usize {
         WireHeader::SIZE + self.body(qualified, sc).len()
@@ -876,7 +876,7 @@ fn the_stated_breakage_boundaries_hold_where_the_arms_say_they_do() {
         Boundary {
             schema: "autoware_planning_msgs/LaneletSegment",
             tier: TINY,
-            stated: 362,
+            stated: 361,
             unit: "primitives",
             chars: 25,
             build: |c, n| {

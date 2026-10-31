@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/benchmarks/lib/machine_hash.sh — compute a stable machine identifier
+# tools/scripts/benchmarks/lib/machine_hash.sh: compute a stable machine identifier
 # from a baseline-report.md Summary card.
 #
 # The hash ties every results row (via the `machine_hash` CSV column) back to
@@ -98,7 +98,7 @@ compute_machine_hash() {
 # captured on the same kernel/governor therefore hashes identically via
 # either path.
 #
-# Consumers: scripts/benchmarks/reproduce.sh and
+# Consumers: tools/scripts/benchmarks/reproduce.sh and
 # benches/latency/bench.py::compute_machine_hash (via
 # subprocess — this function is the single source of truth; do not
 # reimplement the field derivation elsewhere).

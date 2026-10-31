@@ -840,7 +840,7 @@ fn composed_plan_is_decorated_and_stamps_windows_and_backgrounds_by_kind() {
 fn composed_plan_decoration_component_values_match_the_hand_oracle() {
     // Decode the emitted COMPONENT VALUES from a REAL compose output
     // (not just their entity paths) and pin them against hand oracles — the stage
-    // background is SolidColor #10161f and the trailing window is cursor-relative
+    // background is SolidColor #0b0d11 and the trailing window is cursor-relative
     // [-30s, 0] on both nanosecond timelines. A value drift (e.g. wrong kind/color/
     // bounds) fails HERE even though the entity paths are unchanged.
     let l = compose_layout(&bare(go2_corpus(), ComposeStrategy::Auto, true)).expect("composes");
@@ -872,8 +872,8 @@ fn composed_plan_decoration_component_values_match_the_hand_oracle() {
         );
         assert_eq!(
             bg.colors,
-            vec![[0x10, 0x16, 0x1f, 0xff]],
-            "stage color #10161f: {bg:?}"
+            vec![[0x0b, 0x0d, 0x11, 0xff]],
+            "stage color #0b0d11: {bg:?}"
         );
     }
 

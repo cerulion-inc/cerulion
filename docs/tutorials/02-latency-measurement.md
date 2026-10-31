@@ -43,9 +43,14 @@ which is fine for a measurement you only log).
 > against `self.real_ns()`, on the same machine.
 >
 > **And only under `--single-process`.** The default `cerulion graph run`
-> derives a multi-process partition whose workers run on a gating `VirtualClock`
-> starting at 0 and advancing by a fixed logical quantum per step, so those wire
-> stamps are deterministic LOGICAL values and are not wall-comparable at all.
+> derives a multi-process partition, and its ranks FREE-RUN: each advances its
+> own gating clock at STEP BOUNDARIES by the measured wall elapsed, from an epoch
+> anchored to that rank's own `real_ns()`. Those stamps stay on the
+> monotonic-since-boot timebase, but each is a per-rank boundary time carrying
+> that rank's accumulated rounding, not a reading taken where your node took its
+> own, so the difference is not the hop. (Under the
+> `CERULION_EXECUTION_MODE=lockstep` opt-out the stamps are logical quantum
+> values counted from 0 and share no domain with `real_ns()` at all.)
 > `--single-process` is what puts the run on `RealClock`; it is required here,
 > not a convenience.
 
@@ -99,11 +104,14 @@ cerulion graph run obstacle_avoidance --release --single-process
 
 `--single-process` is REQUIRED here, not a convenience. Without it,
 `cerulion graph run` derives a multi-process partition by default for a graph
-with no `process_groups:` block, and each worker runs on a gating `VirtualClock`
-that starts at 0 and advances by a fixed logical quantum per step. Its wire
-stamps are deterministic LOGICAL values, and subtracting a wall reading from one
-measures nothing. `--single-process` is what puts the run on `RealClock`, whose
-stamps are wall-comparable within the machine.
+with no `process_groups:` block, and each rank free-runs on its own gating
+clock, advanced at step boundaries by the measured wall elapsed from an epoch
+anchored to that rank's `real_ns()`. Its wire stamps are per-rank boundary
+times, not readings taken where your node takes its own, so a difference against
+`self.real_ns()` measures the boundary rather than the hop. The
+`CERULION_EXECUTION_MODE=lockstep` opt-out is worse for this, not better: its
+stamps are logical quantum values counted from 0. `--single-process` is what
+puts the run on `RealClock`, whose stamps are wall readings on this machine.
 
 Expected local (iceoryx2) latency for fixed-size messages is **single-digit
 microseconds per round trip** on a desktop and tens of microseconds on an embedded

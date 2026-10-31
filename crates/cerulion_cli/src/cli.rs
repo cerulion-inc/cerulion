@@ -32,6 +32,15 @@ pub enum TimeSource {
     Virtual,
 }
 
+/// Authoring language for a generated node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum NodeLanguage {
+    /// Generate a Rust macro node (the default).
+    Rust,
+    /// Generate an embedded-CPython cdylib node.
+    Python,
+}
+
 impl From<TimeSource> for EngineTimeSource {
     fn from(ts: TimeSource) -> Self {
         match ts {
@@ -131,6 +140,12 @@ impl From<PeerLoss> for EnginePeerLossPolicy {
     }
 }
 
+// Only the `Commands` verbs. The full `cerulion` command, which also holds
+// every registered verb family (`cerulion schema`, ...), is
+// `families::cli_command()`: parse, complete and check the verb tree with that,
+// never with `Cli::command()` or `Cli::try_parse_from`, which do not see the
+// families. A plain comment, not a doc comment, so `cerulion --help` keeps the
+// text it has: clap's derive copies a doc comment into the root's help.
 #[derive(Parser)]
 #[command(name = "cerulion", about = "Cerulion robotics middleware CLI", version)]
 pub struct Cli {
@@ -157,9 +172,9 @@ const COMPLETIONS_LONG_ABOUT: &str = "\
 Print the shell code that enables `cerulion` tab-completion.
 
 Completes everything: subcommands, flags, and enum values from the command
-tree, plus LIVE names: topic names for `topic echo/info/hz`, node types
-for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
-workspace + built-in ROS 2 schemas for `schema info`, and robot names for
+tree, plus LIVE names: topic names for `topic echo/info/hz/type/bw`, node
+types for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
+workspace + built-in ROS 2 schemas for `schema info` and `topic find`, and robot names for
 `viz --robot`.
 
 Install it once, per shell:
@@ -195,6 +210,20 @@ which a TAB press must not do.";
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Internal login-gated first-serve registration worker.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    BootstrapRobot {
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        state_root: PathBuf,
+    },
+    /// Internal robot-side revocation sync worker.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    RobotSyncEpoch {
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        state_root: PathBuf,
+    },
     /// Workspace management
     Workspace {
         #[command(subcommand)]
@@ -214,11 +243,6 @@ pub enum Commands {
     Topic {
         #[command(subcommand)]
         action: TopicAction,
-    },
-    /// Schema management
-    Schema {
-        #[command(subcommand)]
-        action: SchemaAction,
     },
     /// Removed: `cerulion ros attach` is now `cerulion ros2 attach`.
     ///
@@ -299,7 +323,7 @@ pub enum Commands {
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
         /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found by scouting with no configuration, and
+        /// typical LAN the robot is found over mDNS with no configuration, and
         /// no schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
@@ -307,11 +331,11 @@ pub enum Commands {
         /// A topic the robot does not serve is an error, not a silent skip.
         #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// Additional zenoh gateway locator to CONNECT to, for a robot scouting
-        /// cannot reach, for example `tcp/192.0.2.10:7683`. Repeatable. Requires
-        /// `--robot`. Used when this command STARTS the daemon; a daemon that is
-        /// already running keeps the locators it started with (scouting covers
-        /// the LAN regardless, and the verb says so).
+        /// Additional zenoh gateway locator to CONNECT to, for a robot mDNS
+        /// discovery cannot reach, for example `tcp/192.0.2.10:7683`.
+        /// Repeatable. Requires `--robot`. Used when this command STARTS the
+        /// daemon; a daemon that is already running keeps the locators it
+        /// started with, and the verb says so.
         #[arg(long, value_name = "LOCATOR", requires = "robot")]
         connect: Vec<String>,
         /// Local zenoh locator to LISTEN on for remote discovery and ingress, for
@@ -363,8 +387,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
         /// The desk device key file (32 raw bytes: an ed25519 seed). When
-        /// omitted, the paired desk key `~/.cerulion/desk.key` is used if it
-        /// exists (written by `cerulion pair`), else an EPHEMERAL key, which an
+        /// omitted, this machine's key `~/.cerulion/identity/device.key` (also
+        /// named `~/.cerulion/desk.key`) is used if it exists (written by
+        /// `cerulion pair` or `cerulion login`), else an EPHEMERAL key, which an
         /// unpaired robot REFUSES, so pair the desk first with `cerulion pair`.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         key_file: Option<PathBuf>,
@@ -397,9 +422,10 @@ pub enum Commands {
     ///
     /// The robot owner starts code pairing on the robot and shares a short code;
     /// you supply it here (`--code`, else typed at the prompt or piped on stdin).
-    /// The desk device key is created at `~/.cerulion/desk.key` on the first pair
-    /// (0600 permissions) and reused afterwards. An existing key is never
-    /// overwritten.
+    /// The desk device key is this machine's key,
+    /// `~/.cerulion/identity/device.key` (also named `~/.cerulion/desk.key`),
+    /// created on the first pair or sign-in (0600 permissions) and reused
+    /// afterwards. An existing key is never overwritten.
     ///
     /// STDOUT carries deterministic, machine-parseable state lines:
     /// `pairing: robot=<name> eid=<hex>`, then on success
@@ -434,9 +460,9 @@ pub enum Commands {
         /// ceremony window, and it authorizes durable enrollment.
         #[arg(long, value_name = "CODE")]
         code: Option<String>,
-        /// The account (64-char hex) this pairing is FOR. When omitted, a
-        /// self-account is derived from the desk device key (a desk with a
-        /// keypair and no Cerulion account).
+        /// The account (64-char hex) a code pairing binds. It must be the desk's
+        /// self-account (the public half of its device key), the value used when
+        /// omitted; any other value is refused.
         #[arg(long, value_name = "HEX")]
         account: Option<String>,
         /// The access-list label the robot stores on its pairing row (so the
@@ -444,7 +470,8 @@ pub enum Commands {
         #[arg(long, value_name = "NAME")]
         label: Option<String>,
         /// The desk device key file (32 raw bytes: an ed25519 seed). Default:
-        /// `~/.cerulion/desk.key` (created 0600 on the first pair, reused after).
+        /// this machine's key `~/.cerulion/identity/device.key` (created 0600 on
+        /// the first pair or sign-in, reused after).
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         key_file: Option<PathBuf>,
         /// Self-hosted relay URL. Default: n0 public relays.
@@ -461,6 +488,19 @@ pub enum Commands {
     /// to authorize, so it works on a headless machine. Use it any time to sign
     /// in, re-authenticate or switch accounts.
     Login,
+    /// Sign this machine out of its Cerulion account.
+    ///
+    /// Removes the session from `~/.cerulion/auth.json` (the account id stays)
+    /// and revokes it at the account service. Every command that needs an
+    /// account is then refused until the next `cerulion login`. Signing out
+    /// when no one is signed in changes nothing and succeeds.
+    ///
+    /// STDOUT carries one machine-parseable line: `signed_out: account=<id>`,
+    /// or `not_signed_in` when there was no session. Exit 0 on either; exit 1
+    /// when the local store could not be rewritten, or when the machine was
+    /// signed out but the service did not confirm the revoke (the error says
+    /// which).
+    Logout,
     /// Manage your Cerulion account.
     ///
     /// Currently: your devices (`cerulion account devices list` and
@@ -470,6 +510,17 @@ pub enum Commands {
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+    /// Show or change usage telemetry consent.
+    ///
+    /// Release builds send coarse, content-free usage events (which verb ran,
+    /// how it ended, coarse durations and counts; never arguments, paths or
+    /// data). `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` (or `false`, `off`,
+    /// `no`) also turn it off. Builds without a telemetry key send nothing.
+    /// See `docs/telemetry.md`.
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
     },
     /// Interactive terminal dashboard
     Tui,
@@ -634,6 +685,10 @@ impl Commands {
     pub fn log_verb_class(&self) -> VerbLogClass {
         use VerbLogClass::{LongRunning, OneShot};
         match self {
+            #[cfg(unix)]
+            Commands::BootstrapRobot { .. } => OneShot,
+            #[cfg(unix)]
+            Commands::RobotSyncEpoch { .. } => OneShot,
             // ── Long-running / runtime verbs: keep the `info` default ──
             Commands::Graph { action } => match action {
                 // Runtime loops: the live run, the live profiler, and the
@@ -647,7 +702,9 @@ impl Commands {
                 | GraphAction::Validate { .. }
                 | GraphAction::List
                 | GraphAction::Levels { .. }
-                | GraphAction::Partition { .. } => OneShot,
+                | GraphAction::Partition { .. }
+                | GraphAction::Pause { .. }
+                | GraphAction::Resume { .. } => OneShot,
             },
             // `node run` is a runtime loop; every other node verb runs-and-exits.
             Commands::Node { action } => match action {
@@ -704,11 +761,12 @@ impl Commands {
                 BagAction::Info { .. } | BagAction::Migrate { .. } => OneShot,
             },
             // ── One-shot verbs: QUIET (`warn`) default ──
-            // `account devices list/revoke` run-and-exit.
+            // `account devices list/revoke` and `logout` run-and-exit.
             Commands::Account { .. }
+            | Commands::Telemetry { .. }
+            | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
-            | Commands::Schema { .. }
             | Commands::Trace { .. }
             // Prints a shell script to stdout and exits. It is also
             // the one verb whose stdout is EVALUATED by a shell, so a stray
@@ -735,6 +793,17 @@ impl Commands {
             Commands::Bagd => OneShot,
         }
     }
+}
+
+/// `cerulion telemetry <action>`.
+#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryAction {
+    /// Print whether telemetry is on and which setting decided it.
+    Status,
+    /// Turn telemetry on for this machine (the consent file).
+    On,
+    /// Turn telemetry off for this machine (the consent file).
+    Off,
 }
 
 /// `cerulion account <action>`.
@@ -818,18 +887,26 @@ pub enum Ros2Action {
     /// the verb included: read THIS page with `cerulion help ros2 run`, and
     /// `ros2 run --help` for the native surface.
     ///
-    /// The one exception is `--adopt-take` given right after `run`, which is
-    /// refused. `ros2` is a Python CLI that starts the node as a further
-    /// subprocess with close_fds=True, so the heap hook this launcher hands
-    /// over as an inherited descriptor never reaches the node and every take
-    /// would be served by copy. For zero-copy plain takes, launch the node
-    /// executable directly with the hook preloaded and
+    /// The exceptions are Cerulion's own flags, given right after `run`.
+    /// `--adopt-take` is refused. `ros2` is a Python CLI that starts the node
+    /// as a further subprocess with close_fds=True, so the heap hook this
+    /// launcher hands over as an inherited descriptor never reaches the node
+    /// and every take would be served by copy. For zero-copy plain takes,
+    /// launch the node executable directly with the hook preloaded and
     /// CERULION_RMW_ADOPT_TAKE=1 (Linux/GNU only: the hook interposes glibc's
     /// malloc/free).
     ///
+    /// `--record-deliveries <DIR>` records what the process consumed, in the
+    /// order it consumed it, into `<DIR>/<exe>-<pid>.rdl.mcap`.
+    /// `--replay-deliveries <LOG>` replays that one process against its log
+    /// and writes `<LOG>.verdict.json` (identical, or the first node, topic
+    /// and window whose outputs diverged). The two exclude each other. See
+    /// docs/ros2_replay.md for what replays exactly and what is refused.
+    ///
     /// Exit codes (pre-exec failures only; a successful exec inherits ros2's
     /// own): 69 = `librmw_cerulion.so` missing or `--adopt-take` given,
-    /// 127 = `ros2` not on PATH, 1 = other. Unix-only.
+    /// 2 = a refused delivery-log flag, 127 = `ros2` not on PATH, 1 = other.
+    /// Unix-only.
     Run {
         /// Forwarded verbatim to `ros2 run` (e.g. `demo_nodes_cpp talker`);
         /// a LEADING `--adopt-take` is Cerulion's own flag, refused here
@@ -853,9 +930,15 @@ pub enum Ros2Action {
     /// the verb included: read THIS page with `cerulion help ros2 launch`, and
     /// `ros2 launch --help` for the native surface.
     ///
+    /// `--record-deliveries <DIR>` right after `launch` records every ROS 2
+    /// process the launch starts, one `<exe>-<pid>.rdl.mcap` each. There is
+    /// no replay flag here: a replay is one process, run with
+    /// `cerulion ros2 run --replay-deliveries <LOG> ...`.
+    ///
     /// Exit codes (pre-exec failures only; a successful exec inherits ros2's
     /// own): 69 = `librmw_cerulion.so` missing or `--adopt-take` given,
-    /// 127 = `ros2` not on PATH, 1 = other. Unix-only.
+    /// 2 = a refused delivery-log flag, 127 = `ros2` not on PATH, 1 = other.
+    /// Unix-only.
     Launch {
         /// Forwarded verbatim to `ros2 launch` (e.g.
         /// `demo.launch.py use_rviz:=false`, or the `pkg file.launch.py`
@@ -970,7 +1053,8 @@ pub enum Ros2Action {
         )]
         timeout: f64,
         /// Print the discovery report and stop: write nothing, run nothing.
-        /// Wins over `--yes`.
+        /// Wins over `--yes`. Does not require a workspace. The write and
+        /// run path still does.
         #[arg(long)]
         dry_run: bool,
         /// Skip the interactive confirm and write + run non-interactively
@@ -1038,12 +1122,30 @@ fn parse_at_least_one(s: &str) -> Result<u64, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WorkspaceStarter {
+    /// Complete synthetic scanner and safety controller source for this CLI
+    #[value(name = "obstacle_avoidance")]
+    ObstacleAvoidance,
+}
+
+impl From<WorkspaceStarter> for cerulion_cli_engine::starter::Starter {
+    fn from(value: WorkspaceStarter) -> Self {
+        match value {
+            WorkspaceStarter::ObstacleAvoidance => Self::ObstacleAvoidance,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum WorkspaceAction {
     /// Create a new workspace
     Create {
         /// Workspace name
         name: String,
+        /// Include complete example sources bundled with this CLI version
+        #[arg(long, value_enum)]
+        starter: Option<WorkspaceStarter>,
     },
     /// Initialize a workspace at the current directory
     Init {
@@ -1060,6 +1162,7 @@ pub enum WorkspaceAction {
 #[derive(Subcommand)]
 pub enum NodeAction {
     /// Create a new node type
+    #[command(alias = "new")]
     Create {
         /// Node type name
         // Deliberately NO completer. A create argument names
@@ -1067,13 +1170,19 @@ pub enum NodeAction {
         // exactly the set this verb REJECTS (`NodeExists`). Offering them
         // completes a guaranteed error. The correct candidate set is empty.
         node_type: String,
+        /// Authoring language for the generated node.
+        #[arg(long, value_enum, default_value_t = NodeLanguage::Rust)]
+        lang: NodeLanguage,
         /// Add an output port: SCHEMA NAME (both required). At most one `-o`
-        /// per `node create`; add more with `cerulion node modify`.
+        /// per Rust `node create`; add more with `cerulion node modify`. A
+        /// Python node takes `-o` repeatedly.
         #[arg(short = 'o', long = "output", num_args = 2, value_names = ["SCHEMA", "NAME"])]
         output: Vec<String>,
         /// Add a non-trigger input port: SCHEMA NAME (both required). At most
-        /// one `-i` per `node create`; add more with `cerulion node modify`.
-        /// For the input that should fire the node, use `-T` instead.
+        /// one `-i` per Rust `node create`; add more with `cerulion node modify`.
+        /// A Python node takes `-i` repeatedly (every input of a
+        /// `sync_window_ms` Python node joins the aligned set). For the input
+        /// that should fire the node, use `-T` instead.
         #[arg(short = 'i', long = "input", num_args = 2, value_names = ["SCHEMA", "NAME"])]
         input: Vec<String>,
         /// Add the TRIGGER input: SCHEMA NAME (both required). The input is
@@ -1238,10 +1347,15 @@ pub enum NodeAction {
         /// other targets, where the loop blocks normally.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
+        /// Keep this run on this machine: no network gateway, session,
+        /// egress or ingress. Equivalent to `--network off`; the environment
+        /// kill-switch remains honored with or without this flag.
+        #[arg(long)]
+        local: bool,
         /// Network kill-switch, the same as `graph run --network off`. The only
         /// accepted value is `off`: run LOCAL-ONLY, with no network gateway
-        /// and no topic visible on the network. When the flag is absent, a
-        /// real-clock `node run` starts the network gateway and every produced
+        /// and no topic visible on the network. Without a CLI or environment
+        /// kill-switch, a real-clock `node run` starts the network gateway and every produced
         /// topic is announced on the LAN, viewable by any peer without pairing.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
@@ -1275,6 +1389,19 @@ pub enum GraphAction {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
         name: String,
+        /// Launch-argument overrides, `name:=value`, for the arguments the
+        /// graph declares under its top-level `args:` map (each with a
+        /// default). An override replaces the default for this run only:
+        /// `cerulion graph run robot use_sim:=true robot_name:=go2`. The
+        /// value is read as a YAML scalar (`true` is a bool, `50` an
+        /// integer, `go2` text; quote digits to keep them text). An
+        /// override for an argument the graph does not declare is refused
+        /// before any node loads, with the nearest declared name.
+        #[arg(
+            value_name = "NAME:=VALUE",
+            value_parser = cerulion_cli_engine::graph_launch_args::check_override_word
+        )]
+        launch_args: Vec<String>,
         /// Clock that drives the run
         #[arg(long = "time-source", value_enum, default_value_t = TimeSource::Real)]
         time_source: TimeSource,
@@ -1374,11 +1501,14 @@ pub enum GraphAction {
         ///
         /// A single-process run records real cumulative fire times, so the
         /// graph's own topics replay identically. A multi-process run is
-        /// recorded into ONE bag covering every worker, and its fire times are
-        /// lockstep logical time rather than wall time; `--single-process`
-        /// forces the single-process recording instead. Live clock only:
-        /// combining `--record` with `--time-source virtual|external` is
-        /// rejected. Unix-only.
+        /// recorded into ONE bag covering every worker. By DEFAULT (free-run)
+        /// each rank records its OWN wall-faithful timeline from a shared
+        /// epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the
+        /// recorded fire times are that mode's gating quantum rather than wall
+        /// time. The bag's `coordination` stamp says which.
+        /// `--single-process` forces the single-process recording instead.
+        /// Live clock only: combining `--record` with
+        /// `--time-source virtual|external` is rejected. Unix-only.
         // `String`-typed, so the original `PathBuf` sweep missed
         // it and it would have completed NOTHING. Found by the structural
         // walk in `completion_wiring_tests`.
@@ -1423,19 +1553,23 @@ pub enum GraphAction {
         /// Force a single-process run, even when the graph declares
         /// `process_groups:`. The graph produces identical results, just
         /// without process isolation. On a graph WITHOUT `process_groups:`
-        /// this also skips the multi-process default entirely: no partition is
-        /// derived and nothing is asked. Conflicts with `--auto-partition`.
+        /// this also skips deriving the multi-process default. Conflicts with `--auto-partition`.
         #[arg(long = "single-process")]
         single_process: bool,
+        /// Keep this run on this machine: no network gateway, session,
+        /// egress or ingress. Equivalent to `--network off`; the environment
+        /// kill-switch remains honored with or without this flag.
+        #[arg(long)]
+        local: bool,
         /// Network kill-switch. The only accepted value is `off`: run
         /// LOCAL-ONLY. No network gateway is started, no network session opens
         /// and nothing crosses the machine boundary (a loud notice says so).
-        /// When the flag is absent, a graph with an enabled `network:` block
+        /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// announces every produced topic on the LAN, viewable by any peer
-        /// without pairing. Restrict exposure with a `network:` block, or pass
-        /// `off` for local-only.
+        /// can announce every produced topic when LAN access is open. Android
+        /// defaults to paired-only access, which withholds topic announcements.
+        /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
         /// Cap, in entries, on the in-memory fire trace. The trace is a BOUNDED
@@ -1480,23 +1614,24 @@ pub enum GraphAction {
         /// Re-derive the multi-process partition even when the graph already
         /// declares `process_groups:`.
         ///
-        /// Shows the derived partition (from the cost snapshot at
-        /// `graphs/<NAME>.costs.yaml` when present, else one process per node)
-        /// and the diff against the existing block. On a terminal it then asks
-        /// whether to keep yours or apply the new one; with `--yes` it applies;
-        /// with no terminal and no `--yes` the run uses the re-derived groups
-        /// IN MEMORY (file untouched) and says so loudly. An unpartitioned
-        /// graph on Unix under the real clock derives a partition BY DEFAULT,
-        /// so this flag matters only for re-deriving over an existing block.
+        /// Uses the cost snapshot at `graphs/<NAME>.costs.yaml` when
+        /// present, else one process per node. The derived groups run in
+        /// memory without a prompt or graph-file change, on terminals and in
+        /// scripts. Add `--yes` to save them with a backup. The run bands over
+        /// the graph's own levels; `cerulion graph partition <NAME>` is the
+        /// cost-refined inspection and save surface, so its layout can differ
+        /// when a cost snapshot moves a node to another level. The run
+        /// directory's `graph.yaml` holds the layout a run executed. An
+        /// unpartitioned graph on Unix under the real clock derives a
+        /// partition by default.
         /// Conflicts with `--single-process`.
         #[arg(long = "auto-partition", conflicts_with = "single_process")]
         auto_partition: bool,
-        /// Write the derived partition into the graph YAML without asking (a
-        /// surgical rewrite with a `.bak` backup). Without it, a run on a
-        /// terminal asks y/N, and a run with no terminal NEVER changes the
-        /// file: it runs the derived groups in memory and says so loudly. Only
-        /// meaningful when a partition is being derived (an unpartitioned graph
-        /// by default, or `--auto-partition`).
+        /// Save the derived partition into the graph YAML with a `.bak`
+        /// backup. Without this opt-in, terminal and non-terminal runs use
+        /// the derived groups in memory and leave the graph file unchanged.
+        /// Only meaningful when a partition is being derived (an
+        /// unpartitioned graph by default, or `--auto-partition`).
         #[arg(long)]
         yes: bool,
     },
@@ -1525,6 +1660,15 @@ pub enum GraphAction {
     /// levels each group owns and whether the partition can run as written
     /// (an invalid partition is printed in full and the command exits
     /// nonzero). Uses the same levelization the runtime uses.
+    ///
+    /// The report closes with the chains block: the linear single-consumer
+    /// trigger chains that could run as one fused synchronous call sequence
+    /// inside one process, and for every other consumer edge the reason it
+    /// keeps the queued path. The two add up to every consumer edge in the
+    /// graph. The chains are judged against the graph's declared colocation
+    /// (its `process_groups:` block, or one process); a run writes its own
+    /// census into its run directory. Nothing in the runtime fuses chains
+    /// yet: the block reports what the graph would allow.
     Levels {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
@@ -1627,6 +1771,40 @@ pub enum GraphAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Pause a live run: hold every process of it at its next step boundary and
+    /// stop its clock.
+    ///
+    /// Nothing steps while the run is paused, and the run's clock stands still,
+    /// so a timer neither skips ticks nor bursts on resume, and a recording of
+    /// the run shows no gap across the pause. Stopping the process instead
+    /// (`SIGSTOP`) does neither: the hardware clock keeps running, so the
+    /// timestamps jump by the length of the stop and the timers burst when it
+    /// resumes. A node that reads the hardware clock itself (`real_ns()`) still
+    /// sees it advance through a pause, and a source outside the graph keeps
+    /// publishing into its inputs' queues under their own backpressure policy.
+    ///
+    /// Name the run by its run id (`0x` and 32 hex digits, printed by `graph run` and recorded in the
+    /// run's `run.json`), or by its graph name when exactly one live run has it.
+    /// The run's `run.json` records `"paused": true` and the viz daemon's `runs`
+    /// reports it. Pausing a paused run succeeds and changes nothing. Exit 0 on
+    /// success, 4 when no live run matches ("not running"), 1 otherwise (a run
+    /// with no pause page, because an older build started it or it runs on
+    /// virtual time, is refused with the reason).
+    Pause {
+        /// The run to pause: a run id (`0x` and 32 hex digits) or a graph name
+        /// that matches exactly one live run
+        run_id: String,
+    },
+    /// Resume a paused run from the moment it stopped.
+    ///
+    /// The run clock continues from the value it was stopped at, and every process
+    /// of the run steps again. Resuming a run that is not paused succeeds and
+    /// changes nothing. Names the run, and exits, exactly as `graph pause` does.
+    Resume {
+        /// The run to resume: a run id (`0x` and 32 hex digits) or a graph name
+        /// that matches exactly one live run
+        run_id: String,
+    },
     /// HIDDEN: run ONE worker process of a multi-process deployment.
     ///
     /// NOT a user-facing verb. The multi-process supervisor behind
@@ -1660,8 +1838,9 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (multicast and gossip scouting
-    /// on), so robots on the LAN show up with no flags and no pairing; when it
+    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
+    /// cache and the hostname rung), so robots on the LAN show up with no
+    /// flags and no pairing; when it
     /// finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
@@ -1670,7 +1849,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--no-network` to skip the remote
+    /// peers discovery cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1681,19 +1860,20 @@ pub enum TopicAction {
         #[arg(long)]
         all: bool,
         /// Skip the REMOTE network discovery query (scripts, CI, offline).
-        /// Without it, remote discovery runs automatically. Locally mirrored
+        /// Without a CLI or environment kill-switch, remote discovery runs
+        /// automatically. Locally mirrored
         /// remote topics are still listed as REMOTE streaming rows: that
         /// information is read from local shared memory, not the network, so
         /// this flag skips only the network query.
-        #[arg(long = "no-network")]
+        #[arg(long = "local", visible_alias = "no-network")]
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
-        /// port). Adds to the default scouting session.
+        /// port). Adds to the discovered peers.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// Additional zenoh locator to listen on for discovery (repeatable),
-        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default discovery session.
         #[arg(long, value_name = "LOCATOR")]
         listen: Vec<String>,
         /// OPT-IN: also sweep the local /24 subnets, one address at a time, on
@@ -1707,32 +1887,49 @@ pub enum TopicAction {
         /// appears as a robot.
         #[arg(long)]
         scan: bool,
+        /// Show each topic's message type after its name, as
+        /// `/topic  [package/Type]` (`ros2 topic list -t`). A LOCAL topic is
+        /// typed from one message (the listing waits up to one second in
+        /// all); a REMOTE topic from its robot's catalog. A type that is not
+        /// known shows `[unknown]`.
+        #[arg(short = 't', long = "show-types")]
+        show_types: bool,
     },
     /// Show info about a topic (schema name + last sequence/timestamp)
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Info {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
     },
-    /// Echo messages from a topic (decoded fields)
+    /// Echo messages from a topic as YAML
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Echo {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
-        /// Max array elements to render before truncating with `...` + a
-        /// `(N elements)` tail (default 128; matches `ros2 topic echo
-        /// --truncate-length`). Must be a positive integer: 0 and negative
-        /// values are rejected at parse.
+        /// Max array elements to print; a cut array ends in a
+        /// `!truncated <n>` element (n = elements left out). Default 128;
+        /// matches `ros2 topic echo --truncate-length`. Must be a positive
+        /// integer: 0 and negative values are rejected at parse.
         #[arg(
             long = "truncate-length",
             value_name = "N",
@@ -1745,9 +1942,14 @@ pub enum TopicAction {
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Set
-    /// CERULION_NETWORK=off to disable remote discovery (local-only).
+    /// automatically and released when the command exits. Pass `--local`
+    /// to read genuine local producers without remote discovery or demand.
     Hz {
+        /// Read genuine local shared-memory producers only. No remote
+        /// discovery, schema query or network-daemon startup. A remote mirror
+        /// is refused even when its bytes already exist locally.
+        #[arg(long)]
+        local: bool,
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
@@ -1898,6 +2100,27 @@ pub enum BagAction {
         /// claim about the recording, so a plain `--resim all` honours it too.
         #[arg(long)]
         strict_state: bool,
+        /// With `--resim`: on a recording that begins MID-RUN, resume on the
+        /// param values in force even where they differ from the ones the
+        /// recording names. A param is not node state, so a restore never
+        /// writes one; without this flag such a difference refuses the run
+        /// with exit 2, one line per param (node, param, recorded value,
+        /// current value). Inert on a from-start bag. Valid in BOTH resim
+        /// modes.
+        #[arg(long)]
+        allow_param_change: bool,
+        /// With `--resim`: write the re-executed frames to a new bag at this
+        /// path. One channel per graph-produced topic, labelled with the schema
+        /// the re-executed graph publishes, holding every frame it published on
+        /// it. The recorded external inputs are not copied (they
+        /// are unchanged and already in the input bag), and the output carries
+        /// no scheduler trace, so it is a recording to read or index, not a bag
+        /// `--resim` can re-execute. The path must not exist: an existing file
+        /// is refused with exit 2 and never overwritten. Valid in BOTH resim
+        /// modes: it shapes what the run produces, not the comparison. With
+        /// `--report`, the JSON gains a `record_out` field naming the path.
+        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+        record_out: Option<PathBuf>,
     },
     /// Show what a bag holds (topics, frame counts, schemas, time span) without
     /// publishing anything.
@@ -2069,32 +2292,62 @@ pub enum BagAction {
     },
 }
 
-#[derive(Subcommand)]
-pub enum SchemaAction {
-    /// Create a new schema
-    Create {
-        /// Schema name
-        // No completer, and this arm was the worst of the three.
-        // The workspace half is what the verb rejects (already-exists), and
-        // the 254 built-in `pkg/Type` names are worse than useless here: a
-        // `sensor_msgs/Image` either fails on the `/` or silently creates a
-        // workspace schema that SHADOWS the built-in for the whole workspace.
-        name: String,
-    },
-    /// Delete a schema
-    Delete {
-        /// Schema name
-        #[arg(add = ArgValueCandidates::new(completion::schema_names))]
-        name: String,
-    },
-    /// Show info about a schema
-    Info {
-        /// Schema name
-        #[arg(add = ArgValueCandidates::new(completion::schema_names))]
-        name: String,
-    },
-    /// List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
-    List,
+#[cfg(test)]
+mod graph_pause_dispatch_tests {
+    use super::*;
+
+    /// `graph pause <run>` and `graph resume <run>` parse to their own actions with the
+    /// run as the one positional argument.
+    #[test]
+    fn graph_pause_and_resume_parse_their_run() {
+        let id = "0x00000000000000000000000000000abc";
+        let cli = Cli::try_parse_from(["cerulion", "graph", "pause", id])
+            .expect("`graph pause <id>` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Pause { run_id },
+            } => assert_eq!(run_id, id),
+            _ => panic!("expected Graph::Pause"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "resume", "perception"])
+            .expect("`graph resume <name>` must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Resume { run_id },
+            } => assert_eq!(run_id, "perception"),
+            _ => panic!("expected Graph::Resume"),
+        }
+    }
+
+    /// The run is a required positional: a bare verb is a usage error (clap exit 2),
+    /// never a guess at the one live run.
+    #[test]
+    fn graph_pause_and_resume_require_a_run() {
+        for verb in ["pause", "resume"] {
+            let err = Cli::try_parse_from(["cerulion", "graph", verb])
+                .err()
+                .unwrap_or_else(|| panic!("`graph {verb}` with no run must be a parse error"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{verb}"
+            );
+        }
+    }
+
+    /// Both are run-and-exit verbs: quiet by default, like every other `graph` verb that
+    /// does not run a loop.
+    #[test]
+    fn graph_pause_and_resume_are_one_shot_verbs() {
+        for verb in ["pause", "resume"] {
+            let cli = Cli::try_parse_from(["cerulion", "graph", verb, "x"]).expect("parse");
+            assert_eq!(
+                cli.command.log_verb_class(),
+                VerbLogClass::OneShot,
+                "{verb}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2122,6 +2375,27 @@ mod graph_levels_dispatch_tests {
         assert!(
             Cli::try_parse_from(["cerulion", "graph", "levels"]).is_err(),
             "`graph levels` without a graph name must be rejected"
+        );
+    }
+
+    /// The verb runs and exits, so it keeps the quiet one-shot filter: a
+    /// lifecycle breadcrumb on top of a report is noise.
+    #[test]
+    fn graph_levels_is_a_one_shot_verb() {
+        let cli =
+            Cli::try_parse_from(["cerulion", "graph", "levels", "perception"]).expect("parse");
+        assert_eq!(cli.command.log_verb_class(), VerbLogClass::OneShot);
+    }
+
+    /// `chains` is NOT a verb of its own: the census is part of the `graph
+    /// levels` report. A stray subcommand must be a loud parse error, never a
+    /// silent acceptance that would leave a removed verb half alive in the
+    /// shell's history and in scripts.
+    #[test]
+    fn graph_chains_is_not_a_verb() {
+        assert!(
+            Cli::try_parse_from(["cerulion", "graph", "chains", "perception"]).is_err(),
+            "`graph chains` must be rejected: the census is part of `graph levels`"
         );
     }
 }
@@ -2156,7 +2430,7 @@ mod pair_dispatch_tests {
                 assert!(label.is_none(), "the label defaults to the desk hostname");
                 assert!(
                     key_file.is_none(),
-                    "the key file defaults to ~/.cerulion/desk.key"
+                    "the key file defaults to this machine's key"
                 );
                 assert!(relay_url.is_none());
                 assert!(!relay_disabled);
@@ -2454,6 +2728,72 @@ mod graph_partition_dispatch_tests {
             Cli::try_parse_from(["cerulion", "graph", "partition", "g", "--force"]).is_err(),
             "an unknown --force flag must be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_run_launch_args_tests {
+    use super::*;
+
+    fn launch_args_of(argv: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(argv).expect("parses");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Run { launch_args, .. },
+            } => launch_args,
+            _ => panic!("expected Graph::Run"),
+        }
+    }
+
+    /// `name:=value` words after the graph name are collected in order, and
+    /// flags may follow or precede them.
+    #[test]
+    fn graph_run_collects_name_value_overrides_after_the_graph_name() {
+        assert_eq!(
+            launch_args_of(&[
+                "cerulion",
+                "graph",
+                "run",
+                "robot",
+                "use_sim:=true",
+                "robot_name:=go2",
+                "--single-process",
+            ]),
+            ["use_sim:=true", "robot_name:=go2"]
+        );
+        assert_eq!(
+            launch_args_of(&["cerulion", "graph", "run", "--release", "robot", "n:=1"]),
+            ["n:=1"]
+        );
+    }
+
+    /// A bare `graph run <name>` carries no override: the graph's declared
+    /// defaults apply.
+    #[test]
+    fn graph_run_without_overrides_carries_none() {
+        assert!(launch_args_of(&["cerulion", "graph", "run", "robot"]).is_empty());
+    }
+
+    /// A word after the graph name that is not `name:=value` is a usage
+    /// error at parse, naming the word, the shape and the `--flag=value`
+    /// spelling (the word a user most often means is a flag's value).
+    #[test]
+    fn graph_run_refuses_a_word_that_is_not_an_override_at_parse() {
+        let err = Cli::try_parse_from(["cerulion", "graph", "run", "robot", "bags"])
+            .err()
+            .expect("a bare word is not an override")
+            .to_string();
+        assert!(
+            err.contains("launch argument override 'bags' is malformed")
+                && err.contains("found no `:=`")
+                && err.contains("`--record=DIR`"),
+            "{err}"
+        );
+        let err = Cli::try_parse_from(["cerulion", "graph", "run", "robot", "my-arg:=1"])
+            .err()
+            .expect("an invalid name is refused")
+            .to_string();
+        assert!(err.contains("'my-arg' is not an argument name"), "{err}");
     }
 }
 
@@ -3496,8 +3836,10 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        show_types,
                     },
             } => {
+                assert!(!show_types, "a bare list prints no types");
                 assert!(!no_network, "bare list must default to remote-discovery ON");
                 assert!(connect.is_empty());
                 assert!(listen.is_empty());
@@ -3505,6 +3847,21 @@ mod topic_list_network_flag_tests {
                 assert!(!all, "internal topics must be HIDDEN on a bare list");
             }
             _ => panic!("expected Topic::List"),
+        }
+    }
+
+    #[test]
+    fn topic_list_t_and_show_types_ask_for_types() {
+        for flag in ["-t", "--show-types"] {
+            match Cli::try_parse_from(["cerulion", "topic", "list", flag])
+                .expect("`topic list -t` must parse")
+                .command
+            {
+                Commands::Topic {
+                    action: TopicAction::List { show_types, .. },
+                } => assert!(show_types, "{flag}"),
+                _ => panic!("expected Topic::List"),
+            }
         }
     }
 
@@ -3586,6 +3943,7 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        ..
                     },
             } => {
                 assert!(!no_network);
@@ -4255,12 +4613,20 @@ mod verb_log_class_tests {
     use super::*;
 
     /// Parse a full argv and return the classified verb log class — the exact
-    /// path `main` takes (`Cli::parse().command.log_verb_class()`).
+    /// path `main` takes: a registered verb family classifies itself, every
+    /// other verb goes through `Commands::log_verb_class`.
     fn class_of(argv: &[&str]) -> VerbLogClass {
-        Cli::try_parse_from(argv)
-            .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
-            .command
-            .log_verb_class()
+        use clap::FromArgMatches as _;
+        let matches = crate::families::cli_command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"));
+        match crate::families::find(crate::families::FAMILIES, &matches) {
+            Some((family, sub)) => family.log_class(sub),
+            None => Cli::from_arg_matches(&matches)
+                .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
+                .command
+                .log_verb_class(),
+        }
     }
 
     /// One-shot introspection / management verbs default QUIET
@@ -4366,6 +4732,57 @@ mod verb_log_class_tests {
             assert!(strict_state, "{argv:?} must carry --strict-state");
             assert_eq!(verify, want_verify, "{argv:?}");
             assert_eq!(resim.as_deref(), Some("all"), "{argv:?}");
+        }
+    }
+
+    /// `--allow-param-change` parses onto `bag play` in both resim modes, and
+    /// an invocation without it carries `false`.
+    #[test]
+    fn bag_play_parses_allow_param_change_in_both_resim_modes() {
+        for (extra, want) in [
+            (vec!["--allow-param-change"], true),
+            (vec!["--verify", "--allow-param-change"], true),
+            (vec![], false),
+        ] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action:
+                    BagAction::Play {
+                        allow_param_change, ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(allow_param_change, want, "{argv:?}");
+        }
+    }
+
+    /// `--record-out` parses onto `bag play` in both resim modes and carries its
+    /// path, so a `main` destructure that dropped it fails here rather than
+    /// silently writing no bag.
+    #[test]
+    fn bag_play_parses_record_out_in_both_resim_modes() {
+        for verify in [false, true] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            if verify {
+                argv.push("--verify");
+            }
+            argv.extend(["--record-out", "out.mcap"]);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action: BagAction::Play { record_out, .. },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(
+                record_out.as_deref(),
+                Some(std::path::Path::new("out.mcap")),
+                "{argv:?}"
+            );
         }
     }
 
@@ -4669,6 +5086,129 @@ mod ros2_run_dispatch_tests {
         assert!(
             Cli::try_parse_from(["cerulion", "ros2"]).is_err(),
             "ros2 requires an action"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_scope_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn local_scope_is_explicit_across_run_and_inspection_verbs() {
+        for args in [
+            vec!["node", "run", "example", "--local"],
+            vec!["graph", "run", "example", "--local"],
+            vec!["topic", "list", "--local"],
+            vec!["topic", "echo", "/example/value", "--local"],
+            vec!["topic", "hz", "/example/value", "--local"],
+            vec!["topic", "info", "/example/value", "--local"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("cerulion").chain(args))
+                .expect("the unified local switch must parse");
+            let selected = match cli.command {
+                Commands::Node {
+                    action: NodeAction::Run { local, .. },
+                }
+                | Commands::Graph {
+                    action: GraphAction::Run { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Echo { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Hz { local, .. },
+                }
+                | Commands::Topic {
+                    action: TopicAction::Info { local, .. },
+                } => local,
+                Commands::Topic {
+                    action: TopicAction::List { no_network, .. },
+                } => no_network,
+                _ => panic!("unexpected verb"),
+            };
+            assert!(selected);
+        }
+    }
+
+    #[test]
+    fn local_scope_combines_with_legacy_run_switch() {
+        for verb in ["node", "graph"] {
+            let cli = Cli::try_parse_from([
+                "cerulion",
+                verb,
+                "run",
+                "example",
+                "--local",
+                "--network",
+                "off",
+            ])
+            .expect("equivalent switches remain compatible");
+            match cli.command {
+                Commands::Node {
+                    action: NodeAction::Run { local, network, .. },
+                }
+                | Commands::Graph {
+                    action: GraphAction::Run { local, network, .. },
+                } => {
+                    assert!(local);
+                    assert_eq!(network.as_deref(), Some("off"));
+                }
+                _ => panic!("unexpected verb"),
+            }
+            assert!(Cli::try_parse_from([
+                "cerulion",
+                verb,
+                "run",
+                "example",
+                "--local",
+                "--network",
+                "on"
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn local_help_and_legacy_help_describe_their_own_arguments() {
+        for verb in ["node", "graph"] {
+            let mut command = Cli::command();
+            let run = command
+                .find_subcommand_mut(verb)
+                .unwrap()
+                .find_subcommand_mut("run")
+                .unwrap();
+            let local = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == "local")
+                .unwrap()
+                .get_help()
+                .unwrap()
+                .to_string();
+            let legacy = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == "network")
+                .unwrap()
+                .get_help()
+                .unwrap()
+                .to_string();
+            assert!(local.contains("Keep this run on this machine"), "{local}");
+            assert!(!local.contains("only accepted value"), "{local}");
+            assert!(legacy.contains("only accepted value"), "{legacy}");
+            assert!(run.render_long_help().to_string().contains("--local"));
+        }
+        let mut command = Cli::command();
+        let list = command
+            .find_subcommand_mut("topic")
+            .unwrap()
+            .find_subcommand_mut("list")
+            .unwrap();
+        let help = list.render_long_help().to_string();
+        assert!(help.contains("--local"));
+        assert!(
+            help.contains("--no-network"),
+            "the compatibility spelling must remain discoverable: {help}"
         );
     }
 }

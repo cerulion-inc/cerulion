@@ -1,0 +1,193 @@
+[
+  {
+    "check": "socket name",
+    "expected": "@cuda_vmm_8423_0",
+    "observed": "@cuda_vmm_8423_0",
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "payload byte",
+    "expected": "58",
+    "observed": "58",
+    "pass": true,
+    "note": "one byte 'X' carries the cmsg"
+  },
+  {
+    "check": "fds per message",
+    "expected": 1,
+    "observed": 1,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "server closes after one message",
+    "expected": 0,
+    "observed": 0,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "second connect served",
+    "expected": 1,
+    "observed": 1,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "fd imports as VMM handle",
+    "expected": 0,
+    "observed": 0,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "block head is the publisher's fill",
+    "expected": "5a5a5a5a5a5a5a5a",
+    "observed": "5a5a5a5a5a5a5a5a",
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "IPCMetadata size",
+    "expected": 24,
+    "observed": 24,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "IPCMetadata offsets",
+    "expected": [
+      0,
+      8,
+      16
+    ],
+    "observed": [
+      0,
+      8,
+      16
+    ],
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "shm segment size",
+    "expected": 24,
+    "observed": 24,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "shm uid == descriptor ipc_uid",
+    "expected": 148160286763667602,
+    "observed": 148160286763667602,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "plugin import backend",
+    "expected": "cuda",
+    "observed": "cuda",
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "plugin import refcount while held",
+    "expected": 1,
+    "observed": 1,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "refcount after drop",
+    "expected": 0,
+    "observed": 0,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "realloc inside grace gets a new block",
+    "expected": true,
+    "observed": true,
+    "pass": true,
+    "note": "describe->realloc 13997 us"
+  },
+  {
+    "check": "late import inside grace",
+    "expected": [
+      "cuda",
+      4096,
+      "1111111111111111"
+    ],
+    "observed": [
+      "cuda",
+      4096,
+      "1111111111111111"
+    ],
+    "pass": true,
+    "note": "describe->import 14563 us"
+  },
+  {
+    "check": "reuse after grace picks the first released block",
+    "expected": 0,
+    "observed": 0,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "uid in shm unchanged until the next descriptor",
+    "expected": 1862107318622037343,
+    "observed": 1862107318622037343,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "old descriptor, reused block, before re-describe",
+    "expected": [
+      "cuda",
+      4096,
+      "3333333333333333"
+    ],
+    "observed": [
+      "cuda",
+      4096,
+      "3333333333333333"
+    ],
+    "pass": true,
+    "note": "imports and reads the NEW owner's bytes: the uid guard has not moved yet"
+  },
+  {
+    "check": "re-describe writes a new uid",
+    "expected": true,
+    "observed": true,
+    "pass": true,
+    "note": ""
+  },
+  {
+    "check": "stale descriptor after re-describe",
+    "expected": [
+      "cuda",
+      0
+    ],
+    "observed": [
+      "cuda",
+      0
+    ],
+    "pass": true,
+    "note": "empty CUDA buffer, no error to the caller"
+  },
+  {
+    "check": "held block not reused after grace",
+    "expected": true,
+    "observed": true,
+    "pass": true,
+    "note": "refcount while held 1"
+  },
+  {
+    "check": "block reused once the reader dropped it",
+    "expected": 2,
+    "observed": 2,
+    "pass": true,
+    "note": ""
+  }
+]

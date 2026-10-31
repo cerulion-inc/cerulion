@@ -2,7 +2,7 @@
 //! # cerulion-wire
 //!
 //! A minimal, dependency-light reader/encoder for the **Cerulion wire
-//! format**: the 32-byte header plus the offset-table framing that carries
+//! format**: the 40-byte header plus the offset-table framing that carries
 //! every Cerulion message on the wire.
 //!
 //! This crate exists so **closed-source** applications (the Cerulion Studio
@@ -34,7 +34,7 @@
 //! ## Wire layout
 //!
 //! ```text
-//! [WireHeader (32 B)][fixed section][offset table (8·N B)][variable payload]
+//! [WireHeader (40 B)][fixed section][offset table (8·N B)][variable payload]
 //! ```
 //!
 //! ## Example
@@ -69,7 +69,7 @@ mod offset;
 
 pub use error::WireError;
 pub use frame::Frame;
-pub use header::WireHeader;
+pub use header::{WireHeader, WIRE_HEADER_VERSION};
 pub use offset::OffsetEntry;
 
 // Byte-layout guards: these MUST match `cerulion_core::wire`. A mismatch here
@@ -77,15 +77,15 @@ pub use offset::OffsetEntry;
 // by `cerulion_core`'s lockstep test.
 const _: () = {
     assert!(
-        core::mem::size_of::<WireHeader>() == 32,
-        "WireHeader must be 32 bytes"
+        core::mem::size_of::<WireHeader>() == 40,
+        "WireHeader must be 40 bytes"
     );
     assert!(
         core::mem::size_of::<OffsetEntry>() == 8,
         "OffsetEntry must be 8 bytes"
     );
     assert!(
-        WireHeader::SIZE == 32,
+        WireHeader::SIZE == 40,
         "WireHeader::SIZE must equal size_of::<WireHeader>()"
     );
     assert!(

@@ -17,7 +17,7 @@
 //! and bagd's `__cerulion/record_health.json`. Consequences that
 //! matter:
 //!
-//! - The Schema record bytes are BYTE-UNCHANGED, so the 18-byte
+//! - The Schema record bytes are BYTE-UNCHANGED, so the
 //!   [`SchemaDescriptor`](crate::SchemaDescriptor) contract, its
 //!   `descriptor_version`, and every existing reader keep working in BOTH
 //!   directions — an old `cerulion` reads a new bag and a new `cerulion` reads

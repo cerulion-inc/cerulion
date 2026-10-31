@@ -13,8 +13,13 @@
 //! publish time of the frame being read (for a held latest-value input, the
 //! held frame's original stamp, which is its freshness).
 //!
-//! The view holds the iceoryx2 sample for its entire lifetime; once the
-//! view drops, the SHM slot is released back to the publisher pool.
+//! A view built by the receive path holds the iceoryx2 sample for its entire
+//! lifetime; once the view drops, the SHM slot is released back to the
+//! publisher pool. A view built by [`super::bounded_view`] instead borrows
+//! bytes its caller already holds and owns no sample, so it releases nothing:
+//! the caller's own borrow is what keeps the slot alive. Which one a view is
+//! shows in its `SampleHandle` variant and nowhere else,
+//! which is the point, because a node reads both the same way.
 
 use std::marker::PhantomData;
 
@@ -25,9 +30,10 @@ use super::shm_sample::SampleHandle;
 
 /// Zero-copy SHM-backed receive handle.
 ///
-/// `'sample` is the lifetime of the held iceoryx2 inbound sample; the
-/// SHM slot stays alive as long as the view is alive. `T: ShmMessage`
-/// is the schema being read.
+/// `'sample` is the lifetime of whatever keeps the bytes alive: the held
+/// iceoryx2 inbound sample on the receive path, or the caller's borrow of an
+/// already-committed slot on the bounded path. Either way the bytes outlive the
+/// view. `T: ShmMessage` is the schema being read.
 ///
 /// # Send / Sync
 ///
@@ -48,9 +54,17 @@ pub struct InputView<'sample, T: ShmMessage + 'sample> {
     sample: SampleHandle<'sample>,
 
     /// SHM-backed reader — the codegen-emitted `<Name><'sample>` type.
-    /// Constructed from `&'sample [u8]` over `[32..total_size]` of the
-    /// sample's payload (after the 32-byte WireHeader).
+    /// Constructed from `&'sample [u8]` over `[WireHeader::SIZE..total_size]` of the
+    /// sample's payload (after the 40-byte WireHeader).
     reader: T::Reader<'sample>,
+
+    /// The frame's wire header, as the checks that admitted the frame parsed it.
+    ///
+    /// Thirty-two bytes carried by value. Every construction site has the parsed
+    /// header in hand one line earlier, and [`Self::wire_header`] hands this copy
+    /// back, so a node body that reads the header costs no second parse of the same
+    /// bytes on a path whose rule is one parse per frame.
+    header: WireHeader,
 
     /// `InputView` must be `!Send` and `!Sync`.
     _not_send: PhantomData<*const ()>,
@@ -60,18 +74,29 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
     /// Construct an `InputView` from an inbound sample and a reader over
     /// its payload.
     ///
-    /// Crate-private: only `CerulionSubscriber::try_view` may call this. A
-    /// node reaches the view only as `self.<input>` inside `tick`.
+    /// Crate-private, with exactly two callers: `CerulionSubscriber::try_view`
+    /// on the receive path and [`super::bounded_view::BoundedFrame::serve_as`]
+    /// on the scheduler-bounded one. A node reaches the view only as
+    /// `self.<input>` inside `tick`, and cannot tell which caller built it.
     ///
     /// The caller is responsible for validating that the sample's
     /// WireHeader's `schema_hash` matches `T::SCHEMA_HASH`. Mismatch
     /// returns `TransportError::SchemaMismatch` from the `try_view`
     /// boundary.
+    ///
+    /// `header` is that validated header. Each caller holds it already: the two
+    /// paths through `validate_wire_frame` take its first return value, and the
+    /// spin read parses the header itself to read the sequence it waits for.
     #[allow(dead_code)] // Constructor used by CerulionSubscriber::try_view.
-    pub(crate) fn new(sample: SampleHandle<'sample>, reader: T::Reader<'sample>) -> Self {
+    pub(crate) fn new(
+        sample: SampleHandle<'sample>,
+        reader: T::Reader<'sample>,
+        header: WireHeader,
+    ) -> Self {
         Self {
             sample,
             reader,
+            header,
             _not_send: PhantomData,
         }
     }
@@ -88,47 +113,22 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
 
     /// The full [`WireHeader`] of the frame this view serves.
     ///
-    /// Parses the 32-byte header off the front of the held SHM frame.
-    /// `self.sample.bytes()` returns the ENTIRE frame INCLUDING the header —
-    /// for a live sample AND for the held-replay path (which serves
-    /// the subscriber-retained frame via `SampleHandle`'s `InboundRef`
-    /// variant) — so for a held latest-value input the header reads the HELD
-    /// frame's ORIGINAL values, unchanged across silent steps.
+    /// A copy of the header the frame checks parsed before this view existed, so
+    /// the accessor is a thirty-two byte read rather than a second parse of the
+    /// same bytes. The header is the SERVED frame's: for a held latest-value input,
+    /// served through `SampleHandle`'s `InboundRef` variant, it carries the held
+    /// frame's original values, unchanged across silent steps.
     ///
-    /// # Infallibility (why the impossible arm does not panic)
+    /// # Infallibility
     ///
-    /// A view is constructed ONLY by `CerulionSubscriber::try_view`'s
-    /// `build_inbound_view`, which validates the header (and its 32-byte
-    /// length) BEFORE the view exists; the held-replay path serves that same
-    /// already-validated frame. So `read_from_buf` cannot return `None` in
-    /// practice. On the by-construction-impossible short-frame arm we do NOT
-    /// silently fabricate a header: a `debug_assert!` fires loudly in dev and
-    /// a `tracing::error!` records it in prod, then a zeroed header is
-    /// returned — a node body must never PANIC through this accessor.
+    /// No failing arm, and nothing fabricated on one. Every view is constructed
+    /// behind checks that parse the header and bound the payload before the view
+    /// exists, on the receive path through `build_inbound_view`, on the
+    /// scheduler-bounded path through `BoundedFrame::serve_as`, and on the spin
+    /// read through its own parse of the sequence it waits for, and each hands that
+    /// header to the constructor.
     pub fn wire_header(&self) -> WireHeader {
-        let bytes = self.sample.bytes();
-        // Loud in dev on the by-construction-impossible short frame (the ONLY
-        // input that makes `read_from_buf` return `None`). In release this is
-        // compiled out and the `unwrap_or_else` below logs + returns a zeroed
-        // header — a node body must never PANIC through this accessor.
-        debug_assert!(
-            bytes.len() >= WireHeader::SIZE,
-            "InputView::wire_header: frame ({} bytes) shorter than \
-             WireHeader::SIZE ({}) — the view was built from a header-validated \
-             sample, so this is impossible",
-            bytes.len(),
-            WireHeader::SIZE,
-        );
-        WireHeader::read_from_buf(bytes).unwrap_or_else(|| {
-            tracing::error!(
-                frame_len = bytes.len(),
-                wire_header_size = WireHeader::SIZE,
-                "InputView::wire_header could not parse a WireHeader from a \
-                 header-validated sample; returning a zeroed header — this is a bug"
-            );
-            // All fields zeroed (schema_hash / sequence / timestamp_ns = 0).
-            WireHeader::new(0, 0, 0)
-        })
+        self.header
     }
 
     /// The wire-header publish timestamp (`timestamp_ns`) of the frame this
@@ -136,11 +136,9 @@ impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
     /// original stamp, which is exactly its freshness (staleness
     /// arbitration compares this against the node's clock).
     ///
-    /// Thin projection over [`Self::wire_header`] (one parse of the same 32
-    /// bytes; no extra cost). On the impossible short-frame arm it returns
-    /// `0` after the loud `wire_header` diagnostic — never panicking.
+    /// One field of the header this view carries.
     pub fn wire_timestamp_ns(&self) -> u64 {
-        self.wire_header().timestamp_ns
+        self.header.timestamp_ns
     }
 }
 
@@ -151,4 +149,151 @@ impl<'sample, T: ShmMessage + 'sample> std::ops::Deref for InputView<'sample, T>
     fn deref(&self) -> &Self::Target {
         &self.reader
     }
+}
+
+/// The wire-frame checks every view construction shares, and the payload range
+/// they prove is in bounds.
+///
+/// ONE copy of the rule. Two call sites build an [`InputView`]: the receive
+/// path, which borrows an iceoryx2 sample, and the scheduler-bounded path in
+/// [`super::bounded_view`], which borrows bytes a producer has just committed.
+/// Both must refuse the same frames for the same reasons, and a second copy of
+/// four bounds checks is exactly how one of them ends up accepting a frame the
+/// other rejects.
+///
+/// Returns the parsed header and the payload range `[WireHeader::SIZE,
+/// total_size)` within `raw`, which the caller may slice without further
+/// checks. Refuses, in this order:
+///
+/// * a frame shorter than the 40-byte header, which has no header to read;
+/// * a header the reader cannot parse;
+/// * a `schema_hash` that is not `T::SCHEMA_HASH`, which means the two ends
+///   disagree about the message's fields and the frame would be MISREAD rather
+///   than merely unfamiliar;
+/// * a `total_size` below the header or past the frame. Checked explicitly
+///   rather than clamped: a `.max(WireHeader::SIZE)` coercion of a malformed
+///   size would silently serve a reader over bytes the producer never wrote.
+pub(crate) fn validate_wire_frame<T: ShmMessage>(
+    topic: &str,
+    raw: &[u8],
+) -> crate::error::TransportResult<(WireHeader, std::ops::Range<usize>)> {
+    let (header, payload) = validate_wire_frame_raw(topic, raw, Some(T::SCHEMA_HASH))?;
+    validate_reader_prefix::<T>(topic, raw, payload.end)?;
+    Ok((header, payload))
+}
+
+/// The two checks of [`validate_wire_frame`] that depend on the schema type:
+/// `total_size` leaves room for `T`'s fixed section and offset table, and the
+/// frame starts 8-aligned. Shared with the spin receive path, which parses the
+/// header itself.
+pub(crate) fn validate_reader_prefix<T: ShmMessage>(
+    topic: &str,
+    raw: &[u8],
+    total_size: usize,
+) -> crate::error::TransportResult<()> {
+    use crate::error::TransportError;
+
+    // The reader `T::build_reader` returns REINTERPRETS the payload bytes. A
+    // fixed-schema reader (`&<Name>Shm`) ASSERTS on a buffer too small for the
+    // fixed section and on one whose start is misaligned, and an assert in a
+    // reader is a panic in a node body. A variable-schema reader reads such a
+    // buffer from a heap copy instead, which would put an allocation on the
+    // receive path. Both conditions are refused HERE with a reason.
+    //
+    // A frame a publisher wrote always satisfies both, which is why the frames
+    // in front of these checks are the malformed ones: a header claiming a
+    // `total_size` with no room for the fields it names, and a slice a caller
+    // handed over at an address the wire format does not put frames at.
+    let required = crate::wire::frame_prefix_size(T::WIRE_FIXED_SIZE, T::VARIABLE_FIELD_COUNT)
+        .ok_or_else(|| TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "schema fixed size {} with {} variable field(s) overflows a wire frame",
+                T::WIRE_FIXED_SIZE,
+                T::VARIABLE_FIELD_COUNT,
+            ),
+        })?;
+    if total_size < required {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "wire header total_size {total_size} leaves no room for the schema: a {} \
+                 byte fixed section plus {} offset table entry/entries needs {required}",
+                T::WIRE_FIXED_SIZE,
+                T::VARIABLE_FIELD_COUNT,
+            ),
+        });
+    }
+    const WIRE_ALIGN: usize = crate::shm_runtime::FRAME_ALIGN;
+    if raw.as_ptr().align_offset(WIRE_ALIGN) != 0 {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "frame is not {WIRE_ALIGN}-byte aligned, which the wire format requires \
+                 and a zero-copy reader cannot work around"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The untyped core of [`validate_wire_frame`]: the checks that need no
+/// schema type, shared with the raw read path (`CerulionSubscriber::view_raw`)
+/// so a frame the typed path refuses is refused by the raw path too, for the
+/// same reason and with the same words.
+///
+/// Parses the 40-byte header exactly once and returns it with the payload
+/// range `[WireHeader::SIZE, total_size)`; every later consumer of the header
+/// on this read (the service cursor, the host that needs the schema hash)
+/// takes this copy instead of re-reading the bytes. Refuses, in this order:
+///
+/// * a frame shorter than the header;
+/// * a header the reader cannot parse;
+/// * when `expected_schema_hash` is given, a `schema_hash` that differs
+///   from it. A raw read that passes `None` accepts any schema and leaves the
+///   hash to its caller;
+/// * a `total_size` below the header or past the frame.
+pub(crate) fn validate_wire_frame_raw(
+    topic: &str,
+    raw: &[u8],
+    expected_schema_hash: Option<u64>,
+) -> crate::error::TransportResult<(WireHeader, std::ops::Range<usize>)> {
+    use crate::error::TransportError;
+
+    if raw.len() < WireHeader::SIZE {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "undersized message: {} bytes, need at least {}",
+                raw.len(),
+                WireHeader::SIZE,
+            ),
+        });
+    }
+    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
+        topic: topic.to_string(),
+        reason: "failed to parse WireHeader from received message".to_string(),
+    })?;
+    if let Some(expected_hash) = expected_schema_hash {
+        if header.schema_hash != expected_hash {
+            return Err(TransportError::SchemaMismatch {
+                topic: topic.to_string(),
+                expected_hash,
+                actual_hash: header.schema_hash,
+            });
+        }
+    }
+    let total_size = header.total_size as usize;
+    if total_size < WireHeader::SIZE || total_size > raw.len() {
+        return Err(TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
+                total_size,
+                raw.len(),
+                WireHeader::SIZE,
+            ),
+        });
+    }
+    Ok((header, WireHeader::SIZE..total_size))
 }

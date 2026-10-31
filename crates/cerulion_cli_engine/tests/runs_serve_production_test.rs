@@ -134,6 +134,7 @@ fn a_run_written_by_the_production_descriptor_is_served_with_its_artifacts_verba
     let graph_yaml = "name: served\nprefix: served\nnodes: []\n";
 
     let descriptor = start_run_descriptor(RunDescriptorSpec {
+        chains: None,
         run_id: mint_run_id(),
         graph_name: "served",
         run_started_at_ns: started_at,
@@ -246,6 +247,7 @@ fn a_run_that_ended_leaves_no_trace_in_the_served_answer() {
     let gateway = gateway_on_the_global_namespace("ended");
 
     let descriptor = start_run_descriptor(RunDescriptorSpec {
+        chains: None,
         run_id: mint_run_id(),
         graph_name: "ending",
         run_started_at_ns: 42,

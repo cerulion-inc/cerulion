@@ -67,11 +67,28 @@ const WALKED: [&str; 3] = [
 
 /// Calls that must name a `ReadSiteRole::` literal.
 ///
-/// 29 in `subscriber.rs` (22 mint arms + the 7 `drain_samples` call sites,
+/// 32 in `subscriber.rs` (25 mint arms + the 7 `drain_samples` call sites,
 /// which are where the batch path's constant is named), 1 in `runtime.rs` (the
 /// `stage_read_outcomes_for_test` seam) and 2 in `scheduler/mod.rs` (its
 /// in-module merge tests). Re-count with the failure message, never by editing
 /// this number to match.
+///
+/// It went 32 -> 35 with the every-consult record (trace format 7): a consult
+/// that found its queue EMPTY stages a `Drain`-role `NoFrame` at a LITERAL
+/// popped 0 (a non-decimated empty drain delivered no frame and the junk it
+/// skipped is subtracted, so the pop count at these arms is zero), on three
+/// arms that were silent: `drain_for_trigger`'s `FrozenSlot::Empty`,
+/// `sync_discard_head`'s refill `FrozenSlot::Empty`, and
+/// `sync_peek_next_stamp`'s plain (undecimated) Empty, which split off the
+/// `Decimated` mint it shared a call with. All three stage at the BOUNDARY site
+/// only: a post-fire refill pass runs on the recording side alone (a planned
+/// `Data` fire asks the refill hook only between its fires and never makes the
+/// terminal probe, and a planned Sync fire runs no align pass at all), so each
+/// takes its site as an argument from its caller and a record there would hold a
+/// position no replay can fill. Each reads the stage's consult rule
+/// through `consult_capture_armed` before staging. Its capture arms are
+/// `read_outcome_capture_iox2_test`'s drain-site arms (the per-step tables
+/// carry the empty consult's record from this format on).
 ///
 /// It went 30 -> 32 with the format-5 peek/head mark: the per-set
 /// Sync matcher's PROMOTION (`sync_discard_head`) now stages a record of its
@@ -82,14 +99,16 @@ const WALKED: [&str; 3] = [
 /// `the_sync_matchers_descent_pops_are_drain_site_reads` (which now
 /// asserts the promotion row on BOTH legs) and
 /// `a_non_improving_peek_is_marked_a_peek_not_the_head`.
-const DECLARED_LITERAL_MINTS: usize = 32;
+const DECLARED_LITERAL_MINTS: usize = 35;
 
-/// Calls that FORWARD a `role` parameter rather than naming one — all four in
-/// `subscriber.rs`: the two `stage_read_outcome*` helper bodies, and the two
-/// `DrainedBatch` mints inside `drain_samples`, which pass that function's own
-/// `role` parameter through to them. Every one of those four is reached only
-/// from a site this walk ALSO checks, so the chain bottoms out in a literal.
-const DECLARED_FORWARDING_MINTS: usize = 4;
+/// Calls that FORWARD a `role` parameter rather than naming one, all six in
+/// `subscriber.rs`: the two `stage_read_outcome*` helper bodies, and the four
+/// mints inside `drain_samples` (the two `DrainedBatch` mints, plus the two
+/// `NoFrame` mints the every-consult record added at the gate's withheld
+/// return and at a zero-delivery drain), which pass that function's own `role`
+/// parameter through to them. Every one of those six is reached only from a
+/// site this walk ALSO checks, so the chain bottoms out in a literal.
+const DECLARED_FORWARDING_MINTS: usize = 6;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

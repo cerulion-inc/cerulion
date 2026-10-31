@@ -8,7 +8,8 @@
 //! hostname or `CERULION_ROBOT_IDENTITY` override, NOT the graph prefix); a
 //! discovering
 //! CLI browses the same service type and hands each resolved instance to
-//! the [`crate::discovery_ladder`] as an `Mdns`-rung [`DiscoveredPeer`].
+//! the [`crate::discovery_ladder`] as an `Mdns`-rung
+//! [`cerulion_discovery::ladder::DiscoveredPeer`].
 //!
 //! Both halves are ADDITIVE overlays: an advertise/browse failure is a loud
 //! `tracing::warn!` and the caller keeps serving / falls back to the other
@@ -25,20 +26,19 @@
 //! same /24). netd must advertise too — and `cerulion_cli_engine` depends on
 //! `cerulion_netd`, so netd cannot import the beacon from here (cyclic package
 //! edge). The advertise therefore lives in the leaf crate
-//! [`cerulion_mdns`], once, and both processes link it; the BROWSE half stays
-//! here (netd never browses, and these functions return
-//! `cerulion_discovery::DiscoveredPeer` and normalize eids through the CLI's own
-//! [`crate::connect_cmd::normalize_eid`] seam).
+//! [`cerulion_mdns`], once, and both processes link it. The bounded browse
+//! ([`browse_rung`]) moved there too, because netd's boot-time peer fold browses
+//! as well; it is re-exported here for the ladder. The `eid=` reader
+//! ([`resolve_robot_eid`]) stays here: it normalizes eids through the CLI's own
+//! [`crate::connect_cmd::normalize_eid`] seam.
 //!
 //! [`advertise_gateway`] below is a thin adapter that keeps the CLI's
 //! `CliError` surface byte-unchanged for `graph run-gateway`.
 
-use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
-use crate::discovery_ladder::{DiscoveredPeer, DiscoveryRung};
 use crate::error::CliError;
 
 // ONE definition of the service type, in the crate the ADVERTISER
@@ -55,6 +55,10 @@ use crate::error::CliError;
 // a `pub use` escapes `dead_code = deny`, so an unused re-export is invisible
 // dead surface rather than a build failure.
 pub use cerulion_mdns::{MdnsAdvertiseGuard, CERULION_SERVICE_TYPE};
+// The bounded browse lives in `cerulion_mdns` so `cerulion-netd`'s boot fold
+// runs the same record-to-locator mapping as the ladder.
+use cerulion_mdns::instance_from_fullname;
+pub use cerulion_mdns::{browse_rung, browse_rung_report, BrowseRungReport};
 
 use cerulion_mdns::{advertise_gateway as advertise_gateway_raw, is_valid_eid};
 
@@ -68,78 +72,6 @@ use cerulion_mdns::{advertise_gateway as advertise_gateway_raw, is_valid_eid};
 /// NOT the graph prefix (the TXT `robot=` value).
 pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, CliError> {
     advertise_gateway_raw(robot, port).map_err(|e| CliError::Validation(e.to_string()))
-}
-
-/// Browse `_cerulion._tcp` for up to `budget`, returning every resolved
-/// robot as an `Mdns`-rung [`DiscoveredPeer`]. Best-effort: a daemon-start
-/// or browse failure is a loud `tracing::warn!` and an EMPTY vec (discovery
-/// continues on the other rungs) — NEVER an `Err`, never a panic. The daemon
-/// is shut down before returning.
-pub fn browse_rung(budget: Duration) -> Vec<DiscoveredPeer> {
-    let daemon = match ServiceDaemon::new() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "mDNS: cannot start the ServiceDaemon to browse `_cerulion._tcp` — robot discovery continues on the other rungs (cache, hostname)"
-            );
-            return Vec::new();
-        }
-    };
-    let receiver = match daemon.browse(CERULION_SERVICE_TYPE) {
-        Ok(rx) => rx,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "mDNS: cannot browse `_cerulion._tcp` — robot discovery continues on the other rungs (cache, hostname)"
-            );
-            let _ = daemon.shutdown();
-            return Vec::new();
-        }
-    };
-
-    let mut peers: Vec<DiscoveredPeer> = Vec::new();
-    let deadline = Instant::now() + budget;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline - now;
-        // `recv_timeout` returns Err on BOTH a clean window-timeout and a
-        // sender disconnect. Split them by the receiver's own disconnect state
-        // — a method call, avoiding any need to name flume's transitive-only
-        // `RecvTimeoutError` type (flume is an mdns-sd dependency, not a direct
-        // one). A plain timeout is the normal window end (break quietly); a
-        // disconnect means the ServiceDaemon's background thread died mid-browse
-        // (abnormal — we own the daemon and have NOT shut it down yet), which
-        // today silently looks like "no robots". Warn loudly, name that results
-        // may be PARTIAL + the escape, then break.
-        match receiver.recv_timeout(remaining) {
-            Ok(ServiceEvent::ServiceResolved(resolved)) => {
-                let addrs: Vec<IpAddr> =
-                    resolved.addresses.iter().map(|a| a.to_ip_addr()).collect();
-                let robot_txt = resolved.get_property_val_str("robot");
-                peers.extend(peer_from_resolved(
-                    robot_txt,
-                    &resolved.fullname,
-                    &addrs,
-                    resolved.port,
-                ));
-            }
-            Ok(_) => continue,
-            Err(_) => {
-                if receiver.is_disconnected() {
-                    tracing::warn!(
-                        "mDNS: the `_cerulion._tcp` browse daemon died mid-browse — robot discovery results may be PARTIAL; if an expected robot is missing, reach it directly with `--connect tcp/<host>:7683`"
-                    );
-                }
-                break;
-            }
-        }
-    }
-    let _ = daemon.shutdown();
-    peers
 }
 
 /// Resolve a robot NAME to its iroh endpoint id (hex) by browsing
@@ -223,61 +155,9 @@ pub fn pick_eid_for_name(records: &[(String, Option<String>)], name: &str) -> Op
     })
 }
 
-/// Recover the instance name from a resolved fullname by stripping the
-/// `.<service-type>` suffix (`myrobot._cerulion._tcp.local.` → `myrobot`).
-/// The TXT-`robot` fallback when a peer advertised no `robot=` property.
-fn instance_from_fullname(fullname: &str) -> String {
-    let suffix = format!(".{CERULION_SERVICE_TYPE}");
-    fullname
-        .strip_suffix(&suffix)
-        .unwrap_or(fullname)
-        .to_string()
-}
-
-/// Map ONE resolved mDNS record → zero or more [`DiscoveredPeer`]s. The
-/// record→peer seam `browse_rung` delegates to (PURE — hand-oracle tested):
-///
-/// - `robot` = the TXT `robot=` value, or the fullname's instance name when
-///   absent.
-/// - Address selection PREFERS IPv4: if the record carries any IPv4 address,
-///   one peer is emitted per IPv4 address (`tcp/<ip>:<port>`); only when the
-///   record is IPv6-ONLY are the IPv6 addresses used (bracket form
-///   `tcp/[<ip>]:<port>`). No addresses ⇒ no peers.
-fn peer_from_resolved(
-    robot_txt: Option<&str>,
-    fullname: &str,
-    addrs: &[IpAddr],
-    port: u16,
-) -> Vec<DiscoveredPeer> {
-    let robot = robot_txt
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| instance_from_fullname(fullname));
-    let v4: Vec<&IpAddr> = addrs.iter().filter(|a| a.is_ipv4()).collect();
-    let chosen: Vec<&IpAddr> = if v4.is_empty() {
-        addrs.iter().filter(|a| a.is_ipv6()).collect()
-    } else {
-        v4
-    };
-    chosen
-        .into_iter()
-        .map(|ip| {
-            let locator = match ip {
-                IpAddr::V4(v4) => format!("tcp/{v4}:{port}"),
-                IpAddr::V6(v6) => format!("tcp/[{v6}]:{port}"),
-            };
-            DiscoveredPeer {
-                robot: robot.clone(),
-                locator,
-                rung: DiscoveryRung::Mdns,
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn pick_eid_for_name_selects_the_matching_valid_eid() {
@@ -366,80 +246,5 @@ mod tests {
             None,
             "0X (uppercase prefix) is NOT stripped — identical to normalize_eid"
         );
-    }
-
-    #[test]
-    fn instance_from_fullname_strips_service_suffix() {
-        assert_eq!(
-            instance_from_fullname("myrobot._cerulion._tcp.local."),
-            "myrobot"
-        );
-        // A fullname WITHOUT the suffix is returned verbatim (defensive).
-        assert_eq!(instance_from_fullname("bare-name"), "bare-name");
-    }
-
-    #[test]
-    fn peer_from_resolved_uses_txt_robot_value() {
-        let addrs = [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7))];
-        let peers = peer_from_resolved(
-            Some("robotA"),
-            "ignored._cerulion._tcp.local.",
-            &addrs,
-            7683,
-        );
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].robot, "robotA");
-        assert_eq!(peers[0].locator, "tcp/192.168.1.7:7683");
-        assert_eq!(peers[0].rung, DiscoveryRung::Mdns);
-    }
-
-    #[test]
-    fn peer_from_resolved_falls_back_to_instance_name_when_no_txt() {
-        let addrs = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))];
-        let peers = peer_from_resolved(None, "myrobot._cerulion._tcp.local.", &addrs, 7683);
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].robot, "myrobot");
-        assert_eq!(peers[0].locator, "tcp/10.0.0.1:7683");
-    }
-
-    #[test]
-    fn peer_from_resolved_prefers_ipv4_over_ipv6() {
-        // A dual-stack record: v4 wins, the v6 sibling is dropped → ONE peer.
-        let addrs = [
-            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)),
-        ];
-        let peers = peer_from_resolved(Some("dual"), "dual._cerulion._tcp.local.", &addrs, 7683);
-        assert_eq!(peers.len(), 1, "v4 preference collapses the v6 sibling");
-        assert_eq!(peers[0].locator, "tcp/192.168.1.7:7683");
-    }
-
-    #[test]
-    fn peer_from_resolved_uses_ipv6_bracket_form_when_v6_only() {
-        let addrs = [IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))];
-        let peers = peer_from_resolved(Some("v6"), "v6._cerulion._tcp.local.", &addrs, 7683);
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].locator, "tcp/[fe80::1]:7683");
-        assert_eq!(peers[0].rung, DiscoveryRung::Mdns);
-    }
-
-    #[test]
-    fn peer_from_resolved_emits_one_peer_per_v4_address() {
-        let addrs = [
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)),
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 8)),
-        ];
-        let peers = peer_from_resolved(Some("multi"), "multi._cerulion._tcp.local.", &addrs, 7683);
-        // Input Vec order is preserved by the map → deterministic oracle.
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].locator, "tcp/192.168.1.7:7683");
-        assert_eq!(peers[1].locator, "tcp/192.168.1.8:7683");
-        assert!(peers.iter().all(|p| p.robot == "multi"));
-    }
-
-    #[test]
-    fn peer_from_resolved_empty_addrs_yields_no_peers() {
-        let peers = peer_from_resolved(Some("x"), "x._cerulion._tcp.local.", &[], 7683);
-        assert!(peers.is_empty());
     }
 }

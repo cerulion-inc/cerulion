@@ -52,6 +52,8 @@ fn ext_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn No
         identity: "ext".to_string(),
         prefix: "extg".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "ext_consumer".to_string(),
@@ -231,6 +233,8 @@ fn topic_override_publishes_under_absolute_name_with_single_writer() {
         prefix: "tfg".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "broadcaster".to_string(),
                 node_type: "tf_broadcaster".to_string(),
@@ -244,6 +248,8 @@ fn topic_override_publishes_under_absolute_name_with_single_writer() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "localizer".to_string(),
                 node_type: "ext_consumer".to_string(),

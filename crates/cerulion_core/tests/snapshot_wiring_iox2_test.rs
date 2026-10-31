@@ -159,6 +159,8 @@ fn snap_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -172,6 +174,8 @@ fn snap_graph(
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "snap_consumer".to_string(),
@@ -338,6 +342,8 @@ fn fire_gating_skips_snapshot_on_non_fire_steps() {
         prefix: "snapfg".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -351,6 +357,8 @@ fn fire_gating_skips_snapshot_on_non_fire_steps() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ext_snap_consumer".to_string(),
@@ -535,6 +543,8 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer_plain".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -548,6 +558,8 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer_block".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -562,6 +574,8 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
             },
             // Consumer declared LAST → ticks after both producers within level 0.
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "dual_input_consumer".to_string(),
@@ -772,6 +786,8 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
         nodes: vec![
             // level 0
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -780,6 +796,8 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
             },
             // level 1
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "trig_a".to_string(),
                 node_type: "forward_node".to_string(),
@@ -790,6 +808,8 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "trig_b".to_string(),
                 node_type: "forward_node".to_string(),
@@ -801,6 +821,8 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
             },
             // level 2: qsib declared BEFORE cons → qsib ticks first within level 2
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "qsib".to_string(),
                 node_type: "forward_node".to_string(),
@@ -811,6 +833,8 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "trig_plain_consumer".to_string(),
@@ -984,6 +1008,8 @@ fn run_sample(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64)> {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -991,6 +1017,8 @@ fn run_sample(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64)> {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "sample_consumer".to_string(),
@@ -1111,6 +1139,8 @@ fn flat_and_level_executors_produce_byte_identical_traces() {
         let nodes: Vec<NodeDef> = IDS
             .iter()
             .map(|id| NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
                 node_type: "snap_producer".to_string(),
@@ -1260,6 +1290,8 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
         nodes: vec![
             // level 0
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "snap_producer".to_string(),
@@ -1268,6 +1300,8 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
             },
             // level 1
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "trig_a".to_string(),
                 node_type: "forward_node".to_string(),
@@ -1278,6 +1312,8 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "trig_b".to_string(),
                 node_type: "forward_node".to_string(),
@@ -1289,6 +1325,8 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
             },
             // level 2: qsib declared BEFORE scons → qsib ticks first within level 2
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "qsib".to_string(),
                 node_type: "forward_node".to_string(),
@@ -1299,6 +1337,8 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "scons".to_string(),
                 node_type: "sync_trig_plain_consumer".to_string(),

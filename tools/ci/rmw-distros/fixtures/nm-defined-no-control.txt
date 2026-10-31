@@ -1,0 +1,9 @@
+0000000000031c80 T rmw_shutdown
+0000000000031d40 T rmw_context_fini
+0000000000032010 T rmw_create_node
+00000000000320f0 T rmw_create_publisher
+0000000000032440 T rmw_publish
+0000000000033220 T rmw_take_with_info
+0000000000033990 T rmw_get_implementation_identifier
+00000000000a2b30 D _edata
+00000000000a2b40 B __bss_start

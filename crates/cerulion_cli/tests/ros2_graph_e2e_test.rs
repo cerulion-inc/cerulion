@@ -18,6 +18,12 @@
 //! half of the mixed graph). `#[serial]`: the real binary joins the default
 //! iceoryx2 namespace; unique prefixes per test.
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -170,6 +176,10 @@ impl Sandbox {
             .env("CERULION_NETWORK", "off")
             .env("RUST_LOG", "cerulion=info,cerulion_cli_engine=info")
             .env_remove("CARGO_TARGET_DIR")
+            // HERMETIC on the execution mode: REMOVED, never inherited. The
+            // multi-process arm here is a SUPERVISOR run and free-runs by
+            // default; on the `--single-process` arms the variable is inert.
+            .env_remove("CERULION_EXECUTION_MODE")
             .env_remove("CERULION_ROS2_PRELOAD")
             // The login gate is on by default; this file is not about the gate.
             .env("CERULION_LOGIN_GATE", "off")

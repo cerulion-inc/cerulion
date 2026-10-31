@@ -1,0 +1,237 @@
+{
+  "fixtureVersion": 1,
+  "description": "Public protocol oracles and adversarial witnesses. No production secrets. Hash expectations use the specified bytes and SHA-256, independently of the application implementation.",
+  "accountNamespaceHex": "636572756c696f6e3a73757061626173652d6163636f756e743a763100",
+  "accounts": [
+    {
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "uuidBytesHex": "00000000000000000000000000000000",
+      "accountHex": "66669b3d9f280a257bfe9a4bf746fb845af9b8b03d0c020e6a15a9b6bc0764cc",
+      "accountBase64url": "ZmabPZ8oCiV7_ppL90b7hFr5uLA9DAIOahWptrwHZMw"
+    },
+    {
+      "uuid": "00112233-4455-4677-8899-aabbccddeeff",
+      "uuidBytesHex": "00112233445546778899aabbccddeeff",
+      "accountHex": "021f0a006866fde5256f57cfad02a022fae9e8e473a6e4d3a471f1f4bd83e917",
+      "accountBase64url": "Ah8KAGhm_eUlb1fPrQKgIvrp6ORzpuTTpHHx9L2D6Rc"
+    },
+    {
+      "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      "uuidBytesHex": "ffffffffffffffffffffffffffffffff",
+      "accountHex": "fe8659687e439fce595e6095b20a6fda27d2f8b1a77399e44c8b7a271664025b",
+      "accountBase64url": "_oZZaH5Dn85ZXmCVsgpv2ifS-LGnc5nkTIt6JxZkAls"
+    }
+  ],
+  "proofOfPossession": {
+    "purpose": "device-registration",
+    "accountHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "publicKeyHex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "challenge": "challenge_0-",
+    "payloadHex": "16000000636572756c696f6e2f6465766963652d706f702f7631130000006465766963652d726567697374726174696f6e20000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f0c0000006368616c6c656e67655f302d"
+  },
+  "ed25519": [
+    {
+      "name": "rfc8032-empty-message",
+      "source": "https://www.rfc-editor.org/rfc/rfc8032#section-7.1",
+      "testOnlySeedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": true
+    },
+    {
+      "name": "rfc8032-single-byte",
+      "source": "https://www.rfc-editor.org/rfc/rfc8032#section-7.1",
+      "testOnlySeedHex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "publicKeyHex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "messageHex": "72",
+      "signatureHex": "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+      "strictAccepted": true
+    },
+    {
+      "name": "cofactored-only-equation",
+      "description": "A=B+T for the order-four point encoded as all zeroes; R=2B and S=2+H(R||A||M) mod L. k mod4 is nonzero, so the uncofactored equation fails.",
+      "publicKeyHex": "5252cc0a7f208133b620acbd4537eba2a4123bf0a8c2e4f980c3b31bb69765ea",
+      "messageHex": "6d697865642d6f72646572207769746e6573732030",
+      "signatureHex": "c9a3f86aae465f0e56513864510f3997561fa2c9e85ea21dc2292309f3cd60225f806d6361ab05cc2bc87687c43cdebc872d1a2c07c471922eb21470099e640e",
+      "strictAccepted": false
+    },
+    {
+      "name": "mixed-order-valid-equation",
+      "description": "Same A=B+T,R=2B construction, with k mod4 zero. Dalek strict allows this valid mixed-order key; a torsion-free-only check would over-restrict it.",
+      "publicKeyHex": "5252cc0a7f208133b620acbd4537eba2a4123bf0a8c2e4f980c3b31bb69765ea",
+      "messageHex": "6d697865642d6f72646572207769746e6573732036",
+      "signatureHex": "c9a3f86aae465f0e56513864510f3997561fa2c9e85ea21dc2292309f3cd6022fe383ab507f1dd17e7f7a82366cfd826c3f6b23d1843df395d9750507af5110a",
+      "strictAccepted": true
+    },
+    {
+      "name": "identity-key-and-R",
+      "publicKeyHex": "0100000000000000000000000000000000000000000000000000000000000000",
+      "messageHex": "636572756c696f6e2070616972696e67207061726974792070726f6265",
+      "signatureHex": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "strictAccepted": false
+    },
+    {
+      "name": "non-small-order-key-with-identity-R",
+      "description": "A is the base point, R is identity, S is SHA512(R||A||M) mod L. Mathematically valid equation; strict verification rejects small-order R.",
+      "publicKeyHex": "5866666666666666666666666666666666666666666666666666666666666666",
+      "messageHex": "70616972696e6720737472696374207a65726f206e6f6e6365",
+      "signatureHex": "0100000000000000000000000000000000000000000000000000000000000000daa764ee8e06fd215e683e956a4af9c8e38a862028802f59d11da40f8bdd5500",
+      "strictAccepted": false
+    },
+    {
+      "publicKeyHex": "",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "key-length-0"
+    },
+    {
+      "publicKeyHex": "00",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "key-length-1"
+    },
+    {
+      "publicKeyHex": "00000000000000000000000000000000000000000000000000000000000000",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "key-length-31"
+    },
+    {
+      "publicKeyHex": "000000000000000000000000000000000000000000000000000000000000000000",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "key-length-33"
+    },
+    {
+      "publicKeyHex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "key-length-64"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "",
+      "strictAccepted": false,
+      "name": "signature-length-0"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "00",
+      "strictAccepted": false,
+      "name": "signature-length-1"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "strictAccepted": false,
+      "name": "signature-length-32"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "strictAccepted": false,
+      "name": "signature-length-63"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "strictAccepted": false,
+      "name": "signature-length-65"
+    },
+    {
+      "publicKeyHex": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-key-p-plus-0",
+      "publicKeyDecodes": true,
+      "publicKeySmallOrder": true
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-R-p-plus-0"
+    },
+    {
+      "publicKeyHex": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-key-p-plus-1",
+      "publicKeyDecodes": true,
+      "publicKeySmallOrder": true
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-R-p-plus-1"
+    },
+    {
+      "publicKeyHex": "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-key-p-plus-2",
+      "publicKeyDecodes": false
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-R-p-plus-2"
+    },
+    {
+      "publicKeyHex": "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-key-p-plus-3",
+      "publicKeyDecodes": true,
+      "publicKeySmallOrder": false
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "noncanonical-R-p-plus-3"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010",
+      "strictAccepted": false,
+      "name": "noncanonical-S-order"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "strictAccepted": false,
+      "name": "noncanonical-S-maximum"
+    },
+    {
+      "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "messageHex": "00",
+      "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+      "strictAccepted": false,
+      "name": "wrong-message"
+    }
+  ]
+}

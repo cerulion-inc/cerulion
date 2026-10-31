@@ -20,7 +20,7 @@ ONE 32-byte SECRET seeds both the iroh endpoint and the pairing
 `DeviceIdentity` (`client.rs::from_seed` consumes it), and its PUBLIC half
 doubles as the iroh `EndpointId` and the pairing transport public key; the
 seed is never the public half. iroh multiplexes both ALPNs on that endpoint
-(`cerulion_link::alpn`: `cerulion/wire/1` = raw topic frames, `cerulion/ops/1` =
+(`cerulion_link::alpn`: `cerulion/wire/2` = raw topic frames, `cerulion/ops/1` =
 ops verbs; the trailing `/1` is each plane's protocol-version boundary). Exactly
 one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accept
 (`daemon::handle_accepted`; pinned over real loopback endpoints by
@@ -44,24 +44,42 @@ one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accep
 
 | Crate | Side | License | In `default-members`? | Role |
 |---|---|---|---|---|
-| `cerulion_pairing` | both | MIT OR Apache-2.0 | yes | formats + crypto + state machines ONLY; no network I/O, no iroh dep (embeds in firmware and in the closed Studio client) |
+| `cerulion_pairing` | both | MIT OR Apache-2.0 | yes | formats + crypto + state machines, plus the machine identity files (`identity`: config directory, machine key, high-water file); no network I/O, no iroh dep (embeds in firmware and in the closed Studio client) |
 | `cerulion_link` | both | MIT OR Apache-2.0 | **no** (pulls iroh, ~390 crates) | thin iroh wrapper: endpoints, dial, framing, relay seam, ops-stream adapter; never depends on `cerulion_core` |
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
+| `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, and the protocol-only `OpsClient`; depends on serde, serde_json and thiserror only |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust |
-| `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/1` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
+| `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
 | `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the `cerulion connect`/`pair` worker binary (session driver + CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
 
 Load-bearing boundary contracts:
 
-- **The AGPL/closed boundary is a PROCESS boundary**: the closed Studio spawns
+- **The AGPL/closed boundary for the connect worker is a PROCESS boundary**: the closed Studio spawns
   the AGPL `cerulion-connectd` binary exactly as it spawns the gateway/vizd
   (`crates/cerulion_connectd/src/lib.rs`; the CLI side is pure argv resolution in
   `cerulion_cli_engine::connect_cmd`; the `cerulion` CLI stays iroh-free).
-  *License placement itself has no enforcing test; verified against the SPDX
-  headers + `Cargo.toml` license fields.*
-- **`cerulion-wire` deliberately duplicates the wire structs** (32-byte header,
+  The permissive crates never depend on an AGPL crate:
+  `the_permissive_crates_reach_no_agpl_crate`
+  (`crates/cerulion_hygiene/tests/dependency_rules_test.rs`) reads every
+  member's `license` from `cargo metadata` and fails if a `MIT OR Apache-2.0`
+  member reaches any member not licensed exactly `MIT OR Apache-2.0` over
+  normal or build edges.
+- **The ops protocol is a CRATE boundary**: the `cerulion/ops/1` wire types and
+  the protocol-only client live in `cerulion_ops_proto` (MIT OR Apache-2.0), so a
+  closed client links them without linking `cerud`. `cerud` depends on it and
+  re-exports the types and constants at their old paths (`cerud::protocol::{Hello,
+  HandshakeReply, Request, Response, ..}`, `cerud::verbs::inventory::Inventory`);
+  `cerud::protocol`'s frame and codec functions and `cerud::client::OpsClient`
+  call the `cerulion_ops_proto` ones and convert `OpsProtoError` into the
+  `CerudError` variant of the same name. `Response::from_error` takes any
+  `ErrorKind + Display` error, and `cerud` implements `ErrorKind` with
+  `CerudError::kind`, so the `kind` strings stay in `cerud`. The bytes are
+  pinned to golden frames in
+  `crates/cerulion_ops_proto/tests/fixtures/ops_wire_golden.txt` by
+  `crates/cerulion_ops_proto/tests/wire_golden_test.rs`.
+- **`cerulion-wire` deliberately duplicates the wire structs** (40-byte header,
   8-byte offset entry) so the permissive decode seam stands alone. Byte
   compatibility is pinned by `crates/cerulion_core/tests/wire_lockstep_test.rs` (the
   real writer encodes, this crate re-parses) plus in-crate `const` size asserts.
@@ -149,6 +167,20 @@ axes postcard is lenient about: a wrong leading version is refused BY NAME, and
 trailing bytes are a loud error (`format_vectors_test.rs`, including
 `an_unversioned_epoch_envelope_is_refused_loudly`).
 
+- **Team trust formats** (`cerulion_pairing::team`, pure, nothing calls them
+  yet): the X.509 profile for machine leaves (`<role>.g<N>.<team>.cerulion.invalid`,
+  ed25519, extKeyUsage serverAuth plus clientAuth always written, robot leaves
+  with notAfter `99991231235959Z`) and team issuing CAs (self-signed, CA with
+  path length 0), written by a hand-rolled DER encoder and read back by the strict
+  `check_leaf` / `check_team_ca`; the intermediate-signed `TeamTrustBundle`
+  (`cerulion-pairing:team-trust:v1`: the current issuing CA, the next
+  generation's CA published one rotation ahead, retired CAs and robot leaves),
+  `TeamStatusList` and `StatusFreshness`
+  (`cerulion-pairing:team-status:v1`, told apart by a kind byte); and the pure
+  anti-rollback decisions in `team::rollback`. Pinned by `team_formats_test.rs`
+  against x509-parser, rustls-webpki, rcgen-built refusals and hand-built
+  signing bytes.
+
 ## 5. The robot accept gate (`cerulion_remoted`)
 
 `PairingAuthorizer` (`authorizer.rs`) is pure over the live `SharedTrust`: map
@@ -158,6 +190,49 @@ by cell in `authorizer_matrix_test.rs`; the accept-time routing over real
 endpoints is `loopback_test.rs` (`wire_unpaired_key_is_refused`,
 `ops_unpaired_key_reaches_bootstrap_only`,
 `unclaimed_robot_wire_refused_ops_bootstrap_only`).
+
+A `DemandSubject::Lan` carries no paired identity, so `PairingAuthorizer`
+admits it. The LAN posture lives in front of every serving plane instead:
+`NetworkManager` retains `LanAccess` separately from the caller-installed inner
+authorizer and applies the posture in front of it. It refuses every LAN subject
+under `LanAccess::Paired` (`CERULION_LAN_ACCESS`, the Android default, and the
+Android app's `lan_access` key) and defers other subjects to the inner
+authorizer. `set_demand_authorizer` replaces only the inner authorizer;
+`set_lan_access` changes the posture. The liveliness watch, the demand queryable
+and the reconcile belt all consult the layered gate, so no demand path enables
+egress the gate refused. `set_lan_access(Paired)` also closes the bridge manager
+with `TopicBridgeManager::set_lan_closed`, atomically revoking enabled egress
+and preventing every demand path from re-enabling it, then waits out any
+in-flight gateway forwarding pass so no frame leaves after the close returns.
+The posture gates the write direction too. Under `Paired` an ingress
+registration declares no zenoh data subscriber and no demand token, and the
+receive callback refuses and counts (`IngressStats::lan_refused_drops`) any
+frame that still reaches it. `set_lan_access(Paired)` suspends every live
+ingress entry (undeclares both, keeps the injector and its counters) and waits
+out every receive callback that already passed its posture check before it
+returns, so no frame from the zenoh LAN plane is re-injected after the close;
+reopening redeclares both. A callback that checks the posture after the close,
+even one still in flight when the close returns, refuses and counts its frame.
+The demand GET loop does not consult the posture: it keeps sending GETs while
+paired, and each GET's selector names one ingress topic it demands. Writes
+from a paired desk travel over the remote plane, whose re-inject seam does not
+consult the LAN posture. Oracle tests:
+`demand_authorizer.rs` unit tests,
+`demand_reconcile_never_enables_a_refused_demand` and
+`paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate` (the
+switch side of the wait: it stores the paired flag, then blocks while a
+receive callback holds the ingress gate) in `network.rs`,
+`test_paired_lan_ingress_delivers_nothing_and_closing_stops_delivery` and
+`test_paired_receive_callback_refuses_and_counts_every_lan_frame` in
+`network_ingress_test.rs`, and
+`crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
+
+The LAN posture is a whole-plane switch: a LAN source address proves no
+identity, so per-peer LAN authorization, with each LAN peer's identity bound to
+its pairing key, is not supported yet. Per-peer, per-topic and per-direction
+(observe or command) access with revocation is what the paired remote plane
+provides, binding each session to its pairing key over an authenticated
+transport.
 
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/
@@ -217,7 +292,7 @@ endpoints is `loopback_test.rs` (`wire_unpaired_key_is_refused`,
 
 ## 6. The wire plane (robot side)
 
-A `cerulion/wire/1` connection (admitted only for a paired `CAP_OBSERVE`
+A `cerulion/wire/2` connection (admitted only for a paired `CAP_OBSERVE`
 account) carries ONE bidi control stream (length-prefixed JSON:
 `catalog`/`demand`/`undemand`/`schema`/`status`/`sync_epoch`, the same
 `cerulion_q` vocabulary the LAN uses, imported not mirrored) and ONE uni data
@@ -325,6 +400,95 @@ everything else to zenoh (`wan.rs` unit test
   `iroh_plane.rs` module docs; the automatic prefer-LAN-when-also-reachable
   picker: `wan.rs` module docs ("the plane-picker's scope").
 
+## 8b. The account-first path: register at first serve, reach by account
+
+The ceremony above (a chassis secret, a pairing code, an operator typing at the
+robot) is the path for a machine nobody has an account for. A machine that IS
+logged in needs none of it, because `cerulion login` already proved which
+account owns it. **This path is proven against the in-tree `cerulion_accountd`
+only; the hosted issuer is identity-only today, so nothing here works against
+it until that service issues device certificates and registers robots.**
+
+**On the robot, `cerulion login` is the only account step.** The first
+network-serving run registers the machine. The gate is the LISTEN locator
+(`CERULION_NETD_LISTEN`): it is what makes netd a standing gateway, and only a
+standing gateway starts `robot_supervisor`. netd is spawn-once, so the variable
+must be in netd's OWN environment before the first command that spawns it; a
+netd already running without it must be stopped. A failed registration, or a
+`cerulion-remoted` that exits, is retried with a backoff that doubles from 5 s
+to a 300 s cap, at most 30 consecutive attempts; a sequence that stayed up for
+10 minutes starts the count again. Each failure is a warning naming the reason
+and the next wait.
+
+The supervisor resolves two SIBLINGS of the running netd binary and runs them in
+turn: `cerulion bootstrap-robot --state-root <root>`, a hidden login-gated
+worker whose stdout is a machine-readable result, then `cerulion-remoted
+--provision-bundle <path>` to write the robot state, then `cerulion-remoted` to
+serve. The hidden worker exists so netd reuses the CLI engine's login and
+registration code without a `netd -> cli_engine` package edge; no operator ever
+runs either by hand. All three binaries must therefore sit in one directory.
+The release archives after v1.0.0, the installer and the Debian package place
+`cerulion`, `cerulion-netd` and `cerulion-remoted` side by side, so a released
+install with `CERULION_NETD_LISTEN` set runs this supervisor path.
+
+The robot's identity is the login device key, so the endpoint id a desk dials is
+the key registration proved possession of. Roots come from the issuer's
+well-known endpoint. Registration is idempotent: an already-registered machine
+does nothing. If the account service is unreachable at first serve the WAN plane
+refuses loudly with the reason, the LAN plane keeps serving, and the supervisor
+retries on the backoff above.
+
+**On the desk, there is no pairing step.** `topic list` and `viz --robot` read
+the account's robots from the issuer's owner-only list endpoint and mark each
+one with a bounded presence probe. The directory fetch inside `topic list` has
+its own 2 s deadline (`LISTING_FETCH_BUDGET`, session refresh included); past it,
+or on any error, the listing prints its LAN half and one
+`account robots not listed: <reason>` line. Selection is by exact, case-sensitive display
+name, or by the reserved `account:<robot id>` route; a display name shared with a
+LAN robot is reported as a collision and refused rather than guessed. A
+directory entry is never reachability evidence by itself. The first demand of a
+remote account robot dials it through netd's internet plane with the login key
+and presents the owner's certificate chain ONCE, and only on a classified
+unpaired refusal: never after expiry, revocation or a denied permission, and
+never as a silent fallback to a code. On the robot side the `pair` verb admits a
+chain whose account equals the owner account with no robot-scoped grant; every
+other account still needs the full grant presentation.
+
+**Code pairing cannot name an account.** Possession of a code and of the device
+keys proves neither, so `code-pair-finish` binds the guest to the self-account
+derived from the authenticated transport key and refuses any other value; a
+cloud account requires the full roots-verified chain whose device key equals the
+transport peer key. The owner row is never preserved for a guest, because that
+would hand the guest the owner's authority outright
+(`crates/cerulion_remoted/tests/code_pair_account_test.rs`).
+
+**One endpoint per machine.** A machine whose netd hosts a LISTEN gateway owns
+its endpoint through the sibling remoted, so netd's OUTGOING demands from that
+machine are refused at the point of demand with the reason, never by opening a
+second endpoint. Robot-to-robot over the internet, and a desk that also serves,
+are the documented restriction.
+
+### Which plane served a mirror
+
+Both planes re-inject into the same local shared memory under the same topic
+name, with the same wire bytes, so nothing downstream can tell a locally
+mirrored robot from one dialed over the internet. A robot on the same network is
+reachable over both, which is exactly how a test that checks only that the
+frames arrived can pass with the internet path never exercised: a serving
+machine opens the LAN plane on every interface it has, so a desk that learns one
+locator gets the topic locally.
+
+`MirrorPlane::serving_plane` is the answer, and the `status` demand table
+reports it per row as `plane`. A composing plane answers from the route it
+PINNED when it ensured the mirror, not from a fresh decision, so the field
+describes what happened rather than what a picker would choose now. The field is
+optional on the wire: absent means the daemon does not report a plane, never
+that the local plane served it, because a daemon that predates the field omits
+it and any default would be a routing claim it never made.
+`crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` pins it
+against the delivery it describes, on a desk whose local plane cannot mirror at
+all.
+
 ## 9. Revocation epochs: mint, carry, apply, evict
 
 The full lifecycle is `docs/revocation.md`; the contributor invariants:
@@ -336,7 +500,20 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   Rollback-floor-gated like every other acceptance path. Pinned by
   `store_test.rs` + `chain_verify_test.rs`; device granularity end-to-end by
   `multi_device_revoke_e2e_test.rs`.
-- **Desks push; robots never poll.** Both desk dial paths carry the cached epoch
+- **The robot fetches its own epoch.** On a registered robot, netd's supervisor
+  runs the hidden `cerulion robot-sync-epoch --state-root <root>` worker (an
+  internal process, never an operator command; it refuses without a robot
+  registration or a provisioned `remoted/` directory) at start, every
+  `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (default 300 s),
+  early on remoted's `epoch.request`, with 5 s to 300 s backoff and a 120 s
+  deadline above its own worst case, so the deadline never cuts a session
+  refresh in flight. It fetches `/v1/robots/{id}/access` with the robot's own
+  login and writes `remoted/epoch.pending` (`hex(postcard(EpochSyncWire))`);
+  `cerulion_remoted::epoch_pull` applies it within 2 s. This is the path that cuts
+  a stolen desk. Session refreshes are serialized across processes by an
+  exclusive lock beside `auth.json` (`.auth-refresh.lock`): a refresh token is
+  single-use, and the loser of a race uses the session the winner wrote.
+- **Desks also push.** Both desk dial paths carry the cached epoch
   unconditionally; there is deliberately NO knob to withhold it (by
   design: a withholding knob would be a footgun). The shared substrate is
   `wireclient::epoch` (`prepare_epoch_push` / `classify_epoch_reply`); the robot
@@ -378,16 +555,45 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   `cerulion_cli_engine::auth::atomic_write_secret`**: 0700 parent, per-process
   temp sibling, symlink-proof `create_new` at 0600, fsync, atomic rename. Its
   callers include the auth store, `robots.toml` (`pair_cmd`), and `peers.json`
-  (`peer_cache`). The desk-key write in `wireclient` implements the same
-  create-new-0600 discipline locally (it cannot link the engine).
-- Desk inventory (`~/.cerulion/`): `desk.key` (32-byte seed), `device.cert`
+  (`peer_cache`). The machine key has its own writer,
+  `cerulion_pairing::identity` (0700 directories; the key goes to a synced 0600
+  dot-named sibling hard-linked into place, so it never overwrites and is never
+  seen partly written),
+  which `cerulion login`, `cerulion pair` and `wireclient`'s `--key-file`
+  creation all call.
+- Every per-machine config file under `~/.cerulion` resolves from one rule,
+  `cerulion_pairing::identity::config_dir` (`CERULION_HOME` verbatim when set
+  and non-empty). The crates without `cerulion_pairing` (`cerulion_core` run
+  directories, `cerulion_discovery` peers, `cerulion_telemetry` consent) mirror
+  it; `crates/cerulion_cli/tests/config_home_test.rs` pins each path to it and
+  refuses shipped code with a `".cerulion"` literal within six lines after a
+  `home_dir` or `"HOME"` mention, outside its allowed list. Daemon
+  sockets (`cerulion_hygiene`) and the downloaded video decoder keep their own
+  location rules.
+- `cerulion connect` and `cerulion pair` hand `cerulion-connectd` the key's
+  legacy name `desk.key`: `connect` resolves `epochs/` next to its key file,
+  and `pair` recognizes the path as the machine key and loads it through the
+  identity layout.
+- Desk inventory (`~/.cerulion/`): `identity/device.key` (the 32-byte machine
+  seed; `desk.key` is a hard link to it or an equal copy, adopted byte for byte when it is the
+  only one present, and two different keys are refused), `identity/<team>/high_water`
+  (MAC'd clock, bundle generation and status sequence floors),
+  `identity/active_team` (the team sessions open with), `identity/<team>/leaf.der`
+  and `identity/<team>/bundle` (the team leaf and the postcard trust bundle,
+  accepted by `IdentityLayout::load_team_credentials` only against a trusted
+  root set; `team_credentials_test.rs`), `dev-issuer/state` (feature
+  `dev-issuer` only: the development issuer's root, intermediate and team CA
+  keys), `device.cert`
   (login-issued), `robots.toml` (name → eid pins), `epochs/<robot>.epoch`,
   `grants/`, `auth.json`, `peers.json` (LAN discovery; see
   `network-daemons.md`).
 - Robot inventory (state root, `remoted/` subdir; `remoted::config`):
   `device_key`, `trust_store` + `trust_store.mac_key` (the daemon loads the
-  trust-store MAC key from this file, so robot setup must provision and protect
-  it; there is no secure-storage backend and no enforcing test),
+  trust-store MAC key from this file, so robot setup must provision it, mode
+  0600; there is no secure-storage backend. On load the daemon clears the group
+  and other permission bits of the device key, the MAC key, the trust store and
+  the device index, without following a symbolic link at the path, and saves
+  create the trust store and the device index 0600),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
   root), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
@@ -411,6 +617,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_pairing/tests/owner_grant_verify_test.rs` | Offline owner-grant verification, one-flip negative matrix |
 | `crates/cerulion_pairing/tests/pake_test.rs` | CPace agree-iff-code-and-identities-match, attempts/TTL/burn policy |
 | `crates/cerulion_pairing/tests/client_test.rs` | Device-identity seam + the two end-to-end pairing flows across all modules |
+| `crates/cerulion_pairing/tests/team_formats_test.rs` | Team X.509 leaf and CA profile read back by x509-parser and accepted by rustls-webpki, rcgen-built refusals, bundle and status signing bytes, anti-rollback order |
 | `crates/cerulion_link/tests/loopback_test.rs` | Dial-by-key + mutual key auth against independently-derived oracle keys; framing round-trips |
 | `crates/cerulion_link/tests/uni_and_ops_stream_test.rs` | Uni-stream helpers + the synchronous `QuicOpsStream` adapter, literal byte oracles |
 | `crates/cerulion_remoted/tests/authorizer_matrix_test.rs` | Every cell of the sacred verb table, real-crypto access rows |
@@ -430,12 +637,15 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |
 | `cerulion_wireclient` in-module tests | Dial-config parsers, epoch push decisions + cache-path pins, reply classification |
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |
+| `crates/cerulion_ops_proto/tests/wire_golden_test.rs` | Every `cerulion/ops/1` message type encodes to, and decodes from, a golden frame built from JSON text |
 | `crates/cerulion_accountd/tests/*` | Account-plane acceptance over a real server, CA↔shipped-verifier byte-compat, device-code state, 5xx error-leak ban |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
+| `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
+| `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,
-`cerud`, `cerulion_accountd`, `cerulion-wire`; no `--test-threads=1` anywhere in
+`cerud`, `cerulion_ops_proto`, `cerulion_accountd`, `cerulion-wire`; no `--test-threads=1` anywhere in
 this family. `cerulion_link` / `cerulion_remoted` cold-compile the ~390-crate
 iroh tree: long first builds are normal. The netd WAN plane tests ride
 `cargo test -p cerulion_netd` (`wan` is default-on; keep

@@ -1,6 +1,6 @@
 //! Misaligned payload receive (bytemuck alignment regression).
 //!
-//! The transport receive path reads the 32-byte `WireHeader` off an
+//! The transport receive path reads the 40-byte `WireHeader` off an
 //! incoming payload `&[u8]` whose backing address is NOT guaranteed to
 //! be 8-aligned (iceoryx2 hands back shared-memory slices; see the
 //! `read_from_buf` rationale in `wire.rs`). The receive path therefore
@@ -34,10 +34,11 @@ fn sample_header() -> WireHeader {
         offset_table_count: 3,
         sequence: 42,
         timestamp_ns: 0x0102_0304_0506_0708,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
 }
 
-/// Serialize `header` into a buffer whose 32-byte window starts at a
+/// Serialize `header` into a buffer whose 40-byte window starts at a
 /// deliberately non-8-aligned address. Returns the owning `Vec` and the
 /// start offset of the misaligned window.
 fn misaligned_wire_buffer(header: &WireHeader) -> (Vec<u8>, usize) {

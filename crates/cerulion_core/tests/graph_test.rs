@@ -226,7 +226,8 @@ fn in_prefix_miss_warns(lines: &[&str]) -> Vec<String> {
 #[tracing_test::traced_test]
 fn a_worker_view_whose_source_a_sibling_group_produces_does_not_warn() {
     let config = parse_graph(WORKER_VIEW_YAML).unwrap();
-    let siblings = std::collections::BTreeSet::from(["/p/camera/image".to_string()]);
+    let siblings: cerulion_core::graph::SiblingProducedTopics =
+        ["/p/camera/image".to_string()].into_iter().collect();
     validate_graph_with(
         &config,
         ValidationOptions {
@@ -254,7 +255,8 @@ fn a_worker_view_still_warns_for_a_source_no_sibling_produces() {
     // worker would pass the test above and fail here.
     let yaml = format!("{WORKER_VIEW_YAML}      - name: typo\n        source: /p/camera/imge\n");
     let config = parse_graph(&yaml).unwrap();
-    let siblings = std::collections::BTreeSet::from(["/p/camera/image".to_string()]);
+    let siblings: cerulion_core::graph::SiblingProducedTopics =
+        ["/p/camera/image".to_string()].into_iter().collect();
     validate_graph_with(
         &config,
         ValidationOptions {
@@ -3113,6 +3115,7 @@ nodes:
 /// partition covering only the native nodes is COMPLETE (the orphan check
 /// exempts ros2 entries).
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn ros2_entries_are_refused_in_process_groups_and_exempt_from_coverage() {
     let base = r#"
 prefix: p

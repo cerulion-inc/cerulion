@@ -5,12 +5,13 @@
 //! `MADV_SEQUENTIAL` alone. It now drives EXPLICIT batched advise-behind behind a
 //! per-pass cursor.
 //!
-//! `mcap::MessageStream` exposes no byte cursor and copies each payload, so the
-//! completeness watermark is a CONSERVATIVE frontier: the cumulative sum of
-//! consumed message-payload lengths (a strict lower bound on the true read
-//! position — framing/chunk overhead sits behind the payloads already passed).
-//! These pins prove the scan really evicts, safely (every advised region ends at
-//! or before that frontier), monotonically, and page-batched.
+//! The scan feeds the `mcap` sans-io reader itself, so its watermark is the
+//! EXACT on-disk read position: the bytes already copied out of the map. (An
+//! earlier payload-sum frontier ignored record framing and message indexes,
+//! which on a small-frame bag are most of the file, so the resident remainder
+//! grew with the record count.) These pins prove the scan really evicts, safely
+//! (every advised region ends at or before that frontier), monotonically,
+//! page-batched, and all the way to the end of the file.
 
 use std::path::PathBuf;
 
@@ -70,10 +71,13 @@ fn page() -> usize {
 }
 
 #[test]
-fn completeness_scan_advises_behind_its_own_payload_frontier() {
+fn completeness_scan_advises_behind_its_on_disk_read_position() {
     let path = tmp();
     // ~4000 * 128 B = ~512 KiB of payload → dozens of page-scale batches.
-    write_multi_page_bag(&path, 4000, 128);
+    const MSGS: usize = 4000;
+    const PAYLOAD_LEN: usize = 128;
+    write_multi_page_bag(&path, MSGS, PAYLOAD_LEN);
+    let file_len = std::fs::metadata(&path).unwrap().len() as usize;
 
     let reader = BagReader::open(&path).expect("open bag mapped");
     reader.enable_scoped_advise_probe();
@@ -88,19 +92,24 @@ fn completeness_scan_advises_behind_its_own_payload_frontier() {
     let calls = reader.take_scoped_advise_probe();
     assert!(
         !calls.is_empty(),
-        "the completeness scan must evict behind its payload frontier (mutation guard: \
+        "the completeness scan must evict behind its read position (mutation guard: \
          reverting the advise_evict_behind_scoped call in completeness() empties this)"
     );
     let p = page();
     let mut prev_end = 0usize;
     for (i, c) in calls.iter().enumerate() {
-        // The conservative payload-sum frontier is a LOWER bound on the true
-        // read position, so an evicted region ending at or before it is always
-        // already-read — eviction never races the live scan.
+        // The frontier is the count of bytes already copied out of the map, so
+        // an evicted region ending at or before it is always already-read
+        // (eviction never races the live scan), and it never exceeds the file.
         assert!(
             c.end <= c.watermark,
-            "call {i}: advised end {} must not exceed the scan payload frontier {}",
+            "call {i}: advised end {} must not exceed the scan read position {}",
             c.end,
+            c.watermark
+        );
+        assert!(
+            c.watermark <= file_len,
+            "call {i}: read position {} must not exceed the {file_len}-byte file",
             c.watermark
         );
         assert_eq!(c.start % p, 0, "call {i}: start {} page-aligned", c.start);
@@ -112,13 +121,31 @@ fn completeness_scan_advises_behind_its_own_payload_frontier() {
         );
         prev_end = c.end;
     }
-    // The scan really progressed far: the final payload frontier is many
-    // batches in (not a frozen cursor emitting one token eviction).
+    // The scan really progressed far: the final frontier is many batches in
+    // (not a frozen cursor emitting one token eviction).
     let last = calls.last().unwrap();
     assert!(
         last.watermark >= 8 * 4096,
-        "the payload frontier must advance well past a single batch: {}",
+        "the read position must advance well past a single batch: {}",
         last.watermark
+    );
+    // And it evicted the WHOLE file but the final partial page: with a
+    // page-sized batch every page the scan finished reading is advised as soon
+    // as it is behind the read position, which reaches the end of the file.
+    // A payload-only frontier could never pass the payload total (record
+    // framing and message indexes are not payload), and would leave that
+    // overhead, which grows with the record count, resident after `open`.
+    let payload_total = MSGS * PAYLOAD_LEN;
+    assert!(
+        last.end > payload_total,
+        "the final advised end {} must pass the {payload_total}-byte payload total: the \
+         frontier is the on-disk read position, not the payload sum",
+        last.end
+    );
+    assert_eq!(
+        last.end,
+        file_len & !(p - 1),
+        "the final advised end must be the last page boundary of the {file_len}-byte file"
     );
 
     let _ = std::fs::remove_file(&path);

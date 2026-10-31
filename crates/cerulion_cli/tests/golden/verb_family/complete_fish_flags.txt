@@ -1,0 +1,6 @@
+exit: Some(0)
+--- stdout
+--verbose	Enable verbose (debug-level) logging (`-v` or `--verbose`)
+--help	Print help
+
+--- stderr

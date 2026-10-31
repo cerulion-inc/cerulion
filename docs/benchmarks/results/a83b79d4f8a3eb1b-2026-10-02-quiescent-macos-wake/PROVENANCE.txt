@@ -1,0 +1,38 @@
+MACOS DATA WAKE, BEFORE AND AFTER, ONE MACHINE
+
+Before:  main 75b487eaa47f5f1082aa639726d9148e47589a23 (git_dirty: false).
+After:   61fb8aac413d37322a9dcb05a2e32ee3bd820395 (git_dirty: false), the sha
+         the run.json files record. It is a development commit; its tree
+         (0b62a009fadbbb955490c1160722d78d757d0240) is identical to public
+         commit a0b4529fe7c8454d3badbb333807527ef6768429, a commit on the pull
+         request that merged into main as
+         64fc0de94c5be438023e0c915f23876b9ad3d64b. Four later commits on that
+         pull request touched the doorbell and the graph runtime before it
+         merged, and main has changed the wake path since (a publish now rings
+         every topic a graph produces). Neither the merged commit nor main
+         today has been re-measured on macOS.
+Machine: Apple M3 Max, 16 cores, 128 GiB, macOS 26.0.1 arm64, machine hash
+         a83b79d4f8a3eb1b; 24 MHz timebase, so 41.667 ns is one tick.
+Shape:   cerulion_workspace_split_chrt0 (two worker processes) and
+         cerulion_workspace_mono_chrt0 (one process), quiescent pacing,
+         chrt 0, msg-class variable, default settings, no pinning. The
+         manifests read dma_lock_posture "tuned" because the CPU DMA latency
+         lock was requested; that lock does nothing outside Linux, so these
+         runs ran at the platform's defaults.
+         Three sizes: 64 B, 4 KiB, 1 MiB. Five reps per cell per arm, the two
+         arms alternating within one session per cell. The recorder state of these
+         runs is not recorded in the manifests.
+
+Each run ran only those three sizes, so compile_csv.py reports the other
+seven sizes as missing; the CSV rows for the three sizes cover all five reps.
+The data rows reproduce byte for byte when compile_csv.py is run again over
+the raw samples with --allow-partial.
+
+Scrub applied to each run.json: the uname node field reads box-mac and the
+argv run-dir reads <DESKHOME>/run/m-before or <DESKHOME>/run/m-after, in all
+30 nested invocations of each file. No other field is changed.
+
+CSV: the data rows are compile_csv.py's output byte for byte. The leading "#"
+schema-note lines use the ASCII form the other packages ship.
+
+No .bin samples and no run logs are in this package.

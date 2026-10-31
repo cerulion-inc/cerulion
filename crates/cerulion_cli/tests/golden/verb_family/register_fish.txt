@@ -1,0 +1,5 @@
+exit: Some(0)
+--- stdout
+complete --keep-order --exclusive --command cerulion --arguments "(COMPLETE=fish <BIN> -- (commandline --current-process --tokenize --cut-at-cursor) (commandline --current-token))"
+
+--- stderr

@@ -160,7 +160,7 @@ impl AdaptiveSizer {
     /// # Precondition
     ///
     /// `size` must be at least `WireHeader::SIZE` — every wire frame
-    /// carries the 32-byte header. Empty-payload pollution of the window
+    /// carries the 40-byte header. Empty-payload pollution of the window
     /// is mitigated upstream: variable schemas with un-written fields
     /// trigger an early return in `OutputProxy::Drop` before reaching
     /// here, and fixed schemas always emit `WIRE_FIXED_SIZE + header`
@@ -325,8 +325,8 @@ mod tests {
     #[test]
     fn warm_loan_floor_at_min_required() {
         // Small recent payloads — the headroom multiplier would dip
-        // below min_required (e.g. 32 bytes × 1.5 = 48, but min_required = 64).
-        // `record()` requires size >= WireHeader::SIZE (32),
+        // below min_required (e.g. 40 bytes × 1.5 = 60, but min_required = 64).
+        // `record()` requires size >= WireHeader::SIZE (40),
         // so the test uses the smallest valid value to exercise the
         // floor-clamp path.
         use crate::wire::WireHeader;
@@ -334,7 +334,7 @@ mod tests {
         for _ in 0..WINDOW_SIZE {
             sizer.record(WireHeader::SIZE as u32);
         }
-        // 32 × 3 / 2 = 48; clamps up to min_required = 64.
+        // 40 × 3 / 2 = 60; clamps up to min_required = 64.
         assert_eq!(sizer.next_loan_size(64, 16 * 1024 * 1024), 64);
     }
 
@@ -406,8 +406,8 @@ mod tests {
     #[should_panic(expected = "AdaptiveSizer::record: size 0 below WireHeader::SIZE")]
     fn record_below_wire_header_size_panics_in_debug() {
         // `record()` rejects sizes below WireHeader::SIZE
-        // (32 bytes) in debug builds. In production this is unreachable
-        // — every wire frame carries the 32-byte header by construction
+        // (40 bytes) in debug builds. In production this is unreachable:
+        // every wire frame carries the 40-byte header by construction
         // (variable schemas early-return on un-written fields; fixed
         // schemas always emit `WireHeader::SIZE + WIRE_FIXED_SIZE`).
         // The `debug_assert!` pins the invariant for future callers.

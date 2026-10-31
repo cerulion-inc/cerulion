@@ -1,0 +1,24 @@
+// The same logical content as the Cerulion / ROS 2 messages in the bench.
+namespace wirecmp.fb;
+
+struct Time { sec:int; nanosec:uint; }
+table Header { stamp:Time; frame_id:string; }
+
+// Fixed-size sample: a struct (inline, no vtable) inside a root table.
+struct ImuSample {
+  stamp_ns:ulong; seq:uint; status:uint;
+  orientation:[double:4]; angular_velocity:[double:3]; linear_acceleration:[double:3];
+}
+table ImuMsg { sample:ImuSample; }
+
+table Image {
+  header:Header; height:uint; width:uint; encoding:string;
+  is_bigendian:ubyte; step:uint; data:[ubyte];
+}
+
+table PointField { name:string; offset:uint; datatype:ubyte; count:uint; }
+table PointCloud2 {
+  header:Header; height:uint; width:uint; fields:[PointField];
+  is_bigendian:bool; point_step:uint; row_step:uint; data:[ubyte]; is_dense:bool;
+}
+root_type Image;

@@ -1,0 +1,11 @@
+error: field `gain` carries more than one `#[param]`; a field is one param: merge the keys into a single `#[param(..)]`
+  --> tests/ui/param_duplicate_on_one_field.rs:12:5
+   |
+12 |     #[param(default = 2.0)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_duplicate_on_one_field.rs:9:7
+  |
+9 |     #[output]
+  |       ^^^^^^

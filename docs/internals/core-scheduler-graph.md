@@ -109,6 +109,15 @@ exists; `none` means the principle is enforced by the conventions in
   a silently-defaulted one, the misleading-surface rule applied to config. Adding a field
   to a graph config type therefore means adding it to the round-trip and rejection oracles
   in `config_deny_unknown_fields_test`, or the gate that catches the typo class goes stale.
+- **Launch arguments resolve at parse.** `args:` and `${name}` resolve in
+  `graph/launch_args.rs` (pure): the section is lifted out of the YAML tree and substituted
+  before `GraphConfig` reads it, so `GraphConfig` has no `args` field and every reader sees a
+  resolved graph. A document with no `args:` and no overrides is read AS WRITTEN (`$`
+  included, nothing substituted), so a recorded `graph.yaml` reads back exactly as recorded:
+  resolution is a fixed point (Replay = Live). Only `parse_graph_raw_with_launch_args` takes
+  overrides (`graph run`), and it returns the `ArgProvenance` beside the config;
+  `parse_graph_as_written` keeps references for an edit that writes a value back into the
+  file. A new substitution site is a case in that module's walker, never a struct field.
 - Unified trigger drain: eligible data-trigger consumers drain trigger + body on one
   subscriber. `NodeEntry::unifies_trigger_drain` decouples drain eligibility from the
   rayon-eligibility flag (`performs_input_snapshot`). `CERULION_DRAIN_DISCIPLINE=separate`
@@ -145,6 +154,39 @@ constraints:
 - Joins, fan-outs, and Sync keep the step + barrier structure; fusion applies to linear
   single-consumer chains only.
 
+### The census (shipped; the executor ignores it)
+
+`graph/chain.rs` decides WHICH edges qualify, and nothing more. It is pure analysis over
+`GraphTopology` + `TriggerEdges` + `Levels` + the run's colocation: `census_chains` returns
+the chains that qualify plus a `ChainBar` for every consumer edge that does not, so the
+verdicts partition the graph's consumer edges and a reader can add them up. Read by
+the chains block of `cerulion graph levels` and written into every run's `run.json`, so
+the shape of real graphs is measured rather than guessed. No execution path consumes it.
+
+The rules and the reason each exists are in that module's own header. Two are worth
+naming here because they are easy to get wrong:
+
+- **The context rule.** A fused consumer may read no non-trigger input whose in-graph
+  producer sits at a level at or after the CHAIN HEAD's level. The queued executor
+  snapshots a node's non-trigger inputs at the start of its own level phase, when every
+  earlier level has ticked; a fused consumer runs inside the HEAD's level phase, when only
+  part of that level has. The head is the bound, not the consumer's own level. An edge the
+  rule refuses CUTS its chain: the refused consumer heads a new one, judged against its
+  own level.
+- **One level per hop.** A fused hop must land on the level RIGHT AFTER its producer's.
+  A derived levelization places a consumer one level below its DEEPEST triggering
+  producer, so a single-trigger consumer is always adjacent and only a join spans
+  further, which the join rule reports first. What reaches this rule is a
+  `level_assignments:` block, which may legally place a sole consumer further down while
+  the executor still opens the levels in between. It is also what makes a chain's
+  rendered level band its head's level plus its hop count.
+- **One fusable edge per producer.** A topic-level fan-out is refused because the second
+  consumer would wait for the first consumer's whole chain. A node publishing two
+  single-consumer topics is the same wait one level up, and refusing it is also what makes
+  "a node belongs to at most one chain" true rather than assumed: a consumer has at most
+  one trigger edge, so once a producer has at most one outbound fused edge the fused edges
+  form disjoint paths.
+
 ## Trigger policies
 
 - Trigger policy is a NODE-TYPE concern (macro attribute); graph YAML carries topology
@@ -176,6 +218,59 @@ constraints:
   an unverified input and destroy arrived complete sets. Death is evaluated BEFORE descent,
   so a provably unmatchable frame is classified UNMATCHABLE (something is wrong) rather than
   PASSED-OVER (the feature working).
+- **Sync can match on CAPTURE time.** By default a head's stamp is the frame's WIRE stamp
+  (publish time). A node whose `NodeInfo` carries capture-stamp locations
+  (`NodeInfo::with_sync_capture_stamps`) aligns on each message's `header.stamp` instead,
+  the ROS 2 `message_filters` ApproximateTime analogue. The matcher is unchanged: the graph
+  runtime wraps the node's head ops (`graph/sync_capture.rs`) and, after an op places a
+  head or a staged next, decodes `header.stamp` off THAT frame (`NodeEntry::sync_capture_stamp`,
+  a read-only slot accessor) through the pure layer `scheduler/sync_stamp.rs`. The pure
+  layer keeps rule (1) true for stamps the producer does not keep monotone: a head stamp
+  below the input's newest accepted one (its capture high-water) by at most the window is
+  DISCARDED and counted (`sync_capture_backwards_drops`), a drop of more than the window is a
+  clock restart left to the ordinary epoch reset, and an undecodable stamp is discarded and
+  counted (`sync_capture_decode_failures`); each of the two discard kinds has its own
+  `FailureRegimeLatch` (loud first `warn!`, counted repeats, recovery line). A staged next
+  that would not be accepted answers "nothing to descend to" and is judged when it becomes
+  the head; an op that gives up after 256 discards voids the last one, so each frame is
+  counted once, and answers "no head" (never a failure, which would fire a tuple whose member
+  the op popped). The capture high-water follows the scheduler's own: an accepted new-epoch
+  head clears every partner's (as the epoch reset does), and a `Void` of an accepted head
+  clears its own (the scheduler voids one only to discard it). The decode reads only inside
+  the frame the wire header declares (`total_size`), reads a `header` table entry only when
+  the wire header's declared offset table (`offset_table_offset`, `offset_table_count`) sits
+  where the schema puts it and holds that index, and refuses an entry below the parent's data
+  floor. Only a `sync_window_ms` node may opt in: without a window a clock restart
+  cannot be told from out-of-order frames, so `unbounded_sync` is refused at build. Every
+  decision is a function of frame bytes and accepted stamps, so two runs over the same frames
+  select the same sets. The framework section carries each input's capture high-water in its
+  own version-3 table (`NodeFrameworkState::sync_capture_high_water`), because a fired head
+  leaves the head map but its stamp still decides which frames are backwards; a RESTORE seeds
+  it from that table (`GraphRuntime::restore_sync_capture_high_water`) and from each restored
+  head (`GraphRuntime::restore_sync_input_timestamps`), so a resumed run drops what live
+  dropped. Both seams also raise the scheduler's wire-stamp epoch high-water for that input to
+  the same stamp, because on a capture-time node the epoch reset runs on capture stamps: a
+  clock restart right after the resume then re-bases the node as it did live, instead of
+  keeping the held old-epoch partner and discarding the new frame. The section also carries
+  the node's epoch floor in a version-4 tail after that table (`sync_epoch_floor`, restored by
+  `GraphRuntime::restore_sync_epoch_floor`; a version-3 section ends at the table, so a
+  checkpoint written before the floor existed still reads, with no floor). Both the Flashback
+  anchor and `GraphRuntime::node_framework_state` fill these two fields through one helper,
+  so an anchor states the same Sync state as the read seam: a restart re-bases every partner, and a re-based
+  partner's frames are tested against that floor, so a run resumed before the partner's first
+  new-epoch frame discards the same old-epoch straggler live discarded. The block-credit check
+  counts every pop on a capture-time trigger input as credit (`AllPops`), because the opt-in
+  builds only per-set, so there is no legacy port to decline over. The replay verifier cannot re-derive capture-time sets from
+  the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
+  locations are resolved once per input from the schema (`codegen::header_stamp_location`,
+  the writers' own `LayoutResolver`), and `graph::validation::resolve_capture_sync_stamps`
+  refuses an unstamped input with `TransportError::SyncCaptureStamp` naming node and input.
+  The build also refuses the opt-in on a non-sync node, a location for an input that is not a
+  trigger input, and an entry without frame access (`NodeEntry::supports_sync_capture_stamps`
+  is `false`): today that is every `#[cerulion_node]` node, in-process or cdylib, because the
+  macro forwards the head ops but not the stamp accessor; only `ClosureNodeEntry` opts in. The opt-in is the `#[doc(hidden)]` builder
+  `NodeInfo::with_sync_capture_stamps`: no macro key or graph-load path sets it yet. Nodes
+  that do not opt in run the publish-time path unchanged.
 - `External` nodes are ingress/drivers: `external_source()` returns
   `Fd` (pollable, attached non-owning), `Blocking` (helper thread + doorbell pipe), or
   `HostDriven` (polled seam only). `run_live` refuses any external node provably inert
@@ -209,11 +304,15 @@ constraints:
   order with the same data (`polled_vs_live_iox2_test`, hand-oracle-anchored).
   `fire_time_ns` is the one legitimate difference on the default live path (wall-delta
   advancement).
-- Deterministic-live: `GraphRuntime::build_live_deterministic*` runs the live loop on a
-  Barrier gating clock advancing a fixed run-independent logical quantum (the graph's
-  tightest timing, floored at 1 ms) per `live_step`; recorded `fire_time_ns` is
-  replay-deterministic. Wall-clock health (liveliness sweeps, silence deadlines) rides a
-  DEDICATED `RealClock` watch clock; the two never mix.
+- Deterministic-live: the live loop runs on a CONTROLLED gating clock, advanced once per
+  `live_step`, so recorded `fire_time_ns` is replay-deterministic. HOW it advances is the
+  execution mode's: under the `CERULION_EXECUTION_MODE=lockstep` opt-out
+  (`build_live_deterministic_with_manager_and_barrier`, and the single-process
+  `build_live_deterministic*` builders) by a fixed run-independent logical quantum, the
+  graph's tightest timing floored at 1 ms; under the free-run default
+  (`build_live_deterministic_free_run`) by wall-following once per step from the shared
+  epoch, with no barrier. Wall-clock health (liveliness sweeps, silence deadlines) rides a
+  DEDICATED `RealClock` watch clock in both; the two never mix.
 - Replay never touches external sources: `external_source()` is queried exactly once, at
   `run_live` entry, never under polled `step()` or replay (provably: a panicking
   fixture + a query counter at zero while the replay leg delivers the oracle sequence).
@@ -234,16 +333,22 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   data-latency gate.
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
   dossier), hence the SHM DOORBELL: a cache-line-aligned atomic per topic; the publisher
-  rings AFTER the iceoryx2 send; the consumer monitor-waits on the line; iceoryx2 stays
+  rings AFTER the iceoryx2 send; where the CPU carries a monitor-wait primitive the
+  consumer monitor-waits on the line; iceoryx2 stays
   the data channel and correctness fallback. After a doorbell wake, drain the iceoryx2
-  listener so the WaitSet doesn't double-report. The doorbell is a NO-OP STUB on macOS;
-  never select it as a desk-side wake primitive.
+  listener so the WaitSet doesn't double-report. On macOS the page is real too and
+  carries a 4-byte wake epoch beside the counter: the publisher bumps both and, while a
+  consumer holds the page's `parked` claim, issues `os_sync_wake_by_address_all`, and
+  the consumer kernel-blocks on the epoch instead of pacing
+  (`CERULION_DOORBELL_OS_SYNC=0` drops that block).
 - Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT) / AMD MWAITX where
   present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
   cannot hit the cache-flushing deep C-state); no-primitive targets (macOS included) run
   the park default-ON in a degraded chunked short-sleep-recheck: never a busy-spin,
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
-  wakes hot).
+  wakes hot). That arm tries three kernel blocks before it paces, in order: a credit
+  word, barrier arrival, and on macOS the primary topic's doorbell epoch. A process
+  blocks on one address, so the first that applies owns it.
 - The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is
@@ -281,6 +386,10 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   without that routing, park-off multi-process runs collapse to the timeout cadence.
 
 ## Barrier and multi-process lockstep
+
+(The barrier is what the `CERULION_EXECUTION_MODE=lockstep` opt-out selects. A
+multi-process run free-runs by DEFAULT and maps no barrier, so everything in
+this section is the opt-out's machinery.)
 
 - `BarrierShared` (`src/barrier.rs`) is a lock-free count-down sense-reversing barrier;
   `MappedBarrier` maps the same atomics into a POSIX-SHM `MAP_SHARED` page for

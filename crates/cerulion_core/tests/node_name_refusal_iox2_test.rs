@@ -128,6 +128,7 @@ fn init_for_test_refuses_an_unrepresentable_identity() {
 /// It was already fallible, but served a bare `{e:?}` behind a generic
 /// `InvalidTransportConfig`; it now converges so a supervisor and a resim
 /// diagnose an unrepresentable identity identically.
+#[cfg(not(feature = "local-transport"))] // Detached managers serve other processes.
 #[test]
 fn detached_with_config_refuses_an_unrepresentable_identity() {
     for (name, expected) in hostile_identities() {

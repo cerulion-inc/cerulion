@@ -40,7 +40,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
-static NODES: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+static NODES: Mutex<Option<HashMap<u64, NodeState>>> = Mutex::new(None);
+
+/// One handle's state: its tick count, and whether its ticks fail (read
+/// ONCE from `CER_TICK_FAIL` at init, so the tick path does no env lookup).
+struct NodeState {
+    ticks: u64,
+    tick_fail: bool,
+}
 
 /// Null-terminated JSON info string in .rodata — no allocation, no leak.
 ///
@@ -186,7 +193,13 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let mut guard = NODES.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(handle, 0); // tick count starts at 0
+    map.insert(
+        handle,
+        NodeState {
+            ticks: 0,
+            tick_fail: std::env::var_os("CER_TICK_FAIL").is_some(),
+        },
+    );
     handle
 }
 
@@ -194,8 +207,13 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
 pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
     let mut guard = NODES.lock().unwrap();
     match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-        Some(count) => {
-            *count += 1;
+        // `CER_TICK_FAIL` at init (INERT for every other test that loads this
+        // fixture): fail the tick with code 1 and no message, the shape of an
+        // older cdylib that exports no `cerulion_take_last_error_kind`.
+        // Consumed by `cerulion_core/tests/node_error_kind_cdylib_test.rs`.
+        Some(state) if state.tick_fail => 1,
+        Some(state) => {
+            state.ticks += 1;
             0
         }
         None => 4, // handle not found
@@ -210,7 +228,7 @@ pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
 pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
     let guard = NODES.lock().unwrap();
     match guard.as_ref().and_then(|m| m.get(&handle)) {
-        Some(_count) => 0, // nothing to pump (no publishers)
+        Some(_state) => 0, // nothing to pump (no publishers)
         None => 4,         // handle not found
     }
 }
@@ -233,6 +251,5 @@ pub extern "C" fn cerulion_test_get_tick_count(handle: u64) -> u64 {
     guard
         .as_ref()
         .and_then(|m| m.get(&handle))
-        .copied()
-        .unwrap_or(0)
+        .map_or(0, |state| state.ticks)
 }

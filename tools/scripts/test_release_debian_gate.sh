@@ -18,7 +18,7 @@ make_archive() {
     version=$1
     root="$workdir/cerulion-${version}-x86_64-unknown-linux-gnu"
     mkdir -p "$root"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' '#!/bin/sh' > "$root/$binary"
         chmod 0755 "$root/$binary"
     done

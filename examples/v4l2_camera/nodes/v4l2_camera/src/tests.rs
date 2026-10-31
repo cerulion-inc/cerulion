@@ -72,3 +72,14 @@ fn every_publish_result_returns_the_capture_buffer() {
         Err("requeue")
     );
 }
+
+#[test]
+fn an_unplugged_camera_stops_the_node_and_any_other_dequeue_error_does_not() {
+    use cerulion_core::prelude::NodeError;
+    // ENODEV (19): the device is gone.
+    let err = dequeue_error(std::io::Error::from_raw_os_error(19));
+    assert!(matches!(err, NodeError::Fatal(_)), "got {err:?}");
+    // EIO (5): a failed read, not a missing device.
+    let err = dequeue_error(std::io::Error::from_raw_os_error(5));
+    assert!(matches!(err, NodeError::Io(_)), "got {err:?}");
+}

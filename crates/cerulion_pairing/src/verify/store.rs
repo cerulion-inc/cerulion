@@ -11,7 +11,9 @@
 //!
 //! The HMAC covers the header + body. On load the tag is verified first (in
 //! constant time); a mismatch is [`PairingError::TamperDetected`]. Writes are
-//! atomic (write a sibling `.tmp` then `rename`). The MAC key is supplied by the
+//! atomic and durable: the bytes go to a sibling `.tmp` that is fsynced, renamed
+//! over the store, and then the directory is fsynced, so after a power loss the
+//! store holds either the old bytes or the new ones. The MAC key is supplied by the
 //! caller (firmware secure storage) on every load/save — this crate holds no
 //! key-management policy.
 //!
@@ -29,7 +31,9 @@ use serde::{Deserialize, Serialize};
 
 use super::access::{AccessRow, EpochOutcome, OwnershipState, PairingSource};
 use super::chain;
-use super::{OwnerGrantPresentation, PairingPresentation, VerifiedPairing};
+use super::{
+    OwnerCertificatePresentationWire, OwnerGrantPresentation, PairingPresentation, VerifiedPairing,
+};
 use crate::crypto::{self, VerifyResult};
 use crate::error::{ser_err, CertKind, PairingError};
 use crate::format::canonical::checked_len_u32;
@@ -146,9 +150,11 @@ impl TrustStore {
     }
 
     /// Load and verify a store from disk. Fails with [`PairingError::TamperDetected`]
-    /// if the MAC does not verify.
+    /// if the MAC does not verify. On Unix, when `path` itself is a regular file
+    /// with a single link, its group and other permission bits are cleared before
+    /// it is read; a symbolic link at `path` is read through unchanged.
     pub fn load(path: impl AsRef<Path>, mac_key: &[u8]) -> Result<Self, PairingError> {
-        let bytes = std::fs::read(path.as_ref())?;
+        let bytes = read_private(path.as_ref())?;
         let inner = Self::decode(&bytes, mac_key)?;
         Ok(TrustStore {
             inner,
@@ -156,14 +162,30 @@ impl TrustStore {
         })
     }
 
-    /// Atomically write the store to its backing path (write `.tmp`, then
-    /// `rename`), authenticated with `mac_key`.
+    /// Atomically and durably write the store to its backing path,
+    /// authenticated with `mac_key`: create a fresh sibling temporary file
+    /// (exclusively, mode 0600 on Unix), write and fsync it, rename it over the
+    /// store, then fsync the directory. The store takes the temporary file's mode
+    /// at the rename: 0600, less any bits the umask clears.
+    ///
+    /// A failure up to and including the rename leaves the old store in place and
+    /// is returned. A failed directory fsync after the rename is logged at `warn`
+    /// and the save returns `Ok`, since the new store is already in place; if that
+    /// save recorded a revocation, a power loss can then bring back the previous
+    /// store, in which the revoked device still has access, and the `warn` line is
+    /// the only trace of it.
+    ///
+    /// Each save uses its own temporary file, so concurrent saves never share one
+    /// and the last rename wins.
     pub fn save(&self, mac_key: &[u8]) -> Result<(), PairingError> {
+        self.save_with(mac_key, &mut StdSaveFs)
+    }
+
+    /// [`Self::save`] over an injected [`SaveFs`].
+    fn save_with(&self, mac_key: &[u8], fs: &mut impl SaveFs) -> Result<(), PairingError> {
         let path = self.path.as_ref().ok_or(PairingError::NoStorePath)?;
         let bytes = self.encode(mac_key)?;
-        let tmp = tmp_path(path);
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, path)?;
+        replace_durably(fs, &unique_tmp_path(path), path, &bytes)?;
         Ok(())
     }
 
@@ -409,6 +431,66 @@ impl TrustStore {
             return Err(PairingError::RobotUnclaimed);
         }
         self.verify_chain(pres, authenticated_peer_key, now_ns)
+    }
+
+    /// Verify an owner's certificate chain for a new device binding. The existing
+    /// owner row is preserved byte-for-byte; only the rollback floor advances.
+    /// Certificate and issuer scopes must cover that row, because the access index
+    /// maps devices to account-wide permissions, not per-device permissions.
+    pub fn verify_owner_certificate(
+        &mut self,
+        pres: &OwnerCertificatePresentationWire,
+        authenticated_peer_key: &PublicKey,
+        now_ns: u64,
+    ) -> Result<AccountId, PairingError> {
+        pres.validate_version()?;
+        let owner = self.owner().ok_or(PairingError::RobotUnclaimed)?;
+        if now_ns < self.inner.high_water_ns {
+            return Err(PairingError::RollbackDetected {
+                now_ns,
+                high_water_ns: self.inner.high_water_ns,
+            });
+        }
+        chain::verify_intermediate(&self.inner.root_set, &pres.intermediate, now_ns)?;
+        chain::verify_device_cert(
+            &pres.device_cert,
+            &pres.intermediate.cert.intermediate_key,
+            &pres.intermediate.cert.max_scope,
+            authenticated_peer_key,
+            now_ns,
+        )?;
+        if pres.device_cert.cert.account != owner {
+            return Err(PairingError::NotOwner);
+        }
+        if self.inner.revoked_accounts.contains(&owner) {
+            return Err(PairingError::RevokedByEpoch {
+                epoch: self.inner.current_epoch,
+            });
+        }
+        if self.inner.revoked_devices.contains(authenticated_peer_key) {
+            return Err(PairingError::RevokedDeviceByEpoch {
+                epoch: self.inner.current_epoch,
+            });
+        }
+        let row = self
+            .inner
+            .access_rows
+            .iter()
+            .find(|row| row.account == owner)
+            .ok_or(PairingError::StoreCorrupt(
+                "claimed owner has no access row",
+            ))?;
+        if row.revoked {
+            return Err(PairingError::RevokedByOwner);
+        }
+        if row.expires_at_ns.is_some_and(|expiry| now_ns >= expiry) {
+            return Err(PairingError::OwnerAccessExpired);
+        }
+        if !row.scope.is_attenuation_of(&pres.device_cert.cert.scope) {
+            return Err(PairingError::OwnerCertificateScopeInsufficient);
+        }
+        self.inner.high_water_ns = now_ns;
+        Ok(owner)
     }
 
     /// The pure offline chain verification shared by [`TrustStore::verify_new_pairing`]
@@ -917,6 +999,8 @@ impl TrustStore {
     /// 3. [`PairingError::WitnessAccountMismatch`] when the witness's account is
     ///    not the account being established (a confirmation for account A cannot
     ///    persist account B).
+    /// 4. [`PairingError::CodePairOwnerAccount`] when the account is the robot's
+    ///    owner: the owner row is never written by a code pairing.
     pub fn establish_code_pairing(
         &mut self,
         confirmed: &CpaceConfirmed,
@@ -933,6 +1017,9 @@ impl TrustStore {
         }
         if confirmed.account() != account {
             return Err(PairingError::WitnessAccountMismatch);
+        }
+        if self.owner() == Some(account) {
+            return Err(PairingError::CodePairOwnerAccount);
         }
         self.upsert_active_row(AccessRow {
             account,
@@ -1139,9 +1226,750 @@ fn access_row_expiry(not_after_ns: u64) -> Option<u64> {
     (not_after_ns != u64::MAX).then_some(not_after_ns)
 }
 
-/// Sibling temp path for atomic writes: append `.tmp` to the file name.
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
+/// A fresh sibling name for one save's temporary file, `.<name>.<16 hex>.tmp` in
+/// the store's directory. The hex hashes the process id and a per-process
+/// counter under std's OS-seeded `RandomState`, so two saves (in one process or
+/// two) and a crashed save's leftover do not share a name. The name is unique,
+/// not secret: the exclusive create in [`StdSaveFs`] is what refuses a path that
+/// is already there.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".{:016x}.tmp", hasher.finish()));
     path.with_file_name(name)
+}
+
+/// Read the store file at `path`. On Unix, when `path` is itself a regular file
+/// with a single link that group or other users can access, its group and other
+/// permission bits are cleared through the open handle before it is read, logged at
+/// `warn` (see `narrow_to_owner`; a symbolic link at `path` is read through and its
+/// target is not changed). When clearing them fails, that is logged at `warn` and
+/// the read goes on.
+fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let at_path = std::fs::symlink_metadata(path).ok();
+    let mut file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    narrow_to_owner(&file, path, at_path.as_ref());
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Clear the group and other permission bits of the open store `file`.
+///
+/// `at_path` is the metadata of `path` itself, read before the open without
+/// following a link. The bits are cleared only when the open handle is the same
+/// device and inode as the regular file found at `path` when its metadata was
+/// read, and that file has a single link. A path that is a symbolic link or not
+/// a regular file, that shares its file with another name, that was replaced
+/// between the two reads, or whose metadata could not be read is read as usual
+/// and its mode is left alone, logged at `warn`.
+#[cfg(unix)]
+fn narrow_to_owner(file: &std::fs::File, path: &Path, at_path: Option<&std::fs::Metadata>) {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let Some(at_path) = at_path else {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store's metadata could not be read before it was opened; its mode \
+             was not checked"
+        );
+        return;
+    };
+    if at_path.file_type().is_symlink() {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store path is a symbolic link; the mode of its target is left alone"
+        );
+        return;
+    }
+    if !at_path.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store path is not a regular file; its mode is left alone"
+        );
+        return;
+    }
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read the trust store's mode"
+            );
+            return;
+        }
+    };
+    if meta.dev() != at_path.dev() || meta.ino() != at_path.ino() {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store path changed while it was opened; its mode is left alone"
+        );
+        return;
+    }
+    if meta.nlink() != 1 {
+        tracing::warn!(
+            path = %path.display(),
+            links = meta.nlink(),
+            "the trust store file has more than one link; its mode is left alone"
+        );
+        return;
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o077 == 0 {
+        return;
+    }
+    let narrowed = mode & !0o077;
+    match file.set_permissions(std::fs::Permissions::from_mode(narrowed)) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            mode = format_args!("{mode:o}"),
+            narrowed = format_args!("{narrowed:o}"),
+            "the trust store was accessible to other users; cleared its group and other bits"
+        ),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            mode = format_args!("{mode:o}"),
+            error = %e,
+            "the trust store is accessible to other users and its group and other bits \
+             could not be cleared"
+        ),
+    }
+}
+
+/// The file-system steps [`replace_durably`] runs, one method per step, so a
+/// test can record their order. [`StdSaveFs`] is the production implementation.
+trait SaveFs {
+    /// Create `path` for writing; it must not exist.
+    fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File>;
+    /// Write all of `bytes` to `file`, which was created at `path`.
+    fn write(&mut self, file: &mut std::fs::File, path: &Path, bytes: &[u8])
+        -> std::io::Result<()>;
+    /// Flush `file` (created at `path`) and its metadata to stable storage.
+    fn sync_file(&mut self, file: &std::fs::File, path: &Path) -> std::io::Result<()>;
+    /// Rename `from` over `to`.
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
+    /// Flush the directory `dir`, so a rename into it is on stable storage.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()>;
+}
+
+/// [`SaveFs`] over `std::fs`.
+struct StdSaveFs;
+
+impl SaveFs for StdSaveFs {
+    /// An exclusive create (`O_CREAT|O_EXCL`): it fails with `AlreadyExists` on
+    /// any existing path, a symbolic link included, without following it (POSIX
+    /// `open()` specifies `EEXIST` when `O_CREAT|O_EXCL` names a symbolic link,
+    /// dangling or not; Linux and macOS do so). On Unix the file is created with
+    /// mode 0600.
+    fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    }
+    fn write(
+        &mut self,
+        file: &mut std::fs::File,
+        _path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        std::io::Write::write_all(file, bytes)
+    }
+    fn sync_file(&mut self, file: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+        file.sync_all()
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    /// Unix opens the directory and fsyncs it. Off Unix this is a no-op.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+}
+
+/// Replace `path` with `bytes` so that a power loss at any point leaves either
+/// the old file or all of the new one: write `tmp`, fsync it, rename it over
+/// `path`, then fsync the directory holding `path` (the current directory for a
+/// bare file name). Without the first fsync the rename can reach the disk
+/// before the data does; without the second the rename itself can be lost.
+///
+/// A failure up to and including the rename is returned with `path` unchanged;
+/// `tmp` is removed when this call created it. The rename is the commit point: a
+/// failed directory fsync after it is logged at `warn` and the replace returns
+/// `Ok`, because the new file is in place and a power loss can only bring back the
+/// old one.
+fn replace_durably(
+    fs: &mut impl SaveFs,
+    tmp: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    // A failed create made nothing, so whatever is at `tmp` is not this save's
+    // and is left alone.
+    let mut file = fs.create(tmp)?;
+    let staged = fs
+        .write(&mut file, tmp, bytes)
+        .and_then(|()| fs.sync_file(&file, tmp));
+    drop(file);
+    if let Err(e) = staged.and_then(|()| fs.rename(tmp, path)) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    if let Err(e) = fs.sync_dir(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "the trust store's directory could not be flushed after the rename"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One recorded [`SaveFs`] step.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        Create(PathBuf),
+        Write(PathBuf),
+        SyncFile(PathBuf),
+        Rename(PathBuf, PathBuf),
+        SyncDir(PathBuf),
+    }
+
+    /// Records each step, then performs it through [`StdSaveFs`].
+    #[derive(Default)]
+    struct Recorder(Vec<Step>);
+
+    impl SaveFs for Recorder {
+        fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
+            self.0.push(Step::Create(path.to_path_buf()));
+            StdSaveFs.create(path)
+        }
+        fn write(
+            &mut self,
+            file: &mut std::fs::File,
+            path: &Path,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            self.0.push(Step::Write(path.to_path_buf()));
+            StdSaveFs.write(file, path, bytes)
+        }
+        fn sync_file(&mut self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+            self.0.push(Step::SyncFile(path.to_path_buf()));
+            StdSaveFs.sync_file(file, path)
+        }
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.0
+                .push(Step::Rename(from.to_path_buf(), to.to_path_buf()));
+            StdSaveFs.rename(from, to)
+        }
+        fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            self.0.push(Step::SyncDir(dir.to_path_buf()));
+            StdSaveFs.sync_dir(dir)
+        }
+    }
+
+    #[test]
+    fn a_durable_replace_syncs_the_file_before_the_rename_and_the_directory_after() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        let tmp = unique_tmp_path(&path);
+        std::fs::write(&path, b"old").unwrap();
+        let mut fs = Recorder::default();
+        replace_durably(&mut fs, &tmp, &path, b"new bytes").unwrap();
+        assert_eq!(
+            fs.0,
+            vec![
+                Step::Create(tmp.clone()),
+                Step::Write(tmp.clone()),
+                Step::SyncFile(tmp.clone()),
+                Step::Rename(tmp.clone(), path.clone()),
+                Step::SyncDir(tmp_dir.path().to_path_buf()),
+            ]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new bytes");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_bare_file_name_syncs_the_current_directory() {
+        /// Records only, so the test touches nothing on disk.
+        #[derive(Default)]
+        struct DirOnly(Vec<PathBuf>);
+        impl SaveFs for DirOnly {
+            fn create(&mut self, _: &Path) -> std::io::Result<std::fs::File> {
+                tempfile::tempfile()
+            }
+            fn write(&mut self, _: &mut std::fs::File, _: &Path, _: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn sync_file(&mut self, _: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn rename(&mut self, _: &Path, _: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+                self.0.push(dir.to_path_buf());
+                Ok(())
+            }
+        }
+        let mut fs = DirOnly::default();
+        replace_durably(&mut fs, Path::new("s.tmp"), Path::new("s"), b"x").unwrap();
+        assert_eq!(fs.0, vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn a_failed_directory_sync_after_the_rename_still_saves() {
+        /// Delegates to [`StdSaveFs`] but refuses the directory sync.
+        struct DirSyncFails;
+        impl SaveFs for DirSyncFails {
+            fn create(&mut self, p: &Path) -> std::io::Result<std::fs::File> {
+                StdSaveFs.create(p)
+            }
+            fn write(&mut self, f: &mut std::fs::File, p: &Path, b: &[u8]) -> std::io::Result<()> {
+                StdSaveFs.write(f, p, b)
+            }
+            fn sync_file(&mut self, f: &std::fs::File, p: &Path) -> std::io::Result<()> {
+                StdSaveFs.sync_file(f, p)
+            }
+            fn rename(&mut self, a: &Path, b: &Path) -> std::io::Result<()> {
+                StdSaveFs.rename(a, b)
+            }
+            fn sync_dir(&mut self, _: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected"))
+            }
+        }
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        replace_durably(&mut DirSyncFails, &unique_tmp_path(&path), &path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_failed_file_sync_keeps_the_old_store_and_removes_the_tmp() {
+        /// Delegates to [`StdSaveFs`] but refuses the file sync.
+        struct FileSyncFails;
+        impl SaveFs for FileSyncFails {
+            fn create(&mut self, p: &Path) -> std::io::Result<std::fs::File> {
+                StdSaveFs.create(p)
+            }
+            fn write(&mut self, f: &mut std::fs::File, p: &Path, b: &[u8]) -> std::io::Result<()> {
+                StdSaveFs.write(f, p, b)
+            }
+            fn sync_file(&mut self, _: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected"))
+            }
+            fn rename(&mut self, a: &Path, b: &Path) -> std::io::Result<()> {
+                StdSaveFs.rename(a, b)
+            }
+            fn sync_dir(&mut self, d: &Path) -> std::io::Result<()> {
+                StdSaveFs.sync_dir(d)
+            }
+        }
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        let tmp = unique_tmp_path(&path);
+        std::fs::write(&path, b"old").unwrap();
+        let err = replace_durably(&mut FileSyncFails, &tmp, &path, b"new").unwrap_err();
+        assert_eq!(err.to_string(), "injected");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!tmp.exists(), "the tmp is removed");
+    }
+
+    #[test]
+    fn save_runs_the_durable_replace_on_the_store_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        let roots = RootSet::new(vec![PublicKey([1; 32]), PublicKey([2; 32])], 2).unwrap();
+        let store = TrustStore::provision(RobotId([0xB0; 32]), PublicKey([3; 32]), roots, b"c", 0)
+            .unwrap()
+            .with_path(&path);
+        let mut fs = Recorder::default();
+        store
+            .save_with(b"0123456789abcdef0123456789abcdef", &mut fs)
+            .unwrap();
+        let Some(Step::Create(tmp)) = fs.0.first().cloned() else {
+            panic!("the first step is the create: {:?}", fs.0);
+        };
+        assert_tmp_name(&tmp, &path);
+        assert_eq!(
+            fs.0,
+            vec![
+                Step::Create(tmp.clone()),
+                Step::Write(tmp.clone()),
+                Step::SyncFile(tmp.clone()),
+                Step::Rename(tmp, path.clone()),
+                Step::SyncDir(tmp_dir.path().to_path_buf()),
+            ]
+        );
+        TrustStore::load(&path, KEY).expect("the saved store loads");
+    }
+
+    const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    fn test_store(path: &Path) -> TrustStore {
+        let roots = RootSet::new(vec![PublicKey([1; 32]), PublicKey([2; 32])], 2).unwrap();
+        TrustStore::provision(RobotId([0xB0; 32]), PublicKey([3; 32]), roots, b"c", 0)
+            .unwrap()
+            .with_path(path)
+    }
+
+    /// `tmp` is `.<store name>.<16 lowercase hex>.tmp` beside `store`.
+    fn assert_tmp_name(tmp: &Path, store: &Path) {
+        assert_eq!(tmp.parent(), store.parent(), "{}", tmp.display());
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        let prefix = format!(".{}.", store.file_name().unwrap().to_str().unwrap());
+        let hex = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .unwrap_or_else(|| panic!("unexpected tmp name {name}"));
+        assert_eq!(hex.len(), 16, "{name}");
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn each_save_gets_its_own_temporary_name() {
+        let path = Path::new("/r/trust.store");
+        let a = unique_tmp_path(path);
+        let b = unique_tmp_path(path);
+        assert_tmp_name(&a, path);
+        assert_tmp_name(&b, path);
+        assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_over_a_0644_store_leaves_it_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Control: a file created without an explicit mode keeps group or other
+        // bits under this umask, so the 0600 below comes from the save.
+        let probe = dir.path().join("probe");
+        std::fs::File::create(&probe).unwrap();
+        assert_ne!(
+            mode_of(&probe) & 0o077,
+            0,
+            "the umask clears group and other bits, which would hide a dropped mode"
+        );
+        std::fs::remove_file(&probe).unwrap();
+        test_store(&path).save(KEY).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_a_0644_store_narrows_it_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        test_store(&path).save(KEY).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        TrustStore::load(&path, KEY).expect("a narrowed store still loads");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_at_a_temporary_name_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        // The fixed name saves used before, and a name shaped like a fresh one.
+        let fixed = dir.path().join("trust.store.tmp");
+        let shaped = dir.path().join(".trust.store.0123456789abcdef.tmp");
+        for link in [&fixed, &shaped] {
+            std::os::unix::fs::symlink(&victim, link).unwrap();
+            let err = StdSaveFs
+                .create(link)
+                .expect_err("an existing path is refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            let err = replace_durably(&mut StdSaveFs, link, &path, b"new").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            assert!(
+                link.symlink_metadata().is_ok(),
+                "the planted path is left in place"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep",
+            "the target is unchanged"
+        );
+        assert!(!path.exists(), "nothing was renamed into place");
+        // A save beside the planted links goes through its own fresh name.
+        test_store(&path).save(KEY).unwrap();
+        TrustStore::load(&path, KEY).expect("the saved store loads");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_store_is_read_through_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.store");
+        test_store(&target).save(KEY).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("trust.store");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        TrustStore::load(&link, KEY).expect("a symlinked store still loads");
+        assert_eq!(mode_of(&target), 0o644, "the link's target keeps its mode");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_with_another_hard_link_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.store");
+        test_store(&first).save(KEY).unwrap();
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::hard_link(&first, &path).unwrap();
+        TrustStore::load(&path, KEY).expect("a hard-linked store still loads");
+        assert_eq!(
+            mode_of(&first),
+            0o644,
+            "a file with two links keeps its mode"
+        );
+    }
+
+    #[cfg(unix)]
+    /// A FIFO at `path` with `mode`, made with the system `mkfifo`, and a handle
+    /// on it opened read-write so the open does not wait for a peer.
+    fn fifo_with_mode(path: &Path, mode: u32) -> std::fs::File {
+        let made = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg(format!("{mode:o}"))
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed: {made}");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_store_path_is_not_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        let file = fifo_with_mode(&path, 0o644);
+        let at_path = std::fs::symlink_metadata(&path).unwrap();
+        narrow_to_owner(&file, &path, Some(&at_path));
+        assert_eq!(mode_of(&path), 0o644, "a non-regular file keeps its mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_the_store_path_is_not_changed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("trust.store");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            TrustStore::load(&sub, KEY).is_err(),
+            "a directory is not a store"
+        );
+        assert_eq!(mode_of(&sub), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_handle_that_is_not_the_file_at_the_path_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let opened = dir.path().join("opened");
+        let other = dir.path().join("other");
+        std::fs::write(&opened, b"x").unwrap();
+        std::fs::write(&other, b"y").unwrap();
+        std::fs::set_permissions(&opened, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let file = std::fs::File::open(&opened).unwrap();
+        let other_meta = std::fs::symlink_metadata(&other).unwrap();
+        narrow_to_owner(&file, &opened, Some(&other_meta));
+        assert_eq!(mode_of(&opened), 0o644, "a different inode is not changed");
+        let own_meta = std::fs::symlink_metadata(&opened).unwrap();
+        narrow_to_owner(&file, &opened, Some(&own_meta));
+        assert_eq!(mode_of(&opened), 0o600, "the same inode is narrowed");
+    }
+
+    #[test]
+    fn concurrent_saves_both_succeed_and_leave_a_valid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        let store = test_store(&path);
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        store.save(KEY).expect("a concurrent save succeeds");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        TrustStore::load(&path, KEY).expect("the final store has a valid MAC");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "trust.store")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temporary file is left: {leftovers:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_certificate_state_tests {
+    use super::*;
+    use crate::format::{DeviceCert, IntermediateCert, PrincipalKind, Validity, FORMAT_VERSION};
+    use ed25519_dalek::SigningKey;
+
+    fn fixture() -> (TrustStore, OwnerCertificatePresentationWire) {
+        let root = SigningKey::from_bytes(&[1; 32]);
+        let issuer = SigningKey::from_bytes(&[2; 32]);
+        let issuer_key = PublicKey(issuer.verifying_key().to_bytes());
+        let device = SigningKey::from_bytes(&[3; 32]);
+        let device_key = PublicKey(device.verifying_key().to_bytes());
+        let validity = Validity {
+            not_before_ns: 0,
+            not_after_ns: 100,
+        };
+        let proof = OwnerCertificatePresentationWire::new(
+            IntermediateCert {
+                version: FORMAT_VERSION,
+                intermediate_key: issuer_key,
+                validity,
+                issued_at_ns: 0,
+                max_scope: Scope::OWNER_FULL,
+            }
+            .sign_by_roots(&[&root]),
+            DeviceCert {
+                version: FORMAT_VERSION,
+                device_key,
+                account: AccountId([4; 32]),
+                principal_kind: PrincipalKind::Human,
+                scope: Scope::OWNER_FULL,
+                validity,
+                issued_at_ns: 0,
+                issuer_key,
+            }
+            .sign(&issuer),
+        );
+        let mut store = TrustStore::provision(
+            RobotId([5; 32]),
+            device_key,
+            RootSet::new(vec![PublicKey(root.verifying_key().to_bytes())], 1).unwrap(),
+            b"unit recovery",
+            1,
+        )
+        .unwrap();
+        store
+            .claim(
+                AccountId([4; 32]),
+                b"unit recovery",
+                PrincipalKind::Human,
+                1,
+            )
+            .unwrap();
+        (store, proof)
+    }
+
+    #[test]
+    fn owner_certificate_cannot_clear_a_sticky_revoked_owner_row() {
+        let (mut store, proof) = fixture();
+        // owner_revoke intentionally prevents self-lockout. A persisted revoked
+        // owner row must still fail closed if imported or loaded from older state.
+        store.inner.access_rows[0].revoked = true;
+        assert!(matches!(
+            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2),
+            Err(PairingError::RevokedByOwner)
+        ));
+        assert!(store.access_rows()[0].revoked);
+        assert_eq!(store.high_water_ns(), 1);
+    }
+
+    #[test]
+    fn owner_certificate_never_synthesizes_a_missing_owner_row() {
+        let (mut store, proof) = fixture();
+        store.inner.access_rows.clear();
+        assert!(matches!(
+            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2),
+            Err(PairingError::StoreCorrupt(
+                "claimed owner has no access row"
+            ))
+        ));
+        assert!(store.access_rows().is_empty());
+        assert_eq!(store.high_water_ns(), 1);
+    }
+
+    #[test]
+    fn owner_certificate_preserves_finite_row_and_refuses_its_expiry_boundary() {
+        let (mut store, proof) = fixture();
+        store.inner.access_rows[0].expires_at_ns = Some(3);
+        let original = store.access_rows().to_vec();
+        store
+            .verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2)
+            .unwrap();
+        assert_eq!(store.access_rows(), original);
+        assert!(matches!(
+            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 3),
+            Err(PairingError::OwnerAccessExpired)
+        ));
+        assert_eq!(store.access_rows(), original);
+        assert_eq!(store.high_water_ns(), 2);
+    }
 }

@@ -177,7 +177,7 @@ mod posix {
         // SAFETY: FFI unlink of a valid NUL-terminated name; result
         // intentionally ignored (ENOENT is a normal outcome).
         unsafe {
-            libc::shm_unlink(name.as_ptr());
+            crate::posix_shm::shm_unlink(name.as_ptr());
         }
     }
 
@@ -229,7 +229,7 @@ mod posix {
         // SAFETY: FFI to POSIX named SHM; `name` is a valid C string. See the
         // doc above for why the mode is a `c_uint`.
         let fd = unsafe {
-            libc::shm_open(
+            crate::posix_shm::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o600 as libc::c_uint,
@@ -288,7 +288,7 @@ mod posix {
         pub(crate) fn open(name: &CStr) -> Result<Self, MapError> {
             // SAFETY: FFI open of an existing named SHM object; `name` is a
             // valid C string.
-            let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
+            let fd = unsafe { crate::posix_shm::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
             if fd < 0 {
                 return Err(MapError {
                     step: MapStep::ShmOpen,

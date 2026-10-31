@@ -5,7 +5,7 @@
 //! # Why the labels have to be recorded
 //!
 //! A `multi_publisher_topics` topic is written by several publishers onto one
-//! iceoryx2 service, and the 32-byte wire header's `sequence` is a
+//! iceoryx2 service, and the 40-byte wire header's `sequence` is a
 //! PER-PUBLISHER commit counter — so a bag's user channel holds an interleaving
 //! no reader can attribute after the fact. The recorder CAN see it (iceoryx2
 //! reports the sample's `UniquePublisherId` at drain time), so the attribution

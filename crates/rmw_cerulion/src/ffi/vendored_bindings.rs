@@ -24,7 +24,8 @@
 //        -DCERULION_HAS_FEATURES_H=1 \
 //        -DCERULION_HAS_NETWORK_FLOW_ENDPOINT_ARRAY_H=1 \
 //        -DCERULION_HAS_SUBSCRIPTION_CONTENT_FILTER_OPTIONS_H=1 \
-//        -DCERULION_HAS_QOS_STRING_CONVERSIONS_H=1
+//        -DCERULION_HAS_QOS_STRING_CONVERSIONS_H=1 \
+//        -DCERULION_HAS_SERVICE_ENDPOINT_INFO_ARRAY_H=1
 // (wrapper.h include-gates post-Foxy headers on these defines
 // — build.rs derives them by probing the sourced distro's include dirs;
 // the pinned rolling clones have every one, so a hand regeneration must
@@ -2146,6 +2147,92 @@ impl Default for rmw_network_flow_endpoint_array_s {
 }
 #[doc = " Structure to hold an arrary of network_flow_endpoint_t"]
 pub type rmw_network_flow_endpoint_array_t = rmw_network_flow_endpoint_array_s;
+#[doc = " A data structure that encapsulates the node name, node namespace,\n service_type, service_type_hash, endpoint_count, gids and qos_profiles of clients and servers.\n for a service."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rmw_service_endpoint_info_s {
+    #[doc = " Name of the node"]
+    pub node_name: *const ::std::os::raw::c_char,
+    #[doc = " Namespace of the node"]
+    pub node_namespace: *const ::std::os::raw::c_char,
+    #[doc = " The associated service type's name"]
+    pub service_type: *const ::std::os::raw::c_char,
+    #[doc = " Hashed value for service type's description"]
+    pub service_type_hash: rosidl_type_hash_t,
+    #[doc = " The endpoint type"]
+    pub endpoint_type: rmw_endpoint_type_t,
+    #[doc = " The `endpoint_count` value is determined as follows:\n - 1 if the middleware explicitly supports services (e.g., Zenoh).\n - 2 if request/response are represented as separate reader/writer topics (e.g., DDS)."]
+    pub endpoint_count: usize,
+    #[doc = " The GIDs of the endpoint(s). The array size is `endpoint_count`.\n If the middleware represents the request and response as separate topics,\n the GIDs should be provided sequentially in the order: reader, writer."]
+    pub endpoint_gids: *mut [u8; 16usize],
+    #[doc = " QoS profiles of the endpoint(s). The array size is `endpoint_count`.\n If the middleware represents the request and response as separate topics,\n the QoS profiles should be provided sequentially in the order: reader, writer"]
+    pub qos_profiles: *mut rmw_qos_profile_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rmw_service_endpoint_info_s"]
+        [::std::mem::size_of::<rmw_service_endpoint_info_s>() - 88usize];
+    ["Alignment of rmw_service_endpoint_info_s"]
+        [::std::mem::align_of::<rmw_service_endpoint_info_s>() - 8usize];
+    ["Offset of field: rmw_service_endpoint_info_s::node_name"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, node_name) - 0usize];
+    ["Offset of field: rmw_service_endpoint_info_s::node_namespace"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, node_namespace) - 8usize];
+    ["Offset of field: rmw_service_endpoint_info_s::service_type"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, service_type) - 16usize];
+    ["Offset of field: rmw_service_endpoint_info_s::service_type_hash"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, service_type_hash) - 24usize];
+    ["Offset of field: rmw_service_endpoint_info_s::endpoint_type"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, endpoint_type) - 60usize];
+    ["Offset of field: rmw_service_endpoint_info_s::endpoint_count"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, endpoint_count) - 64usize];
+    ["Offset of field: rmw_service_endpoint_info_s::endpoint_gids"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, endpoint_gids) - 72usize];
+    ["Offset of field: rmw_service_endpoint_info_s::qos_profiles"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_s, qos_profiles) - 80usize];
+};
+impl Default for rmw_service_endpoint_info_s {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " A data structure that encapsulates the node name, node namespace,\n service_type, service_type_hash, endpoint_count, gids and qos_profiles of clients and servers.\n for a service."]
+pub type rmw_service_endpoint_info_t = rmw_service_endpoint_info_s;
+#[doc = " Array of service endpoint information"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rmw_service_endpoint_info_array_s {
+    #[doc = " Size of the array."]
+    pub size: usize,
+    #[doc = " Contiguous storage for service endpoint information elements."]
+    pub info_array: *mut rmw_service_endpoint_info_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rmw_service_endpoint_info_array_s"]
+        [::std::mem::size_of::<rmw_service_endpoint_info_array_s>() - 16usize];
+    ["Alignment of rmw_service_endpoint_info_array_s"]
+        [::std::mem::align_of::<rmw_service_endpoint_info_array_s>() - 8usize];
+    ["Offset of field: rmw_service_endpoint_info_array_s::size"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_array_s, size) - 0usize];
+    ["Offset of field: rmw_service_endpoint_info_array_s::info_array"]
+        [::std::mem::offset_of!(rmw_service_endpoint_info_array_s, info_array) - 8usize];
+};
+impl Default for rmw_service_endpoint_info_array_s {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Array of service endpoint information"]
+pub type rmw_service_endpoint_info_array_t = rmw_service_endpoint_info_array_s;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct rosidl_runtime_c__float__Sequence {

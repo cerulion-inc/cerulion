@@ -7,8 +7,10 @@
 //! `tick_within_ms` times only ticks that RETURN — the scheduler reads
 //! `elapsed()` after the callback, so a tick that never comes back increments no
 //! counter and emits no line. The one thing in the system that noticed a
-//! never-returning tick was the level barrier's boundary timeout, and the flow-mode
-//! arc deletes it. This module is the replacement's half that can
+//! never-returning tick was the level barrier's boundary timeout, and the
+//! default free-run run creates no barrier at all, so it has no such timeout;
+//! only the `CERULION_EXECUTION_MODE=lockstep` opt-out still does. This module
+//! is the replacement's half that can
 //! be driven by an oracle vector: a THRESHOLD resolved once at plan time, and a
 //! rule that folds one observation into a verdict.
 //!

@@ -14,6 +14,7 @@ native_ros2_messages = { path = "../../native_ros2_messages" }
 
 [features]
 cdylib = []
+local-transport = ["cerulion_core/local-transport"]
 default = ["cdylib"]
 
 # The ONE strict lint table lives in the root `[workspace.lints]`.

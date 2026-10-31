@@ -7,3 +7,7 @@
 # Transient per-size ping-source backup made by run_workspace.sh's period
 # rewrite (restored on exit; self-healing across a killed run).
 *.orig
+# crosshost/crosshost.py renders its graphs here (they carry the run's
+# addresses and certificate paths) and writes config/iceoryx2.toml for the run.
+graphs/xhost_*.yaml
+config/iceoryx2.toml

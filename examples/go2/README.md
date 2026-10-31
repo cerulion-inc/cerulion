@@ -26,12 +26,9 @@ The companion computer is the Go2 EDU's on-board Jetson, or any Linux
 machine plugged into the robot's LAN. Nothing renders on the robot: it ships
 raw frames, and `cerulion-vizd` on your desk decodes and draws them.
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml`,
-`Cargo.lock` and `deny.toml`, and it is excluded from the repository's root
-workspace. It depends on `cerulion_core` / `native_ros2_messages` through the
-relative paths in `Cargo.toml`, so run every command from inside this
-directory. (Outside the repository, swap them for the published crates.io
-versions.)
+This example is a standalone workspace with its own `deny.toml`: run every
+command from inside this directory. See
+[Build and run from inside the example](../README.md#build-and-run-from-inside-the-example).
 
 ## What ships
 
@@ -180,7 +177,7 @@ hostname, which you can read off `cerulion topic list` and pass instead.
 
 `--single-process` is a recommendation: networked multi-process runs are
 first-class, but this walkthrough uses one process, and the flag also skips
-the partition prompt. The transform tree is a second run,
+deriving a partition. The transform tree is a second run,
 `cerulion graph run tf --release --single-process`, in another shell (both
 runs converge on the machine's one `cerulion-netd`, so the identity exported
 above already applies to it).

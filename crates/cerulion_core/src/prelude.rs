@@ -113,7 +113,7 @@
 //! `graphs/<graph>.yaml`.
 
 // Core types
-pub use crate::error::{NodeError, NodeResult, TransportError, TransportResult};
+pub use crate::error::{NodeError, NodeErrorKind, NodeResult, TransportError, TransportResult};
 pub use crate::message::ShmMessage;
 pub use crate::transport::fill_from::{FillFrom, SliceSource};
 pub use crate::transport::input_view::InputView;

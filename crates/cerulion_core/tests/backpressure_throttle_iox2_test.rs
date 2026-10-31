@@ -70,6 +70,8 @@ fn throttle_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "tp".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "upstream".to_string(),
                 node_type: "upstream".to_string(),
@@ -83,6 +85,8 @@ fn throttle_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
                 node_type: "throttled_relay".to_string(),

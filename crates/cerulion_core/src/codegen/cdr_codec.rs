@@ -17,7 +17,7 @@
 //! # Two directions
 //!
 //! - [`CdrCodec::decode`] — ingress (sensor direction): a CDR body →
-//!   a complete Cerulion wire frame (32-byte [`WireHeader`] + payload),
+//!   a complete Cerulion wire frame (40-byte [`WireHeader`] + payload),
 //!   ready for `publish_raw`.
 //! - [`CdrCodec::encode`] — egress/actuator direction: a Cerulion wire
 //!   frame → a CDR body, ready to prepend a DDS encapsulation header and
@@ -102,11 +102,16 @@
 //! it as present-with-zero-fields) — encodes as the nested schema's
 //! ZERO-DEFAULT fields (every fixed field zero, every string/array empty,
 //! recursively). Deterministic; a legitimate native frame is never rejected.
+//! The same rule holds for a dynamic `string[]` or array of a variable
+//! nested type: an empty blob (what a derived `Default` snapshot holds)
+//! encodes as zero elements. A fixed array of `N > 0` such elements with an
+//! empty blob is refused, since its arity is knowably wrong.
 
 use std::collections::BTreeMap;
 
 use super::element_codec::{CanonicalBodyBuilder, ElementBodyError};
 use super::layout::{LayoutResolver, WireLayout};
+use super::nested_index::NestedIndex;
 use super::resolve::resolve_fixed_nested;
 use super::schema::{FieldType, MessageSchema};
 use crate::shm_runtime::read_offset_entry;
@@ -532,12 +537,24 @@ impl CdrWriter {
 /// [`FrameWalker::new`](crate::codegen::FrameWalker::new) takes), then
 /// [`decode`](Self::decode) / [`encode`](Self::encode) any number of frames.
 pub struct CdrCodec {
-    /// Qualified name → resolved schema (declaration order drives the CDR
-    /// walk; the `fixed` flags on nested fields are resolved).
-    schemas: BTreeMap<String, MessageSchema>,
-    /// Qualified name → wire layout (drives Cerulion fixed offsets + the
-    /// offset table).
-    layouts: BTreeMap<String, WireLayout>,
+    /// The resolved schemas in input order; the index is the schema's
+    /// identity (declaration order drives the CDR walk; the `fixed` flags on
+    /// nested fields are resolved).
+    schemas: Vec<MessageSchema>,
+    /// Each schema's qualified name, by index (borrowed by error paths).
+    names: Vec<String>,
+    /// Wire layout by index (drives Cerulion fixed offsets + the offset
+    /// table); `None` for a schema whose layout failed.
+    layouts: Vec<Option<WireLayout>>,
+    /// Qualified name → index of the text's final owner (the index
+    /// [`LayoutResolver::layout_of`] reads), present only when that owner
+    /// has a layout. The entry point for a top-level schema named by text.
+    by_name: BTreeMap<String, usize>,
+    /// Identity `(package, name)` → index over EVERY schema in the set (the
+    /// resolver's own registry): nested references bind through it, never
+    /// through qualified-name text, so a packaged `pkg/Type` and a
+    /// package-less schema NAMED `pkg/Type` never stand in for each other.
+    index: NestedIndex,
 }
 
 impl CdrCodec {
@@ -548,37 +565,68 @@ impl CdrCodec {
     pub fn new(schemas: Vec<MessageSchema>) -> (Self, Vec<String>) {
         let mut schemas = schemas;
         let warnings = resolve_fixed_nested(&mut schemas);
-        // Snapshot the RESOLVED schemas (LayoutResolver::new re-resolves
-        // idempotently, so this snapshot matches the layouts' classification).
-        let schema_map: BTreeMap<String, MessageSchema> = schemas
-            .iter()
-            .map(|s| (s.qualified_name(), s.clone()))
-            .collect();
-        let qnames: Vec<String> = schemas.iter().map(|s| s.qualified_name()).collect();
+        // LayoutResolver::new re-resolves idempotently, so the schemas it
+        // owns match the layouts' classification.
         let (mut resolver, _resolver_warnings) = LayoutResolver::new(schemas);
-        let mut layouts = BTreeMap::new();
-        for q in qnames {
-            if let Some(layout) = resolver.layout_of(&q) {
-                layouts.insert(q, layout);
+        let names: Vec<String> = resolver
+            .schemas()
+            .iter()
+            .map(MessageSchema::qualified_name)
+            .collect();
+        let mut layouts = Vec::with_capacity(names.len());
+        let mut by_name = BTreeMap::new();
+        for (idx, name) in names.iter().enumerate() {
+            match resolver.layout_at(idx) {
+                Ok(layout) => {
+                    if resolver.index_of(name) == Some(idx) {
+                        by_name.insert(name.clone(), idx);
+                    }
+                    layouts.push(Some(layout));
+                }
+                Err(error) => {
+                    tracing::warn!(schema = %name, error = %error, "schema left out of the CDR codec");
+                    layouts.push(None);
+                }
             }
         }
+        let index = NestedIndex::from_schemas(resolver.schemas());
         (
             Self {
-                schemas: schema_map,
+                schemas: resolver.schemas().to_vec(),
+                names,
                 layouts,
+                by_name,
+                index,
             },
             warnings,
         )
     }
 
+    /// The layout of the text's final owner, when it has one.
+    fn layout_named(&self, qualified_name: &str) -> Option<&WireLayout> {
+        let idx = *self.by_name.get(qualified_name)?;
+        self.layouts[idx].as_ref()
+    }
+
+    /// The schema and layout at `idx`. A schema whose layout failed is
+    /// [`CdrCodecError::UnknownSchema`], as when it was never loaded.
+    fn slot(&self, idx: usize) -> Result<(&MessageSchema, &WireLayout), CdrCodecError> {
+        match self.layouts.get(idx) {
+            Some(Some(layout)) => Ok((&self.schemas[idx], layout)),
+            _ => Err(CdrCodecError::UnknownSchema(
+                self.names.get(idx).cloned().unwrap_or_default(),
+            )),
+        }
+    }
+
     /// True if `qualified_name` can be transcoded by this codec.
     pub fn knows(&self, qualified_name: &str) -> bool {
-        self.layouts.contains_key(qualified_name)
+        self.by_name.contains_key(qualified_name)
     }
 
     /// The wire `schema_hash` for a known schema (for stamping/validation).
     pub fn schema_hash(&self, qualified_name: &str) -> Option<u64> {
-        self.layouts.get(qualified_name).map(|l| l.schema_hash)
+        self.layout_named(qualified_name).map(|l| l.schema_hash)
     }
 
     /// Narrow `configured` to this schema's own per-route SLICE
@@ -595,12 +643,12 @@ impl CdrCodec {
         qualified_name: &str,
         configured: crate::wire::MaxSliceLen,
     ) -> Option<crate::wire::MaxSliceLen> {
-        self.layouts.get(qualified_name).map(|layout| {
+        self.layout_named(qualified_name).map(|layout| {
             crate::codegen::route_budget::route_slice_budget_capped(layout, configured)
         })
     }
 
-    /// Decode a CDR body into a complete Cerulion wire frame (32-byte
+    /// Decode a CDR body into a complete Cerulion wire frame (40-byte
     /// [`WireHeader`] + payload). `sequence` / `timestamp_ns` stamp the header
     /// (the publisher's counters/clock — deterministic under replay).
     pub fn decode(
@@ -611,12 +659,13 @@ impl CdrCodec {
         sequence: u32,
         timestamp_ns: u64,
     ) -> Result<Vec<u8>, CdrCodecError> {
-        let layout = self
-            .layouts
+        let idx = *self
+            .by_name
             .get(qualified_name)
             .ok_or_else(|| CdrCodecError::UnknownSchema(qualified_name.to_string()))?;
+        let (_, layout) = self.slot(idx)?;
         let mut reader = CdrReader::new(cdr_body, endian);
-        let payload = self.decode_payload(qualified_name, &mut reader)?;
+        let payload = self.decode_payload(idx, &mut reader)?;
 
         // The NOT-FULLY-CONSUMED gate. The walk above
         // succeeding proves only that the body was long enough for THIS
@@ -663,6 +712,7 @@ impl CdrCodec {
             offset_table_count: layout.variable_fields.len() as u32,
             sequence,
             timestamp_ns,
+            step_tag: crate::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; WireHeader::SIZE];
         header.write_to_buf(&mut frame);
@@ -683,7 +733,7 @@ impl CdrCodec {
         self.decode(qualified_name, endian, body, sequence, timestamp_ns)
     }
 
-    /// Encode a complete Cerulion wire frame (32-byte header + payload) into a
+    /// Encode a complete Cerulion wire frame (40-byte header + payload) into a
     /// CDR body (the egress/actuator direction). The header is stripped and
     /// ignored — only the schema (`qualified_name`) + the payload drive the
     /// encoding, so `encode(decode(cdr)) == cdr`.
@@ -693,9 +743,10 @@ impl CdrCodec {
         endian: CdrEndianness,
         cerulion_frame: &[u8],
     ) -> Result<Vec<u8>, CdrCodecError> {
-        if !self.layouts.contains_key(qualified_name) {
-            return Err(CdrCodecError::UnknownSchema(qualified_name.to_string()));
-        }
+        let idx = *self
+            .by_name
+            .get(qualified_name)
+            .ok_or_else(|| CdrCodecError::UnknownSchema(qualified_name.to_string()))?;
         if cerulion_frame.len() < WireHeader::SIZE {
             return Err(CdrCodecError::BadWirePayload {
                 schema: qualified_name.to_string(),
@@ -708,29 +759,23 @@ impl CdrCodec {
         }
         let payload = &cerulion_frame[WireHeader::SIZE..];
         let mut writer = CdrWriter::new(endian);
-        self.encode_payload(qualified_name, payload, &mut writer)?;
+        self.encode_payload(idx, payload, &mut writer)?;
         Ok(writer.buf)
     }
 
     // -- decode (CDR → Cerulion) --------------------------------------------
 
-    /// Build the Cerulion payload `[fixed][offset table][var]` for `qname` by
-    /// walking its fields in declaration order over the CDR reader. This is
+    /// Build the Cerulion payload `[fixed][offset table][var]` for the
+    /// `idx`-th schema by walking its fields in declaration order over the CDR reader. This is
     /// the recursive workhorse: the top-level frame and every variable-nested
     /// sub-frame flow through it.
     fn decode_payload(
         &self,
-        qname: &str,
+        idx: usize,
         reader: &mut CdrReader<'_>,
     ) -> Result<Vec<u8>, CdrCodecError> {
-        let layout = self
-            .layouts
-            .get(qname)
-            .ok_or_else(|| CdrCodecError::UnknownSchema(qname.to_string()))?;
-        let schema = self
-            .schemas
-            .get(qname)
-            .ok_or_else(|| CdrCodecError::UnknownSchema(qname.to_string()))?;
+        let (schema, layout) = self.slot(idx)?;
+        let qname = self.names[idx].as_str();
 
         let mut fixed = vec![0u8; layout.fixed_size];
         let mut var_bufs: Vec<Vec<u8>> = Vec::with_capacity(layout.variable_fields.len());
@@ -738,18 +783,18 @@ impl CdrCodec {
 
         // A member-less message is one placeholder octet on the wire and zero
         // fields here — step over it before the (empty) walk.
-        self.skip_idl_placeholder(qname, reader);
+        self.skip_idl_placeholder(idx, reader);
 
         for field in &schema.fields {
             if field.field_type.is_variable() {
                 let bytes =
-                    self.decode_cdr_variable(qname, &field.name, &field.field_type, reader)?;
+                    self.decode_cdr_variable(idx, &field.name, &field.field_type, reader)?;
                 var_bufs.push(bytes);
             } else {
                 let fl = &layout.fixed_fields[fixed_idx];
                 debug_assert_eq!(fl.name, field.name, "fixed-field lockstep desync");
                 self.decode_cdr_fixed(
-                    qname,
+                    idx,
                     &field.name,
                     &field.field_type,
                     reader,
@@ -774,12 +819,12 @@ impl CdrCodec {
         builder.finish().map_err(|e| Self::body_err(qname, e))
     }
 
-    /// True when `qname` names a MEMBER-LESS message (no fields — a
+    /// True when the `idx`-th schema is a MEMBER-LESS message (no fields: a
     /// comment-only or constants-only `.msg`), which occupies
     /// [`IDL_EMPTY_STRUCT_OCTETS`] on the CDR wire but nothing in a Cerulion
     /// payload.
-    fn is_member_less(&self, qname: &str) -> bool {
-        self.schemas.get(qname).is_some_and(|s| s.fields.is_empty())
+    fn is_member_less(&self, idx: usize) -> bool {
+        self.schemas.get(idx).is_some_and(|s| s.fields.is_empty())
     }
 
     /// Step the reader over a member-less message's IDL placeholder octet.
@@ -815,8 +860,8 @@ impl CdrCodec {
     /// placeholder in the stream, which mis-aligns every following field of an
     /// enclosing message by exactly one byte — inside the trailing-pad
     /// allowance, where the gate structurally cannot see it.
-    fn skip_idl_placeholder(&self, qname: &str, reader: &mut CdrReader<'_>) {
-        if self.is_member_less(qname) && reader.remaining() >= IDL_EMPTY_STRUCT_OCTETS {
+    fn skip_idl_placeholder(&self, idx: usize, reader: &mut CdrReader<'_>) {
+        if self.is_member_less(idx) && reader.remaining() >= IDL_EMPTY_STRUCT_OCTETS {
             reader.pos += IDL_EMPTY_STRUCT_OCTETS;
         }
     }
@@ -824,8 +869,8 @@ impl CdrCodec {
     /// Write a member-less message's IDL placeholder octet (the inverse of
     /// [`Self::skip_idl_placeholder`]), so an egress frame is the length a ROS
     /// 2 reader expects.
-    fn write_idl_placeholder(&self, qname: &str, writer: &mut CdrWriter) {
-        if self.is_member_less(qname) {
+    fn write_idl_placeholder(&self, idx: usize, writer: &mut CdrWriter) {
+        if self.is_member_less(idx) {
             writer
                 .buf
                 .extend(std::iter::repeat_n(0u8, IDL_EMPTY_STRUCT_OCTETS));
@@ -845,13 +890,14 @@ impl CdrCodec {
     /// with their `#[repr(C)]` sub-offsets).
     fn decode_cdr_fixed(
         &self,
-        schema: &str,
+        parent: usize,
         field: &str,
         ft: &FieldType,
         reader: &mut CdrReader<'_>,
         fixed: &mut [u8],
         offset: usize,
     ) -> Result<(), CdrCodecError> {
+        let schema = self.names[parent].as_str();
         match ft {
             FieldType::Bool
             | FieldType::I8
@@ -893,7 +939,7 @@ impl CdrCodec {
                         })?;
                 for i in 0..*length {
                     self.decode_cdr_fixed(
-                        schema,
+                        parent,
                         field,
                         element_type,
                         reader,
@@ -908,20 +954,17 @@ impl CdrCodec {
                 package,
                 ..
             } => {
-                let nq = self.resolve_nested_qname(schema, field, schema_name, package)?;
-                let nlayout = self
-                    .layouts
-                    .get(&nq)
-                    .ok_or_else(|| CdrCodecError::UnknownSchema(nq.clone()))?;
+                let nidx = self.resolve_nested(parent, field, schema_name, package)?;
+                let (_, nlayout) = self.slot(nidx)?;
                 // A member-less nested target contributes its placeholder
                 // octet and no fields; skipping it here is what keeps the
                 // FOLLOWING field of this message aligned.
-                self.skip_idl_placeholder(&nq, reader);
+                self.skip_idl_placeholder(nidx, reader);
                 // A fixed nested has every field in `fixed_fields`, in CDR
                 // declaration order — walk those directly at the base offset.
                 for nfl in &nlayout.fixed_fields {
                     self.decode_cdr_fixed(
-                        &nq,
+                        nidx,
                         &nfl.name,
                         &nfl.field_type,
                         reader,
@@ -944,11 +987,12 @@ impl CdrCodec {
     /// payload bytes (the offset-table entry's slice).
     fn decode_cdr_variable(
         &self,
-        schema: &str,
+        parent: usize,
         field: &str,
         ft: &FieldType,
         reader: &mut CdrReader<'_>,
     ) -> Result<Vec<u8>, CdrCodecError> {
+        let schema = self.names[parent].as_str();
         match ft {
             FieldType::String => self.read_cdr_string(schema, field, reader),
             FieldType::Bytes => {
@@ -958,7 +1002,7 @@ impl CdrCodec {
             }
             FieldType::DynamicArray { element_type } => {
                 let count = reader.read_u32(schema, field)? as usize;
-                self.decode_cdr_seq(schema, field, element_type, count, reader)
+                self.decode_cdr_seq(parent, field, element_type, count, reader)
             }
             FieldType::FixedArray {
                 element_type,
@@ -966,7 +1010,7 @@ impl CdrCodec {
             } => {
                 // Reaches here only when the element is VARIABLE (a variable
                 // fixed-array). CDR has NO count for a fixed array.
-                self.decode_cdr_seq(schema, field, element_type, *length, reader)
+                self.decode_cdr_seq(parent, field, element_type, *length, reader)
             }
             FieldType::Nested {
                 schema_name,
@@ -974,8 +1018,8 @@ impl CdrCodec {
                 ..
             } => {
                 // A single variable nested field → headerless sub-frame.
-                let nq = self.resolve_nested_qname(schema, field, schema_name, package)?;
-                self.decode_payload(&nq, reader)
+                let nidx = self.resolve_nested(parent, field, schema_name, package)?;
+                self.decode_payload(nidx, reader)
             }
             FieldType::StringFixed(_)
             | FieldType::Bool
@@ -999,12 +1043,13 @@ impl CdrCodec {
     /// variable-payload encoding for a sequence/array of that element.
     fn decode_cdr_seq(
         &self,
-        schema: &str,
+        parent: usize,
         field: &str,
         element_type: &FieldType,
         count: usize,
         reader: &mut CdrReader<'_>,
     ) -> Result<Vec<u8>, CdrCodecError> {
+        let schema = self.names[parent].as_str();
         guard_count(schema, field, count, reader.remaining())?;
         match element_type {
             FieldType::Bool | FieldType::I8 | FieldType::U8 => {
@@ -1043,17 +1088,14 @@ impl CdrCodec {
                 package,
                 ..
             } => {
-                let nq = self.resolve_nested_qname(schema, field, schema_name, package)?;
-                let nlayout = self
-                    .layouts
-                    .get(&nq)
-                    .ok_or_else(|| CdrCodecError::UnknownSchema(nq.clone()))?;
+                let nidx = self.resolve_nested(parent, field, schema_name, package)?;
+                let (_, nlayout) = self.slot(nidx)?;
                 if nlayout.is_fixed() {
                     // Back-to-back fixed sections (stride = padded size), NO
                     // count prefix — the reader recovers count from len/stride.
                     let mut out = Vec::new();
                     for _ in 0..count {
-                        let sub = self.decode_payload(&nq, reader)?;
+                        let sub = self.decode_payload(nidx, reader)?;
                         out.extend_from_slice(&sub);
                     }
                     Ok(out)
@@ -1062,7 +1104,7 @@ impl CdrCodec {
                     let mut out = Vec::new();
                     out.extend_from_slice(&(count as u32).to_le_bytes());
                     for _ in 0..count {
-                        let sub = self.decode_payload(&nq, reader)?;
+                        let sub = self.decode_payload(nidx, reader)?;
                         out.extend_from_slice(&(sub.len() as u32).to_le_bytes());
                         out.extend_from_slice(&sub);
                     }
@@ -1118,23 +1160,17 @@ impl CdrCodec {
 
     // -- encode (Cerulion → CDR) --------------------------------------------
 
-    /// Emit the CDR body for `qname` from a Cerulion payload
+    /// Emit the CDR body for the `idx`-th schema from a Cerulion payload
     /// `[fixed][table][var]`. The recursive workhorse for the top-level frame
     /// and every nested sub-frame.
     fn encode_payload(
         &self,
-        qname: &str,
+        idx: usize,
         payload: &[u8],
         writer: &mut CdrWriter,
     ) -> Result<(), CdrCodecError> {
-        let layout = self
-            .layouts
-            .get(qname)
-            .ok_or_else(|| CdrCodecError::UnknownSchema(qname.to_string()))?;
-        let schema = self
-            .schemas
-            .get(qname)
-            .ok_or_else(|| CdrCodecError::UnknownSchema(qname.to_string()))?;
+        let (schema, layout) = self.slot(idx)?;
+        let qname = self.names[idx].as_str();
 
         let head = layout.fixed_size + layout.offset_table_bytes();
         if payload.len() < head {
@@ -1151,7 +1187,7 @@ impl CdrCodec {
 
         // Mirror of the decode side: a member-less message must leave its
         // placeholder octet on the wire or a ROS 2 reader sees a short body.
-        self.write_idl_placeholder(qname, writer);
+        self.write_idl_placeholder(idx, writer);
 
         let mut fixed_idx = 0usize;
         let mut var_idx = 0usize;
@@ -1176,13 +1212,13 @@ impl CdrCodec {
                     }
                     &payload[off..off + len]
                 };
-                self.encode_cdr_variable(qname, &field.name, &field.field_type, vbytes, writer)?;
+                self.encode_cdr_variable(idx, &field.name, &field.field_type, vbytes, writer)?;
                 var_idx += 1;
             } else {
                 let fl = &layout.fixed_fields[fixed_idx];
                 debug_assert_eq!(fl.name, field.name, "fixed-field lockstep desync (encode)");
                 self.encode_cdr_fixed(
-                    qname,
+                    idx,
                     &field.name,
                     &field.field_type,
                     payload,
@@ -1199,13 +1235,14 @@ impl CdrCodec {
     /// payload at `offset` (recursing through fixed arrays + fixed nested).
     fn encode_cdr_fixed(
         &self,
-        schema: &str,
+        parent: usize,
         field: &str,
         ft: &FieldType,
         payload: &[u8],
         offset: usize,
         writer: &mut CdrWriter,
     ) -> Result<(), CdrCodecError> {
+        let schema = self.names[parent].as_str();
         match ft {
             FieldType::Bool
             | FieldType::I8
@@ -1246,7 +1283,7 @@ impl CdrCodec {
                         })?;
                 for i in 0..*length {
                     self.encode_cdr_fixed(
-                        schema,
+                        parent,
                         field,
                         element_type,
                         payload,
@@ -1261,15 +1298,12 @@ impl CdrCodec {
                 package,
                 ..
             } => {
-                let nq = self.resolve_nested_qname(schema, field, schema_name, package)?;
-                let nlayout = self
-                    .layouts
-                    .get(&nq)
-                    .ok_or_else(|| CdrCodecError::UnknownSchema(nq.clone()))?;
-                self.write_idl_placeholder(&nq, writer);
+                let nidx = self.resolve_nested(parent, field, schema_name, package)?;
+                let (_, nlayout) = self.slot(nidx)?;
+                self.write_idl_placeholder(nidx, writer);
                 for nfl in &nlayout.fixed_fields {
                     self.encode_cdr_fixed(
-                        &nq,
+                        nidx,
                         &nfl.name,
                         &nfl.field_type,
                         payload,
@@ -1292,12 +1326,13 @@ impl CdrCodec {
     /// slice `vbytes`.
     fn encode_cdr_variable(
         &self,
-        schema: &str,
+        parent: usize,
         field: &str,
         ft: &FieldType,
         vbytes: &[u8],
         writer: &mut CdrWriter,
     ) -> Result<(), CdrCodecError> {
+        let schema = self.names[parent].as_str();
         match ft {
             FieldType::String => {
                 std::str::from_utf8(vbytes).map_err(|_| CdrCodecError::InvalidUtf8 {
@@ -1313,18 +1348,18 @@ impl CdrCodec {
                 Ok(())
             }
             FieldType::DynamicArray { element_type } => {
-                self.encode_cdr_seq(schema, field, element_type, None, vbytes, writer)
+                self.encode_cdr_seq(parent, field, element_type, None, vbytes, writer)
             }
             FieldType::FixedArray {
                 element_type,
                 length,
-            } => self.encode_cdr_seq(schema, field, element_type, Some(*length), vbytes, writer),
+            } => self.encode_cdr_seq(parent, field, element_type, Some(*length), vbytes, writer),
             FieldType::Nested {
                 schema_name,
                 package,
                 ..
             } => {
-                let nq = self.resolve_nested_qname(schema, field, schema_name, package)?;
+                let nidx = self.resolve_nested(parent, field, schema_name, package)?;
                 if vbytes.is_empty() {
                     // A ZERO-LENGTH offset-table entry is how the native
                     // writers spell an UNWRITTEN variable-nested field (the
@@ -1336,15 +1371,12 @@ impl CdrCodec {
                     // `[fixed][table]` buffer IS that value: every fixed
                     // field zero, every offset entry (0,0) → empty
                     // strings/arrays (recursively, for nested-in-nested).
-                    let nlayout = self
-                        .layouts
-                        .get(&nq)
-                        .ok_or_else(|| CdrCodecError::UnknownSchema(nq.clone()))?;
+                    let (_, nlayout) = self.slot(nidx)?;
                     let zero = vec![0u8; nlayout.fixed_size + nlayout.offset_table_bytes()];
-                    return self.encode_payload(&nq, &zero, writer);
+                    return self.encode_payload(nidx, &zero, writer);
                 }
                 // vbytes is a headerless sub-frame [fixed][table][var].
-                self.encode_payload(&nq, vbytes, writer)
+                self.encode_payload(nidx, vbytes, writer)
             }
             _ => Err(CdrCodecError::BadWirePayload {
                 schema: schema.to_string(),
@@ -1359,13 +1391,30 @@ impl CdrCodec {
     /// the Cerulion bytes imply).
     fn encode_cdr_seq(
         &self,
-        schema: &str,
+        parent: usize,
         field: &str,
         element_type: &FieldType,
         fixed_count: Option<usize>,
         vbytes: &[u8],
         writer: &mut CdrWriter,
     ) -> Result<(), CdrCodecError> {
+        let schema = self.names[parent].as_str();
+        // An EMPTY blob for a counted array (`string[]`, or an array of a
+        // variable nested type) is how a native writer spells zero elements:
+        // the `set_<f>_bytes(&[])` idiom, and the value a derived
+        // `Default` snapshot holds. The frame walker reads it as zero
+        // elements, so encode it the same way. A fixed array of `N > 0`
+        // such elements has a knowably wrong arity, so it still falls
+        // through and fails on the missing count.
+        if vbytes.is_empty()
+            && fixed_count.unwrap_or(0) == 0
+            && self.is_counted(parent, field, element_type)
+        {
+            if fixed_count.is_none() {
+                writer.write_u32(0);
+            }
+            return Ok(());
+        }
         match element_type {
             FieldType::Bool | FieldType::I8 | FieldType::U8 => {
                 if fixed_count.is_none() {
@@ -1424,11 +1473,8 @@ impl CdrCodec {
                 package,
                 ..
             } => {
-                let nq = self.resolve_nested_qname(schema, field, schema_name, package)?;
-                let nlayout = self
-                    .layouts
-                    .get(&nq)
-                    .ok_or_else(|| CdrCodecError::UnknownSchema(nq.clone()))?;
+                let nidx = self.resolve_nested(parent, field, schema_name, package)?;
+                let (_, nlayout) = self.slot(nidx)?;
                 if nlayout.is_fixed() {
                     // Back-to-back fixed sections; count = len / stride.
                     let stride = nlayout.fixed_size;
@@ -1446,7 +1492,7 @@ impl CdrCodec {
                         writer.write_u32(count as u32);
                     }
                     for chunk in vbytes.chunks(stride) {
-                        self.encode_payload(&nq, chunk, writer)?;
+                        self.encode_payload(nidx, chunk, writer)?;
                     }
                     Ok(())
                 } else {
@@ -1459,7 +1505,7 @@ impl CdrCodec {
                     for _ in 0..count {
                         let len = cur.read_u32()? as usize;
                         let sub = cur.take(len)?;
-                        self.encode_payload(&nq, sub, writer)?;
+                        self.encode_payload(nidx, sub, writer)?;
                     }
                     Ok(())
                 }
@@ -1472,57 +1518,66 @@ impl CdrCodec {
         }
     }
 
-    /// Resolve a nested reference to its qualified name using the SAME
-    /// precedence as [`LayoutResolver`] / [`FrameWalker`](crate::codegen::FrameWalker): qualified →
-    /// same-package → bare `Header`→`std_msgs/Header` → unambiguous bare
-    /// suffix.
-    fn resolve_nested_qname(
+    /// True when an array of `element_type` is framed as a `u32` count and
+    /// per element a `u32` length and body: a `string`, or a nested type
+    /// whose bound layout is variable. A nested type that does not bind is
+    /// not counted here, so the normal path reports it.
+    fn is_counted(&self, parent: usize, field: &str, element_type: &FieldType) -> bool {
+        match element_type {
+            FieldType::String => true,
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => self
+                .resolve_nested(parent, field, schema_name, package)
+                .and_then(|nidx| self.slot(nidx))
+                .is_ok_and(|(_, layout)| !layout.is_fixed()),
+            _ => false,
+        }
+    }
+
+    /// Bind a nested reference written inside the `parent`-th schema to its
+    /// target's index, through the SAME identity registry the layout
+    /// resolver and the frame walker bind with (see [`NestedIndex`]):
+    /// qualified, then same-package (the parent's own `package` field), then
+    /// bare `Header` to `std_msgs/Header`, then an unambiguous bare name. The
+    /// bound index is carried down the walk, so the layout and schema a
+    /// nested field decodes with are the ones the parent's layout inlined,
+    /// even when a second schema shares the target's qualified text. No
+    /// allocation on the bound path.
+    fn resolve_nested(
         &self,
-        parent_qname: &str,
+        parent: usize,
         field: &str,
         schema_name: &str,
         package: &Option<String>,
-    ) -> Result<String, CdrCodecError> {
-        let target = match package {
-            Some(pkg) => format!("{pkg}/{schema_name}"),
-            None => schema_name.to_string(),
-        };
-        self.lookup_nested_qname(schema_name, package, parent_qname)
-            .ok_or_else(|| CdrCodecError::NestedResolutionFailed {
-                schema: parent_qname.to_string(),
+    ) -> Result<usize, CdrCodecError> {
+        let parent_package = self.schemas[parent].package.as_deref();
+        self.index
+            .bind(package.as_deref(), schema_name, parent_package)
+            .map(|bound| bound.idx)
+            .map_err(|_| CdrCodecError::NestedResolutionFailed {
+                schema: self.names[parent].clone(),
                 field: field.to_string(),
-                target,
+                target: match package {
+                    Some(pkg) => format!("{pkg}/{schema_name}"),
+                    None => schema_name.to_string(),
+                },
             })
-    }
-
-    fn lookup_nested_qname(
-        &self,
-        schema_name: &str,
-        package: &Option<String>,
-        parent_qname: &str,
-    ) -> Option<String> {
-        // Delegate to the SINGLE shared ladder (see
-        // [`resolve_nested_qname_ladder`]) over this codec's loaded layouts, so
-        // the decoder's nested resolution can never drift from the
-        // `cerulion ros2 attach` acquisition-completeness walk that must predict
-        // it.
-        resolve_nested_qname_ladder(
-            schema_name,
-            package.as_deref(),
-            parent_qname,
-            |k| self.layouts.contains_key(k),
-            self.layouts.keys().map(String::as_str),
-        )
     }
 }
 
-/// Cerulion's canonical nested-`.msg`-reference resolution ladder — the SINGLE
-/// source of truth shared by the CDR codec's private `lookup_nested_qname`
-/// (which delegates here) and the `cerulion ros2 attach` acquisition-completeness
-/// walk (`cerulion_cli_engine::ros_cmd::nested_dependencies`), so the decoder's
-/// resolution and the walk that must PREDICT it can never silently drift (a
-/// drift-guard test feeds cases through here and asserts these documented
-/// outcomes).
+/// Cerulion's nested-`.msg`-reference resolution ladder on qualified-name
+/// TEXT, for a caller that holds only a set of names: the `cerulion ros2
+/// attach` acquisition-completeness walk
+/// (`cerulion_cli_engine::ros_cmd::nested_dependencies`), which must predict
+/// what the CDR decoder will bind. The decoder itself binds on schema
+/// identity, `(package, name)`, through the registry the layout resolver
+/// uses. The two agree on every set in which each qualified text names one
+/// schema; they differ only for a package-less schema whose own name holds a
+/// `/`, which a name set cannot tell apart from a packaged one. A drift-guard
+/// test feeds cases through here and asserts these documented outcomes.
 ///
 /// Resolves a nested reference — a bare `schema_name` with an optional source
 /// `package`, appearing inside the message `parent_qname` — to its qualified
@@ -1696,7 +1751,7 @@ mod tests {
         c
     }
 
-    /// A Cerulion frame whose 32-byte header is a placeholder (all zeros) —
+    /// A Cerulion frame whose 40-byte header is a placeholder (all zeros),
     /// [`CdrCodec::encode`] strips and ignores the header, so this is a
     /// sufficient encode input built purely from a hand payload.
     fn headerless_input(payload: &[u8]) -> Vec<u8> {
@@ -1832,11 +1887,11 @@ mod tests {
             .unwrap();
         assert_eq!(&frame[WireHeader::SIZE..], &payload[..]);
         // Header fields are stamped from the layout. offset_table_offset is
-        // FRAME-relative (32-byte header + the 8-byte fixed section = 40) —
+        // FRAME-relative (40-byte header + the 8-byte fixed section = 48),
         // the wire.rs "byte offset from message start" contract the native
         // publisher stamps.
         let hdr = WireHeader::read_from_buf(&frame).unwrap();
-        assert_eq!(hdr.offset_table_offset, 40);
+        assert_eq!(hdr.offset_table_offset, 48);
         assert_eq!(hdr.offset_table_count, 2);
 
         // Independent cross-check via the walker.
@@ -2160,10 +2215,11 @@ mod tests {
         // codec writes `u32 count` + per element `u32 len` + headerless
         // sub-frame). Previously this test's only oracle was the codec against
         // ITSELF, with a comment claiming "the array is opaque to the walker" —
-        // no longer true, and the two sides resolve the element layout through
-        // INDEPENDENT resolvers (`resolve_nested_qname` here vs the walker's
-        // `lookup_nested`), so their agreement needs an assertion, not
-        // inspection. The oracle is the hand-built CDR body above.
+        // no longer true. Both sides bind the element through the one shared
+        // identity registry, but each writes or reads the framing with its
+        // own code (`decode_cdr_seq` here, the walker's bounded cursor
+        // there), so their agreement needs an assertion, not inspection.
+        // The oracle is the hand-built CDR body above.
         let (walker, _) = FrameWalker::new(pointfield_set());
         let fv = walker.walk("sensor_msgs/Fields", &frame).unwrap();
         match fv.field("fields") {
@@ -2527,6 +2583,77 @@ mod tests {
             .encode("test_msgs/Stamped", CdrEndianness::Little, &frame)
             .expect("re-encode");
         assert_eq!(re, cdr, "encode(decode(x)) == x holds for the zero-default");
+    }
+
+    #[test]
+    fn test_encode_empty_counted_arrays_emit_zero_count() {
+        // An empty blob for a `string[]` or an array of a variable nested
+        // type (a derived `Default` snapshot, or `set_<f>_bytes(&[])`) is
+        // zero elements, as the frame walker reads it, never a rejected
+        // frame.
+        let mut set = pointfield_set();
+        let mut lists = MessageSchema::new_in_package("Lists", "test_msgs");
+        lists.add_field(FieldDef::new(
+            "names",
+            FieldType::DynamicArray {
+                element_type: Box::new(FieldType::String),
+            },
+        ));
+        lists.add_field(FieldDef::new(
+            "fields",
+            FieldType::DynamicArray {
+                element_type: Box::new(nested("PointField", "sensor_msgs")),
+            },
+        ));
+        lists.add_field(FieldDef::new("value", FieldType::U32));
+        set.push(lists);
+        let c = codec(set);
+
+        // Hand Cerulion payload: fixed [value=9] + table [(0,0), (0,0)].
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u32.to_le_bytes());
+        for _ in 0..2 {
+            payload.extend_from_slice(&0u32.to_le_bytes()); // entry offset 0
+            payload.extend_from_slice(&0u32.to_le_bytes()); // entry len 0
+        }
+        let cdr = c
+            .encode(
+                "test_msgs/Lists",
+                CdrEndianness::Little,
+                &headerless_input(&payload),
+            )
+            .expect("empty counted arrays encode as zero elements");
+
+        // Hand oracle: names count 0, fields count 0, value 9.
+        let mut expect = Vec::new();
+        expect.extend_from_slice(&0u32.to_le_bytes());
+        expect.extend_from_slice(&0u32.to_le_bytes());
+        expect.extend_from_slice(&9u32.to_le_bytes());
+        assert_eq!(cdr, expect);
+    }
+
+    #[test]
+    fn test_encode_empty_fixed_string_array_is_err() {
+        // `string[2]` with an empty blob has a knowably wrong arity: refuse
+        // it, never emit two invented empty strings.
+        let mut pair = MessageSchema::new_in_package("Pair", "test_msgs");
+        pair.add_field(FieldDef::new(
+            "names",
+            FieldType::FixedArray {
+                element_type: Box::new(FieldType::String),
+                length: 2,
+            },
+        ));
+        let c = codec(vec![pair]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let r = c.encode(
+            "test_msgs/Pair",
+            CdrEndianness::Little,
+            &headerless_input(&payload),
+        );
+        assert!(r.is_err(), "{r:?}");
     }
 
     #[test]
@@ -3085,6 +3212,53 @@ mod tests {
                 text.contains(expect),
                 "message must carry {expect:?}: {text}"
             );
+        }
+    }
+
+    /// The decoder binds on identity and the attach walk on names
+    /// ([`resolve_nested_qname_ladder`]); on a name set they must bind the
+    /// same target on every rung. Each expected target is written by hand.
+    #[test]
+    fn nested_binding_agrees_with_the_names_only_ladder_on_every_rung() {
+        let set: Vec<MessageSchema> = [
+            ("geometry_msgs", "Point"),
+            ("acme", "Sub"),
+            ("std_msgs", "Header"),
+            ("acme", "Widget"),
+            ("foo", "Thing"),
+            ("foo", "Dup"),
+            ("bar", "Dup"),
+        ]
+        .into_iter()
+        .map(|(pkg, name)| MessageSchema::new_in_package(name, pkg))
+        .collect();
+        let (codec, _) = CdrCodec::new(set);
+        let parent = 3; // acme/Widget
+        let names: Vec<&str> = codec.names.iter().map(String::as_str).collect();
+        let cases: [(&str, Option<&str>, Option<&str>); 7] = [
+            ("Point", Some("geometry_msgs"), Some("geometry_msgs/Point")),
+            ("Point", Some("foo"), None),
+            ("Sub", None, Some("acme/Sub")),
+            ("Header", None, Some("std_msgs/Header")),
+            ("Thing", None, Some("foo/Thing")),
+            ("Dup", None, None),
+            ("Ghost", None, None),
+        ];
+        for (name, pkg, expected) in cases {
+            let package = pkg.map(str::to_string);
+            let decoder = codec
+                .resolve_nested(parent, "f", name, &package)
+                .ok()
+                .map(|idx| codec.names[idx].as_str());
+            let ladder = resolve_nested_qname_ladder(
+                name,
+                pkg,
+                "acme/Widget",
+                |k| names.contains(&k),
+                names.iter().copied(),
+            );
+            assert_eq!(decoder, expected, "decoder on {pkg:?}/{name}");
+            assert_eq!(ladder.as_deref(), expected, "ladder on {pkg:?}/{name}");
         }
     }
 }

@@ -20,6 +20,10 @@ pub mod auth;
 // Account self-service device management (list/revoke) + the robot-ACL
 // revocation engine seam (Studio / web account page; there is no CLI verb).
 pub mod account_cmd;
+pub mod account_identity;
+#[cfg(unix)]
+pub mod account_robot_access;
+pub mod account_robots;
 // `cerulion bag play` / `bag info` / `bag record` — the bag-as-a-data-source
 // verbs. `play` re-publishes recorded frames BYTE-VERBATIM onto local SHM, wall-paced
 // (the robot-substitute source for desk-side work); `record` is the desk-side
@@ -65,12 +69,12 @@ pub mod error;
 #[cfg(unix)]
 pub mod flashback_cmd;
 pub mod graph_cmd;
+pub mod graph_edit;
+pub mod graph_launch_args;
+pub mod graph_params_check;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;
-// The orphan port-tag reclaim (selector + descriptor-pinned removal) — the one
-// removal `cerulion clean` performs itself, kept OUT of the wiring module.
-pub mod orphan_port_tags;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
 // The LOCAL ament harvest rung — a filesystem-only
@@ -79,6 +83,8 @@ pub mod local_harvest;
 pub mod multiprocess;
 pub mod node_cmd;
 pub mod node_metadata;
+mod node_metadata_accumulate;
+pub mod node_params_info;
 // The `cerulion pair` verb — PURE eid/name resolution ladder + the
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
 // iroh-free; the CPace ceremony lives in the spawned sibling).
@@ -87,12 +93,16 @@ pub mod pair_cmd;
 // /v1/robots`) binds the logged-in account as THIS machine's owner and returns
 // the offline-verifiable owner grant. The install-funnel entry (a robot install,
 // not a desk); dials the account service via reqwest.
+#[cfg(unix)]
+pub mod robot_bootstrap;
 pub mod robot_cmd;
 // The desk-side device↔account binding resolver: reads the cached
 // `SignedDeviceCert` (~/.cerulion/device.cert) and resolves this machine's VERIFIED
 // cloud AccountId (asserting the cert attests THIS machine's device key). The
 // desk half of the binding the robot side enforces via `device_index`.
 pub mod device_binding;
+/// Consistent local certificate chains for automatic owner access.
+pub mod owner_certificate;
 // The peer-cache discovery rung + best-effort persist to
 // `~/.cerulion/peers.json` (warm peers for the next run).
 pub mod peer_cache;
@@ -124,6 +134,10 @@ pub mod replay_cmd;
 // transport).
 #[cfg(unix)]
 pub mod replay_engine;
+// The `--record-out` sink of `bag play --resim`: the re-executed frames, written
+// to a fresh bag. Unix-gated with the engine that feeds it.
+#[cfg(unix)]
+pub mod resim_record_out;
 // The `cerulion bag play --resim` SURFACE
 // over that engine — flag legality and the neutral-vs-`--verify` exit contract.
 // A verb layer only: it calls `replay_cmd::run_replay` and changes nothing
@@ -201,10 +215,20 @@ pub mod run_lock;
 // The mp machinery is gated the same way for the same reason.
 #[cfg(unix)]
 pub mod run_sweep;
+// `cerulion graph pause|resume`: finds a live run in the registry, flips its pause
+// page and mirrors the state into `run.json`. `cfg(unix)` like the page itself and
+// like `bag_cmd`, whose run selection it reuses.
+#[cfg(unix)]
+pub mod run_control;
 // `cerulion ros2 attach` — DDS discovery report + bridge config/graph
 // generation. PURE over `cerulion_dds`'s DDS-free discovery types (the live
 // backend is a separate crate); fully oracle-testable without a DDS peer.
 pub mod ros_cmd;
+// The attach ROOT (`cerulion ros2 attach`): the discovered workspace or, for
+// a workspace-less `--dry-run` ONLY, an exclusively created empty temp dir
+// removed on guard exit. Command logic lives in the engine; the binary
+// resolves through here so the no-workspace case is unit-testable.
+pub mod ros_attach_root;
 // `cerulion ros2 run` — env orchestration + transparent exec() for running
 // bare ROS 2 launch files on Cerulion transport (`RMW_IMPLEMENTATION=
 // rmw_cerulion`). Platform-independent plan building; the exec() half is
@@ -244,6 +268,9 @@ pub mod schema_store;
 // has it" cannot be expressed in Cargo at all — the probe lives here, and
 // `node build` consults it. Pure decision core + an injected pkg-config probe.
 pub mod system_deps;
+// The `graph run` warning for a tcp/ link on a host that resets idle TCP
+// connections to the initial congestion window.
+pub mod tcp_idle_warning;
 // The shared near-miss key predicate for hand-authored config
 // files whose FOREIGN sibling keys must stay legal (`~/.cerulion/config.toml`,
 // `~/.cerulion/robots.toml`), plus the Levenshtein bound `system_deps`'
@@ -324,3 +351,6 @@ pub(crate) mod test_env {
         env_mutex().lock().unwrap_or_else(|p| p.into_inner())
     }
 }
+
+/// Bundled, release-matched workspace starters.
+pub mod starter;

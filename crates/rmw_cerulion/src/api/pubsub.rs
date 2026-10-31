@@ -26,6 +26,8 @@ use crate::ffi::{
     self, rmw_ret_t, RMW_RET_BAD_ALLOC, RMW_RET_ERROR, RMW_RET_INVALID_ARGUMENT, RMW_RET_OK,
     RMW_RET_UNSUPPORTED,
 };
+use crate::replay::log::{EntityKind, GraphQuery, OutputKind, TakeKind, TakeRec};
+use crate::replay::{TakeAction, TakeMeta};
 use crate::runtime::{
     self, GraphRegistry, PublisherData, PublisherInner, SubscriptionData, SubscriptionInner,
 };
@@ -79,6 +81,60 @@ const BRIDGED_VARIABLE_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(128 * 102
 ///
 /// [`TopicServiceConfig::create_borrow_floor`]: cerulion_core::transport::TopicServiceConfig::create_borrow_floor
 pub(crate) const RMW_TAKE_LOAN_BORROW_BUDGET: usize = 4;
+
+/// The publisher slots a ROS topic's iceoryx2 service is CREATED with by an
+/// rmw endpoint. Every ROS node publishes `/rosout` (and `/parameter_events`
+/// and `/tf` are shared the same way), and iceoryx2's create default is 2
+/// publishers, so a third node on a topic could not attach its publisher and
+/// `rcl_node_init` failed on the `/rosout` one. 32 is the number of nodes
+/// that can publish one topic. iceoryx2 also caps the processes attached to
+/// one service (`max_nodes`, default 20; the rmw is one iceoryx2 node per
+/// process); a floored create sets that cap to one process per publisher and
+/// subscriber slot, so the publisher slots bind first.
+///
+/// Applied as [`TopicServiceConfig::create_publisher_floor`]: create-leg
+/// only, so an rmw endpoint still attaches to a service another opener
+/// created with fewer slots (a native graph's single-writer topic, a
+/// `cerulion topic echo`), whose slots then bind as created.
+///
+/// [`TopicServiceConfig::create_publisher_floor`]: cerulion_core::transport::TopicServiceConfig::create_publisher_floor
+pub(crate) const ROS_TOPIC_CREATE_PUBLISHERS: usize = 32;
+
+/// The most subscriber slots a ROS topic's iceoryx2 service is CREATED with by
+/// an rmw endpoint, the subscriber-slot twin of [`ROS_TOPIC_CREATE_PUBLISHERS`]
+/// (iceoryx2's create default is 8; `/clock` under `use_sim_time` and `/tf`
+/// carry one subscription per node). The floor a topic gets is
+/// [`ros_topic_create_subscribers`], which lowers it for large slice ceilings.
+/// Applied as [`TopicServiceConfig::create_subscriber_floor`].
+///
+/// [`TopicServiceConfig::create_subscriber_floor`]: cerulion_core::transport::TopicServiceConfig::create_subscriber_floor
+pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
+
+/// The slice bytes the subscriber floor may account for, summed over the
+/// floor's slots: [`ros_topic_create_subscribers`] divides it by the topic's
+/// slice ceiling. 1 GiB gives 8 slots at the 128 MiB tier (`sensor_msgs/Image`,
+/// `PointCloud2`, unlisted variable types), 32 at 32 MiB and below.
+pub(crate) const ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET: u64 = 1 << 30;
+
+/// The create-leg subscriber floor for a ROS topic whose slices are
+/// `slice_len` bytes: [`ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET`] / `slice_len`,
+/// clamped to `1..=`[`ROS_TOPIC_CREATE_SUBSCRIBERS`].
+///
+/// Each subscriber slot adds `subscriber_max_buffer_size +
+/// subscriber_max_borrowed_samples` slices (16 + 2, or 16 + 4 for a loanable
+/// type, at the rmw defaults) to every publisher's data segment, and each
+/// subscribing process maps every publisher's segment. The segment is demand-paged, so the cost is virtual
+/// address space, not resident memory. At 128 MiB slices, 32 slots reserve
+/// 72 to 80 GiB per publisher, which a 39-bit VA arm64 kernel (512 GiB of
+/// user space) runs out of after a few image publishers; 8 slots reserve
+/// 18 to 20 GiB. A floor at or below the node config's `max_subscribers`
+/// default changes nothing, so a large ceiling never lowers that default.
+pub(crate) fn ros_topic_create_subscribers(slice_len: MaxSliceLen) -> usize {
+    let slots = ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET / u64::from(slice_len.get());
+    usize::try_from(slots)
+        .unwrap_or(ROS_TOPIC_CREATE_SUBSCRIBERS)
+        .clamp(1, ROS_TOPIC_CREATE_SUBSCRIBERS)
+}
 
 /// Windowed borrow: the
 /// iceoryx2 `publisher_max_loaned_samples` a LOANABLE rmw topic's publisher
@@ -134,11 +190,9 @@ pub(crate) const RMW_BORROW_MAX_GAP_BYTES: usize = 4 * 1024 * 1024;
 /// exits. A leaked sample keeps the port's on-disk tag alive, and a
 /// DEREGISTERED port with a live tag wedges every later dead-node sweep of
 /// this process's node (the teardown block cites the iceoryx2 file:line
-/// facts). The slot cost is stated there too: rmw topics carry iceoryx2's default
-/// `max_publishers = 2`, so a re-create on the same ROS topic still
-/// succeeds only while the topic's OTHER slot is free (it takes that slot)
-/// and the next returns NULL — with any other live publisher already on
-/// the topic (the `/rosout` shape) the first re-create is the refused one.
+/// facts). The slot cost is stated there too: the leaked port holds one of
+/// the topic's publisher slots ([`ROS_TOPIC_CREATE_PUBLISHERS`] on a service
+/// an rmw endpoint created) for the life of the process.
 static BORROW_DESTROY_LEAKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Unconditional running total of windowed slots leaked at publisher
@@ -507,6 +561,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // LOWERS the stock default (a depth-1 /tf_static topic needs no raise:
         // 1 <= default*3/4).
         let mut topic_config = rt.transport.default_topic_config();
+        topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
         topic_config.history_size = history;
         if history > 0 {
             topic_config.subscriber_max_buffer_size = topic_config
@@ -541,6 +596,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // geometry is cached on the handle so the per-call paths never
         // recompute eligibility.
         let slice_len = slice_len_for(&bridge);
+        topic_config.create_subscriber_floor = Some(ros_topic_create_subscribers(slice_len));
         let windowed_geo = windowed_borrow_geometry(
             &bridge,
             slice_len.get() as usize,
@@ -658,8 +714,11 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // publish path already calls), so a consumer parked on this topic's
         // line — the event-driven `rmw_wait`'s park tier, or a native
         // monitor-wait loop in the same namespace — wakes the instant the
-        // frame is committed. No-op stub off Linux; a failed open degrades
-        // to the fd/timer wakes with the warn `enable_doorbell_shared` logs.
+        // frame is committed. On macOS the ring costs a second atomic bump in
+        // the same line and a kernel wake only while a native consumer holds
+        // the page's claim; where neither a page nor a wake word exists it is
+        // the no-op stub. A failed open degrades to the fd/timer wakes with
+        // the warn `enable_doorbell_shared` logs.
         // UNOWNED, never unlinked: a ROS topic is provisioned at TWO
         // publishers (the `/rosout` shape), so an owned bell would let the
         // first publisher to die pull the page from under the survivor — it
@@ -798,6 +857,13 @@ pub unsafe extern "C" fn rmw_create_publisher(
             &data_ref.topic,
             data_ref.bridge.schema_hash(),
         );
+        // Delivery log / replay: the publisher's stable name (`pub:<topic>#n`).
+        crate::replay::on_entity(
+            EntityKind::Publisher,
+            (*ptr).data as usize,
+            &data_ref.topic,
+            &(*((*node).data as *const runtime::NodeData)).name,
+        );
         ptr
     })
 }
@@ -816,6 +882,7 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
         if !ffi::is_our_identifier((*publisher).implementation_identifier) {
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
+        crate::replay::on_entity_destroyed((*publisher).data as usize);
         // All fallible/registry work happens through a BORROW first; the
         // Box::from_raw + frees are the final infallible block, so a
         // caught panic can never leave the rmw handle dangling.
@@ -1052,22 +1119,16 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
             // "disconnected" about a port that still counts as attached — an
             // event/count contradiction, not a remedy. Slot cost: the port
             // holds one of the topic's publisher slots for the life of this
-            // process. rmw topics are provisioned at iceoryx2's
-            // default `max_publishers = 2` (`default_topic_config` leaves
-            // `max_publishers: None` and declares
-            // `PublisherProvisioning::External`, so no single-writer pre-check
-            // fires), so a re-create on the same ROS topic still succeeds
-            // ONLY while the topic's other slot is free — it takes that slot —
-            // and the next is refused (with any other live publisher already
-            // on the topic, the `/rosout` shape, the FIRST re-create is the
-            // refused one):
+            // process. A service an rmw endpoint created carries
+            // `ROS_TOPIC_CREATE_PUBLISHERS` slots (a service another opener
+            // created carries that opener's count), so each leak lowers the
+            // topic's remaining publisher slots by one; once none remain,
             // `create_publisher_with_topic_config` fails with
-            // `ExceedsMaxSupportedPublishers` ("all 2 of the topic's publisher
-            // slots are attached"), `rmw_create_publisher` logs `publisher
-            // creation failed` and returns NULL. Pinned in-process by
-            // `rmw_borrow_publish_test` (port count + the 2-slot consequence)
-            // and cross-process by `rmw_leak_at_destroy_registry_test` (a
-            // dead node with a leaked port is swept clean).
+            // `ExceedsMaxSupportedPublishers`, `rmw_create_publisher` logs
+            // `publisher creation failed` and returns NULL. Pinned in-process by
+            // `rmw_borrow_publish_test` (port count + the held slot) and
+            // cross-process by `rmw_leak_at_destroy_registry_test` (a dead node
+            // with a leaked port is swept clean).
             std::mem::forget(data);
         } else {
             drop(data);
@@ -1077,11 +1138,69 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
     })
 }
 
+/// Delivery log / replay: hash the body of the frame about to be sent (the
+/// wire header, which carries the wall-clock timestamp, is not part of it).
+/// One thread-local flag read when no recorded or replayed output is in
+/// flight.
+#[inline]
+fn capture_frame_output(frame: &[u8]) {
+    if !crate::replay::output_capture_armed() {
+        return;
+    }
+    let end = WireHeader::read_from_buf(frame)
+        .map(|h| h.total_size as usize)
+        .filter(|&n| (WireHeader::SIZE..=frame.len()).contains(&n))
+        .unwrap_or(frame.len());
+    crate::replay::capture_output_body(frame.get(WireHeader::SIZE..end).unwrap_or(&[]));
+}
+
+/// Delivery log / replay: hash the packed encoding of the message struct
+/// at `msg` (what a copying publish sends), for a path whose frame bytes are
+/// not that encoding. One thread-local flag read when no recorded or
+/// replayed output is in flight.
+///
+/// # Safety
+/// `msg` points at a valid message of the publisher's type.
+unsafe fn capture_struct_output(data: &PublisherData, msg: *const c_void) {
+    if !crate::replay::output_capture_armed() {
+        return;
+    }
+    match data.bridge.flatten(msg, 0, 0) {
+        Ok(frame) => capture_frame_output(&frame),
+        Err(e) => {
+            tracing::warn!(
+                topic = %data.topic,
+                error = %e,
+                "delivery log: the output could not be encoded for its hash; an empty body is hashed"
+            );
+            crate::replay::capture_output_body(&[]);
+        }
+    }
+}
+
 /// # Safety
 /// rmw ABI contract: `ros_message` points at a valid message of the
 /// publisher's type.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_publish(
+    publisher: *const ffi::rmw_publisher_t,
+    ros_message: *const c_void,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_impl(publisher, ros_message, allocation);
+    }
+    crate::replay::output((*publisher).data as usize, OutputKind::Publish, || {
+        publish_impl(publisher, ros_message, allocation)
+    })
+}
+
+/// The live `rmw_publish`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish`].
+unsafe fn publish_impl(
     publisher: *const ffi::rmw_publisher_t,
     ros_message: *const c_void,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
@@ -1094,6 +1213,8 @@ pub unsafe extern "C" fn rmw_publish(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
             Err(_) => 0,
@@ -1141,6 +1262,7 @@ pub unsafe extern "C" fn rmw_publish(
                     return RMW_RET_ERROR;
                 }
             }
+            capture_frame_output(&frame);
             match inner.publisher.publish_raw(&frame) {
                 Ok(_recipients) => {
                     // Native history: TRANSIENT_LOCAL
@@ -1255,6 +1377,7 @@ pub unsafe extern "C" fn rmw_publish(
                     return RMW_RET_ERROR;
                 }
             }
+            capture_frame_output(loan.bytes_mut());
             match inner.publisher.send_raw_loan(loan) {
                 Ok(_recipients) => {
                     inner.publisher.check_subscriber_events();
@@ -1355,7 +1478,7 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         // `static_cast` only; only the heap fallback constructs) and its
         // dtor never runs `~MessageT`, so the slot state IS the message's
         // initial state — and zeros are NOT rosidl defaults (a Quaternion
-        // declares `float64 w 1`). Zero ONLY the 32-byte header region
+        // declares `float64 w 1`). Zero ONLY the 40-byte header region
         // (rewritten at publish; deterministic meanwhile), then run the
         // typesupport's `init_function` on the payload — the loaned
         // message's REAL construction. repr(C) padding stays unwritten
@@ -1372,10 +1495,10 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         let payload_ptr = bytes.as_mut_ptr().add(WireHeader::SIZE).cast::<u8>();
         // Alignment gate (fail closed — never hand out, and never run a
         // typed `init_function` on, a misaligned struct pointer). Expected
-        // to ALWAYS hold on iceoryx2 0.9.1: the sample header is 40 B @
-        // align 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES` in
-        // cerulion_core) and a `[u8]` payload has align 1, so the payload
-        // starts at chunk+40 of an 8-aligned chunk ⇒ 8-aligned; +32
+        // to ALWAYS hold: the sample header is align 8 and its size is a
+        // multiple of 8 (measured, see `IOX2_SAMPLE_HEADER_BYTES` in
+        // cerulion_core, currently 48) and a `[u8]` payload has align 1, so
+        // the payload starts 8-aligned in an 8-aligned chunk; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen
         // static assert. But that is DE FACTO, not an iceoryx2 API
         // guarantee, and the service builder's `.payload_alignment()`
@@ -1667,6 +1790,13 @@ unsafe fn publish_windowed_loan(
         _ => None,
     };
     let armed = w.window_owner.is_some();
+    // Delivery log / replay: the sealed frame below can carry dead gap
+    // bytes (earlier fills, incidental allocations) and places the payload
+    // where the fill left it, so its bytes depend on more than the message.
+    // Hash the message's packed encoding instead, the same bytes the copy
+    // paths send. The window is disarmed here, so this flatten's
+    // allocation does not land in it.
+    capture_struct_output(data, key as *const c_void);
 
     match data.bridge.seal_borrowed_frame(
         key as *mut u8,
@@ -1685,6 +1815,7 @@ unsafe fn publish_windowed_loan(
                 offset_table_count: data.bridge.layout().variable_fields.len() as u32,
                 sequence: seq,
                 timestamp_ns: now,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             };
             {
                 let bytes = loan.bytes_uninit_mut();
@@ -1849,6 +1980,7 @@ unsafe fn publish_copy_of_slot_struct(
             return RMW_RET_ERROR;
         }
     }
+    capture_frame_output(copy_loan.bytes_mut());
     match inner.publisher.send_raw_loan(copy_loan) {
         Ok(_recipients) => {
             inner.publisher.check_subscriber_events();
@@ -1874,6 +2006,24 @@ unsafe fn publish_copy_of_slot_struct(
 pub unsafe extern "C" fn rmw_publish_loaned_message(
     publisher: *const ffi::rmw_publisher_t,
     ros_message: *mut c_void,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_loaned_impl(publisher, ros_message, allocation);
+    }
+    crate::replay::output((*publisher).data as usize, OutputKind::Publish, || {
+        publish_loaned_impl(publisher, ros_message, allocation)
+    })
+}
+
+/// The live `rmw_publish_loaned_message`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish_loaned_message`].
+unsafe fn publish_loaned_impl(
+    publisher: *const ffi::rmw_publisher_t,
+    ros_message: *mut c_void,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
@@ -1884,6 +2034,8 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let key = ros_message as usize;
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
@@ -1944,8 +2096,10 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             offset_table_count: 0,
             sequence: seq,
             timestamp_ns: now,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         header.write_to_buf(&mut loan.bytes_mut()[..WireHeader::SIZE]);
+        capture_frame_output(loan.bytes_mut());
 
         // Native history: no Cerulion-side ring push.
         // `send_raw_loan` retains the frame natively in the iceoryx2
@@ -2066,12 +2220,19 @@ pub unsafe extern "C" fn rmw_publisher_count_matched_subscriptions(
         // ALL processes. The local registry only sees this process — which
         // breaks cross-process readiness checks (rclcpp wait-for-matched,
         // rcl_action availability).
-        let count = match runtime::runtime() {
-            Ok(rt) => rt.transport.topic_subscriber_count(&data.topic),
-            Err(_) => 0,
-        };
-        *subscription_count = count;
-        RMW_RET_OK
+        let (ret, count) = crate::replay::graph(
+            GraphQuery::PublisherMatchedSubscriptions,
+            &data.topic,
+            || {
+                let n = match runtime::runtime() {
+                    Ok(rt) => rt.transport.topic_subscriber_count(&data.topic),
+                    Err(_) => 0,
+                };
+                (RMW_RET_OK, n as u64)
+            },
+        );
+        *subscription_count = count as usize;
+        ret
     })
 }
 
@@ -2149,6 +2310,38 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let Some(ros_topic) = ffi::cstr(topic_name) else {
             return std::ptr::null_mut();
         };
+        // Lyrical and Rolling: `acceptable_buffer_backends`. CPU is always
+        // acceptable and is the only backend this rmw has, so a subscription
+        // naming another backend is created, logs one warning naming the
+        // backends it ignores, and receives CPU data. Malformed input fails
+        // the create (null, the RMW_RET_ERROR of a constructor) with the
+        // reason on rcl's error channel.
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        {
+            let requested = (*subscription_options).acceptable_buffer_backends;
+            let requested =
+                (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
+            match crate::rosidl_buffer::validate_acceptable_buffer_backends(requested) {
+                Ok(ignored) if !ignored.is_empty() => {
+                    tracing::warn!(
+                        topic = %ros_topic,
+                        ignored_backends = %ignored.join(","),
+                        "acceptable_buffer_backends names backends rmw_cerulion does not have; \
+                         this subscription receives every frame as CPU data"
+                    );
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::error!(
+                        topic = %ros_topic,
+                        reason = %reason,
+                        "subscription creation refused: acceptable_buffer_backends is malformed"
+                    );
+                    let _ = ffi::rcutils_set_error_state_best_effort(&reason);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
         let Ok(rt) = runtime::runtime() else {
             return std::ptr::null_mut();
         };
@@ -2182,13 +2375,19 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let requested_depth = (*qos).depth;
         let provisioned_depth = rt.transport.subscriber_buffer_size();
         // Same create-config shape as `create_subscriber` (the
-        // transport defaults — see the note above), with ONE
-        // addition for loanable (plain) types: the create-leg borrow floor,
-        // so a subscription-first create also mints the service loan-ready
+        // transport defaults; see the note above), plus the port floors on
+        // every type and, for loanable (plain) types, the create-leg borrow
+        // floor, so a subscription-first create also mints the service loan-ready
         // (order-independent with the publisher-side floor; the core keeps
         // the OPEN leg requirement-free, so a pre-existing smaller service
         // still attaches).
         let mut topic_config = rt.transport.default_topic_config();
+        // Whichever endpoint creates the service sizes its port caps, so the
+        // subscription carries the publisher's floors too, the subscriber
+        // floor from the same per-type slice ceiling the publisher uses.
+        topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
+        topic_config.create_subscriber_floor =
+            Some(ros_topic_create_subscribers(slice_len_for(&bridge)));
         // The take-side gate (fixed types AND forgeable-
         // sequence types) — distinct from the publisher's `can_loan`.
         let can_loan_take = bridge.can_loan_take();
@@ -2386,7 +2585,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // included, which is why the read-only loan contract is documented
         // beside the fixed-type rule — and Jazzy additionally gates on
         // `ROS_DISABLE_LOANED_MESSAGES=0`, above the rmw.
-        rmw_sub.can_loan_messages = can_loan_take;
+        // A replay serves takes from the delivery log by copy, so it offers
+        // no loans (rclcpp then takes through the copying path, which
+        // delivers the same message).
+        rmw_sub.can_loan_messages = can_loan_take && crate::replay::subscription_loans_allowed();
         let ptr = Box::into_raw(rmw_sub);
         // Registry mutation last (see rmw_create_publisher).
         {
@@ -2429,6 +2631,13 @@ pub unsafe extern "C" fn rmw_create_subscription(
             };
             let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
             GraphRegistry::add_endpoint(&mut graph.subscriptions, &data_ref.topic, record);
+            // Delivery log / replay: the stable name (`sub:<topic>#n`).
+            crate::replay::on_entity(
+                EntityKind::Subscription,
+                (*ptr).data as usize,
+                &data_ref.topic,
+                &node_data.name,
+            );
         }
         runtime::notify_graph_change();
         ptr
@@ -2449,6 +2658,7 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
         if !ffi::is_our_identifier((*subscription).implementation_identifier) {
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
+        crate::replay::on_entity_destroyed((*subscription).data as usize);
         // Borrow first, free last (see rmw_destroy_publisher).
         {
             let data = &*((*subscription).data as *const SubscriptionData);
@@ -2507,6 +2717,86 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
 }
 
 unsafe fn take_impl(
+    subscription: *const ffi::rmw_subscription_t,
+    ros_message: *mut c_void,
+    taken: *mut bool,
+    message_info: *mut ffi::rmw_message_info_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live take.
+    if !crate::replay::active() {
+        return take_impl_live(subscription, ros_message, taken, message_info);
+    }
+    if subscription.is_null() || ros_message.is_null() || taken.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    if !ffi::is_our_identifier((*subscription).implementation_identifier) {
+        return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+    }
+    let key = (*subscription).data as usize;
+    match crate::replay::take_action(key, TakeKind::Message) {
+        TakeAction::Live => take_impl_live(subscription, ros_message, taken, message_info),
+        TakeAction::Record(r) => r.take(
+            key,
+            TakeKind::Message,
+            || take_impl_live(subscription, ros_message, taken, message_info),
+            |_| message_take_meta(*taken, message_info),
+        ),
+        TakeAction::Serve(rec) => {
+            let data = &*((*subscription).data as *const SubscriptionData);
+            serve_recorded_message(data, rec, ros_message, taken, message_info)
+        }
+        TakeAction::Refuse => RMW_RET_ERROR,
+    }
+}
+
+/// What a live message take reported, for the delivery log.
+unsafe fn message_take_meta(taken: bool, message_info: *const ffi::rmw_message_info_t) -> TakeMeta {
+    TakeMeta {
+        taken,
+        received_ts: if taken && !message_info.is_null() {
+            (*message_info).received_timestamp
+        } else {
+            0
+        },
+        request: None,
+    }
+}
+
+/// Replay: deliver a recorded take into the caller's message, decoded by the
+/// subscription's own bridge, with the message info the live take produced.
+unsafe fn serve_recorded_message(
+    data: &SubscriptionData,
+    rec: Option<TakeRec>,
+    ros_message: *mut c_void,
+    taken: *mut bool,
+    message_info: *mut ffi::rmw_message_info_t,
+) -> rmw_ret_t {
+    *taken = false;
+    let Some(rec) = rec else {
+        return RMW_RET_OK;
+    };
+    if rec.taken {
+        if !data.bridge.unflatten(&rec.body, ros_message) {
+            crate::replay::served_decode_failed(&data.topic);
+            return RMW_RET_ERROR;
+        }
+        *taken = true;
+        if !message_info.is_null() {
+            // The same fill as the live take, from the recorded values.
+            let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
+            info.source_timestamp = rec.source_ts;
+            info.received_timestamp = rec.received_ts;
+            super::stamp_sequence_numbers(&mut info, rec.seq as u64);
+            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            info.from_intra_process = false;
+            *message_info = info;
+        }
+    }
+    rec.ret
+}
+
+/// The live take.
+unsafe fn take_impl_live(
     subscription: *const ffi::rmw_subscription_t,
     ros_message: *mut c_void,
     taken: *mut bool,
@@ -2602,9 +2892,36 @@ unsafe fn take_impl(
                 &data.topic,
             );
         }
+        // A member this build's C++ typesupport gives no way to WRITE
+        // (a `bool[]` before Humble: the generator emits no `assign` for
+        // `std::vector<bool>`), at the top level or inside a nested message,
+        // makes every frame of this type undeliverable.
+        // Decided at registration, so this is one `Option` read per frame,
+        // and taken BEFORE `unflatten` so the caller's message is untouched.
+        // The frame is consumed and dropped through the SAME latch and
+        // regime as every other decode refusal, with the member named,
+        // never as a generic malformed-entry warning, which would blame the
+        // wire for a limit of this build.
+        if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+            crate::decode_failure_latch::report_decode_entry_refused(
+                &data.decode_failures,
+                crate::decode_failure_latch::DecodeSite::Subscription,
+                &data.topic,
+                &data.type_name,
+                msg.payload().len(),
+                var_idx,
+                &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+            );
+            return;
+        }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
             info_out = Some((header.timestamp_ns, header.sequence as u64));
+            crate::replay::capture_take_body(
+                msg.payload(),
+                header.sequence as i64,
+                header.timestamp_ns as i64,
+            );
             crate::decode_failure_latch::report_decode_success(
                 &data.decode_failures,
                 crate::decode_failure_latch::DecodeSite::Subscription,
@@ -2643,8 +2960,7 @@ unsafe fn take_impl(
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
                     Err(_) => 0,
                 };
-                info.publication_sequence_number = seq;
-                info.reception_sequence_number = u64::MAX;
+                super::stamp_sequence_numbers(&mut info, seq);
             }
             info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
             info.from_intra_process = false;
@@ -2954,11 +3270,16 @@ unsafe fn take_adopted(
         // Empty queue — `taken` stays false.
         return RMW_RET_OK;
     };
-    // `try_receive_one_owned` only returns frames whose header parses and
-    // whose total_size is in bounds — a None here means the frame changed
-    // under us; fail loudly, never fabricate (mirror of take_loaned_impl).
+    // `owned.wire_header()` returns the header the read entry stored when it took
+    // the frame: `try_receive_one_owned` serves a frame only through
+    // `OwnedInboundSample::with_header`, handing it the header its own loop
+    // parsed and bounds-checked. A `None` belongs to a sample built by
+    // `OwnedInboundSample::new` over bytes that did not parse as a header; this
+    // arm refuses that sample and returns an error in place of a fabricated
+    // header (`take_loaned_impl` carries the same refusal, after its shadow
+    // release).
     let Some(header) = owned.wire_header() else {
-        tracing::error!(topic = %data.topic, "adopted take: header re-read failed; dropping frame");
+        tracing::error!(topic = %data.topic, "adopted take: frame carries no parsed header; dropping frame");
         return RMW_RET_ERROR;
     };
     // The pure gate (see `take_gate`), not a fourth
@@ -2991,6 +3312,8 @@ unsafe fn take_adopted(
     }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
+    // Delivery log: the body this take decodes (kept only if it is taken).
+    crate::replay::capture_take_body(&owned.payload()[WireHeader::SIZE..], seq as i64, ts as i64);
 
     // The PRE-WRITE frame gate. Both decodes below walk
     // the type's members writing as they go and bail at the first entry they
@@ -3026,6 +3349,25 @@ unsafe fn take_adopted(
     // allocation failure in a copy arm, a malformed body inside a NESTED
     // member, and an unaligned forged entry) still fail mid-decode — exactly
     // as the plain copying take does.
+    // The type-level blocker first (see the copying take's arm): a member
+    // this build cannot write, at the top level or inside a nested message,
+    // refuses the frame here, before the entry walk and before any write,
+    // with the member named. Read off the bridge, so it borrows nothing from
+    // the held sample.
+    if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+        );
+        return RMW_RET_OK;
+    }
     {
         let body = &owned.payload()[WireHeader::SIZE..];
         if let Err((var_idx, verdict)) = data.bridge.frame_entries_readable(body) {
@@ -3483,8 +3825,7 @@ unsafe fn take_adopted(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -3576,7 +3917,7 @@ pub unsafe extern "C" fn rmw_take_sequence(
 /// one-read-path decision: no bypass read plane), validates it BEFORE any
 /// pointer escapes, then holds the sample in the subscription's
 /// `pending_takes` table and hands rclcpp a pointer DIRECTLY into the SHM
-/// payload (past the 32-byte `WireHeader`). Zero copies, zero payload allocs.
+/// payload (past the 40-byte `WireHeader`). Zero copies, zero payload allocs.
 ///
 /// The held sample is what makes the pointer sound: iceoryx2's borrow
 /// accounting pins the publisher-pool slot until the `Sample` drops (the pool
@@ -3706,15 +4047,18 @@ unsafe fn take_loaned_impl(
         }
         return RMW_RET_OK;
     };
-    // `try_receive_one_owned` only returns frames whose header parses and
-    // whose total_size is in bounds, so this re-read cannot fail; a None
-    // here would mean the frame changed under us — fail loudly, never
-    // fabricate.
+    // `owned.wire_header()` returns the header the read entry stored when it took
+    // the frame: `try_receive_one_owned` serves a frame only through
+    // `OwnedInboundSample::with_header`, handing it the header its own loop
+    // parsed and bounds-checked. A `None` belongs to a sample built by
+    // `OwnedInboundSample::new` over bytes that did not parse as a header; the
+    // arm below releases the shadow, logs, and returns an error in place of a
+    // fabricated header.
     let Some(header) = owned.wire_header() else {
         if let Some(s) = shadow.take() {
             inner.shadows.release(s);
         }
-        tracing::error!(topic = %data.topic, "loaned take: header re-read failed; dropping frame");
+        tracing::error!(topic = %data.topic, "loaned take: frame carries no parsed header; dropping frame");
         return RMW_RET_ERROR;
     };
     // The pure gate (see `take_gate`).
@@ -3751,8 +4095,35 @@ unsafe fn take_loaned_impl(
             &data.topic,
         );
     }
+    // The type-level blocker (see the copying take's arm): a member this
+    // build cannot write refuses the frame HERE, before the forge writes its
+    // first field into the shadow, with the member named. The shadow goes
+    // back to the pool UNUSED rather than being retired with copies in it,
+    // and the frame is consumed and dropped through the same reporter the
+    // other two take paths use, so a subscriber on such a topic neither
+    // churns the shadow pool nor reads a malformed-entry line blaming the
+    // wire for a limit of this build.
+    if let Some((var_idx, path)) = data.bridge.unwritable_bool_seq() {
+        if let Some(s) = shadow.take() {
+            inner.shadows.release(s);
+        }
+        let body_len = owned.payload().len() - WireHeader::SIZE;
+        drop(owned);
+        crate::decode_failure_latch::report_decode_entry_refused(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body_len,
+            var_idx,
+            &crate::type_bridge_cpp::bool_seq_no_assign_detail(path),
+        );
+        return RMW_RET_OK;
+    }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
+    // Delivery log: the body this take hands out (kept only if it is taken).
+    crate::replay::capture_take_body(&owned.payload()[WireHeader::SIZE..], seq as i64, ts as i64);
     let loaned_ptr: *mut c_void = if let Some(mut shadow) = shadow {
         // FORGED shape. The bridge validates the frame (entries in bounds,
         // element-multiple lengths, element-aligned forge targets) and
@@ -3848,10 +4219,10 @@ unsafe fn take_loaned_impl(
             return RMW_RET_OK;
         }
         // Alignment gate (fail closed — never hand out a misaligned struct
-        // pointer). Expected to ALWAYS hold on iceoryx2 0.9.1: the sample
-        // header is 40 B @ align 8 (measured — see `IOX2_SAMPLE_HEADER_BYTES`
-        // in cerulion_core) and a `[u8]` payload has align 1, so the payload
-        // starts at chunk+40 of an 8-aligned chunk ⇒ 8-aligned; +32
+        // pointer). Expected to ALWAYS hold: the sample header is align 8 and
+        // its size is a multiple of 8 (measured, see
+        // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
+        // `[u8]` payload has align 1, so the payload starts 8-aligned; +32
         // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen static
         // assert. But that is DE FACTO, not an iceoryx2 API guarantee, and
         // the service builder's `.payload_alignment()` override is
@@ -3927,8 +4298,7 @@ unsafe fn take_loaned_impl(
             Ok(rt) => rt.transport.clock().now_ns() as i64,
             Err(_) => 0,
         };
-        info.publication_sequence_number = seq;
-        info.reception_sequence_number = u64::MAX;
+        super::stamp_sequence_numbers(&mut info, seq);
         info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
         info.from_intra_process = false;
         *message_info = info;
@@ -3949,8 +4319,35 @@ pub unsafe extern "C" fn rmw_take_loaned_message(
     _allocation: *mut ffi::rmw_subscription_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
-        take_loaned_impl(subscription, loaned_message, taken, std::ptr::null_mut())
+        take_loaned_replayable(subscription, loaned_message, taken, std::ptr::null_mut())
     })
+}
+
+/// The loaned take under the delivery log: recorded like a copying take;
+/// refused (`RMW_RET_UNSUPPORTED`, the caller falls back to the copying take)
+/// during a replay, whose subscriptions offer no loans.
+unsafe fn take_loaned_replayable(
+    subscription: *const ffi::rmw_subscription_t,
+    loaned_message: *mut *mut c_void,
+    taken: *mut bool,
+    message_info: *mut ffi::rmw_message_info_t,
+) -> rmw_ret_t {
+    match crate::replay::mode() {
+        crate::replay::Mode::Record(r) => {
+            if subscription.is_null() || taken.is_null() {
+                return RMW_RET_INVALID_ARGUMENT;
+            }
+            let key = (*subscription).data as usize;
+            r.take(
+                key,
+                TakeKind::Message,
+                || take_loaned_impl(subscription, loaned_message, taken, message_info),
+                |_| message_take_meta(*taken, message_info),
+            )
+        }
+        crate::replay::Mode::Replay(_) => RMW_RET_UNSUPPORTED,
+        _ => take_loaned_impl(subscription, loaned_message, taken, message_info),
+    }
 }
 
 /// # Safety
@@ -3964,7 +4361,7 @@ pub unsafe extern "C" fn rmw_take_loaned_message_with_info(
     _allocation: *mut ffi::rmw_subscription_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
-        take_loaned_impl(subscription, loaned_message, taken, message_info)
+        take_loaned_replayable(subscription, loaned_message, taken, message_info)
     })
 }
 
@@ -4049,12 +4446,19 @@ pub unsafe extern "C" fn rmw_subscription_count_matched_publishers(
         // action's feedback/status topics (with a
         // process-local registry alone, cross-process action clients would never see
         // the server).
-        let count = match runtime::runtime() {
-            Ok(rt) => rt.transport.topic_publisher_count(&data.topic),
-            Err(_) => 0,
-        };
-        *publisher_count = count;
-        RMW_RET_OK
+        let (ret, count) = crate::replay::graph(
+            GraphQuery::SubscriptionMatchedPublishers,
+            &data.topic,
+            || {
+                let n = match runtime::runtime() {
+                    Ok(rt) => rt.transport.topic_publisher_count(&data.topic),
+                    Err(_) => 0,
+                };
+                (RMW_RET_OK, n as u64)
+            },
+        );
+        *publisher_count = count as usize;
+        ret
     })
 }
 
@@ -4072,8 +4476,15 @@ pub unsafe extern "C" fn rmw_subscription_get_actual_qos(
     RMW_RET_OK
 }
 
+// Content-filtered topics arrived with Humble: on an older distro
+// `rmw_subscription_content_filter_options_t` does not exist, so both
+// exports are compiled away WHOLE rather than stubbed (the distro gate
+// reads the built library with `nm` and fails if either is defined where
+// the headers lack the type).
+
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_set_content_filter(
     _subscription: *mut ffi::rmw_subscription_t,
@@ -4084,6 +4495,7 @@ pub unsafe extern "C" fn rmw_subscription_set_content_filter(
 
 /// # Safety
 /// rmw ABI contract.
+#[cfg(cerulion_has_content_filter_options)]
 #[no_mangle]
 pub unsafe extern "C" fn rmw_subscription_get_content_filter(
     _subscription: *const ffi::rmw_subscription_t,
@@ -4196,6 +4608,33 @@ mod slice_ceiling_tests {
     const CATCH_ALL: u32 = 128 * 1024 * 1024;
     const SMALL_TIER: u32 = 256 * 1024;
 
+    /// The subscriber floor follows the slice ceiling: 1 GiB of slice per
+    /// floor, capped at 32 slots. Each tier of the slice-ceiling table, the
+    /// budget's own break points, and the extremes.
+    #[test]
+    fn subscriber_floor_scales_with_the_slice_ceiling() {
+        const MIB: u32 = 1024 * 1024;
+        let cases = [
+            (CATCH_ALL, 8),
+            (64 * MIB, 16),
+            (33 * MIB, 31),
+            (32 * MIB, 32),
+            (16 * MIB, 32),
+            (4 * MIB, 32),
+            (SMALL_TIER, 32),
+            (WireHeader::SIZE as u32, 32),
+            (1024 * MIB, 1),
+            (u32::MAX, 1),
+        ];
+        for (slice, want) in cases {
+            assert_eq!(
+                ros_topic_create_subscribers(MaxSliceLen::const_new(slice)),
+                want,
+                "slice ceiling {slice}"
+            );
+        }
+    }
+
     fn leaked_cstr(s: &str) -> *const c_char {
         CString::new(s).expect("cstr").into_raw()
     }
@@ -4273,6 +4712,7 @@ mod slice_ceiling_tests {
             type_id_: ros_type::DOUBLE,
             string_upper_bound_: 0,
             members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
             is_key_: false,
             is_array_: true,
             array_size_: 0,
@@ -4282,15 +4722,20 @@ mod slice_ceiling_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
         }]));
         let mm = Box::leak(Box::new(CppMessageMembers {
             message_namespace_: leaked_cstr(namespace),
             message_name_: leaked_cstr(name),
             member_count_: 1,
             size_of_: 24,
+            #[cfg(cerulion_has_is_key)]
             has_any_key_member_: false,
             members_: members.as_ptr(),
             init_function: None,
@@ -4399,7 +4844,7 @@ mod slice_ceiling_tests {
     /// section` bound, and an env entry naming it is IGNORED — loudly (one
     /// WARN per creation naming the type), never silently inert and never
     /// applied (an applied narrow override would refuse every publish of a
-    /// frame that is ALWAYS exactly 56 bytes here).
+    /// frame that is ALWAYS exactly 64 bytes here).
     #[traced_test]
     #[test]
     fn a_fixed_type_keeps_its_exact_bound_and_an_override_naming_it_warns_ignored() {
@@ -4411,7 +4856,7 @@ mod slice_ceiling_tests {
             exact,
             "no override: exact bound, byte-identical to the pre-override bound"
         );
-        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:32");
+        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:48");
         assert_eq!(
             slice_len_with_overrides(&bridge, &named).get(),
             exact,
@@ -4440,7 +4885,7 @@ mod slice_ceiling_tests {
     #[test]
     fn the_ignored_override_warn_is_once_per_type_not_per_creation() {
         let exact = (WireHeader::SIZE + 24) as u32;
-        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:32,rmw_slcflood/B:32");
+        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:48,rmw_slcflood/B:48");
         let a = fixed_bridge("rmw_slcflood__msg", "A");
         for _ in 0..5 {
             assert_eq!(

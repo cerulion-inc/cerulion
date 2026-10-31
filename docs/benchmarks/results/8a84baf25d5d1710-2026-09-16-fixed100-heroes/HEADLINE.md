@@ -108,7 +108,7 @@ STOCK posture (CER_BENCH_DMA_LOCK=0, chrt 0); recorder ON (always-on Flashback, 
 
 Ratios are ROS 2 defaults p50 / Cerulion multi-process (free run enabled) p50 from unrounded ns.
 
-Lockstep is the shipped default; the multi-process row was measured with CERULION_EXECUTION_MODE=free_run (see PROVENANCE-TWO-BUILDS.txt).
+Lockstep was the shipped default when this package was measured; the multi-process row was measured with CERULION_EXECUTION_MODE=free_run, which is now the default execution mode for a multi-process run (see PROVENANCE-TWO-BUILDS.txt).
 
 ## Provenance: TWO builds in this package
 

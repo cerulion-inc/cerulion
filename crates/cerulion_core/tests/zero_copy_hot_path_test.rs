@@ -249,10 +249,19 @@ fn publish_path_zero_alloc_fixed_schema() {
     let alloc_count = ALLOCATOR.disable();
     // --- END CRITICAL SECTION ---
 
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: `Publisher::loan`
+    // allocates once per sample (`ChunkMutSharedState` builds an
+    // `ArcSyncPolicy`, one 104-byte `Arc::new(MutexHandle::new())`), it is not
+    // avoidable through the API, and 0.9.1 did not do it. ONE loan happened in
+    // the window above, so exactly one allocation is waived and anything else
+    // still fails. `upstream_waivers_test` fails closed when the iceoryx2 pin
+    // moves off the version this waiver names.
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(1);
     assert_eq!(
-        alloc_count, 0,
-        "publish path (loan_proxy + Drop) must produce ZERO heap allocations \
-         for a fixed-schema, no-history, no-network publisher; got {alloc_count}",
+        alloc_count, waived,
+        "publish path (loan_proxy + Drop) allocated {alloc_count} times for a fixed-schema, \
+         no-history, no-network publisher. Exactly {waived} is what upstream 2035 costs for the \
+         one loan in this window; anything else is OURS and must be zero.",
     );
 }
 
@@ -324,9 +333,18 @@ fn publish_path_zero_alloc_variable_schema() {
     let alloc_count = ALLOCATOR.disable();
     // --- END CRITICAL SECTION ---
 
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: `Publisher::loan`
+    // allocates once per sample (`ChunkMutSharedState` builds an
+    // `ArcSyncPolicy`, one 104-byte `Arc::new(MutexHandle::new())`), it is not
+    // avoidable through the API, and 0.9.1 did not do it. ONE loan happened in
+    // the window above, so exactly one allocation is waived and anything else
+    // still fails. `upstream_waivers_test` fails closed when the iceoryx2 pin
+    // moves off the version this waiver names.
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(1);
     assert_eq!(
-        alloc_count, 0,
-        "variable-schema publish (set_<field>, loan_<field>) must produce \
-         ZERO heap allocations on the no-history, no-network publisher; got {alloc_count}",
+        alloc_count, waived,
+        "variable-schema publish (set_<field>, loan_<field>) allocated {alloc_count} times on \
+         the no-history, no-network publisher. Exactly {waived} is what upstream 2035 costs for \
+         the one loan in this window; anything else is OURS and must be zero.",
     );
 }

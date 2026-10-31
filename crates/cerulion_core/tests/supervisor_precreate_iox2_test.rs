@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// Detached managers serve other processes, which local-transport refuses.
 //! The CORE SEAMS for supervisor-side pre-creation of every
 //! graph-owned iceoryx2 service BEFORE any worker spawns.
 //!
@@ -190,6 +192,8 @@ fn build_three_axis_graph() -> GraphRuntime {
         prefix: "precreate".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "precreate_producer".to_string(),
@@ -197,6 +201,8 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![out("a"), out("b"), out("c")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "snap".to_string(),
                 node_type: "snap_consumer".to_string(),
@@ -204,6 +210,8 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "deep".to_string(),
                 node_type: "deep_consumer".to_string(),
@@ -211,6 +219,8 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "trig".to_string(),
                 node_type: "trig_consumer".to_string(),

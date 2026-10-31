@@ -39,7 +39,10 @@ use cerulion_core::transport::run_registry::{
     RUN_REGISTRY_SERVICE_NAME,
 };
 
-type CerService = iceoryx2::service::ipc_threadsafe::Service;
+#[cfg(not(feature = "local-transport"))]
+type TestService = iceoryx2::service::ipc_threadsafe::Service;
+#[cfg(feature = "local-transport")]
+type TestService = iceoryx2::service::local_threadsafe::Service;
 
 /// A hand-built run record. Every field is DISTINCT and non-default so a
 /// field-order slip in the codec cannot pass by coincidence.
@@ -225,7 +228,7 @@ fn an_unanswered_live_writer_is_incomplete_never_a_settled_empty() {
     let node = iceoryx2::prelude::NodeBuilder::new()
         .name(&"silent-writer".try_into().expect("node name"))
         .config(&config)
-        .create::<CerService>()
+        .create::<TestService>()
         .expect("node");
     let service = node
         .service_builder(&RUN_REGISTRY_SERVICE_NAME.try_into().expect("service name"))

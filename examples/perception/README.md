@@ -78,9 +78,11 @@ verification with the shifted detector:
 1. Check the twin against the detector, then build the three node libraries the
    loop needs: `cerulion node build <type> --release` for `camera`, `detector`
    and `detector_perturbed`, then `cerulion graph validate perception_min`.
-2. **Record** `perception_min` for ~3 s: `cerulion graph run perception_min --release --single-process --record`
-   (single-process is the wall-faithful recording path; a split run records
-   on its lockstep quantum instead).
+2. **Record** `perception_min` for ~3 s: `cerulion graph run perception_min --release --single-process --network off --record`
+   (single-process stays the wall-faithful recording path; under the free-run
+   default a split run records each rank's OWN wall-following boundary times,
+   and the `CERULION_EXECUTION_MODE=lockstep` opt-out records on the handed
+   quantum instead).
 3. **Replay #1 (golden):** `cerulion bag play <bag> --resim all --verify --tolerance tolerance.yaml`: **exit 0**, `replay PASS`.
 4. **Swap** `libdetector_perturbed` over `libdetector` (the deliberate output regression).
 5. **Replay #2 (perturbed):** same command: **exit 1**, a `bbox_iou` regression:
@@ -101,9 +103,12 @@ A pure x-shift of 8 px on a 20x20 box gives IoU `240/560 = 0.4286`, below the
 The script drives the `cerulion` on your `PATH`. Set `CERULION=/path/to/cerulion`
 to drive a different binary.
 
+The recording step runs with `--network off`, which keeps the run on this machine:
+the demo reads its bag locally, so no other machine needs to see it.
+
 ## Run it yourself, by hand
 
-The same loop, one verb at a time:
+The same loop, one verb at a time (`--network off` keeps the run on this machine):
 
 ```bash
 cd examples/perception
@@ -112,7 +117,7 @@ cerulion node build camera --release
 cerulion node build detector --release
 cerulion graph validate perception_min
 
-cerulion graph run perception_min --release --single-process --record   # Ctrl+C to stop
+cerulion graph run perception_min --release --single-process --network off --record   # Ctrl+C to stop
 # The run prints `recording written to <path>` as its last line; use that path:
 BAG="recordings/perception_min_<timestamp>.mcap"
 cerulion bag play "$BAG" --resim all --verify --tolerance tolerance.yaml   # exit 0
@@ -129,7 +134,7 @@ other two libraries:
 cerulion node build tracker --release
 cerulion node build imu --release
 cerulion graph validate perception
-cerulion graph run perception --release --record
+cerulion graph run perception --release --network off --record
 ```
 
 While it runs, `cerulion topic hz /percep/camera/image_raw` reads about 30 Hz

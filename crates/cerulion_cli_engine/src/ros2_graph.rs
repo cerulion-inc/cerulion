@@ -9,8 +9,9 @@
 //! **v1 is spawn + supervise ONLY.** A ros2 entry is an opaque child process
 //! on the staged transport env (`RMW_IMPLEMENTATION=rmw_cerulion` — the SAME
 //! env `cerulion ros2 run` stages, via [`crate::ros2_cmd::stage_base_child_env`]).
-//! It is not scheduled: no trigger policy, no DAG level, no barrier seat, no
-//! `WorkerPlan`, and no determinism claim — its topics meet native nodes on
+//! It is not scheduled: no trigger policy, no DAG level, no `WorkerPlan`, no
+//! seat in the barrier the `CERULION_EXECUTION_MODE=lockstep` opt-out creates,
+//! and no determinism claim: its topics meet native nodes on
 //! the shared transport by NAME. `GraphConfig::take_ros2_nodes` lifts the
 //! entries out BEFORE the native half is validated-for-build, partitioned,
 //! recorded or built, so every downstream seam sees a plain native graph.
@@ -429,12 +430,21 @@ impl Ros2Children {
     /// stragglers — then fold a `StopRun` failure into the run's result (an
     /// `Ok` run whose ros2 child died under `--peer-loss fail` becomes the
     /// `Err` that names it; an existing `Err` is kept, the ros2 failure
-    /// logged beside it).
+    /// logged beside it). One exception: a fatal-node verdict (exit 3) is
+    /// not a failure of the run, so a `--peer-loss fail` death WINS over it
+    /// (exit 1, the policy CI chose) and the fatal nodes are logged instead.
     pub fn finish(&self, result: CliResult<()>) -> CliResult<()> {
         self.teardown_gracefully();
         let failure = lock_failure(&self.failure).take();
         match (result, failure) {
             (Ok(()), Some(msg)) => Err(CliError::Validation(msg)),
+            (
+                Err(e @ (CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. })),
+                Some(msg),
+            ) => {
+                tracing::error!(graph = %self.graph, fatal = %e, "node fatal stop (the ros2 entry failure below decides the exit status)");
+                Err(CliError::Validation(msg))
+            }
             (Err(e), Some(msg)) => {
                 tracing::error!(graph = %self.graph, failure = %msg, "ros2 entry failure (run also failed)");
                 Err(e)
@@ -1049,6 +1059,37 @@ mod tests {
             !logs_contain("ros2 entry dropped un-reaped"),
             "a set `finish` reaped is not dropped un-reaped"
         );
+    }
+
+    /// A `--peer-loss fail` ros2 death beats a fatal-node verdict: the run
+    /// exits 1 naming the entry, not 3. A fatal verdict with no ros2 failure
+    /// is kept as is (exit 3).
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_loss_failure_wins_over_a_fatal_node_verdict() {
+        let fatal = || {
+            crate::error::node_fatal_verdict(vec![(
+                "lidar".to_string(),
+                "Fatal error: lost".to_string(),
+            )])
+        };
+        let child = sh("exit 3");
+        wait_exited_without_reaping(child.id());
+        let set = Ros2Children::for_test("g", PeerLossPolicy::Fail, vec![("sidecar", child)]);
+        let err = set
+            .finish(fatal())
+            .expect_err("the ros2 death fails the run");
+        assert!(
+            !matches!(err, CliError::NodeFatal { .. }),
+            "the ros2 death replaces the fatal verdict: {err:?}"
+        );
+        assert!(err.to_string().contains("'sidecar'"), "{err}");
+
+        let healthy = sh("exit 0");
+        wait_exited_without_reaping(healthy.id());
+        let set = Ros2Children::for_test("g", PeerLossPolicy::Fail, vec![("sidecar", healthy)]);
+        let err = set.finish(fatal()).expect_err("the fatal verdict stays");
+        assert!(matches!(err, CliError::NodeFatal { .. }), "{err:?}");
     }
 
     /// The other edge of the same rule: a child still RUNNING at teardown is

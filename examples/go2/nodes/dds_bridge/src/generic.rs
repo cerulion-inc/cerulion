@@ -19,7 +19,7 @@
 //!
 //! # How the decoded frame is published (the integration choice)
 //!
-//! [`decode_to_wire_frame`] returns a complete Cerulion wire frame (32-byte
+//! [`decode_to_wire_frame`] returns a complete Cerulion wire frame (40-byte
 //! `WireHeader` + payload) whose `schema_hash` is the SOURCE schema's — ready
 //! for `CerulionPublisher::publish_raw` on a dynamically-created publisher.
 //! The precedent is the network→local injector

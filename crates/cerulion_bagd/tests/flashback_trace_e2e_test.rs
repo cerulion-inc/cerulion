@@ -98,8 +98,8 @@ use cerulion_core::flashback::retention::RetentionCaps;
 use cerulion_core::flashback::switch::TriggerPosture;
 use cerulion_core::flashback::trigger::{CaptureRequest, TriggerPolicy};
 use cerulion_core::state_ring::{
-    encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL, STATE_RECORD_PAYLOAD,
-    STATE_RECORD_SIZE,
+    encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
+    STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
 };
 use cerulion_core::trace_ring::{
     TraceRingProducer, TraceRingRecord, RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE,
@@ -228,14 +228,34 @@ fn departure(step: u64) -> TraceRingRecord {
     }
 }
 
-/// A trace spanning the anchor step and three steps past it.
+/// A trace spanning the anchor step and three steps past it, then the next
+/// step's boundary, which proves step `ANCHOR_STEP + 3` complete.
 ///
 /// Written by hand, in the order the scheduler pushes them (a boundary at
 /// `begin_step`, then that step's fires), so the trim's answer can be compared
 /// against a set this file states rather than against the trim's own output.
+/// The capture's end cut removes the trailing boundary's step, so the oracle
+/// below stops at `ANCHOR_STEP + 3`.
 fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
     let mut out = Vec::new();
     for step in (ANCHOR_STEP - 2)..=(ANCHOR_STEP + 3) {
+        out.push(boundary(step));
+        out.push(fire(step, 0));
+        out.push(fire(step, 1));
+    }
+    out.push(boundary(ANCHOR_STEP + 4));
+    out
+}
+
+/// A trace whose FIRST boundary is the run's own step 0.
+///
+/// The one fixture property that matters is the first boundary's step, because
+/// that is what `resolve_resume` reads and what `judge_resimmable` compares
+/// against 0. Built in the same shape as its sibling above, so the pair differs
+/// in the WINDOW and in nothing else.
+fn trace_from_step_zero() -> Vec<TraceRingRecord> {
+    let mut out = Vec::new();
+    for step in 0..=3u64 {
         out.push(boundary(step));
         out.push(fire(step, 0));
         out.push(fire(step, 1));
@@ -248,7 +268,7 @@ fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
 fn expected_kept() -> Vec<TraceRingRecord> {
     trace_across_the_anchor()
         .into_iter()
-        .filter(|r| r.step > ANCHOR_STEP)
+        .filter(|r| r.step > ANCHOR_STEP && r.step <= ANCHOR_STEP + 3)
         .collect()
 }
 
@@ -261,8 +281,10 @@ fn anchor_record(node_idx: u32, fill: u8) -> Vec<u8> {
             step: ANCHOR_STEP,
             node_idx,
             part: 0,
-            kind: RECORD_KIND_FINAL,
+            kind: RECORD_KIND_FINAL_V2,
             len: payload.len() as u32,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         },
         &payload,
     )
@@ -345,6 +367,18 @@ struct Harness {
     topic: String,
     /// The continuous bag a `--record` recorder also wrote.
     continuous: Option<PathBuf>,
+    /// The RANK each state ring this run stood up declares in its header,
+    /// ascending, read back off the rings themselves.
+    ///
+    /// Carried because no arm can read it anywhere else. A rank reaches a bag
+    /// through `state_coverage.json`, which is written only when an armed
+    /// plane was observed and these arms stand none up, and the extra rings
+    /// publish nothing, so the records cannot witness them either. The header
+    /// is what every reader downstream takes its word from
+    /// (`StateCoverage::ranks_discovered` is built from `ring.rank()`), which
+    /// is why it is read back from the ring rather than restated from the
+    /// counter that stamped it.
+    state_ring_ranks: Vec<u32>,
 }
 
 impl Harness {
@@ -397,7 +431,7 @@ const GRAPH_YAML: &[u8] = b"name: trace-demo\nnodes:\n  - id: probe\n    type: p
 ///
 /// The discriminator for the REPLAY_VERDICT thread: a predicate that
 /// stops at `parse_graph` accepts this, and `run_replay` refuses it at
-/// `BagInvalidAttachment` (`replay_cmd.rs:579`).
+/// `BagInvalidAttachment` (`replay_cmd.rs:1398`).
 const GRAPH_YAML_PARSES_BUT_INVALID: &[u8] =
     b"name: trace-demo\nnodes:\n  - id: sink\n    type: sink_node\n    inputs:\n      - name: inp\n        source: ghost/out\n";
 
@@ -438,6 +472,7 @@ fn capture_with_extra_state_rings(
         false,
         extra_state_rings,
         false,
+        &[],
     )
 }
 
@@ -460,6 +495,7 @@ fn capture_inner(
         with_armed_plane,
         0,
         false,
+        &[],
     )
 }
 
@@ -477,6 +513,7 @@ fn capture_with_departure_ring(tag: &str, trace: &[TraceRingRecord], state: &[Ve
         false,
         0,
         true,
+        &[],
     )
 }
 
@@ -491,6 +528,14 @@ fn capture_inner_full(
     with_armed_plane: bool,
     extra_state_rings: usize,
     with_departure_ring: bool,
+    // Records for a SECOND worker trace ring whose header declares rank 1.
+    // Empty stands up no second ring, which is every other arm. A record's
+    // `reserved` cannot carry a rank from here: both drain paths overwrite it
+    // with the RING's own header rank (`trace_drain.rs`'s
+    // `ring.consumer.rank()` at the window drain, and `lib.rs`'s `rank_u32`
+    // from `ring_rank_bytes[i]` at the trailing drain), so a second RANK in a
+    // bag's trace needs a second RING and nothing else will do.
+    peer_rank_trace: &[TraceRingRecord],
 ) -> Harness {
     let mgr = make_manager(64);
     let topic = unique_topic("/fbt/probe");
@@ -539,14 +584,30 @@ fn capture_inner_full(
     // this function exactly as the primary one is. Declaring a name with no ring
     // behind it would exercise the recorder's degraded-open path instead of the
     // multi-ring one, which is a different arm.
+    //
+    // Each takes its OWN header rank, counting up from the primary ring's 0, so
+    // the shape is the multi RANK deployment these arms are named for rather
+    // than several rings all claiming rank 0, which no real run produces: one
+    // ring per rank is what `process_groups` provisions. A hand stamped
+    // manifest can assert the ring COUNT, and only real rings at real ranks can
+    // assert what a recorder does with them.
     let _extra_state_owners: Vec<StateRingOwner> = (0..extra_state_rings)
         .map(|i| {
             let extra_tag = unique_ring_tag(&format!("st{tag}x{i}"));
-            let owner = StateRingOwner::create(&extra_tag, RING_RECORDS, 0, RUN, &NODES)
+            let rank = i as u32 + 1;
+            let owner = StateRingOwner::create(&extra_tag, RING_RECORDS, rank, RUN, &NODES)
                 .expect("create an extra state ring");
             cfg.state_rings.push(owner.name().to_string());
             owner
         })
+        .collect();
+    // The ranks as the RINGS declare them, read back off each header rather
+    // than restated from the counter above, and handed to the arm. Without
+    // this the "two REAL ranks" half of the multi-ring shape is pinned by
+    // nothing: every extra ring can be put back at rank 0 and the whole binary
+    // stays green, because nothing else in this harness reads a rank.
+    let state_ring_ranks: Vec<u32> = std::iter::once(state_owner.rank())
+        .chain(_extra_state_owners.iter().map(StateRingOwner::rank))
         .collect();
     // MINTED ONCE and held: a ring is SPSC, so a second `producer()` answers
     // `None`. It is also the RENDEZVOUS below — the producer is the only handle
@@ -583,9 +644,22 @@ fn capture_inner_full(
         cfg.rings.push(owner.name().to_string());
         owner
     });
+    // The PEER worker ring: header rank 1, the same node manifest as rank 0's.
+    // Held to the end of this function exactly as the others are.
+    let mut peer_owner = (!peer_rank_trace.is_empty()).then(|| {
+        let peer_tag = unique_ring_tag(&format!("pr{tag}"));
+        let owner =
+            cerulion_core::trace_ring::TraceRingOwner::create(&peer_tag, RING_RECORDS, 1, &NODES)
+                .expect("create the peer trace ring");
+        cfg.rings.push(owner.name().to_string());
+        owner
+    });
     let mut trace_producer = trace_owner
         .as_mut()
         .map(|o| o.producer().expect("the single trace producer"));
+    let mut peer_producer = peer_owner
+        .as_mut()
+        .map(|o| o.producer().expect("the single peer trace producer"));
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let rec_mgr = Arc::clone(&mgr);
@@ -602,6 +676,9 @@ fn capture_inner_full(
     // after) — which is what makes the state rendezvous below sound for BOTH.
     if let Some(p) = trace_producer.as_mut() {
         push_trace(p, trace);
+    }
+    if let Some(p) = peer_producer.as_mut() {
+        push_trace(p, peer_rank_trace);
     }
     for record in state {
         // The mint is the CALLER's because a ring is SPSC and `producer()` is
@@ -675,6 +752,7 @@ fn capture_inner_full(
         bag,
         topic,
         continuous,
+        state_ring_ranks,
     }
 }
 
@@ -786,6 +864,17 @@ fn a_capture_carries_its_trace_trimmed_to_its_anchor_and_reads_resimmable() {
         )),
         "the count is MEASURED, and it is the number of records the bag really holds — \
          stated in the handoff's own vocabulary, the one place this manifest says it: {m}"
+    );
+    // The end cut, stated: the one rank's final step (the trailing boundary
+    // alone) was removed, and the sentence says why.
+    let end_cut = m["handoff"]["trace_end_cut"]
+        .as_str()
+        .expect("the handoff states the capture's end cut");
+    assert!(
+        end_cut.starts_with(
+            "1 step(s) removed from the end of the trace (1 scheduler-trace record(s))"
+        ) && end_cut.contains("read record"),
+        "the end cut names its count and its cause: {end_cut}"
     );
     // The RECORDER's own drained count, on the mode whose
     // reader is the WRITER THREAD.
@@ -989,7 +1078,7 @@ fn the_fixture_graphs_have_the_validity_their_arms_depend_on() {
 /// The sibling arm above covers a graph that is ABSENT. This one covers a graph
 /// that is present and unusable — the case a presence check and a parse check
 /// both wave through. `run_replay` runs UTF-8 -> parse -> `validate_graph`
-/// (`replay_cmd.rs:553-583`), each failing as `BagInvalidAttachment` -> exit 2,
+/// (`replay_cmd.rs:1371-1401`), each failing as `BagInvalidAttachment` -> exit 2,
 /// so a capture whose predicate stopped at `parse_graph` published
 /// `resimmable: true` against a bag replay refuses before loading anything.
 ///
@@ -1427,6 +1516,16 @@ fn a_capture_with_no_anchor_in_window_reads_not_resimmable_honestly() {
 #[test]
 fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() {
     let h = capture_with_extra_state_rings("noanchormulti", &trace_across_the_anchor(), &[], 1);
+    // PRECONDITION on the FIXTURE, and the half that nothing else reads: two
+    // rings on two DIFFERENT ranks, as their own headers declare them. Several
+    // rings all claiming rank 0 is what a hand stamped manifest produces and
+    // what no real run does, and the pair below differs in its WINDOW and in
+    // nothing else, so both arms state the shape they share.
+    assert_eq!(
+        h.state_ring_ranks,
+        vec![0, 1],
+        "PRECONDITION: one ring per rank, counting up from the primary ring's 0"
+    );
 
     let m = flashback_manifest(&h.bag);
     // PRECONDITIONS: this really is the no-anchor arm, and the manifest really
@@ -1455,11 +1554,349 @@ fn a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares() 
         .as_str()
         .expect("a refusal states its reason");
     assert!(
-        reason.contains("state rings") && reason.contains("no rank"),
+        reason.contains("state rings") && reason.contains("carries its producer's rank"),
         "the verdict must report the RING ambiguity the bag declares — the gap resim reaches \
          first — rather than an anchor-shaped reason: {reason}"
     );
+    // …and it says that NOTHING WALKED a rank space, which is true of this
+    // recorder and is the half a roster alone cannot state: the harness hands
+    // its rings in by name and stands up no discovery tag, so the sweep never
+    // runs, the roster is empty for that reason rather than for having looked,
+    // and an unqualified silence here would read as "no rank published
+    // nothing". This is the one arm that drives that wiring end to end, from
+    // the recorder's own swept set through the verdict to the stored sentence.
+    assert!(
+        reason.contains("nothing walked a rank space"),
+        "a run whose state rings were named walked no rank space, and the stored reason \
+         says so rather than falling silent: {reason}"
+    );
 
+    h.cleanup();
+}
+
+/// A window reaching the run's own step 0 is RESIMMABLE at two REAL state
+/// rings, on two REAL ranks.
+///
+/// This is leg (C) of the six operator sentences' behaviour oracle, over a
+/// recording rather than over a hand stamped manifest. The oracle in
+/// `cerulion_cli_engine` drives the claim end to end and reads the printed line
+/// back, but its two ring bag is a ONE rank fixture whose coverage manifest was
+/// edited to say `rings_declared: 2`: it pins what the REPLAYER does with a
+/// manifest, and it cannot pin what a RECORDER writes into one. So the claim
+/// that the step 0 exception governs both ring counts rested on a stamp, and a
+/// stamp is exactly the thing that cannot show the recorder agreeing.
+///
+/// The PAIR is what carries it, and the sibling is
+/// `a_no_anchor_capture_is_judged_against_the_ring_count_its_manifest_declares`
+/// directly above: the SAME driver, the SAME two real rings at ranks 0 and 1,
+/// the SAME absent anchor, and a trace whose window starts MID RUN. That one
+/// reads `resimmable: false` with the ring ambiguity. This one moves the window
+/// to step 0 and nothing else, and reads `resimmable: true`. Two real
+/// recordings differing in the window alone are what pin the refusal to the
+/// WINDOW rather than to the ring count.
+
+#[test]
+fn a_two_rank_capture_whose_window_reaches_step_zero_reads_resimmable() {
+    let h = capture_with_extra_state_rings("stepzeromulti", &trace_from_step_zero(), &[], 1);
+    // PRECONDITION, and the RANK half of this arm's own headline: two rings on
+    // two REAL ranks, read back off the ring headers. Nothing else in this
+    // binary reads a rank, so without this the extra ring could be put back at
+    // rank 0 and the arm would still pass while its name and its doc both
+    // claim two ranks.
+    assert_eq!(
+        h.state_ring_ranks,
+        vec![0, 1],
+        "PRECONDITION: two REAL ranks, which is the one ring per rank shape a \
+         multi-process run provisions"
+    );
+
+    let m = flashback_manifest(&h.bag);
+    // PRECONDITIONS. Without all three this arm could read `resimmable: true`
+    // for reasons that have nothing to do with the window: an anchor that
+    // covers everything, a single ring, or a trace that never reached the bag.
+    assert_eq!(
+        m["anchor"]["embedded"],
+        serde_json::json!(false),
+        "PRECONDITION: no anchor is embedded, so nothing but the window can be \
+         carrying the verdict: {m}"
+    );
+    assert_eq!(
+        m["handoff"]["trace_rings_configured"],
+        serde_json::json!(1),
+        "PRECONDITION: one TRACE ring, so the node map is resolvable and the \
+         verdict cannot be reporting the node-map gap: {m}"
+    );
+    assert!(
+        carried_records(&m) > 0,
+        "PRECONDITION: the bag really carries a trace, or the verdict would be \
+         the no-trace one: {m}"
+    );
+
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "two REAL state rings and a window reaching step 0: the ring count is \
+         never consulted, because no anchor is read at all: {m}"
+    );
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    assert!(
+        reason.contains("step 0"),
+        "and the sentence says WHY, which is the window: {reason}"
+    );
+    assert!(
+        reason.contains("--resim"),
+        "the positive reason tells the operator what to RUN: {reason}"
+    );
+    // THE ANTI-CLAIM: the sibling's sentence must not be the one rendered here.
+    // A verdict that reported the ring ambiguity on this bag would be the very
+    // reading the six sentences were reworded to retire.
+    assert!(
+        !reason.contains("state rings"),
+        "the ring ambiguity is not reached on this window: {reason}"
+    );
+
+    h.cleanup();
+}
+
+/// A two rank capture whose PEER ended shorter renders the fold, and the sentence
+/// says which number it is.
+///
+/// The verdict an operator reads carries the covered range's endpoint, and that
+/// endpoint is the recorder's fold: the MINIMUM over the ranks that kept a
+/// boundary of each rank's last kept target. The sentence used to call it "the
+/// last step boundary this capture's trace carries", which on this bag names a
+/// DIFFERENT and later instant, so the rendered claim and the number beside it
+/// disagreed. This arm is the only thing in the tree that reads the rendered
+/// text, which is why the wording survived the fold.
+///
+/// The shape is reachable through the ordinary from start path: `judge_resimmable`
+/// returns on the step 0 arm before the multi ring gate, so a two rank capture
+/// renders a POSITIVE verdict with a range in it.
+///
+/// TWO REAL TRACE RANKS, which is the only way a bag can carry two. A record's
+/// `reserved` cannot carry a rank from the fixture: both drain paths overwrite it
+/// with the RING's own header rank, `ring.consumer.rank()` at
+/// `crates/cerulion_bagd/src/trace_drain.rs:828` and `rank_u32` from
+/// `ring_rank_bytes[i]` at `crates/cerulion_bagd/src/lib.rs:7837`. So the peer's
+/// boundaries go through a SECOND worker ring whose header declares rank 1.
+///
+/// A worker ring and not the supervisor's DEPARTURE ring, decided from the drain
+/// side: that ring's header rank is the `u32::MAX` sentinel
+/// (`crates/cerulion_core/src/trace_ring.rs:482`), not a peer rank, the harness
+/// mints no producer for it so nothing can be pushed in, and a departure record
+/// would make `judge_resimmable` refuse at `ResimGap::FaultReplay` and leave this
+/// arm no positive verdict to read.
+///
+/// HAND ORACLE. `boundary(step)` stamps `1_000_000 + step * 4_000_000`, so rank 0
+/// keeping steps 0 to 3 ends at 13_000_000 and rank 1 keeping steps 0 and 1 ends
+/// at 5_000_000. The fold is 5_000_000 and rank 0's own last boundary is
+/// 13_000_000, which is really IN this bag, so the absence assertion below has
+/// something to be absent: a renderer that went back to rank 0's stream prints
+/// 13_000_000 and fails on it.
+#[test]
+fn a_peer_ending_shorter_renders_the_folds_instant_and_names_it_as_the_fold() {
+    let mut rank0 = Vec::new();
+    for step in 0..=3u64 {
+        rank0.push(boundary(step));
+        rank0.push(fire(step, 0));
+    }
+    // Step 4's boundary proves step 3; the capture's end cut removes step 4.
+    rank0.push(boundary(4));
+    // The PEER's own stream, on its own ring, ending two steps earlier; its
+    // step-2 boundary proves step 1 and is itself cut.
+    let peer: Vec<TraceRingRecord> = (0..=2u64).map(boundary).collect();
+    let h = capture_inner_full(
+        "peershorterrender",
+        &rank0,
+        &[],
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        0,
+        false,
+        &peer,
+    );
+
+    // PRECONDITION, and the one this arm turns on: the BAG's own trace records
+    // carry BOTH ranks. Read off the records rather than off the state rings,
+    // which say nothing about the trace.
+    let ranks: std::collections::BTreeSet<u32> = trace_payloads(&h.bag)
+        .iter()
+        .filter_map(|p| {
+            p.as_chunks::<{ TRACE_RECORD_SIZE as usize }>()
+                .0
+                .first()
+                .copied()
+        })
+        .map(|r| TraceRingRecord::from_bytes(&r).rank())
+        .collect();
+    assert_eq!(
+        ranks,
+        std::collections::BTreeSet::from([0, 1]),
+        "PRECONDITION: the bag's trace records carry two ranks, so the fold is \
+         over two values and 13000000 exists to be absent: {ranks:?}"
+    );
+
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "PRECONDITION: the window reaches step 0, so the verdict is the POSITIVE \
+         one and carries a range at all: {m}"
+    );
+    let covered = m["anchor"]["resim_covered_through_ns"]
+        .as_u64()
+        .expect("a positive verdict carries its covered range");
+    assert_eq!(
+        covered, 5_000_000,
+        "PRECONDITION: the recorder wrote the FOLD, rank 1's last kept target, \
+         not rank 0's 13000000: {m}"
+    );
+
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    // THE RENDERED TEXT, as an operator reads it.
+    assert!(
+        reason.contains(
+            "through gating-clock instant 5000000 ns (the earliest last kept step boundary \
+             across the ranks that kept one)"
+        ),
+        "the sentence names the instant AND says it is the fold over ranks: {reason}"
+    );
+    assert!(
+        !reason.contains("the last step boundary this capture's trace carries"),
+        "and never the pre-fold wording, which this bag makes false: {reason}"
+    );
+    assert!(
+        !reason.contains("13000000"),
+        "rank 0's own last target is in this bag and is not what the verdict \
+         promises: {reason}"
+    );
+    h.cleanup();
+}
+
+/// A final step that SHARES its predecessor's target ends the covered range
+/// strictly below that target.
+///
+/// Equal consecutive targets are legal (a 0-delta step). Frames are stamped at
+/// their step's target, so the removed final step's frames carry the same stamp
+/// as the last kept step's, and a replay that covers through that stamp counts
+/// frames from a step it never drives. The end cut therefore removes every step
+/// at the final target, and the range ends at the step before them.
+///
+/// HAND ORACLE. Steps 0 to 2 are stamped 1, 5 and 9 ms; step 3 is stamped 9 ms
+/// as well and is the final step (no step 4 boundary). The cut removes steps 2
+/// and 3, so the range ends at 5 ms.
+#[test]
+fn a_final_step_tied_to_its_predecessors_target_ends_the_range_below_the_tie() {
+    let mut trace = Vec::new();
+    for step in 0..=2u64 {
+        trace.push(boundary(step));
+        trace.push(fire(step, 0));
+    }
+    let tie = boundary(2).fire_time_ns;
+    let mut last = boundary(3);
+    last.fire_time_ns = tie;
+    let mut last_fire = fire(3, 0);
+    last_fire.fire_time_ns = tie;
+    trace.push(last);
+    trace.push(last_fire);
+    let h = capture_inner_full(
+        "endcuttie",
+        &trace,
+        &[],
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        0,
+        false,
+        &[],
+    );
+
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "PRECONDITION: the window reaches step 0 and steps 0 and 1 are proven: {m}"
+    );
+    let covered = m["anchor"]["resim_covered_through_ns"]
+        .as_u64()
+        .expect("a positive verdict carries its covered range");
+    assert_eq!(
+        covered,
+        boundary(1).fire_time_ns,
+        "the range ends at step 1's target, strictly below the {tie} ns the removed \
+         final step's frames carry: {m}"
+    );
+    assert_eq!(
+        carried_records(&m),
+        4,
+        "steps 0 and 1 are carried (a boundary and a fire each); steps 2 and 3 are \
+         removed together: {m}"
+    );
+    let end_cut = m["handoff"]["trace_end_cut"]
+        .as_str()
+        .expect("the handoff states the capture's end cut");
+    assert!(
+        end_cut.starts_with(
+            "2 step(s) removed from the end of the trace (4 scheduler-trace record(s))"
+        ),
+        "the end cut counts both removed steps: {end_cut}"
+    );
+    h.cleanup();
+}
+
+/// A rank whose only step is its unfinished final one DECLINES the resume claim.
+///
+/// The end cut removes that rank's every record, while the frames its step
+/// published stay in the bag. A covered range folded over the ranks that kept a
+/// boundary then ends at rank 0's instant, and the peer's frames inside it match
+/// no boundary the bag carries for their rank, which a replay refuses as an
+/// inconsistent recording. So the capture states that the rank has no complete
+/// step and is not resimmable.
+#[test]
+fn a_rank_with_no_complete_step_declines_the_resume_claim() {
+    let mut rank0 = Vec::new();
+    for step in 0..=3u64 {
+        rank0.push(boundary(step));
+        rank0.push(fire(step, 0));
+    }
+    rank0.push(boundary(4));
+    // The peer's first step only: its boundary and the fire after its tick
+    // published, and no next boundary to prove it.
+    let peer = vec![boundary(0), fire(0, 0)];
+    let h = capture_inner_full(
+        "endcutpeerunproven",
+        &rank0,
+        &[],
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        0,
+        false,
+        &peer,
+    );
+
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(false),
+        "rank 1 kept no complete step, so no range this capture can declare covers \
+         its frames: {m}"
+    );
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    assert!(
+        reason.contains("rank(s) [1]") && reason.contains("no complete step"),
+        "the reason names the rank and the cause: {reason}"
+    );
     h.cleanup();
 }
 

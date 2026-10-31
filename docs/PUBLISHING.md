@@ -25,6 +25,7 @@ dev-dependencies are stripped by `cargo package`):
 | `cerulion_mdns` | (none) |
 | `cerulion_pairing` | (none) |
 | `cerulion_link` | (none) |
+| `cerulion_telemetry` | (none) |
 | `cerulion_wireclient` | `cerulion_link`, `cerulion_core`, `cerulion_pairing` |
 | `cerulion_bag` | `cerulion_core` |
 | `cerulion_netd` | `cerulion_core`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `native_ros2_messages`, `cerulion_link`, `cerulion_wireclient`, `cerulion_pairing` |
@@ -32,7 +33,7 @@ dev-dependencies are stripped by `cargo package`):
 | `cerulion_wsd` | `cerulion_core`, `cerulion_cli_engine`, `cerulion_hygiene` |
 | `cerulion_cli_engine` | `cerulion_core`, `native_ros2_messages`, `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `cerulion_pairing`, `cerulion_bag`, `cerulion_bagd`, `cerulion_netd` |
 | `cerulion_cli_tui` | `cerulion_cli_engine`, `cerulion_core` |
-| `cerulion_cli` | `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_core`, `cerulion_dds`, `cerulion_bagd`, `cerulion_bag`, `cerulion_netd`, `native_ros2_messages` |
+| `cerulion_cli` | `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_core`, `cerulion_dds`, `cerulion_bagd`, `cerulion_bag`, `cerulion_netd`, `cerulion_telemetry`, `native_ros2_messages` |
 
 Publish in this order:
 
@@ -40,8 +41,9 @@ Publish in this order:
 2. **`cerulion_core`**
 3. **`native_ros2_messages`**
 4. **`cerulion_dds`**, **`cerulion_discovery`**, **`cerulion_hygiene`**, **`cerulion_mdns`**,
-   **`cerulion_pairing`**, **`cerulion_link`**, and **`cerulion_bag`**
-   (independent of one another after their listed prerequisites)
+   **`cerulion_pairing`**, **`cerulion_link`**, **`cerulion_bag`**, and
+   **`cerulion_telemetry`** (independent of one another after their listed
+   prerequisites; `cerulion_telemetry` has no internal dependency)
 5. **`cerulion_wireclient`**
 6. **`cerulion_netd`**
 7. **`cerulion_bagd`**
@@ -111,12 +113,18 @@ Run from the workspace root, in order:
       workspace inheritance resolves.
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] The per-package test steps in `.github/workflows/ci.yml`, for every
-      crate the release touches (`./tools/scripts/ci_test_shard.sh cerulion_core
-      <shard> 4` for the four `cerulion_core` shards), plus the serial
-      iceoryx2 test lists in the per-crate `AGENTS.md` files. **Not `cargo test --workspace`**:
-      it deadlocks on iceoryx2's shared-memory singleton, which is why every
-      test step in `ci.yml` enumerates its packages explicitly.
+- [ ] The per-package test steps in `.github/workflows/ci.yml`, run as written
+      there, for every crate the release touches. The four `cerulion_core`
+      shards are `./tools/scripts/ci_test_shard.sh cerulion_core <shard> 4`;
+      the script runs `cargo nextest run --profile ci`, which applies the
+      serial fence in `.config/nextest.toml` to the `cerulion_core` test
+      binaries it names (`crates/cerulion_core/tests/serial_discipline_test.rs`
+      asserts that membership against its declared inventory), and
+      `tools/scripts/install_nextest.sh` installs the pinned nextest the
+      script requires. Doctests are outside nextest, so `cargo test -p
+      cerulion_core --doc` is its own step. **Not `cargo test --workspace`**:
+      it deadlocks on iceoryx2's shared-memory singleton, which is why the
+      test steps in `ci.yml` name this workspace's packages one by one.
 - [ ] For each publishable crate:
       `cargo package --list -p <crate> --allow-dirty` and verify:
   - `README.md` is present in every listing.
@@ -136,30 +144,84 @@ Run from the workspace root, in order:
       prerequisites are available.
 - [ ] Test fixtures (`crates/test_fixtures/*`) and `crates/cerulion_core/fuzz` all carry
       `publish = false`: they must never reach crates.io.
+- [ ] The shipped programs: every release archive, the Debian package and the
+      Homebrew formula carry `cerulion`, `cerulion-netd`, `cerulion-connectd`
+      and `cerulion-remoted`. `./tools/scripts/install.sh --self-test`,
+      `./tools/scripts/test_render_homebrew_formula.sh` and, on Linux,
+      `./tools/scripts/test_build_deb.sh` check the three lists; the install
+      smoke of `release-artifacts.yml` checks the installed release.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
-      access for all seventeen publishable crates listed above.
+      access for all eighteen publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
       the new version before publishing the next crate in the order.
 
+## Post-publish verification
+
+`tools/scripts/publish_preflight.sh` reads `cargo package --list`, the listing
+cargo would upload, and `release.yml` runs it on every publish through
+`tools/scripts/publish_crates.sh`. `tools/scripts/verify_published.sh` reads the
+other end: for every publishable workspace member at one version it fetches the
+sparse-index entry, the version metadata and the `.crate` archive crates.io
+serves, and checks each of them.
+
+```bash
+tools/scripts/verify_published.sh 1.0.0                 # every publishable member
+tools/scripts/verify_published.sh 1.0.0 --crate cerulion_core --skip-docs
+```
+
+Per crate it asserts that the archive's sha256 equals both the index `cksum` and
+the API `checksum`, that its byte length equals the API `crate_size`, that every
+member lies under `<name>-<version>/` with no `..` segment, that none of the
+in-repository tooling instruction files is anywhere inside (the script names
+them), that nothing ships from a `tests/`
+directory at the crate root (a `cfg(test)` module under `src/` is library source
+and does ship), that the text files the packaged `license` expression requires
+are present and that the expression matches the API `license`, that the packaged
+description carries no tracker id, that every relative target of an inline
+`](...)` link or image in the packaged README resolves inside the archive (that
+is the whole README scope: reference-style definitions, autolinks and HTML
+`href` attributes are not read), and that `.cargo_vcs_info.json`'s git sha1
+is the commit `v<version>` points at. Each check prints one `PASS`, `FAIL` or
+`WARN` line, every crate is read before the exit status is decided, and any
+`FAIL` exits non-zero. docs.rs is a `WARN` line carrying the HTTP status: the
+crate page answers whether or not a library was built, so it never fails a run,
+and `--skip-docs` skips the request.
+
+The `verify` job of `release.yml` runs it after `publish` on the same tag push,
+with `--skip-docs`, for the tag's version. Its licence table is the one
+`crates/cerulion_hygiene/tests/crate_license_texts_test.rs` matches on; an
+expression neither knows is refused by both rather than passed with no text
+required. `tools/scripts/test_verify_published.sh` is its offline oracle table
+and runs in the `Lint` job.
+
 ## Known Caveats
 
-- **License files**: `LICENSE-APACHE` and `LICENSE-MIT` live under `docs/legal/`
-  and are not copied into each crate package. The SPDX `license` field
-  (`AGPL-3.0-only`, workspace-inherited; `cerulion_link` and `cerulion_pairing`
-  override it with `MIT OR Apache-2.0`) is what
-  crates.io requires; per-crate license file copies can be added later if
-  desired (cargo only auto-copies `readme`/`license-file`, and `license-file`
-  is mutually exclusive with `license`).
-- **MSRV** (`rust-version = "1.93"`, workspace-inherited): Cerulion's own code needs
-  only 1.87 (`usize::is_multiple_of` in `crates/cerulion_core/src/wire.rs` and in
-  codegen-emitted code), and the tree without the viz members floors at 1.88
-  (darling/time/time-core/home/instability declare rust-version 1.88).
-  The binding constraint is the `rerun` 0.34 SDK pulled by the
-  `cerulion_viz` / `cerulion-vizd` members: it declares 1.92, but its transitive
-  `fixed` 1.31.0 declares 1.93. ENFORCED: the `msrv` CI job runs
-  `cargo +1.93.0 check --workspace --all-targets` on every push to `main`
-  (and on `workflow_dispatch`; it is skipped on
-  `pull_request`; see `docs/internals/ci-and-gates.md` § "CI job map"), so
+- **License files**: every publishable crate carries, in its own directory and
+  in its `include` list, the text its SPDX `license` field obliges it to ship.
+  The field is `AGPL-3.0-only` workspace-inherited for most members, which
+  obliges the root `LICENSE`; `cerulion_link` and `cerulion_pairing` override it
+  with `MIT OR Apache-2.0`, which obliges both `LICENSE-MIT` and
+  `LICENSE-APACHE`, and both crates carry both files.
+  The copies the per-crate ones are compared against are
+  `docs/legal/LICENSE-MIT` and `docs/legal/LICENSE-APACHE` for the permissive
+  pair, and the repository-root `LICENSE` for the AGPL text.
+  Two gates assert it: `crates/cerulion_hygiene/tests/crate_license_texts_test.rs`
+  over the working tree, byte for byte against the canonical text, and the
+  `licence` check of `tools/scripts/verify_published.sh` over the archive
+  crates.io serves. Cargo copies no license text on its own: it auto-copies only
+  `readme`/`license-file`, and `license-file` is mutually exclusive with
+  `license`, so the `include` entry is what puts the file in the package.
+- **MSRV** (`rust-version = "1.95"`, workspace-inherited): set by Cerulion's own
+  code, `try_update` on the integer atomics in `crates/cerulion_core` (stable since
+  1.95; Rust 1.99 deprecates its former name `fetch_update`). The dependency tree
+  floors lower: the tree without the viz members at 1.91
+  (`iroh` 1.0.2 and its companion crates declare rust-version 1.91), and the
+  `rerun` 0.34 SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93
+  through its transitive `fixed` 1.31.0. ENFORCED: the `msrv` CI job runs
+  `cargo +1.95.0 check --workspace --all-targets` on every pull request and every
+  push to `main` (and on `workflow_dispatch`; it is excluded from the merge
+  queue, where `main`'s push run is the control; see
+  `docs/internals/ci-and-gates.md` § "CI job map"), so
   this floor is build-proven, not a survey.
 - **Minimal-versions floor**: macro-emitted code calls
   `IndexMap::get_disjoint_mut` (added in indexmap 2.8); manifests
@@ -169,7 +231,8 @@ Run from the workspace root, in order:
 
 ## First publication: new-crate rate limit and partial publishes
 
-All seventeen publishable crates exist on crates.io: the `0.1.0` release
+Seventeen of the eighteen publishable crates exist on crates.io; `cerulion_telemetry` is
+new and is published for the first time with the release that adds it. The `0.1.0` release
 published eleven of them for the first time (`cerulion_bag`, `cerulion_bagd`,
 `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_link`,
 `cerulion_mdns`, `cerulion_netd`, `cerulion_pairing`, `cerulion_wireclient` and
@@ -244,7 +307,12 @@ build, on either archive shape.
 transaction against a hand-written rustup fixture, and CI runs it beside the
 installer self-test.
 
-After every binary is activated and verified, `install.sh` writes the PATH setup
+After every binary is activated and verified, `install.sh` links the
+programs (`cerulion`, `cerulion-netd`, `cerulion-connectd` and, when the
+archive carries it, `cerulion-remoted`) into `~/.local/bin` (and into `/usr/local/bin` when that directory is
+on the PATH, writable without sudo, reachable by every account from the install
+directory, and neither `~/.local/bin` nor another `cerulion` is on the PATH), never replacing
+a name that is not already its own link, then writes the PATH setup
 that makes the install one command: `<cerulion home>/env` and a fish twin, each
 prepending the install directory, and Cargo's `bin` when that run provisioned
 Rust, guarded so a second source adds nothing; then one marked, idempotent line
@@ -254,8 +322,19 @@ symlink out of the home directory is left alone. `--no-modify-path` and
 `CERULION_NO_MODIFY_PATH` skip the whole step, and so does an unset `HOME`; then
 the PATH to set by hand is printed instead. The step runs last and its failures
 are warnings, so a PATH that could not be written never fails an install whose
-binaries are already in place. The self-test covers the first write, the second
-run, both opt-outs, a symlinked profile, an unset `HOME` and fish.
+binaries are already in place. The last line printed says whether `cerulion`
+(and Cargo, when the archive set Rust up) already resolves on the PATH the
+installer inherited, and names `. <cerulion home>/env` when it does not.
+`--uninstall` removes the programs, the links that point at them and, when the
+env file names that install, the marked profile lines and then the env files;
+it refuses a directory without the marker and leaves the rest of the cerulion
+home alone.
+The self-test covers the first write, the second run, both opt-outs, a
+symlinked profile, an unset `HOME`, fish, a shell that already searches
+`~/.local/bin`, a foreign `cerulion` there, the system bin directory and its
+three guards, an archive without `cerulion-remoted` (no file and no link for
+it, a downgrade that removes both, a failed downgrade that restores the
+file, and an interrupted one that restores the file and the link), and `--uninstall` including a refused directory and a second copy.
 
 ## The Homebrew formula
 
@@ -295,7 +374,7 @@ with contents read and write and pull requests read and write. The job keeps
 the branch push and the pull request are the token's two jobs, and the tap's
 `main` keeps its protection.
 
-The rendered formula installs the three binaries, plus the ROS 2 Jazzy rmw and
+The rendered formula installs the four binaries, plus the ROS 2 Jazzy rmw and
 the heap hook on Linux, generates shell completions, and carries the release's
 own `install_rust.sh` and `rustc-version.txt` in `libexec` behind a
 `cerulion-install-rust` command. Homebrew runs installs with `HOME` pointing at

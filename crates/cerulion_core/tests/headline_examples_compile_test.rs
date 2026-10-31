@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Compile-coverage for the headline node examples in `README.md`,
-//! `USER_API.md`, the root agent guide and `docs/tutorials/`: the
+//! `docs/user-api.md`, the root agent guide and `docs/tutorials/`: the
 //! `#[cerulion_node]` / `#[cerulion_node_impl]` surface.
 //!
 //! # Corpus, and what is deliberately outside it
 //!
 //! Every `.md` in the tree carrying a ```rust fence was classified. IN the
-//! corpus: `README.md`, `USER_API.md`, `docs/tutorials/01-getting-started.md`,
+//! corpus: `README.md`, `docs/user-api.md`, `docs/tutorials/01-getting-started.md`,
 //! `docs/tutorials/02-latency-measurement.md`. Deliberately OUT, each for a stated
 //! reason — if you add a doc with node examples, either mirror it here or add it
 //! to this list, so the next gap is a choice and not an accident:
@@ -39,7 +39,7 @@ use native_ros2_messages::sensor_msgs::{Image, LaserScan};
 
 // ----------------------------------------------------------------------
 // Mirrors the `SafetyController` headline example in `README.md` and
-// `USER_API.md`: LaserScan trigger input + Vector3 fixed-only output.
+// `docs/user-api.md`: LaserScan trigger input + Vector3 fixed-only output.
 // ----------------------------------------------------------------------
 
 // `period_ms` and `#[input(trigger)]` cannot coexist — the validator
@@ -556,7 +556,7 @@ fn macro_tick_within_ms_compiles_and_propagates_to_node_info() {
 
 // ----------------------------------------------------------------------
 // Compile-coverage for the four `#[on_event]`
-// handler shapes documented in `USER_API.md` ("Backpressure → #[on_event]
+// handler shapes documented in `docs/user-api.md` ("Backpressure → #[on_event]
 // callbacks", Event types 1–4). The UI compile-FAIL tests
 // (`tests/ui/on_event_*`) pin the rejection cases; this pins the POSITIVE
 // surface so a future macro change that breaks a documented handler

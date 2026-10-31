@@ -1,0 +1,19 @@
+prefix: obstacle_avoidance
+nodes:
+- id: laser_scanner
+  type: laser_scanner
+  inputs: []
+  outputs:
+  - name: scan
+    schema: sensor_msgs/LaserScan
+    max_slice_len: 4096
+    history_size: 0
+- id: safety_controller
+  type: safety_controller
+  inputs:
+  - name: scan
+    source: laser_scanner/scan
+  outputs:
+  - name: linear_velocity
+    schema: geometry_msgs/Vector3
+    history_size: 0

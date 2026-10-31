@@ -150,6 +150,8 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "unbounded_sync_node".to_string(),
@@ -172,6 +174,8 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "unbounded_sync_sink".to_string(),
@@ -193,7 +197,7 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
 }
 
 /// Mint the two raw external publishers on the absolute source topics. Vector3
-/// is 24 bytes fixed (< 64 with the 32-byte wire header), matching the
+/// is 24 bytes fixed (< 64 with the 40-byte wire header), matching the
 /// `sync_fire_iox2_test` sizing.
 fn external_publishers(runtime: &GraphRuntime) -> (CerulionPublisher, CerulionPublisher) {
     let mgr = runtime.test_transport().expect("test transport parked");
@@ -319,6 +323,10 @@ fn one_input_does_not_fire_then_second_input_fires_without_losing_data() {
 // (d) determinism (Principle #7): two full runs of the (a) sequence are
 // byte-identical in both the fire count and the delivered value.
 // ===========================================================================
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "upstream iceoryx2 0.10.0 defect 2034: on macOS a process that has run one graph containing a plugin node cannot create any further iceoryx2 resource, so this arm cannot run here until that is fixed. Runs normally on Linux."
+)]
 #[test]
 #[serial]
 fn fire_and_delivery_are_deterministic() {

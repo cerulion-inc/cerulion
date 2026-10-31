@@ -6,8 +6,8 @@ The user surface is intentionally narrow:
 
 1. **The `cerulion` CLI**: workspace, node, graph, topic, schema, recording, visualization, remote access.
 2. **Three macros**: `#[cerulion_node]` on the struct, `#[cerulion_node_impl]` on the impl block, and `#[derive(CerulionState)]` on a type your node holds.
-3. **Field attributes**: `#[input(...)]`, `#[output(...)]` and `#[cerulion(...)]`.
-4. **Graph YAML**: declarative wiring. Topology only; trigger policy lives on the node's macro.
+3. **Field attributes**: `#[input(...)]`, `#[output(...)]`, `#[param(...)]` and `#[cerulion(...)]`.
+4. **Graph YAML**: declarative wiring, plus per-node `params:` values and launch `args:` with defaults. Topology and values only; trigger policy lives on the node's macro.
 5. **Schema YAML** (or ROS2 `.msg`): message type definitions.
 6. **A handful of conventions inside `tick()`**: direct field access, `?` error propagation, `self.now_ns()`, `self.request_shutdown()`.
 7. **Environment variables**: see [Environment variables](#environment-variables) for the complete set.
@@ -66,8 +66,17 @@ not create one.
 
 | Command | Effect |
 |---|---|
-| `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). |
-| `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. |
+| `workspace create <NAME>` | New workspace under `./<NAME>/` (Cargo workspace + `graphs/`, `nodes/`, `schemas/`, `.cargo/config.toml`). Reserves the destination before scaffolding and refuses an existing path, including a racing creator or dangling symlink. |
+| `workspace create <NAME> --starter obstacle_avoidance` | Complete bundled scanner/controller workspace for this CLI version, including source tests and a graph. Atomic installation on Linux and macOS refuses every existing path, including symlinks. A parent filesystem without a no-replace rename (some network, FUSE and overlay filesystems; SMB and FAT volumes) is refused with the reason; create the workspace under a local filesystem and move it. A run killed during installation can leave a hidden `.cerulion-starter-<hex>.tmp` directory beside the destination, holding only that run's half-written files; the CLI never deletes it for you, so remove it by hand. |
+| `workspace init [LOCATION]` | Initialize the current (or given) directory as a workspace in place. An initially absent folder is reserved before scaffolding; a competing creator is refused. |
+
+The starter option is absent from the public 1.0.0 binaries; inspect
+`cerulion workspace create --help` before using it. Starter sources are embedded
+in the CLI, so acquisition works offline without GitHub access. Dependencies
+follow the same checkout-or-exact-registry selection as an empty workspace.
+`starter.toml` records the selected source name, CLI version and full compiler
+fingerprint. The generated README shows both the included graph and explicit
+create/stage/wire commands. The name must be a single directory name.
 
 For a CLI built with a stable Rust release, both commands write
 `rust-toolchain.toml` naming that release and the minimal profile, but only when
@@ -92,6 +101,9 @@ with exact pins matching its own version (`cerulion_core = "=X.Y.Z"` and
 checkout (`cargo install --path crates/cerulion_cli`, or run from its `target/`)
 scaffolds absolute path dependencies into that checkout instead. The command
 prints which one it chose on a `dependencies:` line under `Created workspace`.
+The scaffolded `Cargo.toml` also pins the iceoryx2 crates to the fork revision
+the CLI is built with through `[patch.crates-io]`, so the first build fetches
+that git revision.
 
 To override the default, edit the two entries in the generated root
 `Cargo.toml` under `[workspace.dependencies]`; member manifests inherit them
@@ -103,35 +115,192 @@ no command that rewrites an existing workspace's manifest in place.
 
 | Command | Effect |
 |---|---|
-| `node create <TYPE> [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC] [--raw-ffi]` | New node crate at `nodes/<TYPE>/`, written from the `#[cerulion_node]` macro template. (`--raw-ffi` selects the legacy hand-written FFI template instead. It carries no panic safety or error propagation of its own, and gets none of the per-set Sync, held-input or node-logging behaviour this document describes. Use the macro template unless you need the raw FFI.) `-i` declares a regular input; `-T` declares a TRIGGER input (the new field becomes `#[input(trigger)]` and the node's policy becomes `data_trigger=<NAME>`). At most ONE `-i`, ONE `-o` and ONE `-T` per call (repeat the verb, or use `node modify`, to add more ports); both values of each flag are REQUIRED. Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. See `--policy` below for the SPEC grammar and the defaulting rules. |
+| `node create <TYPE> [--lang rust\|python] [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC] [--raw-ffi]` | New node crate at `nodes/<TYPE>/`, written from the `#[cerulion_node]` macro template (`node new` is an alias). `--lang python` instead creates an embedded-CPython `cdylib` whose logic lives in `node.py`; it rejects `--raw-ffi` with `--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template`, needs a Cerulion checkout (otherwise: `Python nodes need a Cerulion checkout: cerulion_pynode is not published to a registry`), requires `-T` or `--policy`, and accepts only port names that are Python identifiers, not keywords and not runtime-reserved names. (`--raw-ffi` selects the legacy hand-written FFI template instead. It carries no panic safety or error propagation of its own, and gets none of the per-set Sync, held-input or node-logging behaviour this document describes. Use the macro template unless you need the raw FFI.) `-i` declares a regular input; `-T` declares a TRIGGER input (the new field becomes `#[input(trigger)]` and the node's policy becomes `data_trigger=<NAME>`; a Python port is declared with `trigger=True` and `@cerulion.node(trigger="<NAME>")`). At most ONE `-T` per call. A Rust node takes at most ONE `-i` and ONE `-o` per call (repeat the verb, or use `node modify`, to add more ports); a Python node accepts `-i` and `-o` repeatedly (a `sync_window_ms` Python node needs two or more `-i`), because `node modify` refuses Python nodes; both values of each flag are REQUIRED. Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. See `--policy` below for the SPEC grammar and the defaulting rules. |
 | `node delete <TYPE>` | Remove `nodes/<TYPE>/` and its workspace member entry. |
-| `node modify <TYPE> [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC]` | Add ports to an existing node and/or change its trigger policy. For macro-form nodes, splices a new `#[input]` / `#[output]` field into the struct directly; the surrounding tick body and any custom helper fields are preserved. For a legacy `--raw-ffi` node it regenerates the `INFO_BYTES` JSON instead. `-T SCHEMA NAME` adds a TRIGGER input (equivalent to `-i SCHEMA NAME --policy data_trigger=NAME`). Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. `--policy SPEC` rewrites the macro's trigger policy atomically; see `--policy` below. |
-| `node build <TYPE> [--release]` | `cargo build` the node crate as a cdylib. Also probes the node's **optional SYSTEM dependencies** and enables each feature whose system library is actually present; see `Optional SYSTEM dependencies` below. The probe report is printed to stderr BEFORE cargo runs (so a build that fails because of an enabled feature still says which feature that was), and a malformed declaration REFUSES the build rather than silently producing a capability-less artifact. Cargo's own output is captured and shown only when the build fails, so one progress line (`Building '<TYPE>'. …`) goes to stderr just before cargo starts; stdout carries only the result line, `Built '<TYPE>'`. The first build of a workspace also compiles the Cerulion runtime and can take a few minutes. |
+| `node modify <TYPE> [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC]` | Add ports to an existing node and/or change its trigger policy. For macro-form nodes, splices a new `#[input]` / `#[output]` field into the struct directly; the surrounding tick body and any custom helper fields are preserved. A Python node refuses every `node modify` operation: edit `nodes/<TYPE>/node.py` and run `cerulion node build <TYPE>` instead. For a legacy `--raw-ffi` node it regenerates the `INFO_BYTES` JSON instead. `-T SCHEMA NAME` adds a TRIGGER input (equivalent to `-i SCHEMA NAME --policy data_trigger=NAME`). Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. `--policy SPEC` rewrites the macro's trigger policy atomically; see `--policy` below. |
+| `node build <TYPE> [--release]` | `cargo build` the node crate as a cdylib. For a Python node it first imports `node.py` with the resolved interpreter and regenerates the baked port metadata. Also probes the node's **optional SYSTEM dependencies** and enables each feature whose system library is actually present; see `Optional SYSTEM dependencies` below. The probe report is printed to stderr BEFORE cargo runs (so a build that fails because of an enabled feature still says which feature that was), and a malformed declaration REFUSES the build rather than silently producing a capability-less artifact. Cargo's own output is captured and shown only when the build fails, so one progress line (`Building '<TYPE>'. …`) goes to stderr just before cargo starts; stdout carries only the result line, `Built '<TYPE>'`. The first build of a workspace also compiles the Cerulion runtime and can take a few minutes. |
 | `node stage <TYPE> [-i ID] [-g GRAPH] [-I NAME SOURCE]...` | Add the node as an instance in a graph YAML. Repeated `-I name source` wires inputs (`-I image camera/image`). A staged instance carries no prefix of its own: `prefix:` is a GRAPH-level key (set by `graph create -n PREFIX`), so topic resolution for every instance in the file comes from there. |
-| `node run <TYPE> [-p PREFIX] [-i ID] [--release] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Run a single node on its own, which is useful for development without a full graph. Runs through `graph run` (a one-node graph, report skipped), so an output whose `schema:` the workspace defines more than once is refused the same way. `-p` sets the topic prefix (default `standalone`) and `-i` the instance id (default: the type name), so an output lands on `/standalone/<TYPE>/<port>` unless you say otherwise. `--release`, `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` mean what they mean on `graph run`. |
+| `node run <TYPE> [-p PREFIX] [-i ID] [--release] [--local] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Run a single node on its own, which is useful for development without a full graph. Runs through `graph run` (a one-node graph, report skipped), so an output whose `schema:` the workspace defines more than once is refused the same way. `-p` sets the topic prefix (default `standalone`) and `-i` the instance id (default: the type name), so an output lands on `/standalone/<TYPE>/<port>` unless you say otherwise. `--release`, `--local`, `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` mean what they mean on `graph run`. |
 | `node list` | List all node types in the workspace. |
-| `node info <TYPE>` | Print the node's metadata (ports, schemas, trigger policy) by parsing `nodes/<TYPE>/src/lib.rs`. |
+| `node info <TYPE>` | Print the node's metadata (ports, schemas, trigger policy) by parsing `nodes/<TYPE>/src/lib.rs`, then a `Params:` table (name, type, default, min, max, description) read from the BUILT node library, the same document a graph's `params:` is checked against; before the first `node build` the table says so instead. |
 
 ### `cerulion graph`
 
 | Command | Effect |
 |---|---|
 | `graph create <NAME> [-n PREFIX]` | New `graphs/<NAME>.yaml`. Default prefix is the hostname (with `.local` stripped). |
-| `graph run <NAME> [--time-source real\|external\|virtual] [--no-validate] [--release] [--peer-loss continue\|fail] [--single-process] [--auto-partition] [--yes] [--trace-limit N] [--record[=DIR]] [--record-env allowlist\|all\|none] [--record-cpu CORE\|none] [--no-rings] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Load + validate + execute the graph. `--release` loads each node's release-profile cdylib; without it the freshest built library wins (debug or release, whichever profile you built most recently), and the other profile stays a fallback when only one is built. `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` are documented with their environment counterparts under [Environment variables](#environment-variables); `--record-env` and `--record-cpu` are described at the end of this row. **A FAILING validation check refuses the run**; warnings stay advisory. `--no-validate` skips the pre-flight validation REPORT, not validation as such. The graph topology, the macro trigger wiring and the node libraries are re-checked when the graph is built, so the flag cannot get a run past those refusals; it moves you from one refusal to an identical one. What it does still skip is the `schema:` family: a NON-EMPTY value naming no resolvable schema, one contradicting the producing node's own declaration, or one disagreeing with the consumer's. And any `schema:` spelling that is AMBIGUOUS in the workspace is REFUSED outright, by the workspace LOOKUP, before the graph is built and whether or not the report ran: `--no-validate` skips the report, not the resolution, and a spelling with more than one definition has no meaning for a run to proceed on, so the run (and `graph profile`, which never runs the report) refuses it with the same refusal reason the report carries, in a refusal of its own (`graph 'perception': output 'cam'.out declares schema: Foo, which this workspace refuses: 'Foo' is ambiguous …`, with every refused spelling named at once, each by the first port that declares it; a bare name the `.msg` store defines in two packages is refused the same way; a schema file the lookup cannot read or parse stops the run too, framed as `could not check` and naming that file), naming every source: an entry name declared by several `schemas/*.yaml` files, a file stem beside an entry of the same name in another file, or a YAML definition the `.msg` store also spells (a bare entry or stem beside any `schemas/<pkg>/msg/<Name>.msg`; a nested `schemas/<pkg>/<Type>.yaml` beside `schemas/<pkg>/msg/<Type>.msg`, for the qualified spelling; a bare name one nested sole-entry `schemas/<pkg>/<Name>.yaml` and any `schemas/<any>/msg/<Name>.msg` (or a second such nested file) also spell, refused before the store may answer; a nested file beside a TOP-LEVEL definition is not a twin: the bare spelling names the top-level one and the nested file is `<pkg>/<Name>`) (`'Foo' is ambiguous in this workspace`, then `defined by: schemas/a.yaml (entry Foo), schemas/b.yaml (entry Foo). …`); `cerulion schema info` refuses the same spelling the same way (a port whose Rust type a `#[cfg]` decides (a gated module beside a same-named crate, an ancestor's module reached through a gated glob (or a gated ancestor module reached through a glob), a gated `use` of the module a type's path starts with, cfg-exclusive imports of one leaf (or of that module), or a conditional import shadowing an outer scope's) has two or more valid names and accepts any of them, as a pass with a warning; a `#[cfg]`-gated glob that is the ONLY path to a port's type is not one of these: with the cfg off the type is unbound and that configuration does not build, so the port carries one name and no alternative, `graph validate` describes that configuration only, and the parser says so for the port; the node parser's own warning, said when the node is read, names the shape and, for a gated module, glob or module import, the `use ::X::T` / `use self::X::T` (or `use super::X::T`) spelling that ends it). An ABSENT or empty `schema:` is NOT in that set: it is refused by `validate_graph`, i.e. as a topology failure, which this flag cannot skip either: such a graph is REFUSED whether or not `--no-validate` is passed. A graph whose `schema:` is NON-EMPTY but wrong (the family the flag DOES skip) RUNS instead: the wire layout comes from the node's Rust type, not the label, so the consequence appears later, as a bag channel whose label resolves to nothing or to the wrong definition, a Studio decoder that renders nothing, or a replay that refuses a healthy bag. How much of the channel is wrong depends on the producing node: one built with `#[cerulion_node]` supplies both the wire hash and the fixed SIZE, so the frames are described correctly and only the NAME is wrong; a node whose port metadata carries no size (a `--raw-ffi` node whose info block omits the key, or a node library built before that key existed) falls back to the workspace schema's size, and records `0` when neither source can size the channel, so a wrong label can be joined by a wrong or unknown size. **`--no-validate` CONFLICTS with `--record` at parse time:** a recording makes those later consequences permanent: a bag written with the schema checks off carries channel labels nothing ever checked, so it cannot be reliably replay-verified (`cerulion bag play --resim` can refuse a healthy bag, or replay one under the wrong label). Refused before the graph is read, so it costs no shared memory, no workers and no bag. Drop one: record with validation on, or run without `--record`. **Default (`--time-source real`): live event-driven loop** (RealClock on the iceoryx2 WaitSet), which wakes within microseconds of a publish. `virtual` selects the deterministic VirtualClock + 1 ms poll path (replay / benchmarking). `external` is accepted but **inert + warns**: an external time master (a sim's `/clock`) is not supported. **Multi-process:** a graph declaring `process_groups:` runs one worker PROCESS per group on Unix (Linux AND macOS), in barrier lockstep by default, or free-run under the `CERULION_EXECUTION_MODE=free_run` opt-in (see [Environment variables](#environment-variables)); non-Unix falls back to the monolith with a loud notice (`--single-process` forces the monolith anywhere). **Multi-process by DEFAULT:** an UNPARTITIONED graph (no `process_groups:`) on Unix under the real clock DERIVES a partition (a cost-aware one, fused greedily, when `graphs/<NAME>.costs.yaml` exists, written by `cerulion graph profile`, else the process-per-node baseline) and runs it multi-process. Persisting the derivation into the YAML needs consent: `--yes` writes (surgical splice + `.bak`); a TTY run previews the bands + diff and asks y/N (`N` still runs multi-process with the groups held IN-MEMORY, file untouched); a non-TTY run NEVER mutates the file (in-memory + a loud notice naming `--yes` and `--single-process`). `--single-process` opts out entirely (no derivation, no prompt). **A `block` edge is split only when it can be credited:** a topic with an in-graph producer and a `block` consumer has its WHOLE FLOW (producers, `block` consumers, and any non-`block` siblings) placed in ONE group by the derivation (shown in `graph partition`'s consent preview; logged at `info` by `graph run`), because crossing a process boundary costs a real hop and a worker that cannot see a mixed topic's sibling installs a defer the monolith degrades. A HAND-WRITTEN partition may still split the edge, and is accepted when the supervisor can mint it a **cross-process credit word** (exactly one in-graph producer, no non-`block` consumers), which carries the defer through shared memory losslessly. Every other split is refused before any worker spawns, naming which bar it hit: a multi-producer topic (the word counts ONE producer's outstanding frames) or a MIXED topic (its `block` consumers degrade to `drop_oldest`, so there is no lossless defer to credit). `--auto-partition` re-derives over an EXISTING `process_groups:` block (diff vs your block; TTY `N` keeps yours; conflicts with `--single-process`). Virtual/external time sources keep their earlier monolith routing on unpartitioned graphs. See `docs/multi_process.md` ("When does a run go multi-process?"). `--peer-loss` sets the worker-death policy. `continue` (default): the dead group is dropped from the barrier and the survivors keep running DEGRADED (loud; exit 0 unless every worker crashed); `fail`: any worker death stops the whole deployment (fail-loud, for CI/replay). `--trace-limit N` caps the in-memory fire-trace ring (default 100 000; `0` rejected, because the trace is a bounded observability window, not the replay record). `--time-source external` is REJECTED for multi-process (every worker advances its OWN gating clock, the barrier-gated lockstep quantum by default or its wall-faithful clock under free-run, never an external time master). **Scheduler-trace rings:** every MULTI-PROCESS run provisions one shared-memory scheduler-trace ring per rank plus a supervisor departure ring, **recording or not**. That is what makes a Flashback capture of ANY serving run re-executable with `cerulion bag play --resim`, instead of only a run somebody decided in advance to record. Cost: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. `--no-rings` declines them for a memory-tight robot, and ALSO stops the Flashback window recorder being started for that run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). `--no-rings` CONFLICTS with `--record` at parse time (a recording without a scheduler trace is not a recording). It is an option of `graph run` ALONE: `cerulion ros2 attach` and `cerulion node run` do not define it, so passing it there is an unexpected-argument parse error, not an inert flag (those verbs reach a graph run internally and mint no ring on the monolith shapes below, but there is no flag on them to say so). On the `graph run` shapes that mint no ring anyway it is NOT a no-op: a `--single-process` or `--time-source external` run still has its window recorder stopped by it, so the run takes NO captures, and each says at launch which it was. Two shapes are true no-ops: a `--time-source virtual` MONOLITH (it starts no recorder either way, though a `virtual` run of a `process_groups:` graph still routes to the supervisor, which does start one), and any NON-UNIX build, where the recorder, the run directory and the `cerulion flashback` verb are all `#[cfg(unix)]` and there is nothing for the flag to stop. Those monolith shapes mint no ring DELIBERATELY: their gating clock is wall-driven, so a trace taken there would carry boundaries a resim cannot re-advance to (a `resimmable: true` that would not hold); routing them onto the recording clock's discipline is not implemented. Not to be confused with `--trace-limit`, which caps the IN-MEMORY fire-trace deque `cerulion graph` introspection reads. **Recording:** `--record[=DIR]` records the run to a replay-grade MCAP bag (Unix-only; requires the live clock, so `virtual`/`external` are rejected). A single-process run records wall-faithful `fire_time_ns` on the wall-following gating clock; a `process_groups:` graph records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring (the ones above; `--record` drains them, it does not create them) drained by one `bagd`, each record's `reserved` stamped with its ring's rank (per-rank manifests + the `u32::MAX` departure sentinel). Under the default barrier lockstep, mp recordings are QUANTUM-timed (lockstep gating clocks), not wall-faithful; under the `CERULION_EXECUTION_MODE=free_run` opt-in each rank records its OWN wall-faithful timeline from a shared epoch (the bag's `coordination` stamp says which); `--single-process --record` forces the single-process wall-faithful path. See `docs/multi_process.md` ("Recording a multi-process run"). **`--record-env`** (requires `--record`) chooses how the environment is captured into the bag's `env.json`: `allowlist` (default) records every variable NAME but only records VALUES for `CERULION_*`, `RUST_LOG` and `IOX2_*`, hashing every other value so a re-execution can DETECT divergence without the bag carrying your secrets; `all` records values verbatim (full fidelity, and the bag embeds whatever was in your environment, which is warned loudly at record time); `none` records names only. **`--record-cpu`** (requires `--record`) says where the spawned recorder runs: a core id to pin it to, or `none` to let it float. Absent means AUTO: on Linux with at least 4 **permitted** cores the recorder is pinned to the highest-numbered permitted one, which removes the x86 recording tail. Permitted, not logical: the count comes from this process's CPU affinity mask, so a container allowed 2 cores of a 64-core host is capacity-bound and skips the pin. An explicit core must be in that permitted set, or it is a loud error naming the set. Pinning is Linux-only; elsewhere an explicit core warns loudly and the recorder floats. |
-| `graph validate <NAME> [--release]` | Parse + validate without running. The report names the node library it found for each node and its profile; `--release` makes it look for release-profile libraries only, matching `node build --release` and `graph run --release`. |
+| `graph run <NAME> [NAME:=VALUE]... [--time-source real\|external\|virtual] [--no-validate] [--release] [--peer-loss continue\|fail] [--single-process] [--auto-partition] [--yes] [--trace-limit N] [--record[=DIR]] [--record-env allowlist\|all\|none] [--record-cpu CORE\|none] [--no-rings] [--local] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Load + validate + execute the graph. `NAME:=VALUE` words after the graph name override the launch arguments the graph declares under `args:` for this run (see [Launch arguments](#launch-arguments)); a word for an argument the graph does not declare is refused before any node loads, with the nearest declared name, and a word that is not `name:=value` is a usage error. `--release` loads each node's release-profile cdylib; without it the freshest built library wins (debug or release, whichever profile you built most recently), and the other profile stays a fallback when only one is built. `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` are documented with their environment counterparts under [Environment variables](#environment-variables); `--record-env` and `--record-cpu` are described at the end of this row. **A FAILING validation check refuses the run**; warnings stay advisory. `--no-validate` skips the pre-flight validation REPORT, not validation as such. The graph topology, the macro trigger wiring and the node libraries are re-checked when the graph is built, so the flag cannot get a run past those refusals; it moves you from one refusal to an identical one. What it does still skip is the `schema:` family: a NON-EMPTY value naming no resolvable schema, one contradicting the producing node's own declaration, or one disagreeing with the consumer's. And any `schema:` spelling that is AMBIGUOUS in the workspace is REFUSED outright, by the workspace LOOKUP, before the graph is built and whether or not the report ran: `--no-validate` skips the report, not the resolution, and a spelling with more than one definition has no meaning for a run to proceed on, so the run (and `graph profile`, which never runs the report) refuses it with the same refusal reason the report carries, in a refusal of its own (`graph 'perception': output 'cam'.out declares schema: Foo, which this workspace refuses: 'Foo' is ambiguous …`, with every refused spelling named at once, each by the first port that declares it; a bare name the `.msg` store defines in two packages is refused the same way; a schema file the lookup cannot read or parse stops the run too, framed as `could not check` and naming that file), naming every source: an entry name declared by several `schemas/*.yaml` files, a file stem beside an entry of the same name in another file, or a YAML definition the `.msg` store also spells (a bare entry or stem beside any `schemas/<pkg>/msg/<Name>.msg`; a nested `schemas/<pkg>/<Type>.yaml` beside `schemas/<pkg>/msg/<Type>.msg`, for the qualified spelling; a bare name one nested sole-entry `schemas/<pkg>/<Name>.yaml` and any `schemas/<any>/msg/<Name>.msg` (or a second such nested file) also spell, refused before the store may answer; a nested file beside a TOP-LEVEL definition is not a twin: the bare spelling names the top-level one and the nested file is `<pkg>/<Name>`) (`'Foo' is ambiguous in this workspace`, then `defined by: schemas/a.yaml (entry Foo), schemas/b.yaml (entry Foo). …`); `cerulion schema info` refuses the same spelling the same way (a port whose Rust type a `#[cfg]` decides (a gated module beside a same-named crate, an ancestor's module reached through a gated glob (or a gated ancestor module reached through a glob), a gated `use` of the module a type's path starts with, cfg-exclusive imports of one leaf (or of that module), or a conditional import shadowing an outer scope's) has two or more valid names and accepts any of them, as a pass with a warning; a `#[cfg]`-gated glob that is the ONLY path to a port's type is not one of these: with the cfg off the type is unbound and that configuration does not build, so the port carries one name and no alternative, `graph validate` describes that configuration only, and the parser says so for the port; the node parser's own warning, said when the node is read, names the shape and, for a gated module, glob or module import, the `use ::X::T` / `use self::X::T` (or `use super::X::T`) spelling that ends it). An ABSENT or empty `schema:` is NOT in that set: it is refused by `validate_graph`, i.e. as a topology failure, which this flag cannot skip either: such a graph is REFUSED whether or not `--no-validate` is passed. A graph whose `schema:` is NON-EMPTY but wrong (the family the flag DOES skip) RUNS instead: the wire layout comes from the node's Rust type, not the label, so the consequence appears later, as a bag channel whose label resolves to nothing or to the wrong definition, a Studio decoder that renders nothing, or a replay that refuses a healthy bag. How much of the channel is wrong depends on the producing node: one built with `#[cerulion_node]` supplies both the wire hash and the fixed SIZE, so the frames are described correctly and only the NAME is wrong; a node whose port metadata carries no size (a `--raw-ffi` node whose info block omits the key, or a node library built before that key existed) falls back to the workspace schema's size, and records `0` when neither source can size the channel, so a wrong label can be joined by a wrong or unknown size. **`--no-validate` CONFLICTS with `--record` at parse time:** a recording makes those later consequences permanent: a bag written with the schema checks off carries channel labels nothing ever checked, so it cannot be reliably replay-verified (`cerulion bag play --resim` can refuse a healthy bag, or replay one under the wrong label). Refused before the graph is read, so it costs no shared memory, no workers and no bag. Drop one: record with validation on, or run without `--record`. **Default (`--time-source real`): live event-driven loop** (RealClock on the iceoryx2 WaitSet), which wakes within microseconds of a publish. `virtual` selects the deterministic VirtualClock + 1 ms poll path (replay / benchmarking). `external` is accepted but **inert + warns**: an external time master (a sim's `/clock`) is not supported. **Multi-process:** a graph declaring `process_groups:` runs one worker PROCESS per group on Unix (Linux AND macOS), free-running by default (no shared barrier, each rank on its own wall-following clock) or in barrier lockstep under the `CERULION_EXECUTION_MODE=lockstep` opt-out (see [Environment variables](#environment-variables)); non-Unix falls back to the monolith with a loud notice (`--single-process` forces the monolith anywhere). **Multi-process by DEFAULT:** an UNPARTITIONED graph (no `process_groups:`) on Unix under the real clock DERIVES a partition (a cost-aware one, fused greedily, when `graphs/<NAME>.costs.yaml`, written by `cerulion graph profile`, exists AND is usable; without one, the process-per-node baseline; a present-but-unusable default artifact (unreadable, malformed, wrong version, failed hand-edit validation) warns loudly, names the file and falls back to that baseline, where `graph partition` and `--auto-partition` hard-error instead) and runs it multi-process. The derived groups run in memory without a prompt or partition diff, on terminals and in scripts; the graph YAML stays byte-identical. `--yes` explicitly saves the derivation with a surgical splice and `.bak` backup. The run bands over the graph's own levels and never refines them; `cerulion graph partition <NAME>` (preview and confirm a save; `--dry-run` inspects only) is the cost-refined surface, so its layout can differ from the run's when a cost snapshot moves a node to another level, and saving it makes later runs use exactly that layout. The run directory's `graph.yaml` holds the layout a run executed. Once workers are ready, the status reports the node count, multi-process mode and Ctrl-C stop instruction. `--single-process` opts out entirely (no derivation, no prompt). **A `block` edge is split only when it can be credited:** a topic with an in-graph producer and a `block` consumer has its WHOLE FLOW (producers, `block` consumers, and any non-`block` siblings) placed in ONE group by the derivation (shown in `graph partition`'s consent preview; logged at `info` by `graph run`), because crossing a process boundary costs a real hop and a worker that cannot see a mixed topic's sibling installs a defer the monolith degrades. A HAND-WRITTEN partition may still split the edge, and is accepted when the supervisor can mint it a **cross-process credit word** (exactly one in-graph producer, no non-`block` consumers), which carries the defer through shared memory losslessly. Every other split is refused before any worker spawns, naming which bar it hit: a multi-producer topic (the word counts ONE producer's outstanding frames) or a MIXED topic (its `block` consumers degrade to `drop_oldest`, so there is no lossless defer to credit). `--auto-partition` re-derives over an existing `process_groups:` block and runs the new groups in memory; `--yes` explicitly saves them. Conflicts with `--single-process`, and is REFUSED under `--time-source external` before any derivation (a multi-process deployment cannot follow an external clock), so the graph file stays untouched. Virtual/external time sources keep their earlier monolith routing on unpartitioned graphs. See `docs/multi_process.md` ("When does a run go multi-process?"). `--peer-loss` sets the worker-death policy. `continue` (default): the dead group is dropped from the barrier and the survivors keep running DEGRADED (loud; exit 0 unless every worker crashed); `fail`: any worker death stops the whole deployment (fail-loud, for CI/replay). `--trace-limit N` caps the in-memory fire-trace ring (default 100 000; `0` rejected, because the trace is a bounded observability window, not the replay record). `--time-source external` is REJECTED for multi-process (every worker advances its OWN gating clock, its wall-faithful clock under the free-run default or the barrier-gated lockstep quantum under the opt-out, never an external time master). **Scheduler-trace rings:** every MULTI-PROCESS run provisions one shared-memory scheduler-trace ring per rank plus a supervisor departure ring, **recording or not**. That is what makes a Flashback capture of ANY serving run re-executable with `cerulion bag play --resim`, instead of only a run somebody decided in advance to record. Cost: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. `--no-rings` declines them for a memory-tight robot, and ALSO stops the Flashback window recorder being started for that run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). `--no-rings` CONFLICTS with `--record` at parse time (a recording without a scheduler trace is not a recording). It is an option of `graph run` ALONE: `cerulion ros2 attach` and `cerulion node run` do not define it, so passing it there is an unexpected-argument parse error, not an inert flag (those verbs reach a graph run internally and mint no ring on the monolith shapes below, but there is no flag on them to say so). On the `graph run` shapes that mint no ring anyway it is NOT a no-op: a `--single-process` or `--time-source external` run still has its window recorder stopped by it, so the run takes NO captures, and each says at launch which it was. Two shapes are true no-ops: a `--time-source virtual` MONOLITH (it starts no recorder either way, though a `virtual` run of a `process_groups:` graph still routes to the supervisor, which does start one), and any NON-UNIX build, where the recorder, the run directory and the `cerulion flashback` verb are all `#[cfg(unix)]` and there is nothing for the flag to stop. Those monolith shapes mint no ring DELIBERATELY: their gating clock is wall-driven, so a trace taken there would carry boundaries a resim cannot re-advance to (a `resimmable: true` that would not hold); routing them onto the recording clock's discipline is not implemented. Not to be confused with `--trace-limit`, which caps the IN-MEMORY fire-trace deque `cerulion graph` introspection reads. **Recording:** `--record[=DIR]` records the run to a replay-grade MCAP bag (Unix-only; requires the live clock, so `virtual`/`external` are rejected). A single-process run records wall-faithful `fire_time_ns` on the wall-following gating clock; a `process_groups:` graph records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring (the ones above; `--record` drains them, it does not create them) drained by one `bagd`, each record's `reserved` stamped with its ring's rank (per-rank manifests + the `u32::MAX` departure sentinel). By default (free-run) each rank records its OWN wall-faithful timeline from a shared epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out mp recordings are QUANTUM-timed (lockstep gating clocks), not wall-faithful (the bag's `coordination` stamp says which); `--single-process --record` forces the single-process wall-faithful path. See `docs/multi_process.md` ("Recording a multi-process run"). **`--record-env`** (requires `--record`) chooses how the environment is captured into the bag's `env.json`: `allowlist` (default) records every variable NAME but only records VALUES for `CERULION_*`, `RUST_LOG` and `IOX2_*`, hashing every other value so a re-execution can DETECT divergence without the bag carrying your secrets; `all` records values verbatim (full fidelity, and the bag embeds whatever was in your environment, which is warned loudly at record time); `none` records names only. **`--record-cpu`** (requires `--record`) says where the spawned recorder runs: a core id to pin it to, or `none` to let it float. Absent means AUTO: on Linux with at least 4 **permitted** cores the recorder is pinned to the highest-numbered permitted one, which removes the x86 recording tail. Permitted, not logical: the count comes from this process's CPU affinity mask, so a container allowed 2 cores of a 64-core host is capacity-bound and skips the pin. An explicit core must be in that permitted set, or it is a loud error naming the set. Pinning is Linux-only; elsewhere an explicit core warns loudly and the recorder floats. **Exit status**: 0 for a run that ends normally (Ctrl+C, or a node requested shutdown); **3** when one or more nodes returned `NodeError::Fatal` and were stopped during the run (the run keeps going until you stop it, then prints `Error: node '<id>' stopped on a fatal error: <message>` for each one; a `--record` run finalizes its bag first). This holds for the multi-process default too: the stopped node's worker prints that line and exits 3, and the supervisor adds one `Error:` line per such worker group and exits 3. A failure that fails the run wins over 3 and exits 1: a worker death under `--peer-loss fail`, every worker crashing, a recording failure, or a `ros2:` entry's death under `--peer-loss fail` (the stopped nodes are still logged). A degraded `--peer-loss continue` run with a stopped node still exits 3; 1 for any other failure. See [`NodeError` variants](#nodeerror-variants). |
+| `graph validate <NAME> [--release]` | Parse + validate without running. One `params '<node id>'` line per node that sets `params:` or whose type declares any: a passing line lists the values in force, a failing line names the unknown param (with the nearest declared name), the wrong type or the out-of-range value, and fails the report. The report names the node library it found for each node and its profile; `--release` makes it look for release-profile libraries only, matching `node build --release` and `graph run --release`. |
 | `graph list` | List all graphs in the workspace. |
-| `graph levels <NAME>` | Read-only view of the derived DAG levelization: one row per level (nodes + trigger policies), the triggering edges leaving each level, and, when the graph declares `process_groups:`, the group → owned-level band mapping with the spawner-consumability verdict (an invalid partition still prints in full, then exits nonzero: CI-gateable). That verdict also NAMES any split `block` edge it found CREDITABLE, so this is the verb that answers "will my hand-written split work?". It says which edges depend on a supervisor-minted credit word. Judged on SOURCE metadata; `graph run` re-checks the built cdylibs and refuses on drift. |
+| `graph levels <NAME>` | Read-only view of the derived DAG levelization: one row per level (nodes + trigger policies), the triggering edges leaving each level, and, when the graph declares `process_groups:`, the group → owned-level band mapping with the spawner-consumability verdict (an invalid partition still prints in full, then exits nonzero: CI-gateable). That verdict also NAMES any split `block` edge it found CREDITABLE, so this is the verb that answers "will my hand-written split work?". It says which edges depend on a supervisor-minted credit word. Judged on SOURCE metadata; `graph run` re-checks the built cdylibs and refuses on drift. The report closes with the **chains block**: the trigger edges that could run as one FUSED chain (a linear single-consumer chain inside one process, where the consumer is called directly with the bytes the producer just committed instead of the frame crossing a level boundary and being received again), each with its nodes, hop topics and level band, and for every other consumer edge the reason it keeps the queued path: `latest-value-read`, `no-in-graph-producer`, `multiple-producers`, `fan-out`, `producer-branches`, `separate-processes`, `opted-out`, `block`, `sample`, `consumer-policy`, `join`, `level-not-adjacent`, `throttle`, `block-involved`, `late-context-input`, `length-ceiling`. The two add up to every consumer edge in the graph. The chains are judged against the graph's DECLARED colocation (its `process_groups:` block, or one process), which a run may not use: every `graph run` writes its own census into its run directory. Nothing in the runtime fuses chains yet. See [Fused chains](#fused-chains). |
 | `graph profile <NAME> [--duration SECS] [--fires N] [-o/--out PATH]` | Profile the graph LIVE and write its cost snapshot to `graphs/<NAME>.costs.yaml` (`-o/--out` overrides). An output whose `schema:` the workspace defines more than once is refused before profiling, naming every source (the resolver's refusal, the same as `graph run`'s: a profile executes the graph and never runs the validation report). Runs on the real clock; measures per-node p50 tick durations + per-edge fire rates, and FREEZES the core-count default budget into the v2 artifact (`derived_budget_ns` = `ceil(Σ p50 / profile_cores)`, from the profiling machine's permitted cores), the input of the cost-aware auto-partitioner (see `docs/auto_partitioning.md`). **Default: per-node fire targets are AUTO-DERIVED**: a warm-up of `clamp(cap/10, 1s, 3s)` observes each node's rate, projects its fires over the cap, halves that (rate-droop tolerance) and clamps into [20, 1000]; the run stops when every warm-up-active node meets its OWN target, at the `--duration` cap (default 30 s), or on Ctrl+C. Harvest isolation is judged against the same observation re-projected to the ACTUAL observed window: an early Ctrl+C isolates only genuinely under-sampled nodes, never everything against a cap-length projection. `--fires N` overrides with ONE uniform target for every node (the escape hatch for nodes whose first fire lands after the warm-up, e.g. a period > 3 s). A node that falls short of its target is **ISOLATED**: no cost is recorded (never fabricated) and it stays in its own process group, warned loudly per node (a node silent through warm-up carries the "no target derived" marker, and a never-fired node whose triggering inputs saw a zero-rate topic gets the starved-trigger hint: profile under representative load, running the driver graph alongside), but exit 0 (isolation is a valid outcome; raise `--duration`, or force uniform mode with `--fires N`). The artifact is user-editable; its `hop:` block (per-platform defaults) can be overwritten with hop costs measured on your machine. See [Splitting a `block` edge across processes](#splitting-a-block-edge-across-processes-the-credit-word). |
 | `graph partition <NAME> [--costs PATH] [--budget-ns N] [--dry-run] [--yes]` | Derive and WRITE the graph's `process_groups:` partition: a cost-aware greedy fusion when a cost snapshot exists (the default `graphs/<NAME>.costs.yaml`, or an explicit `--costs`, which must exist and parse; a present-but-malformed artifact is a hard error, never a silent baseline fallback), else the process-per-node baseline. With a cost snapshot the DAG levels are refined first, and a `level_assignments:` block is written beside the partition only when that refinement moves at least one node (no snapshot, or a refinement that changes nothing, writes none and removes a stale one); see [Deployment keys](#deployment-keys-process_groups-process_group_order-level_assignments). `--budget-ns` caps each group's summed p50. **Default: the artifact's FROZEN `derived_budget_ns`** (`ceil(Σ p50 / profile_cores)`, computed at profile time on the profiling machine and never re-derived by a reader; re-profile on the TARGET machine to re-derive); an explicit value always overrides, and an earlier (v1) artifact or absent frozen value falls back to unbounded fusion with a loud re-profile info. The `graph run` default resolves the budget through the SAME point (the two surfaces cannot diverge). The rewrite is SURGICAL: only the `process_groups:` and `level_assignments:` blocks change (a stale `process_group_order:` block is also removed, because the emitted listing order IS the rank order); comments and formatting are preserved byte-for-byte and the prior file is backed up to `<file>.bak`. NEVER writes without consent: a TTY run shows the proposed bands + a block-scoped diff and asks y/N; non-TTY requires `--yes` (else a loud refusal naming `--yes` and `--dry-run`); `--dry-run` previews only (wins over `--yes`). Uses replace-scoped validation (every check EXCEPT the partition blocks being replaced), so it is also the recovery tool for a stale/broken `process_groups:` block. |
+| `graph pause <RUN>` / `graph resume <RUN>` | Pause a live run, or let it go on. Every process of the run holds at its next step boundary, so no node steps and no level is left half run, and the run's clock stands still: a `Period` timer neither skips ticks nor bursts on resume, and a recording of the run shows no gap across the pause. `SIGSTOP` does neither. `<RUN>` is the run id (`0x` and 32 hex digits, printed by `graph run` and recorded in the run's `run.json`) or a graph name that matches exactly one live run. `run.json` records `"paused": true` or `false`, and the viz daemon's `runs` rows carry `"paused": true` while a run is held (the key is absent otherwise). The run's own state is the truth and `run.json` its mirror: if `run.json` cannot be rewritten, the verb still succeeds, prints a warning that `run.json` and the viz row may show the old state, and running the same verb again repairs them. Pausing a paused run, or resuming a running one, succeeds and changes nothing. Exit 0 on success, 4 when no live run matches, 1 when the run cannot be paused (it was started by an older build, runs on `--time-source virtual` or `external`, or its graph has ROS 2 entries, which are separate processes a pause cannot hold), the name matches more than one run, or the registry could not settle which runs are live (name the run by its id and try again). Two commands on one run take turns. Run the verb with the same `CERULION_HOME` as the run, because it refuses a run directory outside that home's run directory root. A node that reads the hardware clock itself (`real_ns()`) still sees it advance through a pause, and a source outside the graph keeps publishing into its inputs' queues under their own backpressure policy. Unix only. |
 
 ### `cerulion topic`
 
 | Command | Effect |
 |---|---|
-| `topic list [--all] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (multicast + gossip scouting ON, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--no-network` skips the remote query (scripts / CI / offline). `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer scouting can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
-| `topic info <TOPIC>` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
-| `topic echo <TOPIC> [--truncate-length N]` | Stream messages with schema-aware decoding for stock types (`std_msgs/String`, `sensor_msgs/Image`, …); hex fallback otherwise. `--truncate-length` caps how many elements of a long array or string each line prints (default 128, minimum 1); raise it to see a whole payload, lower it to keep a fast topic readable. |
-| `topic hz <TOPIC>` | Publish-rate measurement. |
+| `topic list [--all] [-t] [--local] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (the discovery ladder below, gossip scouting on, zenoh multicast scouting only under `CERULION_MULTICAST_SCOUTING=on`, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--local` (also spelled `--no-network`) or `CERULION_NETWORK=off` skips the whole remote query, including the discovery ladder and `--scan`; explicit locators are ignored in this scope. Existing shared-memory mirrors remain REMOTE rows attributed to their origin robot. `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer the ladder can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
+| `topic info <TOPIC> [--local]` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
+| `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages as YAML, one document per frame: a `# seq=.. ts=..ns schema=0x.. size=..` comment, a `# <type>` comment, the message in the [message YAML](#message-yaml) form, then `---`. Every type the workspace or a robot can name decodes (built-in, `.msg` store, `schemas/*.yaml`); a frame no schema names prints `#` comment lines that say why, with a hex preview of its first 64 payload bytes. `--truncate-length` caps how many elements of each array print (default 128, minimum 1); a cut array ends in `!truncated <n>`, the number left out. Raise it to see a whole payload, lower it to keep a fast topic readable. A frame whose YAML passes 2000 lines prints its first 2000, then a `!truncated` line and a comment; echo stops writing there, so a huge frame costs no more than its first 2000 lines. |
+| `topic hz <TOPIC> [--local]` | Publish-rate measurement. |
+| `topic list -t` (also `--show-types`) | The same listing with each topic's message type after its name: `/robot/camera/image  [sensor_msgs/Image]`. The topic name stays the first token of the row; `--all`'s `internal` marker and a mirror row's `● streaming` marker follow the type. A LOCAL topic is typed from one message, read in batches of 128 topics that each share one one second wait, so a listing costs about one second per 128 local topics (hidden internal topics are not read unless `--all` is given), and named from the built-in, `.msg` store and workspace types; a topic that sent nothing in its batch's second shows `[unknown]`, and a type no local schema names shows its schema hash, `[0x...]`. A REMOTE row is typed from its robot's catalog (the schema name the robot sends, else its schema hash named as above), and a mirror row from its origin robot's catalog only, never from another robot that publishes the same topic name; a row no catalog types, or every remote row under `--local`, shows `[unknown]`. Plain `topic list` output does not change. |
+| `topic type <TOPIC> [--local]` | Print the topic's message type as `package/Type`, or as the bare YAML key for a workspace schema declared with no package. Opens the topic exactly as `topic info` does, so a REMOTE robot's topic works the same way, and names it with the same ladder. Exit 1 with an error naming the topic when it is not found, when it sends no message within the wait (1 s local, 3 s remote), or when no known type names its schema hash. A local topic whose hash no built-in or workspace type names is looked up once on the network, as `topic echo` does, which can add a few seconds; `--local` (or `CERULION_NETWORK=off`) skips that lookup. |
+| `topic find <TYPE> [--local] [--connect LOCATOR] [--listen LOCATOR]` | Print, one per line and sorted, every topic whose type is `TYPE`: each LOCAL topic typed from one message, and each REMOTE robot's topic that `topic list` discovers, typed from its catalog. `--connect` and `--listen` (repeatable) add locators to discovery as on `topic list`, for a robot discovery cannot find. `--local` (or `CERULION_NETWORK=off`) reads local topics only. Each robot's catalog is matched on its own, so a topic two robots publish with different types is found by either type. A mirrored remote topic is searched through its origin robot's catalog only (another robot that publishes the same topic name does not count); when that catalog does not list it (under `--local`, or a failed remote query) one stderr line counts the mirrored topics not searched. A failed remote query prints the `topic list` stderr line and the local result still stands; a robot that served no catalog (it was never asked, did not answer, or refused) is named in one stderr line, since its topics were not searched. A local topic that could not be read (its open, its local lease or its receive failed) is named in one stderr line too, and a local topic that sent no message in the one-second wait (a topic slower than that) in another, since its type is not known. Takes the name `topic type` and `topic list -t` print, as printed: `package/Type`, or a bare `Type` for a workspace schema declared with no package, whose YAML key may be any text (`1scan`, `Scan-2`). The ROS 2 form `package/msg/Type` also finds `package/Type`. A type no topic carries prints nothing and exits 0; a malformed name (an empty part such as `pkg//Type`, or a control character) exits 1 naming it. |
+| `topic bw <TOPIC> [--local] [--window N]` | Print once a second the bandwidth of the topic's message payloads over the newest `N` messages (default 100, from 2 to 100000): `bandwidth: 480 B/s, mean: 24 B, min: 24 B, max: 24 B, window: 100`. Units are decimal (1 KB = 1000 B) up to TB. The rate uses the messages' own wire stamps, so a played-back bag measures what the live run measured. A second with no new message prints a `no messages received` line instead and keeps the window, as `ros2 topic bw` does, so a topic slower than one message a second still measures a rate (a figure can then span a pause until the window fills with new messages). Each publisher of the topic is measured on its own stamps and the topic's rate is their sum, so two publishers whose clocks disagree (a sim clock and a wall clock on one `multi_publisher_topics` topic) still read what they send. A message stamped behind all of its publisher's messages in the window, as when `bag play --loop` starts a new pass, is a clock reset of that publisher: its earlier messages leave the window, so a figure never mixes two passes. Messages that arrive over the network carry the identity of the local publisher that re-injects them, so remote writers that share one re-injector are measured as one. Runs until Ctrl+C; a missing topic exits 1 naming it. |
+
+The discovery verbs map onto the ROS 2 ones:
+
+| ROS 2 | Cerulion |
+|---|---|
+| `ros2 topic list -t` | `cerulion topic list -t` |
+| `ros2 topic type /chatter` | `cerulion topic type /chatter` |
+| `ros2 topic find std_msgs/msg/String` | `cerulion topic find std_msgs/msg/String` (or `std_msgs/String`) |
+| `ros2 topic bw /chatter --window 100` | `cerulion topic bw /chatter --window 100` |
+
+### Message YAML
+
+`topic echo` prints a message in one YAML form, and the same form is how
+Cerulion reads a message from text (the `cerulion_core::dynamic::yaml_to_message`
+API): a message printed whole (no `!truncated` element) is valid input as it
+stands, with or without the `---` line echo prints after it. An unset nested field prints as its zero values, so reading it back
+gives the same values in a full-size frame, not the same bytes.
+
+```yaml
+header:
+  stamp:
+    sec: 1
+    nanosec: 2
+  frame_id: "map"
+name: ["shoulder", "elbow"]
+position: [0.5, 1e-7]
+velocity: []
+effort: [1.5]
+```
+
+- **Keys.** One key per field, in the order the `.msg` or schema YAML
+  declares them. Every field is required on input, and a key that is not a
+  field of the type is an error. A message type with no fields is `{}`
+  (empty input is accepted for it).
+- **Numbers.** Integers are decimal. An integer that does not fit its
+  field is refused as out of range at that field; past 128 bits YAML reads
+  the digits as a float, so the error is `expected uint64, got float`. Floats print in the shortest form that
+  reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
+  `.inf` and `-.inf`; an integer is accepted for a float field. A
+  `float32` reads back to the same bits. The one exception is NaN: every
+  NaN prints `.nan` and reads back as the standard quiet NaN, so its sign
+  and payload bits are not kept.
+- **Strings.** Always double quoted, so `"true"`, `"1"` and `""` stay
+  strings. Control characters and the characters YAML reads as line breaks
+  print as escapes (`\n`, `\t`, `\x1B`, `\u2028`).
+- **Arrays.** Arrays of numbers, booleans and strings are flow sequences
+  (`[1, 2, 3]`); arrays of messages are block sequences (`- x: 1.0`).
+  `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
+  array (`float64[9]`) must have exactly its length. An unbounded array of
+  messages with no fields (`std_msgs/Empty[]`) is always `[]`: the wire
+  form holds no count for it, so a longer one is refused. Arrays of
+  strings and messages nest at most 8 deep through variable-size messages
+  (ones holding a string, `bytes` or an unbounded array at any depth): a
+  nonempty ninth level is refused (`arrays of strings and messages nest
+  more than 8 deep here`), because echo could not print it back.
+- **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
+  messages: `stamp: {sec: 1, nanosec: 2}` in block form.
+- **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
+  written as the number: `level: 1`, not `level: WARN`.
+- **Bounds.** A `string_fixed[n]` value is at most `n` bytes of UTF-8 and
+  holds no NUL character. A ROS `string<=N` value (or each element of
+  `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
+  `N` elements (`dimensions: expected at most 3 elements, got 4`). A
+  `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
+  UTF-16 code units, as ROS 2 counts them. Echo prints a frame past its bounds
+  as it is; reading that output back is refused.
+- **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
+  duplicate keys and more than one document are refused. A `!truncated`
+  element is refused with a message that says the array was cut for
+  display.
+- **Size.** A message whose YAML form is longer than 256 MiB is not
+  printed: the error names the field being written when the cap was
+  passed (`inner.rows[0].leaves[9].v: the YAML form passes the
+  268435456-byte output cap`). An unset nested field prints its zero
+  values, so a small frame can name a very large form. Message YAML
+  longer than 257 MiB (the 256 MiB form plus room for echo's comment
+  lines and `---`) is refused before it is read.
+
+Every error names the full field path (`(message)` for the whole message)
+and the expected type or bound:
+
+```text
+pose.position.x: expected float64, got string
+header.stamp.nanosec: -1 is out of range for uint32 (0 to 4294967295)
+pose.positon: unknown field; geometry_msgs/Pose has fields: position, orientation
+pose.orientation.w: missing field required by geometry_msgs/Quaternion
+covariance: expected exactly 36 elements, got 35
+tag: string is 5 bytes, over the bound of 4 bytes
+ranges[4]: this array was cut short for display (elements left out: 310); print the message again with a larger --truncate-length
+```
+
+### Local scope for runs and topic inspection
+
+This source version accepts `--local` on `graph run`, `node run`, and `topic
+list`, `echo`, `hz`, `info`, `type`, `find` and `bw`. Released CLI 1.0.0 uses `--network off` for
+runs, `--no-network` for listing, and `CERULION_NETWORK=off` for observers.
+Those spellings remain supported; `--local` adds a consistent spelling.
+
+```sh
+cerulion graph run obstacle_avoidance --release --local
+cerulion topic list --local
+cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity --local
+cerulion topic hz /obstacle_avoidance/safety_controller/linear_velocity --local
+```
+
+Use `cerulion graph run <NAME> --local` for a graph, or
+`cerulion node run <TYPE> --local` for an individual node.
+
+For runs, `--local` and `--network off` suppress this run's gateway
+registration/startup, network session, egress and ingress, regardless of the
+graph's `network:` block. For inspection, `--local` skips remote discovery,
+network-daemon demand/startup and remote schema lookup. Genuine local producers
+still read from shared memory. An unknown local schema prints the existing
+hash/hex fallback instead of requesting a decoder over the network.
+
+Local scope wins over `topic list`'s `--connect`, `--listen` and `--scan`.
+The environment kill-switch is also honored: unset or whitespace-only
+`CERULION_NETWORK` leaves the default networking behavior; trimmed,
+case-insensitive `off` suppresses networking. Any other nonempty value warns
+and fails closed, preserving the existing behavior. No CLI option overrides
+an engaged environment kill-switch to enable networking. `--local` and the
+legacy run switch may be supplied together. The inspection verbs (`topic
+list`, `echo`, `hz`, `info`, `type`, `find`, `bw`, and `schema info`) also read the network
+daemon's own switch, `CERULION_NETD_NETWORK`, with the daemon's parse (only
+the exact value `off` engages it): engaged, they open no discovery session,
+query and start no network daemon, and look up no schema remotely, and a
+refusal names the variable that engaged the scope.
+
+Local selection applies to the command's runtime/topic plane after the
+existing sign-in gate. A machine that has never signed in still needs
+`cerulion login`; `--local` does not disable the account sign-in flow.
+
+The flag does not stop another process's gateway or remove its mirrors.
+Listing still shows already mirrored shared-memory topics under REMOTE,
+attributed to the source robot, or `origin unavailable` when attribution failed.
+Network injectors retain a required shared-memory identity marker separately
+from that attribution. `echo`, `hz`, and `info` refuse such mirrors
+in local scope because holding a mirror requires a network-daemon demand;
+the refusal names the mirror and the option to read on its source robot.
+A topic your own graph declares under `network: ingress:` is not such a mirror:
+the gateway `graph run` starts for that graph re-injects it as part of the run,
+so `topic list` shows it under LOCAL and `echo`, `hz`, and `info` read it from
+shared memory directly, with or without `--local`.
+While a local observer runs, its source lease refuses remote replacement even
+if its local producer stops; exit releases the lease. Listener quota exhaustion
+or simultaneous local/remote creation fails explicitly. The marker listener quota
+uses the native event configuration (default 16 local observers per topic).
+
+Upgrade and restart an older gateway before relying on this source distinction:
+an already-running older injector without either a marker or attribution cannot
+be distinguished from a local producer. Custom network injectors must use the
+marked transport APIs; raw local DDS and bag playback remain local sources.
 
 ### `cerulion schema`
 
@@ -190,24 +359,25 @@ restriction of its own; it runs wherever the clang engine binary does.
 |---|---|
 | `ros2 run [ARGS...]` | `ros2 run demo_nodes_cpp talker` becomes `cerulion ros2 run demo_nodes_cpp talker`; nothing else changes. Stages the child environment: `RMW_IMPLEMENTATION=rmw_cerulion`, the Cerulion lib dir prepended to `LD_LIBRARY_PATH`, a minimal ament prefix (whose `lib/librmw_cerulion.so` links the built cdylib) prepended to `AMENT_PREFIX_PATH`, and an automatic `LD_PRELOAD` of `libcerulion_heaphook.so`, which the Linux packages install beside the binary (one `info` line names the injected path; `CERULION_ROS2_PRELOAD=off` disables). It then **`exec`s** `ros2 run [ARGS...]`. The `cerulion` process BECOMES `ros2`: stdio, Ctrl+C and the exit code all flow through the kernel untouched. Nodes started this way find each other by topic name on the shared-memory plane, but the ros2 CLI graph tools (`ros2 topic list`, `ros2 topic echo`, `ros2 node list`, rqt) do not see Cerulion topics (the rmw's discovery is process-local); inspect them with `cerulion topic list` / `cerulion topic echo`. The rmw cdylib is looked for next to the `cerulion` binary (the Linux packages install it there; in a checkout `cargo build -p rmw_cerulion` puts it there); `CERULION_LIB_DIR` points elsewhere. **Exit codes** are the verb's own only when it never got to `exec`: **69** `librmw_cerulion.so` missing (on Linux the message names the install routes and the override; on macOS it says ROS 2 Jazzy has no macOS binaries and the verbs need a Linux machine), or `--adopt-take` given at all (see below), **127** `ros2` not on `PATH`, **1** any other pre-exec failure, **2** clap's own usage error (bare `cerulion ros2`) or `CERULION_RMW_ADOPT_TAKE` set in the environment WITHOUT `--adopt-take`; a successful `exec` inherits `ros2`'s exit code. A bad package name, a missing launch file or a wrong flag are `ros2`'s own errors, reported by `ros2` itself. **`--adopt-take` is REFUSED by this verb: exit 69.** It is Cerulion's ONE own flag here and must come FIRST, right after `run` (everything else is forwarded verbatim, so the position is what tells it apart from a `ros2` flag of the same name). It asks for zero-copy plain takes: a take of a forgeable type serves the shared-memory bytes IN PLACE instead of copying them, and the application's own `free` of each sequence releases the sample. That needs `libcerulion_heaphook.so` loaded IN THE NODE, and the launcher hands the hook over as an inherited descriptor (`LD_PRELOAD` names `/proc/self/fd/<N>`, never the hook's path, so no name is resolved a second time between validation and `exec`), but `ros2 run`/`ros2 launch` are a Python CLI that spawns the node as a FURTHER subprocess with `close_fds=True`, so that descriptor is already closed when the node's loader reads `LD_PRELOAD`. The hook would not load and every take would be served by copy, after this verb had already reported success, so the verb refuses at launch instead, naming the cause and the alternative; no two-hop-safe binding scheme exists. **To get zero-copy plain takes, launch the node executable DIRECTLY**: one hop keeps the preload. Run this in a shell that has already sourced your ROS 2 setup; each path variable is PREPENDED to the sourced value, exactly as this verb stages it, because replacing them would drop the distro's own ament index and libraries: `LD_PRELOAD=<lib dir>/libcerulion_heaphook.so${LD_PRELOAD:+:$LD_PRELOAD} LD_LIBRARY_PATH=<lib dir>${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} AMENT_PREFIX_PATH=<ament prefix>${AMENT_PREFIX_PATH:+:$AMENT_PREFIX_PATH} RMW_IMPLEMENTATION=rmw_cerulion CERULION_RMW_ADOPT_TAKE=1 <install>/lib/<pkg>/<executable>`. The refusal message prints that line with your actual paths filled in **when those paths can carry it**. When they cannot, it prints no command at all and says why instead: `LD_PRELOAD` is split by the loader on spaces AND colons (`LD_LIBRARY_PATH` and `AMENT_PREFIX_PATH` on colons), and a path whose bytes are not valid UTF-8 cannot be rendered as text without silently rewriting it, so a pasted command would start the node WITHOUT the hook, or point at a location that does not exist. Quoting does not help: the shell hands the variable through intact and the loader splits its value. Relocate the library to a path with no space, no colon and valid UTF-8 (for example beside the `cerulion` binary), then run the verb again to get the command. Adoption is **Linux/GNU only** either way: the hook interposes glibc's `malloc`/`free`. Two environment variables belong to the child, not to this verb: **`CERULION_RMW_ADOPT_TAKE`** is read by `rmw_cerulion`; this verb does not set it (the flag refuses), and setting it yourself here is refused (exit 2) rather than honoured as a request nothing validated; set it on a node you launch DIRECTLY, with the hook preloaded; and **`CERULION_RMW_ADOPT_TAKE_BUDGET`** (a positive integer) caps how many samples one subscription may hold adopted at once, defaulting to the built-in borrow budget; an unusable value warns and uses the default (once per subscription that reads it, not once per process: creates are rare and each is its own report). |
 | `ros2 launch [ARGS...]` | The same staged environment and `exec()`, forwarding to `ros2 launch [ARGS...]`: `ros2 launch demo.launch.py use_rviz:=false`, the `pkg file.launch.py` package form, `--show-args`, all verbatim. Same exit contract, and the same leading-position-only `--adopt-take` (given right after `launch`), refused for the same reason. |
-| `ros2 attach --iface IP [--domain N] [--timeout SECS] [--graph-name NAME] [--topic-prefix PREFIX] [--robot-name NAME] [--dry-run] [--yes]` | Discover a running ROS 2 system's DDS topics, resolve each type, and generate a bridge graph (`graphs/<NAME>.yaml` + `graphs/<NAME>.bridge.yaml`) that carries those topics onto Cerulion. `--iface` is REQUIRED and is the robot-LAN interface IP to run discovery on; it restricts discovery to that interface so a multi-homed host does not drop fragmented discovery data. `--domain` must match the robot's `ROS_DOMAIN_ID` (default 0). `--timeout` is the discovery collection window in seconds (default 5; must be finite and within `(0, 3600]`, rejected at parse time). Types that resolve neither in the workspace `.msg` store nor in the built-in corpus are acquired over the wire from the robot's own `~/get_type_description` service and materialized under `schemas/<pkg>/msg/`; see `docs/schema_resolution.md`. Nothing is written or run until you consent: `--dry-run` prints the discovery report and stops (it wins over `--yes`), `--yes` writes and runs non-interactively, and a TTY run asks. `--robot-name` sets the generated graph's `prefix:` namespace; it is NOT the announced network identity, which comes from this machine's hostname or `CERULION_ROBOT_IDENTITY`. **Every run's report ends with an automatic MIGRATION section** (no flag; `--dry-run` prints it too): the discovered processes grouped by whether they could run under `rmw_cerulion` instead of being bridged: restartable today (every message type resolves locally), restartable once this attach's acquired schemas are written on consent, or stays bridged (unresolvable types named; endpoints with no `ros_discovery_info` record are worded as absence of evidence, a vendor/raw-DDS process or a node table the window did not observe; and a robot where that is everything gets the zero-restartable line), plus the equivalent `cerulion ros2 launch` line, a paste-ready `ros2:` graph-entry block (`<package>`/`<executable>` placeholders: DDS discovery sees endpoints, not launch metadata), the bridged-vs-native cost facts (a bridged topic pays a per-message CDR decode in the bridge; a native topic has no decode hop and is zero-copy eligible), and a closing pointer at `cerulion ros2 migrate`. Pure rendering over the discovery data already in hand: it never blocks, opens no network, and changes no outcome or exit code. **No visualization node is staged on the robot**: to see the data, run `cerulion viz --robot <name>` on your own machine. |
+| `ros2 attach --iface IP [--domain N] [--timeout SECS] [--graph-name NAME] [--topic-prefix PREFIX] [--robot-name NAME] [--dry-run] [--yes]` | Discover a running ROS 2 system's DDS topics, resolve each type, and generate a bridge graph (`graphs/<NAME>.yaml` + `graphs/<NAME>.bridge.yaml`) that carries those topics onto Cerulion. `--iface` is REQUIRED and is the robot-LAN interface IP to run discovery on; it restricts discovery to that interface so a multi-homed host does not drop fragmented discovery data. `--domain` must match the robot's `ROS_DOMAIN_ID` (default 0). `--timeout` is the discovery collection window in seconds (default 5; must be finite and within `(0, 3600]`, rejected at parse time). Types that resolve neither in the workspace `.msg` store nor in the built-in corpus are acquired over the wire from the robot's own `~/get_type_description` service and materialized under `schemas/<pkg>/msg/`; see `docs/schema_resolution.md`. Nothing is written or run until you consent: `--dry-run` prints the discovery report and stops (it wins over `--yes`, and it does not require a workspace; a workspace that is present still supplies its `.msg` store), `--yes` writes and runs non-interactively, and a TTY run asks. Writing or running requires a workspace. A workspace-less dry-run still needs one writable directory outside a workspace: it creates an empty one under `TMPDIR` and removes it again at exit, and on a host where that directory cannot be created the run exits with a notice naming both remedies: Point TMPDIR at a writable location, or run the dry-run from inside a workspace. `--robot-name` sets the generated graph's `prefix:` namespace; it is NOT the announced network identity, which comes from this machine's hostname or `CERULION_ROBOT_IDENTITY`. **Every run's report ends with an automatic MIGRATION section** (no flag; `--dry-run` prints it too): the discovered processes grouped by whether they could run under `rmw_cerulion` instead of being bridged: restartable today (every message type resolves locally), restartable once this attach's acquired schemas are written on consent, or stays bridged (unresolvable types named; endpoints with no `ros_discovery_info` record are worded as absence of evidence, a vendor/raw-DDS process or a node table the window did not observe; and a robot where that is everything gets the zero-restartable line), plus the equivalent `cerulion ros2 launch` line, a paste-ready `ros2:` graph-entry block (`<package>`/`<executable>` placeholders: DDS discovery sees endpoints, not launch metadata), the bridged-vs-native cost facts (a bridged topic pays a per-message CDR decode in the bridge; a native topic has no decode hop and is zero-copy eligible), and a closing pointer at `cerulion ros2 migrate`. Pure rendering over the discovery data already in hand: it never blocks, opens no network, and changes no outcome or exit code. **No visualization node is staged on the robot**: to see the data, run `cerulion viz --robot <name>` on your own machine. |
 | `ros2 migrate [--workspace DIR] [--write] [--yes]` | Migrate the colcon workspace's C++ publish call sites to the ROS 2 **loaned-message API** (`borrow_loaned_message()` → fill → `publish(std::move(loaned))`) wherever a clang AST prover shows the rewrite is behavior-preserving: an AST transform over the workspace's `compile_commands.json` (build with `colcon build --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` first; the verb names that command when the database is absent), never a regex. The safe pattern is a locally-built message (`std::make_unique`/`std::make_shared`/a stack local) filled and published once, to a provably-fixed `rclcpp::Publisher`, with no other use of the pointer; everything unprovable lands in a **manual-candidates report** with a fixed reason (pointer escapes, built in another function, retained member, conditional publish, publisher not provable, constructor arguments, …). rclpy nodes are **report-only**: rclpy has no loaned-message API upstream, so those keep one copy per side (two copies become one under the launcher's heap hook). Migrating does not couple the workspace to Cerulion; rclcpp falls back to allocate+copy when the rmw cannot loan. **INITIALIZATION, HOWEVER, IS NOT IDENTICAL ON EVERY RMW, and this decides whether a site is safe to migrate.** `make_unique<T>()` VALUE-INITIALIZES: every field the code does not write holds its declared default (a Quaternion's `w=1`, zeros elsewhere). A LOANED message carries that guarantee only where the rmw provides it, and `rclcpp::LoanedMessage` does NOT construct on the can-loan path; it takes the pointer `rcl_borrow_loaned_message` returns and casts it (`rclcpp` jazzy, `loaned_message.hpp`), placement-new'ing `MessageT()` only in the CANNOT-loan branch. So: on `rmw_cerulion` initialization matches `make_unique` on both paths; a loanable (recursively-fixed) type's SHM slot is constructed by running the typesupport's own `init_function` with `MessageInitialization::ALL` (`rmw_borrow_loaned_message` → `init_loaned_payload`, so declared defaults hold), and a type it cannot loan returns `RMW_RET_UNSUPPORTED` so rclcpp heap-constructs it. On ANY rmw that cannot loan the type, rclcpp constructs it too, so that case matches everywhere. But on an rmw that CAN loan and does not initialize, the loaned buffer is **uninitialized, possibly recycled memory**: `rmw_fastrtps`, the ROS 2 default, calls Fast DDS `loan_sample()` with no `LoanInitializationKind` and constructs nothing afterwards, and that parameter's default is `NO_LOAN_INITIALIZATION` ("Do not perform initialization of sample … the user should take care of writing every field on the data type before calling write"). So **the rewrite value-initializes the loaned message itself**: it emits `<loaned>.get() = <MessageT>();` immediately after the borrow, restoring exactly what `make_unique<T>()` gave on every rmw, at the cost of one value-init store on a path that has just taken a loan. It is an ASSIGNMENT rather than a placement-new deliberately: on the cannot-loan path rclcpp has already constructed a real message that may own heap members, and a placement-new over it would leak them, while on the loaning path the type is `is_plain()` and the implicit copy-assignment is trivial (it writes the destination without reading it). Without that store a field the site does not write would read as whatever the loan pool last held, with no compile error and no crash. (Fast DDS loans only "plain" fixed types, so a message with a string or a vector, `std_msgs/String` among them, takes the constructing fallback; a plain one such as `geometry_msgs/Twist` does not, which is why the matrix carries a partially-written `Twist` fixture.) **Dry-run by default**: prints the full unified diff + the candidates report and refreshes the machine-readable manifest at `.cerulion/ros2-migrate-manifest.json` (its only write; atomic). `--write` applies behind consent (a TTY asks; non-TTY requires `--yes`): it REFUSES a dirty git tree, writes **one commit** plus `cerulion-ros2-migration.patch` (undo = `git revert <sha>` or `git apply -R cerulion-ros2-migration.patch`). **One case puts other paths in that commit:** a `pre-commit` hook stages INSIDE `git commit`, after this verb's own index check, so a hook that stages (`git add -A` is the common shape) adds its own paths to the migration commit. Hooks are the user's responsibility; the run does not refuse or unwind, it COMMITS AND WARNS, naming the unplanned paths, and when that warning appears the safe undo is **`git apply -R cerulion-ros2-migration.patch`**, which reverses only the migration's own edits. `git revert <sha>` is NOT an equivalent there: it would undo the hook's paths too. After the commit, `--write` runs `colcon build --packages-select <affected>`: a build failure exits 1 and names the revert path; the commit stays. A Ctrl-C during the write window does not silently strand a partial migration: the interrupt is observed at the write safepoints, the run rolls back what it wrote and refuses, and anything the rollback cannot restore (a write failure) or deliberately preserves (another actor changed the file mid-run) is REPORTED for hand repair, never dropped silently (after the commit exists, an interrupt changes nothing: the commit is the durable state; a hard kill such as SIGKILL can still leave partial state, which is what the patch file and the clean-tree gate's committed baseline are for). While `--write` is applying, it holds the workspace lock (`<workspace>/.cerulion/workspace.lock`), **on Unix** (see the platform note below), so a second Cerulion writer on the same directory (another `ros2 migrate`, or a `ros2 attach` / `node` / `graph` / `schema` command when your Cerulion workspace root IS this colcon workspace) WAITS (with one loud line naming the lock file) instead of interleaving its writes with the migration's. The lock is per-directory: if `--workspace` is not also your Cerulion workspace root, those other verbs lock a different file and do not wait. It is taken after you consent and released before the build, so reading the diff blocks nobody and the build does not hold it; Ctrl-C ends the wait (the run refuses without rewriting a source file or committing anything; the wait may have created the untracked `.cerulion/`, and the message says so) rather than leaving you with a process no ordinary signal can stop. One consequence of the commit happening under the lock: a `pre-commit` hook that itself runs a `cerulion` command which writes this workspace will deadlock; hooks are your responsibility. The dry-run takes no lock and leaves no lock file (so a dry-run run alongside someone else's `--write` can report a half-migrated tree; re-run it if the report looks inconsistent). **Platform note:** the lock is a kernel `flock(2)`, so every guarantee in this paragraph is a UNIX guarantee. On a non-Unix build the guard is a declared-weaker no-op that locks nothing and waits for nobody; two concurrent writers there can interleave. Every `cerulion` workspace writer behaves that way on a non-Unix build. The dry-run diff and the applied bytes come from the same code path (byte-identical by construction); a second run proposes nothing (idempotent). Requires the migration engine binary `cerulion-ros2-migrate-clang` (beside the `cerulion` binary, on `PATH`, or via `CERULION_ROS2_MIGRATE_TOOL`): **exit 69** with container build instructions when absent, never a silently-inert analysis. |
 
 ### `cerulion viz`
 
 | Command | Effect |
 |---|---|
-| `viz [TOPIC...] [--robot NAME] [--connect LOCATOR]... [--listen LOCATOR]... [--detach]` | Visualize live topics in Cerulion Studio. Zero YAML, zero hand-written nodes. The verb is a thin CLIENT of the long-lived `cerulion-vizd` daemon: it starts the daemon if absent and sends one attach per topic. It starts no viewer: Studio connects to the same daemon and renders whatever is attached, so open Studio to see the topics (before or after the run). The daemon owns the taps, the schema-generic decode and the render. Each `TOPIC` is absolute (a missing leading `/` is added); pin a type with `TOPIC=SCHEMA` (`/go2/cloud=sensor_msgs/PointCloud2`) when it cannot be resolved locally; otherwise a local topic's schema back-fills from its first frame. **With NO arguments** it attaches every decodable local topic the daemon finds (silent or undecodable topics are skipped). `--robot NAME` visualizes a REMOTE robot: the daemon declares gateway ingress, re-injects the robot's frames into desk-local shared memory and taps the mirror; the robot serves raw bytes and nothing else, and each topic's type is resolved from the robot's served catalog, so no schema pin is needed. A topic the robot does not serve is a hard error, not a silent skip. `--connect`/`--listen` (repeatable, each requires `--robot`) add zenoh locators for a robot scouting cannot reach; they are threaded into the daemon's config only when THIS command starts it; a daemon already running keeps its boot-time locators. `--detach` attaches and returns immediately, leaving the daemon up. Without `--detach` the verb stays attached until Ctrl+C, then detaches only the topics it added; the shared daemon keeps running. |
+| `viz [TOPIC...] [--robot NAME] [--connect LOCATOR]... [--listen LOCATOR]... [--detach]` | Visualize live topics in Cerulion Studio. Zero YAML, zero hand-written nodes. The verb is a thin CLIENT of the long-lived `cerulion-vizd` daemon: it starts the daemon if absent and sends one attach per topic. It starts no viewer: Studio connects to the same daemon and renders whatever is attached, so open Studio to see the topics (before or after the run). The daemon owns the taps, the schema-generic decode and the render. Each `TOPIC` is absolute (a missing leading `/` is added); pin a type with `TOPIC=SCHEMA` (`/go2/cloud=sensor_msgs/PointCloud2`) when it cannot be resolved locally; otherwise a local topic's schema back-fills from its first frame. **With NO arguments** it attaches every decodable local topic the daemon finds (silent or undecodable topics are skipped). `--robot NAME` visualizes a REMOTE robot: the daemon declares gateway ingress, re-injects the robot's frames into desk-local shared memory and taps the mirror; the robot serves raw bytes and nothing else, and each topic's type is resolved from the robot's served catalog, so no schema pin is needed. A topic the robot does not serve is a hard error, not a silent skip. `--connect`/`--listen` (repeatable, each requires `--robot`) add zenoh locators for a robot mDNS discovery cannot reach; they are threaded into the daemon's config only when THIS command starts it; a daemon already running keeps its boot-time locators. `--detach` attaches and returns immediately, leaving the daemon up. Without `--detach` the verb stays attached until Ctrl+C, then detaches only the topics it added; the shared daemon keeps running. |
 
-### `cerulion connect` / `pair` / `login` / `account`
+### `cerulion connect` / `pair` / `login` / `logout` / `account`
 
 Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 
 | Command | Effect |
 |---|---|
-| `cerulion pair [ROBOT] [--eid HEX] [--addr IP:PORT]... [--code CODE] [--account HEX] [--label NAME] [--key-file PATH] [--relay-url URL] [--relay-disabled]` | Enroll this desk with a robot, once. `ROBOT` is a 64-char-hex endpoint id or a name resolved from the robot's mDNS record (else `~/.cerulion/robots.toml`); `--eid` gives the id directly. `--code` is the short pairing code the robot owner shared; **prefer omitting it** and typing it at the prompt, because a code passed on the command line is visible in process listings for the ceremony window and it authorizes durable enrollment. `--label` is the name the robot stores on its access-list row so its owner recognizes this desk (default: your hostname). `--key-file` is the desk device key (default `~/.cerulion/desk.key`, created `0600` on first pair and reused after). Pairing writes the robot's name pin, so `cerulion connect <name>` works afterwards. |
+| `cerulion pair [ROBOT] [--eid HEX] [--addr IP:PORT]... [--code CODE] [--account HEX] [--label NAME] [--key-file PATH] [--relay-url URL] [--relay-disabled]` | Enroll this desk with a robot, once. `ROBOT` is a 64-char-hex endpoint id or a name resolved from the robot's mDNS record (else `~/.cerulion/robots.toml`); `--eid` gives the id directly. `--code` is the short pairing code the robot owner shared; **prefer omitting it** and typing it at the prompt, because a code passed on the command line is visible in process listings for the ceremony window and it authorizes durable enrollment. `--label` is the name the robot stores on its access-list row so its owner recognizes this desk (default: your hostname). `--key-file` is the desk device key (default this machine's key `~/.cerulion/identity/device.key`, also named `~/.cerulion/desk.key`, created `0600` on first pair or sign-in and reused after). Pairing writes the robot's name pin, so `cerulion connect <name>` works afterwards. |
 | `cerulion connect [ROBOT] [--eid HEX] [--addr IP:PORT]... [--topic TOPIC]... [--all] [--key-file PATH] [--schemas-dir DIR] [--relay-url URL] [--relay-disabled] [--network off]` | Dial a paired robot's wire plane and re-inject its topics into desk-local shared memory, so `topic echo` and `viz` see them as LOCAL topics. `--topic` (repeatable) selects what to bring across; `--all` brings everything. Runs until Ctrl+C. It spawns the `cerulion-connectd` sibling binary (a separate binary because it links iroh), which it looks for beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it, and `CERULION_CONNECTD_BIN` points at one that lives elsewhere. |
-| `cerulion login` | Sign in to a Cerulion account. Runs the RFC 8628 device-code flow: prints a short code and a verification URL to open on any device, then waits for you to authorize. It is headless-friendly, so it works over SSH. Use it any time to sign in, re-authenticate or switch accounts. Ordinary commands require a signed-in machine: on one that has never signed in, the first command starts this flow at a terminal and refuses with this command's name anywhere else. Exempt: `login` itself, `completions`, `--help`, `--version`, and the internal `graph run-worker` and `graph run-gateway` subprocess verbs a gated parent spawns. |
+| `cerulion login` | Sign in to a Cerulion account. Runs the RFC 8628 device-code flow: prints a short code and a verification URL to open on any device, then waits for you to authorize. It is headless-friendly, so it works over SSH. Use it any time to sign in, re-authenticate or switch accounts. Ordinary commands require a signed-in machine: on one that has never signed in, the first command starts this flow at a terminal and refuses with this command's name anywhere else. Exempt: `login` itself, `logout`, `telemetry` (so consent can be read or changed before signing in), `completions`, `clean`, `--help`, `--version`, and the internal `graph run-worker` and `graph run-gateway` subprocess verbs a gated parent spawns. |
+| `cerulion logout` | Sign this machine out. Removes the session and refresh tokens from `~/.cerulion/auth.json` (the account id and the signed-in-before marker stay, the same record Cerulion Studio's "Sign out" writes), then revokes the session at the account service (`POST /v1/auth/revoke`). Every command the login gate covers is then refused (exit 7, "signed out") until the next `cerulion login`; at a terminal that command starts the sign-in instead. STDOUT is one line, `signed_out: account=<id>`, or `not_signed_in` when no session was stored (exit 0, nothing changed). Exit 1 when `auth.json` could not be rewritten (nothing was signed out), or when the machine was signed out but the service did not confirm the revoke (offline, service error): the session then stays valid at the service until it expires. A cached device certificate is left; revoke the device with `cerulion account devices revoke`. |
 | `cerulion account devices list` / `devices revoke <DEVICE_ID>` | List and revoke the desks enrolled on your account: self-service management of your own machines. Robot access management lives in Studio and the web account page, not the CLI. |
 
 ### Other
@@ -217,13 +387,14 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | `cerulion bag play <BAG> [-r\|--rate N] [--loop] [--topics TOPIC]... [-s\|--start-offset S] [-u\|--duration D]` | **Playback.** Republish a bag's recorded frames onto local shared memory, wall-paced from the bag's own log times. Every frame goes back out BYTE-VERBATIM, its wire header's `sequence` and `timestamp_ns` intact, under its recorded topic name, in the order the recorder saw them. Nothing is re-executed and no node is loaded: to anything attached to local shared memory this is indistinguishable from a robot publishing, which is what makes it the way to develop a consumer against yesterday's data. Local only. `--rate` scales the pacing (default 1.0), `--loop` restarts at the end, `--topics` (repeatable) plays a subset, and `--start-offset` / `--duration` bound the span: skip the first S seconds of BAG TIME, and stop after D seconds of it (fractional accepted for both). A topic whose publisher slot is already held by a live producer is refused BY NAME and skipped; the rest still play. Add `--resim` to re-execute instead of republish; see the next row. |
 | `cerulion bag record [TOPIC...] [-a\|--all] [-e\|--regex PATTERN] [-x\|--exclude PATTERN]... [-o\|--out PATH] [--duration SECS] [--schema-wait-ms MS] [--run[=RUN]]` | **Record.** Tap live topics into a standard MCAP bag, the `ros2 bag record` shape, driving Cerulion's production recorder. Name topics positionally, take everything with `--all`, or select with `--regex` and prune with `--exclude` (repeatable). `-o` defaults to `recording.mcap`; `--duration` stops after N seconds (omit to record until Ctrl+C). **Local payload capture:** this taps THIS machine's shared memory, recording a robot's topics means running this verb ON the robot and copying the file afterwards. Schema resolution may query network peers within its configured budget; `CERULION_RECORD_SCHEMA_DEMAND_MS=0` disables those networked schema lookups. A named topic that is not live here is refused by name. `--schema-wait-ms` (default 2000) is how long each topic's first frame is waited for before the bag is created, so its channel can carry the real wire schema hash; frames seen during the wait are recorded, not dropped, and a topic still silent when it elapses gets a placeholder hash for the life of that bag. `--run` ATTACHES to a live `cerulion graph run`, so the bag describes a RUN, carrying its effective graph, env snapshot, host and run identity, and recording the topics the run declares rather than everything live on the machine. Pass it bare when one run is live; **`--run=<RUN>`, with the `=`, names one** by run id or graph name when several are (several live runs and no id is a refusal, never a guess). Note the `=` is required: `--run foo` attaches to the sole run and records the TOPIC `foo`. Recording begins where it attaches, nothing before that point is recoverable, and the bag says so. `--run` is also the one `bag record` shape whose topic set is INFERRED rather than named, so live-topic discovery is ON for it (a run's declared outputs are not everything it puts on the wire); `CERULION_RECORD_DISCOVERY=off` turns that off. Channels carry the learned wire schema hash; schema resolution adds a qualified name and embeds the required custom definitions when available. Unresolved types remain explicitly unknown. A bare topic recording carries no graph execution context. With `--run`, the recorder also copies the run's graph, environment and identity, and attaches its available scheduler-trace rings. A mid-run resim additionally needs compatible checkpoints: if the run reports a standing Flashback recorder, this recorder leaves its single-consumer state rings alone, so use that recorder's captures for anchored replay. Otherwise it can discover available state rings, without arming checkpoints itself. `bag info` reports the retained context and state coverage; `bag play --resim all --verify` checks the actual recording's prerequisites before comparing outputs. See `docs/flashback.md` for the attach and resume conditions. |
 | `cerulion bag info <BAG>` | Show what a bag holds (topics, frame counts, schemas, time span) without publishing anything. The same pre-scan `bag play` prints. Also the way to read a torn bag: it reports what is readable. |
-| `cerulion bag play <BAG> --resim all [--verify] [-u\|--duration D] [--strict-state] [--report FILE] [--tolerance FILE]` | RE-EXECUTE a bag carrying supported execution context, such as a `cerulion graph run --record` recording or a replayable Flashback capture: the bag supplies the graph, the env, the recorded external inputs and the scheduler trace, and your workspace's CURRENT node builds are re-run against them. **Bare `--resim all` is NEUTRAL**, it re-executes and reports what happened, makes no claim about whether the result matches the recording, and exits 0 on any completed run; divergence is the output, which is what an edit → build → re-run loop wants. **`--verify` asks for the verdict**: every produced frame is diffed byte-for-byte against the recording, so a code change that alters a node's output is caught as a regression. With `--verify` the exit code is 0 = pass, 1 = data violation, 2 = not replay-grade / corrupt bag, 3 = node failure (build load error, or a node PANICKED, a crash is reported as the root cause, never disguised as a data diff; a node that merely returns `Err` is normal behavior and re-runs to 0), 4 = tolerance-config error, 5 = internal, 6 = the re-executed schedule diverged. When several apply, 3 beats 6 beats 1, the report still shows everything. Neutral mode declines exactly the two COMPARISON codes (1 and 6); 2, 3 and 5 mean the re-execution could not be performed and stay loud in both modes. A node SUBSET (`--resim planner,…`) is not supported and is refused by name. `--duration D` covers only the first D SECONDS of BAG TIME; there is no `--max-ticks` step cap, because a per-rank resim has k step axes and no shared step number while every rank's boundary stream shares the GO epoch, so a bound in TIME is rank-uniform where a step count is not (`--max-ticks` is not accepted: clap's unknown-argument error, exit 2, no alias, no shim); `--strict-state` refuses the run unless every executed node's state was restored (inert on a bag that begins at step 0), both legal in EITHER mode, because they shape the RUN rather than the comparison; `--report FILE` writes the machine-readable JSON verdict for CI and `--tolerance FILE` relaxes the diff per field, both require `--verify`, since a neutral run has no verdict to persist or relax. The playback flags (`--rate` / `--loop` / `--topics` / `--start-offset`) are refused under `--resim`, each with its reason, `--start-offset` because it names an arbitrary point in playback time, while a re-execution can resume only from a recorded checkpoint that carries the per-rank anchors it needs. Re-executing a bag recorded on a different architecture or OS WARNS (float results may differ in last-bit ULPs across arches, a byte-mismatch may be arch skew, not a regression) but never refuses. If a produced topic's **output schema changed** since recording, it refuses up front with exit 2 (naming the drifted topics + both layout hashes) rather than an unexplained per-frame byte mismatch, re-record or check out the recording-era schemas. For why a re-execution diverges (wall clock, unseeded RNG, hash order, cross-host float skew, …) and the sanctioned alternatives, see `docs/replay_determinism_footguns.md`. **There is no separate replay verb**: typing `replay` after `cerulion` is an unrecognized subcommand (exit 2), with no migration message. |
-| `cerulion bag migrate <BAG> [-o PATH] [--dry-run] [--yes]` | Rewrite a bag whose embedded graph carries keys the graph format does not define, into a **NEW** bag that `bag play --resim` accepts. An older bag may embed your on-disk `graphs/<name>.yaml` rather than the config the run executed, so an undefined setting (a legacy `policy:` block is the one that really happens) travels into the bag and refuses to resim (exit 2). An MCAP attachment is sealed, so there is no way to edit it in place; this writes a corrected copy instead. It lists every key it would remove, with the PATH and the LINE it sits on in the embedded document, and asks before writing: `--dry-run` shows what would go and writes nothing (it wins over `--yes`), `--yes` writes without asking (required when stdin is not a terminal). **Your original bag is never modified**: the migrated bag is a second file, `<name>.migrated.mcap` beside it unless `-o` says otherwise, and an output that already exists is refused rather than overwritten. Every recorded frame (user topics and Cerulion's internal streams alike, with its topic, sequence, timestamps and payload bytes, in the order the recorder wrote them), the scheduler trace, and every other attachment are copied through unchanged; what changes is `graph.yaml` plus one new `__cerulion/migration.json` attachment recording the date, the source bag's SHA-256, and exactly which keys were removed. The migrated graph is re-rendered from the parsed config, so YAML comments and key order do not survive it: the same normalization `graph run --record` applies; nothing but Cerulion reads that document, and your own `graphs/<name>.yaml` is not touched by any of this. It REFUSES, rather than guessing, when: the bag's graph already parses (nothing to migrate); the bag carries no embedded graph; the bag is not finalized (a torn bag has no attachment index; `cerulion bag info` reports what is readable in it); or the graph fails to parse for a reason other than an undefined key, which is real YAML damage a rewrite cannot repair. |
+| `cerulion bag play <BAG> --resim all [--verify] [-u\|--duration D] [--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance FILE]` | RE-EXECUTE a bag carrying supported execution context, such as a `cerulion graph run --record` recording or a replayable Flashback capture: the bag supplies the graph, the env, the recorded external inputs and the scheduler trace, and your workspace's CURRENT node builds are re-run against them. **Bare `--resim all` is NEUTRAL**, it re-executes and reports what happened, makes no claim about whether the result matches the recording, and exits 0 on any completed run; divergence is the output, which is what an edit → build → re-run loop wants. **`--verify` asks for the verdict**: every produced frame is diffed byte-for-byte against the recording, so a code change that alters a node's output is caught as a regression. With `--verify` the exit code is 0 = pass, 1 = data violation, 2 = not replay-grade / corrupt bag, 3 = node failure (build load error, or a node PANICKED, a crash is reported as the root cause, never disguised as a data diff; a node that merely returns `Err` is normal behavior and re-runs to 0), 4 = tolerance-config error, 5 = internal, 6 = the re-executed schedule diverged. When several apply, 3 beats 6 beats 1, the report still shows everything. Neutral mode declines exactly the two COMPARISON codes (1 and 6); 2, 3 and 5 mean the re-execution could not be performed and stay loud in both modes. A node SUBSET (`--resim planner,…`) is not supported and is refused by name. `--duration D` covers only the first D SECONDS of BAG TIME; there is no `--max-ticks` step cap, because a per-rank resim has k step axes and no shared step number while every rank's boundary stream shares the GO epoch, so a bound in TIME is rank-uniform where a step count is not (`--max-ticks` is not accepted: clap's unknown-argument error, exit 2, no alias, no shim); `--strict-state` refuses the run unless every executed node's state was restored (inert on a bag that begins at step 0), and `--allow-param-change` resumes a mid-run bag on the param values in force where they differ from the recorded ones instead of refusing (see [`#[param(...)]`](#param-field-attribute)), all legal in EITHER mode, because they shape the RUN rather than the comparison; `--record-out FILE` writes the re-executed frames to a new bag (one channel per graph-produced topic, labelled with the schema the re-executed graph publishes, every frame the re-executed graph published), also legal in EITHER mode; the file must not exist (an existing one is refused with exit 2, never overwritten), the recorded external inputs are not copied, and the bag carries no scheduler trace, so it is a recording to read or index and not one `--resim` can re-execute; with `--report` the JSON gains a `record_out` field naming the written path; `--report FILE` writes the machine-readable JSON verdict for CI and `--tolerance FILE` relaxes the diff per field, both require `--verify`, since a neutral run has no verdict to persist or relax. The playback flags (`--rate` / `--loop` / `--topics` / `--start-offset`) are refused under `--resim`, each with its reason, `--start-offset` because a resim re-executes from the anchor the recording carries, not from an arbitrary offset into it. Re-executing a bag recorded on a different architecture or OS WARNS (float results may differ in last-bit ULPs across arches, a byte-mismatch may be arch skew, not a regression) but never refuses. If a produced topic's **output schema changed** since recording, it refuses up front with exit 2 (naming the drifted topics + both layout hashes) rather than an unexplained per-frame byte mismatch, re-record or check out the recording-era schemas. For why a re-execution diverges (wall clock, unseeded RNG, hash order, cross-host float skew, …) and the sanctioned alternatives, see `docs/replay_determinism_footguns.md`. **There is no separate replay verb**: typing `replay` after `cerulion` is an unrecognized subcommand (exit 2), with no migration message. |
+| `cerulion bag migrate <BAG> [-o PATH] [--dry-run] [--yes]` | Rewrite a bag whose embedded graph carries keys the graph format does not define, into a **NEW** bag that `bag play --resim` accepts. An older bag may embed your on-disk `graphs/<name>.yaml` rather than the config the run executed, so an undefined setting (a legacy `policy:` block is the one that really happens) travels into the bag and refuses to resim (exit 2). An MCAP attachment is sealed, so there is no way to edit it in place; this writes a corrected copy instead. It lists every key it would remove, with the PATH and the LINE it sits on in the embedded document, and asks before writing: `--dry-run` shows what would go and writes nothing (it wins over `--yes`), `--yes` writes without asking (required when stdin is not a terminal). **Your original bag is never modified**: the migrated bag is a second file, `<name>.migrated.mcap` beside it unless `-o` says otherwise, and an output that already exists is refused rather than overwritten. Every recorded frame (user topics and Cerulion's internal streams alike, with its topic, sequence, timestamps and payload bytes, in the order the recorder wrote them), the scheduler trace, and every other attachment are copied through unchanged (except the header upgrade described below); what changes is `graph.yaml` plus one new `__cerulion/migration.json` attachment recording the date, the source bag's SHA-256, and exactly which keys were removed. A bag recorded by a release with the 32-byte wire header is also migrated when its graph parses, or when it has no graph at all (a `cerulion bag record` bag; then only its frames change and the record carries no graph digests): every whole user frame is written with the current 40-byte header (an untagged step tag) and the record lists those topics under `wire_header_upgraded_topics`; this is the way to play such a bag whose frames exceed the 2 GiB a frame walk will hold upgraded in memory. A 32-byte-header frame that cannot be upgraded (shorter than the header, or declaring a size past its end) refuses the migration, since the copy would carry it in the old layout under a descriptor stating the new one; `cerulion bag info` counts such frames. The migrated graph is re-rendered from the parsed config, so YAML comments and key order do not survive it: the same normalization `graph run --record` applies; nothing but Cerulion reads that document, and your own `graphs/<name>.yaml` is not touched by any of this. It REFUSES, rather than guessing, when: the bag's graph already parses and its frames already carry the current header (nothing to migrate); the bag carries no embedded graph and its frames carry the current header; the bag is not finalized (a torn bag has no attachment index; `cerulion bag info` reports what is readable in it); or the graph fails to parse for a reason other than an undefined key, which is real YAML damage a rewrite cannot repair. |
 | `cerulion flashback [--note TEXT] [--pin] [--no-wait]` | **Capture the moment** (Unix only): write a bag covering the last ~30 seconds plus the next ~15, from the rolling window every serving `graph run` already holds. Nothing has to be armed in advance; the window is always on. The capture lands in `recordings/flashbacks/` and the verb WAITS until the bag is written (`--no-wait` returns as soon as the capture is accepted; the accepted line already carries the path it will have). `--note` records a sentence into the capture, so a bag found three weeks later says what it was about. `--pin` exempts it from retention rotation. Turn the whole plane off with `CERULION_FLASHBACK=off`; every size and retention knob is under [Environment variables](#environment-variables), and `docs/flashback.md` has the full model. |
 | `cerulion bagd --out PATH ...` | The recorder daemon itself (Unix only): the process `graph run --record` and `cerulion bag record` spawn for you. Run it by hand only when you want to attach a recorder to something already running with settings neither of those verbs exposes; `cerulion bagd --help` lists its full argument surface. Attach-mode channels learn their schema hash from the first frame; configured schema resolution can supply names and definitions. Whole-graph resim additionally requires the graph, environment, scheduler trace and any needed resume checkpoints. `graph run --record` supplies the run context to this same recorder; invoking `bagd` on topics alone does not create it. |
-| `cerulion completions <SHELL>` | Print the shell code that enables tab-completion (`zsh` / `bash` / `fish` / `elvish` / `powershell`). Completes subcommands, flags and enum values from the command tree, **plus live names**: topics on `topic echo/info/hz` and `viz`, node types on `node build/run/info/...`, graph names on `graph run/levels/partition/...`, workspace + built-in ROS 2 schemas on `schema info`, robot names on `viz --robot` / `connect` / `pair`, and `.mcap` bags on `bag play` / `bag info`. Install once, per shell (see `docs/cli_completions.md` for the full table); zsh needs TWO lines because the generated script ends in `compdef`, a function `compinit` defines, and macOS's system zshrc never calls it: `echo 'autoload -Uz compinit && (( $+functions[compdef] )) || compinit' >> ~/.zshrc` then `echo 'source <(COMPLETE=zsh cerulion)' >> ~/.zshrc`. These forms regenerate the shell code on demand, so they self-correct across upgrades (redirecting this command into a file also works, but hard-codes the binary's path, so re-run it after an upgrade). **A TAB press never opens the network, never starts a process (`cerulion-netd` least of all), never prints to stderr, and is bounded at 150 ms**: every source is a local directory / `~/.cerulion` file / compile-time static read. Consequence: a REMOTE robot's topics complete only while something HOLDS a mirror of them, and demands are process-scoped; a running `cerulion viz --robot NAME` leaves one standing (vizd holds the demand), `topic echo/info/hz` holds one only for as long as that command runs, and `topic list` demands NOTHING at all (it is a service-directory scan plus a liveliness gather), so with no vizd attach remote topics do not complete. Topic candidates also carry no origin label, because distinguishing a mirror from a local producer costs 620 ms. See `docs/cli_completions.md`. |
+| `cerulion telemetry status` / `on` / `off` | Show or change usage telemetry for this machine. `status` prints whether it is on and which setting decided it; `on` and `off` persist the choice in `~/.cerulion/telemetry.json` (a build compiled without the `telemetry` feature reports that telemetry is not compiled and writes nothing). `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` (or `false`, `off`, `no`) override the file. Works without signing in. Only a build carrying a telemetry key sends anything, such as one run with `POSTHOG_API_KEY` set; `status` says when the build has no key. See `docs/telemetry.md` for exactly what is sent. |
+| `cerulion completions <SHELL>` | Print the shell code that enables tab-completion (`zsh` / `bash` / `fish` / `elvish` / `powershell`). Completes subcommands, flags and enum values from the command tree, **plus live names**: topics on `topic echo/info/hz/type/bw` and `viz`, type names on `topic find`, node types on `node build/run/info/...`, graph names on `graph run/levels/partition/...`, workspace + built-in ROS 2 schemas on `schema info`, robot names on `viz --robot` / `connect` / `pair`, and `.mcap` bags on `bag play` / `bag info`. Install once, per shell (see `docs/cli_completions.md` for the full table); zsh needs TWO lines because the generated script ends in `compdef`, a function `compinit` defines, and macOS's system zshrc never calls it: `echo 'autoload -Uz compinit && (( $+functions[compdef] )) || compinit' >> ~/.zshrc` then `echo 'source <(COMPLETE=zsh cerulion)' >> ~/.zshrc`. These forms regenerate the shell code on demand, so they self-correct across upgrades (redirecting this command into a file also works, but hard-codes the binary's path, so re-run it after an upgrade). **A TAB press never opens the network, never starts a process (`cerulion-netd` least of all), never prints to stderr, and is bounded at 150 ms**: every source is a local directory / `~/.cerulion` file / compile-time static read. Consequence: a REMOTE robot's topics complete only while something HOLDS a mirror of them, and demands are process-scoped; a running `cerulion viz --robot NAME` leaves one standing (vizd holds the demand), `topic echo/info/hz` holds one only for as long as that command runs, and `topic list` demands NOTHING at all (it is a service-directory scan plus a liveliness gather), so with no vizd attach remote topics do not complete. Topic candidates also carry no origin label, because distinguishing a mirror from a local producer costs 620 ms. See `docs/cli_completions.md`. |
 | `cerulion tui` | Interactive ratatui dashboard (Nodes / Topics / Echo tabs). |
-| `cerulion clean [--report-only]` | Sweep iceoryx2 bookkeeping for **dead nodes only**; live nodes' state is preserved. On macOS it also reports the `/tmp/*.shm_state` population (the per-segment files `iceoryx2` leaves behind when a process is killed, which every dead-node sweep must then read past) and reclaims the ones whose creating process is **provably gone** (`kill(pid, 0)` says no such process; anything less certain is left in place and reported) **and** whose iceoryx2 namespace has no node registered in any registry the sweep covers: a state file is the whole namespace's name mapping, not one process's, so a namespace that is still in use keeps its file however long ago its first process died. The registries it covers are the one under your configured root path, the one under the compiled-in default root, and any registry one directory below either of them (which is where an isolated test root's registry lives). A process running under a hand-written `root_path` somewhere else entirely is invisible to that search, and its mappings are not protected. One refusal the sweep can never clear on its own is healed by this verb: a dead node's directory holding nothing but the `.port_tag` files of ports it had already deregistered (a publisher destroyed while one of its loaned samples had been leaked: the tag outlives the port, and a dead process removes nothing), which fails iceoryx2's final `rmdir` on every sweep forever and blocks the state-file reclamation with it. After the first sweep, `clean` removes those tags (only when the owning process is provably gone and the directory, re-listed at that instant, holds nothing else; anything else is refused and named) and then sweeps ONCE MORE, so the registry converges in the same run (a directory something else already emptied is reported as converged pending that sweep, not as a refusal). `--report-only` is look-first for BOTH reclaims: it lists the orphan port tags it would remove and the `.shm_state` files it would reclaim, removes neither, and skips the second sweep; it does **not** suppress the first dead-node sweep, which is the verb's main job (iceoryx2's own reclaim of a dead node's resources) and runs either way. **You should rarely need this**: `cerulion graph run` sweeps dead nodes at startup under a 2 s budget, and reclaims what it can at graceful EXIT under another 2 s, where the graph is already over, so nothing you are waiting on is delayed. A run killed with `SIGKILL` skips its own exit pass; the next run that ends gracefully picks that residue up, so a desk that runs graphs heals progressively without you doing anything. Reach for `clean` when you want it all cleared at once, or when a run reported that its budget ran out. |
+| `cerulion clean [--report-only]` | Sweep iceoryx2 bookkeeping for **dead nodes only**; live nodes' state is preserved. **It needs no account.** The sweep reads and clears this machine's own bookkeeping, reaches no network and touches nothing on your account, so it runs on a machine that has never signed in: a CI runner, or a fresh install a `kill -9` left wedged, which is exactly the machine that needs it. On macOS it also reports the `/tmp/*.shm_state` population (the per-segment files `iceoryx2` leaves behind when a process is killed, which every dead-node sweep must then read past) and reclaims the ones whose creating process is **provably gone** (`kill(pid, 0)` says no such process; anything less certain is left in place and reported) **and** whose iceoryx2 namespace has no node registered in any registry the sweep covers: a state file is the whole namespace's name mapping, not one process's, so a namespace that is still in use keeps its file however long ago its first process died. The registries it covers are the one under your configured root path, the one under the compiled-in default root, and any registry one directory below either of them (which is where an isolated test root's registry lives). A process running under a hand-written `root_path` somewhere else entirely is invisible to that search, and its mappings are not protected. The verb makes ONE dead-node sweep: iceoryx2 0.10 removes a dead port's tag with the rest of its stale resources, so the directory that used to fail `rmdir` forever no longer arises and nothing is left to heal. `--report-only` performs **no side effect at all**: it lists the dead nodes it would sweep, each by the entry name it carries under the registry directory the report names, and, for the `.shm_state` half, the size of the job rather than a list: how many state files are there, and how many of those are provably dead. It removes neither, and leaves the registry byte for byte as it found it. Two limits on those figures, both of which the report itself states. Each is what a SHORT scan saw, so each can be a floor. And a count of provably dead files is not a promise they come off: reclamation runs only on a run WITHOUT the flag, and only when that run's own dead-node sweep converged, because a state file is the only name mapping a still-registered dead node has left. A run that leaves one registered says so and stands the reclamation down. The node listing is what the sweep would **attempt**, not a promise each one comes off: iceoryx2 reports insufficient permissions or a version mismatch only when it tries to remove a node, and the report says so under the list. It closes by saying nothing was removed. **You should rarely need this**: `cerulion graph run` sweeps dead nodes at startup under a 2 s budget, and reclaims what it can at graceful EXIT under another 2 s, where the graph is already over, so nothing you are waiting on is delayed. A run killed with `SIGKILL` skips its own exit pass; the next run that ends gracefully picks that residue up, so a desk that runs graphs heals progressively without you doing anything. Reach for `clean` when you want it all cleared at once, or when a run reported that its budget ran out. |
 | `cerulion trace inspect <dir>` | Read legacy publish-trace files (`trace_*.jsonl`, a JSON-Lines record of which topic published which sequence number when, with no payloads) and print a human-readable timeline. `--filter TOPIC`, `--limit N`, `--reverse`. No `cerulion` verb writes these files, so this verb only matters if you already hold some; see [Publish trace (legacy)](#publish-trace-legacy). **Not the recording bag**: `graph run --record` bags are standard **MCAP** (`.mcap`) and are read by `cerulion bag play` (with or without `--resim`), not this command. |
 | `cerulion --verbose <SUBCMD>` | Bump logging to debug. |
 
@@ -237,18 +408,24 @@ or edited (so a bare built-in name never scaffolds a broken
 
 - A bare name matching a **workspace schema** (`schemas/*.yaml`, by file
   stem or schema name) stays bare: workspace wins over built-ins, with a
-  loud stderr `WARNING:` when it shadows a built-in name. (Making the
-  workspace schema's generated type resolvable in the node crate is
-  the workspace author's responsibility.)
+  loud stderr `WARNING:` when it shadows a built-in name. A Python node
+  imports it as `from cerulion.msgs import <Name>`, a Rust node as
+  `use native_ros2_messages::<Name>;`, the type generated at the message
+  crate's root (see [Workspace messages](#workspace-messages)); in a workspace
+  whose `.cargo/config.toml` does not set `CERULION_WORKSPACE_MSGS` that type
+  does not exist, so add the setting first.
 - A name matching a **`.msg` store schema**
-  (`schemas/<pkg>/msg/<Type>.msg`, e.g. one acquired by `ros2 attach`) is
-  RECOGNIZED, bare or qualified, and **REFUSED for node ports**, with an
-  error naming the store type and the remedy: a store type has no
-  generated Rust type, so the scaffolded `use native_ros2_messages::…;`
-  import could never compile. The store tier sits BETWEEN workspace YAML
-  and built-ins (a same-named workspace YAML schema wins and scaffolds; a
-  same-named built-in is outranked, so the refusal, not the built-in,
-  answers). A bare name defined in **several store packages** is an
+  (`schemas/<pkg>/msg/<Type>.msg`, e.g. one acquired by `ros2 attach`)
+  resolves, bare or qualified, to its `pkg/Type`. A Python node imports it as
+  `from cerulion.msgs.<pkg> import <Type>`; a Rust node as
+  `use native_ros2_messages::<pkg>::<Type>;`, generated from the same file
+  (see [Workspace messages](#workspace-messages)). In a workspace whose
+  `.cargo/config.toml` does not set `CERULION_WORKSPACE_MSGS` (one created
+  before the setting existed) a Rust port of a store type is REFUSED, naming
+  the store type and the line to add, since the import could not compile
+  there. The store tier sits BETWEEN workspace YAML and built-ins (a
+  same-named workspace YAML schema wins; a same-named built-in is
+  outranked). A bare name defined in **several store packages** is an
   ambiguity error listing every candidate. A bare name whose ONLY store
   package's qualified spelling a workspace YAML file ALSO declares
   (`pkg/Type` in both) is refused too, and so is that QUALIFIED spelling,
@@ -286,6 +463,32 @@ or edited (so a bare built-in name never scaffolds a broken
   as above); any other qualified name passes through unchanged (an unknown
   one fails later, at compile time; `cerulion graph validate` is the
   existence gate).
+
+### Workspace messages
+
+A workspace's own messages are typed in both languages from the one file that
+defines them, by the same resolution the runtime uses (a workspace definition
+replaces the built-in of the same qualified name, and the built-ins that embed
+it are absent, with a warning).
+
+| Definition | Rust | Python |
+|---|---|---|
+| `schemas/<pkg>/msg/<Type>.msg` | `native_ros2_messages::<pkg>::<Type>` | `cerulion.msgs.<pkg>.<Type>` |
+| YAML schema named `pkg/Name` | `native_ros2_messages::pkg::Name` | `cerulion.msgs.pkg.Name` |
+| YAML schema named `Name` | `native_ros2_messages::Name` | `cerulion.msgs.Name` |
+
+A package name's `-` is `_` in both module paths. Rust: the workspace's
+`.cargo/config.toml` sets `CERULION_WORKSPACE_MSGS = { value = ".", relative = true }`
+under `[env]` (`workspace create` and `workspace init` write it), and the
+message crate's build script then generates the workspace's types beside the
+built-ins, regenerating when a file under `schemas/` changes; resolver warnings
+appear as cargo warnings. Without the setting the crate holds the built-ins
+only. A type the crate cannot declare is left out with a cargo warning naming
+why, and so is every type that embeds it: a name Rust cannot spell (a keyword,
+a leading digit), a field naming a type no package declares, a field naming another package's type whose name the
+type's own package also declares, a field name two imported packages both
+declare, and a new variable-length type in a vendored package name (a
+`geometry_msgs/Mine` with a `string` field; give it a package of its own). Python: see `docs/python.md`, "Message classes".
 
 ### `--policy SPEC` (`node create` / `node modify`)
 
@@ -341,7 +544,7 @@ count declared in the same `node create` invocation.
 
 Before any of this, `cerulion node build` needs **your own** Rust toolchain: it
 compiles the node with `cargo`, which the CLI does not ship, so `cargo` must be
-on `PATH` (Rust **1.93+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
+on `PATH` (Rust **1.95+**, the MSRV, via [rustup](https://rustup.rs)) alongside a
 **C linker** (`build-essential` on Ubuntu/Debian, the Xcode Command Line Tools on
 macOS). If `cargo` is missing the build fails with a message naming rustup and
 the linker, rather than a raw "No such file or directory" that reads like a lost
@@ -467,6 +670,42 @@ my_robot/
 ```
 
 You shouldn't need to hand-edit `Cargo.toml` or `.cargo/config.toml`; the CLI keeps them in sync. Hand-edit `nodes/<type>/src/lib.rs`, `graphs/*.yaml`, and `schemas/*.yaml`. Port and trigger-policy metadata lives entirely in `src/lib.rs` (there is no `.cerulion.yaml` sidecar, and graph YAML carries no `policy:` block; the macro on the node is the single source of truth, and `cerulion node info` / `cerulion node list` parse the source directly).
+
+### A node crate is a cdylib and an rlib
+
+`cerulion node create` writes a node crate with two library targets and a `pub` node struct:
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+```
+
+```rust
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+pub struct TimerNode {
+    // ...
+}
+```
+
+The `cdylib` is what `cerulion node build` and `cerulion graph run` load. The `rlib` lets another Rust crate, such as an app's own native library, link the node as a plain dependency. That crate depends on the node with `default-features = false`, which turns off the `cdylib` feature and with it the node's C exports (`cerulion_node_info` and the rest), so two linked nodes never clash on one symbol name:
+
+```toml
+[dependencies]
+timer = { path = "../nodes/timer", default-features = false }
+```
+
+Keep that crate out of the node workspace: give it its own `[workspace]` table and build it from its own directory. Cargo merges a package's features across everything one build selects, so a build that also selects the node packages (a plain `cargo build` at the node workspace root, for example) turns their default `cdylib` feature back on, compiles the C exports into the linking crate, and two linked nodes then fail to link on the shared `cerulion_node_info` name.
+
+The items the macro generates for a node take the struct's visibility, so the struct must be `pub` for another crate to reach the node.
+
+A node crate made before this layout needs two edits to link this way: change `crate-type = ["cdylib"]` to `crate-type = ["cdylib", "rlib"]` in its `Cargo.toml`, and change `struct <Name>` to `pub struct <Name>` on the `#[cerulion_node]` struct in `src/lib.rs`. Nothing else changes: the node still builds and runs with `cerulion node build` and `cerulion graph run` as before.
+
+An Android app links its nodes this way into one native library, its app runtime crate, and lists them once with `cerulion_android::embed_nodes! { "timer" => timer::TimerNodeEntry }`, naming each node by the entry type the macro generates for it, `<Struct>Entry`. Each string is the graph YAML `type:` the entry answers to. The app's embedded runtime runs a graph's nodes only from that list: a type that is not listed fails the start with error code 5, and `node_lib_dir` is refused for such a graph in an app. Java must call `CerulionRuntime.loadLibrary("<runtime library name>")` before any other `CerulionRuntime` call. The Android guide (`docs/android.md`, `Graph nodes in an app`) has the full steps.
 
 ---
 
@@ -716,7 +955,7 @@ fire reads its own set's trigger members.
 fn external_source(&mut self) -> ExternalSource { ... }
 ```
 
-`external_source()` is queried **once** at live-loop startup (after `init()`), on the **LIVE path only**, never during a replay (`cerulion bag play --resim`). The wake is record-only: it changes *when* a step runs, never *what* fires, so replay stays byte-identical to live (Principle #7). `ExternalSource` (re-exported in the prelude) has three variants:
+`external_source()` is queried **once** at live-loop startup (after `init()`), on the **LIVE path only**, never during a replay (`cerulion bag play --resim`). The wake is record-only: it changes *when* a step runs, never *what* fires, so replay stays byte-identical to live. `ExternalSource` (re-exported in the prelude) has three variants:
 
 | Variant | Meaning |
 |---|---|
@@ -724,7 +963,7 @@ fn external_source(&mut self) -> ExternalSource { ... }
 | `Blocking(Box<dyn FnMut() -> bool + Send>)` | For fd-less SDKs whose only wait is a blocking call. Driven on a helper thread + a doorbell; each `true` return rings the node (N rings before a step coalesce to one fire). Use a **bounded** internal timeout so the thread can observe shutdown between calls; a closure panic is caught → the source is poisoned **loudly** and stops waking the node. |
 | `HostDriven` | "No self-source." A placeholder: nothing in a `cerulion graph run` can fire such a node, so the run refuses it (below). It is what the `--policy external` scaffold returns so the crate compiles before you write the real source. |
 
-**`cerulion graph run` REFUSES any external node that is provably inert at launch** with a sticky, aggregated error naming every offender **with its reason** and the fixes. The reasons: `host-driven` / `no source` (the node declares no source of its own, so nothing in the run can fire it), `invalid fd` / `duplicate fd` (the declared `Fd` cannot be watched by the live loop), `poisoned node`, `doorbell failed` (the `Blocking` doorbell could not be established), and `fd above select limit` (a live `Fd` `>= FD_SETSIZE` with the monitor-wait park OFF, where the select-backed WaitSet cannot watch it; fix: enable the monitor-wait park, which polls via `poll(2)` with no fd-number ceiling, OR shrink the graph so the fd is minted below `FD_SETSIZE`). All are discovered at collect time, before the loop. Fix each named node: give it a working `Fd` / `Blocking` source and resolve any listed fd/doorbell problem. Under `--time-source virtual` (the deterministic poll loop) **every** external node is inert, because nothing watches their fd/doorbell, so the run is **refused at startup** with reason `virtual time` (fix: re-run with `--time-source real`), not merely warned. The refusal text also mentions driving the graph from an embedding host; that is a framework-internal seam (see the top of this document), not a user path.
+**`cerulion graph run` REFUSES any external node that is provably inert at launch** with a sticky, aggregated error naming every offender **with its reason** and the fixes. The reasons: `host-driven` / `no source` (the node declares no source of its own, so nothing in the run can fire it), `invalid fd` / `duplicate fd` (the declared `Fd` cannot be watched by the live loop), `poisoned node`, `doorbell failed` (the `Blocking` doorbell could not be established), and `fd above select limit` (a live `Fd` `>= FD_SETSIZE` with the monitor-wait park OFF on macOS and the other non-Linux targets, where the select-backed WaitSet cannot watch it; on Linux the WaitSet waits with epoll and takes any live `Fd`; fix: enable the monitor-wait park, which polls via `poll(2)` with no fd-number ceiling, OR shrink the graph so the fd is minted below `FD_SETSIZE`). All are discovered at collect time, before the loop. Fix each named node: give it a working `Fd` / `Blocking` source and resolve any listed fd/doorbell problem. Under `--time-source virtual` (the deterministic poll loop) **every** external node is inert, because nothing watches their fd/doorbell, so the run is **refused at startup** with reason `virtual time` (fix: re-run with `--time-source real`), not merely warned. The refusal text also mentions driving the graph from an embedding host; that is a framework-internal seam (see the top of this document), not a user path.
 
 ```rust
 #[cerulion_node(external)]
@@ -773,7 +1012,7 @@ compile error listing these.
 
 #### The determinism lint
 
-Principle #7 says a replay is byte-identical to the live run, and the commonest
+A replay is byte-identical to the live run, and the commonest
 way to break it is one line in a tick body. So `#[cerulion_node_impl]` walks
 your impl block for calls that cannot replay and **refuses to compile** three
 of them:
@@ -812,10 +1051,51 @@ Declares an input port. Field type is the schema marker (e.g. `LaserScan`).
 | `depth = N` | Queue depth in messages. Default: 10 (`DEFAULT_CONSUMER_DEPTH`). **Maximum: 64** (`MAX_CONSUMER_DEPTH`): every unit of depth commits a full `max_slice_len`-sized SHM slot, so deeper queues reserve pathological amounts of shared memory (64 × 128 MiB = 8 GiB apparent for an `Image`-class topic; apparent, not resident: the pool is lazy/demand-paged, but the reservation still counts against `/dev/shm` `size=` and address space). Rejected at compile time (macro) and at graph-load (topology validation). Applies identically to dylib-loaded nodes; the declaration crosses the cdylib FFI (ABI v8). 64 in-flight messages is the cap; a consumer that needs more, whether from a burst, a transient stall or a sustained rate it cannot keep up with, wants a backpressure policy rather than a deeper queue. |
 | `backpressure = drop_oldest \| sample(N) \| block` | What to do when the subscriber's queue would overflow (or, for `sample(N)`, when reads arrive faster than one per `N` ms). Default: `drop_oldest`. Zero-copy: no Cerulion-side buffer, no copy. Applies identically to dylib-loaded nodes, because the declaration crosses the cdylib FFI (ABI v8). See **Backpressure policies** section below for runtime semantics + counter surface + `#[on_event]` callbacks. On a **per-set-capable** Sync node's `#[input(trigger)]` port both `sample(N)` and `block` are honoured with no degrade; see [Per-set Sync delivery](#per-set-sync-delivery) for what each does to a SET. A Sync node that is NOT per-set-capable (a legacy `--raw-ffi` node, or any node under `CERULION_DRAIN_DISCIPLINE=separate`) keeps the legacy latest-per-set path, and there these policies have a different shape: the gate sees only the survivor of a drain-to-latest rather than every frame, and the block mirror decrements at tick-body-read time rather than at slot exit. The build says which path a node is on, loudly, once. |
 | `expect_within_ms = N` | **QoS subscriber-side deadline.** Expected inter-arrival interval on this input. If `N` ms elapse without new data, the node's `expect_within_missed_count` increments and a `tracing::warn!` fires with structured `node_id`, `input`, `expect_within_ms`, `elapsed_ms` fields. Independent of `trigger`: input deadlines are orthogonal to firing policy. `N` must be > 0. **A window that elapses while the input's data is sitting unserved is BACKLOG, not silence**: on a Data node's `trigger` input with signalled arrivals unserved, and on a per-set Sync node's trigger input whose frame is already the aligned set's member, the node is behind (its own `throttle_ms` cap or a `block` gate deferred the fire), so the window is reported (`expect_within_backlogged_count`, plus a `debug!` per window and one `info!` per regime) and *not* counted as a miss; the cost is that a producer which dies mid-backlog is detected only once the backlog drains, plus at most one more window. **That bound assumes the held head is eventually consumed, and the exception below is specific to the Unified drain discipline** (the default for macro data-trigger nodes; forced-Separate, `block`/`sample` and drain-ineligible cdylib paths use independent trigger/body subscribers, never re-offer a held body head, and so keep the one-window bound): under Unified, a COLLAPSED READ CHAIN, a latest-value context input declared before this trigger whose first message never arrives (the pre-first-delivery wait), re-offers the held head at every level boundary, so the backlog never drains and the watchdog stays in BACKLOG indefinitely, never reporting the dead producer; the diagnostic for that state is the held-head `warn!` (fired after a bounded streak of consecutive re-offers naming both causes and how to tell them apart), plus a climbing `expect_within_backlogged_count`. |
+| `accumulate` | **Keep every message.** On each fire the node receives every frame that arrived on this input since its last fire, not only the newest. See [Accumulate inputs](#accumulate-inputs-keep-every-message) below. |
+| `cap = N` | With `accumulate` only: the most frames one fire can hold. Default: 10. Range: 1 to 64. The cap is also the input's queue depth, so `depth` is not accepted with `accumulate`. On a topic listed in `multi_publisher_topics:` the queue depth ceiling is 16, so a larger cap there is refused when the graph is built. |
 
-That is the COMPLETE `#[input(...)]` surface: `trigger`, `depth`, `backpressure`, `expect_within_ms`.
+That is the COMPLETE `#[input(...)]` surface: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`.
 
-> **Not accepted:** `fifo` / `lifo`, `max_age_ms = N`, and `filter = "fn_name"` are not input attributes. Writing one is a compile error: the generic unknown-attribute message, which names the SUPPORTED set (`trigger`, `depth`, `backpressure`, `expect_within_ms`). None of them (`filter`, `max_age_ms`, and queue policy) is supported.
+> **Not accepted:** `fifo` / `lifo`, `max_age_ms = N`, and `filter = "fn_name"` are not input attributes. Writing one is a compile error: the generic unknown-attribute message, which names the SUPPORTED set (`trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`). None of them (`filter`, `max_age_ms`, and queue policy) is supported.
+
+#### Accumulate inputs: keep every message
+
+A plain non-trigger `#[input]` is a latest-value read: when several frames arrive between two fires, the node reads only the newest. That loses data on a topic with many writers, such as `/tf`, where each writer publishes different transforms. In ROS 2 terms, a latest-value read is a depth-1 subscription, and a `/tf` listener needs every message, as a per-message callback gets. Mark such an input `accumulate`:
+
+```rust
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+pub struct TfBuffer {
+    #[input(accumulate, cap = 16)]
+    tf: TFMessage,
+}
+
+#[cerulion_node_impl]
+impl TfBuffer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        for frame in self.tf.iter() {
+            let transforms = frame.transforms(); // read each frame like a plain input
+            // ...
+        }
+        Ok(())
+    }
+
+    #[on_event(input = "tf")]
+    fn on_tf_overflow(&mut self, event: BackpressureEvent) {
+        tracing::warn!(dropped = event.dropped, "tf frames dropped");
+    }
+}
+```
+
+- **What a fire receives.** `self.tf.iter()` yields every frame received since the last fire, each read the same way a plain input is read. `self.tf.len()` and `self.tf.is_empty()` count them. An empty accumulate input never skips the tick: a fire with no new frame runs and sees zero frames. If the node fires more than once in one step, the first fire receives the frames and later fires in that step receive none, so no frame is served twice. If the tick does not run (for example, another latest-value input has not delivered yet), the frames are kept for the next fire that runs.
+- **Order.** Frames come oldest first by the wire publish timestamp, then by the wire sequence, then by the frame bytes. The order depends only on the frames, never on arrival order or on which writer the transport reads first, so two runs that receive the same frames serve them in the same order.
+- **Cap and overflow.** At most `cap` frames are held. When more arrive before the next fire, the oldest frames by the order above are dropped. Each writer also has its own transport queue of `cap` frames, so a writer that publishes more than `cap` frames between two fires loses its oldest frames in that queue. Both kinds of drop are one count: `self.tf.dropped()` is the number dropped before this fire, `self.tf.dropped_total()` is the lifetime count, with no rate limit, and both also go into the input's `backpressure_drop_oldest_count`. The first fire that drops frames raises one `BackpressureEvent` with `policy = DropOldest`, `dropped` (frames dropped before that fire), `count_total` (the lifetime count) and `buffer_capacity` (the cap); a fire whose collect drops nothing re-arms it. The input holds one event for the handler at a time: while an earlier event is not yet handled, a new regime's event waits, keeps the counts and timestamp of the fire that opened it, and reaches the handler at a later fire after the earlier one is handled, even if that regime has closed by then. A newer regime that opens while an event still waits replaces it; `count_total` still counts every drop. One loss is not countable: queue drops from a writer before this input received any frame from that writer, because there is no earlier sequence number to measure the gap from.
+- **Firing.** An accumulate input never fires the node. The node needs `period_ms`, `external` or a separate `#[input(trigger)]`, and its accumulate inputs are collected each time it fires; a node whose only inputs are accumulate inputs and that declares none of these is a compile error that says so.
+- **State capture.** A node's captured state carries its accumulate inputs: the frames no fire has received yet and both drop counts, after the node's own fields. A node resumed from that state serves the same frames and reports the same counts as the run that was captured. As for every input policy, a backpressure event not yet handled and the open overflow regime are not part of the captured state: a resumed node starts with no pending event and an armed regime, so its first overflowing fire raises a new event. Whole-run replay is unaffected, because it re-executes the collects from the recorded frames. Restoring state captured from a node with different accumulate inputs (added, removed or renamed) is refused, naming the input. The captured state does not record the cap, so a changed cap is refused only when an input holds more unreceived frames than its new cap. A refused restore is the error `StateError::AccumulateRestore`; `StateError` is `#[non_exhaustive]`, so a `match` on it outside `cerulion_core` needs a `_` arm.
+- **Step boundary.** The frames are collected at the step boundary, at the same point a latest-value input takes its snapshot, so a producer firing in the same level never changes what this fire receives.
+- **Node kinds.** The read works the same in an in-process node and in a node built as a cdylib and run by `cerulion graph run`, because the buffer lives inside the node itself.
+- **Refused combinations** (compile errors that list the accepted keys `cap = N`, `backpressure = drop_oldest` and `expect_within_ms = N`): `accumulate` with `trigger` (a trigger input already serves every frame, one fire per frame), with `backpressure = block` (block paces the producer instead of dropping at the cap), with `backpressure = sample(N)` (decimation drops the frames accumulate keeps), and with `depth` (use `cap`). A `cap` outside 1 to 64 and a `cap` without `accumulate` are refused too. The `cerulion` commands that read a node's source (`cerulion node info`, `cerulion graph run` and the others) refuse the same forms.
+- **Cost.** Each frame is copied once, into a slot the node reuses on every fire; once each slot has held a frame of the largest size the topic carries, the read allocates nothing.
 
 ### `#[output(...)]` field attribute
 
@@ -831,6 +1111,93 @@ That is the COMPLETE `#[output(...)]` surface: bare, or `promise_within_ms = N`.
 > **Not accepted:** the `#[output(data, encoding)]` variable-field lists and `#[output(complex(header))]` are not output attributes. Variable-field assignment needs NO declaration. Every `self.<port>.<field> = expr` is rewritten to a uniform fallible write (under the hood: a codegen-emitted `__cer_assign_<field>(…)?` shim on the generated schema type resolves fixed-vs-variable at compile time). Writing one of the removed forms is a compile error that says `#[output]` takes no field list and tells you to assign the field in the node body instead.
 >
 > **Reserved prefix:** schema field names beginning with `__cer` are reserved for this generated plumbing and rejected at codegen time.
+
+### `#[param(...)]` field attribute
+
+Declares a typed setting on a PLAIN field, not a port. The field type is the param
+type, the node reads it as `self.<field>`, and a graph file sets it per node under
+`params:` (see [Graph YAML reference](#graph-yaml-reference)). A value is fixed at graph
+load for the whole run: the precedence is the `default` on the attribute, then the graph
+file. A param supplies a VALUE for a knob the node declares; it never changes any other
+node fact (trigger policy, period, depth, schema).
+
+```rust
+#[cerulion_node(period_ms = 10)]
+struct Controller {
+    #[output]
+    cmd: Twist,
+    #[param(default = 2.0, min = 0.0, max = 5.0, description = "proportional gain")]
+    gain: f64,
+    #[param(default = "base_link")]
+    frame_id: String,
+    #[param(default = true)]
+    enabled: bool,
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `default = <literal>` | Required. The value the node holds when the graph sets none. It must have the field's type exactly: a float field takes `2.0`, never `2`; an integer must fit the field's width. |
+| `min = <literal>`, `max = <literal>` | Inclusive bounds, on integer and float fields only. A graph value outside them is refused at load. |
+| `description = "..."` | Shown by `cerulion node info`. |
+
+Field types: `bool`, `i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `String`, written bare or
+by their standard path (`std::string::String`); another type of the same name
+(`my::String`) is refused. Names are flat:
+a param is a struct field, so `gain`, never `motor.gain`; a dotted key in `params:` is an
+unknown name. A raw-identifier field keeps its name without the prefix: `r#type` is the
+param `type`.
+
+That is the COMPLETE `#[param(...)]` surface. Rejected at compile time, each with a message
+that names the field and the fix: any other key (the error lists the four above), a missing
+`default`, a `default`, `min` or `max` of the wrong type or outside the field's width,
+`min` above `max`, a `default` outside the bounds, bounds on a `bool` or `String` field, a
+field that is also an `#[input]` or `#[output]`, a second `#[param]` on the same field, a
+field under `#[cfg]` or `#[cfg_attr]` (every param exists in every build), a
+`#[cerulion(reconstruct)]` field (a param is never node state, so the key adds nothing),
+and `live`, which is reserved and not supported (a param
+cannot be changed while the graph runs).
+
+The resolved values are written into the fields before the node's own `init` runs, so
+`init` and the first tick both read them, and they are plain field reads on the tick path:
+no lookup, no allocation. A recording carries the values in force in its effective graph,
+every declared param with the graph's value or the default, and `bag play --resim` applies
+the recorded values, not the current graph file and not a default that changed since.
+
+A param is not node state. A node's captured state leaves every `#[param]` field out: it
+is not captured, a restore leaves it alone, and it is not part of the state shape, so
+changing a param's type or name never invalidates a recorded anchor. A resume from a
+mid-run anchor (`bag play --resim` on a bag that begins mid-run) keeps the values in force
+for the resumed graph and first compares them with the values the recording names for each
+restored node. A recording names every declared param and a value is fixed for the run, so
+those are the values at every anchor it took. Any difference, including a param the
+recording names no value for, refuses the resume with exit 2 and one line per param:
+`node '<id>' param '<name>': recorded <value>, current <value>`. Pass
+`--allow-param-change` to resume on the current values instead; each difference is then
+logged as a warning, and a recorded param the node no longer declares is left out of the
+resumed graph rather than refused as an unknown name. A float is compared bit for bit, so
+a recorded `-0.0` against a current `0.0` is a difference.
+
+Because a value is fixed for the run, a node must not write a `#[param]` field, in `init`
+or in `tick`. An anchor does not carry the field, so a resume would run on the graph's
+value instead of the one the node held live. A state capture checks each param against
+the value it held when `init` began and refuses once one differs, naming the param. Keep a
+value the node changes in a plain field: it is state, captured and restored like any other.
+
+**For ROS 2 users.** The same concepts, in Cerulion's form:
+
+| ROS 2 | Cerulion |
+|---|---|
+| `declare_parameter("gain", 2.0)` in the constructor | `#[param(default = 2.0)] gain: f64` on the struct |
+| `ParameterDescriptor` with `floating_point_range` / `description` | `min`, `max`, `description` on the same attribute |
+| `get_parameter("gain").as_double()` | `self.gain` |
+| `--ros-args -p gain:=2.5` / a params file keyed by node name | `params:` on the node's entry in the graph file |
+| A type mismatch is refused when the parameter is set | A type mismatch, an unknown name or an out-of-range value is refused when the graph loads, before any node runs |
+
+Deliberate differences: no wildcards (`/**:`) and no node-name keyed params file, because
+values live on the node entry in the one graph file; no type tags (`!!str`), because the
+field type decides and nothing is coerced, so a `String` param given `off` keeps the string
+`off`; no runtime set or parameter events, because a value is fixed for the run.
 
 ### Inside `tick()`
 
@@ -1209,20 +1576,56 @@ You return `Result<(), NodeError>` from `tick`/`init`/`shutdown`. The variants y
 |---|---|
 | `NodeError::Logic(String)` | Recoverable logic error. |
 | `NodeError::InvalidInput { input, reason }` | An input message failed validation. |
-| `NodeError::Fatal(String)` | Marks the error unrecoverable in intent. The runtime logs and counts it like any other tick error and keeps scheduling the node: there is no hard-stop lifecycle. |
+| `NodeError::Fatal(String)` | Unrecoverable. Returned from `tick`, it STOPS the node (see below). |
 | `NodeError::Custom(Box<dyn Error + Send + Sync>)` | Wrap any other error type. The `Send + Sync` bound is real: an error type that is not both cannot be boxed into it. |
 | `NodeError::Transport(TransportError)` | Auto-converted from `?` on transport calls. |
 | `NodeError::Io(std::io::Error)` | Auto-converted from `?` on `std::fs` / `std::io`. |
 
 You typically do **not** match on `TransportError` variants; they're framework-level. Just `?` them.
 
+#### What each error kind does
+
+Every variant except `Fatal` is logged (`node tick failed`, flood-suppressed per reason) and counted, and the node keeps firing on its trigger as before. An erroring tick publishes nothing.
+
+`NodeError::Fatal` from `tick` stops the node for the rest of the run:
+
+- The scheduler does not fire it again, so it publishes nothing after the tick that returned the error. The rest of the graph keeps running.
+- The log carries ONE error line naming the node, the kind and the message: `node returned a fatal error and is stopped; it will not fire again in this run node_id=<id> kind=fatal error=<message>`.
+- Downstream nodes see the silence through their usual QoS: an input with `expect_within_ms` counts missed windows (`expect_within_missed_count`) and raises its `ExpectWithinEvent` as for any silent upstream. The `#[on_event]` handler runs on the consumer's own tick, so a consumer triggered only by the stopped node's data never runs it (it is never fired again); its missed-window counter is the signal, or give it a `period_ms` trigger. The stopped node's publishers stay open, so a fatal stop raises no `LivelinessEvent`.
+- `cerulion graph run` exits with status **3** when you stop it, after one `Error: node '<id>' stopped on a fatal error: <message>` line per stopped node. In a multi-process run (the default for an unpartitioned graph on Unix, or a `process_groups:` graph) that line comes from the node's worker, which exits 3; the supervisor then names each such worker group on its own `Error:` line and also exits 3. `<message>` is the node's own error text (`Fatal error: lidar lost` for `NodeError::Fatal("lidar lost")`), the same for an in-process node and a built cdylib. A worker that exits 3 is not a crashed worker, so the run is not reported as degraded.
+- An `external` node's wake source stops waking the live loop when the node is stopped, so a device fd that stays ready (a camera whose peer hung up) costs no CPU after the stop. Nothing reads that source again.
+- The stop counts as a node death for Flashback: a live run's window recorder takes ONE capture for the node, with detail `returned_fatal_error`, as it does for a node that panicked. A replay takes none.
+- The stop is part of the recorded run. `bag play --resim all --verify` on a `graph run --record` bag re-executes the node, which returns `Fatal` at the same step, and passes (exit 0). This holds for a multi-process recording too: the schedule check expects no fire of the node after the step that stopped it, and a recorded fire after that step is still a schedule divergence (exit 6). The node must read the same configuration at resim as it did live.
+
+`Fatal` from `init` fails the graph build, like any `init` error (the run exits 1 before it starts). `Fatal` from `shutdown` is logged like any `shutdown` error: the node is not reported as stopped and the exit status does not change.
+
+```rust
+#[cerulion_node_impl]
+impl Lidar {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        if self.frames_lost > 10 {
+            // The sensor is gone: stop this node, keep the rest of the robot running.
+            return Err(NodeError::Fatal("lidar stopped sending frames".to_string()));
+        }
+        Ok(())
+    }
+}
+```
+
+The kind crosses into the runtime only from a node that reports it. A `#[cerulion_node]` node built with this Cerulion does. These do not, so a `Fatal` from them is logged like any other error and the node keeps firing:
+
+- A node built with an older Cerulion. It still loads; rebuild it with `cerulion node build` to get the stop.
+- A `--raw-ffi` node. The template does not export it; add `#[no_mangle] pub extern "C" fn cerulion_take_last_error_kind() -> u32` yourself to get the stop. The host calls it right after `cerulion_take_last_error`; return the last error's kind code (`3` for fatal, `0` for none) and reset it to `0`.
+- A Python node. Its errors are reported without a kind, so it cannot stop itself with `Fatal`.
+
 ---
 
 ## Graph YAML reference
 
-Graph YAML carries **topology only**: `id`, `type`, `inputs`,
-`outputs` (or, for a stock ROS 2 process launched beside the native nodes, `id`
-plus a `ros2:` block; see [`ros2:` entries](#ros2-entries-stock-ros-2-nodes-in-the-same-graph)).
+Graph YAML carries **topology and values**: `id`, `type`, `inputs`,
+`outputs` and the node's `params:` (or, for a stock ROS 2 process launched beside the
+native nodes, `id` plus a `ros2:` block; see
+[`ros2:` entries](#ros2-entries-stock-ros-2-nodes-in-the-same-graph)).
 Trigger policy lives on the node's macro
 (`#[cerulion_node(period_ms = N)]`, `#[input(trigger)]`, etc.) and
 is the single source of truth. Graph YAML once accepted a
@@ -1277,6 +1680,10 @@ the better answer; migration is for a recording of something you cannot do
 again.
 
 ```yaml
+args:                           # optional; launch arguments with defaults, referenced as ${name} in
+  use_sim: false                #   `prefix`, an output's `topic`, an input's `source` and `params:`
+  robot_name: go2               #   values, and overridden at launch: `graph run <NAME> use_sim:=true`
+                                #   (see Launch arguments)
 prefix: my_robot                # optional; defaults to hostname (.local stripped). Topic resolution is "/<prefix>/<node_id>/<port>".
 nodes:
   - id: camera                  # required; unique within the graph
@@ -1300,6 +1707,14 @@ nodes:
     inputs:
       - name: image
         source: camera/image    # <node_id>/<port> reference
+    params:                     # optional; one value per `#[param]` field the node declares.
+      threshold: 0.75           #   Absent names keep the macro default. The value must have
+      frame_id: camera_optical  #   the field's type (a float field takes 0.75, never 1) and lie
+                                #   within the declared min/max. An unknown name, a wrong type
+                                #   or an out-of-range value fails `graph run` and `graph validate`
+                                #   naming the node, the param and the fix. Flat names only.
+                                #   Not accepted on a `ros2:` entry: use `ros2.params` there
+                                #   (a `launch:` entry takes values through `ros2.args`).
 
   - id: sync_consumer
     type: sync_consumer
@@ -1450,6 +1865,125 @@ nodes:
 
 Malformed shapes are rejected at graph load: bare `/`, trailing `/`, empty `//` segments, and prefixes that start/end with `/`.
 
+### Launch arguments
+
+One graph file serves many setups. A graph declares launch arguments under a
+top-level `args:` map, each with a default, and an operator picks a setup at
+launch with `name:=value` overrides on `graph run`. Precedence is the declared
+default, then the override.
+
+```yaml
+args:
+  robot_name: go2                 # short form: the name and its default
+  side: left
+  gain: 2.5
+  use_sim:                        # long form: a default plus a description
+    default: false
+    description: drive the simulator instead of the robot
+prefix: ${robot_name}
+nodes:
+  - id: cam
+    type: camera
+    params:
+      gain: ${gain}               # exactly one reference: the param takes the argument's typed value
+      frame_id: ${side}_cam       # text around a reference makes text ("left_cam")
+      simulated: ${use_sim}
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        topic: /${robot_name}/${side}/image
+  - id: detector
+    type: detector
+    inputs:
+      - name: image
+        source: /${robot_name}/${side}/image
+```
+
+```bash
+cerulion graph run robot                            # the defaults: /go2/left/image, gain 2.5
+cerulion graph run robot side:=right gain:=0.5      # one setup change, same file
+cerulion graph run robot use_sim:=true --record     # the recording carries simulated: true
+```
+
+In a graph that declares `args:`, a reference is `${name}` and `$$` is a
+literal `$`. References are accepted in exactly four places: the graph
+`prefix`, an output's `topic`, an input's `source` and a node's `params:`
+values, and the `$$` escape collapses in those four places only. A `${`
+anywhere else, in a key or in a value (a node `id`, a `schema`,
+`multi_publisher_topics`, a `params:` key), is a load error naming the key.
+Inside a flow mapping or list quote the reference (`params: {gain: "${gain}"}`):
+a bare `{` there opens a nested mapping. A graph that declares no `args:` is
+read as written, every `$` included: nothing is substituted and no escape
+collapses, so a graph written before launch arguments existed loads exactly
+as it always did, and an override passed to such a graph is refused.
+
+Values are typed. A default takes the type it is written with (`false` is a
+bool, `2.5` a float, `go2` text, `"123"` text); an override's value is read
+as a YAML scalar the same way (`use_sim:=true`, `rate:=50`, `name:=go2`;
+quote digits to keep them text: `id:="'123'"`). A `params:` value that is
+exactly one reference takes the argument's typed value, so the param type
+check applies to the resolved value as it would to a literal: `gain:=fast`
+on an `f64` param is refused as a wrong type naming the node, the param, the
+argument that fed the value and the override that set it (or that the
+declared default did). Text around a reference makes text, each value
+written as it reads (`2.0` keeps its decimal point, a bool is `true` or
+`false`).
+
+Resolution happens once, when the graph is read, before any node library
+loads, and it is the same pure function on every path: `graph validate`,
+`graph levels`, `graph profile` and `graph partition` see the declared
+defaults; `graph run` sees the defaults with its overrides applied. What a
+run validates, executes and records is the resolved graph: the `graph.yaml`
+in a recording and in the run directory carries the substituted prefix,
+topics, sources and param values and no `args:` section, so `bag play
+--resim` re-executes exactly the setup that ran and resolves nothing again
+(a recorded graph declares no `args:`, so it is read as written). The graph
+file itself is never rewritten; `node stage` and `graph partition` splice
+into the author's document, `args:` and references included, and an edit
+that wires an input to an output copies the output's `topic` as written,
+reference included, so the wire follows the argument on every run. `graph
+run --yes` saves a derived partition for the graph as declared only: when a
+run's overrides change the prefix, a topic or a source and its derived
+partition differs from the one the file carries, the `--yes` run is refused
+before anything is written, naming `graph partition` as the way to save one
+(without `--yes` the same run uses its derived groups in memory).
+
+Every mistake exits non-zero before any node loads. An override that is
+not `name:=value` is a CLI usage error, refused before the graph file is
+read. The rest are refused when the graph is read: a mistake in the file
+names the argument and its YAML location (a misspelled key elsewhere in a
+graph that declares `args:` keeps its line and column); an override the
+graph does not declare has no place in the file, so it names the declared
+arguments instead; a `--yes` save under overrides that move the wiring
+names `graph partition`:
+
+| Mistake | What you see |
+|---|---|
+| `graph run robot sdie:=right` | `launch argument 'sdie' is not declared by this graph (did you mean 'side'?); declared args: robot_name, side, gain, use_sim` |
+| `graph run robot side=right` | a usage error: ``launch argument override 'side=right' is malformed: expected `name:=value`, found no `:=` `` |
+| `topic: /${robot}/image` with no `robot` argument | ``node 'cam' output 'image' `topic` references launch argument 'robot', which this graph does not declare (did you mean 'robot_name'?)`` |
+| `prefix: ${robot_name` | `` `prefix` has an unterminated substitution in "${robot_name": '${' needs a closing '}' `` |
+| `gain:=fast` on an `f64` param | ``node 'cam': param 'gain' expects f64, got string "fast" (from launch argument 'gain', set by override `gain:=fast`)`` |
+| a default or override whose text contains `${` | `launch argument 'robot_name' default contains '${', but argument values are literal and are not substituted into each other` |
+| `graph run robot side:=right --yes` (the override moves a topic) | `graph 'robot': this run's launch-argument overrides change its wiring (the prefix, an output's topic or an input's source), so the partition derived for this run is not saved into the graph file with --yes; drop --yes to run the derived groups in memory, or save a partition for the declared defaults with `cerulion graph partition robot`` |
+
+**For ROS 2 users.** The same concepts, in Cerulion's form:
+
+| ROS 2 launch | Cerulion |
+|---|---|
+| `DeclareLaunchArgument('use_sim', default_value='false', description='...')` | `use_sim: {default: false, description: ...}` under `args:` in the graph file |
+| `LaunchConfiguration('use_sim')` in a node's parameters, namespace or remapping | `${use_sim}` in `params:`, `prefix`, `topic` or `source` |
+| `ros2 launch pkg robot.launch.py use_sim:=true` | `cerulion graph run robot use_sim:=true` |
+| `--ros-args -p gain:=2.5` on one node | `params: {gain: "${gain}"}` with a `gain` argument (quote a reference inside `{...}`), or the literal value |
+
+Deliberate differences: there is no launch language. A graph file is data, so
+there are no Python launch files, no `PythonExpression`, no `OpaqueFunction`
+and no substitution inside a substitution: an argument's value is literal,
+and `${a}` inside another argument's value is refused rather than resolved.
+Conditions (`IfCondition`), `IncludeLaunchDescription`, `PushRosNamespace`
+and remappings are not supported; a graph that needs two shapes is two graph
+files, or one file whose differences are argument values.
+
 ### `ros2:` entries: stock ROS 2 nodes in the same graph
 
 One graph file can describe the WHOLE robot: native Cerulion nodes (`type:`)
@@ -1577,22 +2111,32 @@ level_assignments:              # optional; node id → DAG level index
 
 | Key | Meaning |
 |---|---|
-| `process_groups:` | One worker PROCESS per group (Unix), running in barrier lockstep by default or free-run under `CERULION_EXECUTION_MODE=free_run`. Declaring it pins the partition; omitting it lets `graph run` derive one (see the `graph run` row for the full default). Every node must appear in exactly one group. A topic with an in-graph producer and a `block` consumer may be SPLIT across groups only when the edge is **creditable** (exactly one in-graph producer and no non-`block` consumers), in which case the supervisor mints it a cross-process credit word and the defer crosses the boundary losslessly. Splitting any other `block` topic's flow is refused before any worker spawns, naming which bar it hit (two or more in-graph producers, or a MIXED topic whose `block` consumers are degraded to `drop_oldest`) and the fix. The DERIVED partition co-locates every `block` topic's whole flow regardless: crossing a boundary costs a real hop whether or not the edge is correct. |
+| `process_groups:` | One worker PROCESS per group (Unix), free-running by default or in barrier lockstep under the `CERULION_EXECUTION_MODE=lockstep` opt-out. Declaring it pins the partition; omitting it lets `graph run` derive one (see the `graph run` row for the full default). Every node must appear in exactly one group. A topic with an in-graph producer and a `block` consumer may be SPLIT across groups only when the edge is **creditable** (exactly one in-graph producer and no non-`block` consumers), in which case the supervisor mints it a cross-process credit word and the defer crosses the boundary losslessly. Splitting any other `block` topic's flow is refused before any worker spawns, naming which bar it hit (two or more in-graph producers, or a MIXED topic whose `block` consumers are degraded to `drop_oldest`) and the fix. The DERIVED partition co-locates every `block` topic's whole flow regardless: crossing a boundary costs a real hop whether or not the edge is correct. |
 | `process_group_order:` | Explicit cross-process rank order: the group names from `process_groups:` in the order you want them ranked, first = rank 0. When present it must be a PERMUTATION of the group names: every group exactly once, no unknowns, no duplicates. When absent, rank follows the `process_groups:` listing order, which is the normal case; `graph partition` emits listing order and REMOVES a stale block of this key rather than maintaining two answers. |
-| `level_assignments:` | Per-node DAG level index, used INSTEAD of the derived levelization. This is the baked output of the cost-aware refinement `graph partition` emits, and it is what lets you hand-tune the schedule. Hard contract, all checked at build: every key names a real node; EVERY node is covered (a partial map is ambiguous about intent and is rejected; delete the whole block to fall back to the derived levels); every triggering edge is strictly level-increasing; and the levels form a contiguous `0..K` with no gaps (the multi-process barrier advances one generation per level). Within-level fire order is NOT taken from this map; it is always `nodes:` declaration order, exactly as on the derived path. |
+| `level_assignments:` | Per-node DAG level index, used INSTEAD of the derived levelization. This is the baked output of the cost-aware refinement `graph partition` emits, and it is what lets you hand-tune the schedule. Hard contract, all checked at build: every key names a real node; EVERY node is covered (a partial map is ambiguous about intent and is rejected; delete the whole block to fall back to the derived levels); every triggering edge is strictly level-increasing; and the levels form a contiguous `0..K` with no gaps (the level index is how the executor and the merged multi-process fire trace name a DAG stage, in every execution mode; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the cross-process barrier is a further consumer of that index, advancing one generation per level). Within-level fire order is NOT taken from this map; it is always `nodes:` declaration order, exactly as on the derived path. |
 
 ### Cross-machine networking: permissive by default + the `network:` block
 
-A real-clock live run is **network-viewable by default**:
+A real-clock live run is **network-viewable by default on non-Android**:
 `graph run` (monolith OR multi-process), `node run`, and `ros2 attach` each
-spawn ONE network GATEWAY process that opens the robot's single zenoh
-session, listens on the well-known port **7683** (bind-probing upward on
-conflict; override with `CERULION_GATEWAY_PORT`), scouts the LAN, and
-announces every produced topic; one loud breadcrumb prints at start. The
+route egress through ONE network gateway that opens the robot's single
+zenoh session and announces every produced topic when LAN access is open;
+one loud breadcrumb prints at start. On the default Unix path that gateway is hosted by the machine's
+`cerulion-netd`, which listens and advertises itself over mDNS only when
+`CERULION_NETD_LISTEN` is set, so a stock robot is not found by a default
+desk. The per-run fallback gateway child listens on the well-known port
+**7683** (bind-probing upward on conflict; override with
+`CERULION_GATEWAY_PORT`) and advertises itself over mDNS. The
 optional top-level `network:` block below RESTRICTS this (a Strict
 allow-list with verbatim locators) rather than enabling it. Turn networking
 off for a run with `--network off` (or `CERULION_NETWORK=off`). See
 `docs/networking.md` for the full gateway model + a two-machine quickstart.
+On Android, LAN access defaults to `paired`; topic announcements are withheld
+while access is paired. Opening access after a paired start does not replay
+announcements withheld while paired; an Android app started with open access
+announces its registered topics when its start completes. When netd serves a
+graph, it reports its own posture so the startup breadcrumb describes the
+serving process.
 
 ```yaml
 network:
@@ -1611,23 +2155,72 @@ network:
   to a router without routing traffic. `disabled` (also what an omitted `mode:`
   means) makes the BLOCK inert, which is NOT the same as turning the network
   off: a run treats a disabled block exactly like no block at all, so under the
-  real clock it gets the permissive default above (gateway process, LAN
-  scouting, every produced topic announced). The local-only switch is
+  real clock it gets the permissive default above (gateway process, mDNS
+  discovery, produced topics eligible for announcement when LAN access is
+  open). The local-only switch is
   `--network off` / `CERULION_NETWORK=off`, nothing in this block. `router` is
   deliberately NOT exposed. An unknown mode string is rejected at parse
   listing the valid values.
 - `connect` / `listen`: each entry maps 1:1 onto a zenoh locator string,
   used VERBATIM (a Strict block adds no scouting and no bind ladder), so a
   config-only two-machine deployment needs one side to `listen` and the
-  other to `connect`. (Scouting-ON + the 7683 bind ladder are the
-  permissive-default behavior, not block knobs.)
+  other to `connect`. (Gossip, opt-in multicast scouting and the 7683 bind
+  ladder are permissive-default behavior, not block knobs.)
 - `egress`: topics this graph exports to the network, enforced as a TRUE
   **allow-list**: only declared egress topics ever leave the machine (a
   remote machine's request for any other produced topic is refused at the
   bridge gate: its bridge flag structurally never flips on; an
   ingress-only graph installs a deny-all gate). Each entry must be
   **produced by an in-graph node** (derived names and `topic:` overrides
-  both count).
+  both count), unless it is marked `external: true`: a topic a process
+  outside the graph publishes on this machine (a ROS 2 program on
+  `rmw_cerulion`, for example) is listed as `{topic: /chatter, external:
+  true}`, and must have no in-graph producer.
+  An entry is a topic name or a map, `{topic: /r/scan, reliability:
+  best_effort}`; `reliability` is `reliable` or `best_effort`, which puts
+  the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator. An entry
+  with no `reliability` (a bare name included) is put at
+  `default_reliability`.
+- `default_reliability`: `reliable` (the default) or `best_effort`, for
+  every `egress` entry that sets no `reliability`. An entry's own
+  `reliability` wins in both directions: `{topic: /r/cmd, reliability:
+  reliable}` stays reliable under a `best_effort` default.
+- Egress send queue: the gateway hands each egress topic's frames to that
+  topic's own send queue and sender thread, so a congested link holds up the
+  topics it carries and not the gateway's other links (closing LAN access
+  while a put waits on a congested link waits for that put). Topics sent to
+  the same peer share that peer's link. A publishing node writes to shared
+  memory and does not wait on the network. A `reliable` frame waits for
+  zenoh's transmit queue instead of being dropped at the sender, for up to
+  zenoh's `wait_before_close` (5 s by default), after which zenoh drops it and
+  closes its link to that peer. When the topic's send queue is itself full, a
+  `reliable` topic refuses the new frame, counts it, and a warning names the
+  topic; a `best_effort` topic drops its oldest queued frame instead (newest
+  wins), counted too. An entry's `send_queue: N` (a whole number of frames,
+  1 or more) sets the queue's bound, for example `{topic: /r/camera,
+  send_queue: 32}`; without it the bound is the depth of the gateway's tap on
+  the topic. Each queued frame is a heap copy, so a topic's queue can hold
+  up to `send_queue` times its frame size. Every gateway logs, every 10 s, a
+  warning for a topic that refused or failed frames since the last report
+  (an info line for best-effort drops alone), and each topic's totals when it
+  stops. The gateway `cerulion-netd` hosts (a run with no
+  `network:` block) also reports each topic's `forwarded`, `dropped`,
+  `refused`, `failed`, `discarded`, `queued`, `in_flight` and `send_queue` in
+  its `status` reply; a run with a `network:` block uses its own gateway
+  process, which reports through its log. `forwarded` counts puts zenoh
+  accepted; a best-effort frame zenoh discards inside its own transmit queue
+  afterwards, and a reliable frame dropped at `wait_before_close`, are not
+  reported to the gateway.
+- `tls`: absolute PEM paths for `quic/` and `tls/` locators: `certificate` +
+  `private_key` for a listener, `root_ca` for a connect (the
+  connect also checks the certificate names the host or IP dialled, and zenoh
+  trusts the public Web PKI roots beside `root_ca`). The carrier is the
+  locator's first segment:
+  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, `tls/<host>:<port>`
+  (TLS 1.3 over TCP, reading the same `tls` files as `quic/`), or
+  `udp/<host>:<port>?rel=1;mixed_rel=1` (QUIC without encryption or peer
+  authentication, for a WireGuard overlay only). See `docs/networking.md`
+  "Carriers and per-topic reliability".
 - `ingress`: topics this graph imports from the network. Each must **NOT**
   have an in-graph producer: they are external sources, the same class as
   a producer-less absolute `source:`. Each must be CONSUMED by an in-graph
@@ -1635,28 +2228,40 @@ network:
   validated against the consuming input's schema hash before re-injection.
 
 Validation (at graph load, so `graph validate` and `graph run` both apply it). Every
-rejection names the offending topic and the fix:
+rejection names the offending topic or setting and the fix:
 
 | Rule | Rejected shape |
 |---|---|
 | Loop safety | The same topic in BOTH `egress` and `ingress` (it would loop back to itself); remove it from one list. |
-| Egress ownership | An `egress` topic no in-graph node produces. |
+| Egress ownership | An `egress` topic no in-graph node produces (list a topic published outside the graph with `external: true`), or an `external: true` topic an in-graph node produces. |
 | Ingress externality | An `ingress` topic an in-graph node produces; remove the entry or the producing node. |
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
 | Duplicates | The same topic twice in one list. |
+| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
+| Certificate files | A `quic/` or `tls/` listener without `tls.certificate` + `tls.private_key`, a `quic/` or `tls/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` or `tls/` connect, or `certificate`/`private_key` with no `quic/` or `tls/` listen. |
+| Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
 export-restricted robot). Inspect what remote machines are advertising with
-`cerulion topic list` (remote discovery is automagic, scouting ON by
+`cerulion topic list` (remote discovery is automagic over mDNS by
 default; add `--connect tcp/<host>:7683`, the well-known permissive-gateway
-port, for a peer scouting can't find).
+port, for a peer mDNS can't find).
 
 Runtime controls (`cerulion graph run`, `node run`):
 
-- `--network off` (also `CERULION_NETWORK=off`, honored by ANY entry point)
-  is the kill-switch: run LOCAL-ONLY (no gateway, no zenoh session; a loud
-  notice). The YAML stays untouched. `off` is the only accepted flag value.
+- `--local` (also `--network off`; also `CERULION_NETWORK=off`, honored by the
+  run and query entry points that read the variable: `graph run`, `node run`,
+  `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`, and
+  `schema info`) is the kill-switch: run LOCAL-ONLY (no gateway, no zenoh
+  session; a loud notice). The YAML stays untouched. `off` is the only accepted
+  `--network` value. (`cerulion connect` and the `cerulion-remoted` daemon honor
+  the switch too, exiting before they start their network transport, but parse
+  it less strictly: `cerulion connect` engages it only on the exact value `off`,
+  and `cerulion-remoted` on `off` in any case with surrounding whitespace
+  ignored; for any other non-empty value both warn and leave the network on.)
+  `cerulion topic list --local` (also spelled `--no-network`) selects the same
+  scope by flag: it skips the whole remote-discovery query.
 - Networked MULTI-PROCESS is FIRST-CLASS:
   the supervisor spawns ONE gateway beside the workers; each worker stays
   network-free. See `docs/multi_process.md`.
@@ -1664,7 +2269,7 @@ Runtime controls (`cerulion graph run`, `node run`):
   The ONE exception: `--record` + an explicit block declaring `ingress:` is
   refused (naming both workarounds: recorded ingress re-injection
   is not replay-faithful). Replay is structurally network-inert (the bag
-  is the input, Principle #7).
+  is the input, and a replay must match the live run).
 - `--time-source virtual`/`external` keep the network INERT (replay-class);
   `graph profile` is local-only by design.
 
@@ -1695,9 +2300,24 @@ raw-FFI INFO block).
 Generated by `cerulion schema create <NAME>`:
 
 `fields:` is a **mapping**, not a list. Each KEY is the string
-`"<type> <name>"`; the value is unused (leave it empty). A list under
-`fields:` does not parse as a mapping, so every field is skipped: you get a
-schema that loads with ZERO fields, a wrong hash, and no error.
+`"<type> <name>"`; the value is unused (leave it empty). One parser applies
+the rules below to every workspace schema file, so a malformed file never
+loads as a silent zero-field schema. What you see depends on the verb:
+`schema info <Name>` on that file exits with the error named; the verbs that
+load the whole `schemas/` directory (`graph run`, `schema list`,
+`schema serve`, `topic`, `node create`) log the error as a warning naming
+the file, skip that file, and load the rest, so a schema from the skipped
+file is then unknown to them:
+
+| Rule | Error text |
+|---|---|
+| each entry under `schemas:` is a mapping (`description:`, `fields:`) | ``schema '<Name>': definition must be a mapping (`description:` / `fields:`), got a non-mapping YAML value`` |
+| `fields:` is a mapping; absent or empty (`fields:` with nothing under it) means no fields; a list (`fields: []`) is refused | ``schema '<Name>': `fields:` must be a mapping of '<type> <name>' keys`` |
+| each field key is exactly `<type> <name>` | `schema '<Name>': invalid field key "<key>": expected exactly '<type> <name>' (e.g. 'uint32 height'), got N token(s)` |
+| field names are unique within a schema | `schema '<Name>': invalid field key "<key>": duplicate field name '<name>'` |
+
+A workspace that still loads with one of these shapes after an upgrade
+(for example `fields: []`) needs the one-line fix the error names.
 
 ```yaml
 schemas:
@@ -1746,6 +2366,43 @@ use native_ros2_messages::sensor_msgs::Image;
 image: Image,
 ```
 
+### Constants and defaults
+
+A `.msg` constant line (`int8 STATUS_FIX=0`, `string MODE="AUTO"`) becomes an
+associated constant on the generated type, so node code reads it as
+`NavSatStatus::STATUS_FIX`. Constants never reach the wire and do not change the
+schema hash. A constant takes a primitive type or `string`, its name is upper case
+(`A_B2`, not `type` or `Mixed`) as in ROS 2, and its value must fit the type:
+`uint8 X=256` is a parse error that names the line. A `float32` value is refused only
+when it rounds to infinity, the same rule the Rust compiler applies.
+
+A field default (`float64 w 1`, `string frame "map"`, `int32[] ids [1, 2]`,
+`bool[2] mask [true, false]`) is kept and applied by the generated `Default`, so
+`QuaternionSnapshot::default().w` is `1.0`. Defaults work on primitives, strings and
+arrays of primitives or strings, with `[a, b]` list syntax; a fixed-size array default
+must have exactly that many elements, and a `<=N` bound is checked (a `string<=N`
+counts UTF-8 bytes, a `wstring<=N` counts UTF-16 units). A `wstring` is written
+as UTF-8, not the UTF-16 a ROS 2 peer reads, so a non-empty `wstring` default is a
+parse error; an empty one (`""`, `[]`) and a `wstring` constant are accepted. A message-type
+field takes no default, and a fixed-size `string[N]` field does not generate yet,
+with or without a default. A default never changes the wire layout or the schema hash,
+and a loaned output slot still starts zeroed: the default applies when you build a
+value with `Default`.
+
+As in ROS 2, the first `#` on a line starts a comment, inside quotes too, so a
+constant or default cannot hold a `#`: `string s a#b` has the default `a`.
+
+### Service files
+
+A `.srv` file is a request body and a response body split by one `---` line. Each
+part parses as its own message in the package of the service, named as ROS 2 names
+it: `std_srvs/SetBool` gives `std_srvs/SetBool_Request` and
+`std_srvs/SetBool_Response`. The schema hash covers that name, so a native peer and
+a ROS 2 peer on `rmw_cerulion` agree on the hash of each part. The generated Rust
+types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
+`SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
+code generated from a `.srv` passes `clippy -D warnings`.
+
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
 corpus is a change to the Cerulion repository itself, made in a source checkout, and
@@ -1764,6 +2421,139 @@ it takes three steps, not one:
 
 ---
 
+## Fused chains
+
+A **fused chain** is a linear single-consumer trigger chain inside one process, executed as one
+synchronous call sequence. The producer's publish is unchanged: it still loans a shared-memory
+slot, writes into it and commits, so `topic echo`, `topic hz`, a recorder tap and any external
+attach see the same frames, in the same bytes, with gap-free sequences. What the chain removes is
+the consumer's trip back through the step machinery to collect a frame the executor already has:
+instead of ending the producer's level, crossing a level boundary and receiving the frame out of
+the consumer's own queue, the executor calls the consumer directly with a read-only view of the
+bytes just committed.
+
+**Nothing in the runtime fuses chains yet.** The chains block that closes
+[`cerulion graph levels`](#cerulion-graph) reports which edges of your graph would qualify, and
+for every other consumer edge the reason it keeps the queued path. The two add up to every
+consumer edge in the graph. It sits in the levels report because a fused hop is a level boundary
+the executor would not have to cross, so the chains read directly off the levels above them:
+
+```bash
+$ cd examples/perception && cerulion graph levels perception
+graph: perception  prefix: percep
+levels source: derived (trigger-aware Kahn levelization)
+nodes: 4  levels: 3
+level 0: camera [period(33ms)], imu [period(10ms)]
+  -> /percep/camera/image_raw  camera -> detector (level 1)
+level 1: detector [data(image_raw)]
+  -> /percep/detector/detections  detector -> tracker (level 2)
+level 2: tracker [data(detections)]
+chains: 1 fusable, 2 hop(s), 0 of 2 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; `cerulion graph run` may derive a partition, and each run writes its own census into its run directory)
+  chain 0  levels 0-2  3 nodes, 2 hop(s)
+    camera -> detector  on /percep/camera/image_raw
+    detector -> tracker  on /percep/detector/detections
+```
+
+An edge that keeps the queued path says why, edge by edge:
+
+```bash
+$ cd examples/go2 && cerulion graph levels teleop
+graph: teleop  prefix: go2
+levels source: derived (trigger-aware Kahn levelization)
+nodes: 4  levels: 2
+level 0: joystick_teleop [external], keyboard_teleop [external], teleop_mux [period(20ms)]
+  -> /go2/cmd_vel  teleop_mux -> sport_driver (level 1)
+level 1: sport_driver [data(cmd)]
+chains: 1 fusable, 1 hop(s), 2 of 3 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; `cerulion graph run` may derive a partition, and each run writes its own census into its run directory)
+  chain 0  levels 0-1  2 nodes, 1 hop(s)
+    teleop_mux -> sport_driver  on /go2/cmd_vel
+  queued by reason: latest-value-read 2
+  queued  /go2/cmd_vel/joystick  joystick_teleop -> teleop_mux.joy_cmd
+    latest-value-read: the consumer reads this topic as a latest value and is not woken by it
+  queued  /go2/cmd_vel/keyboard  keyboard_teleop -> teleop_mux.key_cmd
+    latest-value-read: the consumer reads this topic as a latest value and is not woken by it
+```
+
+An edge qualifies when all of these hold. Each is decided from your declarations, once, at graph
+build: the set never varies with load, because a fusion set that did would make a replay a
+different program.
+
+| Rule | Reason printed when it fails |
+|---|---|
+| The consumer is WOKEN by the edge (`#[input(trigger)]`, or the one input of a data-triggered node). | `latest-value-read` |
+| Exactly one node in the graph publishes the topic. | `no-in-graph-producer`, `multiple-producers` |
+| The topic has exactly one consumer edge, and the producer feeds exactly one qualifying edge. A chain ends at a fan-out: the second consumer would otherwise wait for the first consumer's whole chain. | `fan-out`, `producer-branches` |
+| Producer and consumer run in the same process. Another address space has no slot to hand over. | `separate-processes` |
+| The consumer declares no `fuse: false`. That key is how a graph says a chain must end at a node. | `opted-out` |
+| The input declares neither `block` nor `sample(N)`. `block` defers the producer while the consumer is at threshold, and a consumer that runs inside the producer's own fire never reaches it; `sample(N)` says the consumer reads less often than the producer publishes, and a direct call reads in lockstep. | `block`, `sample` |
+| The consumer fires on THIS frame: a data trigger, not `period_ms`, `sync_window_ms`, `unbounded_sync` or `external`, and this edge is its only trigger. | `consumer-policy`, `join` |
+| The consumer sits on the level RIGHT AFTER the producer's. A derived levelization already guarantees that for a single-trigger consumer, but a `level_assignments:` block may place one further down while the executor still opens the levels in between, so a direct call would fire it a step early. | `level-not-adjacent` |
+| The consumer declares no `throttle_ms`. A rate cap defers a fire, and a direct call has nowhere to defer to. | `throttle` |
+| Neither end is on a `block` topic; those nodes are already fired serially against a shared outstanding count. | `block-involved` |
+| The consumer reads no latest-value input written by a node at or after the CHAIN HEAD's level. Everything below the head has ticked before the head fires, so its values are final; a node at the head's level has not. | `late-context-input` |
+| The chain holds at most 32 nodes, which bounds the call depth. | `length-ceiling` |
+
+A refused edge CUTS its chain rather than killing it: the refused consumer heads a new chain,
+judged against its own level.
+
+**Which colocation the census is judged against.** The chains block uses the graph's DECLARED
+shape: its `process_groups:` block, or one process when it declares none. A run may place the nodes
+differently, because an unpartitioned graph derives a partition by default on Unix (see
+[`graph run`](#cerulion-graph)), and a process-per-node partition fuses nothing. So every
+`cerulion graph run` also writes its own census, under the colocation it actually executes, into
+the run directory's `run.json`:
+
+```json
+"chains": {
+  "fusable_chains": 1,
+  "fusable_hops": 2,
+  "consumer_edges": 4,
+  "longest_chain_nodes": 3,
+  "queued_by_reason": [{ "reason": "fan-out", "edges": 2 }],
+  "chains": [{ "nodes": ["cam", "rect", "det"],
+               "topics": ["/percep/cam/out", "/percep/rect/out"],
+               "head_level": 0 }]
+}
+```
+
+`"chains": null` means the census could not be computed for that run (node source that does not
+parse), never that the graph has no chains.
+
+**Ending a chain at a node: `fuse: false`.** A node entry may declare `fuse: false`, and a chain
+then ENDS at that node: it is never called directly by its producer, and it may still head a chain
+of its own. The key is per NODE ENTRY rather than per node type, because whether a consumer should
+pull its producer's period along with it is a property of the deployment, not of the code: the same
+logger type is a best-effort tail in one graph and a control node in another.
+
+```yaml
+nodes:
+  - id: recorder
+    type: frame_logger
+    fuse: false          # a slow tail must not slow the chain that feeds it
+    inputs:
+      - name: frame
+        source: detector/out
+```
+
+That is the difference the key exists for. A fused chain runs its consumer inside its producer's
+own fire, so a consumer slower than the producer's period makes the CHAIN take longer and the
+head's next period fire late: fusion converts consumer lag into head-node period slip. For a
+control chain that is what you want, because a missed deadline is better than acting on a stale
+frame. For a best-effort tail it is not, and `fuse: false` is how you say so. `fuse: true` is
+accepted and means the same as omitting the key, so a graph may state the default without that
+reading as a request for something different.
+
+The chains block reports the key rather than silently honouring it: the hop INTO an opted-out node
+is listed as queued with the reason `opted-out`, so you can check that the declaration took. The hop
+OUT of it is unaffected, because the key ends a chain at the node rather than forbidding it to head
+one.
+
+Nothing in the runtime fuses chains yet, so the key changes no behaviour today. It is read at
+graph build, reported by `cerulion graph levels` and in the build log, and consumed by no execution
+path.
+
 ## Backpressure
 
 Backpressure is handled as a **scheduling** problem, not a buffering one. Cerulion never copies your data into a side buffer and never holds an iceoryx2 `Sample` handle to apply policy; every variant works either with iceoryx2's native subscriber queue or with the scheduler's pre-fire defer. The whole hot path stays zero-copy.
@@ -1776,7 +2566,7 @@ There are **three input-side policies** (`#[input(backpressure = ...)]`) plus **
 |---|---|
 | `#[input(backpressure = drop_oldest)] image: Image` (default) | iceoryx2-native eviction. When the subscriber's queue is full and a new sample arrives, the oldest unconsumed sample is reclaimed for the new one. "Latest wins": natural for sensor data where stale samples are useless. The data path stays fully iceoryx2-native (no Cerulion buffer/copy), and the subscriber **counts** evictions at drain time via **per-publisher-stream wire-sequence gaps**, keyed by iceoryx2's `sample.origin()` id, so `backpressure_drop_oldest_count` and the `#[on_event(input = "...")]` handler surface the loss **exactly per publisher stream**, with no cap: a consumer lagging by many buffers' worth reports the true loss, multi-publisher topics attribute evictions to the right stream, and a publisher restart simply starts a new stream (its first observation baseline-establishes, uncounted; prior history is unknowable). History replay to late joiners (*backward* sequences within a stream) is recognized as duplicate re-delivery and never counted (re-warned periodically if it persists). Corrupt (undersized) frames and errored drains reset the detector's baselines, and a stream displaced by baseline-capacity eviction under publisher churn re-establishes uncounted for one window; every edge errs toward under-reporting (the conservative direction; never fabricated). This is the default for any input that declares no policy. |
 | `#[input(backpressure = sample(N))] lidar: PointCloud` | Subscriber-side **read-gate** (decimation). On each read (a trigger input pops its next queued sample in FIFO order; a latest-value context input drains to the newest), the sample is accepted only if its **wire `timestamp_ns`** (publish clock, replay-deterministic) is ≥ `N` ms after the last accepted read; otherwise it is **decimated** (dropped and counted, returning no data this tick). Caps the *read* rate without copying or buffering. On a per-set **Sync** trigger input the gate runs BEFORE matching, so only admitted frames are eligible to join a set, and a decimated read caps that step's burst at one set (the backlog is still served in full, one set per boundary). A decimated frame still resets that input's `expect_within_ms` watchdog: the arrival is evidence the producer is alive, and decimation is this consumer's own policy. A gate wider than the node's `sync_window_ms` builds with one `warn!` naming both windows; see [Per-set Sync delivery](#per-set-sync-delivery). |
-| `#[input(backpressure = block)] image: Image` | Scheduler **pre-fire defer**: no data loss (Principle #6). A real-time `outstanding` counter mirrors the consumer's queue depth (incremented at publish, decremented at drain). The moment `outstanding == depth` (the declared `#[input(depth = N)]`, which IS the input's real iceoryx2 queue: the topic's service is provisioned at `max(transport default, largest consumer depth)`, so the declaration is always honored, never silently capped), the producer's tick is **deferred**, *before* the queue overflows, so no sample is ever dropped. On a data-trigger consumer this is lossless **end to end**: per-message FIFO consumption serves every queued sample to its own fire, so the tick observes the complete, contiguous stream (not just the newest at fire time). On a per-set **Sync** trigger input it is lossless end to end too, and the mirror counts a frame the alignment is HOLDING as unserved, so `depth` stays exact rather than becoming `depth` plus the matcher's slots. The cost is that a starved partner holds the producer at `depth` indefinitely; see [Per-set Sync delivery](#per-set-sync-delivery). Only installed when **every** consumer of the topic is `block` (see degradation below). The topic **must have an in-graph producer** (build-time validated; an external publisher can't be deferred). Under multi-process, the producer and every `block` consumer of the topic are put in ONE process group automatically. A hand-written `process_groups:` may SPLIT them, and is accepted when the edge can carry a **cross-process credit word**, a shared-memory cell both workers operate on, minted per edge by the supervisor for a topic with exactly one in-graph producer and no non-`block` consumers. Splitting any other `block` edge is refused at plan time, before any worker starts, naming which bar it hit (two or more in-graph producers, or a MIXED topic whose `block` consumers are degraded to `drop_oldest`). |
+| `#[input(backpressure = block)] image: Image` | Scheduler **pre-fire defer**: no data loss. A real-time `outstanding` counter mirrors the consumer's queue depth (incremented at publish, decremented at drain). The moment `outstanding == depth` (the declared `#[input(depth = N)]`, which IS the input's real iceoryx2 queue: the topic's service is provisioned at `max(transport default, largest consumer depth)`, so the declaration is always honored, never silently capped), the producer's tick is **deferred**, *before* the queue overflows, so no sample is ever dropped. On a data-trigger consumer this is lossless **end to end**: per-message FIFO consumption serves every queued sample to its own fire, so the tick observes the complete, contiguous stream (not just the newest at fire time). On a per-set **Sync** trigger input it is lossless end to end too, and the mirror counts a frame the alignment is HOLDING as unserved, so `depth` stays exact rather than becoming `depth` plus the matcher's slots. The cost is that a starved partner holds the producer at `depth` indefinitely; see [Per-set Sync delivery](#per-set-sync-delivery). Only installed when **every** consumer of the topic is `block` (see degradation below). The topic **must have an in-graph producer** (build-time validated; an external publisher can't be deferred). Under multi-process, the producer and every `block` consumer of the topic are put in ONE process group automatically. A hand-written `process_groups:` may SPLIT them, and is accepted when the edge can carry a **cross-process credit word**, a shared-memory cell both workers operate on, minted per edge by the supervisor for a topic with exactly one in-graph producer and no non-`block` consumers. Splitting any other `block` edge is refused at plan time, before any worker starts, naming which bar it hit (two or more in-graph producers, or a MIXED topic whose `block` consumers are degraded to `drop_oldest`). |
 
 **Default is `drop_oldest`.** Inputs that declare no policy get it.
 
@@ -1997,7 +2787,7 @@ Graph topics are provisioned from the topology (no knobs to tune):
 
 Event-service listener/notifier caps are provisioned as subscribers + publishers (each attacher of either kind uses one listener + one notifier), so the spare slots hold for the whole attach (data + events). Declaring `history_size` larger than a consumer's `depth` warns at build: that consumer's queue can only retain the newest `depth` replayed frames.
 
-### Determinism (Principle #7)
+### Determinism: replay matches live
 
 All policies, and their `BackpressureEvent`s, are deterministic under `VirtualClock`:
 - `drop_oldest`: iceoryx2 queue-driven, not clock-driven; deterministic by construction. The eviction *event* is keyed off the **wire `sequence`** gap (publish-side, monotonic per producer), not wall-clock; replay-identical.
@@ -2015,7 +2805,7 @@ Two runs of the same graph with the same input sequence and `VirtualClock` advan
 
 ## Splitting a `block` edge across processes: the credit word
 
-`block` is lossless by declaration (Principle #6): the producer defers its own fire while the
+`block` is lossless by declaration (no data loss): the producer defers its own fire while the
 consumer is at depth, so nothing is evicted. Inside one process the producer reads the
 consumer's `outstanding` counter directly. Across a process boundary it cannot, so
 a `block` edge whose producer and consumer land in different `process_groups:` cannot
@@ -2208,17 +2998,19 @@ default: loud over silent).
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). **Auto default: ON for live runs** (`--time-source real`/`external`), off for `--time-source virtual`. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this env in both directions. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |
-| `CERULION_DOORBELL` | Data-**doorbell** arm of the park: `1` forces it on (a producer's publish rings a shared-memory line that wakes the parked consumer instantly; implies the park), `0` disables it (timer-only park). Exact match; near-misses warn and use the auto default (**ON for live runs**). Effective on Linux only: on no-primitive targets the doorbell ring is a no-op stub, so it is **forced off** with a warning if you request it, and it does not imply the park there. **Native live loop only:** `rmw_cerulion` does NOT read this flag; its publishers always arm the topic doorbell (a single atomic store per publish; inert if nobody parks) and its `rmw_wait` park tier is governed by `CERULION_MONITOR_WAIT` alone. |
+| `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). **Auto default: ON for live runs** (`--time-source real`/`external`), off for `--time-source virtual`. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this env in both directions. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (a one-rung park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |
+| `CERULION_DOORBELL` | Data-**doorbell** arm of the park: `1` forces it on (a producer's publish rings a shared-memory line that wakes the parked consumer instantly; implies the park), `0` disables it (timer-only park). Exact match; near-misses warn and use the auto default (**ON for live runs**). On Linux a parked consumer hears the ring through the CPU monitor-wait primitive; on macOS 14.4 and later it kernel-blocks on the ring's wake word instead (see `CERULION_DOORBELL_OS_SYNC` below). Where neither exists a ring is still made, but it is observed no sooner than the park's recheck poll already observes the listener, so the doorbell is **forced off** with a warning if you request it. It never implies the park on a target without a CPU monitor-wait primitive. **Native live loop only:** `rmw_cerulion` does NOT read this flag; its publishers always arm the topic doorbell (one atomic increment per publish on Linux; on macOS 14.4 and later two in one cache line, and a kernel wake syscall only while a consumer holds the page's parked claim, a claim a killed consumer leaves set, so a later publish can pay a syscall with nobody there) and its `rmw_wait` park tier is governed by `CERULION_MONITOR_WAIT` alone. |
 | `CERULION_CPU_DMA_LOCK` | CPU C-state cap override (Linux; needs root / `CAP_SYS_NICE` for `/dev/cpu_dma_latency`: a failed acquire warns and the run continues). `1` forces a hard C0 pin, `0` disables the cap (exact match; near-misses warn and use the auto decision). **Auto default:** a graph-derived exit-latency cap computed from the graph's tightest timing, and **skipped entirely while the monitor-wait park is active** (they are alternative shallow-idle mitigations). The `--no-cpu-dma-lock` flag disables the auto cap. No-op off Linux. |
 | `CERULION_CPU_DMA_LOCK_US` | Explicit C-state exit-latency cap in µs (e.g. `=10`), used under the auto mode. A valid non-negative integer wins over the graph-derived cap (but **not** over `CERULION_CPU_DMA_LOCK=1`/`=0`); malformed/negative values warn and fall through to the graph-derived cap. |
-| `CERULION_BARRIER_SPIN_US` | Multi-process only (Unix): the barrier-boundary **spin-then-block** budget in µs at each cross-process DAG-level boundary: the bounded spin runs before the blocking tier (the futex sleep on Linux; on macOS ≥ 14.4 the `os_sync_wait_on_address` kernel wake, with the chunked ~100 µs sleep-recheck as the fallback on older hosts / under `CERULION_BARRIER_OS_SYNC=0`; one knob, every tier). Default **20** on Linux and on macOS with the os_sync tier active (the kernel-wake knee); **150** on the macOS sleep-recheck fallback (covers its ~100 µs arrival skew). `0` is the kill switch; the bounded spin is skipped entirely: on Linux the hard-bounded 50-iteration read loop + futex block; on macOS straight to the blocking tier (no pre-block iteration loop exists on the macOS paths). Values above **100000** (100 ms) are clamped with a warning so a typo can never turn the bounded spin into a busy-spin; garbage warns and uses the default. |
-| `CERULION_BARRIER_OS_SYNC` | macOS only (no-op elsewhere): the barrier's kernel-wake tier (Apple `os_sync_wait_on_address` / `os_sync_wake_by_address_all`, macOS ≥ 14.4, resolved at runtime via `dlsym` so older hosts degrade cleanly instead of failing at launch). `0` disables it: barrier waits take the chunked ~100 µs sleep-recheck fallback (and the spin default above resolves to 150 µs), and the step-start park's barrier-arrival kernel wake (the wake word a parked context blocks on so a peer's arrival wakes it in µs) is disabled with it, restoring the polled ~100 µs cadence. `1`/unset = enabled (the default); anything else warns and stays enabled (exact match; loud over silent). |
+| `CERULION_BARRIER_SPIN_US` | Multi-process under the `CERULION_EXECUTION_MODE=lockstep` opt-out only (Unix); inert on a free-run run, which creates no barrier to wait on: the barrier-boundary **spin-then-block** budget in µs at each cross-process DAG-level boundary: the bounded spin runs before the blocking tier (the futex sleep on Linux; on macOS ≥ 14.4 the `os_sync_wait_on_address` kernel wake, with the chunked ~100 µs sleep-recheck as the fallback on older hosts / under `CERULION_BARRIER_OS_SYNC=0`; one knob, every tier). Default **20** on Linux and on macOS with the os_sync tier active (the kernel-wake knee); **150** on the macOS sleep-recheck fallback (covers its ~100 µs arrival skew). `0` is the kill switch; the bounded spin is skipped entirely: on Linux the hard-bounded 50-iteration read loop + futex block; on macOS straight to the blocking tier (no pre-block iteration loop exists on the macOS paths). Values above **100000** (100 ms) are clamped with a warning so a typo can never turn the bounded spin into a busy-spin; garbage warns and uses the default. |
+| `CERULION_BARRIER_OS_SYNC` | macOS only (no-op elsewhere), and, like the budget above, only under the `CERULION_EXECUTION_MODE=lockstep` opt-out: the barrier's kernel-wake tier (Apple `os_sync_wait_on_address` / `os_sync_wake_by_address_all`, macOS ≥ 14.4, resolved at runtime via `dlsym` so older hosts degrade cleanly instead of failing at launch). `0` disables it: barrier waits take the chunked ~100 µs sleep-recheck fallback (and the spin default above resolves to 150 µs), and the step-start park's barrier-arrival kernel wake (the wake word a parked context blocks on so a peer's arrival wakes it in µs) is disabled with it, restoring the polled ~100 µs cadence. `1`/unset = enabled (the default); anything else warns and stays enabled (exact match; loud over silent). |
 | `CERULION_PARK_OS_SYNC` | macOS only (no-op elsewhere): the live-loop **park nap**'s kernel-wait tier. On a host with no CPU monitor-wait primitive the park is a bounded recheck nap, and on macOS ≥ 14.4 each nap is an `os_sync_wait_on_address` timed wait (roughly half `nanosleep`'s timer-coalescing overshoot). `0` disables that tier and restores the plain sleep-recheck nap; `1`/unset = enabled; any other value warns, naming this variable, and keeps it enabled. See `docs/deployment_tuning.md`. |
+| `CERULION_DOORBELL_OS_SYNC` | macOS only (no-op elsewhere): the **data doorbell**'s kernel-wake tier, the data-plane sibling of the barrier, park-nap and credit os_sync switches in this table. On macOS 14.4 and later a producer's publish bumps a wake word in the topic's shared-memory doorbell page and wakes a consumer that is kernel-blocked on it, so a multi-process hop wakes on the data instead of on the park's recheck timer. `0` turns the data-wake doorbell off on macOS: with no kernel block the ring buys nothing the recheck timer does not already give, so the doorbell does not arm at all and the park stays on its bounded sleep-recheck pacing. It differs from `CERULION_DOORBELL=0` only in reach, which is macOS alone. `1`/unset = enabled; anything else warns, naming this variable, and keeps it enabled. It speaks only for the doorbell: every os_sync switch in this table rides one backend and one unrecoverable-errno latch, and disabling one says nothing about the others. The wake word arms only where the doorbell itself is on, so `CERULION_DOORBELL=0` and `CERULION_MONITOR_WAIT=0` each turn it off as well. The block is carried by the first declared data-trigger or sync-input topic of a consumer that a publisher the process does not own can write, the same line the Linux CPU monitor-wait primitive arms; a ring on any other topic is still observed at the next recheck. **Who the doorbell serves:** any blocked consumer, including one in a graph nobody planned alongside the publisher. A graph publishes on a doorbell for EVERY topic it produces while the doorbell is on, because the readers a ring can reach are not knowable from the publishing graph; a graph opens a doorbell PAGE only when one of its own trigger topics admits a writer outside its process. What a ring costs on a topic nobody blocks on is one atomic and one cached backend read per publish, with the kernel wake itself held behind the page's parked claim. An `rmw_cerulion` consumer that opened no page still blocks on its own listener descriptor and falls back to that wait, and a tool that reads a topic opens no doorbell and so has nothing to be woken on. An `rmw_cerulion` publisher arms its own bell whatever this decides, so an rmw to rmw hop on Linux still wakes on the ring. A consumer arms no block at all when every one of its trigger topics is written only by nodes of its own process (a single-process run, or a rank whose trigger topic is produced in-rank): every publish by such a node happens inside a step the waiting thread itself drives, so no ring can arrive while that thread is blocked. A topic listed in `multi_publisher_topics:` is armable even where this process publishes it, since the opt-in admits writers the graph does not own. See `docs/deployment_tuning.md`. |
 | `CERULION_CREDIT_WAKE` | Multi-process only (Unix): the **producer-side credit park**. A producer deferred at a cross-process `block` gate blocks on that edge's shared credit word, and the consumer's drain wakes it; `0` turns that off, so the producer keeps the park's recheck cadence instead. Correct and bounded either way (the pre-fire gate is unchanged and re-derives on every pass), so the only thing `0` costs is wake latency. `1`/unset = enabled (the default); anything else warns and stays enabled (exact match; a typo must not silently disable a latency plane, because the result is correct output at collapsed latency, which nothing downstream can notice). Inert on any run that splits no `block` edge: the watch list is empty, so the whole plane costs one cached read. |
 | `CERULION_CREDIT_OS_SYNC` | macOS only (no-op elsewhere): the **credit** word's kernel-wake tier, the credit-plane sibling of `CERULION_BARRIER_OS_SYNC` above. `0` disables it: a credit-blocked producer takes the chunked sleep-recheck fallback instead of the `os_sync` kernel block. `1`/unset = enabled; anything else warns and stays enabled. It controls credit waiting independently of `CERULION_BARRIER_OS_SYNC`: both words ride one backend and one unrecoverable-errno latch, but each switch speaks for its own plane, so disabling the barrier's macOS wake tier says nothing about the credit plane. `credit_os_sync_independence_test` drives both switches in both directions in subprocesses (the switches are process-cached, so one process can observe only one combination) and fails if the credit tier consults the barrier's switch. |
 | `CERULION_FIRE_THREADS` | Within-level parallel-fire pool size. Read **once at graph build**. Default: `min(available_parallelism, widest DAG level width)`, at least 1. A positive integer is honored; `0` or garbage warns and auto-sizes. Thread count never changes **what** fires or its recorded order (the level structure fixes that), only how a wide level's independent fires are spread across cores. |
 | `CERULION_LIVE_SPIN_US` | Live-loop **spin-then-block** budget in µs before the loop parks. **Default (unset): derived**. The loop spins only while a wake is imminent per the graph (a `period_ms` node due within one hop, or the last step just fired), and blocks immediately during predicted idle, so a quiescent graph still gives its core back. `0` disables the spin outright (always block immediately). A positive `N` is a fixed manual ceiling, **clamped to 100 000 (100 ms)** with a one-time warn: the spin is a pre-block latency optimization for an imminent wake, never a polling loop. Garbage warns and falls back to derived. Reach for it when you are measuring the last microseconds of wake latency on a pinned core; leave it alone otherwise. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same parse and the same 100 ms ceiling, with ONE asymmetry: `unset` there means NO spin (the rmw wait has no graph to derive an imminent wake from, so its default is park-first), not a derived spin; see "ROS 2 rmw wait tuning" below. |
+| `CERULION_OPEN_FILE_CHECK` | The open-file check of `graph run` and `graph profile`. Unset or `1` refuses a graph estimated to need more open files than the process may hold (40, plus 14 per output port and 22 per input port, against the soft limit after the raise and, on macOS and other non-Linux targets, against 1024), naming both limits and the fix; `0` logs the same text as a warning and starts the graph anyway. Exact match; any other non-empty value warns and keeps the refusal. See the open-file row of `docs/deployment_tuning.md`. |
 
 ### Sign-in environment variables
 
@@ -2391,7 +3183,7 @@ sleep-recheck tier.
 Without that poll a park would never watch external fds at all and an
 ingress node would wake only at the ≤250 ms park timeout, throttling a lidar
 to a few Hz. Wake attribution is observable via the `wakes_external_fd` field in
-the live-loop exit telemetry (Principle #3). Note the C-state cap table entry
+the live-loop exit telemetry. Note the C-state cap table entry
 above: the cap is skipped while the park is active, which includes
 external-fd graphs on all tiers.
 
@@ -2407,7 +3199,8 @@ PARKS on them with the same CPU monitor-wait the native live loop uses
 (`UMWAIT`/`WFE`; a bounded sleep-recheck where the CPU has no primitive), so
 a publish wakes the waiter hardware-instantly. Whether that tier is ON is a
 platform default set by measurement (see the `CERULION_MONITOR_WAIT` row
-below): aarch64 parks by default, x86 does not: its `ppoll` kernel wait
+below): aarch64 parks the first rung of each call by default, x86 does
+not: its `ppoll` kernel wait
 measured faster at both 2 ms and 10 ms. Where it runs the park is bounded
 and yields the core every recheck slice: 20 µs where `UMWAIT` honors the
 deadline; on the aarch64 `WFE` tier (the park's platform-default home) one
@@ -2429,7 +3222,7 @@ empty wake.
 | Variable | Meaning |
 |---|---|
 | `CERULION_LIVE_SPIN_US` | The SAME knob as in "Live-loop tuning" above, read by `rmw_wait` through the same parse and the same 100 000 µs (100 ms) ceiling. The ONE asymmetry: **unset means the consumer's own default, and the rmw wait's default is PARK-FIRST, no spin** (it has no graph to derive wake-imminence from; the native loop's derived default spins only while a wake is provably imminent). A positive `N` arms the µs busy-probe in front of the FIRST kernel block of each `rmw_wait` call, at most twice per call: once on entry, and at most one recovery spin after a wake whose probe found nothing (consumed on first use, never re-armed); never after an empty timeout. The entry spin is also bounded ACROSS calls: it is armed only by a previous call that RETURNED READY, and a call that delivered nothing disarms it (however its blocks woke), so neither an idle executor nor a notification-without-readiness storm spins more than once per idle period, even at the 100 ms cap (the value that is safe on the native loop's imminence-gated spin). It yields between probes. `0` disables (what unset already means here); malformed warns once and stays park-first. The measured basis for the park-first default: spin off is best-or-equal in every posture (stock 30 µs, C1 cap 19, C0 pin 17; 64 B ping-pong p50), while spin on put roughly half the processes into a per-lifetime ~123 µs same-core scheduling mode in the stock and C0 postures (never under a C1 cap). Ignored entirely under `CERULION_RMW_EVENT_WAIT=off`. |
-| `CERULION_MONITOR_WAIT` | The SAME flag as in "Live-loop tuning" above, resolved by `rmw_wait` through the same classification, applied to a PLATFORM default that is measured, not chosen: **unset ⇒ the platform default: park ON on aarch64 (`WFE`), OFF on x86**; `1` ⇒ force the park on (on x86 the bounded one-rung shape, the experiment hatch); `0` ⇒ off (the wait blocks in `ppoll` on the entities' fds; still event-driven, µs wakes); any other non-empty value warns once and keeps the default. The basis (64 B rmw ping-pong p50): x86-64 2 ms park-on 30.1 vs **off 27.7**, 10 ms park-on 58.8 vs **off 19.8**; aarch64 (Jetson) 2 ms park-on **74.8** vs off 127.1, 10 ms park-on **84.3** vs off 135.7. The park, where it runs, is bounded and yields the core every recheck slice: 20 µs where `UMWAIT` honors the deadline, one generic-timer event-stream period (machine-specific, around 130 µs on an Orin-class board) on the aarch64 `WFE` tier that is the park's default home (a parked thread looks busy to the scheduler, so an unbounded park can starve a thread sharing its core). Elsewhere the topic doorbell is a stub and the flag changes nothing. rmw publishers open the topic bell unowned and never unlink it (a ROS topic may carry two publishers, so a dying one must not pull the page from under the survivor; a re-created publisher joins the same page), and a page replaced by an owned creator is re-mapped automatically on the first frame that arrives without a ring. Residual: one 64-byte page per topic can outlive every publisher on the machine until the next creator. Ignored under `CERULION_RMW_EVENT_WAIT=off`. |
+| `CERULION_MONITOR_WAIT` | The SAME flag as in "Live-loop tuning" above, resolved by `rmw_wait` through the same classification, applied to a PLATFORM default that is measured, not chosen: **unset ⇒ the platform default: park ON for the first rung of each call on aarch64 (`WFE`), OFF on x86**; `1` ⇒ force the park on (on x86 the bounded one-rung shape, the experiment hatch); `0` ⇒ off (the wait blocks in `ppoll` on the entities' fds; still event-driven, µs wakes); any other non-empty value warns once and keeps the default. The basis (64 B rmw ping-pong p50): x86-64 2 ms park-on 30.1 vs **off 27.7**, 10 ms park-on 58.8 vs **off 19.8**; aarch64 (Jetson), park held through every block, 2 ms park-on **74.8** vs off 127.1, 10 ms park-on **84.3** vs off 135.7; that shape held one core per idle subscriber, so the aarch64 default parks only the first rung of each call. The park, where it runs, is bounded and yields the core every recheck slice: 20 µs where `UMWAIT` honors the deadline, one generic-timer event-stream period (machine-specific, around 130 µs on an Orin-class board) on the aarch64 `WFE` tier that is the park's default home (a parked thread looks busy to the scheduler, so an unbounded park can starve a thread sharing its core). Elsewhere no ring wakes this wait's park, so the flag changes nothing there. rmw publishers open the topic bell unowned and never unlink it (a ROS topic may carry two publishers, so a dying one must not pull the page from under the survivor; a re-created publisher joins the same page), and a page replaced by an owned creator is re-mapped automatically on the first frame that arrives without a ring. Residual: one 64-byte page per topic can outlive every publisher on the machine until the next creator. Ignored under `CERULION_RMW_EVENT_WAIT=off`. |
 | `CERULION_RMW_EVENT_WAIT` | The one rmw-only knob, the kill-switch. `off` restores the polling wait loop **verbatim**: probe, `sleep(100 µs)`, probe: **no fd block, no park, AND no spin** (`CERULION_LIVE_SPIN_US` is ignored, and the once-only `info!` says so). Everything else (the ready probe, the zero-timeout arm, the 20 ms publisher-event pump cadence) is identical. `on`/unset/empty = event-driven (the default); any other value warns once and stays ON (exact match, no case forgiveness). Independently of this switch, a wait set whose listener drain FAILS mid-call degrades itself to the same sleep pacing for the rest of that call (loud once, counted in `degraded_waits`) and retries the event path on the next call. |
 
 ### ROS 2 rmw slice ceilings
@@ -2446,7 +3239,7 @@ environment variable:
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_RMW_SLICE_CEILING` | Comma-separated `<pkg/Type>:<bytes>` list overriding the per-type slice ceiling for bridged variable topics, e.g. `sensor_msgs/Image:33554432,my_pkg/Big:268435456`. An override wins OUTRIGHT over the table (it can widen or narrow; the operator's explicit word is adopted verbatim). Type names must be EXACTLY `pkg/Type`, two non-empty components: never `pkg::Type` (`:` is the name/bytes separator) and never the rosidl `pkg/msg/Type` (the `msg` segment is not part of the wire name; that entry is skipped with a did-you-mean hint). Any other name shape is skipped loudly rather than stored: a stored name that can never match a bridge topic would be a silently-inert override. Each entry is trimmed of surrounding whitespace (a space after the list comma is fine); a name still carrying whitespace after that trim is skipped loudly. Bytes must be an unsigned integer in `[32, 4294967295]`: the 32-byte wire-header floor below, `WireHeader::total_size`'s `u32` above. A malformed entry is SKIPPED with a loud warn naming it (never a silent zero, never a crash), and the well-formed entries around it still apply; duplicate entries for one type warn and the LAST wins. **The rmw path honors this variable**: `rmw_cerulion` reads it ONCE per process, at the first publisher creation (so a malformed entry warns once per process, never once per publisher, and a value changed after that first creation is not re-read), and resolves every bridged VARIABLE topic's ceiling override-first, then the per-type table, then the 128 MiB catch-all; the resolved value really is the created iceoryx2 slot bound, so an over-ceiling publish fails its SHM loan loudly (`RMW_RET_ERROR`) instead of reserving a blanket slot. An entry naming a FIXED-layout bridged type is IGNORED with a warn at publisher creation: fixed types are always sized exactly at wire header + fixed section, and a narrower slot would refuse every publish. |
+| `CERULION_RMW_SLICE_CEILING` | Comma-separated `<pkg/Type>:<bytes>` list overriding the per-type slice ceiling for bridged variable topics, e.g. `sensor_msgs/Image:33554432,my_pkg/Big:268435456`. An override wins OUTRIGHT over the table (it can widen or narrow; the operator's explicit word is adopted verbatim). Type names must be EXACTLY `pkg/Type`, two non-empty components: never `pkg::Type` (`:` is the name/bytes separator) and never the rosidl `pkg/msg/Type` (the `msg` segment is not part of the wire name; that entry is skipped with a did-you-mean hint). Any other name shape is skipped loudly rather than stored: a stored name that can never match a bridge topic would be a silently-inert override. Each entry is trimmed of surrounding whitespace (a space after the list comma is fine); a name still carrying whitespace after that trim is skipped loudly. Bytes must be an unsigned integer in `[40, 4294967295]`: the 40-byte wire-header floor below, `WireHeader::total_size`'s `u32` above. A malformed entry is SKIPPED with a loud warn naming it (never a silent zero, never a crash), and the well-formed entries around it still apply; duplicate entries for one type warn and the LAST wins. **The rmw path honors this variable**: `rmw_cerulion` reads it ONCE per process, at the first publisher creation (so a malformed entry warns once per process, never once per publisher, and a value changed after that first creation is not re-read), and resolves every bridged VARIABLE topic's ceiling override-first, then the per-type table, then the 128 MiB catch-all; the resolved value really is the created iceoryx2 slot bound, so an over-ceiling publish fails its SHM loan loudly (`RMW_RET_ERROR`) instead of reserving a blanket slot. An entry naming a FIXED-layout bridged type is IGNORED with a warn at publisher creation: fixed types are always sized exactly at wire header + fixed section, and a narrower slot would refuse every publish. |
 
 ### Networking and identity
 
@@ -2455,11 +3248,13 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. `off` is the only accepted value; anything else leaves the permissive default in place. Honored by **any** entry point, so it is the way to silence a machine you do not control the command line of. The `--network off` flag is the same switch. |
+| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. The run and query entry points match `off` after trimming, ASCII case-insensitively; an empty or whitespace-only value is treated as unset, and any other non-empty value fails CLOSED: a loud notice names it and the run or query goes LOCAL-ONLY too. Read by `graph run`, `node run`, `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`, and `schema info`; on `topic list` it skips the whole remote query, the same scope `--local` selects. `--local` and the legacy `--network off` run flags are the same switch (`--network` accepts only `off`), and `--local` on `topic list` (also spelled `--no-network`), `topic echo`, `topic hz` and `topic info` selects the same scope by flag; no flag enables networking over an engaged kill-switch. `cerulion connect` and the `cerulion-remoted` daemon honor the switch too: when it is engaged, each warns and exits before starting its network transport. They differ from the run and query entry points only in how they parse the value. `cerulion connect` engages the switch on the exact value `off`; any other non-empty value warns and it still connects. `cerulion-remoted` trims and lowercases the value, so `off` with surrounding whitespace or capitals engages the switch and `on` is accepted explicitly; any other non-empty value warns and its network stays on. `cerulion viz --robot` refuses under the switch, with the run and query parse, before it spawns or contacts `cerulion-vizd`, and `cerulion pair` refuses under it before its mDNS lookup and before it spawns `cerulion-connectd`. |
 | `CERULION_GATEWAY_PORT` | The port the network gateway listens on, instead of the well-known **7683** (which bind-probes upward on conflict). Set it when 7683 is taken by something else on the robot, or to run two gateways on one box. |
 | `CERULION_ROBOT_IDENTITY` | The robot's announced network identity: the name that shows up in `cerulion topic list`'s `ROBOTS` section, in the mDNS `_cerulion._tcp` record, and as the first chunk of every announce key. Default: this machine's hostname (`.local` stripped). Set it on a stock-image fleet where every machine boots with the same hostname, or when the hostname is not the name your operators use. Resolved identically by the gateway and the remote-plane daemon, so the LAN and WAN planes can never advertise two different names. |
+| `CERULION_LAN_ACCESS` | Who may demand this machine's topics over the LAN, read by `cerulion-netd` and the `graph run` gateway. `open` removes the paired-only posture gate, leaving each demand to the configured inner authorizer (which can still deny it); `paired` refuses every LAN topic demand, catalog and schema query with a reason naming the posture, and re-injects no frame a LAN peer publishes into an ingress topic. On a host that runs the paired remote plane (`cerulion-remoted` beside `cerulion-netd`), topic reads and writes then go through that plane; an Android embedded app does not host it, so under `paired` its topics are not reachable over the LAN at all. Unset or whitespace-only selects the platform default: `paired` on Android, `open` elsewhere. Values match after trimming, ASCII case-insensitively; any other value warns and fails CLOSED to `paired`. A non-Unicode value also warns and fails closed to `paired`. Choose the posture at startup with this variable; an Android app sets its posture with the `lan_access` runtime key. Opening access after a paired start does not replay topic announcements withheld while paired; an Android app started with open access announces its registered topics when its start completes. |
+| `CERULION_MULTICAST_SCOUTING` | `on` (trimmed, ASCII case-insensitive) turns zenoh multicast scouting back on: periodic scout packets to UDP `224.0.0.224:7446`. Default off: peers are found through the `_cerulion._tcp` mDNS browse, the peer cache and the hostname rung, and an idle machine sends no discovery traffic after its one mDNS registration. Set it on a network where mDNS does not cross but multicast does, on every machine that should find or be found that way: a session with it off neither sends nor answers scouts. `off` or empty keeps the default; any other value keeps it off and logs a warning. Read by `cerulion-netd` and `cerulion-vizd` at daemon start, by `graph run` for a permissive gateway process it spawns itself, and by the `topic list` discovery session. A running daemon picks a change up only when it restarts, and a permissive `graph run` whose egress rides a running `cerulion-netd` gets that daemon's value. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
-| `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (desk key, `device.cert`, `robots.toml`, `peers.json`, `runs/`). The isolation knob for a test rig or a second identity on one machine. |
+| `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (`auth.json`, the machine key `identity/device.key` and its legacy name `desk.key`, `device.cert`, `robots.toml`, `peers.json`, `config.toml`, `epochs/`, `runs/`, `ros2/`). Empty counts as unset. The isolation knob for a test rig or a second identity on one machine. |
 | `DDS_BRIDGE_CONFIG` | Path to the bridge mapping file a `cerulion ros2 attach` graph's `dds_bridge` node loads. `ros2 attach` sets it absolute when it runs the graph for you; a hand-written `graph run` of an attach graph inherits whatever your shell exported, so export it there. |
 
 ### ROS 2 on Cerulion transport
@@ -2529,41 +3324,185 @@ from the environment; the only flags are `--help` (both) and `--version`/`-V`
 before the first command that spawns one; a daemon already running keeps its
 boot-time configuration.
 
+`cerulion-vizd` answers one more request on its control socket, `sample`, for
+a controller that wants to see what an attached topic is saying without a second
+subscription. The socket speaks one JSON request line and one JSON reply line:
+`{"id":1,"method":"sample","topic":"/imu","n":5}` returns
+`{"id":1,"ok":true,"topic":"/imu","rows":[{"seq":7,"ts_ns":1700000000000000000,"size":56,"fields":{"x":1.5},"summary":"geometry_msgs/Vector3: x=1.5"}]}`:
+the newest `n` messages of the topic, oldest first. `n` is 1 to 20 (default 5;
+a larger number is clamped to 20 and `0` is refused). `fields` is the decoded
+message as `{field: value}`, or `null` when the daemon holds no schema for the
+frame, the frame is larger than 16 KiB (an image or a point cloud keeps `seq`,
+`ts_ns` and `size` only), or it did not decode; `summary` is a one line label, or
+the reason `fields` is `null`. An array of more than 16 elements, or one cut
+short by the 512 value limit, is
+`{"len":N,"head":[the values kept]}`, and NaN and the infinities are the strings `"NaN"`,
+`"inf"` and `"-inf"`. One decoded frame emits at most 512 values; past that the
+remaining fields are replaced by one `"..."` entry. A byte array (`uint8[]` and
+`int8[]`) is shown as unsigned values from 0 to 255. The `summary` shows a number
+to three significant figures, in scientific notation outside 1e-4 up to 1e3. The
+daemon keeps frames for a topic only while it is being
+sampled: the first `sample` of a topic starts a ring and returns the frames that
+arrive after it (so it is usually empty), and the ring is dropped five seconds
+after the last `sample` that named the topic, so poll a few times a second. At most
+eight topics are sampled at once. `sample` reads frames the daemon already drains
+and opens no subscription of its own, so a topic that is not attached is refused
+with an error; `cerulion viz TOPIC` attaches it. The protocol version in the
+connect banner is unchanged, and a daemon without the verb answers it with the
+structured unknown-method error.
+
+### Model control protocol
+
+The visualization daemon accepts `load_model` with `id`, an absolute local
+`urdf_path`, an already-attached `topic`, a single-segment `model_id`, and ordered
+`motor_joints`. This queues preparation without filesystem work on the control
+thread. `model_status` takes only `id` and returns the latest operation or null. A
+failed preflight releases route alias ownership; failure after SDK installation
+starts retains it until a fresh worker and recording store are created.
+Both return `{id, ok: true, model: ...}` on successful request handling; inspect
+`model.phase` separately to distinguish admission from installed statics. Errors
+retain the existing `{id, ok: false, error: ...}` envelope.
+
+Models occupy `models/<model_id>` and bind only to the chosen LowState route.
+No root pose or sensor transform is inferred. Auto layout adds a separate model
+pane; existing explicit layouts remain unchanged. A `set_blueprint` view whose
+origin is the installed model root counts as grounded, so neither the automatic
+pane nor an explicit layout naming it draws an ungrounded origin warning. A
+custom model-only explicit layout is not yet supported by topic-based grounding.
+
+Detaching the model input before installation cancels the operation. Unrelated
+topics and their network demands remain removable if the render worker fails.
+Once installation starts, the model route cannot be detached or replaced in that worker. Recovery after
+partial installation requires restarting `cerulion-vizd` and discarding the partial
+recording in Studio and any external recording endpoint. Viewer reconnect alone
+does not reset the worker; daemon restart alone cannot erase retained viewer data.
+Status exposes errors and joint/static submission counters; none is proof of GPU rendering or live
+spatial alignment. The first binding supports 1..12 measured movable joints,
+with every movable joint named exactly once in motor-array order.
+
 `cerulion-wsd` is the standing local workspace-engine daemon for proprietary
 Studio clients. It serves workspace, graph and node inspection (workspace schema
-NAMES only; there is no schema verb) plus surgical node/graph edits over
-versioned NDJSON on a private Unix socket. Build, run, profile and schema
+NAMES only; there is no schema inspection verb) plus surgical node/graph edits,
+the three create verbs and a streaming node build over
+versioned NDJSON on a private Unix socket. Run, profile and schema
 inspection are not part of protocol 1. Every connection is
 greeted with `{"hello":"cerulion-wsd","protocol":1}`; a client that reads a
 `protocol` it does not know must disconnect. Requests with a field this version
 does not know are refused (`bad_request`), never silently ignored. Error codes:
 `bad_request`, `unknown_verb`, `workspace_not_found`, `not_found` (graph/node
 type/schema), `invalid_request` (the engine refused; the CLI's own message),
-`version_conflict`, `engine_error`. `cerulion-wsd --help` documents the flags
+`version_conflict`, `engine_error`; the graph edit verbs below add
+`schema_mismatch` and `would_break`. `cerulion-wsd --help` documents the flags
 and environment; the daemon logs to stderr under `RUST_LOG` (default `info`).
+
+The create and build verbs of protocol 1, besides the ones above. Adding them
+did not change the protocol version: a daemon that lacks one answers
+`unknown_verb`, and every older request and response is unchanged.
+
+| Request | Result |
+|---|---|
+| `{"id":1,"verb":"graph.create","root":R,"name":"main","prefix":"bot"}` | `{"version":"<sha256>"}` of the new `graphs/main.yaml`. `prefix` is optional, as `graph create -n`. |
+| `{"id":1,"verb":"node.create","root":R,"spec":{"node_type":"camera","outputs":[{"schema":"sensor_msgs::Image","name":"image"}],"policy":{"kind":"period","period_ms":50}}}` | `{"version":"<sha256>"}` of the new `nodes/camera/src/lib.rs`. `spec` takes the flags of `node create` as data: `inputs` (`-i`), `trigger_input` (`-T`), `outputs` (`-o`), `policy` (`--policy`, the `kind` vocabulary of `node.info`) and `raw_ffi`; every field but `node_type` is optional. The CLI's own defaulting and refusals apply, so a node with no input and no `policy` is `invalid_request`. |
+| `{"id":1,"verb":"schema.create","root":R,"spec":{"name":"lidar_scan"}}` | `{"version":"<sha256>"}` of the new `schemas/lidar_scan.yaml`. The name takes ASCII letters, digits, `_` and `-`, and must not read as a number or a boolean once PascalCased (`123`, `true`); any other is `bad_request`. |
+| `{"id":1,"verb":"node.build","root":R,"node_type":"camera","release":false}` | A stream, below. `release` is optional. |
+
+Every request carries a numeric `id`, which the reply echoes. A successful
+reply is `{"id":1,"ok":true,"result":{...}}` and the Result column above is that
+`result` object, so a create answers `{"id":1,"ok":true,"result":{"version":"<sha256>"}}`;
+a refusal is `{"id":1,"ok":false,"error":{"code":...,"message":...}}`. Creating a graph,
+node type or schema that already exists is `invalid_request`. The create verbs
+take the same exclusive workspace lock as every other mutation. The `version`
+of a created graph can be sent as `expect_version` to `graph.stage_node`,
+`graph.wire`, `graph.unwire` or `graph.unstage`, and that of a created node
+type to `node.modify`; protocol 1 has no verb that edits a
+schema, so a schema's `version` is a fingerprint of the file only.
+
+`node.build` answers with one line per event, each carrying the request `id`:
+zero or more `{"id":1,"event":"diagnostic","file":"nodes/camera/src/lib.rs","line":9,"col":18,"end_line":9,"end_col":24,"level":"error","message":"mismatched types","code":"E0308","rendered":"..."}`
+lines while cargo compiles, then one `{"id":1,"event":"done","ok":false}`. `ok`
+is whether cargo succeeded. A diagnostic is one compiler message (`level` is
+rustc's: `error`, `warning`, `note`); `line` and `col` are 1-based, `file` is
+relative to the workspace root for the workspace's own crates, and `file`,
+`line`, `col`, `end_line`, `end_col` and `code` are `null` when the message has
+no location (a linker failure) or no code. `rendered` is rustc's own text for
+the message. The "aborting due to" and "N warnings emitted" summaries are not
+sent. Cargo output that is not a compiler message (a resolver error, a missing
+toolchain) arrives as one `error` diagnostic with `null` positions, and a
+node's optional-system-dependency notice as a `note`, both before `done`.
+A compiler message over 1 MiB is not sent; one `warning` diagnostic with `null`
+positions says it was left out, and `cerulion node build` shows the full text.
+A `node.build` refused before cargo starts (`bad_request`, `workspace_not_found`,
+`not_found` for an unknown node type) is the ordinary one-line error response
+with no `done`, so a client reads lines for its `id` until one has `error` or
+`"event":"done"`. The build runs the engine function behind `cerulion node build <type>` and
+holds the workspace lock only to open the workspace, not while cargo runs. A client that closes its end of the connection cancels the build in
+progress (cargo and every compiler it started are killed), so keep the
+connection open until `done`; no other verb treats a closed write side that way.
+Requests sent behind a running `node.build` on the same connection are held and
+answered once the build is done; each is held to the usual line limit, and
+queueing more than 8 MiB in all cancels the build.
 
 | Variable | Meaning |
 |---|---|
 | `CERULION_NETD_SOCK` / `CERULION_VIZD_SOCK` | Absolute control-socket path, instead of the default `$XDG_RUNTIME_DIR/cerulion/<netd\|vizd>.sock`, then `~/.cerulion/…`, then `/tmp/cerulion-<euid>/…` (per user; two users on one machine never share a socket directory). For running a second, non-default instance. All three daemons apply the same directory rule. A sticky, world-writable directory (mode `1777`) owned by root or by you is accepted as is (`/tmp` itself, or a `1777` directory of your own): the sticky bit stops every *other* user unlinking your socket, and the one user it does not stop, the directory's own owner, is then root or you (a daemon running as root must also not re-mode the machine's `/tmp` from `1777` to `1755`). A directory of yours that no other user can write into is used as is: nothing is changed and nothing is logged: the `0700` directories the ladder creates, or a `~/.cerulion` another Cerulion command created under a `umask 0022`; one created under Ubuntu's default `umask 0002` is `0775` and is tightened once, with the warn, the first time a daemon uses it. The directory must be readable by you as well as searchable: it is judged and, if need be, tightened through one open descriptor (so a symlink swapped in between the check and the change cannot redirect it), and that open needs the read bit; a search-only `0300` directory of yours is refused with "could not be inspected: Permission denied" (no ladder rung has that shape; only an explicitly configured path can). Otherwise a directory of yours that other users could write into (group or world write bit) is tightened automatically: the write bits are stripped, sticky and setgid bits kept, and one `warn!` line says so; a directory of yours whose bits could **not** be stripped (a filesystem with a fixed mode, such as a CIFS home mounted `dir_mode=0777`) is refused with the reason, as is one that is neither yours nor a root-owned `1777` share. Another user's `1777` share is refused too, not accepted the way `/tmp` is: the sticky bit does not bind that directory's own owner, so its owner can unlink your socket and bind an impostor at the same path. A missing directory is created `0700`. |
 | `CERULION_WSD_SOCKET` | Absolute control-socket path for `cerulion-wsd`; defaults to `$XDG_RUNTIME_DIR/cerulion/wsd.sock`, then `~/.cerulion/wsd.sock`, then `/tmp/cerulion-<euid>/wsd.sock`; the same ladder and directory rule as the row above. |
 | `CERULION_WSD_HARD_EXIT_MS` | Deadline for `cerulion-wsd`'s graceful shutdown before in-flight requests are aborted, in ms (default **5000**): a request blocked on a workspace lock must never turn SIGTERM into a zombie holding the socket. |
-| `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` | `off` forces a strictly LOCAL-ONLY daemon: no zenoh session ever, and a remote demand surfaces a plain "not network-configured" answer instead of hanging. Mirrors `CERULION_NETWORK=off` but scoped to the daemon, so it never surprises a `graph run` sharing the machine. |
+| `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` | `off` forces a strictly LOCAL-ONLY daemon: no zenoh session ever, and a remote demand surfaces a plain "not network-configured" answer instead of hanging. Only the exact value `off` engages it; any other non-empty value warns and the network stays on. Mirrors `CERULION_NETWORK=off` but scoped to the daemon, so it never surprises a `graph run` sharing the machine. The commands that reach the network through the daemon honor it too: with `CERULION_NETD_NETWORK=off`, `topic list`, `topic echo`, `topic hz`, `topic info` and `schema info` stay LOCAL-ONLY, opening no discovery session of their own; with either variable at `off`, `cerulion viz --robot` refuses before contacting the daemon. |
 | `CERULION_NETD_CONNECT` / `CERULION_VIZD_CONNECT` | Comma/whitespace-separated zenoh locators to dial (`tcp/192.168.123.99:7683`). Each is where the corresponding verb's `--connect` is threaded when that command STARTS its daemon: `cerulion viz --connect` into the vizd one, a demanding consumer's `--connect` into the netd one. |
 | `CERULION_NETD_LISTEN` / `CERULION_VIZD_LISTEN` | Comma/whitespace-separated zenoh locators to bind (`tcp/0.0.0.0:7447`). The `--listen` counterpart of the row above, threaded the same way. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
-| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. |
+| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
 
 WSD graph and node reads include a `version` field containing the lowercase
 SHA-256 digest of the exact bytes of `graphs/<graph>.yaml` or
-`nodes/<node_type>/src/lib.rs`. The `graph.stage_node` and `node.modify`
-requests may include `expect_version`. When supplied, the daemon compares it
+`nodes/<node_type>/src/lib.rs`. The `graph.stage_node`, `graph.wire`, `graph.unwire`,
+`graph.unstage` and `node.modify` requests may include `expect_version`. When supplied, the daemon compares it
 under the shared workspace-scoped exclusive lock at
 `<root>/.cerulion/workspace.lock` and returns `version_conflict` without writing
 if the file changed. Successful mutations return the new file-byte version.
 A staged node's `outputs:` are its DECLARED ports (name and schema, read from
 `nodes/<type>/src/lib.rs`), exactly as `cerulion node stage` writes them; only
 the input bindings are supplied by the client.
+
+Three more edit verbs take the same `root`, `graph` and optional
+`expect_version`, and answer with the new `raw` YAML and file `version`:
+
+| Verb | Request fields | Effect |
+|---|---|---|
+| `graph.wire` | `from: {node, port}`, `to: {node, port}` | Adds one `inputs:` entry to the consuming node, `source: <node>/<port>` (the output's absolute `topic:` when it has one). |
+| `graph.unwire` | `from: {node, port}`, `to: {node, port}` | Deletes the matching `inputs:` entry; the `inputs:` key goes with its last entry. |
+| `graph.unstage` | `node` (a node id), optional `force` (default `false`) | Deletes the node's entry. |
+
+`node` and `port` name a node id of the graph and a port on it. These verbs
+edit the file in place: every line outside the added or removed entry keeps its
+bytes, so comments, key order, quoting and the `network:` block survive, and the
+prior bytes are copied to `<graph>.yaml.bak`. A layout that cannot be edited in
+place (a flow-style `nodes:` or `inputs:` entry) is refused with the file
+untouched. Besides the codes above, they refuse with:
+
+- `schema_mismatch`: the output and the input name different schemas, by the
+  same rule as `graph validate`. `error.data` is `{"expected": <input schema>,
+  "found": <output schema>}`. When either side declares no schema name, the wire
+  is accepted and `graph.validate` is the check that follows.
+- `would_break`: `graph.unstage` of a node whose outputs feed other nodes.
+  `error.data` is `{"wires": [{"from": {node, port}, "to": {node, port}}]}` and
+  nothing is written. With `"force": true` the node and those inputs are
+  removed together, and the response lists them under `removed_wires`.
+- `invalid_request`: anything else the engine refuses, such as an unknown node
+  or port, an input that is already wired (unwire it first), no such wire, or
+  an edit that would leave the graph invalid (the last node cannot be removed).
+
+Loops, levelization and the trigger wiring a node type requires are not
+judged by these verbs (for example, unwiring a node's only trigger input
+succeeds); `graph.validate` checks references, schemas and trigger wiring, and
+`graph.levels` reports the levelization and rejects trigger cycles. A node named
+in `process_groups` or `level_assignments` cannot be unstaged here: the edit is
+refused as `invalid_request` and the file is untouched. An input that reads a
+topic other nodes also publish (`multi_publisher_topics`) does not depend on
+the node being unstaged. `error.data` is present only on these two
+refusals. The verbs are additive: the protocol version stays 1, and a daemon
+without them answers `unknown_verb`.
 
 Every engine writer of a workspace file holds that same lock across its
 check-and-write: `cerulion node create/delete/modify`, `node stage`,
@@ -2633,6 +3572,51 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 | `CERULION_NETD_RELAY_DISABLED` | Any non-empty value disables all iroh relays (LAN direct-dial only), for a locked-down or air-gapped desk. WAN builds only. |
 | `CERULION_STATE_ROOT` | The on-robot state root for `cerulion-remoted` (default `/var/lib/cerulion`). Also its `--state-root` flag. |
 
+### Robot Context Protocol
+
+For the `cerulion-rcpd` MCP server. See `docs/rcp.md`.
+
+| Variable | Meaning |
+|---|---|
+| `CERULION_RCP_TOKEN` | The bearer token every streamable HTTP request must carry (`Authorization: Bearer <token>`). `--http` refuses to start when it is unset, empty or whitespace. Not read in stdio mode. |
+
+### Multi-process execution
+
+| Variable | Meaning |
+|---|---|
+| `CERULION_EXECUTION_MODE` | How the workers of a MULTI-PROCESS `graph run` coordinate their steps. Unset (or `free_run`) is the default: **free-run**, no shared barrier, each rank on its own wall-following clock. `lockstep` OPTS OUT into barrier lockstep, where every rank advances the same handed quantum per step behind a shared barrier, the shape that makes per-step boundary times EQUAL across ranks. Read ONCE per run and threaded to every consumer: the run directory's `gating` label (`recorded_wall` for a free-run run whose ranks mint their scheduler-trace rings, which is every run but `--no-rings`, where it reads `wall`; `quantum` for lockstep), every worker plan, and the `coordination` stamp of a bag `--record` writes (`free_run` / `lockstep`), so no two of them can disagree. Exact-match: any other value keeps the default and warns. The `lockstep` opt-out is kept as the revert path for the free-run default; it is not a long-term part of this surface. On a run that executes no process groups (`--single-process`, a non-Unix host, or an unpartitioned graph under a non-real clock; under the real clock an unpartitioned graph is auto-partitioned and free-runs like any supervisor run) there are no ranks to coordinate: the run is the one-rank lockstep timeline, an explicit `free_run` is inert there and warns, and `lockstep` is simply what that run already is (silent). A partitioned graph under `--time-source virtual` still runs the supervisor (the flag is ignored with a warning) and follows the variable; `external` is rejected outright. See [`docs/multi_process.md`](multi_process.md). |
+
+### Android CLI and node workspaces
+
+The CLI, `cerulion-netd` and `cerulion-wsd` build for Android. Node cdylibs
+must be cross-built on a host with the same Rust compiler as the CLI. On
+Android, graph and node runs search
+`<target-directory>/<target-triple>/<profile>` when that node's cdylib is
+present there, otherwise using `<target-directory>/<profile>` when its library
+is present there; missing-library errors name the cargo-ndk paths. Preserve the
+target-triple directory when copying a workspace to the device. When
+`cerulion node build` cannot find Cargo on Android, it directs you to cross-build
+the workspace on the host with `cargo ndk`.
+
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block from
+Cerulion's root manifest. A standalone workspace written by hand must carry
+the same block, pinned to one fork revision. Otherwise node initialization
+refuses an iceoryx2 build without Android shared-memory support. `cerulion viz`
+is desktop-only; run it on a desktop host and connect that host to the device's
+topics over the network.
+
+On Android, netd and wsd control sockets use the abstract Unix-socket
+namespace. Their configured paths become abstract names, not filesystem
+entries. Each daemon drops peers whose `SO_PEERCRED` UID differs from its own
+effective UID, as well as peers whose credentials cannot be verified.
+
+### Android shared memory
+
+| Variable | Meaning |
+|---|---|
+| `CERULION_SHM_DIR` | Android only. Non-empty absolute directory for named shared-memory objects. Two readers use it, each on its own: `cerulion_core::posix_shm` (Cerulion's objects) and the pinned iceoryx2 fork (iceoryx2's shared-memory segments). An absolute directory passed to `cerulion_core::posix_shm::set_shm_dir` wins over it for Cerulion's objects only; iceoryx2 never sees that call, so an app that uses `set_shm_dir` must also export `CERULION_SHM_DIR` (or an absolute `TMPDIR`) before iceoryx2 starts, or iceoryx2 uses its own fallback (`$TMPDIR/cerulion-shm`, else `/data/local/tmp/cerulion-shm`, with no app-sandbox step) and an app process gets a permission error there. Neither setting moves iceoryx2's other files (node and service state) under its root path, `/data/local/tmp/iceoryx2`, which moves only through the `[global] root-path` key in `config/iceoryx2.toml` under the process's working directory. For Cerulion's objects, when both are unset, empty, or relative, the runtime uses `$TMPDIR/cerulion-shm` if `TMPDIR` is absolute; otherwise shell and root processes use `/data/local/tmp/cerulion-shm`, while an app process (which cannot write there) uses `/data/user/<user>/<package>/cache/cerulion-shm` when its sandbox resolves, and fails the first named-object operation with `EACCES` otherwise. Use a directory only Cerulion writes to. The directory must be writable and owned by the process user and not writable by group or others; the directory itself must not be a symbolic link, even when the path ends in `/` or `/.`, and a path containing `..` is refused, while symbolic links in parent directories are followed. |
+
 ### Variables that are not part of this surface
 
 The framework reads a handful of other `CERULION_*` variables that are
@@ -2646,24 +3630,9 @@ setting one can silently cost you a documented guarantee:
 `CERULION_MW_SINGLE_PARK`, `CERULION_MP_DRAIN_MS`, `CERULION_MP_PEER_LOSS`,
 `CERULION_MP_DROP_GRACE_MS`, `CERULION_MP_TRACE_DIR`,
 `CERULION_STATE_ARM_TAG`, `CERULION_H264_LAT_PROBE`,
-`CERULION_NETD_STALL_SHUTDOWN_FOR_TEST`, `CERULION_EXECUTION_MODE`.
+`CERULION_NETD_STALL_SHUTDOWN_FOR_TEST`.
 
-Three are worth a word because they change behavior this document describes:
-`CERULION_EXECUTION_MODE=free_run` opts a MULTI-PROCESS `graph
-run` into the free-run substrate: no barrier, each rank on its own wall-faithful
-clock; the bag's `coordination` stamp and every worker plan follow the ONE
-resolved value. It is **experimental**: it is documented here and the benchmark
-configurations in [`docs/PERFORMANCE.md`](PERFORMANCE.md) name it, and the
-substrate it selects may still change between releases. It is listed with the
-seams because it selects the execution substrate rather than tuning it. The
-default is barrier lockstep on every route; on a run that
-executes no process groups (`--single-process`, a non-Unix host, or an
-unpartitioned graph under a non-real clock; under the real clock an
-unpartitioned graph is auto-partitioned and honours the opt-in) the variable
-is inert and warns; a partitioned graph under `--time-source virtual` still
-runs the supervisor (the flag is ignored with a warning) and honours the
-opt-in, while `external` is rejected outright. Any other value keeps the
-default and warns.
+Two are worth a word because they change behavior this document describes:
 `CERULION_DRAIN_DISCIPLINE=separate` puts every data-trigger node on the
 separate drain path (and so onto legacy latest-per-set Sync delivery; see
 [Per-set Sync delivery](#per-set-sync-delivery)), and
@@ -2678,17 +3647,104 @@ You generally don't set these; the CLI generates the right feature wiring per no
 
 | Feature | On `cerulion_core` | When |
 |---|---|---|
-| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib carries the framework's `CERULION_ABI_VERSION` AND the rustc that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
+| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib's ABI value includes the framework version and its transport kind (the cross-process value remains `CERULION_ABI_VERSION`), plus the rustc fingerprint that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
 | `debug-logging` | yes | Enables `tracing`'s `max_level_trace`. It does NOT put `debug`/`trace` back into a release build: `cerulion_core` sets `release_max_level_info` on its `tracing` dependency, `tracing` consults every `release_max_level_*` feature before any `max_level_*` one in a build without debug assertions, and Cargo unifies features across the binary, so a release binary stays capped at `info` with or without this feature, no matter what `RUST_LOG` says. To get `debug`/`trace` lines, build without cargo's `--release` (a dev-profile build has no ceiling). |
+| `local-transport` | yes, opt-in | Selects an in-process transport for apps whose local publishers, subscribers, and gateway all run in one process. It preserves the zero-copy path within that process. Explicit cross-process configurations, detached pre-creation for other processes, and cdylibs with a different transport kind are refused. Do not enable it for the CLI or daemons. A `local-transport` host refuses every native cdylib node at load: each library carries its own process-local registry, so its frames cannot reach the host. Enable it only for apps whose publishers and subscribers all live in that one process; for cdylib graphs or cross-process setups, build a workspace and run it with `cerulion graph run` on the default transport. |
 | `test-helpers` | yes | Exposes test-only constructors and seams (`ClosureNodeEntry`, the `new_for_test` constructors). Used by integration tests; users shouldn't need it. |
 | `fuzz-helpers` | yes | Fuzz-test entry points. |
+
+---
+
+## Python client
+
+Python-authored nodes must declare exactly one scheduling policy: `period_ms`,
+one input marked `trigger=True`, or `sync_window_ms` for synchronized trigger
+inputs. A `trigger=True` input is refused under `period_ms`, and under
+`trigger=` unless it names that same input. Consequently, `node new --lang python` requires `-T` or `--policy`;
+Python nodes cannot be amended with `node modify`.
+
+`cerulion_py` is a standalone PyO3 wheel (its own cargo workspace, not a
+member of the root one) giving Python processes raw and schema-aware access to
+the same transport: 40-byte wire headers plus payload bytes, over iceoryx2
+shared memory. One process-wide transport lives behind `connect()`:
+a Python process that loads it must not also load another module
+embedding `cerulion_core`.
+
+```bash
+pip install maturin
+cd crates/cerulion_py && maturin develop --release
+```
+
+```python
+import cerulion
+
+session = cerulion.connect()                      # idempotent singleton
+pub = session.publisher("/demo/raw", 0xC0DE, max_payload_len=1 << 20)
+sub = session.subscriber("/demo/raw", depth=1)    # depth <= 16
+
+pub.publish(b"bytes", timestamp_ns=5)             # single-copy publish
+with pub.loan(4) as loan:                          # zero-copy publish path
+    loan.payload[:] = b"data"
+    loan.timestamp_ns = 7
+
+frame = sub.receive(timeout_ms=1000)              # blocks, GIL released
+frame.raw, frame.payload, frame.as_numpy()        # read-only zero-copy views
+frame.to_bytes()                                   # materialised (copies)
+frame.release()                                    # returns the borrowed slot
+```
+
+Typed clients load a `SchemaSet` and bind it to publishers and subscribers:
+
+```python
+schemas = cerulion.SchemaSet()
+schemas.add_yaml("""
+schemas:
+  Point:
+    fields:
+      float64 x: {}
+      float64 y: {}
+""")
+layout = schemas.layout("Point")
+topic = "/demo/typed"
+pub = session.publisher(topic, schema="Point", schemas=schemas)
+sub = session.subscriber(topic, schema="Point", schemas=schemas)
+with pub.loan() as point:                          # writable zero-copy loan
+    point.x, point.y = 1.5, -2.0
+frame = sub.receive(1000)
+point = frame.view()                                # read-only zero-copy view
+owned = point.copy()                                # materialised owned copy
+frame.release()
+```
+
+`publish()` requires a contiguous buffer of single-byte items (`bytes`,
+`bytearray`, `memoryview` of bytes, `np.uint8` arrays; other dtypes need
+`arr.view(np.uint8)`). Received frames hold borrowed loan slots
+(`sub.max_borrowed_samples`, default 2): `release()` them promptly, and
+drop their views first: a live view keeps the slot borrowed. Client errors
+derive from `cerulion.CerulionError` (`TransportError`, `SchemaMismatch`,
+`BorrowLimitExceeded`, `ReleasedFrame`, `EncodeError`, `DecodeError`,
+`SchemaError`, and `BagError`); invalid arguments raise the built-in exceptions listed in
+`docs/python.md`, while a typed `publish()` payload that is not a dict or
+`Message`, or has missing, extra or ill-typed fields, raises `EncodeError`.
+Schema-aware clients additionally expose `SchemaSet.layout(name)`
+and typed `Frame.view()`/`Publisher.loan(**lengths)` for read-only NumPy views
+and writable zero-copy loans. `Publisher.publish(dict)` encodes a typed
+frame straight into a loan; `Publisher.publish_frame(bytes)` is the advanced
+raw complete-frame path. `cerulion.open_bag(path)` reads a finalized
+`cerulion bag record` MCAP bag: `topics()` lists user channels and
+`messages(topics=None)` yields `(topic, Record)` pairs whose bytes are
+owned copies that can be decoded with `Record.view(T)` (a message class) or
+`Record.view("pkg/Name", schemas=s)`.
+
+Full contract, including the zero-copy wording and the interop fixture:
+`docs/python.md`.
 
 ---
 
 ## What this document is NOT
 
 - A tour of `cerulion_core`'s internal modules. Use `cargo doc --open` for the rustdoc if you need to read internals.
-- A specification of the wire format. See `crates/cerulion_core/src/wire.rs` for the 32-byte header layout.
+- A specification of the wire format. See `crates/cerulion_core/src/wire.rs` for the 40-byte header layout.
 - A description of the `iceoryx2` or `zenoh` configuration surfaces. Those are framework-internal.
 - A guide to writing tests against `cerulion_core::graph::*` directly. The integration-test patterns in `crates/cerulion_core/tests/` are framework-internal: they will continue to be supported but are not the path application authors take.
 

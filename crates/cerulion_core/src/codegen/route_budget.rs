@@ -14,7 +14,7 @@
 //!
 //! and every `ros2 attach` route inherits `dds_bridge`'s BRIDGE-WIDE
 //! `DEFAULT_RAW_MAX_SLICE_LEN` = 1 MiB, because the generated bridge config
-//! never emits `max_slice_len:`. So every route — a 157-byte `/tf` frame and a
+//! never emits `max_slice_len:`. So every route, a 165-byte `/tf` frame and a
 //! 46 KiB point cloud alike — lands on the SAME depth 64, which absorbs 38.6 ms
 //! at 1.66 kHz.
 //!
@@ -132,7 +132,7 @@ pub fn route_slice_budget(layout: &WireLayout) -> usize {
 pub fn route_slice_budget_capped(layout: &WireLayout, configured: MaxSliceLen) -> MaxSliceLen {
     let budget = route_slice_budget(layout);
     // Saturating: a budget above `u32::MAX` cannot narrow a `MaxSliceLen`
-    // anyway, and one below the 32-byte floor is impossible (the fixed arm is
+    // anyway, and one below the 40-byte floor is impossible (the fixed arm is
     // `>= WireHeader::SIZE` by construction and every tier is >= 16 KiB) — but
     // `min` with the configured value keeps the result constructible without
     // relying on that.
@@ -169,11 +169,11 @@ mod tests {
     /// A FIXED schema's budget is EXACTLY its frame size — header plus fixed
     /// section, no headroom.
     ///
-    /// Hand oracle: 125 is chosen so `32 + 125 = 157`, the `/tf` frame size
+    /// Hand oracle: 125 is chosen so `40 + 125 = 165`, the `/tf` frame size
     /// the module docs quote, which is what makes the depth consequence below concrete.
     #[test]
     fn a_fixed_schema_budget_is_exactly_header_plus_fixed_section() {
-        assert_eq!(route_slice_budget(&layout("demo/Fixed", 125, 0)), 157);
+        assert_eq!(route_slice_budget(&layout("demo/Fixed", 125, 0)), 165);
         // The degenerate end: a fieldless schema is a bare header.
         assert_eq!(
             route_slice_budget(&layout("std_msgs/Empty", 0, 0)),
@@ -182,7 +182,7 @@ mod tests {
         // And a large fixed schema is still exact — no tier, no rounding.
         assert_eq!(
             route_slice_budget(&layout("demo/BigFixed", 8_000, 0)),
-            8_032
+            8_040
         );
     }
 
@@ -255,10 +255,10 @@ mod tests {
     fn the_capped_rule_narrows_but_never_widens() {
         const BRIDGE_DEFAULT: MaxSliceLen = MaxSliceLen::const_new(1 << 20);
 
-        // Narrows: a fixed 157-byte schema.
+        // Narrows: a fixed 165-byte schema.
         assert_eq!(
             route_slice_budget_capped(&layout("demo/Fixed", 125, 0), BRIDGE_DEFAULT).get(),
-            157
+            165
         );
         // Narrows: both Go2 victims are below the default —
         // `/state_estimation` at TIER_TINY (the tier audit moved Odometry SMALL ->
@@ -355,7 +355,7 @@ mod tests {
     }
 
     /// The result is always a constructible `MaxSliceLen` — including at the
-    /// 32-byte floor, where a fieldless fixed schema lands.
+    /// 40-byte floor, where a fieldless fixed schema lands.
     #[test]
     fn the_capped_rule_is_constructible_at_the_floor() {
         let got = route_slice_budget_capped(

@@ -1,0 +1,37 @@
+FREE RUN AGAINST LOCKSTEP, ONE BUILD, ONE MACHINE
+
+Build:   main 4ff3326d06868bf0402912a15fb9895e78e379aa, with the latency ping
+         change that later landed on main as bbf276489b3c8688a9f3b154cb9a75e2a1e56c78
+         applied (the ping assigns each tick to its nearest grid slot). The
+         applied patch and the landed commit change the same code; they differ
+         only in the punctuation of three comment lines. That patch is why every
+         run.json reads git_dirty: true.
+         cerulion binary sha256 72c9945bf14d45aa254b353d6982c066b54a0fae3c35c6c75323af8a3c53e233
+         rustc 1.95.0
+Machine: x86-64 Linux (Ubuntu 22.04, kernel 6.8), machine hash 3e0b99a7a88f0f38.
+         This is not the machine of the 2026-09-16 fixed100 package; absolute
+         figures are not comparable across the two packages.
+Shape:   cerulion_workspace_split_chrt0 (two worker processes), fixed100,
+         chrt 0, CER_BENCH_DMA_LOCK=0, msg-class variable, recorder ON at the
+         shipped default, k=6 x 2000 samples per size per arm.
+
+Arms:
+  free-run/  CERULION_EXECUTION_MODE unset (the default).
+  lockstep/  CERULION_EXECUTION_MODE=lockstep (the opt out).
+  Every other setting was the shipped default in both arms. Reps ran
+  interleaved with the arm order alternating (A B, B A, A B, ...), and each
+  rep's execution mode was asserted from the run before the rep was kept.
+
+Rate:    every .rate sidecar in this package reads 100 (120 of 120). The
+         launcher refuses and reruns any rep whose sidecars do not all read
+         100; it refused none in either arm.
+
+Scrub applied to each run.json: the uname node field reads box-linux and the
+argv run-dir root reads <BOXHOME>/lanes/<run>, in all six nested invocations
+of each file; the uname rewrite also folds its runs of spaces to one. No
+other field is changed.
+
+CSV: the data rows are compile_csv.py's output byte for byte. The leading "#"
+schema-note lines use the ASCII form the other packages ship.
+
+No .bin samples and no run logs are in this package.

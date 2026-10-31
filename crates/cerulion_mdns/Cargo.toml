@@ -15,16 +15,14 @@
 #
 # So the beacon lands in its own leaf crate. What lives here is exactly what an
 # ADVERTISER needs — the service type, the TXT vocabulary, the beacon-facts
-# enrichment, the SRV port derivation, and the registration guard. The BROWSE half
-# stays in `cerulion_cli_engine::mdns_discovery`: netd never browses, and the
-# browse rung's return type (`cerulion_discovery::DiscoveredPeer`) plus its
-# `connect_cmd::normalize_eid` seam are CLI-side concerns. One definition of
-# `CERULION_SERVICE_TYPE` still serves both, so the advertiser and the browser
-# cannot drift apart on the one string that has to match.
+# enrichment, the SRV port derivation, and the registration guard. It also holds
+# the bounded browse (`browse_rung`), which the CLI's discovery ladder and netd's
+# boot-time peer fold both call; it returns `cerulion_discovery::DiscoveredPeer`.
+# One definition of `CERULION_SERVICE_TYPE` serves the advertiser and the browser.
 #
 # Costs nothing new to the default build: `mdns-sd` is ALREADY in the
 # `default-members` tree via `cerulion_cli_engine`, and this crate pulls nothing
-# else beyond serde/tracing.
+# else beyond serde/tracing and the std-only `cerulion_discovery`.
 [package]
 name = "cerulion_mdns"
 version.workspace = true
@@ -35,7 +33,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "The `_cerulion._tcp` mDNS gateway beacon for Cerulion (advertise half): SRV and TXT record assembly, the endpoint facts published by the remote-access daemon, and the registration guard, shared by `cerulion-netd` and the fallback gateway process"
+description = "The `_cerulion._tcp` mDNS gateway beacon for Cerulion: SRV and TXT record assembly, the endpoint facts published by the remote-access daemon, the registration guard, and the bounded browse, shared by `cerulion-netd`, the CLI and the fallback gateway process"
 readme = "README.md"
 keywords = ["robotics", "mdns", "dns-sd", "discovery", "cerulion"]
 categories = ["science::robotics", "network-programming"]
@@ -51,8 +49,8 @@ workspace = true
 
 [dependencies]
 # Pure-Rust mDNS-SD. No C deps; advertises `_cerulion._tcp` on the LAN.
-# SAME version as `cerulion_cli_engine`'s dep — the browse half and this advertise
-# half must speak one protocol implementation.
+# SAME version as `cerulion_cli_engine`'s dep (its `resolve_robot_eid` browses
+# with it), so every Cerulion mDNS caller speaks one protocol implementation.
 mdns-sd = "0.20"
 # Parse `cerulion_remoted`'s PUBLIC beacon-facts JSON
 # (`eid`/`iroh_port`/`claimable` TXT enrichment).
@@ -63,6 +61,8 @@ tracing = "0.1"
 # The advertise error the two callers map onto their own surfaces (a `CliError`
 # in the CLI, a `warn!` in netd).
 thiserror = "2"
+# `DiscoveredPeer` / `DiscoveryRung`, the browse rung's return type.
+cerulion_discovery = { workspace = true }
 
 [dev-dependencies]
 # Isolated `CERULION_STATE_ROOT` dirs for the beacon-facts I/O-wiring tests.

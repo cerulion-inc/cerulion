@@ -12,6 +12,54 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
 
+const ICEORYX2_FORK_GIT: &str = "https://github.com/cerulion-inc/iceoryx2";
+const ICEORYX2_FORK_REV: &str = "282f479b5c2ae607a461c0f4bc6c70f452d1c604";
+/// Keep these names aligned with the root Cargo.toml pin; a test enforces it.
+const ICEORYX2_FORK_CRATES: &[&str] = &[
+    "iceoryx2",
+    "iceoryx2-bb-concurrency",
+    "iceoryx2-bb-container",
+    "iceoryx2-bb-derive-macros",
+    "iceoryx2-bb-elementary",
+    "iceoryx2-bb-elementary-traits",
+    "iceoryx2-bb-flatbuffers",
+    "iceoryx2-bb-linux",
+    "iceoryx2-bb-lock-free",
+    "iceoryx2-bb-loggers",
+    "iceoryx2-bb-memory",
+    "iceoryx2-bb-posix",
+    "iceoryx2-bb-print",
+    "iceoryx2-bb-system-types",
+    "iceoryx2-cal",
+    "iceoryx2-log",
+    "iceoryx2-log-types",
+    "iceoryx2-pal-concurrency-sync",
+    "iceoryx2-pal-configuration",
+    "iceoryx2-pal-os-api",
+    "iceoryx2-pal-posix",
+    "iceoryx2-pal-print",
+];
+
+/// The build-environment variable that joins a workspace's `schemas/` to the
+/// generated message crate: `native_ros2_messages`' build script reads the
+/// workspace root from it and generates the workspace's `.msg` and YAML types
+/// beside the built-ins. The workspace scaffold sets it in `.cargo/config.toml`
+/// (`[env]`, relative to the workspace root), which cargo passes to every
+/// build script, so `cargo build`, `cerulion node build` and an editor's
+/// rust-analyzer see the same types.
+pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
+
+/// Whether the workspace at `root` generates its messages into the message
+/// crate: its `.cargo/config.toml` parses and sets [`WORKSPACE_MSGS_ENV`] under
+/// `[env]`. A missing or unparseable file is `false`.
+pub fn workspace_generates_messages(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(".cargo").join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("env").and_then(|env| env.as_table()).cloned())
+        .is_some_and(|env| env.contains_key(WORKSPACE_MSGS_ENV))
+}
+
 /// Discovered Cerulion workspace.
 #[derive(Debug)]
 pub struct CerulionWorkspace {
@@ -29,9 +77,10 @@ pub struct CerulionWorkspace {
 
 /// The dependency source `workspace create` chose for the generated root
 /// manifest. The decision keys on where the running `cerulion` BINARY lives
-/// (or was built), never on the current directory — see the crate-private
-/// `find_cerulion_base` — and the CLI prints it beside the created path so a
-/// miss on a checkout-built binary is never silent.
+/// (or was built), never on the current directory: the crate-private
+/// `find_cerulion_root` finds the source checkout the binary came from, and the
+/// CLI prints the chosen source beside the created path so a miss on a
+/// checkout-built binary is never silent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencySource {
     /// Exact-pinned published crates (`cerulion_core = "=X.Y.Z"`).
@@ -101,11 +150,32 @@ pub fn workspace_create(parent_dir: &Path, name: &str) -> CliResult<CerulionWork
             path: root.display().to_string(),
         });
     }
-    scaffold_workspace(&root, name)
+    let ws = create_new_workspace(&root)?;
+    tracing::info!(workspace = %name, path = %ws.root.display(), "workspace created");
+    Ok(ws)
+}
+
+fn create_new_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
+    // Reserve the final directory before writing anything into it. A starter
+    // may have published it since workspace_create's advisory absence check.
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::create_dir(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CliError::WorkspaceExists {
+                path: root.display().to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    scaffold_workspace(root)
 }
 
 /// Initialize a workspace at the given path (default: current directory).
 pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
+    let location_exists = location.exists();
     let cargo_toml = location.join("Cargo.toml");
     if cargo_toml.exists() {
         let content = std::fs::read_to_string(&cargo_toml)?;
@@ -119,7 +189,17 @@ pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("cerulion_ws");
-    scaffold_workspace(location, name)
+    let ws = initialize_workspace(location, location_exists)?;
+    tracing::info!(workspace = %name, path = %ws.root.display(), "workspace created");
+    Ok(ws)
+}
+
+fn initialize_workspace(location: &Path, location_exists: bool) -> CliResult<CerulionWorkspace> {
+    if location_exists {
+        scaffold_workspace(location)
+    } else {
+        create_new_workspace(location)
+    }
 }
 
 /// Locate the Cerulion source checkout root. Three tiers, in order:
@@ -134,13 +214,13 @@ pub fn workspace_init(location: &Path) -> CliResult<CerulionWorkspace> {
 ///    so the walk-up fails even though the repo is right where it was at
 ///    build time — and the generated workspace `Cargo.toml` would fall back
 ///    to broken relative paths, killing every `node_build` in it. The engine
-///    crate's baked `CARGO_MANIFEST_DIR` parent is the repo root at BUILD
+///    crate's baked `CARGO_MANIFEST_DIR` grandparent is the repo root at BUILD
 ///    time; it is valid whenever the binary runs on the machine it was built
 ///    on (developer machines, CI, tests) and is guarded by a runtime existence check.
 ///    Same `CARGO_TARGET_DIR` hazard class as cdylib resolution.
 /// 3. **`None`**: the caller (`scaffold_workspace`) generates exact-pinned
 ///    registry dependencies for the installed-user path.
-pub(crate) fn find_cerulion_base() -> Option<PathBuf> {
+pub(crate) fn find_cerulion_root() -> Option<PathBuf> {
     if let Some(base) = exe_walk_up_candidate() {
         return Some(base);
     }
@@ -156,7 +236,7 @@ pub(crate) fn find_cerulion_base() -> Option<PathBuf> {
     None
 }
 
-/// Tier 1: walk up from the CLI binary's location (see [`find_cerulion_base`]).
+/// Tier 1: walk up from the CLI binary's location (see [`find_cerulion_root`]).
 fn exe_walk_up_candidate() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -202,7 +282,7 @@ fn base_candidate_if_repo(candidate: &Path) -> Option<PathBuf> {
 }
 
 /// Create the workspace directory structure and files.
-fn scaffold_workspace(root: &Path, name: &str) -> CliResult<CerulionWorkspace> {
+pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
     let graphs_dir = root.join("graphs");
     let nodes_dir = root.join("nodes");
     let schemas_dir = root.join("schemas");
@@ -226,7 +306,7 @@ fn scaffold_workspace(root: &Path, name: &str) -> CliResult<CerulionWorkspace> {
 
     // Workspace Cargo.toml — use absolute paths when a source checkout is found,
     // otherwise use exact-pinned registry dependencies.
-    let base = find_cerulion_base();
+    let base = find_cerulion_root();
     if base.is_none() {
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
@@ -253,13 +333,16 @@ fn scaffold_workspace(root: &Path, name: &str) -> CliResult<CerulionWorkspace> {
     std::fs::create_dir_all(&cargo_dir)?;
     std::fs::write(
         cargo_dir.join("config.toml"),
-        r#"[env]
+        format!(
+            r#"[env]
 IOX2_LOG_LEVEL = "error"
-RUST_LOG = { value = "warn", force = false }
-"#,
+RUST_LOG = {{ value = "warn", force = false }}
+# The workspace's schemas/ (.msg packages and YAML) generate into the message
+# crate beside the built-in ROS 2 types.
+{WORKSPACE_MSGS_ENV} = {{ value = ".", relative = true }}
+"#
+        ),
     )?;
-
-    tracing::info!(workspace = %name, path = %root.display(), "workspace created");
 
     Ok(CerulionWorkspace {
         root: root.to_path_buf(),
@@ -421,7 +504,7 @@ fn stable_toolchain_manifest(release: &str) -> Option<String> {
 }
 
 fn workspace_manifest(base: Option<&Path>, version: &str) -> String {
-    if let Some(base) = base {
+    let manifest = if let Some(base) = base {
         let core_path = base
             .join("crates/cerulion_core")
             .display()
@@ -453,11 +536,30 @@ cerulion_core = "={version}"
 native_ros2_messages = "={version}"
 "#
         )
-    }
+    };
+    format!("{manifest}\n{}", iceoryx2_fork_patch())
+}
+
+fn iceoryx2_fork_patch() -> String {
+    let entries = ICEORYX2_FORK_CRATES
+        .iter()
+        .map(|name| {
+            format!("{name} = {{ git = \"{ICEORYX2_FORK_GIT}\", rev = \"{ICEORYX2_FORK_REV}\" }}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# Node libraries link the same iceoryx2 build as the cerulion CLI. Android\n\
+         # shared memory needs it; keep every entry on one revision.\n\
+         [patch.crates-io]\n\
+         {entries}"
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     const OFFICIAL_FINGERPRINT: &str = "1.93.0 (1111111111111111111111111111111111111111)";
@@ -682,9 +784,54 @@ mod tests {
         assert!(ws.nodes_dir.is_dir());
         assert!(ws.schemas_dir.is_dir());
         assert!(ws.root.join(".cargo/config.toml").exists());
+        assert!(
+            workspace_generates_messages(&ws.root),
+            "a new workspace generates its schemas into the message crate"
+        );
         assert_eq!(
             std::fs::read_to_string(ws.root.join(".gitignore")).unwrap(),
             ".cerulion/\n"
+        );
+    }
+
+    #[test]
+    fn workspace_messages_need_the_env_key_under_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo = tmp.path().join(".cargo");
+        assert!(!workspace_generates_messages(tmp.path()), "no config file");
+        std::fs::create_dir_all(&cargo).unwrap();
+        for (text, expected) in [
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", false),
+            ("[build]\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            ("# CERULION_WORKSPACE_MSGS = \".\"\n[env]\n", false),
+            ("[env\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n",
+                true,
+            ),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"/abs/ws\"\n", true),
+        ] {
+            std::fs::write(cargo.join("config.toml"), text).unwrap();
+            assert_eq!(
+                workspace_generates_messages(tmp.path()),
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_crate_reads_the_variable_the_scaffold_sets() {
+        // The two spellings live in two crates; this pins them together.
+        let build_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../native_ros2_messages/build.rs");
+        let text = std::fs::read_to_string(&build_rs).unwrap();
+        assert!(
+            text.contains(&format!(
+                "const WORKSPACE_ENV: &str = \"{WORKSPACE_MSGS_ENV}\";"
+            )),
+            "{} must read {WORKSPACE_MSGS_ENV}",
+            build_rs.display()
         );
     }
 
@@ -722,6 +869,118 @@ mod tests {
     }
 
     #[test]
+    fn a_starter_published_after_bare_creation_precheck_is_preserved() {
+        use crate::starter::{workspace_create_with_starter, Starter};
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("shared");
+        // Pause ordinary creation after its advisory absence check, then let
+        // the starter publish the destination before ordinary scaffolding.
+        assert!(!destination.exists());
+        let starter =
+            workspace_create_with_starter(parent.path(), "shared", Starter::ObstacleAvoidance)
+                .unwrap();
+        let manifest = starter.root.join("Cargo.toml");
+        let mut original = std::fs::read_to_string(&manifest).unwrap();
+        original.push_str("\n# learner's published workspace\n");
+        std::fs::write(&manifest, &original).unwrap();
+        let before = snapshot(&destination);
+        let result = create_new_workspace(&destination);
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+        assert!(matches!(result, Err(CliError::WorkspaceExists { .. })));
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn a_starter_published_after_absent_init_precheck_is_preserved() {
+        use crate::starter::{workspace_create_with_starter, Starter};
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("shared");
+        // Pause initialization after it observes an absent location, then let
+        // starter publication win before the actual init continuation.
+        let location_exists = destination.exists();
+        assert!(!location_exists);
+        let starter =
+            workspace_create_with_starter(parent.path(), "shared", Starter::ObstacleAvoidance)
+                .unwrap();
+        let manifest = starter.root.join("Cargo.toml");
+        let mut original = std::fs::read_to_string(&manifest).unwrap();
+        original.push_str("\n# learner's published workspace\n");
+        std::fs::write(&manifest, &original).unwrap();
+        let before = snapshot(&destination);
+        let result = initialize_workspace(&destination, location_exists);
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+        assert!(matches!(result, Err(CliError::WorkspaceExists { .. })));
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    #[test]
+    fn initialization_of_an_absent_nested_folder_still_creates_a_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let location = parent.path().join("missing/robot");
+        let workspace = workspace_init(&location).unwrap();
+        assert_eq!(workspace.root, location);
+        assert!(workspace.root.join("Cargo.toml").is_file());
+        assert!(workspace.graphs_dir.is_dir());
+    }
+
+    #[test]
+    fn ordinary_creation_retains_nested_name_and_missing_parent_support() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        let workspace = workspace_create(&missing, "nested/robot").unwrap();
+        assert_eq!(workspace.root, missing.join("nested/robot"));
+        assert!(workspace.root.join("Cargo.toml").exists());
+        assert!(workspace.graphs_dir.is_dir());
+    }
+
+    #[test]
+    fn ordinary_creation_preserves_a_non_directory_parent_on_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let existing_file = parent.path().join("file");
+        std::fs::write(&existing_file, b"user source").unwrap();
+        assert!(matches!(
+            workspace_create(&existing_file, "robot"),
+            Err(CliError::Io(_))
+        ));
+        assert_eq!(std::fs::read(existing_file).unwrap(), b"user source");
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ordinary_creation_preserves_a_dangling_destination_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("missing");
+        let destination = parent.path().join("robot");
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        assert!(matches!(
+            workspace_create(parent.path(), "robot"),
+            Err(CliError::WorkspaceExists { .. })
+        ));
+        assert_eq!(std::fs::read_link(destination).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn test_workspace_init_already_exists() {
         let tmp = tempfile::tempdir().unwrap();
         workspace_init(tmp.path()).unwrap();
@@ -743,13 +1002,13 @@ mod tests {
     }
 
     #[test]
-    fn test_find_cerulion_base_returns_some_in_repo() {
+    fn test_find_cerulion_root_returns_some_in_repo() {
         // When running via `cargo test`, the binary is inside the repo's
-        // target/ directory, so find_cerulion_base() should succeed.
-        let base = find_cerulion_base();
+        // target/ directory, so find_cerulion_root() should succeed.
+        let base = find_cerulion_root();
         assert!(
             base.is_some(),
-            "find_cerulion_base() should find the repo root when run from within the repo"
+            "find_cerulion_root() should find the repo root when run from within the repo"
         );
         let base = base.unwrap();
         assert!(base.join("crates/cerulion_core/Cargo.toml").exists());
@@ -757,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_compile_time_base_candidate_returns_some_in_repo() {
-        // In-repo test run: the engine crate's CARGO_MANIFEST_DIR parent IS
+        // In-repo test run: the engine crate's CARGO_MANIFEST_DIR grandparent IS
         // the repo root, so the runtime existence guard holds by construction.
         let base = compile_time_base_candidate();
         assert!(
@@ -787,7 +1046,7 @@ mod tests {
 
         let content = std::fs::read_to_string(ws.root.join("Cargo.toml")).unwrap();
         // When a source checkout is found, paths should be absolute (start with /)
-        if find_cerulion_base().is_some() {
+        if find_cerulion_root().is_some() {
             assert!(
                 content.contains("path = \"/"),
                 "expected absolute paths in Cargo.toml, got:\n{content}"
@@ -813,6 +1072,67 @@ mod tests {
         assert!(manifest.contains(r#"cerulion_core = "=0.0.1-alpha""#));
         assert!(manifest.contains(r#"native_ros2_messages = "=0.0.1-alpha""#));
         assert!(!manifest.contains("path ="));
+    }
+
+    #[test]
+    fn generated_manifests_patch_the_whole_iceoryx2_family_at_the_root_pin() {
+        fn iceoryx2_patch(manifest: &str) -> BTreeMap<String, (String, String)> {
+            let document: toml::Value = toml::from_str(manifest).unwrap();
+            document
+                .get("patch")
+                .and_then(|patch| patch.get("crates-io"))
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with("iceoryx2"))
+                .map(|(name, entry)| {
+                    let entry = entry.as_table().unwrap();
+                    (
+                        name.clone(),
+                        (
+                            entry
+                                .get("git")
+                                .and_then(toml::Value::as_str)
+                                .unwrap()
+                                .to_owned(),
+                            entry
+                                .get("rev")
+                                .and_then(toml::Value::as_str)
+                                .unwrap()
+                                .to_owned(),
+                        ),
+                    )
+                })
+                .collect()
+        }
+
+        let root_manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+                .unwrap();
+        let root_patch = iceoryx2_patch(&root_manifest);
+        assert!(!root_patch.is_empty());
+
+        let checkout_manifest =
+            workspace_manifest(Some(Path::new("/tmp/cerulion-src")), "0.0.1-alpha");
+        let registry_manifest = workspace_manifest(None, "0.0.1-alpha");
+        let example_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/basic_timer/Cargo.toml"
+        ))
+        .unwrap();
+
+        // The Android sample's app runtime crate is its own workspace too, so
+        // it carries the same block: a patch does not reach across workspaces.
+        let android_runtime_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cerulion_android/android/runtime/Cargo.toml"
+        ))
+        .unwrap();
+
+        assert_eq!(iceoryx2_patch(&checkout_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&registry_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&example_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&android_runtime_manifest), root_patch);
     }
 
     #[test]

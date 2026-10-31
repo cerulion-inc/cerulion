@@ -8,6 +8,15 @@
 //! policies. Node types are scaffolded via the real `node_cmd` helpers so the
 //! policy metadata comes from ACTUAL source parsing (`parse_node_metadata`),
 //! the same path the verb uses in production.
+//!
+//! The report CLOSES with the chain-fusion census, so every oracle here pins
+//! it too: which linear single-consumer trigger chains could run as one fused
+//! call sequence, and for every other consumer edge the reason it keeps the
+//! queued path. That half is pinned in the SAME strings as the levels half on
+//! purpose, because a fused hop is a level boundary the executor would not
+//! have to cross, and an oracle that split them could let the two disagree.
+//! The per-rule oracles live beside the analysis
+//! (`cerulion_core/tests/chain_census_test.rs`).
 
 use std::path::Path;
 
@@ -163,6 +172,13 @@ level 0: n0 [period(10ms)]
 level 1: n1 [data(inp)]
   -> /p/n1/out  n1 -> n2 (level 2)
 level 2: n2 [data(inp)]
+chains: 1 fusable, 2 hop(s), 0 of 2 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  chain 0  levels 0-2  3 nodes, 2 hop(s)
+    n0 -> n1  on /p/n0/out
+    n1 -> n2  on /p/n1/out
 ";
     assert_eq!(report, expected, "chain report must match the hand oracle");
 }
@@ -231,6 +247,19 @@ level 1: n1 [data(inp)], n2 [data(inp)]
   -> /p/n1/out  n1 -> n3 (level 2)
   -> /p/n2/out  n2 -> n3 (level 2)
 level 2: n3 [sync(25ms)]
+chains: 0 fusable, 0 hop(s), 4 of 4 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  queued by reason: consumer-policy 2, fan-out 2
+  queued  /p/n0/out  n0 -> n1.inp
+    fan-out: the topic has 2 consumers, and a chain ends at a fan-out
+  queued  /p/n0/out  n0 -> n2.inp
+    fan-out: the topic has 2 consumers, and a chain ends at a fan-out
+  queued  /p/n1/out  n1 -> n3.a
+    consumer-policy: the consumer fires on sync, not on this frame
+  queued  /p/n2/out  n2 -> n3.b
+    consumer-policy: the consumer fires on sync, not on this frame
 ";
     assert_eq!(
         report, expected,
@@ -298,6 +327,13 @@ process groups: 2
   rank 0  P0  levels 0-1  nodes: n0, n1
   rank 1  P1  levels 2  nodes: n2
   partition: spawner-consumable
+chains: 1 fusable, 1 hop(s), 1 of 2 consumer edge(s) queued
+  colocation: the 2 declared process group(s) (P0, P1)
+  chain 0  levels 0-1  2 nodes, 1 hop(s)
+    n0 -> n1  on /p/n0/out
+  queued by reason: separate-processes 1
+  queued  /p/n1/out  n1 -> n2.inp
+    separate-processes: the producer runs in group 'P0' and the consumer in group 'P1'
 ";
     assert_eq!(
         report, expected,
@@ -619,6 +655,19 @@ level 0: camera [period(100ms)], imu [period(100ms)], tracker [period(100ms)], d
   -> /{prefix}/camera/image  camera -> fusion (level 1)
   -> /{prefix}/imu/data  imu -> fusion (level 1)
 level 1: detector [data(image)], fusion [sync(50ms)]
+chains: 0 fusable, 0 hop(s), 4 of 4 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  queued by reason: fan-out 2, consumer-policy 1, latest-value-read 1
+  queued  /{prefix}/camera/image  camera -> detector.image
+    fan-out: the topic has 2 consumers, and a chain ends at a fan-out
+  queued  /{prefix}/camera/image  camera -> fusion.image
+    fan-out: the topic has 2 consumers, and a chain ends at a fan-out
+  queued  /{prefix}/imu/data  imu -> fusion.imu
+    consumer-policy: the consumer fires on sync, not on this frame
+  queued  /external/health  (no in-graph producer) -> diagnostics.health
+    latest-value-read: the consumer reads this topic as a latest value and is not woken by it
 "
     );
     assert_eq!(
@@ -709,6 +758,12 @@ nodes: 2  levels: 2
 level 0: s [period(10ms)]
   -> /p/s/out  s -> c (level 1)
 level 1: c [data(any — inferred)]
+chains: 1 fusable, 1 hop(s), 0 of 1 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  chain 0  levels 0-1  2 nodes, 1 hop(s)
+    s -> c  on /p/s/out
 ";
     assert_eq!(
         report, expected,
@@ -807,6 +862,15 @@ level 0: sa [period(10ms)], sb [period(10ms)]
   -> /p/sa/out  sa -> m (level 1)
   -> /p/sb/out  sb -> m (level 1)
 level 1: m [unbounded_sync]
+chains: 0 fusable, 0 hop(s), 2 of 2 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  queued by reason: consumer-policy 2
+  queued  /p/sa/out  sa -> m.a
+    consumer-policy: the consumer fires on unbounded sync, not on this frame
+  queued  /p/sb/out  sb -> m.b
+    consumer-policy: the consumer fires on unbounded sync, not on this frame
 ";
     assert_eq!(
         report, expected,
@@ -989,6 +1053,12 @@ nodes: 3  levels: 2
 level 0: n0 [period(10ms)]
   -> /p/n0/out  n0 -> n1 (level 1)
 level 1: x [period(10ms)], n1 [data(inp)]
+chains: 1 fusable, 1 hop(s), 0 of 1 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  chain 0  levels 0-1  2 nodes, 1 hop(s)
+    n0 -> n1  on /p/n0/out
 ";
     assert_eq!(
         report.rendered, expected,
@@ -1029,5 +1099,89 @@ nodes:
     assert!(
         err.contains("not strictly level-increasing"),
         "the validation diagnostic surfaces; got: {err}"
+    );
+}
+
+// ==========================================================================
+// The chains block reads DECLARATIONS from node source.
+// ==========================================================================
+
+/// A node-level rate cap written in node SOURCE refuses the hop INTO the
+/// capped node, and leaves the hop out of it alone.
+///
+/// Every declaration the census reads comes from source, so a rule whose value
+/// this path dropped would be decidable in principle and never decided, and
+/// the report would silently over-count fusable hops. The cap is written into
+/// the scaffolded node exactly as an author would write it.
+#[test]
+fn a_rate_cap_in_node_source_refuses_the_hop_into_the_capped_node() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = setup_workspace(tmp.path());
+    let lib = ws.nodes_dir.join("relay").join("src").join("lib.rs");
+    let source = std::fs::read_to_string(&lib).expect("read relay source");
+    assert!(
+        source.contains("#[cerulion_node]\n"),
+        "the scaffold emits a bare attribute for a data-triggered node; got:\n{source}"
+    );
+    std::fs::write(
+        &lib,
+        source.replace("#[cerulion_node]\n", "#[cerulion_node(throttle_ms = 5)]\n"),
+    )
+    .expect("write relay source");
+    write_graph(
+        &ws,
+        "capped",
+        r#"
+name: capped
+prefix: p
+nodes:
+  - id: n0
+    type: src
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: n1
+    type: relay
+    inputs:
+      - name: inp
+        source: n0/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: n2
+    type: sink
+    inputs:
+      - name: inp
+        source: n1/out
+"#,
+    );
+
+    let report = graph_cmd::graph_levels(&ws.root, "capped")
+        .expect("levels")
+        .rendered;
+    let expected = "\
+graph: capped  prefix: p
+levels source: derived (trigger-aware Kahn levelization)
+nodes: 3  levels: 3
+level 0: n0 [period(10ms)]
+  -> /p/n0/out  n0 -> n1 (level 1)
+level 1: n1 [data(inp)]
+  -> /p/n1/out  n1 -> n2 (level 2)
+level 2: n2 [data(inp)]
+chains: 1 fusable, 1 hop(s), 1 of 2 consumer edge(s) queued
+  colocation: one process (this graph declares no process_groups:; \
+`cerulion graph run` may derive a partition, and each run writes its own census into its \
+run directory)
+  chain 0  levels 1-2  2 nodes, 1 hop(s)
+    n1 -> n2  on /p/n1/out
+  queued by reason: throttle 1
+  queued  /p/n0/out  n0 -> n1.inp
+    throttle: the consumer declares `throttle_ms = 5`, and a direct call has nowhere to \
+defer to
+";
+    assert_eq!(
+        report, expected,
+        "the cap must refuse the hop INTO the capped node, and a capped node must still \
+         head a chain of its own"
     );
 }

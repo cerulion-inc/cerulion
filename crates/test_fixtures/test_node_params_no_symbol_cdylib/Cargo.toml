@@ -1,0 +1,21 @@
+[package]
+name = "test_node_params_no_symbol_cdylib"
+version = "0.1.0"
+edition = "2021"
+description = "Test cdylib whose node info declares params but exports no cerulion_node_init_with_params symbol"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Mirrors `test_node_cdylib`: `cerulion_node_init` reclaims the host's
+# `Box::into_raw(NodeContext)` via `Box::from_raw` so each init call
+# doesn't leak one NodeContext (the allocator-pairing contract). The tests
+# never reach init (`info()` refuses the library first), but the FFI surface
+# stays correct in case a future test drives init directly.
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

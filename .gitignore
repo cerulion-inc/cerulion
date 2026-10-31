@@ -49,6 +49,12 @@ Cargo.lock
 !/examples/perception/Cargo.lock
 !/examples/realsense/Cargo.lock
 !/examples/v4l2_camera/Cargo.lock
+# The Python wheel is an isolated workspace; its lock keeps the iceoryx2
+# family identical to the root pin.
+!/crates/cerulion_py/Cargo.lock
+# The Android sample's app runtime crate is an isolated workspace too; its
+# lock was seeded from the root lock, so it carries the same versions.
+!/crates/cerulion_android/android/runtime/Cargo.lock
 
 # Python
 __pycache__/
@@ -73,3 +79,7 @@ notes/
 # contributor keeps it inside the checkout and points LEAK_PATTERNS_FILE at it.
 # The list names what the guard scrubs, so it never ships.
 .leak-patterns.local
+
+# cargo-mutants output (the committed baseline is crates/cerulion_tf/mutants-baseline.txt)
+mutants.out/
+mutants.out.old/

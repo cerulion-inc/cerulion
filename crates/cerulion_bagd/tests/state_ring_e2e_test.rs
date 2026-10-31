@@ -45,7 +45,8 @@ use cerulion_bagd::{run_bagd, BagdConfig, BagdError, BagdSummary, StateCoverage,
 use cerulion_core::state_arm::MappedStateArm;
 use cerulion_core::state_ring::{
     encode_record, encode_skip_record, SkipCause, StateRecordHeader, StateRingOwner,
-    RECORD_KIND_CHUNK, RECORD_KIND_FINAL, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
+    RECORD_KIND_CHUNK_V2, RECORD_KIND_FINAL_V2, STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD,
+    STATE_RECORD_SIZE,
 };
 use cerulion_core::transport::TransportManager;
 
@@ -134,6 +135,21 @@ fn state_coverage(out: &std::path::Path) -> Option<StateCoverage> {
 /// carrying `tail_len` bytes. Hand-built, so the read-back comparison is against
 /// a value this test decided.
 fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>> {
+    anchor_on_rank(0, node_idx, step, parts, tail_len)
+}
+
+/// The same anchor, built for a NAMED rank.
+///
+/// Every record published on a producer must carry the rank of the ring it is
+/// published on, and the producer seam asserts it in a debug build. A test that
+/// drives a ring which is not rank 0 builds its records here.
+fn anchor_on_rank(
+    rank: u32,
+    node_idx: u32,
+    step: u64,
+    parts: u32,
+    tail_len: usize,
+) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(parts as usize);
     for part in 0..parts - 1 {
         out.push(
@@ -143,8 +159,10 @@ fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>>
                     step,
                     node_idx,
                     part,
-                    kind: RECORD_KIND_CHUNK,
+                    kind: RECORD_KIND_CHUNK_V2,
                     len: STATE_RECORD_PAYLOAD as u32,
+                    rank,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &vec![(0xA0 + node_idx as u8).wrapping_add(part as u8); STATE_RECORD_PAYLOAD],
             )
@@ -158,8 +176,10 @@ fn anchor(node_idx: u32, step: u64, parts: u32, tail_len: usize) -> Vec<Vec<u8>>
                 step,
                 node_idx,
                 part: parts - 1,
-                kind: RECORD_KIND_FINAL,
+                kind: RECORD_KIND_FINAL_V2,
                 len: tail_len as u32,
+                rank,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             },
             &vec![0x5A; tail_len],
         )
@@ -245,6 +265,20 @@ fn node_state_anchors_reach_the_bag_and_the_manifest_matches_a_hand_oracle() {
     // (b) the MANIFEST: the hand-computed tally.
     let cov = state_coverage(&out).expect("a checkpointed bag carries state_coverage.json");
     assert_eq!(cov.rings_declared, 1);
+    // The two keys a reader gates and joins on, written by the CONTINUOUS path:
+    // the seed states the record layout at bag creation and finalize fills the
+    // ring-to-rank map from the rings the writer holds. Without the first, a
+    // reader built after the format refuses every recording this build writes.
+    assert_eq!(
+        cov.state_record_format_version,
+        Some(cerulion_core::state_ring::STATE_RECORD_FORMAT_VERSION),
+        "a recording must say which record layout its records were written under"
+    );
+    assert_eq!(
+        cov.ring_ranks,
+        std::collections::BTreeMap::from([(owner.name().to_string(), 0u32)]),
+        "and which rank the ring it drained belonged to"
+    );
     assert!(cov.rings_unavailable.is_empty());
     assert_eq!(cov.records, expected.len() as u64);
     assert_eq!(cov.head_records_discarded, 0);
@@ -433,9 +467,11 @@ fn a_skipped_anchor_names_its_cause_and_is_not_an_escalation() {
         .expect("publish");
 
     let mut records = anchor(0, 10, 1, 3);
-    records.push(encode_skip_record(RUN, 20, 0, SkipCause::Contended, "node mutex held").to_vec());
     records
-        .push(encode_skip_record(RUN, 30, 0, SkipCause::StillEncoding, "a peer is busy").to_vec());
+        .push(encode_skip_record(RUN, 20, 0, 0, SkipCause::Contended, "node mutex held").to_vec());
+    records.push(
+        encode_skip_record(RUN, 30, 0, 0, SkipCause::StillEncoding, "a peer is busy").to_vec(),
+    );
     push_records(&mut owner, &records);
     finish(handle, &shutdown);
 
@@ -1455,9 +1491,11 @@ fn two_rings_emitting_the_same_unknown_index_are_kept_apart() {
     push_records(&mut ring_a, &a_records);
 
     // Ring B: its declared node anchors, and its stray index 1 is SKIPPED.
-    let mut b_records = anchor(0, 10, 1, 6);
+    // Ring B is RANK 1, so every record pushed onto it is built for rank 1: a
+    // record carries its producer's rank, and the seam says so in a debug build.
+    let mut b_records = anchor_on_rank(1, 0, 10, 1, 6);
     b_records
-        .push(encode_skip_record(RUN, 20, 1, SkipCause::LowMemory, "b's stray index").to_vec());
+        .push(encode_skip_record(RUN, 20, 1, 1, SkipCause::LowMemory, "b's stray index").to_vec());
     push_records(&mut ring_b, &b_records);
 
     finish(handle, &shutdown);

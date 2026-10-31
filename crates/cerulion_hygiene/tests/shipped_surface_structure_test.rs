@@ -405,12 +405,14 @@ fn collect_rs_files(dir: &Path, f: &mut impl FnMut(&Path)) {
 /// gate in CI".
 const GATE_CARRIERS: &[&str] = &[
     ".cargo/config.toml",
+    ".github/workflows/android-e2e.yml",
     ".github/workflows/examples-replay.yml",
     ".github/workflows/release-artifacts.yml",
     "benches/latency/check_percentile_parity.py",
     "benches/latency/workspace/run_workspace.sh",
     "tools/ros2_migrate/run_matrix.sh",
     "tools/scripts/verify_rmw_deb_container.sh",
+    "tools/scripts/android_emulator_e2e.sh",
 ];
 
 /// Files where the detector below sees an invocation that is not one: the
@@ -421,10 +423,6 @@ const NOT_AN_INVOCATION: &[(&str, &str)] = &[
     (
         "benches/latency/bench.py",
         "a sentence inside a multi-line message string",
-    ),
-    (
-        "tools/scripts/build_deb.sh",
-        "a sentence inside the package description text",
     ),
     (
         "tools/scripts/check_public_surface.py",
@@ -449,7 +447,15 @@ fn is_wrapper_token(tok: &str) -> bool {
     ) {
         return true;
     }
-    if t.starts_with('-') || t.starts_with('$') {
+    if t.starts_with('$') {
+        // A `"$CERULION"`-style variable head names the binary: the file
+        // builds its path into the variable, so it is NOT a wrapper.
+        // A `$...CER`/`...CERULION` variable names the binary itself
+        // (`$CERULION`, `$HOST_CER`, `$DEV_CER`): not a wrapper token.
+        let v = t.trim_matches(|c| c == '{' || c == '}');
+        return !(v.contains("CERULION") || v.ends_with("CER"));
+    }
+    if t.starts_with('-') {
         return true;
     }
     // A YAML key: `run: cerulion graph run demo` puts the command one token in.
@@ -472,30 +478,886 @@ fn is_wrapper_token(tok: &str) -> bool {
 /// it, and `cerulion --version` is not one either (clap answers it above the
 /// gate).
 fn runs_the_binary(text: &str) -> bool {
-    for line in strip_hash_comments(text).lines() {
-        for seg in line.split(['|', ';', '&']) {
-            let toks: Vec<&str> = seg.split_whitespace().collect();
-            let Some(head_at) = toks.iter().position(|t| !is_wrapper_token(t)) else {
-                continue;
-            };
-            let head = toks[head_at].trim_matches('"').trim_matches('\'');
-            let base = head.rsplit('/').next().unwrap_or(head);
-            if base != "cerulion" {
-                continue;
-            }
-            let Some(next) = toks.get(head_at + 1) else {
-                continue;
-            };
-            let verbish = next.starts_with(|c: char| c.is_ascii_lowercase())
-                && next
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-            if verbish {
-                return true;
-            }
+    strip_hash_comments(text).lines().any(line_runs_the_binary)
+}
+
+/// True when a line, on its own, sets the gate to `off` for the process that
+/// reads the file: a shell `export`, a workflow `env:` key, a cargo `[env]`
+/// entry or a Python `os.environ` write. The setting must open the line, so the
+/// same words inside a quoted command run somewhere else (an `adb shell`
+/// string) do not count.
+fn sets_the_gate_off(line: &str) -> bool {
+    let t = line.trim_start();
+    t == "export CERULION_LOGIN_GATE=off"
+        || t == "CERULION_LOGIN_GATE: \"off\""
+        || t == "CERULION_LOGIN_GATE = \"off\""
+        || t == "CERULION_LOGIN_GATE = { value = \"off\", force = true }"
+        || t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\""
+}
+
+/// The leading-space indent of a line.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// True when `text` sets the gate to `off` for the binary the file runs, in
+/// the shape `path` reads it: a workflow `env:` key counts only inside an
+/// `env:` block that covers the invocation - the workflow-level `env:`, or a
+/// job's `env:` in the job that runs the binary - and a TOML entry counts
+/// only inside `[env]`. A key in another job's `env:` or under a different
+/// TOML section does not apply to the process this file spawns.
+fn file_sets_the_gate_off(path: &Path, text: &str) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "yml" | "yaml" => workflow_sets_the_gate_off(text),
+        "toml" => toml_sets_the_gate_off(text),
+        _ => shell_sets_the_gate_off(text),
+    }
+}
+
+/// TOML: a `CERULION_LOGIN_GATE = "off"` line under `[env]` until the next
+/// section header.
+fn toml_sets_the_gate_off(text: &str) -> bool {
+    let mut in_env = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_env = t.starts_with("[env]");
+            continue;
+        }
+        if in_env
+            && (t == "CERULION_LOGIN_GATE = \"off\""
+                || t == "CERULION_LOGIN_GATE = { value = \"off\", force = true }")
+        {
+            return true;
         }
     }
     false
+}
+
+/// Workflow YAML: a `CERULION_LOGIN_GATE: "off"` key inside an `env:` block.
+/// A job-level `env:` covers only that job: it counts when the same job block
+/// runs the binary; the workflow-level `env:` covers every job.
+fn workflow_sets_the_gate_off(text: &str) -> bool {
+    // A narrower `env:` scope overrides a wider one for the same key: a
+    // workflow-level "off" does NOT disable the gate when the job or step
+    // that invokes the binary sets it to anything else. Resolve overrides
+    // BEFORE counting any "off".
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // (indent, line)
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("CERULION_LOGIN_GATE:") {
+            candidates.push((indent_of(line), i));
+        }
+    }
+    let _ = &candidates;
+    workflow_gate_off_uncovered(text)
+}
+
+fn workflow_gate_off_uncovered(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    // Job blocks: each key directly under the `jobs:` line.
+    let jobs_at = lines.iter().position(|l| l.trim_start() == "jobs:");
+    let mut job_spans: Vec<(usize, usize)> = Vec::new();
+    if let Some(jobs_at) = jobs_at {
+        let jobs_indent = indent_of(lines[jobs_at]);
+        // A job is a mapping key at the first indent level under `jobs:`;
+        // the section ends at the next same-or-shallower line.
+        // Job names sit at the first indent level under `jobs:`; deeper keys
+        // belong to the open job, and the section ends at the first
+        // same-or-shallower line.
+        let mut job_key_indent: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate().skip(jobs_at + 1) {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(line);
+            if ind <= jobs_indent {
+                break;
+            }
+            match job_key_indent {
+                None => job_key_indent = Some(ind),
+                Some(ki) if ind != ki => continue,
+                _ => {}
+            }
+            job_spans.push((i, usize::MAX));
+            let n = job_spans.len();
+            if n > 1 {
+                job_spans[n - 2].1 = i;
+            }
+        }
+    }
+    let mut found = false;
+    // env: blocks: (indent, start line). A key line counts when it is more
+    // deeply indented than the `env:` that opened before it and no
+    // same-or-shallower line closed that block.
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if !t.starts_with("CERULION_LOGIN_GATE:") {
+            continue;
+        }
+        // Find the innermost enclosing `env:` block.
+        let mut env_open: Option<(usize, usize)> = None;
+        for (j, prior) in lines.iter().enumerate().take(i) {
+            let pt = prior.trim_start();
+            if pt.is_empty() || pt.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(prior);
+            if let Some((_, env_i)) = env_open {
+                if ind <= indent_of(lines[env_i]) {
+                    env_open = None;
+                }
+            }
+            // `- env:` is a step item whose env applies to that step only.
+            if pt == "env:" || pt == "- env:" {
+                env_open = Some((ind, j));
+            }
+        }
+        let Some((_, env_i)) = env_open else {
+            continue;
+        };
+        if indent_of(lines[env_i]) == 0 {
+            // Workflow-level env: an "off" covers every invocation unless a
+            // narrower (job or step) env naming the gate overrides it; any
+            // non-off narrower scope wins.
+            if t == "CERULION_LOGIN_GATE: \"off\"" {
+                found = true;
+            }
+            continue;
+        }
+        // Scope the env to what it actually covers. Inside a step item it
+        // reaches ONLY that step: the same step must run the binary. At job
+        // level it covers the job's span (any step may invoke).
+        let Some(&(js, je)) = job_spans.iter().find(|&&(s, e)| s < env_i && env_i < e) else {
+            continue;
+        };
+        // Step items inside this job: each `- ` line under the job's
+        // `steps:` key opens a step at its own indent; the step's span ends
+        // at the next sibling `- ` or at the job's end.
+        let mut step_spans: Vec<(usize, usize)> = Vec::new();
+        let mut steps_indent: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate().take(je.min(lines.len())).skip(js) {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(line);
+            match steps_indent {
+                None => {
+                    if t == "steps:" {
+                        steps_indent = Some(ind);
+                    }
+                }
+                Some(si) => {
+                    if ind <= si {
+                        break; // job's next key closes the steps list
+                    }
+                    if t.starts_with('-') {
+                        step_spans.push((i, usize::MAX));
+                        let n = step_spans.len();
+                        if n > 1 {
+                            step_spans[n - 2].1 = i;
+                        }
+                    }
+                }
+            }
+        }
+        // `s <= env_i`: a `- env:` step opener IS the step's first line.
+        let covering_step = step_spans
+            .iter()
+            .find(|&&(s, e)| s <= env_i && env_i < e.min(lines.len()).min(je));
+        if let Some(&(ss, se)) = covering_step {
+            if lines[ss..se.min(lines.len()).min(je)]
+                .iter()
+                .any(|l| line_runs_the_binary(l))
+            {
+                // The step's own env is the innermost scope for its run.
+                if t == "CERULION_LOGIN_GATE: \"off\"" {
+                    found = true;
+                } else {
+                    // A non-off step env overrides any wider "off".
+                    return false;
+                }
+            }
+            continue;
+        }
+        // Job-level env (sibling of `steps:`, not inside a step): counts
+        // when the job's span runs the binary.
+        if lines[js..je.min(lines.len())]
+            .iter()
+            .any(|l| line_runs_the_binary(l))
+        {
+            if t == "CERULION_LOGIN_GATE: \"off\"" {
+                // The job env wins over a workflow "off" only if no
+                // STEP-level env inside the covering step overrides it.
+                let mut step_spans: Vec<(usize, usize)> = Vec::new();
+                let mut steps_indent: Option<usize> = None;
+                for (k, l2) in lines.iter().enumerate().take(je.min(lines.len())).skip(js) {
+                    let t2 = l2.trim_start();
+                    if t2.is_empty() || t2.starts_with('#') {
+                        continue;
+                    }
+                    let ind2 = indent_of(l2);
+                    match steps_indent {
+                        None => {
+                            if t2 == "steps:" {
+                                steps_indent = Some(ind2);
+                            }
+                        }
+                        Some(si) => {
+                            if ind2 <= si {
+                                break;
+                            }
+                            if t2.starts_with('-') {
+                                step_spans.push((k, usize::MAX));
+                                let n = step_spans.len();
+                                if n > 1 {
+                                    step_spans[n - 2].1 = k;
+                                }
+                            }
+                        }
+                    }
+                }
+                let overridden = step_spans.iter().any(|&(ss, se)| {
+                    lines[ss..se.min(lines.len()).min(je)]
+                        .iter()
+                        .any(|l| l.trim_start() == "CERULION_LOGIN_GATE: \"on\"")
+                });
+                if !overridden {
+                    found = true;
+                }
+            } else {
+                // A non-off job env overrides any wider "off" for its runs.
+                return false;
+            }
+        }
+    }
+    found
+}
+
+/// Shell files: an `export CERULION_LOGIN_GATE=off` counts only when it
+/// reaches every later command-position launch of the binary without its
+/// own gate override: it runs unconditionally (outside any skippable block,
+/// and - when it sits in a function body - only from an unconditional
+/// top-level call of that function). Only a standalone unconditional
+/// top-level re-export can restore coverage after a later assignment or
+/// `unset`; a per-command override applies only to its own command segment.
+/// YAML/TOML syntaxes (`KEY: "off"`,
+/// `KEY = "off"` without export...) are not shell settings and never count
+/// here. Python files use the `os.environ` form and its own reachability
+/// rules.
+fn shell_sets_the_gate_off(text: &str) -> bool {
+    let stripped = strip_hash_comments(text);
+    // A launch inside a remote-shell payload (`device "..."`, `adb shell
+    // "..."`) runs on the other host: the local export never reaches it, so
+    // the payload must set the gate itself, and it never counts as a covered
+    // local launch.
+    if !stripped.lines().all(|l| {
+        split_remote_shell_payload(l)
+            .1
+            .is_none_or(remote_payload_sets_its_own_gate)
+    }) {
+        return false;
+    }
+    let host_only: Vec<String> = stripped
+        .lines()
+        .map(|l| split_remote_shell_payload(l).0)
+        .collect();
+    let lines: Vec<&str> = host_only.iter().map(String::as_str).collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"" {
+            return python_write_reaches_child(&lines, i);
+        }
+        // Only `export` counts: a bare assignment is a shell variable that
+        // never reaches the child process's environment.
+        if t != "export CERULION_LOGIN_GATE=off" {
+            continue;
+        }
+        if shell_block_depth(&lines[..i]) > 0 {
+            continue;
+        }
+        // An export in a function body runs only when the function is
+        // called: the effective point is the first unconditional top-level
+        // call of that function after its definition.
+        let effective_at = match shell_enclosing_functions(&lines[..i]).as_slice() {
+            [] => i,
+            [name] => {
+                let call = (i + 1..lines.len()).find(|&k| {
+                    lines[k].split_whitespace().next() == Some(name.as_str())
+                        && shell_enclosing_functions(&lines[..k]).is_empty()
+                        && shell_block_depth(&lines[..k]) == 0
+                });
+                match call {
+                    Some(k) => k,
+                    None => continue,
+                }
+            }
+            // A nested function definition: too indirect to prove.
+            _ => continue,
+        };
+        let mut covered = true;
+        let mut saw_covered = false;
+        for (k, line) in lines.iter().enumerate().skip(effective_at + 1) {
+            if line.trim() == "export CERULION_LOGIN_GATE=off"
+                && shell_block_depth(&lines[..k]) == 0
+                && shell_enclosing_functions(&lines[..k]).is_empty()
+            {
+                covered = true;
+                continue;
+            }
+            for seg in line.split(['|', ';', '&']) {
+                if seg.trim().is_empty() {
+                    continue;
+                }
+                let overrides = shell_line_overrides_the_gate(seg);
+                if shell_line_launches_the_binary(seg) {
+                    if overrides {
+                        continue;
+                    }
+                    if covered {
+                        saw_covered = true;
+                    } else {
+                        return false;
+                    }
+                } else if overrides {
+                    covered = false;
+                }
+            }
+        }
+        if saw_covered {
+            return true;
+        }
+    }
+    false
+}
+
+/// Splits a shell line into its local part and the double-quoted payload it
+/// hands to a remote shell (`device "..."` or `... shell "..."`), if any. The
+/// local part keeps everything but the payload text.
+fn split_remote_shell_payload(line: &str) -> (String, Option<&str>) {
+    for opener in ["device \"", "shell \""] {
+        let mut from = 0;
+        while let Some(rel) = line[from..].find(opener) {
+            let at = from + rel;
+            from = at + opener.len();
+            let starts_word = line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace() || c == '(' || c == '"');
+            if !starts_word {
+                continue;
+            }
+            let body = &line[from..];
+            let mut escaped = false;
+            let close = body.char_indices().find_map(|(i, c)| {
+                let hit = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                hit.then_some(i)
+            });
+            let end = close.unwrap_or(body.len());
+            let payload = &body[..end];
+            let local = format!("{}{}", &line[..from], &body[end..]);
+            return (local, Some(payload));
+        }
+    }
+    (line.to_string(), None)
+}
+
+/// True when every launch of the binary inside a remote-shell payload sets
+/// the gate to `off` for itself: an `export ... CERULION_LOGIN_GATE=off`
+/// earlier in the payload, or a `CERULION_LOGIN_GATE=off` prefix on the
+/// launch's own command.
+fn remote_payload_sets_its_own_gate(payload: &str) -> bool {
+    let mut exported_off = false;
+    for seg in payload.split(['|', ';', '&']) {
+        let sets_off = seg
+            .split_whitespace()
+            .any(|t| t.trim_matches(['"', '\'']) == "CERULION_LOGIN_GATE=off");
+        let overrides = shell_line_overrides_the_gate(seg);
+        if sets_off && seg.trim_start().starts_with("export ") {
+            exported_off = true;
+        } else if overrides {
+            exported_off = false;
+        }
+        if shell_line_launches_the_binary(seg) && !(exported_off || sets_off) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Python: an `os.environ` write covers only subprocess calls made AFTER it,
+/// so it must run unconditionally before the file's first child launch.
+fn python_write_reaches_child(lines: &[&str], i: usize) -> bool {
+    let launches_child = |l: &str| {
+        let lt = l.trim_start();
+        lt.contains("subprocess.")
+            || lt.contains("os.system(")
+            || lt.contains("Popen(")
+            || lt.contains(".check_output(")
+            || lt.contains("os.spawn")
+    };
+    let first_launch = lines
+        .iter()
+        .position(|l| launches_child(l))
+        .unwrap_or(usize::MAX);
+    let Some(defs) = python_enclosing_defs(lines, i) else {
+        return false;
+    };
+    // Every enclosing function must be invoked after its definition and
+    // before the first child launch, by a call that is itself reachable:
+    // at module level or under unconditional headers, never under an
+    // `if False:` or inside another function body.
+    let called = defs.iter().all(|name| {
+        let call = format!("{name}(");
+        (i + 1..first_launch.min(lines.len())).any(|k| {
+            let lt = lines[k].trim_start();
+            (lt.starts_with(&call) || lt.starts_with(&format!("await {call}")))
+                && python_enclosing_defs(lines, k).is_some_and(|d| d.is_empty())
+        })
+    });
+    called && first_launch > i && first_launch != usize::MAX
+}
+
+/// The `def` names enclosing line `i`, innermost first, or `None` when an
+/// enclosing block header can skip the line. Unconditional headers are
+/// `class`, `try`/`except`/`finally`, and the `if __name__` idiom; anything
+/// else (`if False:`, `while`, `else`...) can skip it.
+fn python_enclosing_defs(lines: &[&str], i: usize) -> Option<Vec<String>> {
+    let mut floor = indent_of(lines[i]);
+    let mut defs = Vec::new();
+    for prior in lines[..i].iter().rev() {
+        let pt = prior.trim_end();
+        if pt.trim_start().is_empty() || pt.trim_start().starts_with('#') {
+            continue;
+        }
+        let ind = indent_of(prior);
+        if ind >= floor {
+            continue;
+        }
+        floor = ind;
+        if !pt.ends_with(':') {
+            continue;
+        }
+        let h = pt.trim_start();
+        if h.starts_with("def ") || h.starts_with("async def ") {
+            let name = h
+                .trim_start_matches("async ")
+                .trim_start_matches("def ")
+                .split(['(', ' ', ':'])
+                .next()
+                .unwrap_or("")
+                .to_string();
+            defs.push(name);
+            continue;
+        }
+        let unconditional = h.starts_with("class ")
+            || h == "try:"
+            || h.starts_with("except")
+            || h.starts_with("finally")
+            || h.starts_with("if __name__");
+        if !unconditional {
+            return None;
+        }
+    }
+    Some(defs)
+}
+
+/// How many skippable shell blocks (`if`, loops, `case`) are open after
+/// `prior`. Block keywords count only when they OPEN a line (so strings and
+/// mid-line noise never match) with their terminator present; closers match
+/// anywhere on the line so one-line `case...esac` forms balance.
+fn shell_block_depth(prior: &[&str]) -> usize {
+    let mut depth = 0usize;
+    for line in prior {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let opens = match toks.first() {
+            Some(&"if") => toks.contains(&"then"),
+            Some(&"while" | &"until" | &"select") => toks.contains(&"do"),
+            Some(&"for") => toks.contains(&"do") || toks.contains(&"in"),
+            Some(&"case") => toks.contains(&"in"),
+            _ => false,
+        };
+        if opens {
+            depth += 1;
+        }
+        depth = depth.saturating_sub(
+            toks.iter()
+                .filter(|t| matches!(**t, "fi" | "esac" | "done"))
+                .count(),
+        );
+    }
+    depth
+}
+
+/// The shell function bodies still open after `prior`, outermost first. A
+/// `NAME() {` or `function NAME {` line opens one, a bare `{` line opens a
+/// plain group, and a `}` line closes the innermost; a definition that
+/// closes on its own line opens nothing.
+fn shell_enclosing_functions(prior: &[&str]) -> Vec<String> {
+    let mut stack: Vec<Option<String>> = Vec::new();
+    for line in prior {
+        let t = line.trim();
+        if t.starts_with('}') {
+            stack.pop();
+            continue;
+        }
+        if !t.ends_with('{') {
+            continue;
+        }
+        let head = t.trim_end_matches('{').trim_end();
+        let name = head
+            .strip_prefix("function ")
+            .map(|n| n.trim().trim_end_matches("()").trim())
+            .or_else(|| head.strip_suffix("()").map(str::trim))
+            .filter(|n| {
+                !n.is_empty()
+                    && n.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            });
+        stack.push(name.map(str::to_string));
+    }
+    stack.into_iter().flatten().collect()
+}
+
+/// True when a shell line changes the gate away from `off`: an assignment or
+/// export with any other value (as a statement or a per-command prefix), an
+/// `unset`, or an `env -u` that drops it.
+fn shell_line_overrides_the_gate(line: &str) -> bool {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    for (k, tok) in toks.iter().enumerate() {
+        let tok = tok.trim_start_matches(['"', '\'', '(']);
+        if let Some(value) = tok.strip_prefix("CERULION_LOGIN_GATE=") {
+            let value = value.split([';', '"', '\'', ')']).next().unwrap_or("");
+            if value != "off" {
+                return true;
+            }
+        }
+        if tok.trim_end_matches([';', '"', '\'']) == "CERULION_LOGIN_GATE"
+            && k > 0
+            && matches!(toks[k - 1], "unset" | "-u")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a shell line launches the binary: the command head is the
+/// binary (see `line_runs_the_binary`), or a cerulion-carrying variable is
+/// handed with its verb to a launcher function (`ws_bound_launch "$CERULION"
+/// ros2 migrate`). A variable merely mentioned as an argument (`adb push ...
+/// "$DEV_CER"`) is not a launch.
+fn shell_line_launches_the_binary(line: &str) -> bool {
+    if line_runs_the_binary(line) {
+        return true;
+    }
+    line.split(['|', ';', '&']).any(|seg| {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        toks.windows(2).any(|w| {
+            let names_binary = w[0]
+                .trim_matches('"')
+                .trim_matches('\'')
+                .strip_prefix('$')
+                .map(|v| v.trim_matches(|c| c == '{' || c == '}'))
+                .is_some_and(|v| v.contains("CERULION") || v.ends_with("CER"));
+            names_binary && is_verb(w[1])
+        })
+    })
+}
+
+/// True when a token reads as a CLI verb: lowercase letters, digits, `-`.
+fn is_verb(tok: &str) -> bool {
+    tok.starts_with(|c: char| c.is_ascii_lowercase())
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// One line of `runs_the_binary`'s scan.
+fn line_runs_the_binary(line: &str) -> bool {
+    for seg in line.split(['|', ';', '&']) {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        let Some(head_at) = toks.iter().position(|t| !is_wrapper_token(t)) else {
+            continue;
+        };
+        let head = toks[head_at].trim_matches('"').trim_matches('\'');
+        let base = head.rsplit('/').next().unwrap_or(head);
+        // A `$`-head reaches here only when is_wrapper_token let a
+        // cerulion-carrying variable through.
+        if base != "cerulion" && !head.starts_with('$') {
+            continue;
+        }
+        let Some(next) = toks.get(head_at + 1) else {
+            continue;
+        };
+        if is_verb(next) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn only_a_line_that_sets_the_gate_for_its_own_process_counts_as_turning_it_off() {
+    for setting in [
+        "export CERULION_LOGIN_GATE=off",
+        "  CERULION_LOGIN_GATE: \"off\"",
+        "CERULION_LOGIN_GATE = \"off\"",
+        "CERULION_LOGIN_GATE = { value = \"off\", force = true }",
+        "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"",
+    ] {
+        assert!(sets_the_gate_off(setting), "{setting:?} sets the gate off");
+    }
+    for not_a_setting in [
+        "device \"export HOME=/tmp CERULION_LOGIN_GATE=off; cerulion topic list\"",
+        "  [[ \"$name\" == CERULION_LOGIN_GATE ]] || HOST_ENV+=(-u \"$name\")",
+        "# export CERULION_LOGIN_GATE=off",
+        "export CERULION_LOGIN_GATE=on",
+        "export CERULION_LOGIN_GATE=offline",
+        // A bare assignment is a shell variable: it never reaches the child
+        // process, so a later cerulion call still hits the gate.
+        "CERULION_LOGIN_GATE=off",
+        "  CERULION_LOGIN_GATE: \"Off\"",
+        "os.environ[\"CERULION_LOGIN_GATE\"] = \"0\"",
+        "subprocess.run([\"ls\"])\nos.environ[\"CERULION_LOGIN_GATE\"] = \"off\"",
+        "",
+    ] {
+        assert!(
+            !sets_the_gate_off(not_a_setting),
+            "{not_a_setting:?} does not set the gate off"
+        );
+    }
+}
+
+#[test]
+fn a_remote_shell_launch_needs_its_own_gate_setting_even_under_a_local_export() {
+    let sh = Path::new("run.sh");
+    let host = "export CERULION_LOGIN_GATE=off\n\"$HOST_CER\" topic list\n";
+    for carries_it in [
+        "device \"export HOME=/tmp CERULION_LOGIN_GATE=off; '$DEV_CER' topic list\"\n",
+        "out=\"$(device \"cd /d && export CERULION_LOGIN_GATE=off; timeout 8 '$DEV_CER' topic echo /t\" 2>&1)\"\n",
+        "adb shell \"CERULION_LOGIN_GATE=off '$DEV_CER' topic list\"\n",
+        "device \"chmod 755 '$DEV_CER'\"\n",
+    ] {
+        let text = format!("{host}{carries_it}");
+        assert!(
+            file_sets_the_gate_off(sh, &text),
+            "{carries_it:?} sets the gate for its own remote launch"
+        );
+    }
+    for misses_it in [
+        "device \"export HOME=/tmp; '$DEV_CER' topic list\"\n",
+        "out=\"$(device \"cd /d; timeout 8 '$DEV_CER' topic echo /t\" 2>&1)\"\n",
+        "adb shell \"'$DEV_CER' topic list\"\n",
+        "device \"export CERULION_LOGIN_GATE=off; unset CERULION_LOGIN_GATE; '$DEV_CER' topic list\"\n",
+    ] {
+        let text = format!("{host}{misses_it}");
+        assert!(
+            !file_sets_the_gate_off(sh, &text),
+            "{misses_it:?} launches on the remote host without the gate set there"
+        );
+    }
+    // A remote launch is not a covered local launch: with no local launch,
+    // the local export proves nothing.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ndevice \"export CERULION_LOGIN_GATE=off; '$DEV_CER' topic list\"\n"
+    ));
+}
+
+#[test]
+fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
+    let yml = Path::new("w.yml");
+    let toml = Path::new("config.toml");
+    // A workflow-level env: covers every job.
+    assert!(file_sets_the_gate_off(
+        yml,
+        "env:\n  CERULION_LOGIN_GATE: \"off\"\njobs:\n  run:\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A job env: counts when that job runs the binary.
+    assert!(file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    env:\n      CERULION_LOGIN_GATE: \"off\"\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A job env: in a DIFFERENT job does not reach the binary.
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "jobs:\n  other:\n    env:\n      CERULION_LOGIN_GATE: \"off\"\n    steps:\n      - run: echo hi\n  run:\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // A STEP-level env: reaches only its own step, never a sibling.
+    assert!(file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    steps:\n      - env:\n          CERULION_LOGIN_GATE: \"off\"\n        run: cerulion graph run demo\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    steps:\n      - env:\n          CERULION_LOGIN_GATE: \"off\"\n        run: echo sibling\n      - run: cerulion graph run demo\n"
+    ));
+    // Shell files: an export must precede the invocation.
+    let sh = Path::new("run.sh");
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "cerulion topic list\nexport CERULION_LOGIN_GATE=off\n"
+    ));
+    // YAML syntax in a shell file is not a shell setting.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "CERULION_LOGIN_GATE: \"off\"\ncerulion topic list\n"
+    ));
+    // A bare key outside any env: block is not a setting.
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "jobs:\n  run:\n    steps:\n      - run: cerulion graph run demo\n    CERULION_LOGIN_GATE: \"off\"\n"
+    ));
+    // A narrower scope overrides a wider "off": a job env naming the gate
+    // with any other value wins for the runs its job covers.
+    assert!(!file_sets_the_gate_off(
+        yml,
+        "env:\n  CERULION_LOGIN_GATE: \"off\"\njobs:\n  run:\n    env:\n      CERULION_LOGIN_GATE: \"on\"\n    steps:\n      - run: cerulion graph run demo\n"
+    ));
+    // Python: an os.environ write must precede the first child launch in the
+    // same file - a write after the subprocess call covers nothing.
+    let py = Path::new("check.py");
+    assert!(file_sets_the_gate_off(
+        py,
+        "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        py,
+        "subprocess.run([\"cerulion\", \"topic\", \"list\"])\nos.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\n"
+    ));
+    // Python: a write guarded under an `if False:` (or any conditional)
+    // never executes, so it cannot disable the gate.
+    assert!(!file_sets_the_gate_off(
+        py,
+        "if False:\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    // Python: a write inside a `def` counts only when the function is
+    // actually invoked before the first child launch.
+    assert!(file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsetup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    // Shell: an export inside a skipped branch never reaches the binary.
+    let sh = Path::new("check.sh");
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "if [ -n \"$SKIP\" ]; then\n    export CERULION_LOGIN_GATE=off\nfi\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "while false; do\n    export CERULION_LOGIN_GATE=off\ndone\ncerulion topic list\n"
+    ));
+    // Python: the call to the setup function must itself be reachable; a
+    // call under `if False:` or inside another, uncalled function never runs.
+    assert!(!file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\nif False:\n    setup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        py,
+        "def setup():\n    os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"\ndef never():\n    setup()\nsubprocess.run([\"cerulion\", \"topic\", \"list\"])\n"
+    ));
+    // Shell: an export inside a function body counts only when the function
+    // is called unconditionally at top level before the launch.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "setup() {\n    export CERULION_LOGIN_GATE=off\n}\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "setup() {\n    export CERULION_LOGIN_GATE=off\n}\nif false; then\n    setup\nfi\ncerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "setup() {\n    export CERULION_LOGIN_GATE=off\n}\nsetup\ncerulion topic list\n"
+    ));
+    // Shell: only a command-position launch counts; a variable that merely
+    // appears as an argument (`adb push ... "$DEV_CER"`) runs nothing.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\nadb push \"$ROOT/cerulion\" \"$DEV_CER\" >/dev/null\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\nws_bound_launch \"$CERULION\" ros2 migrate\n"
+    ));
+    // Shell: a covered launch is not enough if a later launch comes after an
+    // assignment or unset; a top-level re-export restores coverage, and an
+    // inline override applies only to its own launch.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\ncerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nexport CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nfalse && export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\ntrue || export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nif [ -n \"$X\" ]; then export CERULION_LOGIN_GATE=off; fi\ncerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nCERULION_LOGIN_GATE=on cerulion topic list\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE; cerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nCERULION_LOGIN_GATE=on cerulion topic list; cerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list && unset CERULION_LOGIN_GATE && cerulion topic list\n"
+    ));
+    for overridden in [
+        "export CERULION_LOGIN_GATE=off\nexport CERULION_LOGIN_GATE=on\ncerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nCERULION_LOGIN_GATE=on\ncerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nunset CERULION_LOGIN_GATE\ncerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nCERULION_LOGIN_GATE=on cerulion topic list\n",
+        "export CERULION_LOGIN_GATE=off\nenv -u CERULION_LOGIN_GATE \"$HOST_CER\" topic list\n",
+    ] {
+        assert!(
+            !file_sets_the_gate_off(sh, overridden),
+            "{overridden:?} overrides the gate before the launch"
+        );
+    }
+    // TOML: only under [env].
+    assert!(file_sets_the_gate_off(
+        toml,
+        "[env]\nCERULION_LOGIN_GATE = \"off\"\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        toml,
+        "[alias]\nCERULION_LOGIN_GATE = \"off\"\n[env]\nOTHER = \"x\"\n"
+    ));
 }
 
 #[test]
@@ -506,14 +1368,11 @@ fn everything_that_runs_the_binary_outside_cargo_turns_the_login_gate_off() {
     for carrier in GATE_CARRIERS {
         let text = read(&root.join(carrier));
         assert!(
-            text.contains("CERULION_LOGIN_GATE"),
-            "{carrier} runs the cerulion binary outside cargo but does not set \
-             CERULION_LOGIN_GATE (docs/internals/ci-and-gates.md, \"The login gate in CI\")"
-        );
-        assert!(
-            text.contains("\"off\"") || text.contains("=off") || text.contains("] = \"off\""),
-            "{carrier} names CERULION_LOGIN_GATE but not the value `off`, which the gate \
-             matches byte for byte"
+            file_sets_the_gate_off(&root.join(carrier), &text),
+            "{carrier} runs the cerulion binary outside cargo but has no line that sets \
+             CERULION_LOGIN_GATE to `off` for its own process (docs/internals/ci-and-gates.md, \
+             \"The login gate in CI\"); a mention inside a quoted command for another host \
+             does not count"
         );
     }
     // Then the walk: anything else that invokes the binary is undeclared.

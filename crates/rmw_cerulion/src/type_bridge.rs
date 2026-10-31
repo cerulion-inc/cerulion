@@ -119,13 +119,179 @@ struct RosString {
     capacity: usize,
 }
 
-/// rosidl C sequence header: `{ data: *mut T, size, capacity }` — every
-/// generated sequence type shares this layout.
+/// rosidl C sequence header: `{ data: *mut T, size, capacity }`. This is
+/// the whole struct of every generated MESSAGE sequence on every era
+/// (rosidl_generator_c's msg__struct template never grew), and the common
+/// prefix of every other sequence kind. Primitive and string sequences
+/// (the `ROSIDL_RUNTIME_C__PRIMITIVE_SEQUENCE` macro, which `string.h`
+/// uses too) append two flags from Lyrical on; see [`RosPrimitiveSequence`].
 #[repr(C)]
 struct RosSequence {
     data: *mut u8,
     size: usize,
     capacity: usize,
+}
+
+/// Lyrical and Rolling primitive or string sequence: the header plus
+/// `is_rosidl_buffer` (when set, `data` points at a `rosidl::Buffer<T>`
+/// object rather than at `T` elements) and `owns_rosidl_buffer`. A
+/// Buffer-backed instance is never freed or forged by this bridge: publish
+/// reads its bytes through [`crate::rosidl_buffer`] (copying a non-CPU
+/// backend to host memory), and take fills an owned Buffer in place or
+/// detaches from one it does not own ([`fill_buffer_backed_sequence`]).
+/// Message sequences never carry the flags, so this mirror is only ever
+/// laid over a non-message member's field.
+#[cfg(cerulion_has_is_rosidl_buffer)]
+#[repr(C)]
+struct RosPrimitiveSequence {
+    data: *mut u8,
+    size: usize,
+    capacity: usize,
+    is_rosidl_buffer: bool,
+    owns_rosidl_buffer: bool,
+}
+
+// The hand-written mirrors must be exactly the generated structs on every
+// era: a mirror that lags (or leads) its era reads or writes the wrong
+// bytes of every sequence field. The primitive and string sequences are
+// pinned to their bindgen twins on every era; on the era that grew them,
+// the message sequence is pinned to a bindgen message sequence to prove it
+// did NOT grow.
+#[cfg(cerulion_has_is_rosidl_buffer)]
+const _: () = assert!(
+    std::mem::size_of::<RosPrimitiveSequence>()
+        == std::mem::size_of::<ffi::rosidl_runtime_c__uint8__Sequence>()
+        && std::mem::size_of::<RosPrimitiveSequence>()
+            == std::mem::size_of::<ffi::rosidl_runtime_c__String__Sequence>()
+        && std::mem::size_of::<RosSequence>()
+            == std::mem::size_of::<ffi::rosidl_runtime_c__type_description__Field__Sequence>(),
+    "sequence mirrors must match their bindgen twins (Lyrical layout)"
+);
+#[cfg(not(cerulion_has_is_rosidl_buffer))]
+const _: () = assert!(
+    std::mem::size_of::<RosSequence>()
+        == std::mem::size_of::<ffi::rosidl_runtime_c__uint8__Sequence>()
+        && std::mem::size_of::<RosSequence>()
+            == std::mem::size_of::<ffi::rosidl_runtime_c__String__Sequence>(),
+    "sequence mirror must match its bindgen twins (one shape before Lyrical)"
+);
+
+/// Is this primitive-or-string sequence INSTANCE Buffer-backed (Lyrical
+/// and Rolling: `data` points at a `rosidl::Buffer<T>` object, not at
+/// elements)? `seq` MUST be a primitive or string sequence: only those
+/// carry the flag (a message sequence is 24 bytes and reading a flag past
+/// it would read the next field). Never true before Lyrical.
+unsafe fn prim_seq_is_rosidl_buffer(seq: *const RosSequence) -> bool {
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    {
+        (*(seq as *const RosPrimitiveSequence)).is_rosidl_buffer
+    }
+    #[cfg(not(cerulion_has_is_rosidl_buffer))]
+    {
+        let _ = seq;
+        false
+    }
+}
+
+/// Member-aware form of [`prim_seq_is_rosidl_buffer`]: a message sequence
+/// has no flag and is never Buffer-backed.
+unsafe fn seq_is_rosidl_buffer(
+    member: &ffi::rosidl_typesupport_introspection_c__MessageMember,
+    seq: *const RosSequence,
+) -> bool {
+    member.type_id_ != ros_type::MESSAGE && prim_seq_is_rosidl_buffer(seq)
+}
+
+/// [`seq_is_rosidl_buffer`] for a member that may be an inline fixed array
+/// (which has no sequence header to read a flag from).
+unsafe fn is_buffer_backed_instance(
+    member: &ffi::rosidl_typesupport_introspection_c__MessageMember,
+    field_ptr: *const c_void,
+) -> bool {
+    (member.array_size_ == 0 || member.is_upper_bound_)
+        && seq_is_rosidl_buffer(member, field_ptr as *const RosSequence)
+}
+
+/// The `rosidl::Buffer<uint8_t>` a Buffer-backed instance points at. rosidl
+/// itself treats `data` of every flagged sequence as a
+/// `rosidl::Buffer<uint8_t>` (`rosidl_buffer_uint8_destroy` in each
+/// sequence `fini`), so only a byte-element sequence is accepted.
+unsafe fn buffer_of(
+    seq: *const RosSequence,
+    elem_size: usize,
+) -> Result<*mut c_void, &'static str> {
+    if elem_size != 1 {
+        return Err("a rosidl Buffer-backed sequence whose elements are not bytes");
+    }
+    let buf = (*seq).data as *mut c_void;
+    if buf.is_null() {
+        return Err("a rosidl Buffer-backed sequence with a null Buffer");
+    }
+    Ok(buf)
+}
+
+/// Element count of a Buffer-backed instance, on any backend.
+unsafe fn buffer_seq_len(seq: *const RosSequence, elem_size: usize) -> Result<usize, &'static str> {
+    crate::rosidl_buffer::len_u8(buffer_of(seq, elem_size)?)
+}
+
+/// Bytes of a Buffer-backed instance; a non-CPU backend is copied to host
+/// memory (and counted, see [`crate::rosidl_buffer`]).
+unsafe fn buffer_seq_bytes(
+    seq: *const RosSequence,
+    elem_size: usize,
+) -> Result<crate::rosidl_buffer::BufferBytes, &'static str> {
+    crate::rosidl_buffer::read_u8(buffer_of(seq, elem_size)?)
+}
+
+/// What [`fill_buffer_backed_sequence`] did. Before Lyrical only `Refused`
+/// is reachable (no instance is ever Buffer-backed there).
+#[cfg_attr(not(cerulion_has_is_rosidl_buffer), allow(dead_code))]
+enum BufferFill {
+    /// The owned Buffer now holds the bytes on the CPU backend.
+    Filled,
+    /// Nothing was written (a non-byte or null Buffer, or a failed
+    /// allocation): the take refuses the frame.
+    Refused,
+    /// The sequence no longer refers to the Buffer it did not own, and is
+    /// an empty plain sequence for the caller to fill.
+    Detached,
+}
+
+/// Fill a Buffer-backed instance on take, honouring `owns_rosidl_buffer`.
+unsafe fn fill_buffer_backed_sequence(
+    seq: *mut RosSequence,
+    bytes: &[u8],
+    elem_size: usize,
+) -> BufferFill {
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    {
+        let prim = &mut *(seq as *mut RosPrimitiveSequence);
+        if !prim.owns_rosidl_buffer {
+            prim.data = std::ptr::null_mut();
+            prim.size = 0;
+            prim.capacity = 0;
+            prim.is_rosidl_buffer = false;
+            return BufferFill::Detached;
+        }
+        let Ok(buf) = buffer_of(seq, elem_size) else {
+            return BufferFill::Refused;
+        };
+        if crate::rosidl_buffer::assign_u8(buf, bytes) {
+            // The header shape rosidl_typesupport_fastrtps writes for a
+            // Buffer-backed sequence: the Buffer's size, no capacity.
+            prim.size = bytes.len();
+            prim.capacity = 0;
+            BufferFill::Filled
+        } else {
+            BufferFill::Refused
+        }
+    }
+    #[cfg(not(cerulion_has_is_rosidl_buffer))]
+    {
+        let _ = (seq, bytes, elem_size);
+        BufferFill::Refused
+    }
 }
 
 /// Bridge-level errors. Every variant names the offending type/field.
@@ -441,7 +607,11 @@ enum FieldOp {
     /// `string` field → variable entry: raw UTF-8.
     String { c_offset: usize, var_idx: usize },
     /// Primitive sequence (`T[]`/bounded) → variable entry: raw LE
-    /// element bytes, offset aligned to element alignment.
+    /// element bytes, offset aligned to element alignment. Planned only
+    /// for primitive element types (see [`plan_field_op`]), never for a
+    /// message sequence, so every arm may read the Lyrical instance flag
+    /// through [`prim_seq_is_rosidl_buffer`] in bounds, and every arm
+    /// that reads the header does: a Buffer-backed instance is refused.
     PrimSeq {
         c_offset: usize,
         var_idx: usize,
@@ -927,32 +1097,40 @@ impl BridgedMessage {
                     let bit = forge_idx;
                     forge_idx += 1;
                     let seq = shadow.add(*c_offset) as *mut RosSequence;
-                    match read_var_entry(payload, table_base, *var_idx) {
-                        // An empty entry has nothing to alias: the empty header,
-                        // recorded as forged so the un-forge stays uniform.
-                        Some([]) => {
-                            *seq = EMPTY_ROS_SEQUENCE;
-                            outcome.forged |= mask_bit(bit);
-                            true
-                        }
-                        Some(bytes) if bytes.len().is_multiple_of(*elem_size) => {
-                            match forge_placement(payload, bytes, *elem_size, data_floor, bit) {
-                                ForgePlacement::Forge => {
-                                    let seq = &mut *seq;
-                                    seq.data = bytes.as_ptr() as *mut u8;
-                                    seq.size = bytes.len() / elem_size;
-                                    seq.capacity = seq.size;
-                                    outcome.forged |= mask_bit(bit);
-                                    true
-                                }
-                                ForgePlacement::Copy { below_floor } => {
-                                    outcome.below_floor += usize::from(below_floor);
-                                    assign_prim_sequence(seq, bytes, *elem_size)
-                                }
-                                ForgePlacement::Malformed => false,
+                    // A forgeable member is never a Buffer member, so its
+                    // instance carries no Buffer; one that does anyway is
+                    // refused (false), never aimed at the sample and never
+                    // copied into a shadow that is recycled untainted.
+                    if prim_seq_is_rosidl_buffer(seq) {
+                        false
+                    } else {
+                        match read_var_entry(payload, table_base, *var_idx) {
+                            // An empty entry has nothing to alias: the empty header,
+                            // recorded as forged so the un-forge stays uniform.
+                            Some([]) => {
+                                *seq = EMPTY_ROS_SEQUENCE;
+                                outcome.forged |= mask_bit(bit);
+                                true
                             }
+                            Some(bytes) if bytes.len().is_multiple_of(*elem_size) => {
+                                match forge_placement(payload, bytes, *elem_size, data_floor, bit) {
+                                    ForgePlacement::Forge => {
+                                        let seq = &mut *seq;
+                                        seq.data = bytes.as_ptr() as *mut u8;
+                                        seq.size = bytes.len() / elem_size;
+                                        seq.capacity = seq.size;
+                                        outcome.forged |= mask_bit(bit);
+                                        true
+                                    }
+                                    ForgePlacement::Copy { below_floor } => {
+                                        outcome.below_floor += usize::from(below_floor);
+                                        assign_prim_sequence(seq, bytes, *elem_size)
+                                    }
+                                    ForgePlacement::Malformed => false,
+                                }
+                            }
+                            _ => false,
                         }
-                        _ => false,
                     }
                 }
                 FieldOp::Complex {
@@ -1233,6 +1411,13 @@ impl BridgedMessage {
                 // `free` with a shared-memory address. An empty `/scan`
                 // published twice reaches it. `capacity == 0` owns
                 // nothing, whatever `data` says.
+                // A Buffer-backed instance is not this bridge's to free or
+                // reset (the forge never produces one; a user's is left as
+                // is). A PrimSeq op is a primitive sequence by construction
+                // (`is_forgeable_sequence`), so the flag read is in bounds.
+                if prim_seq_is_rosidl_buffer(seq) {
+                    continue;
+                }
                 if seq.capacity > 0 && !seq.data.is_null() {
                     libc_free(seq.data);
                 }
@@ -1329,8 +1514,16 @@ impl BridgedMessage {
                     ..
                 } => {
                     let seq = &*(c_msg.add(*c_offset) as *const RosSequence);
-                    let byte_len = seq
-                        .size
+                    // A Buffer-backed instance (Lyrical, Rolling) keeps a
+                    // `rosidl::Buffer<uint8_t>` behind `data`: its element
+                    // count comes from the Buffer, on any backend, and the
+                    // write pass reads its bytes through the shim.
+                    let count = if prim_seq_is_rosidl_buffer(seq) {
+                        buffer_seq_len(seq, *elem_size).map_err(|d| self.encode_err(d))?
+                    } else {
+                        seq.size
+                    };
+                    let byte_len = count
                         .checked_mul(*elem_size)
                         .filter(|&n| n <= MAX_FRAME_BYTES)
                         .ok_or_else(|| {
@@ -1348,9 +1541,12 @@ impl BridgedMessage {
                 } => {
                     // Complex fields are small (Headers, string arrays);
                     // sizing them by encoding into a scratch buffer keeps
-                    // ONE codec (no size-only twin that could drift).
+                    // ONE codec (no size-only twin that could drift). The
+                    // sizing mark keeps a nested Buffer from being copied
+                    // to host memory just to be measured.
                     let member = self.member(*member_index);
                     let mut buf = Vec::new();
+                    let _sizing = crate::rosidl_buffer::SizingPass::open();
                     encode_complex(&self.nested_layouts, member, c_msg.add(*c_offset), &mut buf)
                         .map_err(|d| self.encode_err(d))?;
                     size = add_var_size(size, buf.len(), 1).map_err(|d| self.encode_err(d))?;
@@ -1459,6 +1655,23 @@ impl BridgedMessage {
                     forge: _,
                 } => {
                     let seq = &*(c_msg.add(*c_offset) as *const RosSequence);
+                    if prim_seq_is_rosidl_buffer(seq) {
+                        // A non-CPU backend is copied to host memory here; the
+                        // copy must be as long as the Buffer the size pass
+                        // measured.
+                        let want =
+                            buffer_seq_len(seq, *elem_size).map_err(|d| self.encode_err(d))?;
+                        let bytes =
+                            buffer_seq_bytes(seq, *elem_size).map_err(|d| self.encode_err(d))?;
+                        if bytes.as_slice().len() != want {
+                            return Err(self.encode_err(
+                                "the rosidl Buffer's length changed between the size and copy passes",
+                            ));
+                        }
+                        cursor_append_var(&mut cur, table_base, *var_idx, bytes.as_slice(), 1)
+                            .map_err(|d| self.encode_err(d))?;
+                        continue;
+                    }
                     let count = seq.size; // single read in the write pass
                                           // Bound BEFORE forming the slice — `from_raw_parts`
                                           // with a corrupt huge length is UB by itself.
@@ -1512,6 +1725,7 @@ impl BridgedMessage {
             offset_table_count: self.layout.variable_fields.len() as u32,
             sequence,
             timestamp_ns,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut head = [0u8; WireHeader::SIZE];
         header.write_to_buf(&mut head);
@@ -1910,6 +2124,13 @@ unsafe fn is_forgeable_sequence(
     member: &ffi::rosidl_typesupport_introspection_c__MessageMember,
     field_type: &FieldType,
 ) -> bool {
+    // Lyrical and Rolling: a member the typesupport marks as a rosidl
+    // Buffer (`uint8[]`) may hold a Buffer object behind `data`; the forge
+    // writes a plain element triplet, so it never touches such a member.
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    if member.is_rosidl_buffer_ {
+        return false;
+    }
     let element_is_forgeable = match field_type {
         FieldType::Bytes => true,
         FieldType::DynamicArray { element_type } => matches!(
@@ -2170,7 +2391,7 @@ unsafe fn encode_complex(
     out: &mut Vec<u8>,
 ) -> Result<(), &'static str> {
     if member.is_array_ {
-        let (count, elem_base, stride) = sequence_view(member, field_ptr);
+        let (count, elem_base, stride) = sequence_view(member, field_ptr)?;
         check_seq_bound(count, stride)?;
         if count > 0 && elem_base.is_null() {
             return Err("sequence has null data with nonzero size");
@@ -2360,8 +2581,20 @@ unsafe fn encode_message_payload(
             buf.extend_from_slice(ros_string_bytes(s)?);
         } else if member.type_id_ == ros_type::MESSAGE && !member.is_array_ {
             encode_message_payload(layouts, nested_members_of(member), field_ptr, &mut buf)?;
+        } else if member.is_array_
+            && is_primitive_type(member.type_id_)
+            && is_buffer_backed_instance(member, field_ptr)
+        {
+            let seq = field_ptr as *const RosSequence;
+            let elem = primitive_size(member.type_id_);
+            if crate::rosidl_buffer::sizing() {
+                // Measured, not shipped: the Buffer's own length in zeros.
+                buf.resize(buffer_seq_len(seq, elem)?, 0);
+            } else {
+                buf.extend_from_slice(buffer_seq_bytes(seq, elem)?.as_slice());
+            }
         } else if member.is_array_ && is_primitive_type(member.type_id_) {
-            let (count, base, stride) = sequence_view(member, field_ptr);
+            let (count, base, stride) = sequence_view(member, field_ptr)?;
             check_seq_bound(count, stride)?;
             if count > 0 && base.is_null() {
                 return Err("sequence has null data with nonzero size");
@@ -2508,7 +2741,7 @@ pub(crate) fn is_primitive_type(type_id: u8) -> bool {
 unsafe fn sequence_view(
     member: &ffi::rosidl_typesupport_introspection_c__MessageMember,
     field_ptr: *const c_void,
-) -> (usize, *const u8, usize) {
+) -> Result<(usize, *const u8, usize), &'static str> {
     let stride = if member.type_id_ == ros_type::MESSAGE {
         (*nested_members_of(member)).size_of_
     } else if member.type_id_ == ros_type::STRING {
@@ -2518,10 +2751,15 @@ unsafe fn sequence_view(
     };
     if member.array_size_ > 0 && !member.is_upper_bound_ {
         // Inline fixed array.
-        (member.array_size_, field_ptr as *const u8, stride)
+        Ok((member.array_size_, field_ptr as *const u8, stride))
     } else {
         let seq = &*(field_ptr as *const RosSequence);
-        (seq.size, seq.data as *const u8, stride)
+        // A Buffer-backed instance holds a Buffer object behind `data`, not
+        // elements: it cannot be read as bytes, so the frame is refused.
+        if seq_is_rosidl_buffer(member, seq) {
+            return Err("sequence instance is a rosidl Buffer, not readable as bytes");
+        }
+        Ok((seq.size, seq.data as *const u8, stride))
     }
 }
 
@@ -2721,6 +2959,11 @@ unsafe fn prepare_sequence(
         return Some(field_ptr as *mut u8);
     }
     let seq = &mut *(field_ptr as *mut RosSequence);
+    // A Buffer-backed instance cannot be filled by this bridge: refuse the
+    // frame rather than free a Buffer object and overwrite its pointer.
+    if seq_is_rosidl_buffer(member, seq) {
+        return None;
+    }
     // NOTE: prior element contents (strings/nested sequences) were
     // allocated by rosidl init or a previous take; freeing just the
     // backing array would leak their internals. rmw_take's contract is
@@ -2797,6 +3040,19 @@ unsafe fn assign_ros_string(s: *mut RosString, bytes: &[u8]) -> bool {
 
 /// Returns false on allocation failure — see [`assign_ros_string`].
 unsafe fn assign_prim_sequence(seq: *mut RosSequence, bytes: &[u8], _elem_size: usize) -> bool {
+    // A Buffer-backed instance (every caller hands a primitive sequence,
+    // so the flag read is in bounds) honours `owns_rosidl_buffer`: an owned
+    // Buffer is filled in place as a CPU Buffer, which the sequence's `fini`
+    // later destroys; a Buffer the sequence does not own is neither freed
+    // nor written, and the sequence is detached from it and filled as a
+    // plain sequence below.
+    if prim_seq_is_rosidl_buffer(seq) {
+        match fill_buffer_backed_sequence(seq, bytes, _elem_size) {
+            BufferFill::Filled => return true,
+            BufferFill::Refused => return false,
+            BufferFill::Detached => {}
+        }
+    }
     let seq = &mut *seq;
     if !seq.data.is_null() {
         libc_free(seq.data);
@@ -2894,7 +3150,7 @@ pub(crate) fn align_up(value: usize, align: usize) -> usize {
 //
 // `rmw_borrow_loaned_message` for a windowed type loans ONE slot shaped
 //
-//   [WireHeader 32][C struct: c_size][zeroed remnant][window TAIL …]
+//   [WireHeader 40][C struct: c_size][zeroed remnant][window TAIL …]
 //                  ^payload 0        ^data_floor     ^tail_off
 //
 // hands rclcpp the C struct pointer (constructed in the slot by the
@@ -3458,6 +3714,25 @@ impl BridgedMessage {
                     ..
                 } => {
                     let seq = &*(c_msg.add(*c_offset) as *const RosSequence);
+                    // A Buffer-backed instance is never adopted: its bytes
+                    // (a host copy for a non-CPU backend) go into the owned
+                    // arena before the commit runs `fini`.
+                    if prim_seq_is_rosidl_buffer(seq) {
+                        let bytes = buffer_seq_bytes(seq, *elem_size)
+                            .map_err(|d| SealRefusal::Encode(self.encode_err(d)))?;
+                        if bytes.as_slice().is_empty() {
+                            items.push(SealItem::Empty { forgeable: false });
+                        } else {
+                            let start = owned.len();
+                            owned.extend_from_slice(bytes.as_slice());
+                            items.push(SealItem::CopyOwned {
+                                start,
+                                len: owned.len() - start,
+                                align: 1,
+                            });
+                        }
+                        continue;
+                    }
                     let byte_len = seq
                         .size
                         .checked_mul(*elem_size)
@@ -3794,5 +4069,125 @@ mod borrow_seal_plan_tests {
     #[test]
     fn empty_copy_set_plans_nothing_and_clears_stale_state() {
         assert_eq!(plan_offsets(500, 1000, &[]), Ok(vec![]));
+    }
+}
+
+#[cfg(all(test, cerulion_has_is_rosidl_buffer))]
+mod lyrical_buffer_tests {
+    use super::*;
+
+    fn sequence_member(
+        type_id: u8,
+        is_rosidl_buffer: bool,
+    ) -> ffi::rosidl_typesupport_introspection_c__MessageMember {
+        ffi::rosidl_typesupport_introspection_c__MessageMember {
+            type_id_: type_id,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            default_value_: std::ptr::null(),
+            is_rosidl_buffer_: is_rosidl_buffer,
+            ..Default::default()
+        }
+    }
+
+    /// The typesupport's Buffer flag is the ONLY difference between the two
+    /// members: the flagged one is never forged, the plain one is.
+    #[test]
+    fn a_rosidl_buffer_member_is_never_forged_on_the_c_path() {
+        let flagged = sequence_member(ros_type::UINT8, true);
+        let plain = sequence_member(ros_type::UINT8, false);
+        unsafe {
+            assert!(!is_forgeable_sequence(&flagged, &FieldType::Bytes));
+            assert!(is_forgeable_sequence(&plain, &FieldType::Bytes));
+        }
+    }
+
+    /// A Buffer-backed primitive INSTANCE the sequence does NOT own is
+    /// neither freed nor read by the fill: the sequence detaches from it and
+    /// is filled as a plain sequence (a bogus non-null pointer would crash
+    /// the test if it were dereferenced or freed).
+    #[test]
+    fn a_borrowed_buffer_instance_is_detached_never_freed_or_read() {
+        let mut seq = RosPrimitiveSequence {
+            data: 0x10 as *mut u8,
+            size: 3,
+            capacity: 3,
+            is_rosidl_buffer: true,
+            owns_rosidl_buffer: false,
+        };
+        let header = &mut seq as *mut RosPrimitiveSequence as *mut RosSequence;
+        unsafe {
+            assert!(prim_seq_is_rosidl_buffer(header));
+            assert!(assign_prim_sequence(header, &[1, 2, 3], 1));
+        }
+        assert_ne!(
+            seq.data as usize, 0x10,
+            "the Buffer pointer is dropped, not freed"
+        );
+        assert!(!seq.is_rosidl_buffer && !seq.owns_rosidl_buffer);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(seq.data, seq.size) },
+            &[1, 2, 3]
+        );
+        unsafe { libc_free(seq.data) };
+    }
+
+    /// An OWNED Buffer-backed instance whose elements are not bytes, or
+    /// whose Buffer pointer is null, is refused before anything is read or
+    /// written; a string or message view of a flagged instance still refuses.
+    #[test]
+    fn an_owned_buffer_instance_that_is_not_a_byte_buffer_is_refused_untouched() {
+        let mut seq = RosPrimitiveSequence {
+            data: 0x10 as *mut u8,
+            size: 3,
+            capacity: 0,
+            is_rosidl_buffer: true,
+            owns_rosidl_buffer: true,
+        };
+        let header = &mut seq as *mut RosPrimitiveSequence as *mut RosSequence;
+        unsafe {
+            assert!(!assign_prim_sequence(header, &[1, 2, 3, 4], 4));
+            assert!(buffer_seq_bytes(header, 4).is_err());
+            assert!(buffer_seq_len(header, 2).is_err());
+        }
+        unsafe {
+            let prim = &mut *(header as *mut RosPrimitiveSequence);
+            assert_eq!(prim.data as usize, 0x10);
+            assert!(prim.is_rosidl_buffer && prim.owns_rosidl_buffer);
+            prim.data = std::ptr::null_mut();
+            assert!(!assign_prim_sequence(header, &[1], 1));
+            assert!(buffer_seq_bytes(header, 1).is_err());
+            (*(header as *mut RosPrimitiveSequence)).data = 0x10 as *mut u8;
+        }
+        let member = sequence_member(ros_type::UINT8, true);
+        let view = unsafe { sequence_view(&member, header as *const c_void) };
+        assert!(view.is_err(), "a raw element view of a Buffer is refused");
+    }
+
+    /// A MESSAGE sequence is 24 bytes and carries no flag: whatever byte
+    /// follows its header (here a deliberately non-zero one) is never read
+    /// as a Buffer flag.
+    #[test]
+    fn a_message_sequence_never_reads_a_flag_past_its_header() {
+        #[repr(C)]
+        struct Fixture {
+            poses: RosSequence,
+            next_field: u64,
+        }
+        let fixture = Fixture {
+            poses: RosSequence {
+                data: std::ptr::null_mut(),
+                size: 0,
+                capacity: 0,
+            },
+            next_field: u64::MAX,
+        };
+        let member = sequence_member(ros_type::MESSAGE, false);
+        let header = &fixture.poses as *const RosSequence;
+        unsafe {
+            assert!(!seq_is_rosidl_buffer(&member, header));
+        }
+        assert_eq!(fixture.next_field, u64::MAX);
     }
 }

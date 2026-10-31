@@ -45,9 +45,12 @@
 //! # Ingress
 //!
 //! The gateway registers one network→local ingress bridge per declared ingress
-//! topic ([`super::TransportManager::register_ingress_topic`]) — it validates
+//! topic ([`super::TransportManager::register_run_ingress_topic`]): it validates
 //! every inbound frame against the topic's expected schema hash and re-injects
-//! it into local SHM for the graph process to read.
+//! it into local SHM for the graph process to read. The bridge carries NO
+//! network mirror identity marker: a declared ingress topic belongs to this
+//! run's topic set, so a topic observer on the machine reads it from shared
+//! memory directly, in automatic and local scope alike.
 //!
 //! # Loop safety
 //!
@@ -65,6 +68,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::demand_authorizer::LanAccess;
+use super::egress_send::{EgressLanes, EgressStats, EnqueueOutcome, LossReport};
 use super::liveness::{DrainObservation, TopicLiveness, TopicLivenessObserver};
 use super::network::{
     canonical_topic, CatalogSource, DemandGetState, GetDemandState, PermissiveShmProbe, RunSource,
@@ -315,6 +320,13 @@ pub struct SchemaServing {
     /// (`cerulion_core` has no message corpus); the handing side does.
     #[serde(default)]
     pub schema_hashes: Vec<SchemaHashName>,
+    /// Every topic this serving announces - INCLUDING schema-less outputs,
+    /// which carry no `topic_schemas` binding. A host restarting its gateway
+    /// retires every prior-run topic outside this set (bridge flags and
+    /// announcements), so the catalog, which lists the bridge registry, shows
+    /// only the current run's topics plus any registered later.
+    #[serde(default)]
+    pub served_topics: Vec<String>,
 }
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
@@ -341,6 +353,19 @@ pub struct SchemaServingHandles {
     hash_names: Arc<Mutex<HashMap<u64, String>>>,
     /// Qualified name → served doc (the `schema` verb's source).
     docs: Arc<Mutex<std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>>>,
+    /// Serializes a whole `merge`/`replace` so one merge cannot interleave
+    /// between a replacement's per-map writes and resurrect fragments of the
+    /// old snapshot. Per-map locks stay for catalog readers.
+    snapshot_lock: Arc<Mutex<()>>,
+    /// Canonical runtime-registered topic -> advertised `schema_hash`: the
+    /// map the catalog reads for `schema_hash`. A restarted gateway records
+    /// into this same map (see [`GatewayRuntime::new_with_schema_serving`]),
+    /// and `replace` clears it so a prior run's hashes never leak forward.
+    runtime_hashes: Arc<Mutex<HashMap<String, u64>>>,
+    /// Canonical boot-plan topics the catalog labels provenance `Boot`.
+    /// `replace` sets it to the next run's `served_topics`, so a restarted
+    /// run's announced topics are not labelled `Runtime`.
+    boot_topics: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SchemaServingHandles {
@@ -354,12 +379,69 @@ impl SchemaServingHandles {
         topic_schemas: Arc<Mutex<HashMap<String, String>>>,
         hash_names: Arc<Mutex<HashMap<u64, String>>>,
         docs: Arc<Mutex<std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>>>,
+        snapshot_lock: Arc<Mutex<()>>,
+        runtime_hashes: Arc<Mutex<HashMap<String, u64>>>,
+        boot_topics: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         Self {
             topic_schemas,
             hash_names,
             docs,
+            snapshot_lock,
+            runtime_hashes,
+            boot_topics,
         }
+    }
+
+    /// TEST SEAM: the `schema_hash` the catalog these handles serve holds
+    /// for runtime-registered `topic` (canonical-keyed).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn runtime_hash_for_test(&self, topic: &str) -> Option<u64> {
+        self.runtime_hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(canonical_topic(topic).as_ref())
+            .copied()
+    }
+
+    /// TEST SEAM: whether these handles serve nothing - no topic binding,
+    /// hash binding, doc, boot topic or runtime hash.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn is_serving_nothing_for_test(&self) -> bool {
+        fn empty<T>(map: &Mutex<T>, is_empty: impl Fn(&T) -> bool) -> bool {
+            is_empty(
+                &map.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        }
+        empty(&self.topic_schemas, HashMap::is_empty)
+            && empty(&self.hash_names, HashMap::is_empty)
+            && empty(&self.docs, std::collections::BTreeMap::is_empty)
+            && empty(&self.boot_topics, HashSet::is_empty)
+            && empty(&self.runtime_hashes, HashMap::is_empty)
+    }
+
+    /// TEST SEAM: the canonical boot topics and topic-bound names these
+    /// handles serve, each sorted.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn served_topics_for_test(&self) -> (Vec<String>, Vec<String>) {
+        let mut boot: Vec<String> = self
+            .boot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        boot.sort();
+        let mut bound: Vec<String> = self
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        bound.sort();
+        (boot, bound)
     }
 
     /// Fold `serving` into the live maps. FIRST-WINS per key, which makes the
@@ -373,6 +455,49 @@ impl SchemaServingHandles {
     /// Locks are taken one map at a time and never nested (no ordering hazard
     /// with the catalog serve, which locks the same maps one at a time).
     pub fn merge(&self, serving: &SchemaServing) {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.merge_maps(serving);
+    }
+
+    /// Fresh maps seeded from a first construction's `serving` and its
+    /// canonical `boot_topics`, with an empty runtime-hash table.
+    fn seeded(serving: &SchemaServing, boot_topics: &HashSet<String>) -> Self {
+        // hot-path-alloc-ok: gateway construction, never per frame.
+        let handles = SchemaServingHandles {
+            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
+            hash_names: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_lock: Arc::new(Mutex::new(())),
+            docs: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            runtime_hashes: Arc::new(Mutex::new(HashMap::new())),
+            boot_topics: Arc::new(Mutex::new(boot_topics.clone())),
+        };
+        handles.merge_maps(serving);
+        handles
+    }
+
+    /// Adopt a later construction on the latched query surface: merge its
+    /// `serving` (first-wins, like [`Self::merge`]) and its canonical
+    /// `boot_topics` in ONE snapshot critical section, so no reply sees the
+    /// schemas without the boot labels.
+    fn adopt_construction(&self, serving: &SchemaServing, boot_topics: &HashSet<String>) {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.merge_maps(serving);
+        // hot-path-alloc-ok: gateway construction, never per frame.
+        self.boot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(boot_topics.iter().cloned());
+    }
+
+    /// The first-wins fold behind [`Self::merge`]; the caller holds the
+    /// snapshot lock.
+    fn merge_maps(&self, serving: &SchemaServing) {
         {
             let mut ts = self
                 .topic_schemas
@@ -404,6 +529,76 @@ impl SchemaServingHandles {
             }
         }
     }
+
+    /// Replace all live schema-serving maps with the next run's snapshot.
+    ///
+    /// A host can rebuild its gateway inside one process lifetime while the
+    /// latched query surface outlives the gateway that started it. The next run
+    /// must overwrite that surface's maps rather than fold new data into stale
+    /// data. All locks are held in catalog-reader order while maps are replaced,
+    /// preventing a reader from observing a mixed snapshot. Canonical duplicate
+    /// topics and duplicate keys within `serving` are first-wins. The runtime
+    /// hash map is cleared: the next run's gateway records its own hashes.
+    /// The boot-topic set becomes the canonical `serving.served_topics`, so
+    /// the catalog labels the next run's announced topics `Boot`.
+    pub fn replace(&self, serving: &SchemaServing) {
+        let _snapshot = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // hot-path-alloc-ok: process-restart schema refresh, never per frame.
+        // Lock order matches the catalog reader: runtime hashes, then names.
+        let mut rh = self
+            .runtime_hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ts = self
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hn = self
+            .hash_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut docs = self
+            .docs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut boot = self
+            .boot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        *boot = serving
+            .served_topics
+            .iter()
+            .map(|topic| canonical_topic(topic).into_owned())
+            .collect();
+        rh.clear();
+        ts.clear();
+        hn.clear();
+        docs.clear();
+        for binding in &serving.topic_schemas {
+            ts.entry(canonical_topic(&binding.topic).into_owned())
+                .or_insert_with(|| binding.schema_name.clone());
+        }
+        for binding in &serving.schema_hashes {
+            hn.entry(binding.schema_hash)
+                .or_insert_with(|| binding.qualified.clone());
+        }
+        for doc in &serving.schema_docs {
+            docs.entry(doc.qualified.clone())
+                .or_insert_with(|| doc.clone());
+        }
+    }
+
+    /// Serve nothing: empty schema-serving maps and boot set, so the catalog
+    /// names no schema and the schema serve answers no lookup. A host calls
+    /// this when it stops or fails to start its gateway, since the latched
+    /// query surface outlives it.
+    pub fn serve_nothing(&self) {
+        self.replace(&SchemaServing::default());
+    }
 }
 
 impl SchemaServing {
@@ -421,6 +616,45 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
+        // A non-empty `served_topics` is EXPLICIT: folding another serving's
+        // explicit list into an accumulator that only had implicit
+        // (topic_schemas-derived) topics would silently drop the
+        // accumulator's topics from the served set. Materialize the fallback
+        // first so the merged set covers both.
+        if self.served_topics.is_empty() && !other.served_topics.is_empty() {
+            for ts in &self.topic_schemas {
+                let canon = canonical_topic(&ts.topic).into_owned();
+                if !self
+                    .served_topics
+                    .iter()
+                    .any(|have| canonical_topic(have) == canon)
+                {
+                    self.served_topics.push(canon);
+                }
+            }
+        }
+        // The reverse case: an explicit accumulator folding an IMPLICIT
+        // serving (topic_schemas but no served_topics) must take that
+        // serving's bound topics into the explicit list too, or the explicit
+        // list would leave them out of the served set.
+        let other_implicit = other.served_topics.is_empty() && !self.served_topics.is_empty();
+        let other_topics = other.served_topics.iter().map(String::as_str).chain(
+            other
+                .topic_schemas
+                .iter()
+                .filter(|_| other_implicit)
+                .map(|ts| ts.topic.as_str()),
+        );
+        for t in other_topics {
+            let canon = canonical_topic(t);
+            if !self
+                .served_topics
+                .iter()
+                .any(|have| canonical_topic(have) == canon)
+            {
+                self.served_topics.push(t.to_string());
+            }
+        }
         for ts in &other.topic_schemas {
             let canon = canonical_topic(&ts.topic);
             if !self
@@ -506,11 +740,26 @@ pub struct GatewayRuntime {
     /// Canonical announce topic → its active egress tap (present only while the
     /// topic's bridge flag is ON). The observable [`Self::active_tap_topics`].
     taps: HashMap<String, DataOnlySubscriber>,
-    /// Canonical announce topic → cumulative SUCCESSFULLY-forwarded frame count
-    /// (Principle #3). Interior-mutable so the forward path holds only `&self`.
-    forwarded: HashMap<String, AtomicU64>,
-    /// Canonical announce topic → first-warn-then-debug latch for repeated zenoh
-    /// put failures (a persistently unreachable peer must not flood the log).
+    /// Canonical announce topic → its egress send queue and sender thread,
+    /// opened when the topic's first egress tap attaches. The drive loop only
+    /// QUEUES frames here; each topic's own sender thread makes the zenoh put,
+    /// so a reliable put waiting on a full zenoh transmit queue does not hold
+    /// up this loop (except while a LAN close waits for that put) or topics
+    /// sent to other peers. Topics sent to the same peer share its transmit
+    /// queue. The per-topic counters (forwarded, dropped,
+    /// refused, failed, discarded) live on the lanes; see [`Self::egress_stats`].
+    egress_lanes: EgressLanes,
+    /// The LAN access epoch read at the start of the current drive pass;
+    /// every frame the pass queues carries it. A pass that reads a newer
+    /// epoch first detaches every tap and empties every send queue.
+    pass_lan_epoch: u64,
+    /// The periodic WARN (refused or failed) or INFO (best-effort drops) for
+    /// topics whose egress lost frames, checked at the
+    /// end of each drive pass (one clock read; a counter read every
+    /// `LOSS_REPORT_INTERVAL`).
+    loss_report: LossReport,
+    /// Canonical announce topic → first-warn-then-debug latch for repeated tap
+    /// DRAIN failures (a wedged tap must not flood the log).
     forward_warn: HashMap<String, AtomicBool>,
     /// Canonical announce topic → cumulative tap ATTACH failure count
     /// (Principle #3: a topic that cannot egress because its tap never attaches
@@ -806,12 +1055,10 @@ impl GatewayRuntime {
         //     dirty-check stays stable) even if `plan.announce` carried a
         //     canonical duplicate.
         let registered = manager.bridge_manager().registered_topics()?;
-        let mut forwarded = HashMap::new();
         let mut forward_warn = HashMap::new();
         let mut attach_failures = HashMap::new();
         let mut attach_warn = HashMap::new();
         for (canonical, _) in &registered {
-            forwarded.insert(canonical.clone(), AtomicU64::new(0)); // hot-path-alloc-ok: boot
             forward_warn.insert(canonical.clone(), AtomicBool::new(false)); // hot-path-alloc-ok: boot
             attach_failures.insert(canonical.clone(), AtomicU64::new(0)); // hot-path-alloc-ok: boot
             attach_warn.insert(canonical.clone(), AtomicBool::new(false)); // hot-path-alloc-ok: boot
@@ -874,59 +1121,46 @@ impl GatewayRuntime {
         let reconcile_pass_count = Arc::new(AtomicU64::new(0));
         let reconciler_enabled_count = Arc::new(AtomicU64::new(0));
         let get_demand_state = Arc::new(GetDemandState::default());
-        // The shared runtime-hash table + boot-topic provenance the
-        // `catalog` verb reads. Created HERE (before the query surface starts, step
-        // 3b) so its `Arc`s thread into BOTH the catalog source (read on the zenoh
-        // callback thread) and this gateway's drive thread (the sole hash writer).
-        // The live TOPIC set for a catalog still comes from the bridge manager's
-        // registered set, so runtime registrations catalog correctly even before
-        // the drive thread records their hash.
-        let reg_hashes: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
-        let catalog_boot_topics: Arc<HashSet<String>> = Arc::new(boot_topics.clone());
-        // Materialize the CLI-handed schema serving into the
-        // sources the query-surface callback reads. `topic_schemas` is
-        // canonical-topic-keyed (mirrors the announce/hash keying); `schema_docs`
-        // is qualified-name-keyed for the closure walk. SEEDED at boot;
-        // Not frozen — a later registration's serving MERGES in
-        // through [`SchemaServingHandles`] (the netd backfill seam), which is why
-        // the maps are `Mutex`-guarded like the reg-channel hash table above.
-        let catalog_topic_schemas: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(
-            serving
-                .topic_schemas
-                .iter()
-                .map(|ts| {
-                    (
-                        canonical_topic(&ts.topic).into_owned(),
-                        ts.schema_name.clone(),
-                    )
-                })
-                .collect(),
-        ));
-        // Materialize the CLI-computed hash→name bindings
-        // into the reverse map the catalog reads to NAME a runtime-registered topic
-        // (a `ros2 attach` raw route) by ITS reg-channel hash.
-        let catalog_hash_names: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(
-            serving
-                .schema_hashes
-                .iter()
-                .map(|b| (b.schema_hash, b.qualified.clone()))
-                .collect(),
-        ));
-        let schema_source = SchemaSource {
-            docs: Arc::new(Mutex::new(
-                serving
-                    .schema_docs
-                    .iter()
-                    .map(|d| (d.qualified.clone(), d.clone()))
-                    .collect(),
-            )),
+        // The serving maps the `catalog` and `schema` verbs read: the shared
+        // runtime-hash table (this gateway's drive thread is its sole
+        // writer), the boot-topic provenance, the topic->schema and
+        // hash->name maps, the schema docs and the snapshot lock that keeps a
+        // reply from mixing two updates. They exist BEFORE the query surface
+        // starts (step 3b), so every `Arc` threads into both the sources the
+        // zenoh callbacks read and this gateway. The live TOPIC set for a
+        // catalog still comes from the bridge manager's registered set, so
+        // runtime registrations catalog correctly even before the drive
+        // thread records their hash.
+        //
+        // When an earlier construction already latched the process-wide query
+        // surface, that surface keeps reading ITS maps (this construction's
+        // `start_query_surface` no-ops), so this construction adopts ALL of
+        // them and merges its serving and boot topics in, first-wins. Fresh
+        // maps here would never reach the catalog or schema verbs after a
+        // restart. A host that rebuilds its gateway calls
+        // [`SchemaServingHandles::replace`] first when the previous run's
+        // serving must not survive.
+        let serving_handles = match manager
+            .network()
+            .and_then(|network| network.query_surface_serving_handles())
+        {
+            Some(latched) => {
+                latched.adopt_construction(&serving, &boot_topics);
+                latched
+            }
+            None => SchemaServingHandles::seeded(&serving, &boot_topics),
         };
-        // The live-merge handles a later `register_egress` backfills
-        // through — cloned Arcs onto the SAME maps the query surface reads.
-        let serving_handles = SchemaServingHandles {
-            topic_schemas: Arc::clone(&catalog_topic_schemas),
-            hash_names: Arc::clone(&catalog_hash_names),
-            docs: Arc::clone(&schema_source.docs),
+        let reg_hashes = Arc::clone(&serving_handles.runtime_hashes);
+        let catalog_boot_topics = Arc::clone(&serving_handles.boot_topics);
+        let catalog_topic_schemas = Arc::clone(&serving_handles.topic_schemas);
+        let catalog_hash_names = Arc::clone(&serving_handles.hash_names);
+        let catalog_snapshot_lock = Arc::clone(&serving_handles.snapshot_lock);
+        let schema_source = SchemaSource {
+            docs: Arc::clone(&serving_handles.docs),
+            // Shared with the catalog source below: `replace` swaps docs +
+            // snapshot under ONE critical section, and both verbs build
+            // replies under the same mutex.
+            snapshot_lock: Arc::clone(&catalog_snapshot_lock),
         };
         // The catalog source the query surface reads. The gateway retains a
         // CLONE (below, test-gated) so the `catalog_serve_for_test` seam runs the
@@ -936,6 +1170,7 @@ impl GatewayRuntime {
             boot_topics: Arc::clone(&catalog_boot_topics),
             topic_schemas: Arc::clone(&catalog_topic_schemas),
             hash_names: Arc::clone(&catalog_hash_names),
+            snapshot_lock: Arc::clone(&catalog_snapshot_lock),
             // A WEAK handle to THIS gateway's manager so the catalog serve
             // probes each topic's live producer count (the desk's per-row liveness
             // affordance). Weak breaks the manager → NetworkManager → query-surface →
@@ -994,7 +1229,7 @@ impl GatewayRuntime {
         //    guard rejects a topic already announced — belt-and-suspenders with
         //    `plan.validate` above).
         for entry in &plan.ingress {
-            manager.register_ingress_topic(
+            manager.register_run_ingress_topic(
                 &entry.topic,
                 entry.schema_hash,
                 MaxSliceLen::const_new(crate::graph::config::DEFAULT_MAX_SLICE_LEN as u32),
@@ -1056,7 +1291,9 @@ impl GatewayRuntime {
             egress_flags,
             boot_topics,
             taps: HashMap::new(),
-            forwarded,
+            egress_lanes: EgressLanes::new(),
+            pass_lan_epoch: 0,
+            loss_report: LossReport::default(),
             forward_warn,
             attach_failures,
             attach_warn,
@@ -1152,12 +1389,11 @@ impl GatewayRuntime {
         self.serving_handles.clone()
     }
 
-    /// Install the demand-authorization gate the LAN (zenoh) demand-grant
-    /// consults before serving a topic (the access boundary). Forwards to the
-    /// [`NetworkManager`](super::network::NetworkManager); takes effect LIVE (the demand
-    /// callbacks re-read the slot). The LAN plane carries no authenticated identity yet;
-    /// the default is the deny-nothing
-    /// [`AllowAllAuthorizer`](super::demand_authorizer::AllowAllAuthorizer).
+    /// Install the inner demand authorizer the LAN (zenoh) demand-grant consults
+    /// before serving a topic. The configured LAN posture remains in front of it;
+    /// use [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
+    /// to change that posture. Forwards to the [`NetworkManager`](super::network::NetworkManager)
+    /// and takes effect live.
     pub fn set_demand_authorizer(
         &self,
         authorizer: Arc<dyn super::demand_authorizer::DemandAuthorizer>,
@@ -1168,11 +1404,11 @@ impl GatewayRuntime {
     }
 
     /// Run the gateway until `exit` flips true. Each pass drives egress
-    /// once; a pass that forwarded nothing yields the CPU for one
-    /// `GATEWAY_IDLE_POLL` tick (backlog-aware pacing), one that forwarded
+    /// once; a pass that queued no frame yields the CPU for one
+    /// `GATEWAY_IDLE_POLL` tick (backlog-aware pacing), one that queued frames
     /// loops again immediately to drain a backlog. Ingress runs on the zenoh
     /// callback thread and needs no drive.
-    /// A pass that forwarded nothing now calls [`Self::idle_wait`],
+    /// A pass that queued no frame calls [`Self::idle_wait`],
     /// which paces at `GATEWAY_IDLE_POLL` while any demand is ON and BLOCKS on the
     /// demand signal when none is. Consequence for teardown, stated because it is
     /// real: `exit` is an external flag this loop cannot be woken by, so a
@@ -1182,8 +1418,8 @@ impl GatewayRuntime {
     /// (netd's egress plane does).
     pub fn run(&mut self, exit: &AtomicBool) -> TransportResult<()> {
         while !exit.load(Ordering::Relaxed) {
-            let forwarded = self.drive_once()?;
-            if forwarded == 0 {
+            let queued = self.drive_once()?;
+            if queued == 0 {
                 self.idle_wait();
             }
         }
@@ -1267,8 +1503,11 @@ impl GatewayRuntime {
     /// One egress drive pass — the single-iteration test seam of
     /// [`Self::run`]. For every announce topic: attach a tap if its bridge flag
     /// is ON and none exists, drain the tap and forward each frame to zenoh, or
-    /// drop the tap if the flag is OFF. Returns the number of frames
-    /// SUCCESSFULLY forwarded this pass.
+    /// drop the tap if the flag is OFF. Returns the number of frames this pass
+    /// handed to their topic's send queue (a frame a full reliable queue
+    /// refused is not counted). The topic's sender thread puts them on zenoh
+    /// after this returns, so [`Self::forwarded_count`] can trail the frames
+    /// this returns.
     ///
     /// Per-topic failures are NON-FATAL: a
     /// routine per-topic transient — a producer worker restart re-creating its
@@ -1285,6 +1524,25 @@ impl GatewayRuntime {
     /// ([`Self::register_runtime_topic`], fed by the control service /
     /// the SHM probe) joins the tap set here with no restart.
     pub fn drive_once(&mut self) -> TransportResult<usize> {
+        // Hold the egress-pass rendezvous SHARED for the whole pass (every
+        // flag load through the last queued frame): `set_lan_access(Paired)`
+        // takes it exclusively after closing, so no pass that loaded `true`
+        // just before the close queues its drained batch after the close
+        // returns. Scoped to THIS call: the run loop's idle/demand wait never
+        // holds it.
+        let manager = Arc::clone(&self.manager);
+        let _egress_pass = manager.bridge_manager().egress_pass();
+        // Read before any flag load. Frames this pass queues carry this
+        // epoch; a sender puts a frame only while the epoch is unchanged.
+        let epoch = manager.bridge_manager().lan_epoch();
+        if epoch != self.pass_lan_epoch {
+            // LAN access closed since the last pass: every attached tap may
+            // hold frames published before the close, and every send queue
+            // frames queued before it. Detach the taps and empty the queues;
+            // a demanded topic re-attaches a fresh tap below.
+            self.detach_egress_after_lan_close();
+            self.pass_lan_epoch = epoch;
+        }
         // One bump per pass (Principle #3): the observable a
         // zero-demand CEILING is asserted on, and the only way to tell "paced by
         // the demand wait" from "spinning" without a profiler (the
@@ -1332,7 +1590,14 @@ impl GatewayRuntime {
                     // ~1 kHz drive pass while the observer only re-attaches once
                     // per 200 ms sweep.
                     self.liveness.release_own_tap(topic);
-                    match self.manager.create_data_only_subscriber(topic) {
+                    let attached =
+                        self.manager
+                            .create_data_only_subscriber(topic)
+                            .and_then(|tap| {
+                                self.open_egress_lane(topic, flag, tap.buffer_size())?;
+                                Ok(tap)
+                            });
+                    match attached {
                         Ok(tap) => {
                             self.record_attach_success(topic);
                             tracing::debug!(topic = %topic, "gateway egress tap attached");
@@ -1379,9 +1644,12 @@ impl GatewayRuntime {
                 // producer.
                 let drained = drain.frames;
                 for frame in pending {
-                    if self.forward_frame(topic, frame) {
+                    if self.queue_frame(topic, frame) {
                         forwarded_total += 1;
                     }
+                }
+                if drain_err.is_none() && drained > 0 {
+                    self.record_forward_success(topic);
                 }
                 // The egress tap IS this topic's liveness observer while
                 // demand lasts — the frames it just drained are the observation, so
@@ -1443,6 +1711,12 @@ impl GatewayRuntime {
                 if self.taps.remove(topic).is_some() {
                     tracing::debug!(topic = %topic, "gateway egress tap detached — demand ended");
                 }
+                // Empties the send queue on every pass that reads the flag
+                // off, with or without a tap: a drain error drops the tap and
+                // leaves the frames the drive pass queued from it.
+                if let Some(lane) = self.egress_lanes.get(topic) {
+                    lane.discard_queued();
+                }
             }
         }
         // Sweep the observer's own taps. The throttle is a FLOOR, not a
@@ -1452,6 +1726,8 @@ impl GatewayRuntime {
         // Runs AFTER the egress loop so this pass's external-observation hand-offs
         // are already reflected and the sweep never double-taps a demanded topic.
         self.liveness.sweep();
+        self.loss_report
+            .tick(std::time::Instant::now(), self.egress_lanes.stats_ref());
         Ok(forwarded_total)
     }
 
@@ -1561,9 +1837,6 @@ impl GatewayRuntime {
         for (canonical, _) in &registered {
             // hot-path-alloc-ok: once per newly-registered topic (a runtime
             // registration), never per forwarded frame.
-            self.forwarded
-                .entry(canonical.clone())
-                .or_insert_with(|| AtomicU64::new(0));
             self.forward_warn
                 .entry(canonical.clone())
                 .or_insert_with(|| AtomicBool::new(false));
@@ -1958,19 +2231,20 @@ impl GatewayRuntime {
     /// entry point the `__cerulion/gateway_topics` control service and
     /// the permissive SHM probe both feed. The decision: a
     /// `cerulion ros2 attach` robot's dds_bridge creates its SHM publishers at
-    /// runtime (raw routes like `/utlidar/cloud`), and those must be BOTH
-    /// discoverable (announced) AND demandable exactly like a YAML-declared
-    /// producer — discovery and demand must both tell the truth.
+    /// runtime (raw routes like `/utlidar/cloud`), and those must be demandable
+    /// like a YAML-declared producer. When LAN access is open they are also
+    /// discoverable through topic announce tokens; paired-only access withholds
+    /// those tokens while leaving registration successful.
     ///
     /// Registers the topic's bridge flag in the manager's
     /// [`TopicBridgeManager`](super::bridge::TopicBridgeManager) (the source of
     /// truth: this is what makes the topic demand-GRANTABLE — the
     /// demand queryable and the liveliness demand watch both flip
-    /// whatever registered flag a remote token names) and ANNOUNCES it on the
-    /// network (a hashless liveliness token — the announce carries no schema
-    /// hash; egress forwards frames verbatim and the viewer validates on ingress
-    /// against its own metadata). The next [`Self::drive_once`] reconciles the
-    /// topic into the tap set.
+    /// whatever registered flag a remote token names. When posture permits,
+    /// it also ANNOUNCES the topic on the network (a hashless liveliness token;
+    /// the announce carries no schema hash; egress forwards frames verbatim and
+    /// the viewer validates on ingress against its own metadata). The next
+    /// [`Self::drive_once`] reconciles the topic into the tap set.
     ///
     /// Empty boot plan: a PERMISSIVE (`AllowAll`) gateway booted
     /// with an EMPTY announce plan — the generic `ros2 attach` case, ~90 runtime
@@ -2055,42 +2329,99 @@ impl GatewayRuntime {
             return Err(e);
         }
         if newly {
-            tracing::info!(
-                topic = %canonical,
-                "gateway runtime egress topic registered — announced + demandable"
-            );
+            // "Demandable" would overclaim under paired-only access: the
+            // announce was withheld, so remote demand cannot reach this topic
+            // until posture opens. Say what is actually true.
+            let paired = self
+                .manager
+                .network()
+                .is_some_and(|network| network.lan_access() == LanAccess::Paired);
+            if paired {
+                tracing::info!(
+                    topic = %canonical,
+                    "gateway runtime egress topic registered (LAN announce withheld: paired-only access)"
+                );
+            } else {
+                tracing::info!(
+                    topic = %canonical,
+                    "gateway runtime egress topic registered and demandable"
+                );
+            }
         }
         Ok(newly)
     }
 
-    /// Forward one drained wire frame to zenoh under `topic`. Returns `true` on
-    /// success (and bumps the per-topic counter + clears the failure latch);
-    /// a put failure is COUNTED-and-latched, never a panic (`&self` — the
-    /// counters + latch are interior-mutable). The `network()` is `Some` by
-    /// [`Self::new`]'s guarantee.
-    fn forward_frame(&self, topic: &str, frame: Vec<u8>) -> bool {
-        let Some(network) = self.manager.network() else {
-            return false;
+    /// Open `topic`'s egress send queue and start its sender thread, unless
+    /// one is open. The queue's bound is the topic's declared `send_queue`
+    /// ([`NetworkManager::egress_send_queue`](super::network::NetworkManager::egress_send_queue)),
+    /// else `tap_depth`, the receive-queue depth of the topic's egress tap. The
+    /// `network()` is `Some` by [`Self::new`]'s guarantee.
+    fn open_egress_lane(
+        &mut self,
+        topic: &str,
+        flag: &Arc<AtomicBool>,
+        tap_depth: usize,
+    ) -> TransportResult<()> {
+        if self.egress_lanes.get(topic).is_some() {
+            return Ok(());
+        }
+        let Some(network) = self.manager.network_arc() else {
+            return Err(TransportError::Internal {
+                reason: "gateway egress needs a network-configured transport manager".to_string(),
+            });
         };
-        match network.publish_to_network(topic, frame) {
-            Ok(()) => {
-                if let Some(counter) = self.forwarded.get(topic) {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                self.record_forward_success(topic);
-                true
-            }
-            Err(e) => {
-                self.record_forward_failure(topic, Some(&e));
-                false
-            }
+        let capacity = network
+            .egress_send_queue(topic)
+            .map_or(tap_depth.max(1), std::num::NonZeroUsize::get);
+        let reliability = network.egress_reliability(topic);
+        self.egress_lanes.open(
+            topic,
+            reliability,
+            capacity,
+            network,
+            self.manager.bridge_manager_arc(),
+            Arc::clone(flag),
+        )
+    }
+
+    /// Detach every egress tap and discard every queued egress frame, the
+    /// state a demand transition to "no demand" leaves for one topic, for all
+    /// topics at once.
+    // hot-path-alloc-ok-fn: once per LAN access close, not per frame.
+    fn detach_egress_after_lan_close(&mut self) {
+        let topics: Vec<String> = self.taps.keys().cloned().collect();
+        for topic in &topics {
+            self.taps.remove(topic);
+            self.liveness.set_externally_observed(topic, false);
+        }
+        self.egress_lanes.discard_all_queued();
+        if !topics.is_empty() {
+            tracing::debug!(
+                taps = topics.len(),
+                "gateway egress taps detached and send queues emptied after LAN access closed"
+            );
         }
     }
 
+    /// Hand one drained wire frame to `topic`'s send queue. Returns `true`
+    /// when the queue took it (a full best-effort queue takes it by dropping
+    /// its oldest frame), `false` when a full reliable queue refused it, the
+    /// queue is closed, or the topic has no queue. The lane counts each case.
+    fn queue_frame(&self, topic: &str, frame: Vec<u8>) -> bool {
+        let Some(lane) = self.egress_lanes.get(topic) else {
+            return false;
+        };
+        matches!(
+            lane.enqueue(self.pass_lan_epoch, frame),
+            EnqueueOutcome::Queued | EnqueueOutcome::ReplacedOldest
+        )
+    }
+
     /// First failure of a run logs `warn!`, repeats `debug!` (flood suppression,
-    /// the [`super::network`] ingress-latch discipline). Covers the zenoh-put
-    /// and tap-DRAIN failure classes (attach failures have their own latch —
-    /// [`Self::attach_failure_count`]). `error` is `Some` for a transport
+    /// the [`super::network`] ingress-latch discipline). Covers the tap-DRAIN
+    /// failure class (attach failures have their own latch,
+    /// [`Self::attach_failure_count`]; zenoh put failures are counted and
+    /// latched by the topic's send queue). `error` is `Some` for a transport
     /// failure; `None` reserved for a future poison class.
     fn record_forward_failure(&self, topic: &str, error: Option<&TransportError>) {
         let already = self
@@ -2101,23 +2432,24 @@ impl GatewayRuntime {
             (false, Some(e)) => tracing::warn!(
                 topic = %topic,
                 error = %e,
-                "gateway egress forward failed — dropped this frame (repeats log at debug)"
+                "gateway egress tap drain failed; frames still in the tap are lost and the tap \
+                 re-attaches next pass (repeats log at debug)"
             ),
             (true, Some(e)) => tracing::debug!(
                 topic = %topic,
                 error = %e,
-                "gateway egress forward failed (repeat — see the first warning)"
+                "gateway egress tap drain failed (repeat; see the first warning)"
             ),
-            (_, None) => tracing::warn!(topic = %topic, "gateway egress forward failed"),
+            (_, None) => tracing::warn!(topic = %topic, "gateway egress tap drain failed"),
         }
     }
 
-    /// A successful forward ends any failure run: clear the latch and report the
-    /// recovery once (the `DrainWarnLatch::on_success` shape).
+    /// A drain that returned frames ends any drain-failure run: clear the latch
+    /// and report the recovery once (the `DrainWarnLatch::on_success` shape).
     fn record_forward_success(&self, topic: &str) {
         if let Some(w) = self.forward_warn.get(topic) {
             if w.swap(false, Ordering::Relaxed) {
-                tracing::info!(topic = %topic, "gateway egress recovered — forwarding again");
+                tracing::info!(topic = %topic, "gateway egress tap draining again");
             }
         }
     }
@@ -2223,14 +2555,19 @@ impl GatewayRuntime {
         topics
     }
 
-    /// Observable state (Principle #3): cumulative frames SUCCESSFULLY forwarded for
-    /// `topic` (canonical-keyed; `0` for an unannounced topic).
+    /// Observable state (Principle #3): cumulative frames of `topic` whose zenoh
+    /// put returned `Ok` (canonical-keyed; `0` for a topic that has not been
+    /// demanded). The topic's sender thread counts them, so this can trail the
+    /// frames [`Self::drive_once`] queued.
     pub fn forwarded_count(&self, topic: &str) -> u64 {
-        let canonical = canonical_topic(topic).into_owned();
-        self.forwarded
-            .get(&canonical)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        self.egress_stats().topic(topic).map_or(0, |s| s.forwarded)
+    }
+
+    /// Observable state (Principle #3): every egress send queue's counters,
+    /// shared as an `Arc` so a caller can keep reading them after the gateway
+    /// moves onto a drive thread (`cerulion-netd` reports them in `status`).
+    pub fn egress_stats(&self) -> Arc<EgressStats> {
+        self.egress_lanes.stats()
     }
 
     /// Observable state (Principle #3): cumulative tap ATTACH failures for `topic`
@@ -2341,6 +2678,21 @@ impl GatewayRuntime {
         self.get_demand_state.refusal_count()
     }
 
+    /// Observable state (Principle #3): cumulative demand GETs the producer
+    /// queryable refused with `refused:wire-header`, because the demanding
+    /// machine's wire header version differs from this build's.
+    pub fn demand_wire_header_refusal_count(&self) -> u64 {
+        self.get_demand_state.wire_header_refusal_count()
+    }
+
+    /// Observable state (Principle #3): demand GETs the producer queryable
+    /// refused for the wire header whose demanded topic was longer than 256
+    /// bytes, so their log lines share the overflow latch instead of their own.
+    pub fn demand_wire_header_refusal_latch_overlong_count(&self) -> u64 {
+        self.get_demand_state
+            .wire_header_refusal_latch_overlong_count()
+    }
+
     /// Observable state (Principle #3): cumulative GET-expiry disables the reconciler
     /// thread applied (a topic released because its last GET aged past the TTL
     /// AND liveliness was also absent — the composition rule).
@@ -2380,6 +2732,58 @@ impl GatewayRuntime {
         self.demand_get_state
             .as_ref()
             .map(|s| s.refused_ack_count())
+            .unwrap_or(0)
+    }
+
+    /// Cumulative "refused:wire-header" acks the DEMANDER received (Principle
+    /// #3): a producer runs a build with a different wire header version.
+    pub fn demand_wire_header_refused_ack_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.wire_header_refused_ack_count())
+            .unwrap_or(0)
+    }
+
+    /// Observable state (Principle #3): "refused:wire-header" (or legacy
+    /// grant) acks the DEMANDER received whose peer name or topic was longer
+    /// than 256 bytes, so their log lines share the overflow latch instead of
+    /// their own. `0` on a pure-egress gateway.
+    pub fn demand_wire_header_refused_ack_latch_overlong_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.wire_header_refused_ack_latch_overlong_count())
+            .unwrap_or(0)
+    }
+
+    /// Observable state (Principle #3): the robots whose demand acks the
+    /// DEMANDER counted, SORTED (empty on a pure-egress gateway with no
+    /// ingress). The ack counters say how many answers came; this says who
+    /// gave them.
+    pub fn demand_ack_peers(&self) -> Vec<String> {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.ack_peers())
+            .unwrap_or_default()
+    }
+
+    /// Observable state (Principle #3): counted acks whose new peer the
+    /// DEMANDER did not name because its peer set was full (`0` on a
+    /// pure-egress gateway). Not 0 means [`Self::demand_ack_peers`] is
+    /// incomplete.
+    pub fn demand_ack_peer_overflow_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.ack_peer_overflow_count())
+            .unwrap_or(0)
+    }
+
+    /// Observable state (Principle #3): counted acks whose peer name the
+    /// DEMANDER did not store because it was too long (`0` on a pure-egress
+    /// gateway). Not 0 means [`Self::demand_ack_peers`] is incomplete.
+    pub fn demand_ack_peer_overlong_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.ack_peer_overlong_count())
             .unwrap_or(0)
     }
 
@@ -2494,6 +2898,15 @@ impl GatewayRuntime {
     }
 }
 
+impl Drop for GatewayRuntime {
+    /// Close every egress send queue and join its sender thread while the
+    /// transport manager is still alive, then log each topic's totals.
+    fn drop(&mut self) {
+        self.egress_lanes.shutdown();
+        self.egress_lanes.stats_ref().log_totals();
+    }
+}
+
 impl fmt::Debug for GatewayRuntime {
     /// Concise operational summary — the observable surface (announce/ingress
     /// counts + the live tap set), never the manager or tap handles (neither is
@@ -2506,7 +2919,172 @@ impl fmt::Debug for GatewayRuntime {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod schema_serving_handles_tests {
+    use super::{SchemaHashName, SchemaServing, SchemaServingHandles, TopicSchema};
+    use crate::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn replace_rebinds_and_drops_stale_schema_serving_entries() {
+        let old_doc = SchemaDoc {
+            qualified: "old_msgs/Old".to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "int32 old\n".to_string(),
+            deps: vec![],
+        };
+        let handles = SchemaServingHandles::from_parts(
+            Arc::new(Mutex::new(HashMap::from([
+                ("/chatter".to_string(), "old_msgs/Old".to_string()),
+                ("/retired".to_string(), "old_msgs/Retired".to_string()),
+            ]))),
+            Arc::new(Mutex::new(HashMap::from([(7, "old_msgs/Old".to_string())]))),
+            Arc::new(Mutex::new(BTreeMap::from([(
+                old_doc.qualified.clone(),
+                old_doc,
+            )]))),
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(HashMap::from([("/chatter".to_string(), 7)]))),
+            Arc::new(Mutex::new(std::collections::HashSet::from([
+                "/retired".to_string()
+            ]))),
+        );
+        let new_doc = SchemaDoc {
+            qualified: "new_msgs/New".to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "int32 new\n".to_string(),
+            deps: vec![],
+        };
+        let serving = SchemaServing {
+            topic_schemas: vec![
+                TopicSchema {
+                    topic: "chatter".to_string(),
+                    schema_name: "new_msgs/New".to_string(),
+                },
+                TopicSchema {
+                    topic: "/chatter".to_string(),
+                    schema_name: "ignored_msgs/Duplicate".to_string(),
+                },
+            ],
+            schema_docs: vec![
+                new_doc.clone(),
+                SchemaDoc {
+                    text: "int32 ignored\n".to_string(),
+                    ..new_doc.clone()
+                },
+            ],
+            schema_hashes: vec![
+                SchemaHashName {
+                    schema_hash: 9,
+                    qualified: "new_msgs/New".to_string(),
+                },
+                SchemaHashName {
+                    schema_hash: 9,
+                    qualified: "ignored_msgs/Duplicate".to_string(),
+                },
+            ],
+            served_topics: vec!["chatter".to_string()],
+        };
+
+        handles.replace(&serving);
+        // The boot set is the next run's canonical served topics.
+        assert_eq!(
+            *handles.boot_topics.lock().unwrap(),
+            std::collections::HashSet::from(["/chatter".to_string()])
+        );
+
+        {
+            let topics = handles
+                .topic_schemas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(topics.len(), 1);
+            assert_eq!(
+                topics.get("/chatter").map(String::as_str),
+                Some("new_msgs/New")
+            );
+            assert!(!topics.contains_key("/retired"));
+        }
+        {
+            let hashes = handles
+                .hash_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(hashes.len(), 1);
+            assert_eq!(hashes.get(&9).map(String::as_str), Some("new_msgs/New"));
+            assert!(!hashes.contains_key(&7));
+        }
+        {
+            let docs = handles
+                .docs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(docs.len(), 1);
+            assert_eq!(
+                docs.get("new_msgs/New").map(|doc| doc.text.as_str()),
+                Some("int32 new\n")
+            );
+            assert!(!docs.contains_key("old_msgs/Old"));
+        }
+        // The prior run's runtime hashes are cleared: the next run records its own.
+        assert_eq!(handles.runtime_hashes.lock().unwrap().len(), 0);
+
+        // Serving nothing empties every map and the boot set: a stopped
+        // host's catalog names no topic and its schema serve answers nothing.
+        handles.serve_nothing();
+        assert!(handles.boot_topics.lock().unwrap().is_empty());
+        assert!(handles.topic_schemas.lock().unwrap().is_empty());
+        assert!(handles.hash_names.lock().unwrap().is_empty());
+        assert!(handles.docs.lock().unwrap().is_empty());
+        assert!(handles.runtime_hashes.lock().unwrap().is_empty());
+        assert!(handles.is_serving_nothing_for_test());
+    }
+
+    /// Folding a serving with an explicit `served_topics` list into an
+    /// accumulator that had only implicit (topic_schemas-derived) topics
+    /// must not turn the list explicit while dropping the accumulator's
+    /// own topics: the merged set covers both.
+    #[test]
+    fn merge_from_carries_implicit_fallback_topics_into_an_explicit_set() {
+        let mut acc = SchemaServing {
+            topic_schemas: vec![TopicSchema {
+                topic: "/implicit_a".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            ..SchemaServing::default()
+        };
+        let other = SchemaServing {
+            served_topics: vec!["/explicit_b".to_string()],
+            ..SchemaServing::default()
+        };
+        acc.merge_from(&other);
+        let served = acc.served_topics.clone();
+        assert!(served.contains(&"/implicit_a".to_string()), "{served:?}");
+        assert!(served.contains(&"/explicit_b".to_string()), "{served:?}");
+    }
+
+    #[test]
+    fn merge_from_folds_an_implicit_serving_into_an_explicit_set() {
+        let mut acc = SchemaServing {
+            served_topics: vec!["/explicit_a".to_string()],
+            ..SchemaServing::default()
+        };
+        let other = SchemaServing {
+            topic_schemas: vec![TopicSchema {
+                topic: "/implicit_b".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            ..SchemaServing::default()
+        };
+        acc.merge_from(&other);
+        let served = acc.served_topics.clone();
+        assert!(served.contains(&"/explicit_a".to_string()), "{served:?}");
+        assert!(served.contains(&"/implicit_b".to_string()), "{served:?}");
+    }
+}
+
 // Pure GatewayPlan tests (validate + serde round-trip) live in
-// `tests/gateway_iox2_test.rs` alongside the transport e2e — keeping this file
-// free of a `#[cfg(test)] mod tests` avoids annotating test-only allocations for
-// the hot-path alloc lint (the whole file is the network-forwarder cold path).
+// `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
+// schema-serving replacement contract test stays local to access the private maps.

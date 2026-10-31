@@ -29,11 +29,11 @@ use iceoryx2_log::{Log, LogLevel};
 /// Cerulion's default iceoryx2 log level.
 ///
 /// `Error` — iceoryx2's own `warn!`s are operational chatter on a healthy
-/// system (stale listener notifications, "no config file was loaded", failed
-/// notifies to a saturated listener), and one of them
-/// (`iceoryx2-0.9.1/src/port/notifier.rs:525`, `FailedToDeliverSignal`) is
-/// emitted once per publish per stuck listener connection — a measured
-/// ~2500 lines/s ≈ 5 MB/s in production. `error!` and `fatal!` still surface.
+/// system (stale listener notifications, "no config file was loaded", a port
+/// ceiling clamped to its minimum), and the class is emitted from paths that
+/// run per publish, which is how one of them reached a measured ~2500 lines/s
+/// ≈ 5 MB/s in production and filled a root disk. `error!` and `fatal!` still
+/// surface.
 ///
 /// This is the SAME value the generated workspace's `.cargo/config.toml`
 /// documents (`IOX2_LOG_LEVEL = "error"`), the value
@@ -275,6 +275,25 @@ static BRIDGE: IceoryxTracingBridge = IceoryxTracingBridge::new();
 /// call just no-ops.
 pub fn install_iceoryx2_tracing_bridge() -> bool {
     iceoryx2::prelude::set_logger(&BRIDGE)
+}
+
+/// Emit one line through the bridge as iceoryx2 itself would have: forwarded
+/// to `tracing` and teed to the active capture buffer, in call order.
+///
+/// What it is for: a sweep Cerulion drives itself, node by node, in place of
+/// one of iceoryx2's own loop entry points. The per-node bookkeeping lines
+/// that loop emitted (`Dead node (…) detected`, `The dead node (…) was
+/// successfully removed.`, `Unable to remove dead node … (…).`) are the
+/// markers [`crate::iceoryx_logger`]'s consumers parse a sweep's outcome from,
+/// so a caller that owns the loop owns those lines too.
+///
+/// What it does NOT promise: it is not iceoryx2 speaking. It performs no level
+/// filtering of its own — iceoryx2 filters before the bridge is reached, and
+/// this entry point is past that — and it records nothing when no capture is
+/// active on this thread. The caller decides the level, the origin and the
+/// wording; nothing here validates that they match any iceoryx2 release.
+pub fn emit_iceoryx_log(level: LogLevel, origin: &str, message: &str) {
+    BRIDGE.log(level, format_args!("{origin}"), format_args!("{message}"));
 }
 
 /// Run `f` with a thread-local capture buffer collecting every

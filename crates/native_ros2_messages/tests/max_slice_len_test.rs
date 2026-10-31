@@ -34,7 +34,7 @@ use cerulion_core::wire::MaxSliceLen;
 // Tiers are `MaxSliceLen` constants so the
 // assertions match the trait const's `Option<MaxSliceLen>` shape.
 // `MaxSliceLen::const_new` panics at const-eval if the value is
-// invalid; every tier value is > WireHeader::SIZE (32) AND ≤ u32::MAX,
+// invalid; every tier value is > WireHeader::SIZE (40) AND ≤ u32::MAX,
 // so it always returns a valid MaxSliceLen.
 // The tiers are sized generously — free because
 // iceoryx2 `Static` pools are lazy/demand-paged on Linux+macOS.

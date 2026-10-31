@@ -1,9 +1,9 @@
 # examples: agent notes
 
-Six user workspaces, each run end to end via the `cerulion` verbs: `basic_timer`,
+Seven user workspaces, run end to end via the `cerulion` verbs: `basic_timer`,
 `obstacle_avoidance` (the quickstart), `camera_pipeline`, `perception`, `v4l2_camera`,
-`realsense`. `moveit_hero` is a Docker gate for `rmw_cerulion`, not a workspace; `go2`: the
-quadruped demo. Each is standalone (own `Cargo.toml` + `Cargo.lock`).
+`realsense`, `aspire_arm`. `moveit_hero` is a Docker gate for `rmw_cerulion`, not a
+workspace; `go2`: the quadruped demo. Each is standalone (own manifest + lockfile).
 
 ## Shipped surface (gate: `check_public_surface.sh`)
 

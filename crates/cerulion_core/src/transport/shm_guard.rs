@@ -21,10 +21,13 @@
 //! # Contract: loud inference, never mutate, never abort
 //!
 //! This guard DETECTS these conditions and emits a loud [`tracing::warn!`],
-//! then PROCEEDS. It NEVER writes a system setting and NEVER aborts — the
+//! then PROCEEDS. It NEVER writes a system setting and NEVER aborts; the
 //! operator stays in control; we merely make the footgun visible (monitor RSS,
-//! not VSZ). It is Linux-only: macOS has no user-shm THP and this is a no-op
-//! there.
+//! not VSZ).
+//!
+//! The startup checks remain Linux-only because they read `/proc/sys` policy
+//! files that the Android app domain cannot read. macOS has no user-shm THP and
+//! the startup guard is a no-op there.
 //!
 //! # The `madvise` MITIGATION
 //!
@@ -40,16 +43,16 @@
 //! reliably preventing a small write from faulting in a whole 2MiB huge page.
 //! It is surgical (touches ONLY our pool mappings, never a machine-wide setting),
 //! non-destructive (advice only — no unmap, no data mutation), and applied at
-//! publisher AND subscriber creation, once the pool SHM is mapped. On non-Linux
-//! targets it is a no-op (no user-shm THP).
+//! publisher AND subscriber creation, once the pool SHM is mapped. This
+//! per-pool advice runs on Linux and Android; other targets use a no-op.
 
 // The pure decision helpers + verdict enums below are consumed by the
-// Linux-only warn/advise layer AND by the unit tests. On a non-Linux build
-// without `cfg(test)` (e.g. `cargo build` on macOS) they have no caller, so
-// rather than exist-but-`allow(dead_code)` (which masks a genuine dead-code
-// regression on that cell), we compile them OUT entirely there via a
-// per-item `#[cfg(any(test, target_os = "linux"))]`. Linux builds and all
-// test builds still enforce `dead_code = "deny"` on them.
+// Linux startup-warning layer and Linux/Android per-pool advice, plus unit tests.
+// On non-Linux builds without `cfg(test)` (for example, `cargo build` on macOS),
+// they have no caller, so rather than exist-but-`allow(dead_code)` (which masks
+// a genuine dead-code regression on that cell), we compile them OUT entirely
+// there via a per-item `#[cfg(any(test, target_os = "linux"))]`. Linux builds
+// and all test builds still enforce `dead_code = "deny"` on them.
 
 /// Verdict for the shmem Transparent-Huge-Pages policy.
 #[cfg(any(test, target_os = "linux"))]
@@ -151,19 +154,52 @@ pub(crate) fn map_count_verdict(current: usize, max: usize) -> MapCountVerdict {
     }
 }
 
+/// How many times the shared-memory safety probes actually ran. The local
+/// (in-process) transport maps no shared-memory pools, so the probes must
+/// never run for it: tests assert the counter does not move across manager
+/// init rather than relying on no warning happening to fire.
+static SHM_SAFETY_CHECKS_RUN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam: the number of shared-memory safety probe runs so far.
+#[doc(hidden)]
+pub fn shm_safety_checks_run() -> usize {
+    SHM_SAFETY_CHECKS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bumped by each `advise_shm_pools_no_hugepage` call that actually scans;
+/// the local-transport early return does not reach it.
+static SHM_POOL_ADVICE_SCANS_RUN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam: the number of MADV_NOHUGEPAGE pool scans run so far. Gives
+/// tests a deterministic signal that the scan ran - or did not - instead of
+/// relying on the warn-once side channel.
+#[doc(hidden)]
+pub fn shm_pool_advice_scans_run() -> usize {
+    SHM_POOL_ADVICE_SCANS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the operator-set Linux configs that break our
 /// oversize-freely assumption and emit a loud [`tracing::warn!`] for each
 /// unsafe one. Detect-and-warn only — never mutates a system setting, never
 /// aborts. Called ONCE at transport init (cold path).
 #[cfg(target_os = "linux")]
 pub(crate) fn check_and_warn_shm_safety() {
+    // The local (in-process) transport maps no shared-memory pools at all, so
+    // every warning below describes a hazard it cannot hit (like the publisher
+    // pool scan in `advise_shm_pools_no_hugepage`, which skips the same way).
+    if cfg!(feature = "local-transport") {
+        return;
+    }
+    SHM_SAFETY_CHECKS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     warn_if_thp_unsafe();
     warn_if_rlimit_as_bounded();
     warn_if_map_count_approaching();
 }
 
-/// Non-Linux no-op: macOS (and other targets) have no user-shm THP and no
-/// equivalent oversize-reservation hazard, so there is nothing to check.
+/// Startup checks run only on Linux. macOS has no user-shm THP; Android refuses
+/// `/proc/sys` reads in the app domain, so nothing is checked there.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn check_and_warn_shm_safety() {}
 
@@ -272,7 +308,7 @@ fn warn_if_map_count_approaching() {
 ///
 /// Pure and platform-independent (unit-tested on macOS): the caller supplies
 /// the maps contents, so this does no I/O.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
 pub(crate) fn shm_vma_ranges(maps_contents: &str, marker: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     for line in maps_contents.lines() {
@@ -353,7 +389,7 @@ pub(crate) enum PoolAdviseSite {
 /// supervisor's `cer_p_{hex}` planning namespace) scan for the wrong name —
 /// the THP mitigation would silently protect NOTHING and the publisher-site anomaly
 /// warn would fire on every run.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
 pub(crate) fn scan_marker(active_prefix: &str) -> &str {
     if active_prefix.is_empty() {
         "iox2_"
@@ -376,7 +412,7 @@ pub(crate) fn scan_marker(active_prefix: &str) -> &str {
 /// mitigation anomalously found no pool at a site that DEFINITELY just mapped
 /// one — i.e. only the [`PoolAdviseSite::Publisher`] site; see
 /// [`should_warn_scan_anomaly`].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 static SHM_MITIGATION_ANOMALY_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -388,13 +424,22 @@ static SHM_MITIGATION_ANOMALY_WARNED: std::sync::atomic::AtomicBool =
 /// — otherwise a subscriber-before-publisher startup would spuriously fire AND
 /// permanently consume the one-shot token, masking any genuine future
 /// scan-breakage alert.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn should_warn_scan_anomaly(site: PoolAdviseSite, found: usize) -> bool {
     matches!(site, PoolAdviseSite::Publisher) && found == 0
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn advise_shm_pools_no_hugepage(site: PoolAdviseSite, shm_prefix: &str) {
+    // The local (in-process) transport maps no shared-memory pools at all, so
+    // an empty scan is the NORMAL state, not an anomaly. At the publisher
+    // site it would trip the "broken scan" warn-once for nothing (and burn the
+    // one-shot token). There is no VMA to advise: skip the call.
+    if cfg!(feature = "local-transport") {
+        let _ = (site, shm_prefix);
+        return;
+    }
+    SHM_POOL_ADVICE_SCANS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return;
     };
@@ -484,10 +529,10 @@ pub(crate) fn advise_shm_pools_no_hugepage(site: PoolAdviseSite, shm_prefix: &st
     );
 }
 
-/// Non-Linux no-op: no user-shm Transparent Huge Pages, so there is nothing to
-/// advise against. Takes [`PoolAdviseSite`] + the active prefix to keep the
-/// call sites uniform across platforms; both are irrelevant off Linux.
-#[cfg(not(target_os = "linux"))]
+/// No-op on targets without this per-pool mapping advice. Takes
+/// [`PoolAdviseSite`] + the active prefix to keep the call sites uniform across
+/// platforms; both are irrelevant off Linux and Android.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn advise_shm_pools_no_hugepage(_site: PoolAdviseSite, _shm_prefix: &str) {}
 
 #[cfg(test)]
@@ -503,7 +548,7 @@ mod tests {
     // the one-shot `SHM_MITIGATION_ANOMALY_WARNED` token, masking genuine future
     // scan breakage. Mutation check: dropping the `Publisher` gate (warn on any
     // empty scan) flips the `(Subscriber, 0)` case to `true` and this fails.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn scan_anomaly_warns_only_for_publisher_empty_scan() {
         // (site, found_pool_vmas) -> should the one-shot anomaly warn fire?

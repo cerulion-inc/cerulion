@@ -749,8 +749,10 @@ pub fn spawn_mp_record(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, Pat
 }
 
 /// [`spawn_mp_record`] with extra ENVIRONMENT for the spawned supervisor (and,
-/// inherited, its workers) — the `CERULION_EXECUTION_MODE=free_run`
-/// opt-in is an env knob, not a flag.
+/// inherited, its workers): the execution mode (`CERULION_EXECUTION_MODE`)
+/// is an env knob, not a flag, so an arm that wants the explicit `free_run`
+/// spelling passes it here (the lockstep pin below is applied first and this
+/// overrides it).
 pub fn spawn_mp_record_with_env(
     root: &Path,
     extra: &[&str],
@@ -762,11 +764,71 @@ pub fn spawn_mp_record_with_env(
 /// [`spawn_mp_record`] with the graph the CLI is pointed at
 /// (`cerulion graph run <graph_file> ...`) parameterized: the file-stem-identity arm
 /// runs a graph whose FILE name differs from its legacy `name:` key.
+///
+/// The execution mode is PINNED to lockstep here (see
+/// [`SpawnExecutionMode::Lockstep`]); an arm that wants another mode goes
+/// through [`spawn_mp_record_with_mode`] / [`spawn_graph_run_graph`].
 pub fn spawn_mp_record_graph(
     root: &Path,
     graph_file: &str,
     extra: &[&str],
     envs: &[(&str, &str)],
+) -> (ChildGuard, PathBuf, PathBuf) {
+    spawn_graph_run_graph(
+        root,
+        graph_file,
+        true,
+        extra,
+        envs,
+        SpawnExecutionMode::Lockstep,
+    )
+}
+
+/// [`spawn_mp_record`] under an explicit [`SpawnExecutionMode`]: the arms
+/// that pin the DEFAULT (env removed) or the opt-out. `envs` is applied after
+/// the mode, so an arm can still raise `RUST_LOG` or redirect `CERULION_HOME`.
+pub fn spawn_mp_record_with_mode(
+    root: &Path,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+    mode: SpawnExecutionMode,
+) -> (ChildGuard, PathBuf, PathBuf) {
+    spawn_graph_run_graph(root, "mpdemo", true, extra, envs, mode)
+}
+
+/// How a spawned `graph run` sees `CERULION_EXECUTION_MODE`. Every spawn in
+/// this harness goes through one of these three, NEVER through the parent's
+/// inherited environment: the supervisor reads the variable from ITS
+/// environment, which the spawn forwards, so a developer running the suite
+/// with a value exported would otherwise flip every arm to that value and
+/// test the wrong contract.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnExecutionMode {
+    /// `CERULION_EXECUTION_MODE=lockstep`: the OPT-OUT, not the default; every
+    /// lockstep arm keeps its contract by naming it explicitly.
+    Lockstep,
+    /// `CERULION_EXECUTION_MODE=free_run`: the default, spelled out (a spawn
+    /// that wants free-run and must be immune to a `lockstep` exported by the
+    /// developer).
+    FreeRun,
+    /// The variable REMOVED from the child's environment: the flagless default
+    /// the resolver applies (free-run on a supervisor run). Removed rather than
+    /// inherited, so the arm proves the DEFAULT and not whatever the
+    /// developer's shell happens to export.
+    Default,
+}
+
+/// The one spawn every `graph run` in this harness goes through: `record`
+/// adds `--record=recordings`, `mode` decides the child's
+/// `CERULION_EXECUTION_MODE`, `envs` is applied LAST (so an arm can still
+/// override anything, `CERULION_HOME` for the run directory included).
+pub fn spawn_graph_run_graph(
+    root: &Path,
+    graph_file: &str,
+    record: bool,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+    mode: SpawnExecutionMode,
 ) -> (ChildGuard, PathBuf, PathBuf) {
     let stdout_path = root.join("run.stdout");
     let stderr_path = root.join("run.stderr");
@@ -775,8 +837,11 @@ pub fn spawn_mp_record_graph(
     // replay-verified). The workspace this module builds validates, so the
     // flag bought the harness nothing.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
-    cmd.args(["graph", "run", graph_file, "--record=recordings"])
-        .args(extra)
+    cmd.args(["graph", "run", graph_file]);
+    if record {
+        cmd.arg("--record=recordings");
+    }
+    cmd.args(extra)
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
         // Hermetic — no scouting session/gateway in CI (a real-clock
@@ -785,22 +850,28 @@ pub fn spawn_mp_record_graph(
         .env(
             "RUST_LOG",
             "cerulion=info,cerulion_cli_engine=info,cerulion_bagd=info",
-        )
-        // HERMETIC on the execution mode. The supervisor reads
-        // `CERULION_EXECUTION_MODE` from ITS environment, which this spawn
-        // forwards, so a developer running the suite with `free_run` exported
-        // would flip every lockstep arm to free-run and test the wrong
-        // contract. Pinned to the default
-        // here; an arm that WANTS free-run overrides it through `envs`,
-        // which is applied after this line.
-        .env("CERULION_EXECUTION_MODE", "lockstep")
-        .envs(envs.iter().copied())
+        );
+    // HERMETIC on the execution mode, in all three directions (see
+    // `SpawnExecutionMode`): pinned, spelled out, or REMOVED, never inherited.
+    match mode {
+        SpawnExecutionMode::Lockstep => {
+            cmd.env("CERULION_EXECUTION_MODE", "lockstep");
+        }
+        SpawnExecutionMode::FreeRun => {
+            cmd.env("CERULION_EXECUTION_MODE", "free_run");
+        }
+        SpawnExecutionMode::Default => {
+            cmd.env_remove("CERULION_EXECUTION_MODE");
+        }
+    }
+    cmd.envs(envs.iter().copied())
         .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
         .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
     // OWN PROCESS GROUP, so teardown can signal the whole tree — performed by
     // the constructor, which is the only place `setpgid` lives.
-    let guard = ChildGuard::spawn_group_leader(&mut cmd)
-        .expect("spawn cerulion graph run --record (multi-process)");
+    let guard = ChildGuard::spawn_group_leader(&mut cmd).unwrap_or_else(|e| {
+        panic!("spawn cerulion graph run (multi-process, record={record}, mode={mode:?}): {e}")
+    });
     (guard, stdout_path, stderr_path)
 }
 
@@ -1135,11 +1206,12 @@ pub fn by_rank(trace: &[TraceRingRecord]) -> BTreeMap<u32, Vec<&TraceRingRecord>
 /// `read_log` block reports the redundant per-edge read-log verifier as
 /// `verified_clean` over at least one compared edge.
 ///
-/// This is the assertion that makes the verifier's outcome CI-VISIBLE. The
-/// verifier is REPORT-ONLY (it never touches `passed` or the exit code), so
-/// without this assert a divergence, or a verifier that silently went inert,
-/// would leave the run GREEN with its `warn!` in libtest's discarded stderr,
-/// and a green run would be evidence of nothing. With it, a green run means
+/// This is the assertion that makes the verifier's outcome CI-VISIBLE. A
+/// divergence the read-log quarantine does not cover clears `passed` and takes
+/// exit 6 on its own, so a diverging verifier fails the replay itself. What
+/// this assert adds is the other half: a verifier that silently went inert
+/// compares nothing, reports no divergence to fail on, and leaves the run GREEN
+/// with its `warn!` in libtest's discarded stderr. With it, a green run means
 /// the verifier compared at least one edge and agreed: a diverging or
 /// non-exercised verifier fails here.
 ///

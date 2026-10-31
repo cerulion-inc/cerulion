@@ -214,6 +214,7 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         type_id_: ROS_TYPE_DOUBLE,
         string_upper_bound_: 0,
         members_: std::ptr::null(),
+        #[cfg(cerulion_has_is_key)]
         is_key_: false,
         is_array_: true,
         array_size_: 0,
@@ -223,15 +224,20 @@ fn cpp_seq_ts(namespace: &str, name: &str) -> *const ffi::rosidl_message_type_su
         size_function: Some(vecf64_size),
         get_const_function: Some(vecf64_get_const),
         get_function: Some(vecf64_get),
+        #[cfg(cerulion_has_fetch_function)]
         fetch_function: None,
+        #[cfg(cerulion_has_fetch_function)]
         assign_function: None,
         resize_function: Some(vecf64_resize),
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer_: false,
     }]));
     let mm = Box::leak(Box::new(CppMessageMembers {
         message_namespace_: cstr(namespace),
         message_name_: cstr(name),
         member_count_: 1,
         size_of_: std::mem::size_of::<CppSeqMsg>(),
+        #[cfg(cerulion_has_is_key)]
         has_any_key_member_: false,
         members_: members.as_ptr(),
         init_function: None,
@@ -318,10 +324,10 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
     //   - nonsense                  malformed sibling (must warn ONCE, and
     //                               must not disturb any other entry)
     //   - rmw_slc/Narrow{S}:1024    a user type the table never lists
-    //   - rmw_slc/Fixed{S}:32       names a FIXED type (must be ignored)
-    //   - rmw_slc/Fixed2{S}:32      a SECOND fixed type (its own loud head)
+    //   - rmw_slc/Fixed{S}:48       names a FIXED type (must be ignored)
+    //   - rmw_slc/Fixed2{S}:48      a SECOND fixed type (its own loud head)
     let env_value = format!(
-        "tf2_msgs/TFMessage:1024,nonsense,rmw_slc/Narrow{suffix}:1024,rmw_slc/Fixed{suffix}:32,rmw_slc/Fixed2{suffix}:32"
+        "tf2_msgs/TFMessage:1024,nonsense,rmw_slc/Narrow{suffix}:1024,rmw_slc/Fixed{suffix}:48,rmw_slc/Fixed2{suffix}:48"
     );
     let _guard = EnvVarGuard::set("CERULION_RMW_SLICE_CEILING", &env_value);
 
@@ -468,9 +474,9 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
 
         // ── ARM 5: an override naming a FIXED type is ignored, and the
         // ignored-override warn is once-per-TYPE, not per creation ────────
-        // `rmw_slc/Fixed{S}` (3 doubles, exact frame 32 + 24 = 56 B) is
-        // named in the env at 32 B. If the override were APPLIED, this
-        // 56-byte frame could never loan and the publish would fail — its
+        // `rmw_slc/Fixed{S}` (3 doubles, exact frame 40 + 24 = 64 B) is
+        // named in the env at 48 B. If the override were APPLIED, this
+        // 64-byte frame could never loan and the publish would fail; its
         // success is the behavioral proof the override is ignored. THREE
         // publishers of the type are created (distinct topics) so the warn
         // pin below can require 1 loud head + 2 suppressed repeats (a
@@ -523,8 +529,8 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
                 std::ptr::null_mut()
             ),
             RMW_RET_OK,
-            "a fixed type's exact 56-byte frame must publish — failure here \
-             means the 32-byte override was APPLIED instead of ignored"
+            "a fixed type's exact 64-byte frame must publish; failure here \
+             means the 48-byte override was APPLIED instead of ignored"
         );
 
         // ── ARM 6: determinism — a second same-type creation resolves

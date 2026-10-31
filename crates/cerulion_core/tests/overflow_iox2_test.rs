@@ -278,10 +278,10 @@ fn iceoryx2_spill_allocation_failed_surfaces_to_setter_call() {
                     topic.starts_with("test/overflow_iox2/spill_oom_iox2/"),
                     "AllocationFailed must carry the publisher's topic (got: {topic})"
                 );
-                // requested == max_capacity == max_slice_len - WireHeader::SIZE = 16K - 32.
+                // requested == max_capacity == max_slice_len - WireHeader::SIZE = 16K - 40.
                 assert_eq!(
                     requested,
-                    16 * 1024 - 32,
+                    16 * 1024 - 40,
                     "AllocationFailed.requested must reflect max_capacity, not the setter's bytes_needed"
                 );
             }

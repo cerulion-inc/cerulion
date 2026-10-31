@@ -19,7 +19,7 @@
 //! Every `ShmMessage` impl agrees on the unified offset-table layout:
 //!
 //! ```text
-//! [WireHeader (32 bytes)][fixed_section][offset_table][variable_payload]
+//! [WireHeader (40 bytes)][fixed_section][offset_table][variable_payload]
 //! ```
 //!
 //! For fixed schemas, `WIRE_FIXED_SIZE == size of fixed_section` and the
@@ -28,27 +28,21 @@
 //! variable-size nested message), indexed by schema field index. Whether a
 //! field is variable-length follows from its type; there is no attribute.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::error::TransportError;
 use crate::wire::{MaxSliceLen, WireHeader};
 
-/// Sentinel topic for reader-constructed `<Name>Shm`
-/// values. Used as the default `topic` in codegen-emitted `from_bytes`
-/// (read-side). Cached once via `OnceLock` so per-call `Image::build_reader`
-/// is one `Arc::clone` (atomic refcount bump), not a heap allocation —
-/// preserving the zero-alloc invariant on the subscriber hot path.
+/// Topic named in the error a reader-side `<Name>Shm` returns when one of
+/// its `&mut self` setters is called. A reader built by `from_bytes` holds no
+/// topic (its `topic` field is `None`), so the generated error paths fall back
+/// to this name.
 ///
-/// Reader-misuse via macros is structurally unreachable (`InputView<T>`
-/// exposes only `&Self::Reader<'a>`, no `DerefMut`), so this sentinel
-/// only surfaces for test code that calls `T::build_reader` directly.
-/// When such code accidentally invokes a `&mut self` setter, the
-/// resulting `PayloadTooLarge { topic: "<read-only>", max: 0 }` error
-/// attributes the misuse to the reader-side construction path.
-pub fn read_only_topic() -> Arc<str> {
-    static READ_ONLY: OnceLock<Arc<str>> = OnceLock::new();
-    READ_ONLY.get_or_init(|| Arc::from("<read-only>")).clone()
-}
+/// Reader misuse through the macros is structurally unreachable
+/// (`InputView<T>` exposes only `&Self::Reader<'a>`, no `DerefMut`), so this
+/// name only surfaces for code that calls `T::build_reader` directly and then
+/// a setter, which returns `PayloadTooLarge { topic: "<read-only>", max: 0 }`.
+pub const READ_ONLY_TOPIC: &str = "<read-only>";
 
 /// SHM-backed message trait carrying the `Reader<'a>`/`Writer<'a>` GATs.
 ///
@@ -113,7 +107,7 @@ pub trait ShmMessage: Sized {
     /// unrepresentable — the
     /// `MaxSliceLen` newtype encodes BOTH the upper bound
     /// (`u32::MAX`, the wire format's `WireHeader::total_size`
-    /// ceiling) AND the lower bound (`>= WireHeader::SIZE = 32`,
+    /// ceiling) AND the lower bound (`>= WireHeader::SIZE = 40`,
     /// so the slot can hold at least the header). Codegen emits
     /// `MaxSliceLen::const_new(<expr>)` which panics at const-eval
     /// if the bound is violated — pathological schemas fail to
@@ -166,7 +160,7 @@ pub trait ShmMessage: Sized {
         Self: 'a;
 
     /// Construct a `Reader<'a>` over an immutable byte slice (the SHM payload
-    /// region after the 32-byte `WireHeader`).
+    /// region after the 40-byte `WireHeader`).
     ///
     /// Used by `CerulionSubscriber::try_view`
     /// to wrap the inbound iceoryx2 sample's payload in the schema-specific
@@ -180,7 +174,7 @@ pub trait ShmMessage: Sized {
     fn build_reader(bytes: &[u8]) -> Self::Reader<'_>;
 
     /// Construct a `Writer<'a>` over a mutable byte slice (the SHM payload
-    /// region after the 32-byte `WireHeader`).
+    /// region after the 40-byte `WireHeader`).
     ///
     /// Used by `CerulionPublisher::loan_proxy`
     /// to wrap the outbound iceoryx2 sample's payload. For fixed schemas this
@@ -191,7 +185,7 @@ pub trait ShmMessage: Sized {
     /// # `max_capacity` and `topic`
     ///
     /// `max_capacity` is the configured `max_slice_len` ceiling MINUS the
-    /// 32-byte `WireHeader` (i.e., the absolute upper bound on the
+    /// 40-byte `WireHeader` (i.e., the absolute upper bound on the
     /// post-header payload). Variable schemas store it so a setter that
     /// detects `cursor + bytes_needed > self.len` (current loan) can decide
     /// between two paths: (a) `cursor + bytes_needed >
@@ -210,7 +204,7 @@ pub trait ShmMessage: Sized {
     /// invariant on the steady-state publish path. Each loan does one
     /// `Arc::clone` (atomic refcount bump, no allocation); the publisher
     /// allocates the Arc ONCE at construction time. Only the error path
-    /// allocates (`self.topic.to_string()` inside `PayloadTooLarge`
+    /// allocates (one `String` from the topic inside `PayloadTooLarge`
     /// construction), which is rare.
     ///
     /// Previously this was `&'a str` and `loan_proxy`
@@ -224,7 +218,7 @@ pub trait ShmMessage: Sized {
         topic: Arc<str>,
     ) -> Self::Writer<'a>;
 
-    /// Wire size of the payload region (excludes the 32-byte `WireHeader`).
+    /// Wire size of the payload region (excludes the 40-byte `WireHeader`).
     ///
     /// Used by `OutputProxy::Drop` to finalise `WireHeader::total_size` from
     /// the writer's runtime state. For fixed schemas this is always

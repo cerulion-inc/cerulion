@@ -32,7 +32,8 @@ use cerulion_viz::representation::{
 use cerulion_viz::schema_registry::builtin_walker;
 use cerulion_viz::sink::{
     classify_schema, dispatch_frame, dispatch_or_stage, infer_archetype_from_shape,
-    name_mapped_forces_ordered, route_for_input, ArchetypeKind, SinkState,
+    name_mapped_forces_ordered, route_for_input, route_key_for_topic, ArchetypeKind, SinkState,
+    SWEEP_ACCUM_RING, SWEEP_CHILD,
 };
 use cerulion_viz::skeleton::{rearm_skeleton_statics, Skeleton};
 // The media table is gone — an input's entity is `world/<name>`.
@@ -49,6 +50,7 @@ use native_ros2_messages::sensor_msgs::{CompressedImage, Image, JointState, Poin
 use native_ros2_messages::std_msgs::Bool;
 use native_ros2_messages::tf2_msgs::TFMessage;
 use native_ros2_messages::vision_msgs::BoundingBox3D;
+use rerun::external::arrow::array::Array;
 use tracing_test::traced_test;
 
 fn memory() -> (rerun::RecordingStream, rerun::sink::MemorySinkStorage) {
@@ -135,6 +137,7 @@ fn build_fixed_frame_at(
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -284,6 +287,7 @@ fn build_jpeg_frame(jpeg: &[u8], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -342,6 +346,7 @@ fn build_raw_image_frame(encoding: &str, timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -415,6 +420,7 @@ fn build_cloud_frame(points: &[[f32; 4]], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -436,6 +442,7 @@ fn build_tf(seq: u32, ts: u64, transforms_bytes: &[u8]) -> Vec<u8> {
         offset_table_count: TFMessage::VARIABLE_FIELD_COUNT as u32,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -513,6 +520,7 @@ fn build_odometry_frame(
         offset_table_count: 2,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1228,7 +1236,7 @@ fn pointcloud_dispatches_to_points3d_with_exact_points() {
     let walker = builtin_walker();
     let mut state = SinkState::new();
     let (rec, storage) = memory();
-    // Intensity 0.0 → t=0 (blue), 255.0 → t=1 (red) after the /255 clamp.
+    // Intensity 0.0 → t=0 (cerulean), 255.0 → t=1 (red) after the /255 clamp.
     let points = [[1.0f32, 2.0, 3.0, 0.0], [-4.0, 5.0, -6.0, 255.0]];
     let frame = build_cloud_frame(&points, 7_000);
 
@@ -1245,8 +1253,8 @@ fn pointcloud_dispatches_to_points3d_with_exact_points() {
     let cols = cloud.colors.as_ref().expect("intensity channel → colours");
     assert_eq!(
         *cols,
-        vec![[0, 0, 255, 255], [255, 0, 0, 255]],
-        "intensity ramp endpoints: 0 → blue, 255 → red"
+        vec![[0, 192, 255, 255], [255, 0, 0, 255]],
+        "intensity ramp endpoints: 0 → cerulean #00c0ff, 255 → red"
     );
     assert_eq!(cloud.skipped, 0);
 
@@ -1331,6 +1339,7 @@ fn canonical_point_fields_are_reported_undecodable_not_empty() {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns: 1_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1599,6 +1608,176 @@ fn one_frame_per_tick_over_m_ticks_renders_all_m() {
         m as usize,
         "M sweeps on M distinct sub-entities → M chunks"
     );
+}
+
+/// A raw lidar route ROTATES through the sweep ring, while a world-frame MAP
+/// route (`/go2/slam/world_cloud`, the SLAM frontend's whole-map snapshot)
+/// renders every frame on ONE sub-entity: the map is one latest-wins entity,
+/// not the last eight re-samples of the same map overlaid (which thickened
+/// every surface by about a voxel and kept about 5 s of stale map).
+#[test]
+fn a_world_map_cloud_replaces_one_entity_while_a_lidar_cloud_rotates() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let points = [[1.0f32, 2.0, 3.0, 0.0]];
+    let lidar = "utlidar/cloud";
+    let map = "go2/slam/world_cloud";
+    assert!(route_for_input(lidar).accumulates_sweeps);
+    assert!(!route_for_input(map).accumulates_sweeps);
+
+    let ticks = SWEEP_ACCUM_RING + 2;
+    for k in 0..ticks {
+        for input in [lidar, map] {
+            let coalesced = drain_tick(
+                &rec,
+                &walker,
+                input,
+                vec![build_cloud_frame(&points, 1_000 + k)],
+                &mut state,
+            );
+            assert_eq!(coalesced, 0, "one frame per tick renders");
+        }
+    }
+    rec.flush_blocking().expect("flush");
+
+    let lidar_entity = route_for_input(lidar).entity;
+    let map_entity = route_for_input(map).entity;
+    assert_eq!(map_entity, "world/go2/slam/world_cloud");
+    let components = logged_components(&storage);
+    let geometry_at = |entity: &str| -> std::collections::BTreeSet<String> {
+        let prefix = format!("{entity}/{SWEEP_CHILD}/");
+        components
+            .iter()
+            .filter(|(path, descr)| path.starts_with(&prefix) && descr.contains("positions"))
+            .map(|(path, _)| path.clone())
+            .collect()
+    };
+    let lidar_sweeps = geometry_at(&lidar_entity);
+    assert_eq!(
+        lidar_sweeps.len() as u64,
+        SWEEP_ACCUM_RING,
+        "the lidar cloud fills every ring slot: {lidar_sweeps:?}"
+    );
+    let map_sweeps = geometry_at(&map_entity);
+    assert_eq!(
+        map_sweeps.into_iter().collect::<Vec<_>>(),
+        vec![format!("{map_entity}/{SWEEP_CHILD}/0")],
+        "every map snapshot replaces the one sub-entity"
+    );
+    // Both routes rendered every frame; only the slot assignment differs.
+    assert_eq!(state.accepted_sweeps(&lidar_entity), ticks);
+    assert_eq!(state.accepted_sweeps(&map_entity), ticks);
+}
+
+/// A map that takes over an entity a sensor cloud filled (both attached with
+/// `entity=world/shared`, the sensor detached first) clears the seven ring
+/// slots it never rewrites, ONCE, at the map frame's own stamp. A detach
+/// leaves data in the store, so without the Clear the sensor's last sweeps
+/// would stand under the map for the rest of the run.
+#[test]
+fn a_map_taking_over_a_lidar_entity_clears_the_stale_ring_slots_once() {
+    let walker = builtin_walker();
+    let mut state = SinkState::new();
+    let (rec, storage) = memory();
+    let points = [[1.0f32, 2.0, 3.0, 0.0]];
+    let lidar = route_key_for_topic("/utlidar/cloud", Some("world/shared"));
+    let map = route_key_for_topic("/go2/slam/world_cloud", Some("world/shared"));
+    let entity = route_for_input(&lidar).entity;
+    assert_eq!(entity, "world/shared");
+    assert_eq!(
+        route_for_input(&map).entity,
+        entity,
+        "one entity, two topics"
+    );
+    assert!(route_for_input(&lidar).accumulates_sweeps);
+    assert!(!route_for_input(&map).accumulates_sweeps);
+
+    // The sensor fills every ring slot, then detaches (no more frames).
+    for k in 0..SWEEP_ACCUM_RING {
+        let coalesced = drain_tick(
+            &rec,
+            &walker,
+            &lidar,
+            vec![build_cloud_frame(&points, 1_000 + k)],
+            &mut state,
+        );
+        assert_eq!(coalesced, 0);
+    }
+    // The map takes the entity over: two frames, hand-distinct stamps.
+    let takeover_ns = 2_000u64;
+    for k in 0..2u64 {
+        let coalesced = drain_tick(
+            &rec,
+            &walker,
+            &map,
+            vec![build_cloud_frame(&points, takeover_ns + k)],
+            &mut state,
+        );
+        assert_eq!(coalesced, 0);
+    }
+    rec.flush_blocking().expect("flush");
+
+    // (entity, robot_time ns) of every Clear row and of every geometry row:
+    // the stamp tells a sensor sweep (1000..1008) from a map frame (2000..).
+    let mut clears: Vec<(String, i64)> = Vec::new();
+    let mut geometry: Vec<(String, i64)> = Vec::new();
+    for msg in storage.take() {
+        let rerun::log::LogMsg::ArrowMsg(_, arrow_msg) = msg else {
+            continue;
+        };
+        let chunk = rerun::log::Chunk::from_arrow_msg(&arrow_msg).expect("decode chunk");
+        let path = chunk
+            .entity_path()
+            .to_string()
+            .trim_start_matches('/')
+            .to_string();
+        let times: Vec<i64> = chunk
+            .timelines()
+            .iter()
+            .find(|(name, _)| name.as_str() == "robot_time")
+            .map(|(_, col)| col.times_raw().to_vec())
+            .unwrap_or_default();
+        for (descr, list) in chunk.components().iter() {
+            let name = descr.as_str();
+            let bucket = if name.contains("positions") {
+                &mut geometry
+            } else if name.contains("Clear") {
+                &mut clears
+            } else {
+                continue;
+            };
+            // The time column is row-aligned with the component list; a row
+            // holds this component only where the list is valid.
+            for (i, t) in times.iter().enumerate() {
+                if list.list_array.is_valid(i) {
+                    bucket.push((path.clone(), *t));
+                }
+            }
+        }
+    }
+    clears.sort();
+    let slot = |k: u64| format!("{entity}/{SWEEP_CHILD}/{k}");
+    assert_eq!(
+        clears,
+        (1..SWEEP_ACCUM_RING)
+            .map(|k| (slot(k), takeover_ns as i64))
+            .collect::<Vec<_>>(),
+        "slots 1..8 cleared exactly once each, at the first map frame's stamp; \
+         slot 0 is rewritten, never cleared"
+    );
+    // Geometry, told apart by stamp: the sensor's eight sweeps landed one per
+    // slot, and BOTH map frames landed on slot 0 (never a ring slot).
+    geometry.sort();
+    let mut expected: Vec<(String, i64)> = (0..SWEEP_ACCUM_RING)
+        .map(|k| (slot(k), 1_000 + k as i64))
+        .collect();
+    expected.push((slot(0), takeover_ns as i64));
+    expected.push((slot(0), takeover_ns as i64 + 1));
+    expected.sort();
+    assert_eq!(geometry, expected);
+    // One cursor per entity: the map's frames count on after the sensor's.
+    assert_eq!(state.accepted_sweeps(&entity), SWEEP_ACCUM_RING + 2);
 }
 
 /// A `nav_msgs/Odometry` frame on an ODOM-named input poses the
@@ -1961,6 +2140,7 @@ fn build_lowstate_frame(qs: &[f32; 20], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2018,6 +2198,7 @@ fn build_wide_bank_frame(timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2080,6 +2261,7 @@ fn build_posed_bank_frame(timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2124,6 +2306,7 @@ fn build_empty_bank_frame(timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2739,6 +2922,7 @@ fn build_quaternion_stamped(q: [f64; 4]) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 7_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -2805,6 +2989,7 @@ fn build_joint_state(position: &[f64], velocity: &[f64], effort: &[f64]) -> Vec<
         offset_table_count: 5,
         sequence: 0,
         timestamp_ns: 9_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -2896,6 +3081,7 @@ fn build_occupancy_grid(width: u32, height: u32, cells: &[u8]) -> Vec<u8> {
         offset_table_count: 2,
         sequence: 0,
         timestamp_ns: 11_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -3339,6 +3525,7 @@ fn build_header_plus_array_frame(
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -3610,6 +3797,7 @@ fn build_polygon_frame(points: &[[f32; 3]]) -> Vec<u8> {
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -4504,6 +4692,7 @@ fn motion_primitive_frame_at(positions: &[[f64; 3]], timestamp_ns: u64) -> Vec<u
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -4883,6 +5072,7 @@ fn survey_plan_frame(trajectory: &[[f64; 3]], waypoints: &[[f64; 3]]) -> Vec<u8>
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -5276,6 +5466,7 @@ fn acme_frame_at(
         offset_table_count: table_count,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -5415,6 +5606,7 @@ fn build_joint_state_with_names(
         offset_table_count: 5,
         sequence: 0,
         timestamp_ns: 9_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6148,6 +6340,7 @@ fn build_imu_frame(
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6227,6 +6420,7 @@ fn build_string_frame(text: &str, timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6337,6 +6531,7 @@ fn build_laserscan_frame(
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6550,6 +6745,7 @@ fn readings_frame(volts: &[f64]) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6702,6 +6898,7 @@ fn attitude_report_frame(orientation: [f64; 4], temperature_c: f64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6735,4 +6932,90 @@ fn a_rotation_with_sibling_telemetry_renders_the_transform_and_its_plots() {
         "one rotation chunk + one sibling series"
     );
     assert!(!state.took_anyvalues_fallback("acme/AttitudeReport"));
+}
+
+#[test]
+fn explicit_model_owns_a_namespace_outside_unbound_odometry_and_tf() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.urdf");
+    std::fs::write(
+        &path,
+        r#"<robot name="model"><link name="base"/><link name="leg"/>
+        <joint name="hinge" type="revolute"><parent link="base"/><child link="leg"/>
+        <axis xyz="0 1 0"/></joint></robot>"#,
+    )
+    .unwrap();
+    let mut cfg = cerulion_viz::skeleton::UrdfConfig {
+        motor_joints: vec!["hinge".into()],
+        ..Default::default()
+    };
+    let (rec, storage) = memory();
+    let mut state = SinkState::new();
+    assert!(state
+        .install_bound_model(&rec, "selected", Skeleton::try_load(&path, &cfg).unwrap())
+        .is_err());
+    cfg.robot_root = "models/test".into();
+    state
+        .install_bound_model(&rec, "selected", Skeleton::try_load(&path, &cfg).unwrap())
+        .unwrap();
+    rec.flush_blocking().unwrap();
+    storage.take();
+    dispatch_frame(
+        &rec,
+        &builtin_walker(),
+        "robot_odom",
+        &build_odometry_frame([7.0, 8.0, 9.0], [0.0, 0.0, 0.0, 1.0], [0.0; 3], [0.0; 3], 1),
+        &mut state,
+    );
+    dispatch_frame(
+        &rec,
+        &builtin_walker(),
+        "tf",
+        &build_tf(
+            0,
+            2,
+            &encode_tf_transforms(&[TfTransform::new(
+                "world",
+                "robot",
+                [90.0, 0.0, 0.0],
+                IDENTITY_QUAT,
+                0,
+                0,
+            )]),
+        ),
+        &mut state,
+    );
+    rec.flush_blocking().unwrap();
+    let mut saw_odom = false;
+    let mut saw_legacy_root = false;
+    let mut saw_tf = false;
+    // `robot` is no known frame alias, so the TF route files it under the base
+    // entity; odometry alone cannot satisfy this flag.
+    let tf_child = format!("{}/robot", cerulion_viz::tf::BASE_ENTITY);
+    for message in storage.take() {
+        if let rerun::log::LogMsg::ArrowMsg(_, arrow) = message {
+            let chunk = rerun::log::Chunk::from_arrow_msg(&arrow).unwrap();
+            let entity = chunk.entity_path().to_string();
+            assert!(!entity.trim_start_matches('/').starts_with("models/"));
+            saw_odom |= entity.trim_start_matches('/') == "world/robot_odom";
+            saw_legacy_root |= entity.trim_start_matches('/') == cerulion_viz::skeleton::ROBOT_ROOT;
+            saw_tf |= entity.trim_start_matches('/') == tf_child;
+        }
+    }
+    assert!(saw_odom, "unbound odometry still renders its own pose");
+    assert!(saw_legacy_root, "legacy odometry routing remains active");
+    assert!(saw_tf, "legacy TF routing remains active");
+    let frames: Vec<_> = (0..10)
+        .map(|tick| build_raw_image_frame("rgb8", 1_000 + tick))
+        .collect();
+    assert_eq!(
+        drain_tick(&rec, &builtin_walker(), "selected", frames, &mut state),
+        9,
+        "wrong-schema snapshots still coalesce on the selected route"
+    );
+    assert_eq!(state.bound_model_status().unwrap().rejected_frames, 1);
+    assert_eq!(
+        state.bound_model_status().unwrap().joint_frames_submitted,
+        0
+    );
 }

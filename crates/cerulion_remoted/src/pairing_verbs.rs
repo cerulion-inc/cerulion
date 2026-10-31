@@ -43,7 +43,9 @@ use cerulion_pairing::format::{
     SignedIntermediateCert,
 };
 use cerulion_pairing::pake::{CeremonyConfig, CpaceConfirmed, CpaceResponder, PakeIdentities};
-use cerulion_pairing::verify::{OwnerGrantPresentation, PairingPresentation};
+use cerulion_pairing::verify::{
+    OwnerCertificatePresentationWire, OwnerGrantPresentation, PairingPresentation,
+};
 use cerulion_pairing::PairingError;
 
 use crate::clock::RemotedClock;
@@ -405,16 +407,42 @@ impl VerbHandler for PairVerb {
         args: &serde_json::Value,
     ) -> CerudResult<serde_json::Value> {
         let device_key = caller_device_key(caller)?;
-        let blob = str_field(args, "presentation_postcard")?;
-        let presentation = PresentationWire::from_postcard_hex(&blob)?;
-        let name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let account = self
-            .shared
-            .verify_and_establish(&presentation, &device_key, name, self.clock.now_ns())
-            .map_err(|e| CerudError::Verb(format!("pairing failed: {e}")))?;
+        let account = match (
+            args.get("presentation_postcard"),
+            args.get("owner_certificate_postcard"),
+        ) {
+            (Some(_), None) => {
+                let blob = str_field(args, "presentation_postcard")?;
+                let presentation = PresentationWire::from_postcard_hex(&blob)?;
+                let name = args.get("name").and_then(|v| v.as_str()).map(str::to_owned);
+                self.shared.verify_and_establish(
+                    &presentation,
+                    &device_key,
+                    name,
+                    self.clock.now_ns(),
+                )
+            }
+            (None, Some(_)) => {
+                let blob = str_field(args, "owner_certificate_postcard")?;
+                let bytes = hex::decode(&blob).map_err(|_| {
+                    CerudError::Verb("owner_certificate_postcard is not valid hex".into())
+                })?;
+                let presentation = OwnerCertificatePresentationWire::from_postcard(&bytes)
+                    .map_err(|e| {
+                        CerudError::Verb(format!("owner certificate could not be decoded: {e}"))
+                    })?;
+                self.shared.verify_owner_certificate_and_establish(
+                    &presentation,
+                    &device_key,
+                    self.clock.now_ns(),
+                )
+            }
+            _ => return Err(CerudError::Verb(
+                "pair requires exactly one of presentation_postcard or owner_certificate_postcard"
+                    .into(),
+            )),
+        }
+        .map_err(|e| CerudError::Verb(format!("pairing failed: {e}")))?;
         Ok(serde_json::json!({
             "paired": true,
             "account": hex::encode(account.0),
@@ -527,7 +555,8 @@ impl VerbHandler for CodePairStartVerb {
 }
 
 /// `code-pair-finish` — verify the initiator's confirmation tag and persist a
-/// code-paired access row (conservative default scope). Mutating.
+/// code-paired access row for the authenticated device's self-account.
+/// A code does not prove membership of a supplied cloud account. Mutating.
 pub struct CodePairFinishVerb {
     shared: SharedTrust,
     sessions: SharedCodePairSessions,
@@ -561,7 +590,13 @@ impl VerbHandler for CodePairFinishVerb {
         args: &serde_json::Value,
     ) -> CerudResult<serde_json::Value> {
         let device_key = caller_device_key(caller)?;
-        let account = AccountId(hex32_field(args, "account")?);
+        let account = AccountId(device_key);
+        if AccountId(hex32_field(args, "account")?) != account {
+            return Err(CerudError::Verb(
+                "code pairing accepts only the self-account derived from the authenticated device key; use a verified certificate chain for a cloud account"
+                    .into(),
+            ));
+        }
         let name = str_field(args, "name")?;
         let principal_kind = principal_kind_field(args)?;
         let initiator_confirm = hex_bytes_field(args, "initiator_confirm")?;

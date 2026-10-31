@@ -68,6 +68,7 @@ fn build_twist_frame(linear: [f64; 3], angular: [f64; 3]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

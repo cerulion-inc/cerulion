@@ -52,9 +52,11 @@ ENVIRONMENT:
     CERULION_RERUN_URL           Connect the daemon to an external Rerun endpoint
                                  as a CLIENT instead of hosting the proxy.
     CERULION_VIZD_CONNECT        Zenoh locators to CONNECT to for remote robots
-                                 scouting can't reach (comma/space separated).
+                                 (comma/space separated).
     CERULION_VIZD_LISTEN         Zenoh locators to LISTEN on (comma/space separated).
     CERULION_VIZD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no zenoh ever).
+    CERULION_MULTICAST_SCOUTING=on
+                                 Turn zenoh multicast scouting back on (default off).
 ";
 
 fn main() -> ExitCode {
@@ -124,7 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket = ControlSocket::acquire(cerulion_vizd::default_socket_path())?;
 
     // ONE iceoryx2 node + ONE zenoh session for the whole process (Principle #8).
-    // Network-CONFIGURED by default (scouting ON) so the remote arm's
+    // Network-CONFIGURED by default (gossip on, multicast scouting off) so the remote arm's
     // `register_ingress_topic` works, but the session stays LAZY — a purely-local
     // daemon (never a `--robot` attach) opens no zenoh session. `init` (not
     // `get_or_init`) so the network config is honored: the daemon is the sole
@@ -142,7 +144,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // sink, which would buffer every frame in RAM forever → OOM on a long-lived
     // daemon) so the CONTROL plane still runs with viz disabled. `rerun_url` is
     // advertised VERBATIM in the Hello banner every viewer connects to.
-    let host::StreamResolution { rec, rerun_url } = host::resolve_stream();
+    let host::StreamResolution {
+        rec,
+        rerun_url,
+        hosted_port: _,
+    } = host::resolve_stream();
 
     // Resolve the schema universe ONCE (builtins ∪ the bridge config's .msg
     // store) and share it: the worker renders with it, the daemon resolves
@@ -190,7 +196,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         socket = %daemon.socket_path().display(),
         "cerulion-vizd running — SIGINT/SIGTERM to stop"
     );
-
     // Block until a signal flips the flag (SIGINT + SIGTERM via the `termination`
     // feature), then shut the daemon down cleanly.
     let running = Arc::new(AtomicBool::new(true));
@@ -198,11 +203,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
     }
+    let telemetry = cerulion_vizd::telemetry::Telemetry::start_in_background();
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
     }
 
     tracing::info!("cerulion-vizd shutting down");
+    telemetry.shutdown();
     daemon.shutdown();
     Ok(())
 }

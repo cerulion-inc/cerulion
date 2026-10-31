@@ -1,0 +1,13 @@
+rmw	case	pub_rc	sub_rc	sub_backends	marker_hits legacy_hits
+rmw_fastrtps_cpp	same_uid	0	0	 25 cuda;	25 0
+rmw_fastrtps_cpp	real_uid_1001_sub_first	134	3		0 0
+rmw_fastrtps_cpp	real_uid_1001_pub_first	0	134		25 0
+rmw_fastrtps_cpp	real_uid_1001_pub_first_umask000	0	0	 25 cpu;	0 25
+rmw_fastrtps_cpp	uid_override	0	0	 25 cpu;	0 25
+rmw_fastrtps_cpp	device_override	0	0	 25 cpu;	0 25
+rmw_zenoh_cpp	same_uid	0	0	 25 cuda;	25 1
+rmw_zenoh_cpp	real_uid_1001_sub_first	134	3		0 1
+rmw_zenoh_cpp	real_uid_1001_pub_first	137	134		0 0
+rmw_zenoh_cpp	real_uid_1001_pub_first_umask000	0	0	 25 cpu;	0 26
+rmw_zenoh_cpp	uid_override	0	0	 25 cpu;	0 26
+rmw_zenoh_cpp	device_override	0	0	 25 cpu;	0 26

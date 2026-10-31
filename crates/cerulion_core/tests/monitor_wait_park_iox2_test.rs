@@ -15,7 +15,7 @@
 //!    doorbell policy builds its consumer `DoorbellRegistry`, opens producer
 //!    doorbells, and flows data e2e identically to the unparked path.
 //!  - **(c) the no-data-input EDGE**: a period graph with `doorbell: true` has an
-//!    EMPTY registry (`primary_addr() == None`) → the park must degrade to the
+//!    EMPTY registry (no topic resolves) → the park must degrade to the
 //!    timer-only path and still fire, never panic or hang.
 //!
 //! ## A target with NO real monitor-wait primitive
@@ -71,7 +71,7 @@ const EXT_TOPIC: &str = "/mwp/ext";
 ///
 /// # Why this exists
 ///
-/// A doorbell's backing object is named `/cer_db_{ns}_{fnv(topic)}` — a PURE
+/// A doorbell's backing object is named from `(ns, topic)` alone, by a PURE
 /// function of `(ns, topic)`, carrying no pid and no randomness. With one
 /// hardcoded `ns` (say `"mwp"`) every test here would map the SAME
 /// physical page.
@@ -79,19 +79,19 @@ const EXT_TOPIC: &str = "/mwp/ext";
 /// That is invisible under `cargo test -- --test-threads=1`, where the whole
 /// binary is ONE process running its tests sequentially. Under nextest each test
 /// is its OWN process and they run CONCURRENTLY — so
-/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` (Linux-only,
-/// which rings `/mwp/ext` every 200 µs) and
+/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` (which rings
+/// `/mwp/ext` every 200 µs on every target that maps a real page) and
 /// `doorbell_data_graph_builds_registry_and_flows_data` (which asserts the
 /// doorbell counter is ZERO, its producer being out-of-graph and never ringing)
 /// would be two processes writing and reading one shared page. The reader sees the
 /// writer's ring: `left: 1, right: 0`.
 ///
-/// MEASURED: that failure is byte-identical every time, always at the same
-/// test index, and always Linux — the ringer is `#[cfg(target_os = "linux")]`,
-/// so Linux runs exactly one more test than macOS and macOS can never
-/// reproduce it. `left: 1` (not a large count) says the overlap is brief, which
-/// is also why a scheduling change could turn it intermittent; scoping
-/// the namespace removes the collision outright rather than making it rarer.
+/// MEASURED on Linux, where the ringer first ran: the failure is byte-identical
+/// every time and always at the same test index. `left: 1` (not a large count)
+/// says the overlap is brief, which is also why a scheduling change could turn
+/// it intermittent; scoping the namespace removes the collision outright rather
+/// than making it rarer. The ringer now runs on macOS too, where the same
+/// collision is reachable for the same reason.
 ///
 /// The iceoryx2 plane is not the problem — these tests already mint isolated
 /// SHM roots. POSIX SHM is a SECOND, machine-global name plane, and the repo
@@ -171,6 +171,32 @@ impl Consumer {
     }
 }
 
+/// A two-input `Sync` node: every `#[input(trigger)]` field of a Sync node is a
+/// SYNC INPUT, which the build binds through `SyncInputBinding` rather than
+/// through a data-trigger binding. It exists so a graph can declare a topic the
+/// park's arm list reaches only through that second class.
+///
+/// `unbounded_sync` rather than a window, because the arms below read resolved
+/// state after the build and never fire a set, so a timing bound would only add
+/// a knob nothing reads.
+#[cerulion_node(unbounded_sync)]
+#[derive(Default)]
+struct Pairer {
+    #[input(trigger)]
+    local: Vector3,
+    #[input(trigger)]
+    outside: Vector3,
+    fires: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl Pairer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.fires.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 // ===========================================================================
 // Graph construction (hand-built).
 // ===========================================================================
@@ -190,6 +216,8 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         identity: "mwp_ticker".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -214,6 +242,75 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
     (config, factories)
 }
 
+/// A TWO-node chain inside ONE runtime: the period `Ticker` publishes `out` and
+/// the data-trigger `Consumer` triggers on it, so every trigger topic of this
+/// graph is produced by a node this runtime owns.
+///
+/// This is the single-process shape. A park that arms a kernel wake on such a
+/// topic waits for a write only the blocked thread can make, so the rung must
+/// decline here and the park must stay on its bounded recheck.
+fn in_process_chain_graph(
+    observed: Arc<Mutex<Vec<f64>>>,
+    fires: Arc<AtomicU64>,
+) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_chain".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "ticker".to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: "ticker/out".to_string(),
+                }],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "ticker".to_string(),
+        Box::new(TickerEntry::with_state(Ticker {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "consumer".to_string(),
+        Box::new(ConsumerEntry::with_state(Consumer {
+            observed: Arc::clone(&observed),
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    (config, factories)
+}
+
 /// A one-node data-trigger `Consumer` of `/mwp/ext` + factories, sharing
 /// `observed` / `fires`. `id` == factory-map key.
 fn consumer_graph(
@@ -230,6 +327,8 @@ fn consumer_graph(
         identity: "mwp_consumer".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -403,8 +502,8 @@ fn pure_period_graph_fires_under_the_park() {
 // consumer `DoorbellRegistry`, the producer opens an owned doorbell, and data
 // flows e2e identically to the unparked path: publish N frames, drive live each,
 // the consumer fires EXACTLY N times and observes the hand oracle `1.0..=N`. On
-// a no-primitive target the SHM ring is a no-op stub, so the data still flows via real
-// iceoryx2 (the listener poll wakes the loop). Determinism: two runs are
+// a target that maps no real doorbell page the ring is a no-op stub, so the data
+// still flows via real iceoryx2 (the listener poll wakes the loop). Determinism: two runs are
 // byte-identical (Principle #7).
 // ===========================================================================
 #[test]
@@ -468,8 +567,8 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
         // park and exit via its LISTENER poll (the event is queued before the
         // drive). The DOORBELL counter must stay 0 on EVERY platform: this
         // producer is OUT-OF-GRAPH (never `enable_doorbell`ed, so it never
-        // rings), and off-Linux the ring is a stub besides — so a doorbell
-        // attribution here would mean the wake causes are cross-wired.
+        // rings) on any target, so a doorbell attribution here would mean the
+        // wake causes are cross-wired.
         let (entries, listener, doorbell, _timeout) = runtime.park_wake_counts();
         assert!(
             entries > 0,
@@ -508,12 +607,819 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
     );
 }
 
-/// Linux-only: a doorbell RING landing inside a park window is
-/// attributed to the DOORBELL counter — the `wakes_doorbell` branch's e2e
-/// coverage (the doorbell data test above pins it at 0, since its out-of-graph
-/// producer never rings; off-Linux the ring is a no-op stub, so only Linux can
-/// exercise the real branch — a production-scale Linux run measured
-/// `wakes_doorbell=33638/33640`; this is the CI pin).
+/// The MIXED shape, and the one a declared split actually produces: a rank that
+/// holds `ticker` and a consumer of its output, plus a second consumer whose
+/// trigger has no producer here. The locally written topic is declared FIRST, so
+/// only the ordering can put the writable one in the armed slot.
+///
+/// `multi` lists resolved topics for the graph's `multi_publisher_topics:`
+/// opt-in, which is what makes a topic this runtime also publishes writable from
+/// outside it.
+fn mixed_rank_graph(
+    observed: Arc<Mutex<Vec<f64>>>,
+    fires: Arc<AtomicU64>,
+    multi: Vec<String>,
+) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: multi,
+        name: None,
+        identity: "mwp_mixed".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "ticker".to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "local_consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: "ticker/out".to_string(),
+                }],
+                outputs: vec![],
+            },
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "ext_consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: EXT_TOPIC.to_string(),
+                }],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "ticker".to_string(),
+        Box::new(TickerEntry::with_state(Ticker {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    for id in ["local_consumer", "ext_consumer"] {
+        factories.insert(
+            id.to_string(),
+            Box::new(ConsumerEntry::with_state(Consumer {
+                observed: Arc::clone(&observed),
+                fires: Arc::clone(&fires),
+                ..Default::default()
+            })),
+        );
+    }
+    (config, factories)
+}
+
+/// A graph whose every data-trigger topic is produced by a node THIS runtime
+/// owns must resolve no primary line and no data wake.
+///
+/// A kernel wake armed on such a topic waits for a write only the blocked thread
+/// can make, so the park would hold its slice out and then find the message at
+/// the recheck it was going to make anyway. The decision is read from the
+/// runtime's own resolved state, the one site the wait policy line also reads,
+/// never from that line's text.
+///
+/// The data-wake term below is host-gated: off macOS it is false for every graph,
+/// so what carries this arm there is the armed-topic assertion and the registry
+/// assertion beside it, rather than the rung's own verdict.
+#[test]
+#[serial]
+fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = in_process_chain_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let ns = mwp_ns("chainprim");
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+    )
+    .expect("build the in-process chain graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        None,
+        "every trigger topic of this graph is produced by a node this runtime \
+         owns, so nothing outside it can ring one and the park must arm none"
+    );
+    // No armable topic means no registry AT ALL, so the publishes on this graph's
+    // topics cost what they cost on a target with no page. The proof that this is
+    // a decision rather than a failure is the page itself: nothing named for these
+    // topics exists, checked without creating one.
+    assert_eq!(
+        runtime.doorbell_topics_for_test(),
+        None,
+        "no declared topic is writable from outside this process, so the graph \
+         must map no doorbell page and open no registry"
+    );
+    let topic = "/mwp/ticker/out";
+    assert!(
+        cerulion_core::doorbell::shm_object_exists_for_test(&ns, topic),
+        "the PRODUCER side owns a page for {topic} even here: it publishes that \
+         topic, and a ring reaches whoever is blocked on the page, which this \
+         build cannot name. What the consumer side declines is the registry and \
+         the armed line asserted above, so this run maps no page of its own while \
+         its publishes still ring"
+    );
+    // The NEGATIVE control for that yes: the probe must say no for a topic nothing
+    // here publishes, or a probe that answered yes for every name would make the
+    // assertion above vacuously green for ever.
+    assert!(
+        !cerulion_core::doorbell::shm_object_exists_for_test(&ns, "/mwp/probe/absent"),
+        "the probe must find NO page for a topic no node of this graph publishes, \
+         or its positive answer above says nothing"
+    );
+    assert!(
+        !runtime.data_wake_rung_for_test(),
+        "with no ringable line the data-wake rung must decline, so the park keeps \
+         its bounded recheck instead of blocking for a write only this thread makes"
+    );
+    runtime.shutdown();
+}
+
+/// The positive control for the arm above, and the shape a declared two-group
+/// split gives its second group: the trigger topic has NO producer in this
+/// runtime, so a writer that is not a node of it rings the line and the rung is
+/// right to arm.
+///
+/// Judged in BOTH directions against the host fact the rung is gated on, so a
+/// host without the Apple os_sync family is a judged arm rather than a skipped
+/// one.
+#[test]
+#[serial]
+fn a_trigger_with_no_in_graph_producer_resolves_a_primary_and_arms_the_rung() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = consumer_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("extprim")),
+    )
+    .expect("build the external-producer consumer graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        Some(EXT_TOPIC),
+        "the trigger topic has no producer in this runtime, so it is exactly the \
+         line a writer outside it rings and the park must arm it"
+    );
+    let armed = runtime.data_wake_rung_for_test();
+    if cerulion_core::doorbell::wake_word_block_primitive_available() {
+        assert!(
+            armed,
+            "with a ringable line and a host that can kernel-block on one, the \
+             data-wake rung must arm"
+        );
+    } else {
+        assert!(
+            !armed,
+            "with no wake word on this host the rung must decline even though the \
+             line is ringable, and no sibling term may arm it"
+        );
+    }
+    runtime.shutdown();
+}
+
+/// A rank holding a `ticker`, a DATA-TRIGGER consumer of that ticker's output,
+/// and a Sync node pairing the same output with an absolute topic nothing here
+/// writes.
+///
+/// The data trigger is what makes the arm non-vacuous: the graph HAS one, it is
+/// published by a node of this graph, and so it is not armable. The only armable
+/// line is the Sync node's second input, which reaches the list as a SYNC INPUT.
+/// The locally written topic is declared first in both classes, so only the
+/// partition can put the writable one in the armed slot.
+fn sync_input_rank_graph(
+    fires: Arc<AtomicU64>,
+) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_sync_input".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "ticker".to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "local_consumer".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: "ticker/out".to_string(),
+                }],
+                outputs: vec![],
+            },
+            NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: "pairer".to_string(),
+                node_type: "pairer".to_string(),
+                inputs: vec![
+                    InputDef {
+                        name: "local".to_string(),
+                        source: "ticker/out".to_string(),
+                    },
+                    InputDef {
+                        name: "outside".to_string(),
+                        source: EXT_TOPIC.to_string(),
+                    },
+                ],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "ticker".to_string(),
+        Box::new(TickerEntry::with_state(Ticker {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "local_consumer".to_string(),
+        Box::new(ConsumerEntry::with_state(Consumer {
+            observed: Arc::new(Mutex::new(Vec::<f64>::new())),
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "pairer".to_string(),
+        Box::new(PairerEntry::with_state(Pairer {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    (config, factories)
+}
+
+/// A graph with NO cross-process wiring arms its publisher and RINGS the line a
+/// second graph's consumer watches.
+///
+/// The product claim of the arming rule, in one process. The producer graph is
+/// built with `CrossProcessWiring::none()`, which is every single-graph build in
+/// the tree and every graph nobody planned a sibling for: the plan names no
+/// reader of its output, and it arms the topic anyway. The consumer graph
+/// declares that same absolute topic as its trigger, publishes it nowhere, and so
+/// watches the page the producer rings.
+///
+/// What this holds is the producer half and the pairing: the page exists, the
+/// consumer's park watches that exact topic, and a publish advances that page's
+/// ring counter, read here through a third mapping of it. That a RING ends a
+/// blocked consumer's park is held separately by
+/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` and by the
+/// kernel-wake arms in `cerulion_core::doorbell`, which need a ring to land
+/// INSIDE a park window; this arm deliberately buys determinism instead, since a
+/// publish ordered before the window is observed by the loop-top poll as a
+/// listener wake.
+///
+/// The two graphs share the doorbell namespace, which is what puts them on one
+/// page; a production pair shares it through the resolved policy.
+#[test]
+#[serial]
+fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
+    const FEED: &str = "/mwp/xg/feed";
+    let ns = mwp_ns("crossgraph");
+    let fires = Arc::new(AtomicU64::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+
+    // The PRODUCER graph: one `ticker`, publishing FEED through an explicit topic
+    // override so the consumer graph can name it absolutely. No wiring at all.
+    let producer_config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_xg_producer".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
+            ros2: None,
+            id: "feeder".to_string(),
+            node_type: "ticker".to_string(),
+            inputs: vec![],
+            outputs: vec![OutputDef {
+                name: "out".to_string(),
+                schema: "geometry_msgs/Vector3".to_string(),
+                max_slice_len: None,
+                history_size: 0,
+                topic: Some(FEED.to_string()),
+            }],
+        }],
+    };
+    let mut producer_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    producer_factories.insert(
+        "feeder".to_string(),
+        Box::new(TickerEntry::with_state(Ticker {
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    let producer_clock = Arc::new(VirtualClock::new());
+    let producer_drive = Arc::clone(&producer_clock);
+    let mut producer = GraphRuntime::build_for_test_with_policy(
+        producer_config,
+        producer_factories,
+        producer_clock,
+        8,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+    )
+    .expect("build the producer graph with no cross-process wiring");
+
+    assert_eq!(
+        producer.producer_doorbells_armed_for_test(),
+        1,
+        "the producer arms the topic it publishes with no plan behind it: under a \
+         gate keyed to the plan this reads zero and every assertion below falls"
+    );
+    assert_eq!(
+        producer.producer_doorbells_planned_for_test(),
+        0,
+        "and no plan named a reader of it, which is exactly the consumer class the \
+         rule serves"
+    );
+    assert!(
+        cerulion_core::doorbell::shm_object_exists_for_test(&ns, FEED),
+        "the page for {FEED} must exist, or there is no line for a consumer in \
+         another graph to watch"
+    );
+
+    // The CONSUMER graph: a data trigger on that absolute topic, which it does not
+    // publish, so the topic is provisioned External and the park maps its page.
+    let consumer_config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_xg_consumer".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
+            ros2: None,
+            id: "watcher".to_string(),
+            node_type: "consumer".to_string(),
+            inputs: vec![InputDef {
+                name: "inp".to_string(),
+                source: FEED.to_string(),
+            }],
+            outputs: vec![],
+        }],
+    };
+    let mut consumer_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    consumer_factories.insert(
+        "watcher".to_string(),
+        Box::new(ConsumerEntry::with_state(Consumer {
+            observed: Arc::clone(&observed),
+            fires: Arc::clone(&fires),
+            ..Default::default()
+        })),
+    );
+    let mut consumer = GraphRuntime::build_for_test_with_policy(
+        consumer_config,
+        consumer_factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+    )
+    .expect("build the consumer graph on the producer's topic");
+
+    assert_eq!(
+        consumer.doorbell_primary_topic_for_test(),
+        Some(FEED),
+        "the consumer publishes this topic nowhere, so it is the line it watches"
+    );
+
+    // The ring counter of that page, read through a THIRD mapping of it, which is
+    // also the proof that the two graphs are on one page rather than on two of the
+    // same name.
+    let watcher = cerulion_core::doorbell::Doorbell::open_unowned(&ns, FEED)
+        .expect("a third mapping of the page both graphs use");
+    let rings_before = watcher.seq();
+
+    // One producer step publishes a frame, and the publish rings.
+    producer_drive.advance(PERIOD_VTIME_ADVANCE.as_nanos() as u64);
+    producer.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+    consumer.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+
+    assert!(
+        consumer.park_entry_count_for_test() > 0,
+        "the consumer must route its idle through the park, or it is not the \
+         consumer class this rule serves"
+    );
+    assert!(
+        watcher.seq() > rings_before,
+        "the publish must advance the ring counter of the page the consumer \
+         watches: that page is opened by a graph nobody planned beside this one, \
+         and under a gate keyed to the plan the producer arms nothing and this \
+         counter never moves. Got {} against {rings_before}",
+        watcher.seq()
+    );
+
+    drop(watcher);
+    consumer.shutdown();
+    producer.shutdown();
+}
+
+/// A SYNC INPUT can hold the armed line, and the registry still carries the
+/// locally written topic beside it.
+///
+/// The park's arm list is built from the data-trigger topics and then EXTENDED
+/// with every sync input, so a graph whose data triggers are all written in
+/// process reaches a ringable line only through that extension. This graph HAS a
+/// data trigger, `ticker/out` read by `local_consumer`, and a node of this graph
+/// publishes it, so it is not armable; the Sync node's second input is an
+/// absolute topic nothing here writes and is the only line a publisher outside
+/// this process can ring. Dropping the extension leaves the list with that one
+/// unarmable topic, which arms nothing and also loses the poll-all scan for every
+/// sync input.
+#[test]
+#[serial]
+fn a_sync_input_holds_the_armed_line_when_every_data_trigger_is_written_here() {
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = sync_input_rank_graph(Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("syncinput")),
+    )
+    .expect("build the sync-input rank graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        Some(EXT_TOPIC),
+        "the only line a publisher outside this process can write is the sync \
+         input, so the park must arm it even though it is no data trigger"
+    );
+    let topics = runtime
+        .doorbell_topics_for_test()
+        .expect("an armed line means a registry");
+    assert!(
+        topics.contains(&EXT_TOPIC.to_string()) && topics.contains(&"/mwp/ticker/out".to_string()),
+        "the registry must carry both sync inputs: the armed one for the block and \
+         the locally written one for the poll-all scan, which is the only thing \
+         that reads its rings. Carried: {topics:?}"
+    );
+    runtime.shutdown();
+}
+
+/// The armed slot is decided by DECLARED order among the writable topics, not by
+/// which topic was declared first overall.
+///
+/// This rank writes `/mwp/ticker/out` itself and declares a consumer of it
+/// BEFORE the consumer of `/mwp/ext`, which nothing here writes. The armed line
+/// must be `/mwp/ext`, and both topics must stay in the registry so the
+/// poll-all scan still reads the local one's rings.
+#[test]
+#[serial]
+fn the_armed_line_is_the_writable_topic_even_when_a_local_one_is_declared_first() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = mixed_rank_graph(Arc::clone(&observed), Arc::clone(&fires), vec![]);
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("mixedprim")),
+    )
+    .expect("build the mixed rank graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        Some(EXT_TOPIC),
+        "the writable topic takes the armed slot although the locally written \
+         one is declared first"
+    );
+    let topics = runtime
+        .doorbell_topics_for_test()
+        .expect("the registry opened");
+    assert!(
+        topics.contains(&"/mwp/ticker/out".to_string()),
+        "the locally written topic stays in the registry for the poll-all scan - \
+         got {topics:?}"
+    );
+    runtime.shutdown();
+}
+
+/// A topic this runtime publishes is writable from outside it when the graph
+/// opts it into `multi_publisher_topics:`, because the opt-in is what admits
+/// publishers the graph does not own.
+///
+/// Same graph as the arm above with `/mwp/ticker/out` listed, and the consumer
+/// of it declared first, so the listing alone decides the armed line.
+#[test]
+#[serial]
+fn a_multi_publisher_topic_this_runtime_also_writes_is_armable() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = mixed_rank_graph(
+        Arc::clone(&observed),
+        Arc::clone(&fires),
+        vec!["/mwp/ticker/out".to_string()],
+    );
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("multiprim")),
+    )
+    .expect("build the multi-publisher rank graph");
+    assert_eq!(
+        runtime.doorbell_primary_topic_for_test(),
+        Some("/mwp/ticker/out"),
+        "the opt-in admits writers this graph does not own, so the topic it \
+         publishes is armable and, declared first, takes the armed slot"
+    );
+    runtime.shutdown();
+}
+
+/// The park must take NO kernel block on a graph whose declared trigger topics
+/// are all written only by its own nodes: the block is the behaviour, and the
+/// resolved decision above is only its input.
+///
+/// The counter this reads is the same one
+/// `doorbell_ring_during_park_is_attributed_to_doorbell_counter` asserts moves
+/// when a writer that is not a node of it rings, and this graph carries no
+/// barrier participant and no
+/// credit edge, so the shared counter is attributable to the doorbell rung
+/// alone. Zero on its own would not say much: it is also what a host with no wake
+/// word and a removed rung produce. So the same drive runs twice, once on the
+/// chain and once on a graph whose trigger has a writer that is not a node of
+/// this runtime and really rings, and the chain's zero is read against that graph's nonzero. The pair is
+/// macOS-only: off macOS there is no rung to judge and only the park-entry
+/// premise runs. On macOS it is skipped, with a recorded reason, where the host
+/// carries no usable os_sync backend.
+#[test]
+#[serial]
+fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = in_process_chain_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("chainblock")),
+    )
+    .expect("build the in-process chain graph");
+    for _ in 0..4 {
+        runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+    }
+    assert!(
+        runtime.park_entry_count_for_test() > 0,
+        "the parked live drive must route its idle through the park, or the \
+         counter below is zero for the wrong reason"
+    );
+    #[cfg(target_os = "macos")]
+    if !cerulion_core::doorbell::wake_word_block_primitive_available() {
+        eprintln!(
+            "SKIP: no usable os_sync backend on this host, so a zero block count \
+             says nothing about the producer term"
+        );
+        runtime.shutdown();
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        runtime.park_wake_word_block_count_for_test(),
+        0,
+        "no declared topic of this graph is writable from outside it, so the \
+         doorbell rung must take no kernel block; no sibling rung exists here to \
+         bump the shared counter"
+    );
+    runtime.shutdown();
+
+    // The positive half, same host, same run: a consumer whose trigger is written
+    // by a thread that is not a node of this runtime, with that thread ringing.
+    // Its nonzero count is what makes the zero above a decision rather than an
+    // absent capability.
+    #[cfg(target_os = "macos")]
+    {
+        let ns = mwp_ns("chainctl");
+        let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+        let fires = Arc::new(AtomicU64::new(0));
+        let (config, factories) = consumer_graph(Arc::clone(&observed), Arc::clone(&fires));
+        let clock = Arc::new(VirtualClock::new());
+        let mut runtime = GraphRuntime::build_for_test_with_policy(
+            config,
+            factories,
+            clock,
+            8,
+            MonitorWaitPolicy::new(true, true, ns.clone()),
+        )
+        .expect("build the external-producer consumer graph");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ringing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ringer = {
+            let stop = Arc::clone(&stop);
+            let ringing = Arc::clone(&ringing);
+            std::thread::spawn(move || {
+                let db = cerulion_core::doorbell::Doorbell::open_owned(&ns, EXT_TOPIC)
+                    .expect("open the producer-side ringer doorbell");
+                while !stop.load(Ordering::Relaxed) {
+                    db.ring();
+                    ringing.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+        let spun_up = std::time::Instant::now();
+        while !ringing.load(Ordering::Acquire) {
+            assert!(
+                spun_up.elapsed() < Duration::from_secs(10),
+                "the ringer never rang, so the control below would judge nothing"
+            );
+            std::thread::yield_now();
+        }
+        for _ in 0..4 {
+            runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+        }
+        stop.store(true, Ordering::Relaxed);
+        ringer.join().expect("ringer thread panicked");
+        assert!(
+            runtime.park_wake_word_block_count_for_test() > 0,
+            "the control must kernel-block on its armed line, or the zero above \
+             could equally mean the rung is gone"
+        );
+        runtime.shutdown();
+    }
+}
+
+/// The producer side arms EVERY topic the graph publishes, and the plan's own set
+/// is reported rather than consulted.
+///
+/// The only arm that reaches this decision with a NON-EMPTY outbound set, which
+/// is what makes the two numbers separable: this graph publishes two topics, the
+/// plan names ONE of them as read by a sibling group and names the other as a
+/// topic a sibling writes to this graph, so a gate that still read either set
+/// would arm one publisher and open one page. Both pages must exist and both
+/// publishers must have armed, with the planned count at one.
+///
+/// Asserted on the pages themselves as well as on the counts: a page exists for
+/// each topic this graph publishes, whoever was planned to read it.
+#[test]
+#[serial]
+fn a_publisher_arms_every_topic_it_publishes_and_reports_the_planned_set() {
+    let fires = Arc::new(AtomicU64::new(0));
+    let ns = mwp_ns("outbound");
+    let read_by_sibling = "/mwp/ta/out";
+    let written_by_sibling = "/mwp/tb/out";
+
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_outbound".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec!["ta", "tb"]
+            .into_iter()
+            .map(|id| NodeDef {
+                fuse: None,
+                params: Default::default(),
+                ros2: None,
+                id: id.to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            })
+            .collect(),
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    for id in ["ta", "tb"] {
+        factories.insert(
+            id.to_string(),
+            Box::new(TickerEntry::with_state(Ticker {
+                fires: Arc::clone(&fires),
+                ..Default::default()
+            })),
+        );
+    }
+
+    // Both sets non-empty and naming different topics: that is what separates the
+    // armed count from the planned one.
+    let outbound: cerulion_core::graph::SiblingConsumedTopics =
+        [read_by_sibling.to_string()].into_iter().collect();
+    let inbound: cerulion_core::graph::SiblingProducedTopics =
+        [written_by_sibling.to_string()].into_iter().collect();
+    let wiring = cerulion_core::graph::runtime::CrossProcessWiring::none()
+        .with_sibling_consumed_topics(&outbound)
+        .with_sibling_topics(&inbound);
+
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test_with_policy_and_wiring(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+        wiring,
+    )
+    .expect("build the two-output graph with cross-process wiring");
+
+    assert_eq!(
+        runtime.producer_doorbells_armed_for_test(),
+        2,
+        "both publishers arm: a ring reaches whoever is blocked on the page, and \
+         this build cannot name those consumers, so the plan does not gate it"
+    );
+    assert_eq!(
+        runtime.producer_doorbells_planned_for_test(),
+        1,
+        "and the plan's own statement is reported beside that count: one of the \
+         two topics is named as read by a sibling group. A gate reading either set \
+         again would drop the armed count to one"
+    );
+    for topic in [read_by_sibling, written_by_sibling] {
+        assert!(
+            cerulion_core::doorbell::shm_object_exists_for_test(&ns, topic),
+            "the page for {topic} must exist: every topic this graph publishes is \
+             armed while the policy permits one"
+        );
+    }
+    runtime.shutdown();
+}
+
+/// A doorbell RING landing inside a park window is attributed to the DOORBELL
+/// counter, the `wakes_doorbell` branch's e2e coverage (the doorbell data test
+/// above pins it at 0, since its out-of-graph producer never rings; on a target
+/// whose ring is the no-op stub there is no real branch to exercise, so this is
+/// gated to the two targets that map a real page. A production-scale Linux run
+/// measured `wakes_doorbell=33638/33640`; this is the CI pin).
+///
+/// On macOS the same ring additionally carries a KERNEL WAKE, so this test is
+/// also the e2e evidence that the macOS data-wake rung is wired: the park
+/// blocks on the wake word and the ringer's `os_sync_wake_by_address_all`
+/// releases it.
 ///
 /// A NON-Cerulion ringer thread opens an OWNED doorbell on the SAME `(ns,
 /// topic)` the consumer registry mapped (both `shm_open(O_CREAT)` the same
@@ -522,7 +1428,7 @@ fn doorbell_data_graph_builds_registry_and_flows_data() {
 /// a listener event from a publish. Rings landing BETWEEN parks are absorbed by
 /// the next entry's baseline snapshot; the continuous cadence (~200µs) vs the
 /// 50ms park window guarantees rings land INSIDE windows too.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[serial]
 fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
@@ -540,17 +1446,32 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     .expect("build doorbell consumer graph");
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The ringer's FIRST ring, so the park windows below start against a cadence
+    // that is already running. Without it the first window races the thread's
+    // spawn plus three shared-memory syscalls, and a window that opens before the
+    // cadence does is a window the ring genuinely cannot end.
+    let ringing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ringer = {
         let stop = Arc::clone(&stop);
+        let ringing = Arc::clone(&ringing);
         std::thread::spawn(move || {
             let db = cerulion_core::doorbell::Doorbell::open_owned(&mwp_ns("ringattr"), EXT_TOPIC)
                 .expect("open the producer-side ringer doorbell");
             while !stop.load(Ordering::Relaxed) {
                 db.ring();
+                ringing.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_micros(200));
             }
         })
     };
+    let spun_up = std::time::Instant::now();
+    while !ringing.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(10),
+            "the ringer never rang, so nothing below would be judging a ring"
+        );
+        std::thread::yield_now();
+    }
 
     // Each live step parks (50ms window); a ring lands inside it and wakes the
     // park early. No data flows — the steps fire nothing (records-only wake).
@@ -560,7 +1481,7 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
     stop.store(true, Ordering::Relaxed);
     ringer.join().expect("ringer thread panicked");
 
-    let (entries, _listener, doorbell, _timeout) = runtime.park_wake_counts();
+    let (entries, _listener, doorbell, timeout) = runtime.park_wake_counts();
     assert!(
         entries > 0,
         "the parked live drive must route its idle through the park"
@@ -570,11 +1491,67 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
         "a doorbell ring landing inside a park window must be attributed to the \
          DOORBELL wake counter — got {doorbell} across {entries} park entries"
     );
+    // The claim the product makes is that the ring ENDS the park, not that the
+    // park happens to end. A block that timed out at its slice would satisfy
+    // `doorbell >= 1` just as well, because the loop-top poll then attributes the
+    // ring it finds. The ringer is known to be ringing before the first window
+    // opens, by the `ringing` handshake after its spawn, and its cadence is 200
+    // microseconds against a 50 millisecond
+    // window, so a ring lands inside every window this drives.
+    //
+    // Stated as a ONE-window timeout budget: a ringer starved for one whole
+    // window on a loaded runner is a scheduling fact about the host, so one such
+    // window is allowed and a second is not. The ring half is asserted separately
+    // below by `doorbell + 1 >= entries`; this bound on its own would also be
+    // satisfied by a listener wake.
+    assert!(
+        timeout <= 1,
+        "a park window with a ring every 200 microseconds inside it must not be \
+         ended by its own 50 millisecond timeout; one starved window on a loaded \
+         runner is a host fact and is the whole budget - got {timeout} timeouts \
+         across {entries} park entries"
+    );
+    assert!(
+        doorbell + 1 >= entries,
+        "and all but at most one entry must be ring-ended - got {doorbell} ring \
+         wakes across {entries} park entries"
+    );
     assert_eq!(
         fires.load(Ordering::Relaxed),
         0,
         "rings carry no data — the wake is record-only and must not fire the consumer"
     );
+    // On macOS the park has no CPU monitor-wait primitive, so its idle is a
+    // KERNEL BLOCK on the doorbell's wake word rather than a pacing nap. This
+    // graph carries no barrier participant and no credit edge, so the shared
+    // wake-word block counter is attributable to the doorbell rung alone, which
+    // makes it the seam that fails if that rung is removed or the macOS ring
+    // goes back to being a no-op stub.
+    //
+    // Asserted in BOTH directions against the host fact the rung is gated on,
+    // so a host without the Apple os_sync family (macOS before 14.4, or
+    // CERULION_DOORBELL_OS_SYNC=0 in the invoking shell) is a judged arm rather
+    // than a skipped one: the counter must then be exactly 0, which is what a
+    // rung that ignored its own gate would fail.
+    #[cfg(target_os = "macos")]
+    {
+        let blocks = runtime.park_wake_word_block_count_for_test();
+        if cerulion_core::doorbell::wake_word_block_primitive_available() {
+            assert!(
+                blocks > 0,
+                "the macOS park must KERNEL-BLOCK on the doorbell wake word, not \
+                 pace on its recheck nap - no barrier and no credit edge exist \
+                 here, so this counter can only have come from the doorbell rung"
+            );
+        } else {
+            assert_eq!(
+                blocks, 0,
+                "with no wake word on this host the doorbell rung must not run \
+                 at all, and no sibling rung exists in this graph to bump the \
+                 shared counter"
+            );
+        }
+    }
     runtime.shutdown();
 }
 
@@ -582,10 +1559,10 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
 // Test (c) — EDGE: a parked graph with NO data inputs does not hang.
 //
 // Build the `Ticker` graph (NO data-trigger inputs) with `doorbell: true`. The
-// consumer registry is EMPTY (no data inputs → no topics) so `primary_addr()`
-// is `None` and the park has no hardware-armed line: it must degrade to the
-// timer-only park and still FIRE the period node — never panic or hang on an
-// empty registry / `None` primary. Drive a few live iterations; assert `> 0`.
+// consumer registry is EMPTY (no data inputs → no topics) so no topic resolves
+// and the park has no hardware-armed line: it must degrade to the timer-only
+// park and still FIRE the period node, never panic or hang on an empty
+// registry. Drive a few live iterations; assert `> 0`.
 // ===========================================================================
 #[test]
 #[serial]
@@ -593,7 +1570,7 @@ fn parked_graph_with_no_data_inputs_does_not_hang() {
     const ITERS: usize = 8;
 
     // doorbell: true on a graph with NO data-trigger inputs → EMPTY registry →
-    // primary_addr() == None → the park must fall to the timer-only path.
+    // no topic resolves → the park must fall to the timer-only path.
     let (fires, _park_entries) = run_ticker_live(
         MonitorWaitPolicy::new(true, true, mwp_ns("nodatainputs")),
         ITERS,
@@ -791,19 +1768,149 @@ fn run_live_emits_wait_policy_line_with_active_park() {
     runtime.shutdown();
 }
 
+/// The wait-policy line's WAKE FIELDS, on a graph whose CONSUMER side declines.
+///
+/// One line carries the whole wake decision, and it is the only statement a
+/// spawned worker makes about it. Nothing pinned its wake fields, so a rename, a
+/// removal or a change of meaning was invisible to the suite, and two such
+/// changes are in this history: `doorbell` reported whether a registry had been
+/// built and now reports whether the resolved policy permits a doorbell at all,
+/// so it reads TRUE in a run that maps no page; and `producer_doorbells` counted
+/// the topics a sibling group was planned to read and now counts every topic the
+/// graph publishes, with the planned number reported beside it as
+/// `producer_doorbells_planned`. Two lines from two builds are therefore not
+/// comparable by either field, and this arm is what says which meaning each one
+/// carries here.
+///
+/// Every trigger topic of this graph is produced by a node the runtime owns, so
+/// nothing outside it can ring one: no registry opens, the rung declines and no
+/// line is armed, while the POLICY still permits a doorbell and its one publisher
+/// arms the page it owns for a reader this build cannot name.
+#[test]
+#[traced_test]
+#[serial]
+fn the_wait_policy_line_reports_a_declined_wake_on_every_field() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = in_process_chain_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("lineoff")),
+    )
+    .expect("build the in-process chain graph under the doorbell policy");
+
+    // `running` starts false: run_live emits the line, runs no iteration and
+    // returns, which is the same shape the park_active arm above uses.
+    let running = std::sync::atomic::AtomicBool::new(false);
+    runtime.run_live(&running).expect("run_live returns Ok");
+
+    assert!(
+        logs_contain("live loop wait policy"),
+        "the worker-visible line must be emitted"
+    );
+    assert!(
+        logs_contain("doorbell=true"),
+        "`doorbell` reports the RESOLVED POLICY, which permits a doorbell here, \
+         and not whether a registry opened: that is the one field whose meaning \
+         changed, so a reader comparing two builds by it compares nothing"
+    );
+    assert!(
+        logs_contain("registry=none"),
+        "no declared topic is writable from outside this process, so no registry \
+         opens and the field says so rather than reporting a count of zero"
+    );
+    assert!(
+        logs_contain("producer_doorbells=1"),
+        "the one topic this graph publishes IS armed: the producer side does not \
+         read the plan, because the consumers a ring can reach are not knowable \
+         from here"
+    );
+    assert!(
+        logs_contain("producer_doorbells_planned=0"),
+        "and no plan named a sibling reader of it, which is the number reported \
+         beside the armed count rather than gating it"
+    );
+    assert!(
+        logs_contain("data_wake=false"),
+        "with no ringable line the rung declines, so the park keeps its bounded \
+         recheck"
+    );
+    assert!(
+        logs_contain("primary_topic=none"),
+        "no line is armed, so the field names none"
+    );
+    assert!(
+        !logs_contain("data_wake=true") && !logs_contain("doorbell=false"),
+        "each field must render the decision rather than a constant"
+    );
+    runtime.shutdown();
+}
+
+/// The positive control for the fields above: a graph whose trigger topic has no
+/// producer here names that topic in the line and opens one registry entry for
+/// it.
+///
+/// Without this arm every assertion above also passes on a line whose fields are
+/// hardcoded to the declining values.
+#[test]
+#[traced_test]
+#[serial]
+fn the_wait_policy_line_names_the_armed_topic_when_one_is_armed() {
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let fires = Arc::new(AtomicU64::new(0));
+    let (config, factories) = consumer_graph(Arc::clone(&observed), Arc::clone(&fires));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        clock,
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("lineon")),
+    )
+    .expect("build the external-producer consumer graph under the doorbell policy");
+
+    let running = std::sync::atomic::AtomicBool::new(false);
+    runtime.run_live(&running).expect("run_live returns Ok");
+
+    assert!(
+        logs_contain(&format!("primary_topic={EXT_TOPIC}")),
+        "the trigger topic has no producer here, so it is the armed line and the \
+         line must name it"
+    );
+    assert!(
+        !logs_contain("primary_topic=none"),
+        "and must not render the declining value for a graph that armed a line"
+    );
+    assert!(
+        logs_contain("registry=1"),
+        "one topic is mapped, so the registry reports its size rather than none"
+    );
+    // `data_wake` is host-gated (the kernel block exists on macOS 14.4 and
+    // later), so it is not asserted here; the arms over resolved state judge it
+    // in both directions.
+    runtime.shutdown();
+}
+
 // ===========================================================================
 // The DEGRADED park tier is the macOS/no-primitive DEFAULT.
 //
 // Under that default the CLI resolver arms `MonitorWaitPolicy::new(true,
-// false, ns)` (park ON, doorbell FORCED OFF) by default for live runs on
-// no-primitive targets — exactly the policy this test builds with. On such a target
-// the park degrades to the CHUNKED ~100µs bounded sleep-recheck (never a
+// false, ns)` (park ON, doorbell FORCED OFF) for a live run on a no-primitive
+// target where NO consumer can kernel-block on a doorbell, exactly the policy
+// this test builds with. On macOS 14.4 and later the resolver arms the doorbell
+// too, which is a different shape and the park test's own arms cover it. On this
+// one the park degrades to the CHUNKED ~100µs bounded sleep-recheck (never a
 // busy-spin; a single-sleep alternative measures a timer-coalesced NULL on
 // macOS — chunked is the only production shape).
 // ===========================================================================
 
 /// End-to-end: a LIVE runtime under the no-primitive DEFAULT policy shape
-/// (park ON, doorbell OFF — what the CLI resolver emits on a no-primitive target) PARKS
+/// (park ON, doorbell OFF, what the CLI resolver emits on a no-primitive target
+/// with no wake word to block on) PARKS
 /// (`park_entry_count_for_test > 0`) and still fires + DELIVERS: the consumer
 /// observes the hand oracle `1.0..=N` (never a self-compare). The park is a
 /// WAIT primitive — it must change WHEN the loop wakes, never WHAT fires.
@@ -823,8 +1930,8 @@ fn degraded_default_policy_parks_fires_and_delivers() {
         factories,
         clock,
         8,
-        // The no-primitive DEFAULT shape: monitor_wait ON, doorbell
-        // FORCED OFF (the SHM ring is a no-op stub off Linux).
+        // The shape a no-primitive target resolves to where no consumer can be
+        // woken by a doorbell: monitor_wait ON, doorbell OFF.
         MonitorWaitPolicy::new(true, false, mwp_ns("degraded")),
     )
     .expect("build consumer graph under the degraded default policy");
@@ -897,6 +2004,19 @@ fn degraded_default_policy_parks_fires_and_delivers() {
             );
         }
     }
+    // The NEGATIVE control for this shared counter: with the doorbell OFF no page
+    // is mapped, so no wake-word block may run and the counter must stay at zero.
+    // The `policy_doorbell` TERM itself is pinned by
+    // `the_doorbell_rung_applies_only_when_every_term_holds`, not here: with the
+    // doorbell off the registry, baseline and armed-line terms are all false too,
+    // so dropping that one term alone would leave this assertion green.
+    assert_eq!(
+        runtime.park_wake_word_block_count_for_test(),
+        0,
+        "the doorbell is off on this policy, so no wake-word block may run: this \
+         graph has no barrier participant and no credit edge either, so any \
+         count here can only have come from the doorbell rung"
+    );
     runtime.shutdown();
 }
 
@@ -1612,6 +2732,8 @@ mod box_same_core {
             identity: "same_core_ponger_ctx".to_string(),
             prefix: "samecoreg".to_string(),
             nodes: vec![NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ponger".to_string(),
                 node_type: "same_core_ponger".to_string(),

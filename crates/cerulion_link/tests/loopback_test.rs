@@ -240,11 +240,11 @@ async fn frame_too_large_is_rejected_before_allocation() {
 #[test]
 fn alpn_constants_are_the_documented_wire_values() {
     // Hand oracle — the exact bytes on the wire.
-    assert_eq!(alpn::WIRE, b"cerulion/wire/1");
+    assert_eq!(alpn::WIRE, b"cerulion/wire/2");
     assert_eq!(alpn::OPS, b"cerulion/ops/1");
     assert_eq!(
         alpn::ALL,
-        &[b"cerulion/wire/1".as_slice(), b"cerulion/ops/1"]
+        &[b"cerulion/wire/2".as_slice(), b"cerulion/ops/1"]
     );
 }
 

@@ -1,7 +1,7 @@
-error[E0080]: evaluation panicked: MaxSliceLen::const_new requires n >= WireHeader::SIZE (32)
+error[E0080]: evaluation panicked: MaxSliceLen::const_new requires n >= WireHeader::SIZE (40)
   --> tests/ui/const_eval/max_slice_len_const_new_below_floor.rs:15:24
    |
-15 | const _: MaxSliceLen = MaxSliceLen::const_new(31);
+15 | const _: MaxSliceLen = MaxSliceLen::const_new(39);
    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `MaxSliceLen::const_new`
@@ -11,5 +11,5 @@ note: inside `MaxSliceLen::const_new`
    |
   ::: src/wire.rs
    |
-   |             None => panic!("MaxSliceLen::const_new requires n >= WireHeader::SIZE (32)",),
+   |             None => panic!("MaxSliceLen::const_new requires n >= WireHeader::SIZE (40)",),
    |                     --------------------------------------------------------------------- in this macro invocation

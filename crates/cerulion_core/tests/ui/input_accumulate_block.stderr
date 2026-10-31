@@ -1,0 +1,11 @@
+error: `#[input(accumulate)]` cannot be combined with `backpressure = block`: an accumulate input drops its oldest frames at the cap, while `block` paces the producer instead. With `accumulate` the accepted keys are `cap = N`, `backpressure = drop_oldest` and `expect_within_ms = N`.
+ --> tests/ui/input_accumulate_block.rs:7:13
+  |
+7 |     #[input(accumulate, backpressure = block)]
+  |             ^^^^^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_accumulate_block.rs:7:7
+  |
+7 |     #[input(accumulate, backpressure = block)]
+  |       ^^^^^

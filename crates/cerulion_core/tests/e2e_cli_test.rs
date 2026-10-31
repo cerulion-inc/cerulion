@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(target_os = "android"))]
+
 //! End-to-end CLI integration tests (the SHM-backed API rewrite).
 //!
 //! Simulates a real user journey: create workspace → add nodes → build
@@ -30,6 +32,10 @@
 //!   gates after the SHM rewrite. Coverage is strictly stronger in
 //!   `flat_latency_test.rs` (the full publish→receive path, a wider sweep, a
 //!   tighter ceiling on a per-size floor).
+
+// It drives `cerulion_cli_engine`, a host-only dev-dependency that does not
+// build for Android, so this module compiles to nothing there.
+#![cfg(not(target_os = "android"))]
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

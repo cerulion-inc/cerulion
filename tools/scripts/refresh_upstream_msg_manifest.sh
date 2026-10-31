@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# Refresh native_ros2_messages/upstream_msg_manifest.txt — the
+# Refresh crates/native_ros2_messages/upstream_msg_manifest.txt: the
 # checked-in snapshot of every vendored message's UPSTREAM ROS 2 signature,
 # which `upstream_drift_test.rs` gates the corpus against. Each package is
 # pinned to the distro it is vendored from: of 22 packages, 19 Jazzy,
@@ -23,7 +23,7 @@
 # bare one, which would silently delete every one of those judgements.
 #
 # USAGE
-#   ./scripts/refresh_upstream_msg_manifest.sh
+#   ./tools/scripts/refresh_upstream_msg_manifest.sh
 #   git diff crates/native_ros2_messages/upstream_msg_manifest.txt   # REVIEW THIS
 #
 # PINNED REFS — one DISTRO PIN PER PACKAGE

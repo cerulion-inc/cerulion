@@ -8,8 +8,21 @@ The [README](../README.md#install) has the commands for every route. This page h
 
 1. It downloads the release archive for your platform and verifies its SHA-256 checksum.
 2. It provisions Rust, as described in the next section. A failure here stops the install before any binary is touched, so an existing Cerulion install stays as it was.
-3. It places `cerulion`, `cerulion-netd` and `cerulion-connectd` in `CERULION_INSTALL_DIR` (default `~/.cerulion/bin`). On Linux it also places `librmw_cerulion.so` and `libcerulion_heaphook.so` beside them: the ROS 2 Jazzy rmw that `cerulion ros2 run` and `cerulion ros2 launch` use, and the heap hook they preload into ROS 2 nodes. The macOS archives carry neither, because ROS 2 Jazzy has no macOS binaries.
-4. Last, it writes one line to your shell startup files so every new shell has the programs on the PATH. Set `CERULION_NO_MODIFY_PATH=1` to leave your startup files alone; the installer then prints the PATH line for you to add yourself.
+3. It places `cerulion`, `cerulion-netd`, `cerulion-connectd` and `cerulion-remoted` in `CERULION_INSTALL_DIR` (default `~/.cerulion/bin`). On Linux it also places `librmw_cerulion.so` and `libcerulion_heaphook.so` beside them: the ROS 2 Jazzy rmw that `cerulion ros2 run` and `cerulion ros2 launch` use, and the heap hook they preload into ROS 2 nodes. The macOS archives carry neither, because ROS 2 Jazzy has no macOS binaries. The installer does not place a Lyrical library; for ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64, holding the Lyrical `librmw_cerulion.so` and the heap hook: unpack it and set `CERULION_LIB_DIR` to the unpacked directory. It is built and tested in CI but has not been run on a robot. The v1.0.0 archives predate `cerulion-remoted` and carry the other three programs. Installing one of them (`--version v1.0.0`) places those three, and removes a `cerulion-remoted` that a later release left in the install directory along with the installer's link to it.
+4. Last, it puts the programs on the PATH:
+   - It links `cerulion`, `cerulion-netd`, `cerulion-connectd` and `cerulion-remoted` into `~/.local/bin`, creating the directory if needed. The default `~/.profile` on Debian and Ubuntu puts that directory on the PATH of a bash or sh login once it exists. When `~/.local/bin` is not on the PATH of the shell running the installer, `/usr/local/bin` is on it and you can write there without `sudo`, the programs are linked there too, unless other accounts could not follow the link into the install directory (a root install under `/root`, or a macOS home directory) or a different `cerulion` is already on the PATH. They are also not linked there when another account could change what the links run: when `/usr/local/bin`, the install directory, a directory above either, or one of the programs is group- or world-writable (a sticky `/tmp` included), is owned by an account other than root or you, or carries a macOS ACL that allows writes. The installer then prints a warning naming that directory and keeps only the `~/.local/bin` links. A name already taken by a file or another link is left alone, with a warning.
+   - It writes `~/.cerulion/env` (and `env.fish`), which puts the install directory and, when this run installed Rust, `~/.cargo/bin` at the front of the PATH. It then adds one marked line that sources it to `~/.profile`, to the bash startup files that already exist, to `.zshenv` when zsh is present, and to fish's `conf.d` when fish is present. A rerun finds its line and adds nothing.
+   - Its last line says what to do in the terminal you ran it from. A piped installer runs as a child process and cannot change that shell's PATH, so when `cerulion` (or Cargo) is not already found there, the line names the one command that fixes it, `. ~/.cerulion/env` (`source ~/.cerulion/env.fish` in fish). The README's one-liner ends with that command, so nothing more is needed. Otherwise the line says `cerulion` is ready.
+
+   Set `CERULION_NO_MODIFY_PATH=1` (or pass `--no-modify-path`) to leave your startup files and `~/.local/bin` alone; the installer then prints the PATH line for you to add yourself.
+
+## Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh -s -- --uninstall
+```
+
+This removes the programs and libraries from `~/.cerulion/bin` (or from the `--dir` or `CERULION_INSTALL_DIR` you installed with, which must carry the installer's marker), the links that point at them, and, when the env file names that directory, the marked line in each startup file and then the two env files. It prints `Cerulion is uninstalled` only when all of that succeeded, says so when it found nothing to remove, and otherwise names what is left. `~/.cerulion` keeps your sign-in, keys and settings; delete it to remove those too. The Rust toolchain stays with rustup (`rustup self uninstall` removes rustup and every toolchain). A new terminal no longer finds `cerulion`; in the current one, run `hash -r` (bash) or `rehash` (zsh) if it still does.
 
 ## How the install script provisions Rust
 
@@ -32,7 +45,22 @@ An archive you unpack by hand carries the same helper as `install_rust.sh` besid
 sh install_rust.sh rustc-version.txt
 ```
 
-Downloaded release binaries are built with Rust 1.93.0 from rustup, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml). For another release, read that workflow at its tag.
+The 1.0.0 release binaries were built with Rust 1.93.0; the workspace's minimum is Rust 1.95, and each release archive names its own compiler in `rustc-version.txt`, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. For another release, read that workflow at its tag.
+
+## What the Debian package requires and ships
+
+The package depends on `libc6 (>= 2.35)`, `libstdc++6` and `libgcc-s1`, so it installs on Ubuntu 22.04 and later, Debian 12 and later, or another distribution with glibc 2.35 or newer; `apt` refuses the install on an older release. ROS 2 is a `Suggests` (`ros-jazzy-ros-base`), not a dependency: the rmw is loaded by a ROS 2 process and links no ROS library of its own. The rmw works where ROS 2 Jazzy works, Ubuntu 24.04 with `ros-jazzy-ros-base` installed. On a host without ROS 2 the CLI installs, and `cerulion ros2 run` and `cerulion ros2 launch` exit with an error saying `ros2` was not found on `PATH`.
+
+The package installs `cerulion`, `cerulion-netd`, `cerulion-connectd` and `cerulion-remoted` into `/usr/bin`, with `librmw_cerulion.so`, `libcerulion_heaphook.so` and the `cerulion-install-rust` helper beside them. The v1.0.0 package predates `cerulion-remoted` and installs the other three programs. Every release archive, and the package built from it, also carries four license files, because the binaries statically link their dependency graph and most of those licenses require their text and copyright notice to travel with a binary:
+
+| File | What it is |
+|---|---|
+| `LICENSE` | The AGPL-3.0-only text the combined work is under. |
+| `NOTICE` | Attribution for the components a reader is most likely to care about, including the vendored ROS 2 message packages. |
+| `LICENSE-BSD-3-CLAUSE` | The BSD text that seven of those message packages require. |
+| `THIRD-PARTY-LICENSES.md` | The generated inventory of every crate linked into the binaries, grouped by license, with each license text reproduced once. |
+
+In the archive the four sit at the top level beside the binaries. The package installs them into `/usr/share/doc/cerulion/`, beside a `copyright` file that names each of them by path. The [APT packaging notes](packaging/apt.md) cover how the package is built and verified.
 
 ## The C toolchain
 

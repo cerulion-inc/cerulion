@@ -7,8 +7,8 @@
 //! 1. listener.timed_wait_one(timeout)   → block until event or timeout
 //! 2. subscriber.receive() in loop       → drain ALL available samples
 //! 3. For each sample:
-//!    a. read_from_buf() → owned WireHeader (32 bytes, alignment-safe)
-//!    b. &raw[32..] → zero-copy payload slice into shared memory
+//!    a. read_from_buf() → owned WireHeader (40 bytes, alignment-safe)
+//!    b. &raw[WireHeader::SIZE..] → zero-copy payload slice into shared memory
 //!    c. invoke callback with ReceivedMessage
 //! ```
 //!
@@ -38,7 +38,10 @@ use crate::error::{TransportError, TransportResult};
 use crate::graph::node::BackpressurePolicy;
 use crate::message::ShmMessage;
 use crate::read_outcome::{ReadOutcomeKind, ReadOutcomeStage, ReadSiteRole};
-use crate::scheduler::{record_backpressure_event_n, BackpressureCounters, BackpressureEvent};
+use crate::scheduler::sync_stamp::SyncFrameSlot;
+use crate::scheduler::{
+    record_backpressure_event_n, BackpressureCounters, BackpressureEvent, SyncAlignSite,
+};
 use crate::wire::WireHeader;
 
 use super::events::PubSubEvent;
@@ -246,11 +249,8 @@ enum BackpressureProbe {
 #[inline]
 fn wire_timestamp_ns(raw: &[u8]) -> Option<u64> {
     if raw.len() >= WireHeader::SIZE {
-        Some(u64::from_le_bytes(
-            raw[24..32]
-                .try_into()
-                .expect("raw[24..32] is exactly 8 bytes"),
-        ))
+        let bytes = raw.get(24..32)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
     } else {
         None
     }
@@ -263,11 +263,8 @@ fn wire_timestamp_ns(raw: &[u8]) -> Option<u64> {
 #[inline]
 fn wire_sequence(raw: &[u8]) -> Option<u32> {
     if raw.len() >= WireHeader::SIZE {
-        Some(u32::from_le_bytes(
-            raw[20..24]
-                .try_into()
-                .expect("raw[20..24] is exactly 4 bytes"),
-        ))
+        let bytes = raw.get(20..24)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
     } else {
         None
     }
@@ -303,6 +300,31 @@ const BACKWARD_GAP_THRESHOLD: u32 = u32::MAX / 2;
 /// counting stays intermittent for hours — sustained blindness, which the
 /// periodic re-warn exists to break.
 const ANOMALY_REWARN_EVERY: u64 = 64;
+
+/// Listener drains this process has run, test visible only.
+///
+/// A drain that runs where it is not needed costs time and changes no answer, so
+/// no behaviour test can see it. This counter is what lets a test pin WHEN the
+/// drain runs: once after a read that removed frames, and not at all after a read
+/// that removed none.
+///
+/// It is bumped in `try_drain_stale_events`, the fallible core every spelling of a
+/// drain reaches, and not in the infallible wrapper over it, so a drain written as a
+/// direct core call moves this count exactly like one written through the wrapper.
+#[cfg(any(test, feature = "test-helpers"))]
+static LISTENER_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read the listener drain count.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn listener_drain_count() -> u64 {
+    LISTENER_DRAINS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the listener drain count, so a test counts only its own reads.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_listener_drain_count() {
+    LISTENER_DRAINS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Per-drain, per-publisher-stream observation captured
 /// during the drain loop. One entry per distinct `sample.origin()` id seen
@@ -392,6 +414,83 @@ fn classify_gap(base_seq: u32, first_seq: u32) -> GapClass {
 /// An inbound iceoryx2 sample (slice payload, no user header).
 type InboundSample = Sample<CerService, [u8], ()>;
 
+/// A validated, zero-copy raw input frame.
+///
+/// A live sample owns its inbound slot through this view. A held sample
+/// borrows the subscriber's held slot, mirroring typed `try_view`: held
+/// serves do not record a service cursor and remain available for re-serve.
+///
+/// The view carries the [`WireHeader`] the frame checks parsed, so a consumer
+/// that needs a header field reads [`Self::header`] instead of parsing the
+/// same thirty-two bytes a second time.
+pub struct RawInputView<'a> {
+    inner: RawInputViewInner<'a>,
+    header: WireHeader,
+}
+
+enum RawInputViewInner<'a> {
+    Owned(InboundSample, usize),
+    Held(&'a [u8]),
+}
+
+impl RawInputView<'_> {
+    /// The frame's wire header, as validated when the view was built.
+    pub fn header(&self) -> &WireHeader {
+        &self.header
+    }
+
+    /// The frame's schema hash, from [`Self::header`].
+    pub fn schema_hash(&self) -> u64 {
+        self.header.schema_hash
+    }
+
+    /// The view re-offers a frozen held frame rather than a popped one, so
+    /// reading again yields the same frame (the queue did not advance).
+    pub(crate) fn is_held(&self) -> bool {
+        matches!(self.inner, RawInputViewInner::Held(_))
+    }
+
+    /// Detaches the view from the subscriber borrow when it owns its sample.
+    ///
+    /// `Owned` views pin their SHM sample and consume borrow budget for as long
+    /// as the returned value lives; a `Held` view borrows the subscriber's
+    /// held sample and is returned unchanged in the error arm.
+    // The error arm IS the unchanged view (a header copy plus a borrow), returned
+    // by value so the caller keeps reading it; boxing it would allocate on a
+    // receive path to satisfy a size lint.
+    #[allow(clippy::result_large_err)]
+    pub fn into_owned(self) -> Result<RawInputView<'static>, Self> {
+        let header = self.header;
+        match self.inner {
+            RawInputViewInner::Owned(sample, len) => Ok(RawInputView {
+                inner: RawInputViewInner::Owned(sample, len),
+                header,
+            }),
+            RawInputViewInner::Held(bytes) => Err(RawInputView {
+                inner: RawInputViewInner::Held(bytes),
+                header,
+            }),
+        }
+    }
+}
+
+impl std::ops::Deref for RawInputView<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match &self.inner {
+            RawInputViewInner::Owned(sample, frame_len) => &sample.payload()[..*frame_len],
+            RawInputViewInner::Held(bytes) => bytes,
+        }
+    }
+}
+
+impl AsRef<[u8]> for RawInputView<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 /// An owned, zero-copy inbound sample held beyond the receive callback
 /// (the `bagd` recorder tap).
 ///
@@ -434,15 +533,49 @@ pub struct OwnedInboundSample {
     /// slot length for a frame with no parseable / out-of-bounds header (a
     /// corrupt frame is exposed whole rather than silently hidden).
     frame_len: usize,
+    /// The frame's wire header as the read path parsed it, or `None` for a frame
+    /// whose first thirty-two bytes do not parse as one.
+    ///
+    /// Thirty-two bytes carried by value beside `frame_len`, which is derived from
+    /// the same parse. [`Self::wire_header`] hands this copy back, so the ROS 2
+    /// middleware layer's take, which asks for the header one statement after the
+    /// read entry returns, costs the one parse the entry already paid.
+    header: Option<WireHeader>,
 }
 
 impl OwnedInboundSample {
+    /// [`Self::new`] for a caller that has ALREADY parsed this frame's header and
+    /// bounds-checked its `total_size` against the loaned slot.
+    ///
+    /// The read path that hands this in has done both one line earlier, so parsing
+    /// the same thirty-two bytes again here would be the second parse of a frame on
+    /// a path whose rule is one.
+    fn with_header(sample: InboundSample, header: &WireHeader) -> Self {
+        let frame_len = header.total_size as usize;
+        // The precondition, checked where it is cheap: `payload()` slices the loaned
+        // slot to `frame_len`, so a `total_size` outside it would panic there
+        // instead of here. A slot-length read, not a parse, so the tally stays one.
+        debug_assert!(
+            (WireHeader::SIZE..=sample.payload().len()).contains(&frame_len),
+            "with_header's caller must bounds-check total_size against the loaned slot: \
+             {frame_len} is outside {}..={}",
+            WireHeader::SIZE,
+            sample.payload().len()
+        );
+        Self {
+            sample,
+            frame_len,
+            header: Some(*header),
+        }
+    }
+
     /// Wrap an owned inbound sample, computing its wire-frame length once
-    /// (alignment-safe header read; SHM slots are not guaranteed 8-byte
-    /// aligned — see `wire.rs`).
+    /// (alignment-safe header read; SHM slots are not guaranteed 8-byte aligned,
+    /// see `wire.rs`).
     fn new(sample: InboundSample) -> Self {
         let raw = sample.payload();
-        let frame_len = match WireHeader::read_from_buf(raw) {
+        let header = WireHeader::read_from_buf(raw);
+        let frame_len = match header {
             Some(header) => {
                 let total = header.total_size as usize;
                 // Only trust a header whose total_size names a slice WITHIN the
@@ -456,10 +589,17 @@ impl OwnedInboundSample {
             }
             None => raw.len(),
         };
-        Self { sample, frame_len }
+        // The one parse this constructor makes is kept, so `wire_header` reads it
+        // back instead of parsing the same bytes on demand. A frame whose header
+        // does not parse keeps `None` here and the whole slot as its length.
+        Self {
+            sample,
+            frame_len,
+            header,
+        }
     }
 
-    /// The full published wire frame (32-byte [`WireHeader`] + body), exactly
+    /// The full published wire frame (40-byte [`WireHeader`] + body), exactly
     /// the bytes the publisher wrote — zero-copy, borrowing the SHM slot.
     ///
     /// Trailing loan capacity past `WireHeader::total_size` is excluded (the
@@ -474,13 +614,14 @@ impl OwnedInboundSample {
     /// The parsed [`WireHeader`] at the front of the frame, or `None` when the
     /// frame is shorter than a header / unparseable.
     ///
-    /// Returned by value (32 bytes on the stack) via the alignment-safe
-    /// [`WireHeader::read_from_buf`]: iceoryx2 SHM slots are not guaranteed
-    /// 8-byte aligned, so a borrowed [`WireHeader::from_bytes`] view would
-    /// spuriously return `None` on an unaligned slot. This matches how every
-    /// other SHM read path in the transport parses the header.
+    /// Returned by value (40 bytes on the stack), and the value is the one the read
+    /// path parsed with the alignment-safe [`WireHeader::read_from_buf`]: iceoryx2
+    /// SHM slots are not guaranteed 8-byte aligned, so a borrowed
+    /// [`WireHeader::from_bytes`] view would spuriously return `None` on an
+    /// unaligned slot. The parse happens once per frame, in the entry that read it,
+    /// and this accessor reads the copy back.
     pub fn wire_header(&self) -> Option<WireHeader> {
-        WireHeader::read_from_buf(self.sample.payload())
+        self.header
     }
 
     /// The PUBLISHER IDENTITY of this frame — iceoryx2's
@@ -519,27 +660,29 @@ const _: fn() = || {
 /// A **data-only** subscriber for the record/replay capture tap — a
 /// zero-copy SHM reader with NO event `Listener` and NO `Notifier`.
 ///
-/// # Why it exists (the storm, killed structurally)
+/// # Why it exists (a listener the tap never needed)
 ///
 /// The recorder (`bagd`) and the replay engine's capture taps drain SHM samples
 /// exclusively via a POLLING loop ([`Self::drain_owned`]); they never wait on an
-/// event listener. A [`CerulionSubscriber`], however, MANDATES a `Listener` (it
-/// bundles a data receiver AND a WaitSet event listener), and iceoryx2's notifier
-/// sends an 8-byte `SentSample` datagram to EVERY connected listener on every
-/// publish. A tap that never drains that listener lets its `AF_UNIX SOCK_DGRAM`
-/// socket fill; once full, every publisher notify pays iceoryx2's
-/// `FailedToDeliverSignal` path (~12 µs + a ~2 KB warn dump per notify) — the
-/// notify warn storm (10–150 MB/s of stderr, enough to fill a disk
-/// during a long replay).
+/// event listener. A [`CerulionSubscriber`], however, opens the topic's EVENT
+/// service and holds a `Listener` on it for anything but an input that declares no
+/// trigger, so attaching one puts a connection in every publisher's notifier send
+/// loop that nothing will ever wait on.
 ///
 /// A `DataOnlySubscriber` opens ONLY the data pub/sub service (never the topic's
 /// event service), so it registers NO listener connection: the notifier's
-/// per-listener send loop finds ZERO tap connections → ZERO sends → ZERO failed
-/// sends, STRUCTURALLY, at DEFAULT sysctls, under any drain stall or publish
-/// rate. There is no queue, no ceiling, and no `net.unix.max_dgram_qlen` to hit.
-/// This makes a drain-listener, a receive-buffer deepening and a
-/// sender-buffer sweep all unnecessary — each of those would only be
-/// treating the symptom of a listener the tap never needed.
+/// per-listener send loop finds ZERO tap connections → ZERO sends, STRUCTURALLY,
+/// under any drain stall or publish rate. Every publish on a recorded topic
+/// keeps the per-tap notify cost it would otherwise pay.
+///
+/// Under iceoryx2 0.9.1 the cost of getting this wrong was far worse than a
+/// send: a tap that never drained its listener filled its `AF_UNIX SOCK_DGRAM`
+/// socket, after which every publisher notify took a failure path (~12 µs plus a
+/// ~2 KB warning per notify, 10 to 150 MB/s of stderr, enough to fill a disk
+/// during a long replay). 0.10 removed that failure mode, a full doorbell is
+/// swallowed and a notify into an already-notified listener skips the send, so
+/// what remains is the ordinary per-publish cost, which is the reason this type
+/// still exists rather than a historical one.
 ///
 /// # No late-joiner history
 ///
@@ -963,9 +1106,27 @@ struct DrainOutcome {
     decimated: bool,
 }
 
+impl DrainOutcome {
+    /// The gate REFUSED the pop: nothing left the queue, so the drain reports
+    /// the shape a genuinely empty queue reports.
+    ///
+    /// That identity is what keeps a withheld drain staging the same read
+    /// outcome an empty one stages (one `NoFrame` record, popped 0, under the
+    /// call site's role), so the redundant read-log verifier compares the
+    /// hold-back against the recording's own empty drain, record for record.
+    fn withheld() -> Self {
+        Self {
+            slot: FrozenSlot::Empty,
+            popped: 0,
+            latest_ts: None,
+            decimated: false,
+        }
+    }
+}
+
 /// A received message with zero-copy payload access.
 ///
-/// The `header` is an owned copy (32 bytes on stack, from alignment-safe deserialization).
+/// The `header` is an owned copy (40 bytes on stack, from alignment-safe deserialization).
 /// The `payload` is a reference directly into iceoryx2 shared memory — true zero-copy.
 ///
 /// # Lifetime
@@ -975,12 +1136,36 @@ struct DrainOutcome {
 pub struct ReceivedMessage<'a> {
     header: WireHeader,
     payload: &'a [u8],
+    origin: u128,
 }
 
 impl<'a> ReceivedMessage<'a> {
-    /// Create a new received message from header and payload.
+    /// Create a new received message from header and payload. Its
+    /// [`Self::origin`] is `0`, the "no publisher identity" value, because a
+    /// message built by hand came from no publisher port.
     pub fn new(header: WireHeader, payload: &'a [u8]) -> Self {
-        Self { header, payload }
+        Self::from_publisher(header, payload, 0)
+    }
+
+    /// The message a receive path delivers: header, payload and the
+    /// publisher identity of the sample it was read from.
+    pub(crate) fn from_publisher(header: WireHeader, payload: &'a [u8], origin: u128) -> Self {
+        Self {
+            header,
+            payload,
+            origin,
+        }
+    }
+
+    /// The PUBLISHER IDENTITY of the frame: iceoryx2's `UniquePublisherId` of
+    /// the port that committed it, raw, as [`OwnedInboundSample::origin`]
+    /// returns it. Two frames with the same value came from one publisher,
+    /// so an observer can keep the streams of a `multi_publisher_topics`
+    /// topic apart. Sample metadata: reading it parses and allocates nothing.
+    /// The id is run random, so it is compared only within one run; `0` for
+    /// a message built with [`Self::new`].
+    pub fn origin(&self) -> u128 {
+        self.origin
     }
 
     /// Returns the wire header.
@@ -1030,7 +1215,16 @@ pub fn fault_inject_drain_events_err_for_test(armed: bool) {
 pub struct CerulionSubscriber {
     topic: String,
     subscriber: Subscriber<CerService, [u8], ()>,
-    listener: Listener<CerService>,
+    /// This input's event listener, or `None` for an input that declares no
+    /// trigger.
+    ///
+    /// A latest-value input is read on its own node's fire, by the step's
+    /// snapshot. Nothing waits on it: no wake source attaches its listener and no
+    /// execution path blocks on one. So it is built without one, and the port that
+    /// would sit in every publisher's notifier send loop, waited on by nothing,
+    /// does not exist rather than depending on a read to empty it. The subscriber
+    /// still announces itself through its notifier, so history still reaches it.
+    listener: Option<Listener<CerService>>,
     notifier: Notifier<CerService>,
     /// This input's single backpressure probe (see
     /// [`BackpressureProbe`] for the per-variant semantics). `Some` on
@@ -1258,9 +1452,10 @@ pub struct CerulionSubscriber {
     /// ever goes
     /// `None → Some` (set on the first delivery, REPLACED by a newer sample,
     /// never reset to `None` before Drop). That monotonicity is exactly WHY the
-    /// `try_view` `Held` arm's `.expect("...held_sample is Some")` is
-    /// unreachable — `Held` is only ever written by `snapshot_latest` AFTER
-    /// `held_sample` is `Some`, and nothing clears it. There is no "un-hold":
+    /// `try_view` and `view_raw` `Held` arms' missing-sample errors are
+    /// invariant diagnostics - `Held` is only ever written by
+    /// `snapshot_latest` AFTER `held_sample` is `Some`, and nothing clears it.
+    /// There is no "un-hold":
     /// once delivered, the subscriber pins one SHM sample for life (intended; a
     /// liveliness-loss release is future scope).
     held_sample: Option<InboundSample>,
@@ -1395,6 +1590,22 @@ pub struct CerulionSubscriber {
     /// bump. The field itself is unconditional for FFI struct-layout stability
     /// (never `#[cfg]`-gate a field — the SIGSEGV lesson).
     served_sequence: Option<Arc<AtomicU64>>,
+    /// The REPLAY read plan for this input's stage, `Some` on every
+    /// GRAPH-WIRED subscriber, installed DISARMED at wiring time exactly like
+    /// [`Self::read_stage`], and armed only by
+    /// `GraphRuntime::arm_replay_read_plan`. `None` for direct / introspection
+    /// subscribers, which are never part of the read log.
+    ///
+    /// While the plan is unarmed every gated site pays one null-pointer test
+    /// plus one `Acquire` bool load and then takes today's code path unchanged:
+    /// the same cost class [`Self::read_capture_armed`] documents for its own
+    /// field, and the reason the gated bodies live in `#[inline(never)]`
+    /// functions.
+    ///
+    /// Field is unconditional (never `#[cfg]`-gate a field, the FFI
+    /// struct-layout lesson); adding it moved the FFI-crossed `NodeContext`
+    /// layout, which is the v23 ABI bump.
+    replay_plan: Option<Arc<crate::read_outcome::ReadPlanStage>>,
 }
 
 /// Consecutive re-offers of one unserved FIFO head that constitute
@@ -1444,7 +1655,19 @@ pub(crate) enum ConsumeMode {
 enum TriggerDrainSite {
     /// `drain_level`'s once-per-level-boundary drain, BEFORE decide.
     Boundary,
-    /// `Scheduler::tick_data_burst`'s refill, BETWEEN two fires of one step.
+    /// A BETWEEN-FIRES refill: `Scheduler::tick_data_burst`'s, and the per-set
+    /// Sync align pass's `SyncHeadOp::FillRefill` after a fire of
+    /// `Scheduler::tick_sync_burst`.
+    ///
+    /// Both discover a burst's length by asking until the answer is empty. A
+    /// plan-driven replay (`Scheduler::tick_replay_burst`) fires the recorded
+    /// count and asks the Data refill hook only BETWEEN fires, so it never
+    /// makes the TERMINAL probe the live burst's empty answer is; for a Sync
+    /// node it runs no refill align pass at all
+    /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy). Either
+    /// way the empty answer at this site has no replayed twin, so it stages NO
+    /// read-log record. See the `FrozenSlot::Empty` arm of
+    /// [`CerulionSubscriber::drain_for_trigger`].
     Refill,
 }
 
@@ -1458,7 +1681,7 @@ impl CerulionSubscriber {
     pub(crate) fn new(
         topic: String,
         subscriber: Subscriber<CerService, [u8], ()>,
-        listener: Listener<CerService>,
+        listener: Option<Listener<CerService>>,
         notifier: Notifier<CerService>,
         max_publishers: usize,
         max_borrowed_samples: usize,
@@ -1496,6 +1719,7 @@ impl CerulionSubscriber {
             held_head_reoffers: 0,
             held_head_warned: false,
             served_sequence: None,
+            replay_plan: None,
         }
     }
 
@@ -1518,6 +1742,46 @@ impl CerulionSubscriber {
         self.read_stage = Some(stage);
     }
 
+    /// Install this input's shared REPLAY read plan (the enforcement twin of
+    /// [`Self::set_read_outcome_stage`]). Called by the graph runtime at WIRING
+    /// time, before the context moves into the node entry, which is why the
+    /// handle is wired this early: there is no post-move path to a subscriber
+    /// that does not add an FFI export. The runtime retains a clone; arming,
+    /// the per-step install and the end-of-step sweep all happen through that
+    /// side.
+    pub(crate) fn set_replay_read_plan(&mut self, plan: Arc<crate::read_outcome::ReadPlanStage>) {
+        self.replay_plan = Some(plan);
+    }
+
+    /// The ARMED replay gate for this input, or `None`.
+    ///
+    /// One null-pointer test plus one `Acquire` bool load, then the caller takes
+    /// today's path. This is the whole live-path cost of the enforcement.
+    #[inline]
+    fn replay_gate(&self) -> Option<&crate::read_outcome::ReadPlanStage> {
+        self.replay_plan.as_deref().filter(|p| p.is_armed())
+    }
+
+    /// One gate consult, OUT OF LINE so the hot path keeps its instruction
+    /// sequence and its zero-allocation profile.
+    ///
+    /// Answers `None` when the plan is armed but admits nothing here, and
+    /// `Some(due)` with the admission to spend. The caller has already
+    /// established that a gate is armed, so `Ungated` cannot come back.
+    #[inline(never)]
+    fn gate_admission(
+        gate: &crate::read_outcome::ReadPlanStage,
+    ) -> Option<crate::read_outcome::DueRead> {
+        match gate.admit() {
+            crate::read_outcome::GateAnswer::Exact(due) => Some(due),
+            // `Ungated` is unreachable from an armed gate; withholding on it
+            // keeps the two answers that mean "pop nothing" on one arm rather
+            // than adding a fall-through to a live pop.
+            crate::read_outcome::GateAnswer::Withhold
+            | crate::read_outcome::GateAnswer::Ungated => None,
+        }
+    }
+
     /// Is read-outcome capture LIVE on this subscriber — a stage is
     /// wired AND a recording armed it? Checked BEFORE any capture-only work
     /// (the extra served-seq header parse included), so a non-recording run
@@ -1525,6 +1789,18 @@ impl CerulionSubscriber {
     #[inline]
     fn read_capture_armed(&self) -> bool {
         self.read_stage.as_ref().is_some_and(|s| s.is_armed())
+    }
+
+    /// Is a record staged for a consult that found the queue EMPTY? Armed
+    /// capture AND the stage's consult rule
+    /// (`ReadOutcomeStage::records_every_consult`): a replay of a bag declared
+    /// below trace format 7 adopts that recorder's silence at an empty
+    /// consult, and the two read logs then hold the same positions.
+    #[inline]
+    fn consult_capture_armed(&self) -> bool {
+        self.read_stage
+            .as_ref()
+            .is_some_and(|s| s.is_armed() && s.records_every_consult())
     }
 
     /// Mark this input's topic as `multi_publisher_topics`-listed
@@ -1628,16 +1904,25 @@ impl CerulionSubscriber {
     /// advancing at pop would tell a resume to skip a frame it must re-inject.
     ///
     /// Cost: one predictable branch (`None` for every subscriber that is not a
-    /// per-message FIFO trigger input), then one header parse and one `Release`
-    /// store. No allocation, no transport call.
+    /// per-message FIFO trigger input), then one `Release` store. The header is
+    /// the caller's, already parsed on the path that served the frame. No
+    /// allocation, no transport call.
     #[inline]
-    fn record_service_cursor(&self, raw: &[u8]) {
+    fn record_service_cursor_from(&self, header: &WireHeader) {
         let Some(cursor) = self.served_sequence.as_ref() else {
             return;
         };
-        if let Some(header) = WireHeader::read_from_buf(raw) {
-            cursor.store(u64::from(header.sequence) + 1, Ordering::Release);
-        }
+        cursor.store(u64::from(header.sequence) + 1, Ordering::Release);
+    }
+
+    /// [`Self::register_service_cursor`] for a test.
+    ///
+    /// The cursor is installed by graph wiring, so a subscriber a test builds by
+    /// hand has none, and the serve-point work the cursor gates does not run at all
+    /// on such a subscriber. A test that means to measure that work installs one.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn register_service_cursor_for_test(&mut self, cursor: Arc<AtomicU64>) {
+        self.register_service_cursor(cursor);
     }
 
     /// Mark this subscriber as the body half of a
@@ -1827,6 +2112,56 @@ impl CerulionSubscriber {
         self.pending_backpressure_event.take()
     }
 
+    /// Queue a backpressure event raised OUTSIDE this subscriber's own
+    /// probes (an accumulate input's overflow), so the node's
+    /// `#[on_event(input = ...)]` handler drains it through
+    /// [`Self::try_take_backpressure_event`] like any other. An event
+    /// already pending (not yet taken) wins and this one is handed back in
+    /// the `Err`, unchanged, so the caller keeps it owed without a copy.
+    pub(crate) fn queue_backpressure_event(
+        &mut self,
+        event: BackpressureEvent,
+    ) -> Result<(), BackpressureEvent> {
+        if self.pending_backpressure_event.is_none() {
+            self.pending_backpressure_event = Some(event);
+            Ok(())
+        } else {
+            Err(event)
+        }
+    }
+
+    /// This input's `drop_oldest` counter (`backpressure_drop_oldest_count`),
+    /// or `None` with no `drop_oldest` probe installed. An accumulate collect
+    /// reads it before and after its pops: the difference is the frames
+    /// the probe saw evicted from the writers' transport queues.
+    pub(crate) fn drop_oldest_count(&self) -> Option<u64> {
+        match &self.probe {
+            Some(BackpressureProbe::DropOldest(p)) => {
+                Some(p.counters.drop_oldest_count.load(Ordering::Acquire))
+            }
+            _ => None,
+        }
+    }
+
+    /// Add `n` drops made outside the transport queue (an accumulate input
+    /// dropping at its cap) to this input's `drop_oldest` counter, so
+    /// `backpressure_drop_oldest_count` counts every frame the input lost.
+    /// No warn: the caller logs its own regime. A no-op with no
+    /// `drop_oldest` probe installed (a subscriber not wired by a graph).
+    pub(crate) fn record_external_drop_oldest(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(probe) = self.drop_oldest_probe_mut() {
+            // Not `record_backpressure_event_n`: its log line describes a
+            // transport eviction, and these drops are not one.
+            probe
+                .counters
+                .drop_oldest_count
+                .fetch_add(n, Ordering::Release);
+        }
+    }
+
     /// Wire this input's `#[input(expect_within_ms = N)]`
     /// watchdog anchor. The graph runtime mints the `Arc<AtomicU64>`, hands
     /// the same handle to the scheduler's `input_expect_within` tracker, and
@@ -1944,7 +2279,7 @@ impl CerulionSubscriber {
             // replay on a late joiner) could otherwise drive the mirror
             // below zero. Clamping keeps "outstanding == 0" the floor.
             //
-            // `record_drained` IS that saturating `fetch_update`,
+            // `record_drained` IS that saturating `try_update`,
             // and it additionally RINGS the word's wake epoch. Ringing is not
             // decoration on a split edge: freeing credit is precisely the event
             // a credit-blocked producer in another process parks for, and a
@@ -2053,15 +2388,21 @@ impl CerulionSubscriber {
     /// Test-only wrapper over `sync_peek_next_stamp`. See
     /// [`Self::mark_fifo_consume_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn sync_peek_next_stamp_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.sync_peek_next_stamp()
+    pub fn sync_peek_next_stamp_for_test(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
+        self.sync_peek_next_stamp(site)
     }
 
     /// Test-only wrapper over `sync_discard_head`. See
     /// [`Self::mark_fifo_consume_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn sync_discard_head_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.sync_discard_head()
+    pub fn sync_discard_head_for_test(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
+        self.sync_discard_head(site)
     }
 
     /// Test-only wrapper over `sync_void_head`. See
@@ -2101,6 +2442,15 @@ impl CerulionSubscriber {
     /// counts after such a drain are unreliable until the baseline
     /// re-establishes. Mixing read paths on one probed input is a caller
     /// error.
+    ///
+    /// # Errors
+    ///
+    /// A subscriber built with no event listener, which is how a graph builds an
+    /// input that declares no trigger, has nothing to wait on and REFUSES here,
+    /// naming the topic. This entry serves subscribers a tool builds for itself;
+    /// the `cerulion topic` observer is its caller in this tree, and it is not how
+    /// a node reads a declared input, which its own tick reads through the view or
+    /// the step drains for it.
     #[must_use = "receive result must be checked"]
     pub fn wait_for_message<F>(&self, timeout: Duration, mut callback: F) -> TransportResult<usize>
     where
@@ -2113,6 +2463,35 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("wait_for_message");
         }
+        // An input that declares no trigger is built with no event listener, so
+        // there is nothing here to block on. Refuse by name rather than return
+        // zero after the timeout: a zero would read as "no frame arrived" and send
+        // the caller back to wait again on a thing that can never fire.
+        //
+        // This entry serves subscribers a TOOL builds for itself, the `cerulion
+        // topic` observer being its caller in this tree, and is not how a node
+        // reads a declared input: a node's input is read by its own tick through
+        // the view, or drained for it by the step.
+        //
+        // The refusal names the input by its TOPIC, which is what a subscriber
+        // holds; the node-side input name is the caller's own.
+        if self.listener.is_none() {
+            return Err(TransportError::Receive {
+                // hot-path-alloc-ok: cold refusal arm, once per misuse.
+                topic: self.topic.clone(),
+                reason: String::from(
+                    "this subscriber was built with no event listener, so there is nothing \
+                     here to wait on. A graph builds an input that declares no trigger this \
+                     way: read it from the tick instead, or declare the input as a trigger \
+                     if it should wake its node",
+                ),
+            });
+        }
+        // Bound once, after the refusal above proved it present.
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("the refusal above returns for a listenerless input");
         // Drain any stale events from the listener before waiting.
         // This prevents spurious wakeups from previously queued events
         // (e.g., SentSample from a prior publish cycle, SubscriberConnected
@@ -2135,46 +2514,57 @@ impl CerulionSubscriber {
                 return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
 
-            // Block on event listener (or remaining timeout)
-            let event =
-                self.listener
-                    .timed_wait_one(remaining)
-                    .map_err(|e| TransportError::Receive {
-                        topic: self.topic.clone(),
-                        reason: format!("{}", e),
-                    })?;
+            // Block on event listener (or remaining timeout).
+            //
+            // iceoryx2 0.10: `timed_wait_one` is gone. `timed_wait` unblocks on
+            // the first activation and then hands the callback EVERY queued
+            // activation (one call per DISTINCT event id, carrying its count),
+            // returning how many were delivered. So the dispatch moves after the
+            // call: classify the whole batch, then act. `Ok(0)` is the old
+            // `Ok(None)` timeout. Draining the batch in one call rather than one
+            // id per loop turn is the same outcome the old loop reached by
+            // re-waiting, with no re-wait.
+            let mut saw_data_event = false;
+            let activations = listener
+                .timed_wait(
+                    |activation| {
+                        if matches!(
+                            PubSubEvent::try_from(activation.id),
+                            Ok(PubSubEvent::SentSample) | Ok(PubSubEvent::SentHistory)
+                        ) {
+                            saw_data_event = true;
+                        }
+                    },
+                    remaining,
+                )
+                .map_err(|e| TransportError::Receive {
+                    topic: self.topic.clone(),
+                    reason: format!("{}", e),
+                })?;
 
-            match event {
-                Some(event_id) => {
-                    let parsed = PubSubEvent::try_from(event_id);
-                    match parsed {
-                        Ok(PubSubEvent::SentSample) | Ok(PubSubEvent::SentHistory) => {
-                            // Data event — drain samples and return
-                            return self.drain_samples(&mut callback, ReadSiteRole::Body);
-                        }
-                        _ => {
-                            // Non-data event. Drain to check for any pending data
-                            // (send→notify race), but only return if we got data.
-                            let count = self.drain_samples(&mut callback, ReadSiteRole::Body)?;
-                            if count > 0 {
-                                return Ok(count);
-                            }
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    // Timeout — drain any pending samples (send→notify race)
-                    return self.drain_samples(&mut callback, ReadSiteRole::Body);
-                }
+            if activations == 0 {
+                // Timeout, drain any pending samples (send→notify race)
+                return self.drain_samples(&mut callback, ReadSiteRole::Body);
             }
+            if saw_data_event {
+                // Data event, drain samples and return
+                return self.drain_samples(&mut callback, ReadSiteRole::Body);
+            }
+            // Only non-data events. Drain to check for any pending data
+            // (send→notify race), but only return if we got data.
+            let count = self.drain_samples(&mut callback, ReadSiteRole::Body)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            continue;
         }
     }
 
     /// Try to receive messages without blocking.
     ///
-    /// Drains stale events from the listener (preventing socket buffer overflow),
-    /// then drains all available samples from the subscriber queue.
+    /// Drains every available sample from the subscriber queue without blocking;
+    /// the listener drain runs AFTER a read that removed frames, which
+    /// `drain_listener_after_removals` decides and states the cost reason for.
     /// Returns immediately with `Ok(0)` if no messages are available.
     ///
     /// **Backpressure-probe caveat:** see
@@ -2191,7 +2581,7 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive");
         }
-        self.drain_stale_events();
+        // `drain_samples` runs the listener policy itself, on every exit.
         self.drain_samples(&mut callback, ReadSiteRole::Body)
     }
 
@@ -2231,15 +2621,58 @@ impl CerulionSubscriber {
     where
         F: FnMut(ReceivedMessage<'_>),
     {
-        self.drain_stale_events();
+        // `drain_samples` runs the listener policy itself, on every exit.
         self.drain_samples(&mut callback, ReadSiteRole::Drain)
+    }
+
+    /// Drain the listener only after a read that REMOVED frames from the queue.
+    ///
+    /// The four read entries that consume frames take it, and they take it after a
+    /// read that removed frames, nowhere else. The typed view and the latest-wins
+    /// snapshot drain remove frames and drain no listener at all: what they removed
+    /// is cleared by whatever drains the listener they share, and the step always
+    /// does.
+    ///
+    /// The policy lives here, once, for the four read entries that take it;
+    /// [`Self::wait_for_message`] drains before its wait instead, which is a
+    /// different decision and is declared as one.
+    ///
+    /// WHY IT IS KEYED ON A READ'S REMOVALS, in cost: on iceoryx2 0.10 a drain of
+    /// an EMPTY listener is two `recvmsg` calls, two sequentially consistent atomic
+    /// operations and a walk of the shared-memory counting bitset, where 0.9.1 was
+    /// one `recvmsg`. These entries ran it at their head on every read, including
+    /// every read that found nothing, which is the common case for a colocated edge
+    /// whose notify is elided at the source. A read that removed frames rode at
+    /// least one notify, so draining there clears what arrived; a read that removed
+    /// nothing has nothing of its own to clear.
+    ///
+    /// The count is REMOVALS, not frames delivered. A malformed frame is popped and
+    /// not delivered, and the per-message signal count subtracts those on purpose,
+    /// so keying on either would skip the drain after a read that emptied the queue
+    /// of junk.
+    ///
+    /// This is NOT a socket-fill guard and must not be read as one. 0.10 removed
+    /// that hazard at the source: the event id and its repeat count live in a
+    /// shared-memory counting bitset, the doorbell carries one byte, a full doorbell
+    /// is swallowed rather than refused, and a notify into a listener that already
+    /// holds an unconsumed wake skips the send. Per step, every listener the live
+    /// loop polls is drained inside the step: the reactor's own wait drains whatever
+    /// listener fired, in its own callback, and the level drain clears a unified
+    /// binding's standalone listener and a per-set binding's. A separate or sync
+    /// binding's drain READ contributes to that only when it removed frames, which
+    /// is this policy.
+    fn drain_listener_after_removals(&self, removals: u64) {
+        if removals == 0 {
+            return;
+        }
+        self.drain_stale_events();
     }
 
     /// Drain all stale events from the listener without blocking.
     ///
-    /// This clears any queued event notifications (e.g., SentSample from a prior
-    /// publish, SubscriberConnected from our constructor) so `timed_wait_one` will
-    /// only wake on genuinely new events.
+    /// This clears any queued event notifications, a `SentSample` from a prior
+    /// publish or a `SubscriberConnected` from a constructor among them, so a
+    /// timed wait only wakes on genuinely new events.
     fn drain_stale_events(&self) {
         // The consuming read paths never blocked on the listener's fd, so a
         // drain error there costs at most one stale wake later — they
@@ -2266,20 +2699,31 @@ impl CerulionSubscriber {
                 reason: "fault-injected listener drain failure (test seam)".to_string(),
             });
         }
-        loop {
-            match self.listener.try_wait_one() {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    return Err(TransportError::Receive {
-                        // hot-path-alloc-ok: cold error arm — a listener
-                        // whose try_wait_one fails is already off the
-                        // healthy path.
-                        topic: self.topic.clone(),
-                        reason: format!("listener try_wait_one: {e:?}"),
-                    });
-                }
-            }
+        // The drain tally is bumped HERE, in the fallible core, and not in the
+        // infallible wrapper above it: every spelling of a drain reaches this
+        // function, the wrapper's swallowed call and a direct call alike, so a
+        // cost put back at a read's head as a direct core call is counted like
+        // any other. It sits after the fault-inject guard, so an injected
+        // failure that drains nothing counts nothing.
+        #[cfg(any(test, feature = "test-helpers"))]
+        LISTENER_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // iceoryx2 0.10: one `try_wait` empties the queue, so the old
+        // drain-to-`Ok(None)` loop collapses to a single call with the same
+        // outcome (this site always drained to empty).
+        // An input that declares no trigger was built without a listener, so
+        // there is no queue to empty and nothing to fail. See the field's doc.
+        let Some(listener) = self.listener.as_ref() else {
+            return Ok(());
+        };
+        match listener.try_wait(|_a| {}) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(TransportError::Receive {
+                // hot-path-alloc-ok: cold error arm, a listener
+                // whose try_wait fails is already off the
+                // healthy path.
+                topic: self.topic.clone(),
+                reason: format!("listener try_wait: {e:?}"),
+            }),
         }
     }
 
@@ -2298,11 +2742,21 @@ impl CerulionSubscriber {
         // hot-path-alloc-ok: cfg-gated test helper (test / test-helpers
         // feature only) — never compiled into the production hot path
         let mut events = Vec::new();
-        while let Ok(Some(event_id)) = self.listener.try_wait_one() {
-            if let Ok(parsed) = super::events::PubSubEvent::try_from(event_id) {
-                events.push(parsed);
+        // iceoryx2 0.10: the callback fires once per DISTINCT event id carrying
+        // `count` repeats, so push `count` copies to keep this helper's
+        // "one entry per notify" contract (the 0.9.1 queue held one datagram
+        // per notify and this loop popped them one at a time).
+        let listener = self.listener.as_ref().expect(
+            "test_drain_events reads a listener's event queue, and this subscriber was built \
+             with none, so an empty result would read as 'no events arrived'",
+        );
+        let _ = listener.try_wait(|activation| {
+            if let Ok(parsed) = super::events::PubSubEvent::try_from(activation.id) {
+                for _ in 0..activation.count {
+                    events.push(parsed);
+                }
             }
-        }
+        });
         events
     }
 
@@ -2382,7 +2836,12 @@ impl CerulionSubscriber {
         // SAFETY (native_handle): the value is returned as a plain integer
         // whose lifetime/no-close contract is documented above; this call
         // itself stores nothing and closes nothing.
-        unsafe { self.listener.file_descriptor().native_handle() }
+        let listener = self.listener.as_ref().expect(
+            "an input that declares no trigger has no event listener and no file \
+             descriptor to watch; only a trigger input or a tool's own subscriber is \
+             waited on",
+        );
+        unsafe { listener.file_descriptor().native_handle() }
     }
 
     /// Drain this subscriber's event-NOTIFICATION queue
@@ -2436,18 +2895,26 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one");
         }
-        self.drain_stale_events();
+        // Malformed frames this call POPPED. They are queue removals, so each one
+        // rode a notify; the listener policy keys on removals, and the exits that
+        // return without delivering a frame still have to report them.
+        let mut removals = 0u64;
         loop {
-            let Some(sample) = self
-                .subscriber
-                .receive()
-                .map_err(|e| TransportError::Receive {
-                    topic: self.topic.clone(),
-                    reason: format!("{}", e),
-                })?
-            else {
+            let received = match self.subscriber.receive() {
+                Ok(received) => received,
+                Err(e) => {
+                    self.drain_listener_after_removals(removals);
+                    return Err(TransportError::Receive {
+                        topic: self.topic.clone(),
+                        reason: format!("{}", e),
+                    });
+                }
+            };
+            let Some(sample) = received else {
+                self.drain_listener_after_removals(removals);
                 return Ok(false);
             };
+            removals += 1;
             let raw = sample.payload();
             if raw.len() < WireHeader::SIZE {
                 tracing::warn!(
@@ -2479,10 +2946,15 @@ impl CerulionSubscriber {
                 continue;
             }
             let payload = &raw[WireHeader::SIZE..total_size];
-            callback(ReceivedMessage::new(header, payload));
+            callback(ReceivedMessage::from_publisher(
+                header,
+                payload,
+                sample.origin().value(),
+            ));
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
-            self.record_service_cursor(raw);
+            self.record_service_cursor_from(&header);
+            self.drain_listener_after_removals(removals);
             return Ok(true);
         }
     }
@@ -2529,18 +3001,26 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one_owned");
         }
-        self.drain_stale_events();
+        // Malformed frames this call POPPED. They are queue removals, so each one
+        // rode a notify; the listener policy keys on removals, and the exits that
+        // return without delivering a frame still have to report them.
+        let mut removals = 0u64;
         loop {
-            let Some(sample) = self
-                .subscriber
-                .receive()
-                .map_err(|e| TransportError::Receive {
-                    topic: self.topic.clone(),
-                    reason: format!("{}", e),
-                })?
-            else {
+            let received = match self.subscriber.receive() {
+                Ok(received) => received,
+                Err(e) => {
+                    self.drain_listener_after_removals(removals);
+                    return Err(TransportError::Receive {
+                        topic: self.topic.clone(),
+                        reason: format!("{}", e),
+                    });
+                }
+            };
+            let Some(sample) = received else {
+                self.drain_listener_after_removals(removals);
                 return Ok(None);
             };
+            removals += 1;
             let raw = sample.payload();
             if raw.len() < WireHeader::SIZE {
                 tracing::warn!(
@@ -2570,8 +3050,9 @@ impl CerulionSubscriber {
             }
             // Same serve point as the callback twin — one frame,
             // really delivered (ownership does not change what "served" means).
-            self.record_service_cursor(raw);
-            return Ok(Some(OwnedInboundSample::new(sample)));
+            self.record_service_cursor_from(&header);
+            self.drain_listener_after_removals(removals);
+            return Ok(Some(OwnedInboundSample::with_header(sample, &header)));
         }
     }
 
@@ -2591,28 +3072,66 @@ impl CerulionSubscriber {
     where
         F: FnMut(ReceivedMessage<'_>),
     {
+        // The SECOND of the two interception points, consulted at the top of
+        // the body for the same reason as `drain_with_accounting_impl`'s: this
+        // is the other body a graph-wired subscriber's pops funnel through.
+        //
+        // `&self` is not an obstacle, the plan's state lives behind the `Arc`
+        // with an interior `Mutex`, which is the discipline
+        // `ReadOutcomeStage` uses at this same site for the same reason.
+        // Read BEFORE the gate consult: a withheld consult stages the record
+        // the recording's own empty drain wrote at this position.
+        let capture = self.read_capture_armed();
+        let consult_capture = self.consult_capture_armed();
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission(gate) {
+                Some(due) => Some(due),
+                None => {
+                    // The gate held the pop back: nothing left the queue, and
+                    // the record is the one an empty drain at this site
+                    // stages (`NoFrame`, popped 0, the call site's role), so
+                    // the replay's log holds a record at every position the
+                    // recording's does.
+                    if consult_capture {
+                        self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, role);
+                    }
+                    return Ok(0);
+                }
+            },
+        };
         let sub = &self.subscriber;
         let topic = &self.topic;
-        let mut count = 0usize;
-        // The LEGACY batch-drain read outcome — this is the
+        // DELIVERED frames. A `Cell` rather than a plain counter because the
+        // receive closure reads it to stop after the granted pops while the
+        // per-sample closure writes it, and the two capture it immutably.
+        let count = std::cell::Cell::new(0usize);
+        let pop_bound: usize = granted.map_or(usize::MAX, |due| due.pop_count() as usize);
+        // The LEGACY batch-drain read outcome: this is the
         // `TriggerSubscriber::try_receive_timestamps` path (Separate
         // data-trigger + Sync drains) and the accumulate-all
         // `with_unified_drain(false)` tick-body `try_receive`. One
         // DrainedBatch record per NON-EMPTY drain: served-seq = the NEWEST
-        // delivered frame's sequence (drain order — "latest wins"), popped =
+        // delivered frame's sequence (drain order, "latest wins"), popped =
         // the delivered count (malformed frames are skipped by
         // `deliver_raw_frame` and not counted, matching the timestamps the
-        // trigger path forwards). Armed-only; the seq parse is gated on it.
+        // trigger path forwards); one `NoFrame` record (popped 0) per drain
+        // that delivered nothing and faulted nowhere. Armed-only (`capture`
+        // and `consult_capture`, read above the gate consult).
         // rmw `take` / services route through `try_receive_one`, which is
         // DELIBERATELY out of the read log's scope (not recorded in graph
-        // bags today) — see that method.
-        let capture = self.read_capture_armed();
+        // bags today), see that method.
         // On a `multi_publisher_topics` edge, ALSO track the
         // origin of the frame whose sequence this batch reports (the newest
         // DELIVERED one) — the record says which producer's frame the batch
         // served. Gated on the same bit as every other producer capture, so a
         // single-publisher edge never calls `sample.origin()` here.
         let annotate = self.capture_producer_token();
+        // Queue REMOVALS, which is what the listener policy keys on: a popped
+        // frame rode a notify whether or not it survived the frame checks. A
+        // `Cell` because the per-sample closure holds `&self` while the exits
+        // below read it.
+        let removals = std::cell::Cell::new(0u64);
         let mut newest_seq: Option<u32> = None;
         let mut newest_origin: Option<UniquePublisherId> = None;
         // The `block` mirror MUST be decremented for every popped sample even
@@ -2621,6 +3140,9 @@ impl CerulionSubscriber {
         // see the next comment).
         let drain_result = drain_with_block_accounting(
             || {
+                if count.get() >= pop_bound {
+                    return Ok(None);
+                }
                 // The SAME fire-once test fault as
                 // `drain_to_latest_with_accounting`'s receive loop — a `None`
                 // `Cell` read in production, so one branch on the hot path.
@@ -2646,12 +3168,27 @@ impl CerulionSubscriber {
             // (whether or not it survives `deliver_raw_frame`'s filter) — the
             // `block` mirror tracks queue REMOVALS, not deliveries.
             |sample| {
-                if deliver_raw_frame(topic, sample.payload(), callback) {
-                    count += 1;
-                    if capture {
+                // The header `deliver_raw_frame` parsed comes back instead of being
+                // read again here: the served sequence and the cursor below both
+                // want the same thirty-two bytes.
+                removals.set(removals.get() + 1);
+                if let Some(header) =
+                    deliver_raw_frame(topic, sample.payload(), sample.origin().value(), callback)
+                {
+                    count.set(count.get() + 1);
+                    // The served-sequence parse follows the CAPTURE bit or the
+                    // GRANT, either of which consumes it: the record below
+                    // carries it, and the settle below compares it against the
+                    // recorded sequence. Reading it on the capture bit alone
+                    // compared a recorded `Some(seq)` against `None` on every
+                    // gated batch drain of a run whose read-log verifier is
+                    // disabled, since the memory sink that sets the capture bit
+                    // is enabled only on the verifier's active path, and minted
+                    // one sequence mismatch per drain over a clean replay.
+                    if capture || granted.is_some() {
                         if let Some(seq) = wire_sequence(sample.payload()) {
                             newest_seq = Some(seq);
-                            if annotate {
+                            if capture && annotate {
                                 newest_origin = Some(sample.origin());
                             }
                         }
@@ -2662,7 +3199,7 @@ impl CerulionSubscriber {
                     // reads "nothing served" at the anchor while frames were
                     // flowing, and a resume re-injects a band the node had
                     // already consumed.
-                    self.record_service_cursor(sample.payload());
+                    self.record_service_cursor_from(&header);
                 }
             },
             |removed| self.record_block_drained(removed),
@@ -2674,6 +3211,7 @@ impl CerulionSubscriber {
         // never wrote (a false read-log divergence at exactly the fault
         // moment). An all-or-nothing Err (nothing delivered) still records
         // nothing, matching every other drain site's Err posture.
+        let count = count.get();
         if capture && count > 0 {
             match newest_origin {
                 Some(origin) => self.stage_read_outcome_with_producer(
@@ -2690,7 +3228,35 @@ impl CerulionSubscriber {
                     role,
                 ),
             }
+        } else if consult_capture && drain_result.is_ok() {
+            // The drain ran to its end and delivered nothing: one `NoFrame`
+            // record, popped 0, so the consult that found the queue empty
+            // holds a position in the read log (under the recording's consult
+            // rule, see `consult_capture_armed`). Staged before
+            // `drain_result?` for the reason the partial batch is. An `Err`
+            // with zero deliveries stages nothing, the posture every drain
+            // site keeps for a transport fault.
+            self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, role);
         }
+        // The settle compares DELIVERED frames against the quota, which is the
+        // same quantity the `DrainedBatch` record above stages, and the served
+        // sequence against the batch's newest, the two fields the recording
+        // carries for this site. It runs BEFORE the mid-drain `Err` propagates
+        // for the same reason the staging does: the frames delivered so far
+        // really reached the callback.
+        // Settled through the plan HANDLE and not through `replay_gate()`: a
+        // grant is proof the gate was armed at the consult, so re-testing
+        // `is_armed` here would drop the compare for a pop the gate authorised
+        // and pay a second `Acquire` load per drain.
+        if let Some(due) = granted {
+            if let Some(gate) = self.replay_plan.as_deref() {
+                gate.settle(due, count as u64, newest_seq);
+            }
+        }
+        // The listener policy runs on EVERY exit, the errored partial batch
+        // included: those samples are already popped and already recorded, so an
+        // exit through `?` would leave what they rode unclaimed by any later read.
+        self.drain_listener_after_removals(removals.get());
         drain_result?;
         Ok(count)
     }
@@ -2732,6 +3298,136 @@ impl CerulionSubscriber {
         &mut self,
         f: impl FnOnce(InputView<'_, T>) -> R,
     ) -> TransportResult<Option<R>> {
+        let slot = self.select_slot();
+        match slot {
+            FrozenSlot::Sample(sample) => {
+                // The ONE serve point both drain disciplines reach -
+                // Unified serves the boundary's frozen slot, Separate pops live
+                // into the same arm - so the service cursor has one write site
+                // and one meaning, and `CERULION_DRAIN_DISCIPLINE=separate`
+                // yields the identical cursor.
+                //
+                // Advanced only on `Ok`: `build_inbound_view` rejects a
+                // schema-mismatched / undersized / out-of-bounds frame, which
+                // the tick never sees. Recording it as served would tell a
+                // resume to skip a frame nothing read.
+                let (out, header) = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
+                self.record_service_cursor_from(&header);
+                Ok(Some(out))
+            }
+            // NB: this arm records NO cursor, and it is unreachable TWICE over,
+            // which is why that is not a gap:
+            //
+            // 1. The serve-many arm above RETURNS on `Held`, so no `Held` slot
+            //    reaches this match at all.
+            // 2. Even if one did, `held_sample` is written only by
+            //    `snapshot_latest` (the non-trigger, latest-value path), and
+            //    this type's own invariant states that a `Sample` frozen slot
+            //    happens ONLY for trigger / direct-path inputs, which never
+            //    hold - so a `Held` input never carries a cursor to write.
+            //
+            // Storing here would cost an atomic per non-trigger input per fire
+            // for a value no reader can use, and - under serve-many - would do
+            // it once per fire of a burst for one frame.
+            FrozenSlot::Held => {
+                let sample = self
+                    .held_sample
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Internal {
+                        reason: format!(
+                            "subscriber {} selected a held slot without a held sample",
+                            self.topic
+                        ),
+                    })?;
+                build_inbound_view::<T, R>(&self.topic, sample, f).map(|(r, _)| Some(r))
+            }
+            FrozenSlot::Empty => Ok(None),
+            FrozenSlot::Err(e) => Err(e),
+        }
+    }
+
+    /// Return the next complete wire frame without schema validation.
+    ///
+    /// Slot selection, read-outcome staging, FIFO promotion, and block-slot
+    /// reconciliation are identical to [`Self::try_view`]. Live samples are
+    /// retained in an owned view until dropped; held samples borrow the held
+    /// slot and do not advance the service cursor.
+    #[must_use = "raw input view must be checked"]
+    pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
+        self.view_raw_checked(None)
+    }
+
+    /// [`Self::view_raw`] that also requires the frame's schema hash to equal
+    /// `schema_hash`. A mismatched frame is `Err(SchemaMismatch)` and, like a
+    /// typed [`Self::try_view`] rejection, does not advance the service cursor.
+    #[must_use = "raw input view must be checked"]
+    pub fn view_raw_expecting(
+        &mut self,
+        schema_hash: u64,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        self.view_raw_checked(Some(schema_hash))
+    }
+
+    fn view_raw_checked(
+        &mut self,
+        schema_hash: Option<u64>,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        // THE shared frame checks (`validate_wire_frame_raw`, the untyped core
+        // of the typed path's `validate_wire_frame`), so the raw and typed
+        // paths refuse the same frames for the same reasons; the header they
+        // parse is the ONE parse this read performs, carried on the view.
+        let slot = self.select_slot();
+        match slot {
+            FrozenSlot::Held => {
+                let sample = self
+                    .held_sample
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Internal {
+                        reason: format!(
+                            "subscriber {} selected a held slot without a held sample",
+                            self.topic
+                        ),
+                    })?;
+                let (header, payload) = super::input_view::validate_wire_frame_raw(
+                    &self.topic,
+                    sample.payload(),
+                    schema_hash,
+                )?;
+                Ok(Some(RawInputView {
+                    inner: RawInputViewInner::Held(&sample.payload()[..payload.end]),
+                    header,
+                }))
+            }
+            FrozenSlot::Empty => Ok(None),
+            FrozenSlot::Sample(sample) => {
+                let (header, payload) = super::input_view::validate_wire_frame_raw(
+                    &self.topic,
+                    sample.payload(),
+                    schema_hash,
+                )?;
+                // Only a frame that passed every check is served, so only then
+                // does the cursor advance: a rejected frame is re-offered.
+                self.record_service_cursor_from(&header);
+                Ok(Some(RawInputView {
+                    inner: RawInputViewInner::Owned(sample, payload.end),
+                    header,
+                }))
+            }
+            FrozenSlot::Err(error) => Err(error),
+        }
+    }
+
+    /// Callback convenience wrapper around [`Self::view_raw`].
+    #[must_use = "raw input result must be checked"]
+    pub fn try_view_raw<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> TransportResult<Option<R>> {
+        self.view_raw().map(|view| view.map(|view| f(&view)))
+    }
+
+    /// Select the next slot using the same frozen/held/live discipline as `try_view`.
+    ///
+    /// Raw and typed consumers must share this path so read-outcome staging,
+    /// FIFO promotion, and block-slot reconciliation remain identical.
+    fn select_slot(&mut self) -> FrozenSlot {
         // Accounting-once: if a step-boundary snapshot was
         // taken for this input, serve it WITHOUT re-draining (the drain already
         // ran + accounted at snapshot time). Otherwise drain live now (trigger
@@ -2745,14 +3441,8 @@ impl CerulionSubscriber {
         // `Empty` serve reads nothing — so the accounting-once contract is
         // unchanged however many fires read it.
         match self.frozen.as_ref() {
-            Some(FrozenSlot::Held) => {
-                let sample = self
-                    .held_sample
-                    .as_ref()
-                    .expect("FrozenSlot::Held implies held_sample is Some");
-                return build_inbound_view::<T, R>(&self.topic, sample, f).map(Some);
-            }
-            Some(FrozenSlot::Empty) => return Ok(None),
+            Some(FrozenSlot::Held) => return FrozenSlot::Held,
+            Some(FrozenSlot::Empty) => return FrozenSlot::Empty,
             // `Sample` / `Err` (consumed below) and `None` (the live arm).
             _ => {}
         }
@@ -2914,52 +3604,7 @@ impl CerulionSubscriber {
         // call and never touched a slot, so re-deriving finds nothing to
         // release and the pop-time decrement stands unchanged.
         self.reconcile_block_slot_debt();
-        // Reachable with a `Sample` or an `Err` (taken from the slot,
-        // or produced by the live drain) and with an `Empty` (live drain only —
-        // a FROZEN Empty returned above). `Held` is produced by no drain and
-        // returned above, so it is unreachable here; it is served correctly
-        // rather than `unreachable!`d, because a diagnostic slot state must
-        // never be able to abort the read path it observes.
-        match slot {
-            FrozenSlot::Sample(sample) => {
-                // The ONE serve point both drain disciplines reach —
-                // Unified serves the boundary's frozen slot, Separate pops live
-                // into the same arm — so the service cursor has one write site
-                // and one meaning, and `CERULION_DRAIN_DISCIPLINE=separate`
-                // yields the identical cursor.
-                //
-                // Advanced only on `Ok`: `build_inbound_view` rejects a
-                // schema-mismatched / undersized / out-of-bounds frame, which
-                // the tick never sees. Recording it as served would tell a
-                // resume to skip a frame nothing read.
-                let out = build_inbound_view::<T, R>(&self.topic, &sample, f)?;
-                self.record_service_cursor(sample.payload());
-                Ok(Some(out))
-            }
-            // NB: this arm records NO cursor, and it is unreachable TWICE over,
-            // which is why that is not a gap:
-            //
-            // 1. The serve-many arm above RETURNS on `Held`, so no `Held` slot
-            //    reaches this match at all.
-            // 2. Even if one did, `held_sample` is written only by
-            //    `snapshot_latest` (the non-trigger, latest-value path), and
-            //    this type's own invariant states that a `Sample` frozen slot
-            //    happens ONLY for trigger / direct-path inputs, which never
-            //    hold — so a `Held` input never carries a cursor to write.
-            //
-            // Storing here would cost an atomic per non-trigger input per fire
-            // for a value no reader can use, and — under serve-many — would do
-            // it once per fire of a burst for one frame.
-            FrozenSlot::Held => {
-                let sample = self
-                    .held_sample
-                    .as_ref()
-                    .expect("FrozenSlot::Held implies held_sample is Some");
-                build_inbound_view::<T, R>(&self.topic, sample, f).map(Some)
-            }
-            FrozenSlot::Empty => Ok(None),
-            FrozenSlot::Err(e) => Err(e),
-        }
+        slot
     }
 
     /// The single drain-and-account implementation. Drains
@@ -2987,9 +3632,88 @@ impl CerulionSubscriber {
     }
 
     /// The single drain-and-account implementation behind BOTH consume modes
-    /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO).
+    /// (`limit_one = false` ⇒ drain-to-latest; `true` ⇒ pop-one FIFO),
+    /// wrapped by the REPLAY READ GATE.
+    ///
+    /// The gate is consulted ONCE, at the top, before anything pops: a frame
+    /// that is not yet due stays in its OWN queue, in arrival order, with its
+    /// bytes never read. Nothing pops an iceoryx2 queue except a drain, and on a
+    /// graph-wired subscriber every drain funnels into this body or into
+    /// [`Self::drain_samples`], so refusing the pop here is the whole hold-back
+    /// mechanism, no frame is retained as a borrowed sample, which would spend
+    /// one unit of the connection's `subscriber_max_borrowed_samples` budget per
+    /// held frame against a value baked at SERVICE CREATION.
+    ///
+    /// With no armed gate the answer is `Ungated` and the body below runs byte
+    /// for byte as it does today.
     fn drain_with_accounting_impl(&mut self, limit_one: bool) -> DrainOutcome {
-        self.drain_stale_events();
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission(gate) {
+                Some(due) => Some(due),
+                None => {
+                    // No stale EVENT drain here either, for the reason the body
+                    // below states: on a unified binding this is the node's BODY
+                    // subscriber, whose listener is attached to no WaitSet and
+                    // polled by nothing. A withheld drain therefore costs what
+                    // the granted one costs, minus the pop.
+                    return DrainOutcome::withheld();
+                }
+            },
+        };
+        let outcome = self.drain_with_accounting_body(limit_one, granted.map(|d| d.pop_count()));
+        if let (Some(gate), Some(due)) = (self.replay_plan.as_deref(), granted) {
+            // The surviving frame's own wire sequence, read off the slot the
+            // body kept. `Empty` and `Err` carry none, and a DECIMATED drain's
+            // survivor is nothing either, its recorded `served_seq` names the
+            // last ACCEPTED sequence rather than what the read popped, which is
+            // what `identity_unstated` suppresses.
+            let surviving_seq = match &outcome.slot {
+                FrozenSlot::Sample(sample) => wire_sequence(sample.payload()),
+                FrozenSlot::Held | FrozenSlot::Empty | FrozenSlot::Err(_) => None,
+            };
+            gate.settle(due, outcome.popped, surviving_seq);
+        }
+        outcome
+    }
+
+    /// The pop body itself. `pop_budget` is `Some(n)` under an armed gate that
+    /// granted `n` pops and `None` otherwise, in which case the consume mode
+    /// supplies the bound it always had.
+    fn drain_with_accounting_body(
+        &mut self,
+        limit_one: bool,
+        pop_budget: Option<u32>,
+    ) -> DrainOutcome {
+        // iceoryx2 0.10: this path does NOT drain the event listener, and that
+        // is the change, not an omission.
+        //
+        // Under 0.9.1 every read drained first for two reasons. The first was
+        // saturation: an undrained listener filled its `AF_UNIX SOCK_DGRAM`
+        // socket and every later notify took the failure path, which on a live
+        // robot meant a warning line per publish. 0.10 removed that hazard at
+        // the source, the doorbell is one byte, a full doorbell is
+        // swallowed into the NOTIFIED state, and a notify into that state skips
+        // the send entirely, so an undrained listener costs a publisher
+        // nothing and `notify_undelivered_count` stays 0. The second was stale
+        // wakes: an event left in the queue makes the live loop's idle poll
+        // read "data pending" when there is none, which is what makes a live
+        // graph free-run instead of waiting. That reason still holds, and every listener the live loop actually
+        // polls is still drained inside the step, a `DrainSource::Unified`
+        // binding's standalone `ListenerOnly` by `GraphRuntime::drain_level`,
+        // a `Separate` or Sync binding's trigger subscriber by
+        // `try_receive_for_drain`, and a caller that blocks on this
+        // subscriber's own fd by `wait_for_message` / `drain_event_notifications`
+        // before it waits. The listener reached from HERE is the node's BODY
+        // subscriber on a unified binding, which is attached to no WaitSet and
+        // polled by nothing, so draining it bought only the hazard 0.10 deleted.
+        //
+        // What it COST is the point: on 0.10 a drain of an empty listener is
+        // two `recvmsg` calls, two sequentially consistent atomic operations
+        // and a walk of the shared-memory counting bitset, where 0.9.1 was one
+        // `recvmsg`. This path runs once per trigger drain per hop and once per
+        // turn of every `try_view` spin, so it is the single most-repeated drain
+        // in the system.
 
         // Drain to the latest message ("latest wins": drop older
         // messages in favour of the most recent — predictable for control
@@ -3032,12 +3756,27 @@ impl CerulionSubscriber {
         // errors mid-drain (bypassing the decrement would permanently
         // inflate the mirror — the same deadlock guarded in `drain_samples`).
         let mut fault_inject = self.fault_inject_receive_after.get();
-        // FIFO pop-one: the per-sample closure flips this after the first
-        // pop; the receive closure then reports the queue as drained, so
-        // exactly one sample leaves the queue per call and older frames
-        // survive for later reads (per-message delivery). `Cell` because the
-        // receive and per-sample closures both capture it immutably.
-        let stop_after_first = std::cell::Cell::new(false);
+        // How many DELIVERED frames this drain may still take. The
+        // per-sample closure counts each frame it keeps and the receive closure
+        // reports the queue as drained once the count reaches the bound, so
+        // older frames survive for later reads (per-message delivery). `Cell`
+        // because the receive and per-sample closures both capture it
+        // immutably.
+        //
+        // The bound is a COUNT rather than the bool it replaced because the
+        // FIFO pop-one mode and the gate's admit-exactly-N differ only in the
+        // number: `limit_one` is the `1` case of it, an ungated latest-wins
+        // drain is the unbounded case, and an armed gate names its own. The
+        // counted quantity is DELIVERED frames and not queue removals, which is
+        // the same quantity `StagedReadOutcome::popped` carries at this site,
+        // comparing removals would mint a false shortfall on any edge carrying
+        // one corrupt frame.
+        let delivered = std::cell::Cell::new(0u64);
+        let pop_bound: u64 = match pop_budget {
+            Some(pops) => u64::from(pops),
+            None if limit_one => 1,
+            None => u64::MAX,
+        };
         // Corrupt (undersized) frames skipped by the FIFO pop — they are
         // real queue removals (block-mirror-accounted) but must not mint a
         // fire, so the returned `popped` (the trigger's signal count)
@@ -3045,7 +3784,7 @@ impl CerulionSubscriber {
         let junk_skipped = std::cell::Cell::new(0u64);
         let drain_result = drain_with_block_accounting(
             || {
-                if limit_one && stop_after_first.get() {
+                if delivered.get() >= pop_bound {
                     return Ok(None);
                 }
                 // Test-only fire-once receive fault (see the
@@ -3121,7 +3860,7 @@ impl CerulionSubscriber {
                     return;
                 }
                 latest = Some(sample);
-                stop_after_first.set(true);
+                delivered.set(delivered.get() + 1);
             },
             |removed| {
                 removed_in_drain.set(removed);
@@ -3827,6 +4566,8 @@ impl CerulionSubscriber {
     /// The Data burst loop's BETWEEN-FIRES refill of this data-trigger
     /// input — the same one-receive-per-served-frame drain as
     /// [`Self::snapshot_latest_for_trigger`], asking a DIFFERENT question.
+    /// The per-set Sync align pass reaches it too, through
+    /// `SyncHeadOp::FillRefill` after a fire.
     ///
     /// The boundary drain asks "is there a frame to fire on?", and an unserved
     /// frozen head IS one, so it RE-OFFERS the head (Principle #6: the signal a
@@ -3925,6 +4666,21 @@ impl CerulionSubscriber {
         self.fault_inject_sync_next_arrived_err = true;
     }
 
+    /// The bytes of the frame a per-set Sync slot holds right now: the head
+    /// (`frozen`, when it is a delivered sample) or the staged next. `None`
+    /// when that slot holds no frame. A pure read: no pop, no accounting, no
+    /// read-log record, so capture-time matching can read `header.stamp` off
+    /// the very frame the op just placed.
+    pub(crate) fn sync_frame(&self, slot: SyncFrameSlot) -> Option<&[u8]> {
+        match slot {
+            SyncFrameSlot::Head => match &self.frozen {
+                Some(FrozenSlot::Sample(sample)) => Some(sample.payload()),
+                _ => None,
+            },
+            SyncFrameSlot::Next => self.next_head.as_ref().map(|s| s.payload()),
+        }
+    }
+
     /// `NeedStamp`: pop this input's next frame into
     /// [`Self::next_head`] and report its wire stamp — the only way a stamp can
     /// be learned, since nothing but a pop reveals one.
@@ -3961,7 +4717,15 @@ impl CerulionSubscriber {
     /// otherwise means the matcher and the slots have desynced. It refuses to
     /// pop, says so loudly, and answers `Ok(None)` — the DESCENT-REFUSING
     /// answer, so a desync can never be what enables a descent.
-    pub(crate) fn sync_peek_next_stamp(&mut self) -> TransportResult<Option<u64>> {
+    ///
+    /// `site` is the ALIGN PASS's, declared by the caller and never inferred
+    /// here ([`crate::scheduler::SyncHeadOp::PeekNext`] carries it): it decides
+    /// whether an EMPTY pop stages a read-log record. See the
+    /// `FrozenSlot::Empty` arm below.
+    pub(crate) fn sync_peek_next_stamp(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         // Idempotent peek: the retained stamp, no pop.
         if let Some(staged) = &self.next_head {
             return Ok(wire_timestamp_ns(staged.payload()));
@@ -4045,20 +4809,42 @@ impl CerulionSubscriber {
             FrozenSlot::Empty => {
                 // With the format-5 role definition: `Drain`, NOT `Peek`, and the arm above
                 // is where the difference lives. `Peek` marks a record that
-                // NAMES A PARKED FRAME — the thing `verify_sync` must exclude
-                // from its head fold. A decimated pop parks nothing (`next_head`
-                // stays empty and the caller answers `None`), so there is no
-                // head to distinguish it from; it is an ordinary consuming
-                // scheduler read whose frames left the queue. Keeping it
-                // `Drain` is also what makes `Peek` + `Decimated` an
-                // UNPRODUCIBLE pairing replay can convict on.
-                if self.read_capture_armed() && outcome.decimated {
-                    self.stage_read_outcome(
-                        ReadOutcomeKind::Decimated,
-                        None,
-                        outcome.popped,
-                        ReadSiteRole::Drain,
-                    );
+                // NAMES A PARKED FRAME, the thing `verify_sync` must exclude
+                // from its head fold. An empty pop, decimated or plain, parks
+                // nothing (`next_head` stays empty and the caller answers
+                // `None`), so there is no head to distinguish it from; it is
+                // an ordinary scheduler read of a queue that held no frame to
+                // park. Keeping it `Drain` is also what makes `Peek` +
+                // `Decimated` and `Peek` + `NoFrame` UNPRODUCIBLE pairings
+                // replay can convict on.
+                // One record per consult: a decimated pop names the frames
+                // the sample gate dropped; a plain empty pop stages `NoFrame`
+                // at popped 0, a LITERAL because a non decimated `Empty`
+                // delivered no frame and the junk it skipped is subtracted, so
+                // `outcome.popped` is zero at this arm and a pop bearing
+                // record with no sequence (which `plan_edge_admission` refuses
+                // at exit 2) cannot be written from here. Under the recording's
+                // consult rule (`consult_capture_armed`) AND under the pass's
+                // SITE: a BOUNDARY align pass runs on both sides, so its empty
+                // pop has a replayed twin, while a post-fire REFILL align pass
+                // runs only on the recording side (a planned Sync fire goes to
+                // `Scheduler::tick_replay_burst`, and
+                // `Scheduler::set_trigger_refill` refuses any non-`Data`
+                // policy, so no align pass follows it). The split is applied to
+                // the empty-consult record only, the one trace format 7
+                // introduced; the `Decimated` record above predates it and this
+                // site gate does not reach it.
+                if outcome.decimated {
+                    if self.read_capture_armed() {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::Decimated,
+                            None,
+                            outcome.popped,
+                            ReadSiteRole::Drain,
+                        );
+                    }
+                } else if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
+                    self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, ReadSiteRole::Drain);
                 }
                 Ok(None)
             }
@@ -4090,7 +4876,15 @@ impl CerulionSubscriber {
     /// A failed refill FREEZES the `Err` exactly as [`Self::drain_for_trigger`]
     /// does, so the next boundary's drain replaces it and the input self-heals
     /// in one boundary (the `Err` carried no frame, so nothing is lost).
-    pub(crate) fn sync_discard_head(&mut self) -> TransportResult<Option<u64>> {
+    ///
+    /// `site` is the ALIGN PASS's, declared by the caller and never inferred
+    /// here ([`crate::scheduler::SyncHeadOp::Advance`] carries it): it decides
+    /// whether a refill that found the QUEUE empty stages a read-log record.
+    /// See the `FrozenSlot::Empty` arm below.
+    pub(crate) fn sync_discard_head(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         // The head really does leave — drop it (releasing its SHM borrow) and
         // close any held-head regime, exactly as a served head would. The
         // re-offer streak is a "nobody is reading this" heuristic, and a head
@@ -4173,7 +4967,39 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                FrozenSlot::Empty | FrozenSlot::Err(_) | FrozenSlot::Held => {}
+                // The drain found nothing to freeze: one `NoFrame` record,
+                // popped 0. The zero is a LITERAL because this arm's pop count
+                // cannot be anything else: `popped` is the frames removed less
+                // the junk skipped, a non decimated `Empty` means no frame was
+                // delivered, and every removed frame is either junk skipped
+                // (subtracted) or delivered (which freezes `Sample`). Staging
+                // `outcome.popped` would leave a later accounting change free
+                // to write a pop bearing record with no sequence, the shape
+                // `plan_edge_admission` refuses at exit 2. Under the
+                // recording's consult rule (`consult_capture_armed`: a replay
+                // of a bag declared below trace format 7 stages nothing here,
+                // as that recorder did) AND under the pass's SITE, the same
+                // split `drain_for_trigger` applies: a BOUNDARY align pass runs
+                // on both sides (`GraphRuntime::drain_level` runs it
+                // unconditionally), so its empty refill has a replayed twin,
+                // while a post-fire REFILL align pass runs only on the
+                // recording side. `Scheduler::set_trigger_refill` refuses any
+                // non-`Data` policy, so a planned Sync fire goes to
+                // `Scheduler::tick_replay_burst` with no align pass behind it
+                // and makes no consult here at all; a record staged at the
+                // refill site would hold a position the replayed log can never
+                // fill.
+                FrozenSlot::Empty => {
+                    if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::NoFrame,
+                            None,
+                            0,
+                            ReadSiteRole::Drain,
+                        );
+                    }
+                }
+                FrozenSlot::Err(_) | FrozenSlot::Held => {}
             }
         }
         let ts = outcome.latest_ts;
@@ -4397,14 +5223,18 @@ impl CerulionSubscriber {
             ConsumeMode::Latest => self.drain_to_latest_with_accounting(),
             ConsumeMode::EachFifo => self.drain_one_with_accounting(),
         };
-        // The UNIFIED trigger-drain read outcome — a DrainedBatch
-        // (served-seq = the surviving/newest frame, popped = the batch), or a
-        // Decimated when the sample gate dropped the survivor. A SILENT drain
-        // (Empty, popped == 0 — every level pass on a quiet input) records
-        // NOTHING, which is what keeps staging bounded on non-firing nodes;
-        // an Err drain is out of the read-log contract. Exactly ONE record
-        // per drain: the tick's later `try_view` serves the frozen slot
-        // without re-draining (accounting-once — see `try_view`).
+        // The UNIFIED trigger-drain read outcome: a DrainedBatch
+        // (served-seq = the surviving/newest frame, popped = the batch), a
+        // Decimated when the sample gate dropped the survivor, or a NoFrame
+        // (popped 0: a non decimated empty drain delivered nothing and the junk
+        // it skipped is subtracted) when a BOUNDARY drain found nothing to
+        // freeze; an empty REFILL stages nothing, for the pairing reason its
+        // arm states; an Err drain is out of the read-log contract. Exactly ONE
+        // record per drain that staged one: the tick's later `try_view` serves
+        // the frozen slot without re-draining (accounting-once, see
+        // `try_view`). Staging on a quiet input is bounded by the fold (a run of
+        // identical NoFrame records occupies one slot) and by the stage
+        // capacity.
         //
         // Per-message FIFO (52125241e): an `EachFifo` boundary drain pops
         // exactly ONE frame, so its record is `DrainedBatch` with `popped` =
@@ -4445,7 +5275,48 @@ impl CerulionSubscriber {
                     outcome.popped,
                     ReadSiteRole::Drain,
                 ),
-                FrozenSlot::Empty | FrozenSlot::Err(_) | FrozenSlot::Held => {}
+                // The drain found nothing to freeze. A BOUNDARY stages one
+                // `NoFrame` record, popped 0; a REFILL stages nothing, which is
+                // the pre-format-7 behaviour at this site.
+                //
+                // The site is what decides it, and the decision is the pairing
+                // rule rather than a preference. `Scheduler::tick_data_burst`
+                // asks the refill hook once MORE than it fires and the empty
+                // answer is what ENDS the burst, while
+                // `Scheduler::tick_replay_burst` fires the recorded count and
+                // asks the hook only BETWEEN fires. So an empty refill answer is
+                // the terminal probe of a burst that discovered its own length,
+                // and a plan-driven replay makes no consult for it: a record
+                // there would hold a position the replayed log can never fill.
+                // A boundary drain runs once per level pass on both sides, so
+                // its empty consult has a replayed twin by construction. The
+                // same split holds for the per-set Sync align pass, whose
+                // `SyncHeadOp::FillRefill` reaches this body after a fire
+                // (`Scheduler::tick_sync_burst`) while its `FillBoundary` runs
+                // from `drain_level`.
+                //
+                // The zero is a LITERAL because this arm's pop count cannot be
+                // anything else: `popped` is the frames removed less the junk
+                // skipped, a non decimated `Empty` means no frame was
+                // delivered, and every removed frame is either junk skipped
+                // (subtracted) or delivered (which freezes `Sample`). Staging
+                // `outcome.popped` would leave a later accounting change free
+                // to write a pop bearing record with no sequence, the shape
+                // `plan_edge_admission` refuses at exit 2. Under the
+                // recording's consult rule (`consult_capture_armed`: a replay
+                // of a bag declared below trace format 7 stages nothing here,
+                // as that recorder did).
+                FrozenSlot::Empty => {
+                    if site == TriggerDrainSite::Boundary && self.consult_capture_armed() {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::NoFrame,
+                            None,
+                            0,
+                            ReadSiteRole::Drain,
+                        );
+                    }
+                }
+                FrozenSlot::Err(_) | FrozenSlot::Held => {}
             }
         }
         let (popped, latest_ts) = (outcome.popped, outcome.latest_ts);
@@ -4654,6 +5525,10 @@ impl CerulionSubscriber {
                             ),
                         });
                     }
+                    // The same schema-dependent refusals the typed receive
+                    // path makes: no room for the fixed section and offset
+                    // table, or a frame that does not start 8-aligned.
+                    super::input_view::validate_reader_prefix::<T>(&self.topic, raw, total_size)?;
                     let payload_ptr = raw.as_ptr();
                     let payload_len = total_size - WireHeader::SIZE;
                     // SAFETY: `raw` is a valid slice into the iceoryx2
@@ -4671,7 +5546,10 @@ impl CerulionSubscriber {
                         sample,
                         _phantom: std::marker::PhantomData,
                     };
-                    let view = InputView::new(handle, reader);
+                    // The loop above parsed this header to read the sequence it
+                    // waits for; the view carries that copy rather than letting a
+                    // closure that asks for it parse the same bytes again.
+                    let view = InputView::new(handle, reader, header);
                     return Ok(Some(f(view)));
                 }
                 Ok(None) => {
@@ -4705,8 +5583,8 @@ impl CerulionSubscriber {
     /// `run_waitset_reactor_once_for_test` seam). The reactor records which
     /// sources fired and clears the `Listener`'s EVENT-notification queue;
     /// it never reads/consumes the data sample and never fires the scheduler.
-    pub(crate) fn listener(&self) -> &Listener<CerService> {
-        &self.listener
+    pub(crate) fn listener(&self) -> Option<&Listener<CerService>> {
+        self.listener.as_ref()
     }
 }
 
@@ -4718,65 +5596,44 @@ fn build_inbound_view<T: ShmMessage, R>(
     topic: &str,
     sample: &InboundSample,
     f: impl FnOnce(InputView<'_, T>) -> R,
-) -> TransportResult<R> {
+) -> TransportResult<(R, WireHeader)> {
     let raw = sample.payload();
-    if raw.len() < WireHeader::SIZE {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "undersized message: {} bytes, need at least {}",
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
-    let header = WireHeader::read_from_buf(raw).ok_or_else(|| TransportError::Deserialization {
-        topic: topic.to_string(),
-        reason: "failed to parse WireHeader from received message".to_string(),
-    })?;
-    if header.schema_hash != T::SCHEMA_HASH {
-        return Err(TransportError::SchemaMismatch {
-            topic: topic.to_string(),
-            expected_hash: T::SCHEMA_HASH,
-            actual_hash: header.schema_hash,
-        });
-    }
-    // Explicit lower-bound check (no silent
-    // `.max(WireHeader::SIZE)` coercion of a malformed sub-header size).
-    let total_size = header.total_size as usize;
-    if total_size < WireHeader::SIZE || total_size > raw.len() {
-        return Err(TransportError::Deserialization {
-            topic: topic.to_string(),
-            reason: format!(
-                "wire header total_size {} out of bounds (frame {} bytes, header {} bytes)",
-                total_size,
-                raw.len(),
-                WireHeader::SIZE,
-            ),
-        });
-    }
+    // THE shared frame checks, so this path and the scheduler-bounded one in
+    // `super::bounded_view` refuse the same frames for the same reasons. Four
+    // bounds checks in two places is how one of them ends up accepting a frame
+    // the other rejects.
+    let (header, payload) = super::input_view::validate_wire_frame::<T>(topic, raw)?;
     let payload_ptr = raw.as_ptr();
-    let payload_len = total_size - WireHeader::SIZE;
+    let payload_len = payload.len();
     // SAFETY: `raw` is a valid slice into the iceoryx2 SHM region owned by
     // `sample`, which is BORROWED — it is owned by the CALLER and guaranteed
     // to outlive this view (the caller holds it for `f`'s entire scope). We
     // build SampleHandle::InboundRef from the same `&sample` immediately
     // below, so the reader's borrow and the handle both point at the same
     // SHM slot and stay alive and aliasing-free for `f`'s entire scope. The
-    // bound check above keeps `payload_ptr.add(WireHeader::SIZE)` +
-    // `payload_len` within the original `raw` slice.
+    // range the shared checks returned keeps `payload_ptr.add(payload.start)`
+    // + `payload_len` within the original `raw` slice.
     let payload_slice: &[u8] =
-        unsafe { std::slice::from_raw_parts(payload_ptr.add(WireHeader::SIZE), payload_len) };
+        unsafe { std::slice::from_raw_parts(payload_ptr.add(payload.start), payload_len) };
     let reader = T::build_reader(payload_slice);
     let handle = SampleHandle::InboundRef { sample };
-    let view = InputView::new(handle, reader);
-    Ok(f(view))
+    // The shared checks returned this header; the view carries that copy, so the
+    // header a node body reads costs the one parse this path already paid.
+    let view = InputView::new(handle, reader, header);
+    Ok((f(view), header))
 }
 
 /// Validate a raw wire frame and deliver it to `callback` as a
-/// `ReceivedMessage`. Returns `true` if delivered, `false` if skipped
-/// (a `warn` was emitted). Used by the `drain_samples` receive path.
-fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> bool
+/// `ReceivedMessage` that carries `origin`, the publisher identity of the
+/// sample `raw` was read from. Returns the frame's parsed `WireHeader` if
+/// delivered, `None` if skipped (a `warn` was emitted). Used by the
+/// `drain_samples` receive path.
+fn deliver_raw_frame<F>(
+    topic: &str,
+    raw: &[u8],
+    origin: u128,
+    callback: &mut F,
+) -> Option<WireHeader>
 where
     F: FnMut(ReceivedMessage<'_>),
 {
@@ -4786,7 +5643,7 @@ where
             size_bytes = raw.len(),
             "received undersized message, skipping"
         );
-        return false;
+        return None;
     }
     let header = match WireHeader::read_from_buf(raw) {
         Some(h) => h,
@@ -4799,7 +5656,7 @@ where
                 size_bytes = raw.len(),
                 "wire header read failed, skipping"
             );
-            return false;
+            return None;
         }
     };
     // Validate total_size against the
@@ -4813,11 +5670,11 @@ where
             frame_len = raw.len(),
             "wire header total_size out of bounds, skipping"
         );
-        return false;
+        return None;
     }
     let payload = &raw[WireHeader::SIZE..total_size];
-    callback(ReceivedMessage::new(header, payload));
-    true
+    callback(ReceivedMessage::from_publisher(header, payload, origin));
+    Some(header)
 }
 
 /// Drive a `receive()` loop to exhaustion (or the first error) while keeping
@@ -4938,7 +5795,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             consume_mode,
             held_head_reoffers,
             held_head_warned,
-            served_sequence
+            served_sequence,
+            replay_plan
         }),
         abi_pin_struct!(SampleGate {
             interval_ns,
@@ -5391,7 +6249,7 @@ mod tests {
         )
         .expect("per-test SHM transport");
 
-        // A hand-built wire frame: 32-byte header + 8 payload bytes, the
+        // A hand-built wire frame: 40-byte header + 8 payload bytes, the
         // caller-stamped `sequence` the capture parses back.
         let frame = |seq: u32| -> Vec<u8> {
             let mut header = crate::wire::WireHeader::new(0xC1289, seq, 1_000 + u64::from(seq));
@@ -5491,6 +6349,305 @@ mod tests {
         );
     }
 
+    /// An EMPTY drain through `drain_samples` stages ONE `NoFrame` record,
+    /// popped 0, under the call site's role, and a second empty drain at the
+    /// same site folds onto it.
+    ///
+    /// Hand oracle: a body `try_receive` over an empty queue, twice, then one
+    /// `try_receive_for_drain`, expand to the run `[NoFrame Body, NoFrame
+    /// Body, NoFrame Drain]`, every record `served_seq` the stage sentinel and
+    /// `popped` 0. The two body records are byte identical so they fold into
+    /// one counted slot; the drain record differs in its role and opens a new
+    /// slot. Asserted through the run expansion so the arm reads the same
+    /// under `CERULION_READ_LOG_FOLD=off`.
+    ///
+    /// CONTROL in the same body: a stage that adopted a recording's silence at
+    /// empty consults (`adopt_consult_records(false)`, a replay of a bag
+    /// declared below trace format 7) stages nothing for the same three empty
+    /// drains, and still stages the `DrainedBatch` (seq 0, popped 1) a drain
+    /// that delivered one frame writes.
+    ///
+    /// What breaks this test: dropping the zero delivery arm of
+    /// `drain_samples` (an empty drain then stages nothing and the expansion
+    /// is empty), staging it under the stage's role rather than the call
+    /// site's (the third record then reads `Body`), or staging it without
+    /// reading the consult rule (the control then holds three `NoFrame`
+    /// records).
+    #[test]
+    fn drain_samples_stages_one_no_frame_record_for_an_empty_drain() {
+        use crate::read_outcome::{
+            ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, STAGE_NO_FRAME,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "empty_drain_record".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "empty_drain_record";
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let stage = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            hand_wired_drain_sizing(),
+        ));
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+
+        let mut delivered = 0usize;
+        sub.try_receive(|_msg| delivered += 1)
+            .expect("an empty drain is Ok");
+        sub.try_receive(|_msg| delivered += 1)
+            .expect("an empty drain is Ok");
+        sub.try_receive_for_drain(|_msg| delivered += 1)
+            .expect("an empty drain is Ok");
+        assert_eq!(delivered, 0, "nothing was queued, so nothing was delivered");
+
+        // Expanded by run count: (kind, served_seq, popped, token, role) per
+        // occurrence, in staging order.
+        let mut expanded = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            for _ in 0..r.run_count {
+                expanded.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+            }
+            true
+        });
+        assert_eq!(
+            expanded,
+            vec![
+                (
+                    ReadOutcomeKind::NoFrame,
+                    STAGE_NO_FRAME,
+                    0,
+                    None,
+                    ReadSiteRole::Body
+                ),
+                (
+                    ReadOutcomeKind::NoFrame,
+                    STAGE_NO_FRAME,
+                    0,
+                    None,
+                    ReadSiteRole::Body
+                ),
+                (
+                    ReadOutcomeKind::NoFrame,
+                    STAGE_NO_FRAME,
+                    0,
+                    None,
+                    ReadSiteRole::Drain
+                ),
+            ],
+            "one NoFrame record per empty consult, under the call site's role"
+        );
+
+        // CONTROL: the adopted silence. Same three empty drains, then one
+        // frame drained through the body entry point.
+        let frame = |seq: u32| -> Vec<u8> {
+            let mut header = crate::wire::WireHeader::new(0xC1289, seq, 1_000 + u64::from(seq));
+            let total = crate::wire::WireHeader::SIZE + 8;
+            header.total_size = total as u32;
+            let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+            header.write_to_buf(&mut buf);
+            buf
+        };
+        let topic2 = "empty_drain_record_ctl";
+        let mut publisher2 = mgr
+            .create_publisher(topic2, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub2 = mgr.create_subscriber(topic2).expect("subscriber");
+        let stage2 = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            hand_wired_drain_sizing(),
+        ));
+        stage2.arm();
+        stage2.adopt_consult_records(false);
+        assert!(stage2.is_armed() && !stage2.records_every_consult());
+        sub2.set_read_outcome_stage(Arc::clone(&stage2));
+        let mut delivered2 = 0usize;
+        sub2.try_receive(|_msg| delivered2 += 1)
+            .expect("an empty drain is Ok");
+        sub2.try_receive(|_msg| delivered2 += 1)
+            .expect("an empty drain is Ok");
+        sub2.try_receive_for_drain(|_msg| delivered2 += 1)
+            .expect("an empty drain is Ok");
+        assert_eq!(
+            delivered2, 0,
+            "nothing was queued, so nothing was delivered"
+        );
+        publisher2.publish_raw(&frame(0)).expect("publish");
+        sub2.try_receive(|_msg| delivered2 += 1)
+            .expect("a drain of one frame is Ok");
+        assert_eq!(delivered2, 1, "the one queued frame was delivered");
+        let mut expanded2 = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage2.drain_into(|r| {
+            for _ in 0..r.run_count {
+                expanded2.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+            }
+            true
+        });
+        assert_eq!(
+            expanded2,
+            vec![(
+                ReadOutcomeKind::DrainedBatch,
+                0,
+                1,
+                None,
+                ReadSiteRole::Body
+            )],
+            "under the adopted silence the three empty consults stage nothing and \
+             the delivering drain stages its batch"
+        );
+    }
+
+    /// **The matcher's own two consulting ops take the ALIGN SITE, and a
+    /// post-fire REFILL pass stages nothing where a BOUNDARY pass records.**
+    ///
+    /// `CerulionSubscriber::sync_peek_next_stamp` and
+    /// `CerulionSubscriber::sync_discard_head` are reached from BOTH align
+    /// passes: `Scheduler::align_sync_pass` is ONE body whose descent issues
+    /// `PeekNext` and `Advance` identically at either site, and
+    /// `Scheduler::tick_sync_burst` runs a refill pass after EVERY fire. A
+    /// plan-driven replay runs none of those refill passes
+    /// (`Scheduler::set_trigger_refill` refuses any non-`Data` policy, so a
+    /// planned Sync fire reaches `Scheduler::tick_replay_burst` with no align
+    /// pass behind it), so a record staged at the refill site holds a position
+    /// the replayed log can never fill, which is the divergence the
+    /// every-consult record exists not to create.
+    ///
+    /// FOUR CELLS, a nonzero control beside every zero: both ops, at both
+    /// sites, on a queue the op finds EMPTY. Dropping either site test turns a
+    /// `Refill` cell into one `NoFrame` record; reading the site from state
+    /// rather than taking it from the caller turns a `Boundary` cell into
+    /// nothing. The boundary drain that froze the head is in every cell's
+    /// stream, so a cell that staged NOTHING AT ALL fails too.
+    ///
+    /// The empty answer is a real outcome at both ops rather than a
+    /// contrivance: `sync_peek_next_stamp` names three ways to reach it, and
+    /// `sync_discard_head` refills FROM THE QUEUE whenever the head it dropped
+    /// had nothing staged behind it, which is every `DiscardTie`
+    /// (`sync_match::next_sync_step` reaches its window-death arm before any
+    /// peek has run).
+    #[test]
+    fn the_matchers_peek_and_discard_record_an_empty_consult_only_at_a_boundary_pass() {
+        use crate::read_outcome::{
+            ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, STAGE_NO_FRAME,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "align_site_split".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+
+        let frame = |seq: u32| -> Vec<u8> {
+            let mut header = crate::wire::WireHeader::new(0xC1289, seq, 4_000 + u64::from(seq));
+            let total = crate::wire::WireHeader::SIZE + 8;
+            header.total_size = total as u32;
+            let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+            header.write_to_buf(&mut buf);
+            buf
+        };
+
+        // ONE cell: a fresh edge, one frame, the BOUNDARY drain that freezes it
+        // as the head (R-pop requires a `Sample` head before a peek may stage
+        // behind it), then the op under test against the now-EMPTY queue. The
+        // answer is asserted to be the empty one, so the cell cannot pass by
+        // taking a different arm. Returns every record the edge staged, in
+        // staging order.
+        let cell = |topic: &str, peek: bool, site: SyncAlignSite| {
+            let mut publisher = mgr
+                .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+                .expect("publisher");
+            let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+            let stage = Arc::new(ReadOutcomeStage::new(
+                0,
+                ReadStageRole::Body,
+                hand_wired_drain_sizing(),
+            ));
+            stage.arm();
+            assert!(
+                stage.records_every_consult(),
+                "{topic}: the cell runs under the format-7 consult rule"
+            );
+            sub.set_read_outcome_stage(Arc::clone(&stage));
+            publisher.publish_raw(&frame(0)).expect("publish");
+            let (popped, _) = sub.snapshot_latest_for_trigger();
+            assert_eq!(popped, 1, "{topic}: the boundary drain froze the one frame");
+            let answered = if peek {
+                sub.sync_peek_next_stamp(site).expect("the peek is Ok")
+            } else {
+                sub.sync_discard_head(site)
+                    .expect("the advance never errors")
+            };
+            assert_eq!(
+                answered, None,
+                "{topic}: the premise, asserted: the op found the queue EMPTY"
+            );
+            let mut expanded = Vec::new(); // hot-path-alloc-ok: test-only collector.
+            stage.drain_into(|r| {
+                for _ in 0..r.run_count {
+                    expanded.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+                }
+                true
+            });
+            expanded
+        };
+
+        // The head-freezing boundary drain, present in every cell: one frame
+        // left the queue, under the call site's `Drain` role.
+        let froze_the_head = (
+            ReadOutcomeKind::DrainedBatch,
+            0,
+            1,
+            None,
+            ReadSiteRole::Drain,
+        );
+        // The empty consult: no frame, popped 0, `Drain` role.
+        let empty_consult = (
+            ReadOutcomeKind::NoFrame,
+            STAGE_NO_FRAME,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        );
+
+        assert_eq!(
+            cell("align_site_peek_boundary", true, SyncAlignSite::Boundary),
+            vec![froze_the_head, empty_consult],
+            "a BOUNDARY pass's empty `NeedStamp` peek RECORDS: `drain_level` runs              that pass on the replay side too, so the position has a twin"
+        );
+        assert_eq!(
+            cell("align_site_peek_refill", true, SyncAlignSite::Refill),
+            vec![froze_the_head],
+            "a post-fire REFILL pass's empty peek stages NOTHING: the stream is              the boundary drain that froze the head and nothing else"
+        );
+        assert_eq!(
+            cell("align_site_discard_boundary", false, SyncAlignSite::Boundary),
+            vec![froze_the_head, empty_consult],
+            "a BOUNDARY pass's `DiscardTie` refill that found the queue empty              RECORDS, under the same twin argument"
+        );
+        assert_eq!(
+            cell("align_site_discard_refill", false, SyncAlignSite::Refill),
+            vec![froze_the_head],
+            "a post-fire REFILL pass's `DiscardTie` refill stages NOTHING"
+        );
+    }
+
     // The drop_oldest detector: `classify_gap` counts iceoryx2's
     // silent oldest-eviction from one publisher stream's wire-sequence
     // gap (the per-id baseline lookup in `try_view` pins both sequences
@@ -5576,6 +6733,265 @@ mod tests {
         assert_eq!(
             classify_gap(0, BACKWARD_GAP_THRESHOLD + 1),
             GapClass::Backward
+        );
+    }
+
+    #[test]
+    fn raw_frame_validation_accepts_hand_written_wire_frame() {
+        use crate::transport::input_view::validate_wire_frame_raw;
+
+        let mut frame = [0_u8; WireHeader::SIZE];
+        frame[8..12].copy_from_slice(&(WireHeader::SIZE as u32).to_le_bytes());
+        let (header, payload) = validate_wire_frame_raw("/raw", &frame, None).unwrap();
+        assert_eq!(header.total_size as usize, WireHeader::SIZE);
+        assert_eq!(payload, WireHeader::SIZE..WireHeader::SIZE);
+    }
+
+    #[test]
+    fn raw_frame_validation_rejects_undersized_and_out_of_bounds_frames() {
+        use crate::transport::input_view::validate_wire_frame_raw;
+
+        assert!(matches!(
+            validate_wire_frame_raw("/raw", &[0; WireHeader::SIZE - 1], None),
+            Err(TransportError::Deserialization { .. })
+        ));
+        let mut frame = [0_u8; WireHeader::SIZE];
+        frame[8..12].copy_from_slice(&((WireHeader::SIZE as u32) + 1).to_le_bytes());
+        assert!(matches!(
+            validate_wire_frame_raw("/raw", &frame, None),
+            Err(TransportError::Deserialization { .. })
+        ));
+        // The typed path's schema check, on the untyped core: the same frame
+        // passes with no expected hash and fails with a foreign one.
+        frame[8..12].copy_from_slice(&(WireHeader::SIZE as u32).to_le_bytes());
+        assert!(validate_wire_frame_raw("/raw", &frame, None).is_ok());
+        assert!(matches!(
+            validate_wire_frame_raw("/raw", &frame, Some(1)),
+            Err(TransportError::SchemaMismatch {
+                expected_hash: 1,
+                actual_hash: 0,
+                ..
+            })
+        ));
+    }
+
+    fn raw_view_frame(sequence: u32) -> Vec<u8> {
+        let mut frame = vec![
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // schema hash
+            0x2A, 0x00, 0x00, 0x00, // total size
+            0x28, 0x00, 0x00, 0x00, // offset table offset
+            0x00, 0x00, 0x00, 0x00, // offset table count
+            0x00, 0x00, 0x00, 0x00, // sequence
+            0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step tag: untagged
+            0xAA, 0xBB,
+        ];
+        frame[20..24].copy_from_slice(&sequence.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn view_raw_expecting_rejects_a_foreign_schema_without_advancing_the_cursor() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_expecting".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/expecting";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let cursor = Arc::new(AtomicU64::new(0));
+        subscriber.register_service_cursor(Arc::clone(&cursor));
+
+        publisher
+            .publish_raw(&raw_view_frame(4))
+            .expect("publish foreign");
+        match subscriber.view_raw_expecting(0x1122_3344_5566_7788) {
+            Err(TransportError::SchemaMismatch {
+                expected_hash,
+                actual_hash,
+                ..
+            }) => {
+                assert_eq!(expected_hash, 0x1122_3344_5566_7788);
+                assert_eq!(actual_hash, 0x0102_0304_0506_0708);
+            }
+            other => panic!(
+                "expected SchemaMismatch, got {:?}",
+                other.map(|v| v.is_some())
+            ),
+        }
+        assert_eq!(cursor.load(Ordering::Acquire), 0);
+
+        publisher
+            .publish_raw(&raw_view_frame(5))
+            .expect("publish matching");
+        let view = subscriber
+            .view_raw_expecting(0x0102_0304_0506_0708)
+            .expect("view")
+            .expect("sample");
+        assert_eq!(&*view, raw_view_frame(5).as_slice());
+        drop(view);
+        assert_eq!(cursor.load(Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn view_raw_reads_a_live_frame_with_hand_written_bytes() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_live".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/live";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let expected = raw_view_frame(7);
+        publisher.publish_raw(&expected).expect("publish");
+
+        let view = subscriber.view_raw().expect("view").expect("sample");
+        assert_eq!(&*view, expected.as_slice());
+        // The header the frame checks parsed rides the view: the hand-written
+        // frame's schema hash and sequence, read without a second parse.
+        assert_eq!(view.schema_hash(), 0x0102_0304_0506_0708);
+        assert_eq!(view.header().sequence, 7);
+        let owned = match view.into_owned() {
+            Ok(owned) => owned,
+            Err(_) => panic!("live sample is owned"),
+        };
+        assert_eq!(&*owned, expected.as_slice());
+        assert_eq!(owned.header().sequence, 7);
+    }
+
+    #[test]
+    fn view_raw_reoffers_a_held_frame_without_advancing_the_cursor() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_held".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/held";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let expected = raw_view_frame(3);
+        publisher.publish_raw(&expected).expect("publish");
+        subscriber.snapshot_latest();
+
+        let first = subscriber.view_raw().expect("first view").expect("sample");
+        assert_eq!(&*first, expected.as_slice());
+        let held = match first.into_owned() {
+            Ok(_) => panic!("held sample must remain borrowed"),
+            Err(held) => held,
+        };
+        assert_eq!(&*held, expected.as_slice());
+        let second = subscriber.view_raw().expect("second view").expect("sample");
+        assert_eq!(&*second, expected.as_slice());
+    }
+
+    #[test]
+    fn view_raw_rejects_short_and_malformed_live_frames() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_short".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/short";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        publisher
+            .publish_raw(&[0_u8; WireHeader::SIZE - 1])
+            .expect("publish");
+
+        assert!(matches!(
+            subscriber.view_raw(),
+            Err(TransportError::Deserialization { .. })
+        ));
+        let mut malformed = raw_view_frame(8);
+        malformed[8..12].copy_from_slice(&100_u32.to_le_bytes());
+        publisher
+            .publish_raw(&malformed)
+            .expect("publish malformed");
+        assert!(matches!(
+            subscriber.view_raw(),
+            Err(TransportError::Deserialization { .. })
+        ));
+    }
+
+    #[test]
+    fn view_raw_then_try_view_raw_consumes_each_live_frame_once() {
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "view_raw_accounting".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 4,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let topic = "view_raw/accounting";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(128).expect("length"), 0)
+            .expect("publisher");
+        let mut subscriber = mgr.create_subscriber(topic).expect("subscriber");
+        let first = raw_view_frame(1);
+        let second = raw_view_frame(2);
+        publisher.publish_raw(&first).expect("publish first");
+        assert_eq!(
+            subscriber.view_raw().expect("first view").as_deref(),
+            Some(first.as_slice())
+        );
+        assert!(subscriber
+            .try_view_raw(|_| ())
+            .expect("empty view")
+            .is_none());
+        publisher.publish_raw(&second).expect("publish second");
+        assert_eq!(
+            subscriber
+                .try_view_raw(|bytes| bytes.to_vec())
+                .expect("second view"),
+            Some(second)
         );
     }
 }

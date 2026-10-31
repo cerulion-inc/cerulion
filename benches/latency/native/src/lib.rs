@@ -1179,6 +1179,39 @@ mod tests {
         assert!(!fixed100_sustained(FIXED100_TOTAL, FIXED100_TOTAL));
     }
 
+    /// Both sides of the zenoh pair build their `Config` from the pinned
+    /// release's schema: `from_json5` rejects a key that release does not
+    /// know, and each SHM setting reads back with the value the bench
+    /// relies on.
+    #[test]
+    fn zenoh_shm_config_keys_parse_and_read_back_on_the_pinned_release() {
+        for listen in [true, false] {
+            let config = zenoh_shm_config(listen);
+            let get = |key: &str| {
+                config
+                    .get_json(key)
+                    .unwrap_or_else(|e| panic!("{key} is not a key of this zenoh release: {e}"))
+            };
+            assert_eq!(get("mode"), r#""peer""#);
+            assert_eq!(get("scouting/multicast/enabled"), "false");
+            assert_eq!(get("scouting/gossip/enabled"), "false");
+            assert_eq!(get("transport/shared_memory/enabled"), "true");
+            assert_eq!(get("transport/shared_memory/mode"), r#""init""#);
+            let opt = "transport/shared_memory/transport_optimization";
+            assert_eq!(get(&format!("{opt}/enabled")), "true");
+            assert_eq!(get(&format!("{opt}/pool_size")), "67108864");
+            assert_eq!(get(&format!("{opt}/message_size_threshold")), "0");
+            let (side, other) = if listen {
+                ("listen", "connect")
+            } else {
+                ("connect", "listen")
+            };
+            let endpoint = format!(r#"["tcp/{ZENOH_BENCH_ENDPOINT}"]"#);
+            assert_eq!(get(&format!("{side}/endpoints")), endpoint);
+            assert_ne!(get(&format!("{other}/endpoints")), endpoint);
+        }
+    }
+
     /// The fixed100 counts: uniform (2100, 100) at every size, and
     /// the plan derives measured = 2000 at every rung (the CSV
     /// exact-count contract is rate-independent).

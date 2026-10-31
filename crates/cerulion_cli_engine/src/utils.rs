@@ -50,6 +50,51 @@ pub fn validate_node_type(name: &str) -> CliResult<()> {
     Ok(())
 }
 
+/// Validate a port name used as an attribute on an embedded Python node.
+pub fn validate_python_identifier(name: &str) -> CliResult<()> {
+    let mut chars = name.chars();
+    let valid_start = chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic());
+    let valid_rest = chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+    if !valid_start || !valid_rest {
+        return Err(CliError::Validation(format!(
+            "port name '{name}' is not a valid Python identifier"
+        )));
+    }
+    const KEYWORDS: &[&str] = &[
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+        "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+        "try", "while", "with", "yield",
+    ];
+    if KEYWORDS.contains(&name) {
+        return Err(CliError::Validation(format!(
+            "port name '{name}' is a Python keyword"
+        )));
+    }
+    const RESERVED: &[&str] = &[
+        "now_ns",
+        "request_shutdown",
+        "env",
+        "loan",
+        "tick",
+        "init",
+        "shutdown",
+    ];
+    if RESERVED.contains(&name) {
+        return Err(CliError::Validation(format!(
+            "port name '{name}' is reserved by the Python node runtime"
+        )));
+    }
+    if name.starts_with("_cer_") || name.starts_with("__cerulion") || name.starts_with("__") {
+        return Err(CliError::Validation(format!(
+            "port name '{name}' uses a prefix reserved by the Python node runtime"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +144,51 @@ mod tests {
         let long_name = "a".repeat(129);
         let err = validate_node_type(&long_name).unwrap_err();
         assert!(err.to_string().contains("must not exceed 128"));
+    }
+
+    #[test]
+    fn validate_python_identifier_covers_all_contract_arms() {
+        for name in ["inp", "_x", "a1"] {
+            assert!(
+                validate_python_identifier(name).is_ok(),
+                "{name} should pass"
+            );
+        }
+        for name in ["1abc", "with-dash", ""] {
+            let err = validate_python_identifier(name).unwrap_err();
+            assert!(err.to_string().contains("is not a valid Python identifier"));
+        }
+        for name in ["class", "None"] {
+            let err = validate_python_identifier(name).unwrap_err();
+            assert!(err.to_string().contains("is a Python keyword"));
+        }
+        for name in ["loan", "tick"] {
+            let err = validate_python_identifier(name).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("is reserved by the Python node runtime"));
+        }
+        for name in [
+            "_cer_ctx",
+            "_cer_inputs",
+            "__cerulion_ports__",
+            "__init__",
+            "__dict__",
+            "__",
+            "___",
+            "__foo",
+        ] {
+            let err = validate_python_identifier(name).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("port name '{name}' uses a prefix reserved by the Python node runtime")
+            );
+        }
+        for name in ["_cerx", "cer_ctx"] {
+            assert!(
+                validate_python_identifier(name).is_ok(),
+                "{name} should pass"
+            );
+        }
     }
 }

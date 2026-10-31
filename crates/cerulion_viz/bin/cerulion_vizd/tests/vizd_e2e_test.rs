@@ -79,8 +79,9 @@ use cerulion_netd::registry::TopicKey;
 use cerulion_netd::CatalogGather;
 use cerulion_viz::blueprint::{
     apply_runtime_blueprint, blueprint_decorations, blueprint_panel_timeline,
-    blueprint_property_paths, clear_runtime_blueprint, current_runtime_blueprint_plan,
-    default_layout, rearm_blueprint, send_blueprint_once, BlueprintPlan, PlanNode,
+    blueprint_property_paths, blueprint_view_classes, clear_runtime_blueprint,
+    current_runtime_blueprint_plan, default_layout, rearm_blueprint, send_blueprint_once,
+    BlueprintPlan, PlanNode,
 };
 // The PURE element-array extractor the sink ladder consumes —
 // used to anchor the codec-produced `/plan` frame to its hand oracle BEFORE it
@@ -117,8 +118,9 @@ use serde_json::Value;
 /// A RECORDING spy [`cerulion_vizd::DemandPlane`] (a DI test double —
 /// Principle #13, not fake data) that SUCCEEDS every demand/release but creates NO
 /// real mirror, so the daemon's tap step fails on the non-existent `{topic}/data`
-/// service — the fault the rollback test needs. Records every demand + release for
-/// hand-oracle assertions.
+/// service, the fault the rollback test needs. A test that runs its own publisher
+/// on the daemon's manager gives the tap a local service in place of the mirror.
+/// Records every demand + release for hand-oracle assertions.
 #[derive(Default)]
 struct RecordingDemandPlane {
     demands: std::sync::Mutex<Vec<(String, String, u64)>>,
@@ -523,6 +525,7 @@ fn build_vector3_frame(seq: u32, ts: u64, v: [f64; 3]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -547,6 +550,7 @@ fn build_widget_frame(schema_hash: u64, seq: u32, ts: u64, x: f64, y: f64) -> Ve
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -3534,6 +3538,7 @@ fn a_remote_topic_re_attaches_right_after_detach_on_both_surfaces_e2e() {
         }],
         schema_docs: vec![],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3802,6 +3807,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
         ],
         schema_docs: vec![widget_doc.clone()],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3942,7 +3948,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
             if let Ok(n) = probe.drain_owned(1, &mut scratch) {
                 for frame in scratch.iter().take(n) {
                     // `payload()` on a drained owned frame is the FULL wire frame
-                    // (32-byte WireHeader + data); the custom fields begin after it.
+                    // (40-byte WireHeader + data); the custom fields begin after it.
                     let full = frame.payload();
                     let base = WireHeader::SIZE;
                     if full.len() >= base + 16 {
@@ -4043,6 +4049,7 @@ fn schema_less_resolve_is_served_by_netd_not_vizds_own_network() {
         ],
         schema_docs: vec![widget_doc.clone()],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -5077,6 +5084,7 @@ fn discover_over_many_silent_topics_is_bounded() {
 fn oracle_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> cerulion_core::CatalogReply {
     use cerulion_core::{CatalogEntry, CatalogProvenance};
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: entries
@@ -7499,7 +7507,7 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
 
     // PROVENANCE ISOLATION (must precede the compose): the DEFAULT send-once,
     // fired ONCE at worker spawn (`ensure_setup` → `send_blueprint_once`, guarded so it
-    // never re-fires), decorates its Scene-only scene with the `#10161f` Background (as
+    // never re-fires), decorates its Scene-only scene with the `#0b0d11` Background (as
     // of the Scene-only default it carries NO time_series window/axis). Left in the sink, that default
     // Background would let the background presence gate + value loops below pass EVEN IF
     // compose stopped decorating (a reproducible false-pass). So
@@ -7551,7 +7559,7 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
     );
 
     // Decode the applied blueprint's COMPONENT VALUES (not just the
-    // paths) — the SolidColor #10161f stage background + the [-30s, 0] cursor-relative
+    // paths): the SolidColor #0b0d11 stage background + the [-30s, 0] cursor-relative
     // window are exactly what the viewer reads.
     let dec = blueprint_decorations(&msgs);
     assert!(
@@ -7566,8 +7574,8 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
         );
         assert_eq!(
             bg.colors,
-            vec![[0x10, 0x16, 0x1f, 0xff]],
-            "stage color #10161f: {bg:?}"
+            vec![[0x0b, 0x0d, 0x11, 0xff]],
+            "stage color #0b0d11: {bg:?}"
         );
     }
     assert!(
@@ -7602,6 +7610,131 @@ fn composed_blueprint_carries_the_trailing_window_and_stage_background_e2e() {
             "cursor-relative [-30s, 0], one timeline-agnostic range: {ta:?}"
         );
     }
+
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Test 21c: a HAND-AUTHORED set_blueprint layout carries the stage
+// background on its spatial view (and no trailing window on its plot).
+//
+// The background is viewer chrome, not a compose decoration: without it, a
+// hand-authored set_blueprint scene (what a Studio attach sends) falls back to
+// rerun's GradientDark skybox inside the #0b0d11 Studio frame. Provenance
+// isolation is by BARRIER, not by a timed drain: the attach re-derives the default
+// layout (a Scene hero, so one Background of its own) on the worker thread
+// asynchronously, and on a loaded runner that layout can land AFTER a
+// consecutive-empty-reads drain has declared the sink quiet, so it would then be
+// counted as the set_blueprint plan's. The worker queue is in-order, so a
+// `VizControl::sync` after the attach reply returns only once the attach-derived
+// layout (and the boot send-once, when this test is the one that fires it) has
+// been handed to the stream; a flush + take then clears the sink deterministically,
+// and the same barrier after `set_blueprint` means everything taken is that plan's
+// alone. The absent window proves the provenance (a compose or default plot WOULD
+// carry one).
+
+#[test]
+fn set_blueprint_layout_carries_the_stage_background_on_spatial_views_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport("vizd_setbp_bg");
+    let topic = "/vizd/bpbg";
+    let _publisher = mgr
+        .create_publisher(topic, MaxSliceLen::const_new(1 << 16), 0)
+        .expect("silent producer attaches");
+
+    let (worker, flush, storage) = memory_worker("setbp_bg");
+    // A control handle of our own (the daemon takes its own clone): the barrier
+    // below rides the SAME in-order queue the daemon's layout verbs enqueue on.
+    let worker_control = worker.control();
+    let (socket, dir) = temp_socket("setbp_bg");
+    let mut daemon = start_hermetic(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    let att = client.request(&format!(
+        r#"{{"id":1,"method":"attach","topic":"{topic}"}}"#
+    ));
+    assert_eq!(att["ok"].as_bool(), Some(true), "{att}");
+    assert_eq!(att["entity"].as_str(), Some("world/vizd/bpbg"));
+
+    // The attach enqueued its re-derived default layout BEFORE replying; the
+    // barrier returns once the worker has applied it (in-order queue), so after the
+    // flush the sink holds every pre-layout message there will ever be. The attach
+    // layout always carries a Scene hero, so its Background MUST be among them: a
+    // drain that found none would be clearing the wrong moment.
+    worker_control.sync();
+    flush.flush_blocking().ok();
+    let before_layout = storage.take();
+    assert!(
+        blueprint_property_paths(&before_layout)
+            .iter()
+            .any(|p| p.ends_with("/Background")),
+        "the attach-derived default layout (a Scene hero) landed before the drain: \
+         {:?}",
+        blueprint_property_paths(&before_layout)
+    );
+
+    let layout = r#"{"id":2,"method":"set_blueprint","layout":{"auto_views":false,"root":{"type":"container","kind":"horizontal","shares":[3.0,1.0],"children":[{"type":"view","kind":"spatial3d","name":"Map","origin":"world"},{"type":"view","kind":"time_series","name":"Plots","origin":"world/vizd/bpbg"}]}}}"#;
+    let applied = client.request(layout);
+    assert_eq!(applied["ok"].as_bool(), Some(true), "{applied}");
+    assert_eq!(applied["views"].as_u64(), Some(2));
+
+    // Same barrier: the verb enqueued the plan before replying, so once the worker
+    // acks, the plan's blueprint messages are in the stream; the flush lands them in
+    // the sink and the take is exactly the set_blueprint plan's chunks.
+    worker_control.sync();
+    flush.flush_blocking().ok();
+    let msgs = storage.take();
+    assert!(
+        blueprint_property_paths(&msgs)
+            .iter()
+            .any(|p| p.ends_with("/Background")),
+        "the applied set_blueprint layout carries a Background on its spatial view: {:?}",
+        blueprint_property_paths(&msgs)
+    );
+
+    let dec = blueprint_decorations(&msgs);
+    assert_eq!(dec.backgrounds.len(), 1, "one spatial view: {dec:?}");
+    assert_eq!(
+        dec.backgrounds[0].kind_names(),
+        vec!["SolidColor".to_string()],
+        "{dec:?}"
+    );
+    assert_eq!(
+        dec.backgrounds[0].colors,
+        vec![[0x0b, 0x0d, 0x11, 0xff]],
+        "stage color #0b0d11: {dec:?}"
+    );
+    // The one Background belongs to the spatial3d view, not merely to SOME view: a
+    // regression logging it onto the plot would still count one.
+    let views = blueprint_view_classes(&msgs);
+    let mut classes: Vec<&str> = views.iter().map(|(_, c)| c.as_str()).collect();
+    classes.sort_unstable();
+    assert_eq!(classes, vec!["3D", "TimeSeries"], "{views:?}");
+    let spatial_path = &views
+        .iter()
+        .find(|(_, c)| c == "3D")
+        .expect("one spatial3d view")
+        .0;
+    let owner = dec.backgrounds[0]
+        .path
+        .trim_start_matches('/')
+        .trim_end_matches("/Background");
+    assert_eq!(
+        owner, spatial_path,
+        "the Background rides the spatial3d view's path: {dec:?} vs {views:?}"
+    );
+    assert!(
+        dec.windows.is_empty() && dec.time_axes.is_empty(),
+        "a hand-authored plot is never auto-windowed: {dec:?}"
+    );
 
     daemon.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -8523,6 +8656,7 @@ fn plan_has_view_named(plan: &BlueprintPlan, name: &str) -> bool {
 fn big_catalog(robot: &str, n: usize) -> cerulion_core::CatalogReply {
     use cerulion_core::{CatalogEntry, CatalogProvenance};
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: (0..n)
@@ -8830,6 +8964,7 @@ fn build_undecodable_path_frame() -> Vec<u8> {
         offset_table_count: 2,
         sequence: 0,
         timestamp_ns: PLAN_TS,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE];
     header.write_to_buf(&mut frame);
@@ -10660,6 +10795,152 @@ fn a_paced_stream_reports_exactly_zero_pre_decode_loss() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// The live voxel map: a voxel-delta PointCloud2 topic is classified by its
+// FIELD LAYOUT, so every reporter names it `VoxelMap`, never `Points3D`.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A `sensor_msgs/PointCloud2` voxel-delta frame (5 cm, packed `fields`, frame
+/// `odom`) carrying `FLOOR`, one `SET` and `ROBOT`.
+fn voxel_delta_frame() -> Vec<u8> {
+    use cerulion_core::codegen::layout::LayoutResolver;
+    use native_ros2_messages::sensor_msgs::PointCloud2;
+    let schemas: Vec<MessageSchema> = native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .filter_map(|(pkg, name, text)| parse_rosmsg(text, name, Some(pkg)).ok())
+        .collect();
+    let (mut resolver, _) = LayoutResolver::new(schemas);
+    let layout = resolver
+        .layout_of("sensor_msgs/PointCloud2")
+        .expect("PointCloud2 layout");
+    let header = resolver
+        .layout_of("std_msgs/Header")
+        .expect("Header layout");
+    let fixed_off = |name: &str| {
+        layout
+            .fixed_fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("PointCloud2 has no fixed field '{name}'"))
+            .offset
+    };
+    // Packed `fields`: name_len, name, offset, datatype, count.
+    let mut fields = Vec::new();
+    for (name, offset, datatype) in [
+        ("vx_50mm", 0u32, 3u8),
+        ("vy_50mm", 2, 3),
+        ("vz_50mm", 4, 3),
+        ("hits", 6, 2),
+        ("op", 7, 2),
+    ] {
+        fields.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        fields.extend_from_slice(name.as_bytes());
+        fields.extend_from_slice(&offset.to_le_bytes());
+        fields.push(datatype);
+        fields.extend_from_slice(&1u32.to_le_bytes());
+    }
+    // `header.frame_id` = "odom".
+    let head = header.fixed_size + header.offset_table_bytes();
+    let mut header_blob = vec![0u8; head];
+    write_offset_entry(&mut header_blob, header.fixed_size, 0, head as u32, 4);
+    header_blob.extend_from_slice(b"odom");
+    // FLOOR (epoch 1, layer 0), SET (3, 4, 5), ROBOT (0, 0, 6).
+    let mut data = Vec::new();
+    for (x, y, z, op) in [(1i16, 0i16, 0i16, 5u8), (3, 4, 5, 0), (0, 0, 6, 4)] {
+        data.extend_from_slice(&x.to_le_bytes());
+        data.extend_from_slice(&y.to_le_bytes());
+        data.extend_from_slice(&z.to_le_bytes());
+        data.push(1);
+        data.push(op);
+    }
+    let fixed = layout.fixed_size;
+    let table = layout.offset_table_bytes();
+    let mut payload = vec![0u8; fixed + table];
+    for (name, v) in [
+        ("height", 1u32),
+        ("width", 3),
+        ("point_step", 8),
+        ("row_step", 24),
+    ] {
+        payload[fixed_off(name)..fixed_off(name) + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let header_off = (fixed + table) as u32;
+    let fields_off = header_off + header_blob.len() as u32;
+    let data_off = fields_off + fields.len() as u32;
+    write_offset_entry(&mut payload, fixed, 0, header_off, header_blob.len() as u32);
+    write_offset_entry(&mut payload, fixed, 1, fields_off, fields.len() as u32);
+    write_offset_entry(&mut payload, fixed, 2, data_off, data.len() as u32);
+    payload.extend_from_slice(&header_blob);
+    payload.extend_from_slice(&fields);
+    payload.extend_from_slice(&data);
+    let mut frame = vec![0u8; WireHeader::SIZE];
+    WireHeader {
+        schema_hash: <PointCloud2 as ShmMessage>::SCHEMA_HASH,
+        total_size: (WireHeader::SIZE + payload.len()) as u32,
+        offset_table_offset: (WireHeader::SIZE + fixed) as u32,
+        offset_table_count: 3,
+        sequence: 0,
+        timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+    }
+    .write_to_buf(&mut frame);
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+#[test]
+fn a_voxel_delta_topic_reports_the_voxel_map_archetype_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport("voxelmap");
+    let topic = "/vizd/voxels";
+    let _publisher = Publisher::spawn_fixed_frame(Arc::clone(&mgr), topic, voxel_delta_frame());
+    let (worker, _flush, _storage) = memory_worker("voxelmap");
+    let (socket, dir) = temp_socket("voxelmap");
+    let mut daemon: RunningDaemon = start_hermetic(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    let att = client.request(&format!(
+        r#"{{"id":1,"method":"attach","topic":"{topic}"}}"#
+    ));
+    assert_eq!(att["ok"].as_bool(), Some(true), "attach: {att}");
+    assert_eq!(
+        att["archetype"].as_str(),
+        Some("VoxelMap"),
+        "the field layout outranks the PointCloud2 name row: {att}"
+    );
+    let entity = att["entity"].as_str().expect("entity").to_string();
+    assert_eq!(entity, "world/vizd/voxels");
+
+    let status_row = |client: &mut Client, id: u64| -> Option<Value> {
+        let st = client.request(&format!(r#"{{"id":{id},"method":"status"}}"#));
+        entry_for(&st["topics"], "topic", topic).cloned()
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            status_row(&mut client, 2).is_some_and(|r| r["archetype"].as_str() == Some("VoxelMap"))
+        }),
+        "the status row names the archetype: {:?}",
+        status_row(&mut client, 3)
+    );
+    let row = status_row(&mut client, 4).expect("row");
+    assert_eq!(row["entity"].as_str(), Some(entity.as_str()), "{row}");
+    assert_eq!(
+        row["view_kinds"],
+        serde_json::json!(["spatial3d"]),
+        "a voxel map renders in ONE 3D view and never dumps: {row}"
+    );
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // The dump companion is refused on a LIVE signal, and COMES BACK when
 // a degradation fires — over the real daemon, the real worker and real frames.
 //
@@ -10701,6 +10982,7 @@ fn marker_array_frame(blob: &[u8]) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -10988,6 +11270,7 @@ fn h264_frame(au: &[u8]) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -11094,10 +11377,16 @@ fn a_mid_gop_camera_attach_drops_its_companion_when_the_sps_lands_e2e() {
         views_with_companion,
         applied_views()
     );
+    // The whole status row and the installed plan ride the message, so a
+    // disagreement names the live signal that produced it (renditions, proof,
+    // degradation) instead of only the two view lists.
+    let report = client.request(r#"{"id":4,"method":"status"}"#);
+    let row = entry_for(&report["topics"], "topic", topic).cloned();
     assert_eq!(
-        view_kinds(&mut client, 4),
+        row.as_ref().map(|r| r["view_kinds"].clone()),
         Some(serde_json::json!(["spatial2d"])),
-        "…and the report must agree with it"
+        "…and the report must agree with it: status row {row:?}; installed plan {:?}",
+        current_runtime_blueprint_plan()
     );
     assert!(
         daemon.poll_loop_layout_signal_reflows() > reflows_before_sps,
@@ -11975,6 +12264,7 @@ fn liveness_catalog(
 ) -> cerulion_core::CatalogReply {
     use cerulion_core::{CatalogEntry, CatalogProvenance};
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: entries
@@ -13837,4 +14127,412 @@ fn a_plane_that_cannot_query_runs_degrades_rather_than_claiming_an_empty_lan_e2e
 
     daemon.shutdown();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Exercise model admission over the real control socket, with real files and a
+/// silent SHM route. SDK submission proves installation, not GPU appearance.
+#[test]
+fn model_import_status_route_ownership_and_layout_e2e() {
+    let _statics = blueprint_statics_guard();
+    for explicit in [false, true] {
+        clear_runtime_blueprint();
+        let mgr = isolated_transport(if explicit {
+            "model_explicit"
+        } else {
+            "model_auto"
+        });
+        let topic = "/vizd/joints";
+        let _publisher = mgr
+            .create_publisher(topic, MaxSliceLen::const_new(1 << 16), 0)
+            .unwrap();
+        let _alias = mgr
+            .create_publisher("/vizd/alias", MaxSliceLen::const_new(1 << 16), 0)
+            .unwrap();
+        let (worker, flush, storage) = memory_worker("model_control");
+        let counters = worker.counters();
+        let (socket, dir) = temp_socket("model");
+        let mut daemon = start_hermetic(
+            socket.clone(),
+            DEFAULT_POLL_INTERVAL,
+            mgr,
+            worker,
+            builtin_walker(),
+            None,
+        )
+        .unwrap();
+        let mut client = Client::connect(&socket);
+        assert_eq!(
+            client.request(r#"{"id":1,"method":"model_status"}"#),
+            serde_json::json!({"id":1,"ok":true,"model":null})
+        );
+        let path = dir.join("robot.urdf");
+        let mut load = serde_json::json!({"id":2,"method":"load_model","urdf_path":path,"topic":topic,"model_id":"demo","motor_joints":["hinge"]});
+        let absent = client.request(&load.to_string());
+        assert_eq!(absent["ok"], false);
+        assert!(absent["error"]
+            .as_str()
+            .unwrap()
+            .contains("existing exact topic attachment"));
+        assert_eq!(
+            client
+                .request(&serde_json::json!({"id":3,"method":"attach","topic":topic}).to_string())
+                ["ok"],
+            true
+        );
+        assert_eq!(
+            client.request(
+                r#"{"id":30,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}"#
+            )["ok"],
+            true
+        );
+        let ambiguous = client.request(&load.to_string());
+        assert_eq!(ambiguous["ok"], false);
+        assert!(ambiguous["error"].as_str().unwrap().contains("shared"));
+        assert_eq!(
+            client.request(r#"{"id":31,"method":"detach","topic":"/vizd/alias"}"#)["ok"],
+            true
+        );
+        // A preparation failure remains observable and allows another operation.
+        assert_eq!(client.request(&load.to_string())["ok"], true);
+        let mut failed = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                failed = client.request(r#"{"id":4,"method":"model_status"}"#);
+                failed["model"]["phase"] == "failed"
+            }),
+            "missing URDF must fail asynchronously: {failed}"
+        );
+        assert!(failed["model"]["error"].is_string());
+        let first_operation = failed["model"]["operation_id"].as_u64().unwrap();
+        // A failed preflight owns no model rows or alias reservation.
+        let alias = client.request(
+            r#"{"id":32,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}"#,
+        );
+        assert_eq!(
+            alias["ok"], true,
+            "preflight failure must release aliases: {alias}"
+        );
+        assert_eq!(
+            client.request(r#"{"id":33,"method":"detach","topic":"/vizd/alias"}"#)["ok"],
+            true
+        );
+        std::fs::write(&path, r#"<robot name="oracle"><link name="base"/><link name="arm"/><joint name="hinge" type="continuous"><parent link="base"/><child link="arm"/><axis xyz="0 0 1"/></joint><link name="tip"/><joint name="mount" type="fixed"><parent link="arm"/><child link="tip"/><origin xyz="0.25 -0.5 1"/></joint></robot>"#).unwrap();
+        if explicit {
+            let response = client.request(r#"{"id":5,"method":"set_blueprint","layout":{"root":{"type":"view","kind":"spatial3d","name":"Keep operator layout","origin":"world"}}}"#);
+            assert_eq!(response["ok"], true, "{response}");
+            assert!(wait_until(Duration::from_secs(3), || {
+                current_runtime_blueprint_plan()
+                    .is_some_and(|p| plan_has_view_named(&p, "Keep operator layout"))
+            }));
+        }
+        load["id"] = 6.into();
+        let admitted = client.request(&load.to_string());
+        assert_eq!(admitted["ok"], true, "{admitted}");
+        assert!(admitted["model"]["operation_id"].as_u64().unwrap() > first_operation);
+        let mut installed = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                installed = client.request(r#"{"id":7,"method":"model_status"}"#);
+                installed["model"]["phase"] == "installed"
+            }),
+            "valid model must install: {installed}"
+        );
+        assert_eq!(installed["model"]["root"], "models/demo");
+        assert_eq!(installed["model"]["route_key"], "vizd/joints");
+        assert_eq!(installed["model"]["binding"]["statics_submitted"], true);
+        // Read actual model data from the recording, not just the success flag.
+        // The translated fixed mount must exist before any measured joint frame.
+        flush.flush_blocking().unwrap();
+        let mut translations = Vec::new();
+        for message in storage.take() {
+            let LogMsg::ArrowMsg(_, arrow) = message else {
+                continue;
+            };
+            let chunk = re_chunk::Chunk::from_arrow_msg(&arrow).unwrap();
+            if chunk.entity_path() == &"models/demo/arm/tip".into() {
+                assert!(chunk.is_static(), "fixed mount must be static");
+                translations.extend(
+                    chunk
+                        .iter_component::<rerun::components::Translation3D>(
+                            rerun::Transform3D::descriptor_translation().component,
+                        )
+                        .flat_map(|batch| batch.iter().map(|value| value.0 .0).collect::<Vec<_>>()),
+                );
+            }
+        }
+        assert_eq!(translations, vec![[0.25, -0.5, 1.0]]);
+        assert_eq!(installed["model"]["binding"]["joint_frames_submitted"], 0);
+        assert_eq!(installed["model"]["binding"]["rejected_frames"], 0);
+        assert!(wait_until(Duration::from_secs(3), || counters
+            .layout_signal_generation
+            .load(Ordering::Relaxed)
+            > 0));
+        let poll_mark = daemon.poll_loop_iterations();
+        assert!(wait_until(Duration::from_secs(3), || daemon
+            .poll_loop_iterations()
+            >= poll_mark + 2));
+        if explicit {
+            assert_eq!(
+                daemon.poll_loop_layout_signal_reflows(),
+                0,
+                "installed signal must preserve the explicit layout"
+            );
+        }
+        assert!(wait_until(Duration::from_secs(3), || {
+            current_runtime_blueprint_plan().is_some_and(|p| {
+                plan_has_view_named(
+                    &p,
+                    if explicit {
+                        "Keep operator layout"
+                    } else {
+                        "Robot model"
+                    },
+                )
+            })
+        }));
+        let plan = current_runtime_blueprint_plan().unwrap();
+        assert_eq!(plan_has_view_named(&plan, "Robot model"), !explicit);
+        // Establish a different applied plan in BOTH iterations: seeing the model
+        // pane after reset must prove a new worker emission, not its old auto plan.
+        // The explicit layout names the installed model root itself: that origin
+        // is grounded by the daemon's own model, not by a topic, so it must draw
+        // no ungrounded-origin hint (there is no topic Studio could attach).
+        let before = client.request(r#"{"id":35,"method":"set_blueprint","layout":{"root":{"type":"container","kind":"horizontal","children":[{"type":"view","kind":"spatial3d","name":"Before reset","origin":"world"},{"type":"view","kind":"spatial3d","name":"Operator model","origin":"/models/demo"}]}}}"#);
+        assert_eq!(before["ok"], true, "{before}");
+        assert_eq!(
+            before["warnings"],
+            serde_json::json!([]),
+            "an installed model root grounds an explicit view: {before}"
+        );
+        assert!(wait_until(Duration::from_secs(3), || {
+            current_runtime_blueprint_plan().is_some_and(|plan| {
+                plan_has_view_named(&plan, "Before reset")
+                    && !plan_has_view_named(&plan, "Robot model")
+            })
+        }));
+        let reset = client.request(r#"{"id":34,"method":"set_blueprint"}"#);
+        assert_eq!(reset["ok"], true, "{reset}");
+        assert_eq!(reset["reset"], true);
+        assert!(wait_until(Duration::from_secs(3), || {
+            current_runtime_blueprint_plan()
+                .is_some_and(|plan| plan_has_view_named(&plan, "Robot model"))
+        }));
+        let reset_plan = current_runtime_blueprint_plan().unwrap();
+        assert!(!plan_has_view_named(&reset_plan, "Before reset"));
+        assert!(!plan_has_view_named(&reset_plan, "Keep operator layout"));
+        assert_eq!(
+            reset["views"].as_u64(),
+            Some(reset_plan.view_count() as u64)
+        );
+        // The reset's own auto model pane is grounded by the installed model, so
+        // the daemon reports no hint about it.
+        assert_eq!(
+            reset["warnings"],
+            serde_json::json!([]),
+            "the auto model pane must not warn about its own origin: {reset}"
+        );
+        for request in [
+            serde_json::json!({"id":8,"method":"detach","topic":topic}),
+            serde_json::json!({"id":9,"method":"attach","topic":"/vizd/alias","entity":"world/vizd/joints"}),
+            serde_json::json!({"id":10,"method":"attach","topic":topic,"entity":"world/other"}),
+        ] {
+            let response = client.request(&request.to_string());
+            assert_eq!(
+                response["ok"], false,
+                "model route must remain stable: {response}"
+            );
+        }
+        let after = client.request(r#"{"id":11,"method":"model_status"}"#);
+        assert_eq!(
+            after["model"]["operation_id"],
+            installed["model"]["operation_id"]
+        );
+        assert_eq!(after["model"]["phase"], "installed");
+        let attached = client.request(r#"{"id":12,"method":"list"}"#);
+        assert_eq!(
+            attached["attached"].as_array().unwrap().len(),
+            1,
+            "{attached}"
+        );
+        daemon.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+// ── A REMOTE attach reports the archetype its FRAMES classify as ────────────
+//
+// A remote attach seeds `status` from the pinned schema NAME, so a row has an
+// archetype before any frame arrives. The name table cannot see content: it maps
+// every `sensor_msgs/CompressedImage` to `Image`, while the sink draws one whose
+// `data` is an H.264 access unit as `VideoStream` (the shape a Go2 front camera
+// arrives in). So the first decodable frame must replace the name guess, and a
+// re-attach must not write the guess back over it. A re-attach that pins a
+// DIFFERENT schema is refused, and the tap keeps the schema and archetype it had.
+//
+// The demand plane is the RECORDING double: its demand succeeds without creating
+// a mirror, and the test's own publisher on the SAME manager is the local service
+// a netd mirror would have been. The recorded demand proves the first attach
+// took the remote arm, and that neither re-attach demanded a second mirror.
+#[test]
+fn a_remote_h264_compressed_image_attach_reports_the_video_stream_archetype_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport_with_network("camremote");
+    let topic = "/vizd/camremote";
+    let keyframe = h264_frame(&annex_b(&[GO2_SPS, GO2_PPS, GO2_IDR_HEAD]));
+    let _publisher = Publisher::spawn_fixed_frame(Arc::clone(&mgr), topic, keyframe);
+    let (worker, _flush, _storage) = memory_worker("camremote");
+    let (socket, dir) = temp_socket("camremote");
+    let plane = Arc::new(RecordingDemandPlane::default());
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::clone(&plane) as Arc<dyn cerulion_vizd::DemandPlane>,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+    let attach = |client: &mut Client, id: u64, schema: &str| -> Value {
+        client.request(&format!(
+            r#"{{"id":{id},"method":"attach","topic":"{topic}","robot":"go2","schema":"{schema}"}}"#
+        ))
+    };
+    let status_row = |client: &mut Client, id: u64| -> Option<Value> {
+        let st = client.request(&format!(r#"{{"id":{id},"method":"status"}}"#));
+        entry_for(&st["topics"], "topic", topic).cloned()
+    };
+
+    let att = attach(&mut client, 1, "sensor_msgs/CompressedImage");
+    assert_eq!(att["ok"].as_bool(), Some(true), "remote attach: {att}");
+    assert_eq!(att["robot"].as_str(), Some("go2"), "{att}");
+    assert_eq!(att["already_attached"].as_bool(), Some(false), "{att}");
+    assert_eq!(
+        att["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{att}"
+    );
+    // The reply's archetype is the name seed, taken under the same lock that
+    // creates the tap's stats, so no frame verdict can precede it.
+    assert_eq!(
+        att["archetype"].as_str(),
+        Some("Image"),
+        "the first attach reply names the schema name's archetype: {att}"
+    );
+
+    // THE pin: once a frame has been drained and decoded, `status` names what
+    // the sink draws. Waiting on `frames > 0` as well means the verdict is read
+    // off a row that has seen data, not only off the seed.
+    let mut id = 10;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            id += 1;
+            status_row(&mut client, id).is_some_and(|r| {
+                r["frames"].as_u64().unwrap_or(0) > 0
+                    && r["archetype"].as_str() == Some("VideoStream")
+            })
+        }),
+        "status must name the archetype the frames classify as: {:?}",
+        status_row(&mut client, 2)
+    );
+    let row = status_row(&mut client, 3).expect("status row");
+    assert_eq!(
+        row["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "the schema stays the pinned type: {row}"
+    );
+    let list = client.request(r#"{"id":4,"method":"list"}"#);
+    let listed = entry_for(&list["attached"], "topic", topic).expect("list row");
+    assert_eq!(
+        listed["archetype"].as_str(),
+        Some("VideoStream"),
+        "list reads the same verdict: {listed}"
+    );
+
+    // A RE-ATTACH of the streaming topic must not write the name guess back over
+    // the frame verdict. Nothing would replace it again: the poll thread stops
+    // classifying once a frame has resolved the topic.
+    let re = attach(&mut client, 5, "sensor_msgs/CompressedImage");
+    assert_eq!(re["ok"].as_bool(), Some(true), "re-attach: {re}");
+    assert_eq!(re["already_attached"].as_bool(), Some(true), "{re}");
+    assert_eq!(
+        re["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{re}"
+    );
+    assert_eq!(
+        re["archetype"].as_str(),
+        Some("VideoStream"),
+        "the re-attach reply names the frame verdict: {re}"
+    );
+    for id in 101..=110 {
+        let row = status_row(&mut client, id).expect("status row");
+        assert_eq!(
+            row["archetype"].as_str(),
+            Some("VideoStream"),
+            "a re-attach must not revert status to the name guess: {row}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A re-attach that pins a DIFFERENT schema is refused. Answering it would
+    // reply with the new name beside the kept frame verdict, while `status` and
+    // `list` keep the type the mirror was demanded at.
+    let changed = attach(&mut client, 6, "sensor_msgs/Image");
+    assert_eq!(
+        changed["ok"].as_bool(),
+        Some(false),
+        "changed pin: {changed}"
+    );
+    let err = changed["error"].as_str().expect("an error message");
+    for needle in [
+        topic,
+        "'sensor_msgs/CompressedImage'",
+        "'sensor_msgs/Image'",
+        "detach",
+    ] {
+        assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+    }
+    let row = status_row(&mut client, 7).expect("the tap survives the refusal");
+    assert_eq!(
+        row["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{row}"
+    );
+    assert_eq!(row["archetype"].as_str(), Some("VideoStream"), "{row}");
+    let list = client.request(r#"{"id":8,"method":"list"}"#);
+    let listed = entry_for(&list["attached"], "topic", topic).expect("list row");
+    assert_eq!(
+        listed["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["archetype"].as_str(),
+        Some("VideoStream"),
+        "{listed}"
+    );
+    // The refused attach left the tap's pin alone: the original pin still
+    // re-attaches cleanly.
+    let again = attach(&mut client, 9, "sensor_msgs/CompressedImage");
+    assert_eq!(again["ok"].as_bool(), Some(true), "{again}");
+    assert_eq!(again["archetype"].as_str(), Some("VideoStream"), "{again}");
+
+    assert_eq!(
+        *plane.demands.lock().unwrap(),
+        vec![(
+            "go2".to_string(),
+            topic.to_string(),
+            <CompressedImage as ShmMessage>::SCHEMA_HASH,
+        )],
+        "exactly one demand, for the pinned CompressedImage type"
+    );
+    assert!(
+        plane.releases.lock().unwrap().is_empty(),
+        "the refusal released nothing"
+    );
+
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }

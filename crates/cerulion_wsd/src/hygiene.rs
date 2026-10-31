@@ -12,7 +12,7 @@
 //! fails if either grows one.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use cerulion_hygiene::{pidfile_for, SocketGuard};
 
@@ -26,11 +26,19 @@ pub fn default_socket_path() -> PathBuf {
     cerulion_hygiene::WSD.default_socket_path()
 }
 
+/// Connect to the workspace daemon, using a std socket for Android's abstract
+/// namespace before converting it to a nonblocking Tokio stream.
+pub fn connect_control_socket(socket: &Path) -> io::Result<tokio::net::UnixStream> {
+    let stream = cerulion_hygiene::connect_control_socket(socket)?;
+    stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(stream)
+}
+
 /// Bind a private socket while holding the pidfile lock, as a tokio listener.
 /// See [`cerulion_hygiene::DaemonSocket::acquire_socket`] for the contract.
 pub fn acquire_socket(socket: PathBuf) -> io::Result<(tokio::net::UnixListener, SocketGuard)> {
     let (listener, guard) = cerulion_hygiene::WSD.acquire_socket(socket)?;
-    // A failure here drops `guard`, which unlinks the socket + pidfile.
+    // A failure here drops `guard`, which releases the socket + pidfile.
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     Ok((listener, guard))
@@ -46,13 +54,14 @@ mod tests {
     }
 
     /// The tokio conversion really binds through the shared crate and the
-    /// guard still owns the files.
+    /// guard still owns the pidfile.
     #[tokio::test]
     async fn acquire_through_the_wrapper_yields_a_tokio_listener_and_a_live_guard() {
         let dir = std::env::temp_dir().join(format!("cer_wsd_wrap_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let socket = dir.join("wsd.sock");
         let (listener, guard) = acquire_socket(socket.clone()).expect("acquire");
+        #[cfg(not(target_os = "android"))]
         assert_eq!(
             listener.local_addr().unwrap().as_pathname(),
             Some(socket.as_path())

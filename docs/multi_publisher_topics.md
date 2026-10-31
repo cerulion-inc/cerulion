@@ -141,8 +141,8 @@ below name where its guarantees stop.
 | ROS2 weakness | Cerulion answer |
 |---|---|
 | Nondeterministic cross-publisher order | **Within one process the scheduler preserves producer execution order**, so a single-process graph's accumulate-all sequence is reproducible. Writers split across processes have no cross-writer total order; a recording retains each frame's writer provenance, so replay reproduces what was recorded |
-| Silent queue overflow | **No silent drops**, Principle #6 (no data loss): an eviction is counted per publisher stream and surfaced through `backpressure_drop_oldest_count` and the `#[on_event]` handler, so the consumer is not left guessing why a key vanished. Every edge of that accounting errs toward under-reporting rather than fabricating a loss |
-| No replay fidelity | **Replay = Live** (Principle #7): a recorded `/diagnostics` or crash-event sequence re-executes from the recording instead of being re-published into a live transport, so the consumer sees the recorded order |
+| Silent queue overflow | **No silent drops** (no data loss): an eviction is counted per publisher stream and surfaced through `backpressure_drop_oldest_count` and the `#[on_event]` handler, so the consumer is not left guessing why a key vanished. Every edge of that accounting errs toward under-reporting rather than fabricating a loss |
+| No replay fidelity | **Replay = Live**: a recorded `/diagnostics` or crash-event sequence re-executes from the recording instead of being re-published into a live transport, so the consumer sees the recorded order |
 
 Replay is the practical consequence: the ordered sequence of
 `/diagnostics`, `/rosout` or crash and liveliness events that preceded a
@@ -162,9 +162,11 @@ Within one process the scheduler preserves producer execution order, so a
 single-process graph's accumulate-all sequence is reproducible. Writers split
 across processes have no cross-writer total order, and neither do two
 separately run graphs publishing to the same topic (two graphs both writing
-`/tf`): the multi-process lockstep contract
-([`docs/multi_process.md`](multi_process.md)) hands one clock to the process
-groups of ONE graph, and does not join two graphs. Cross-graph order is
+`/tf`): the multi-process coordination contract
+([`docs/multi_process.md`](multi_process.md)) covers the process
+groups of ONE graph (one handed clock under the
+`CERULION_EXECUTION_MODE=lockstep` opt-out, a per-rank wall-following clock
+each by default), and does not join two graphs. Cross-graph order is
 correct by count but not reproducible frame for frame.
 
 ## What is available today

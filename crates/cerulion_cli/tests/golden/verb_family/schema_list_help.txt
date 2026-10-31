@@ -1,0 +1,11 @@
+exit: Some(0)
+--- stdout
+List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
+
+Usage: cerulion schema list [OPTIONS]
+
+Options:
+  -v, --verbose  Enable verbose (debug-level) logging (`-v` or `--verbose`)
+  -h, --help     Print help
+
+--- stderr

@@ -173,6 +173,7 @@ fn spawn_fake_daemon(tag: &str, protocol: u32, script: Vec<Answer>) -> FakeDaemo
         let banner = Hello {
             hello: HELLO_MARKER.to_string(),
             protocol,
+            wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
         }
         .to_json_line();
         let _ = writeln!(w, "{banner}");
@@ -225,6 +226,7 @@ fn spawn_fake_daemon(tag: &str, protocol: u32, script: Vec<Answer>) -> FakeDaemo
 /// "the wait resolved" assertion compares against.
 fn catalog_reply() -> cerulion_core::CatalogReply {
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: "robot".to_string(),
         entries: Vec::new(),
@@ -841,6 +843,7 @@ fn a_mid_poll_transport_error_reports_how_long_the_wait_had_run() {
             Hello {
                 hello: HELLO_MARKER.to_string(),
                 protocol: PROTOCOL_VERSION,
+                wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
             }
             .to_json_line()
         );
@@ -933,6 +936,7 @@ fn the_wait_loop_does_not_reconnect_on_an_early_close() {
                 Hello {
                     hello: HELLO_MARKER.to_string(),
                     protocol: PROTOCOL_VERSION,
+                    wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
                 }
                 .to_json_line()
             );

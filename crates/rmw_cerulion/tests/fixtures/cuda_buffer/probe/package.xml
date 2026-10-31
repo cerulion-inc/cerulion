@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>cuda_buffer_s2_probe</name>
+  <version>0.0.0</version>
+  <description>Capture probes for the cuda_buffer_backend interop fixtures (test tooling, not shipped).</description>
+  <maintainer email="noreply@example.invalid">cerulion</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>cuda_buffer</depend>
+  <depend>cuda_buffer_backend_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>rosidl_buffer</depend>
+  <depend>rosidl_buffer_backend</depend>
+  <depend>rosidl_buffer_backend_registry</depend>
+  <depend>rosidl_typesupport_cpp</depend>
+  <depend>rosidl_typesupport_fastrtps_cpp</depend>
+  <depend>sensor_msgs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

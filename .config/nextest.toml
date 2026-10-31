@@ -86,7 +86,9 @@ default-namespace = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
-  binary(=adaptive_sizing_iceoryx2_test)
+  binary(=accumulate_set_iox2_test)
++ binary(=accumulate_zero_alloc_test)
++ binary(=adaptive_sizing_iceoryx2_test)
 + binary(=cli_e2e_graph_latency_test)
 + binary(=cross_thread_rtt_test)
 + binary(=deliver_history_failure_iox2_test)
@@ -97,6 +99,9 @@ filter = '''
 + binary(=graph_latency_test)
 + binary(=graph_test)
 + binary(=latency_threshold_test)
++ binary(=latest_value_input_has_no_listener_test)
++ binary(=listener_drain_count_test)
++ binary(=local_transport_test)
 + binary(=macro_cdylib_test)
 + binary(=macro_graph_test)
 + binary(=network_test)
@@ -111,6 +116,7 @@ filter = '''
 + binary(=step_zero_alloc_test)
 + binary(=trace_ring_hook_zero_alloc_test)
 + binary(=transport_test)
++ binary(=wire_header_parsed_once_test)
 + binary(=zero_alloc_test)
 + binary(=zero_copy_ci_test)
 + binary(=zero_copy_hot_path_test)
@@ -123,9 +129,10 @@ test-group = 'default-namespace'
 # joining a mutex group.
 #
 # FIVE are whole-file `#![cfg(not(debug_assertions))]` and so run only in the
-# release latency lanes. THREE are DEBUG-OK and therefore gate EVERY pull
+# release latency lanes. FOUR are DEBUG-OK and therefore gate EVERY pull
 # request - `cross_thread_rtt_test`, `flat_latency_test`,
-# `ingress_publish_raw_notify_iox2_test` - which makes them the members this
+# `gateway_egress_congestion_iox2_test`, `ingress_publish_raw_notify_iox2_test` -
+# which makes them the members this
 # fence matters most for, since a PR lane is where the machine is busiest.
 # (Checked per file, not inferred: grepping for the cfg anywhere in the file
 # misclassifies the first two, which mention it on individual items while the
@@ -137,6 +144,7 @@ filter = '''
   binary(=cli_e2e_graph_latency_test)
 + binary(=cross_thread_rtt_test)
 + binary(=flat_latency_test)
++ binary(=gateway_egress_congestion_iox2_test)
 + binary(=graph_latency_test)
 + binary(=ingress_publish_raw_notify_iox2_test)
 + binary(=latency_threshold_test)

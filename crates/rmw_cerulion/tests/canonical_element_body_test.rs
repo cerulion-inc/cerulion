@@ -139,11 +139,26 @@ struct CRosString {
     capacity: usize,
 }
 
+/// A MESSAGE sequence: the plain header on every era.
 #[repr(C)]
 struct CRosSeq {
     data: *mut c_void,
     size: usize,
     capacity: usize,
+}
+
+/// Primitive and string sequences carry the two Lyrical Buffer flags after
+/// the header (message sequences do not); the flags exist on the era the
+/// crate is built for, so this fixture is exactly the distro's struct.
+#[repr(C)]
+struct CPrimSeq {
+    data: *mut c_void,
+    size: usize,
+    capacity: usize,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    is_rosidl_buffer: bool,
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    owns_rosidl_buffer: bool,
 }
 
 #[repr(C)]
@@ -238,7 +253,7 @@ struct CPointCloud2 {
     is_bigendian: bool,
     point_step: u32,
     row_step: u32,
-    data: CRosSeq,
+    data: CPrimSeq,
     is_dense: bool,
 }
 
@@ -1234,10 +1249,14 @@ fn rmw_point_field_element_relocates_three_fixed_members_across_interior_padding
         is_bigendian: false,
         point_step: 16,
         row_step: 32,
-        data: CRosSeq {
+        data: CPrimSeq {
             data: cloud_data.as_mut_ptr() as *mut c_void,
             size: cloud_data.len(),
             capacity: cloud_data.len(),
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         is_dense: true,
     };
@@ -1318,10 +1337,14 @@ fn rmw_point_field_element_relocates_three_fixed_members_across_interior_padding
         is_bigendian: true,
         point_step: 0,
         row_step: 0,
-        data: CRosSeq {
+        data: CPrimSeq {
             data: std::ptr::null_mut(),
             size: 0,
             capacity: 0,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer: false,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            owns_rosidl_buffer: false,
         },
         is_dense: false,
     };

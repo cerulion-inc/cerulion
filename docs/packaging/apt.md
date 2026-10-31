@@ -1,11 +1,12 @@
 # Cerulion Debian and APT distribution
 
-The Debian package is named `cerulion` and installs the CLI, the two daemon
+The Debian package is named `cerulion` and installs the CLI, the three daemon
 binaries, the ROS 2 Jazzy rmw and the heap hook into `/usr/bin`:
 
 * `cerulion`
 * `cerulion-netd`
 * `cerulion-connectd`
+* `cerulion-remoted`
 * `librmw_cerulion.so`
 * `libcerulion_heaphook.so`
 
@@ -20,7 +21,7 @@ unbounded message field straight into a loan slot, and it is transparent to
 a node that never arms a borrow window. The package is assembled from the
 release archive, so the bytes in the package are the release bytes. The rmw
 library is built inside the `ros:jazzy` image against the real Jazzy headers
-(`tools/scripts/build_rmw_jazzy.sh`); the hook is plain Rust over libc and is
+(`tools/scripts/build_rmw.sh jazzy`); the hook is plain Rust over libc and is
 built on the release runner like the binaries. The release workflow installs
 each package in a clean Jazzy container and runs a talker and a listener
 through it, checks that stock rclpy loads the shipped rmw, then checks that
@@ -45,6 +46,15 @@ report that `ros2` is not on `PATH`. macOS packages carry neither the rmw
 nor the hook because ROS 2 Jazzy has no macOS binaries and the hook
 interposes glibc's allocator.
 
+The package carries the Jazzy rmw only. The rmw library records the distro it
+was built for and refuses a different `ROS_DISTRO`, so a ROS 2 Lyrical host
+uses the separate `cerulion-rmw-lyrical-<version>-<target>.tar.gz`
+release asset, built inside the `ros:lyrical` image
+(`tools/scripts/build_rmw.sh lyrical`) for x86_64 and arm64. It holds
+`librmw_cerulion.so`, `libcerulion_heaphook.so` and the license files; unpack it
+and set `CERULION_LIB_DIR` to the unpacked directory, and `cerulion ros2 run`
+and `cerulion ros2 launch` load that library instead of the one in `/usr/bin`. The Lyrical library is built and tested in CI but has not been run on a robot, and unlike the Debian package it is not installed in a clean container before release.
+
 ## License files
 
 Every release archive and the Debian package built from it carry four license
@@ -55,7 +65,7 @@ is under. `NOTICE` is the hand-written attribution for the components a reader
 is most likely to care about, including the vendored ROS 2 message packages.
 `LICENSE-BSD-3-CLAUSE` is the BSD text that seven of those message packages
 require. `THIRD-PARTY-LICENSES.md` is the exhaustive machine-generated
-inventory: every crate linked into the three binaries, grouped by license,
+inventory: every crate linked into the four binaries, grouped by license,
 with each license text reproduced once. It is produced by `cargo about` from
 the locked dependency graph under the policy in `tools/release/about.toml`, whose accepted license list mirrors the `[licenses]` allow list in
 `deny.toml` so the release cannot ship a license CI would refuse. In the
@@ -66,8 +76,7 @@ missing any of the four rather than producing a package without it.
 
 ## APT installation
 
-The production APT repository is served from
-`d2tdat71jcoj6e.cloudfront.net`.
+The production APT repository is served from `apt.cerulion.com`.
 
 Install the signing key and repository:
 
@@ -77,7 +86,7 @@ set -euo pipefail
 sudo install -d -m 0755 /usr/share/keyrings
 keyring_tmp=$(mktemp)
 trap 'rm -f "$keyring_tmp"' EXIT
-if ! curl -fsSL https://d2tdat71jcoj6e.cloudfront.net/cerulion-archive-keyring.gpg \
+if ! curl -fsSL https://apt.cerulion.com/cerulion-archive-keyring.gpg \
   -o "$keyring_tmp"; then
   printf '%s\n' 'error: could not download the Cerulion APT keyring' >&2
   exit 1
@@ -102,17 +111,21 @@ sudo install -m 0644 "$keyring_tmp" \
   /usr/share/keyrings/cerulion-archive-keyring.gpg
 rm -f "$keyring_tmp"
 trap - EXIT
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://d2tdat71jcoj6e.cloudfront.net stable main" \
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://apt.cerulion.com stable main" \
   | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null
 sudo apt-get update && sudo apt-get install cerulion
 )
 ```
 
+The install recipe in the README compares the downloaded keyring against the
+same expected set in the same `printf` form. Both lists change in one commit,
+so a reader of either page installs from the keyring the archive serves.
+
 When a key rotation starts, add the new primary fingerprint as another line
-in the `expected_fingerprints` `printf` list above before publishing the
-overlap keyring. Keep both fingerprints in the list throughout the overlap;
-remove the outgoing fingerprint again after the final new-key-only keyring is
-published.
+in the `expected_fingerprints` `printf` list above, and in the README recipe's
+`printf` list, before publishing the overlap keyring. Keep both fingerprints in
+both lists throughout the overlap; remove the outgoing fingerprint from both
+again after the final new-key-only keyring is published.
 
 This is an apt-native update path: `apt upgrade` brings in new Cerulion
 versions. A machine that installed a bare `.deb` does not receive updates from
@@ -394,8 +407,9 @@ Publish the transition in four stages:
    keyring. Direct A-to-B replacement is refused, so widen from A to A+B first.
    Keep the old fingerprint first in `APT_KEYRING_KEYS` during this stage.
    Before publishing the overlap, add the new fingerprint as a second line
-   in the `expected_fingerprints` list in this document's bootstrap snippet.
-   Keep both expected fingerprints through the overlap.
+   in the `expected_fingerprints` list in this document's bootstrap snippet
+   and in the README recipe's `printf` list. Keep both expected fingerprints
+   through the overlap.
 2. **Inventory only: no publication.** Before removing the old key, perform a mandatory inventory check: verify
    that every client, including clients with `APT::Install-Recommends "false"`,
    has installed the overlap `cerulion-archive-keyring` containing both
@@ -418,7 +432,8 @@ Publish the transition in four stages:
    for `dists/*` invalidation after publishing new-key-signed metadata, then
    publishes and invalidates the narrowed keyring. Remove the outgoing
    fingerprint from the `expected_fingerprints` list in this document's
-   bootstrap snippet after that final publish.
+   bootstrap snippet, and from the README recipe's `printf` list, after that
+   final publish.
 
 Dropping the old key from signing before clients have installed the two-key
 keyring breaks those clients: they cannot use APT to obtain the replacement

@@ -134,10 +134,12 @@ pub(crate) unsafe fn resolve_introspection(
                     data as *const ffi::rosidl_typesupport_introspection_c__MessageMembers,
                 ));
             }
-            // C++ bridge gate, bounded on BOTH edges (the
-            // Jazzy/Kilted hand-mirror exactly), with the
-            // bypass composite — see cpp_typesupport_gate. The C
-            // arm above stays fully functional on every era.
+            // C++ bridge gate: the hand-mirror is shaped per era by the
+            // same capability cfgs that name the era, so every era is
+            // admitted and the only refusing verdict left is a vendored
+            // build under a runtime the snapshot does not admit; see
+            // cpp_typesupport_gate. The C arm above stays fully functional
+            // on every era.
             if cpp_typesupport_gate().emit_refusal() {
                 return None;
             }
@@ -200,7 +202,8 @@ pub(crate) unsafe fn resolve_service_introspection(
                 ));
             }
             // Same gate as the message resolver: CppServiceMembers is
-            // hand-mirrored to the Jazzy/Kilted-era shape too.
+            // hand-mirrored per era too, its trailing `event_members_`
+            // under its own capability cfg.
             if cpp_typesupport_gate().emit_refusal() {
                 return None;
             }
@@ -210,6 +213,30 @@ pub(crate) unsafe fn resolve_service_introspection(
         }
     }
     None
+}
+
+/// Stamp the two message-info sequence numbers, where the rmw of this
+/// build carries them: `rmw_message_info_t` grew
+/// `publication_sequence_number` and `reception_sequence_number` at
+/// Humble, and an older distro's struct has neither field. The frame's
+/// own sequence rides the wire header on every era, so a pre-Humble
+/// build loses the rmw fields, never the datum; `reception_sequence_number`
+/// is the "unsupported" sentinel rmw documents, since a shared-memory
+/// take assigns no reception order of its own.
+///
+/// ONE cfg for all four take paths (serialized, copying, adopting and
+/// loaned), so they cannot drift apart per era.
+#[inline]
+pub(crate) fn stamp_sequence_numbers(info: &mut ffi::rmw_message_info_t, publication: u64) {
+    #[cfg(cerulion_has_message_info_sequence_numbers)]
+    {
+        info.publication_sequence_number = publication;
+        info.reception_sequence_number = u64::MAX;
+    }
+    #[cfg(not(cerulion_has_message_info_sequence_numbers))]
+    {
+        let _ = (info, publication);
+    }
 }
 
 unsafe fn resolve_service_for_identifier(
@@ -457,6 +484,7 @@ mod dispatch_tests {
             type_id_: ROS_TYPE_DOUBLE,
             string_upper_bound_: 0,
             members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
             is_key_: false,
             is_array_: false,
             array_size_: 0,
@@ -466,9 +494,13 @@ mod dispatch_tests {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
         }
     }
 
@@ -482,6 +514,7 @@ mod dispatch_tests {
             message_name_: ident("Vector3"),
             member_count_: 3,
             size_of_: 24,
+            #[cfg(cerulion_has_is_key)]
             has_any_key_member_: false,
             members_: members.as_ptr(),
             init_function: None,

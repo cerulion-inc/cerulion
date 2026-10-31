@@ -16,23 +16,30 @@ laser_scanner  --(sensor_msgs/LaserScan)-->  safety_controller  --(geometry_msgs
   (`x = 0.3`).
 
 The trigger is deliberate. The controller runs when a scan arrives, so every
-command it emits is computed from a new measurement, and that is what keeps
-this graph deterministic when
-`cerulion graph run` splits the two nodes into one process per node (the
-default): a `#[input(trigger)]` edge is a DAG edge, so the scanner
-levelizes strictly above the controller and the cross-process level-boundary
-barrier orders the publish before the read. Polling the same scan on a
-`period_ms` timer leaves the edge out of the DAG: both nodes share one level,
-which scan a tick pairs with becomes OS-scheduled, and the recording does not
-replay. (Co-locating both nodes in one `process_groups:` group, or running
-`--single-process`, also avoids that; see "Scope of the data guarantee" in
-`docs/multi_process.md`.)
+command it emits is computed from a new measurement rather than from whichever
+scan happened to be in the slot when a timer fired. A `#[input(trigger)]` edge
+is also a DAG edge, so the scanner levelizes strictly above the controller.
+Polling the same scan on a `period_ms` timer leaves the edge out of the DAG:
+both nodes share one level. Split across processes under the free-run default,
+nothing then orders that edge: which scan a tick pairs with is decided by OS
+scheduling, and two live runs of the graph can pair differently. The
+`CERULION_EXECUTION_MODE=lockstep` opt-out orders the live pairing instead. A
+`--record` bag re-executes under either mode: every cross-rank edge is served
+from the recorded frames, so a replay reproduces the pairing its run took
+rather than re-deriving it.
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-It depends on `cerulion_core` / `native_ros2_messages` via the relative paths in
-`Cargo.toml`, so run it from inside this directory. (In-repo examples use path
-deps; outside the repo, swap them for the published crates.io versions.)
+When `cerulion graph run` splits the two nodes into one process per node (the
+default partition), the two ranks FREE-RUN: no cross-process barrier is
+created, so the ranks are not stepped against each other, and each one is
+deterministic on its own recorded boundary stream rather than against the
+other's. The `CERULION_EXECUTION_MODE=lockstep` opt-out adds the shared
+level-boundary barrier, the mode that does order the publish before the read
+across a process split. Co-locating both nodes in one `process_groups:` group,
+or running `--single-process`, keeps the edge inside one rank instead. See
+"Scope of the data guarantee" in `docs/multi_process.md`.
+
+This example is a standalone workspace: run its commands from inside this
+directory. See [Build and run from inside the example](../README.md#build-and-run-from-inside-the-example).
 
 ## Run it
 
@@ -53,9 +60,9 @@ cerulion graph run obstacle_avoidance --release --record
 ```
 
 The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+minutes; later builds take seconds. The run derives one process per node
+without changing the graph file; see
+[The process layout on the first run](../README.md#the-process-layout-on-the-first-run).
 
 In a second terminal, watch the velocity command flow:
 
@@ -64,8 +71,21 @@ cerulion topic list
 cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
 ```
 
+Each message prints as one YAML document (the `seq` and `ts` numbers in
+the first comment change with every frame):
+
+```
+# seq=<n> ts=<ns>ns schema=0xd43ee5592039b9df size=56
+# geometry_msgs/Vector3
+x: 0.3
+y: 0.0
+z: 0.0
+---
+```
+
 The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses
-the distance threshold.
+the distance threshold. The lines between the comments and `---` are the
+message in full, as YAML.
 
 ## Verify the recording
 

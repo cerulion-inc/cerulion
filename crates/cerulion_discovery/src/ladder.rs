@@ -70,6 +70,39 @@ impl std::fmt::Display for DiscoveryRung {
     }
 }
 
+/// Drop the peers that are this machine's own gateway processes: `robot` equal
+/// to `own` (this machine's identity) AND a locator address on this host
+/// (loopback, or an address a UDP socket can bind). Keeps order. A peer with the
+/// same identity on another host is kept.
+pub fn drop_this_hosts_gateways(peers: Vec<DiscoveredPeer>, own: &str) -> Vec<DiscoveredPeer> {
+    drop_this_hosts_gateways_with(peers, own, ip_is_on_this_host)
+}
+
+/// [`drop_this_hosts_gateways`] with the "is this address on this host" check
+/// injected. Pure.
+pub fn drop_this_hosts_gateways_with(
+    peers: Vec<DiscoveredPeer>,
+    own: &str,
+    is_local: impl Fn(IpAddr) -> bool,
+) -> Vec<DiscoveredPeer> {
+    peers
+        .into_iter()
+        .filter(|p| !(p.robot == own && locator_ip(&p.locator).is_some_and(&is_local)))
+        .collect()
+}
+
+/// The IP of a `tcp/<ip>:<port>` or `tcp/[<ip>]:<port>` locator; `None` for any
+/// other shape (a host name included).
+fn locator_ip(locator: &str) -> Option<IpAddr> {
+    let rest = locator.strip_prefix("tcp/")?;
+    rest.parse::<SocketAddr>().ok().map(|a| a.ip())
+}
+
+/// Whether `ip` is loopback or assigned to this host (a UDP socket can bind it).
+fn ip_is_on_this_host(ip: IpAddr) -> bool {
+    ip.is_loopback() || std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
 /// Deduplicate peers by their locator's normalized address key, keeping the
 /// FIRST occurrence (so an earlier rung in the merge order wins the tie).
 ///
@@ -342,6 +375,41 @@ pub fn plan_connect_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_this_hosts_gateways_needs_both_the_identity_and_a_local_address() {
+        let p = |r: &str, l: &str| DiscoveredPeer {
+            robot: r.to_string(),
+            locator: l.to_string(),
+            rung: DiscoveryRung::Mdns,
+        };
+        let local = |ip: IpAddr| ip.is_loopback() || ip == IpAddr::from([10, 0, 0, 2]);
+        let peers = vec![
+            p("desk", "tcp/127.0.0.1:7684"),
+            p("go2", "tcp/10.0.0.5:7683"),
+            p("desk", "tcp/10.0.0.2:7684"),
+            // Same identity on ANOTHER host (a shared default hostname): kept.
+            p("desk", "tcp/10.0.0.9:7683"),
+            // Not an IP locator: kept.
+            p("desk", "tcp/desk.local:7683"),
+        ];
+        assert_eq!(
+            drop_this_hosts_gateways_with(peers.clone(), "desk", local),
+            vec![
+                p("go2", "tcp/10.0.0.5:7683"),
+                p("desk", "tcp/10.0.0.9:7683"),
+                p("desk", "tcp/desk.local:7683"),
+            ]
+        );
+        assert_eq!(
+            drop_this_hosts_gateways_with(peers.clone(), "other", local),
+            peers
+        );
+        // The production check treats loopback as local and a TEST-NET address
+        // as not.
+        assert!(ip_is_on_this_host(IpAddr::from([127, 0, 0, 1])));
+        assert!(!ip_is_on_this_host(IpAddr::from([192, 0, 2, 77])));
+    }
 
     /// Build a `DiscoveredPeer` tersely for the plan oracles.
     fn peer(robot: &str, locator: &str, rung: DiscoveryRung) -> DiscoveredPeer {

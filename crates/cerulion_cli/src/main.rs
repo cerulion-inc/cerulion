@@ -3,6 +3,10 @@
 
 mod cli;
 mod completion;
+mod families;
+mod install_marker;
+mod telemetry;
+mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries
 // which completer, the path hints, the create arms completing nothing). A
 // binary-crate unit test because `cerulion_cli` has no library target, so an
@@ -26,17 +30,20 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{CommandFactory, Parser};
+use clap::FromArgMatches;
 
 use cerulion_cli_engine::error::CliResult;
+use cerulion_cli_engine::ipc_cleanup::SweepMode;
+use cerulion_cli_engine::node_cmd::resolve_create_policy;
+use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
     account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
     schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
-    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, Ros2Action,
-    SchemaAction, TopicAction, TraceAction, WorkspaceAction,
+    AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
+    Ros2Action, TopicAction, TraceAction, WorkspaceAction,
 };
 
 /// The migration error for the REMOVED `cerulion ros` family (`ros attach`
@@ -58,10 +65,11 @@ fn main() -> ExitCode {
     // garbage in the user's shell — and because a completion should pay none
     // of the startup below (logging, the iceoryx2 log bridge, the login gate).
     //
-    // The factory it takes is the SAME `Cli::command` this binary parses with,
+    // The factory it takes is the SAME `families::cli_command` this binary
+    // parses with (the `Commands` verbs plus every registered verb family),
     // which is what makes every subcommand, flag and enum value complete for
     // free and keeps completions from drifting out of sync with the CLI.
-    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+    clap_complete::CompleteEnv::with_factory(families::cli_command).complete();
 
     // Quiet iceoryx2's own logger by default. It writes a `[W] Notifier { ... }`
     // pretty-print of internal state on every notify path, which dwarfs our
@@ -83,15 +91,101 @@ fn main() -> ExitCode {
     // VERBATIM pass-through of the native verb — everything after the verb
     // token is forwarded to `ros2 <verb>` untouched, hyphenated tokens
     // included. clap would claim a leading `--prefix` / `-s` as its own
-    // flag, so the dispatch happens HERE, on the raw argv, before
-    // `Cli::parse()`. `cerulion ros2` bare / `--help` / an unknown action
+    // flag, so the dispatch happens HERE, on the raw argv, before the clap
+    // parse (`Cli::command().get_matches()`). `cerulion ros2` bare /
+    // `--help` / an unknown action
     // still fall through to clap (family help + its usage error).
     #[cfg(unix)]
     if let Some(code) = ros2_passthrough_intercept() {
         return code;
     }
 
-    let cli = Cli::parse();
+    let matches = families::cli_command().get_matches();
+    // The internal workers `cerulion-netd` starts on a robot (first-serve
+    // registration, the revocation sync): dispatched before telemetry,
+    // logging and the login gate, so they never start a browser login, record
+    // no event, and their JSON stdout carries nothing else. The engine
+    // requires an existing login.
+    #[cfg(unix)]
+    if matches!(
+        matches.subcommand_name(),
+        Some("bootstrap-robot" | "robot-sync-epoch")
+    ) {
+        let worker = match Cli::from_arg_matches(&matches)
+            .unwrap_or_else(|e| e.exit())
+            .command
+        {
+            Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
+            Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
+            _ => unreachable!("the subcommand name selected an internal worker"),
+        };
+        return match worker {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // One `cli_command_run` per invocation, recorded around the whole
+    // dispatch so every intercept below is covered. `None` (nothing is
+    // recorded or sent) without a key, without consent, for the internal
+    // subprocess verbs, and on the run that prints the first-run notice.
+    let command_run = telemetry::CommandRun::start(&matches);
+    // A registered verb family owns its own dispatch, after the same logging
+    // setup, iceoryx2 bridge and login gate a `Commands` verb gets in
+    // [`dispatch`]; every other verb is a `Commands` variant and takes the
+    // generic path.
+    let verbose = matches.get_flag("verbose");
+    let family_code = families::route(
+        families::FAMILIES,
+        &matches,
+        |class| {
+            init_logging(verbose, class.is_quiet_default());
+            let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
+        },
+        login_gate,
+    );
+    let code = match family_code {
+        Some(code) => code,
+        None => dispatch(Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())),
+    };
+    if let Some(command_run) = command_run {
+        command_run.finish(code);
+    }
+    code
+}
+
+/// The first-need runtime login gate (see [`dispatch`] for the rules).
+/// `Some(exit code)` when the gate refused and the command must not run.
+fn login_gate() -> Option<ExitCode> {
+    // The id is asked for, and claimed, only if the gate runs a login.
+    let gate =
+        login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
+    if let Ok(Some(outcome)) = &gate {
+        telemetry::login_completed(outcome);
+    }
+    match gate {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            // Exit 7 (not the generic FAILURE=1): the login gate is a
+            // "command did not run" refusal, and 1 collides with `bag play
+            // --resim --verify`'s EXIT_VIOLATION. A distinct code lets a CI caller tell
+            // auth-refusal apart from a data violation. The constant lives in
+            // `login_cmd` (the platform-independent login gate), NOT the
+            // `#[cfg(unix)]` `replay_cmd`, so this reference compiles on every
+            // target; the full exit-code registry is documented in `replay_cmd`.
+            Some(ExitCode::from(
+                cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED,
+            ))
+        }
+    }
+}
+
+/// Everything `main` does after parsing a `Commands` verb: the intercepts, the
+/// login gate and the generic [`run`] dispatch.
+fn dispatch(cli: Cli) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
     // its own logging default (the old standalone binary's exact behavior; its
@@ -169,7 +263,7 @@ fn main() -> ExitCode {
     // here, ABOVE the login gate, for the same reason the removed `replay` verb
     // is — you do not have to prove who you are to be told your command line is
     // wrong. `bag play` is identity-gated (`command_needs_identity` exempts only
-    // `login`, `completions` and the two internal `graph run-worker` /
+    // `login`, `completions`, `clean` and the two internal `graph run-worker` /
     // `run-gateway` subprocess verbs), and on a never-signed-in machine
     // `ensure_login_gate` runs the DEVICE-CODE FLOW inline, so `cerulion bag
     // play b.mcap --verify` would open a browser prompt and exit 7 (auth)
@@ -206,17 +300,21 @@ fn main() -> ExitCode {
         }
     }
 
+    // The Android viz refusal is hoisted ABOVE the identity gate for the same
+    // reason the resim one is: an unsupported platform must never answer with
+    // a sign-in prompt. `unsupported_viz_message` is a pure platform check, so
+    // the hoist refuses nothing it did not refuse before. It exits 1
+    // (FAILURE), the same code `run_viz` gives this refusal as a `Validation`
+    // error through the generic dispatch: the command line is well-formed, so
+    // it is not a usage error (2), and the hoist must not change the code.
+    if let Some(refusal) = viz_refusal(&cli.command, cfg!(target_os = "android")) {
+        eprintln!("Error: {refusal}");
+        return ExitCode::FAILURE;
+    }
+
     if command_needs_identity(&cli.command) {
-        if let Err(e) = login_cmd::ensure_login_gate(&mut std::io::stderr()) {
-            eprintln!("Error: {e}");
-            // Exit 7 (not the generic FAILURE=1): the login gate is a
-            // "command did not run" refusal, and 1 collides with `bag play
-            // --resim --verify`'s EXIT_VIOLATION. A distinct code lets a CI caller tell
-            // auth-refusal apart from a data violation. The constant lives in
-            // `login_cmd` (the platform-independent login gate), NOT the
-            // `#[cfg(unix)]` `replay_cmd`, so this reference compiles on every
-            // target; the full exit-code registry is documented in `replay_cmd`.
-            return ExitCode::from(cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED);
+        if let Some(refused) = login_gate() {
+            return refused;
         }
     }
 
@@ -227,7 +325,13 @@ fn main() -> ExitCode {
     // playback and falls through to run() untouched.
     if let Commands::Bag { action } = &cli.command {
         if is_resim_family(action) {
-            return resim_exit_code(cli.command);
+            let started = std::time::Instant::now();
+            let code = resim_exit_code(cli.command);
+            telemetry::emit(
+                telemetry_events::RESIM_COMPLETED,
+                telemetry_events::resim_completed(started.elapsed(), code),
+            );
+            return ExitCode::from(code);
         }
     }
 
@@ -239,6 +343,18 @@ fn main() -> ExitCode {
         return connect_exit_code(cli.command);
     }
 
+    // `cerulion graph pause|resume` address a LIVE RUN, not a workspace, so they
+    // run from anywhere (the generic `Graph` arm discovers a workspace first), and
+    // they own the exit-code contract the generic dispatch cannot express (4 = no
+    // such live run).
+    if let Commands::Graph { action } = &cli.command {
+        match action {
+            GraphAction::Pause { run_id } => return run_control_exit_code(run_id, true),
+            GraphAction::Resume { run_id } => return run_control_exit_code(run_id, false),
+            _ => {}
+        }
+    }
+
     // `cerulion pair` SPAWNS `cerulion-connectd pair` (it links iroh; the
     // `cerulion` CLI stays iroh-free) and forwards its 0–4 pairing exit code — the
     // generic run() dispatch (SUCCESS/FAILURE only) cannot express that, so
@@ -248,8 +364,8 @@ fn main() -> ExitCode {
     }
 
     // Belt-and-braces for `cerulion ros2` invocations that reached clap
-    // anyway (the raw-argv intercept above `Cli::parse()` handles every
-    // direct spelling): forward the parsed action through the same exec
+    // anyway (the raw-argv intercept that runs before the clap parse handles
+    // every direct spelling): forward the parsed action through the same exec
     // dispatch. run/launch deliberately install NO ctrlc handler: after
     // exec() the real ros2 owns the process group and SIGINT. `migrate
     // --write` is the exception (interrupt safety): it arms the
@@ -285,13 +401,52 @@ fn main() -> ExitCode {
         };
     }
 
-    match run(cli) {
+    families::exit_code_of(run(cli))
+}
+
+/// The process exit status for an error a verb returned, built-in or family:
+/// `EXIT_NODE_FATAL` (3) for a run that stopped a node on a fatal error, in
+/// process or in a worker group, and 1 for every other error.
+fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
+    use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
+    match err {
+        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        _ => 1,
+    }
+}
+
+/// `cerulion graph pause|resume <RUN_ID>`: flip the run's pause page and report.
+///
+/// Exit 0 on success (including a run already in the requested state), 4 when no
+/// live run matches, 1 for everything else: an ambiguous name, a run with no pause
+/// page, an unreadable registry. The message goes to stderr; the one-line result of
+/// a success goes to stdout.
+#[cfg(unix)]
+fn run_control_exit_code(run_id: &str, pause: bool) -> ExitCode {
+    use cerulion_cli_engine::run_control::{run_control_verb, RunControlOp};
+    let op = if pause {
+        RunControlOp::Pause
+    } else {
+        RunControlOp::Resume
+    };
+    match run_control_verb(run_id, op, &mut std::io::stdout(), &mut std::io::stderr()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", e);
-            ExitCode::FAILURE
+            eprintln!("Error: {e}");
+            ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// Non-Unix: runs have no pause page there, so the verb says so.
+#[cfg(not(unix))]
+fn run_control_exit_code(_run_id: &str, pause: bool) -> ExitCode {
+    eprintln!(
+        "Error: `cerulion graph {}` is only supported on Unix platforms (a run's pause \
+         control is POSIX shared memory)",
+        if pause { "pause" } else { "resume" }
+    );
+    ExitCode::FAILURE
 }
 
 /// The usage refusal for a `bag play` resim-family invocation, or
@@ -342,6 +497,8 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report,
         tolerance,
         strict_state,
+        allow_param_change,
+        record_out,
         ..
     } = action
     else {
@@ -359,6 +516,8 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report: report.clone(),
         tolerance: tolerance.clone(),
         strict_state: *strict_state,
+        allow_param_change: *allow_param_change,
+        record_out: record_out.clone(),
     })
 }
 
@@ -390,6 +549,8 @@ fn is_resim_family(action: &BagAction) -> bool {
             report,
             tolerance,
             strict_state,
+            allow_param_change,
+            record_out,
             ..
         } => {
             // The two BOTH-HALVES flags are deliberately ABSENT
@@ -415,7 +576,13 @@ fn is_resim_family(action: &BagAction) -> bool {
             // them without `--resim` at the pre-auth gate above, so they are
             // belt-and-braces rather than the live route, and listing them
             // keeps this predicate's answer independent of that gate's scope.
-            resim.is_some() || *verify || report.is_some() || tolerance.is_some() || *strict_state
+            resim.is_some()
+                || *verify
+                || report.is_some()
+                || tolerance.is_some()
+                || *strict_state
+                || *allow_param_change
+                || record_out.is_some()
         }
         // `bag migrate` REWRITES a bag rather than executing one — no
         // resim flags exist on it, so it can never be a resim-surface misuse.
@@ -442,7 +609,7 @@ fn is_resim_family(action: &BagAction) -> bool {
 /// loud refusal and never
 /// reaches the engine.
 #[cfg(unix)]
-fn resim_exit_code(command: Commands) -> ExitCode {
+fn resim_exit_code(command: Commands) -> u8 {
     let Commands::Bag { action } = &command else {
         unreachable!("`resim_exit_code` is reached only for a `bag play` resim-family invocation")
     };
@@ -453,7 +620,7 @@ fn resim_exit_code(command: Commands) -> ExitCode {
     // ONE mapping, shared with the pre-auth `resim_usage_refusal` above — so
     // the flags the usage check validates are, by construction, the flags the
     // run receives. Two hand-written destructures could disagree.
-    ExitCode::from(cerulion_cli_engine::resim_cmd::run_play_resim(bag, flags))
+    cerulion_cli_engine::resim_cmd::run_play_resim(bag, flags)
 }
 
 /// Dispatch `cerulion bag <play|info|record>`.
@@ -489,6 +656,8 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             report,
             tolerance,
             strict_state,
+            allow_param_change,
+            record_out,
         } => {
             // A `--resim` invocation never reaches here — `main`
             // intercepts it for the 0–6 exit contract. What DOES reach here is
@@ -506,6 +675,8 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     report,
                     tolerance,
                     strict_state,
+                    allow_param_change,
+                    record_out,
                 },
             )
             .map_err(cerulion_cli_engine::error::CliError::Validation)?;
@@ -519,7 +690,13 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             else {
                 unreachable!("`bag play --resim` is dispatched in main() before run()")
             };
-            let running = setup_ctrlc_handler()?;
+            let started = std::time::Instant::now();
+            let running = setup_ctrlc_handler().inspect_err(|_| {
+                telemetry::emit(
+                    telemetry_events::BAG_REPLAY_COMPLETED,
+                    telemetry_events::bag_replay_completed(started.elapsed(), false),
+                );
+            })?;
             let mut out = std::io::stdout();
             let summary = bag_cmd::bag_play(
                 &bag,
@@ -533,7 +710,12 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                 },
                 running,
                 &mut out,
-            )?;
+            );
+            telemetry::emit(
+                telemetry_events::BAG_REPLAY_COMPLETED,
+                telemetry_events::bag_replay_completed(started.elapsed(), summary.is_ok()),
+            );
+            let summary = summary?;
             print!("{}", bag_cmd::render_play_summary(&summary));
             out.flush()?;
             Ok(())
@@ -548,7 +730,13 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             schema_wait_ms,
             run,
         } => {
-            let running = setup_ctrlc_handler()?;
+            let started = std::time::Instant::now();
+            let running = setup_ctrlc_handler().inspect_err(|_| {
+                telemetry::emit(
+                    telemetry_events::BAG_RECORD_FAILED,
+                    telemetry_events::bag_record_failed(started.elapsed()),
+                );
+            })?;
             let mut out = std::io::stdout();
             let summary = bag_cmd::bag_record(
                 bag_cmd::RecordOptions {
@@ -584,7 +772,27 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                 },
                 running,
                 &mut out,
-            )?;
+            );
+            match &summary {
+                Ok(summary) => telemetry::emit(
+                    telemetry_events::BAG_RECORD_COMPLETED,
+                    telemetry_events::bag_record_completed(
+                        started.elapsed(),
+                        summary
+                            .bag_paths
+                            .iter()
+                            .filter_map(|path| std::fs::metadata(path).ok())
+                            .map(|meta| meta.len())
+                            .sum(),
+                        summary.per_topic.len(),
+                    ),
+                ),
+                Err(_) => telemetry::emit(
+                    telemetry_events::BAG_RECORD_FAILED,
+                    telemetry_events::bag_record_failed(started.elapsed()),
+                ),
+            }
+            let summary = summary?;
             print!("{}", bag_cmd::render_record_summary(&summary));
             out.flush()?;
             Ok(())
@@ -656,12 +864,12 @@ fn run_bag(_action: BagAction) -> CliResult<()> {
 /// Non-Unix stub: `cerulion bag play --resim` is unavailable (the bag reader is
 /// `#![cfg(unix)]`). Mirrors the `cerulion bagd` platform stub.
 #[cfg(not(unix))]
-fn resim_exit_code(_command: Commands) -> ExitCode {
+fn resim_exit_code(_command: Commands) -> u8 {
     eprintln!(
         "Error: `cerulion bag play --resim` is only supported on Unix platforms (the bag reader \
          depends on Unix-only POSIX trace-ring types)"
     );
-    ExitCode::FAILURE
+    1
 }
 
 /// Resolve + spawn `cerulion-connectd`, streaming its stdio and
@@ -701,10 +909,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         relay_disabled,
         network,
     };
+    let started = std::time::Instant::now();
     let plan = match connect_cmd::plan(&args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::CONNECT_SESSION_COMPLETED,
+                telemetry_events::connect_session_completed(started.elapsed(), 1),
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -722,7 +935,15 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion connect: spawning cerulion-connectd");
-    match connect_cmd::spawn_and_wait(&plan, running) {
+    let result = connect_cmd::spawn_and_wait(&plan, running);
+    telemetry::emit(
+        telemetry_events::CONNECT_SESSION_COMPLETED,
+        telemetry_events::connect_session_completed(
+            started.elapsed(),
+            result.as_ref().map_or(1, |code| i64::from(*code)),
+        ),
+    );
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -766,6 +987,10 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
+            telemetry::emit(
+                telemetry_events::PAIR_COMPLETED,
+                telemetry_events::pair_completed(false),
+            );
             // A resolution / config failure is exit 1 (usage), matching the
             // `cerulion-connectd pair` contract.
             return ExitCode::from(1u8);
@@ -780,7 +1005,12 @@ fn pair_exit_code(command: Commands) -> ExitCode {
         }
     };
     tracing::info!(bin = %plan.bin.display(), "cerulion pair: spawning cerulion-connectd pair");
-    match pair_cmd::spawn_and_pair(&plan, running) {
+    let result = pair_cmd::spawn_and_pair(&plan, running);
+    telemetry::emit(
+        telemetry_events::PAIR_COMPLETED,
+        telemetry_events::pair_completed(matches!(result, Ok(0))),
+    );
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -843,6 +1073,9 @@ fn ros2_exit_code(
             return ExitCode::from(ros2_cmd::classify(&e));
         }
     };
+    if let Some(notice) = ros2_cmd::delivery_notice(&plan) {
+        eprintln!("{notice}");
+    }
     // exec() returns ONLY on failure — on success this process IS ros2 now.
     let err = ros2_cmd::exec_ros2(&plan);
     let code = ros2_cmd::classify(&err);
@@ -959,13 +1192,41 @@ fn ros2_migrate_exit_code(workspace: PathBuf, write: bool, yes: bool) -> ExitCod
     }
 }
 
+#[cfg(unix)]
+fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
+    cerulion_cli_engine::robot_bootstrap::run(state_root, &mut std::io::stdout().lock())
+}
+
+#[cfg(unix)]
+fn robot_sync_epoch(state_root: &std::path::Path) -> CliResult<()> {
+    cerulion_cli_engine::robot_bootstrap::sync_epoch(state_root, &mut std::io::stdout().lock())
+}
+
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
+        #[cfg(unix)]
+        Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
+        #[cfg(unix)]
+        Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name } => {
+            WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;
-                let ws = workspace::workspace_create(&cwd, &name)?;
+                let starter: Option<cerulion_cli_engine::starter::Starter> =
+                    starter.map(Into::into);
+                let ws = if let Some(starter) = starter {
+                    cerulion_cli_engine::starter::workspace_create_with_starter(
+                        &cwd, &name, starter,
+                    )?
+                } else {
+                    workspace::workspace_create(&cwd, &name)?
+                };
                 println!("Created workspace at {}", ws.root.display());
+                if let Some(starter) = starter {
+                    println!(
+                        "  starter: {} (bundled with this CLI); see README.md",
+                        starter.name()
+                    );
+                }
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }
@@ -988,12 +1249,19 @@ fn run(cli: Cli) -> CliResult<()> {
             match action {
                 NodeAction::Create {
                     node_type,
+                    lang,
                     output,
                     input,
                     trigger_input,
                     policy,
                     raw_ffi,
                 } => {
+                    if raw_ffi && matches!(lang, NodeLanguage::Python) {
+                        return Err(cerulion_cli_engine::error::CliError::Validation(
+                            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+                                .to_string(),
+                        ));
+                    }
                     // Reject multi-invocation BEFORE any
                     // `parse_port_args` call. With `num_args = 2`
                     // on each flag, a valid single invocation
@@ -1012,14 +1280,15 @@ fn run(cli: Cli) -> CliResult<()> {
                                 .to_string(),
                         ));
                     }
-                    if input.len() > 2 {
+                    let python = matches!(lang, NodeLanguage::Python);
+                    if input.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-i` per `node create` (use `node modify` to add \
                              more inputs after creation)"
                                 .to_string(),
                         ));
                     }
-                    if output.len() > 2 {
+                    if output.len() > 2 && !python {
                         return Err(cerulion_cli_engine::error::CliError::Validation(
                             "at most one `-o` per `node create` (use `node modify` to add \
                              more outputs after creation)"
@@ -1032,23 +1301,21 @@ fn run(cli: Cli) -> CliResult<()> {
                     // ambiguous/unknown names error before anything
                     // is created. The engine re-resolves as the
                     // enforcement backstop (idempotent, free).
-                    let outputs: Vec<(String, String)> = if output.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&output);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                    let resolve_ports = |args: &[String]| {
+                        args.chunks(2)
+                            .map(|pair| {
+                                let (schema, name) = parse_port_args(pair);
+                                Ok((resolve_and_report(&ws.schemas_dir, &schema, !python)?, name))
+                            })
+                            .collect::<Result<Vec<(String, String)>, cerulion_cli_engine::error::CliError>>()
                     };
-                    let regular_inputs: Vec<(String, String)> = if input.is_empty() {
-                        vec![]
-                    } else {
-                        let (schema, name) = parse_port_args(&input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
-                    };
+                    let outputs = resolve_ports(&output)?;
+                    let regular_inputs = resolve_ports(&input)?;
                     let trigger_inputs: Vec<(String, String)> = if trigger_input.is_empty() {
                         vec![]
                     } else {
                         let (schema, name) = parse_port_args(&trigger_input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                        vec![(resolve_and_report(&ws.schemas_dir, &schema, !python)?, name)]
                     };
                     let explicit_policy = match policy.as_deref() {
                         Some(spec) => Some(parse_policy_spec(spec)?),
@@ -1085,6 +1352,10 @@ fn run(cli: Cli) -> CliResult<()> {
                         inputs: combined_inputs,
                         trigger: trigger_name,
                         raw_ffi,
+                        language: match lang {
+                            NodeLanguage::Rust => node_cmd::NodeLanguage::Rust,
+                            NodeLanguage::Python => node_cmd::NodeLanguage::Python,
+                        },
                     };
                     node_cmd::node_create_with_options(
                         &ws.nodes_dir,
@@ -1145,13 +1416,13 @@ fn run(cli: Cli) -> CliResult<()> {
                         vec![]
                     } else {
                         let (schema, name) = parse_port_args(&input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                        vec![(resolve_and_report(&ws.schemas_dir, &schema, true)?, name)]
                     };
                     let trigger_inputs: Vec<(String, String)> = if trigger_input.is_empty() {
                         vec![]
                     } else {
                         let (schema, name) = parse_port_args(&trigger_input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                        vec![(resolve_and_report(&ws.schemas_dir, &schema, true)?, name)]
                     };
                     let explicit_policy = match policy.as_deref() {
                         Some(spec) => Some(parse_policy_spec(spec)?),
@@ -1219,7 +1490,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     if !output.is_empty() {
                         let (schema, name) = parse_port_args(&output);
                         // Same resolve-and-report as the input arms.
-                        let schema = resolve_and_report(&ws.schemas_dir, &schema)?;
+                        let schema = resolve_and_report(&ws.schemas_dir, &schema, true)?;
                         node_cmd::node_modify_add_port(
                             &ws.nodes_dir,
                             &node_type,
@@ -1338,13 +1609,23 @@ fn run(cli: Cli) -> CliResult<()> {
                     // Cargo's output is captured, so the progress line is the
                     // only thing on screen while it runs. It goes to stderr
                     // with the notice: stdout carries the result alone.
-                    let _outcome = node_cmd::node_build_with_progress(
+                    let started = std::time::Instant::now();
+                    let outcome = node_cmd::node_build_with_progress(
                         &ws.root,
                         &node_type,
                         release,
                         &mut |notice| eprint!("{notice}"),
                         &mut |line| eprintln!("{line}"),
-                    )?;
+                    );
+                    telemetry::emit(
+                        telemetry_events::NODE_BUILD_COMPLETED,
+                        telemetry_events::node_build_completed(
+                            started.elapsed(),
+                            outcome.is_ok(),
+                            release,
+                        ),
+                    );
+                    let _outcome = outcome?;
                     println!("Built '{}'", node_type);
                     Ok(())
                 }
@@ -1377,70 +1658,91 @@ fn run(cli: Cli) -> CliResult<()> {
                     no_cpu_dma_lock,
                     no_monitor_wait,
                     network,
+                    local,
                 } => {
-                    let running = setup_ctrlc_handler()?;
-                    let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
-                    let metadata = node_cmd::node_info(&ws.nodes_dir, &node_type)?;
-
-                    let outputs: Vec<(String, Option<String>)> = metadata
-                        .outputs
-                        .iter()
-                        .map(|p| (p.name.clone(), p.schema.clone()))
-                        .collect();
-
-                    let node_def =
-                        graph_cmd::build_node_def(&node_type, id.as_deref(), &outputs, &[]);
-
-                    // Create temporary graph
-                    let temp_graph = format!("__temp_{}", node_type);
-                    graph_cmd::graph_create(&ws.graphs_dir, &temp_graph, Some(&prefix))?;
-                    graph_cmd::node_stage(&ws.graphs_dir, &temp_graph, node_def)?;
-
-                    let result = graph_cmd::graph_run(
-                        &ws.root,
-                        &ws.graphs_dir,
-                        &temp_graph,
-                        running,
-                        graph_cmd::TimeSource::Real, // live RealClock default (matches `graph run`)
-                        if no_cpu_dma_lock {
-                            graph_cmd::CpuDmaLockMode::Disabled
-                        } else {
-                            graph_cmd::CpuDmaLockMode::Auto
-                        },
-                        if no_monitor_wait {
-                            graph_cmd::MonitorWaitMode::Disabled
-                        } else {
-                            graph_cmd::MonitorWaitMode::Auto
-                        },
-                        true,    // skip validation for temporary single-node graphs
-                        release, // honour `node run --release`, mirroring `graph run`
-                        // `node run`'s temp graph is always a
-                        // single-node monolith — no peer-loss flag, no forced
-                        // single-process, default trace cap.
-                        None,
-                        false,
-                        // `node run` rides the SAME permissive network
-                        // default as `graph run` — a real-clock run spawns the
-                        // gateway and announces the node's topics unless the
-                        // kill-switch is passed (`--network off` here mirrors
-                        // graph run; `off` is clap-enforced as the only value).
-                        network.is_some(),
-                        graph_cmd::PRODUCTION_TRACE_LIMIT,
-                        None, // `node run` does not support recording (use `graph run --record`)
-                        graph_cmd::RecordEnvMode::default(), // unused (record is None)
-                        graph_cmd::RecordCpu::default(), // unused (record is None)
-                        // `node run`'s temp single-node graph must
-                        // never auto-partition — no consent seam.
-                        None,
-                        // `node run` is a monolith, which mints no
-                        // trace ring on any path, so there is nothing to decline.
-                        false,
+                    // `node run` is a graph run of a one-node temporary graph,
+                    // so it reports the same `graph_run_started` and
+                    // `graph_run_completed` pair as `graph run`: the start once
+                    // the run is requested, the completion with whether the
+                    // node was found, staged and run.
+                    let started = std::time::Instant::now();
+                    let handler = setup_ctrlc_handler();
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(false),
                     );
+                    let result = handler.and_then(|running| {
+                        let prefix = prefix.unwrap_or_else(|| "standalone".to_string());
+                        let metadata = node_cmd::node_info(&ws.nodes_dir, &node_type)?;
 
-                    // Clean up temporary graph
-                    let _ =
-                        std::fs::remove_file(ws.graphs_dir.join(format!("{}.yaml", temp_graph)));
+                        let outputs: Vec<(String, Option<String>)> = metadata
+                            .outputs
+                            .iter()
+                            .map(|p| (p.name.clone(), p.schema.clone()))
+                            .collect();
 
+                        let node_def =
+                            graph_cmd::build_node_def(&node_type, id.as_deref(), &outputs, &[]);
+
+                        // Create temporary graph
+                        let temp_graph = format!("__temp_{}", node_type);
+                        graph_cmd::graph_create(&ws.graphs_dir, &temp_graph, Some(&prefix))?;
+                        graph_cmd::node_stage(&ws.graphs_dir, &temp_graph, node_def)?;
+
+                        let result = graph_cmd::graph_run(
+                            &ws.root,
+                            &ws.graphs_dir,
+                            &temp_graph,
+                            running,
+                            graph_cmd::TimeSource::Real, // live RealClock default (matches `graph run`)
+                            if no_cpu_dma_lock {
+                                graph_cmd::CpuDmaLockMode::Disabled
+                            } else {
+                                graph_cmd::CpuDmaLockMode::Auto
+                            },
+                            if no_monitor_wait {
+                                graph_cmd::MonitorWaitMode::Disabled
+                            } else {
+                                graph_cmd::MonitorWaitMode::Auto
+                            },
+                            true,    // skip validation for temporary single-node graphs
+                            release, // honour `node run --release`, mirroring `graph run`
+                            // `node run`'s temp graph is always a
+                            // single-node monolith: no peer-loss flag, no forced
+                            // single-process, default trace cap.
+                            None,
+                            false,
+                            // `node run` rides the SAME permissive network
+                            // default as `graph run`: a real-clock run spawns the
+                            // gateway and announces the node's topics unless the
+                            // kill-switch is passed (`--network off` here mirrors
+                            // graph run; `off` is clap-enforced as the only value).
+                            local || network.is_some(),
+                            graph_cmd::PRODUCTION_TRACE_LIMIT,
+                            None, // `node run` does not support recording (use `graph run --record`)
+                            graph_cmd::RecordEnvMode::default(), // unused (record is None)
+                            graph_cmd::RecordCpu::default(), // unused (record is None)
+                            // `node run`'s temp single-node graph must
+                            // never auto-partition: no consent seam.
+                            None,
+                            // `node run` is a monolith, which mints no
+                            // trace ring on any path, so there is nothing to decline.
+                            false,
+                            // The temp graph declares no launch arguments.
+                            &[],
+                        );
+
+                        // Clean up temporary graph
+                        let _ = std::fs::remove_file(
+                            ws.graphs_dir.join(format!("{}.yaml", temp_graph)),
+                        );
+
+                        result
+                    });
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_COMPLETED,
+                        telemetry_events::graph_run_completed(started.elapsed(), result.is_ok()),
+                    );
                     result
                 }
                 NodeAction::List => {
@@ -1469,9 +1771,9 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Inputs:");
                         for port in &info.inputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
@@ -1479,12 +1781,23 @@ fn run(cli: Cli) -> CliResult<()> {
                         println!("Outputs:");
                         for port in &info.outputs {
                             println!(
-                                "  {} {}",
+                                "  {} ({})",
                                 port.name,
-                                port.schema.as_deref().unwrap_or("(untyped)")
+                                port.schema.as_deref().unwrap_or("untyped")
                             );
                         }
                     }
+                    // The `#[param]` table comes from the BUILT library's node
+                    // info, the document a graph's `params:` is checked against.
+                    let declared = cerulion_cli_engine::node_params_info::declared_params(
+                        &ws.root,
+                        &node_type,
+                        &cerulion_cli_engine::node_inspector::InProcessInspector,
+                    );
+                    print!(
+                        "{}",
+                        cerulion_cli_engine::node_params_info::render_params(&node_type, &declared)
+                    );
                     Ok(())
                 }
             }
@@ -1499,6 +1812,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
                 GraphAction::Run {
                     name,
+                    launch_args,
                     time_source,
                     no_validate,
                     release,
@@ -1507,6 +1821,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     peer_loss,
                     single_process,
                     network,
+                    local,
                     trace_limit,
                     no_rings,
                     record,
@@ -1515,19 +1830,29 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
-                    use std::io::IsTerminal as _;
-                    let running = setup_ctrlc_handler()?;
-                    // The auto-partition consent seam — the real
-                    // TTY probe + the shared y/N prompt (the engine only
-                    // consults it on the interactive persist arm).
-                    let mut confirm = stdin_yes_no_confirm;
+                    // The typed parse of the override words. Their shape was
+                    // checked at clap parse (`check_override_word`), so a
+                    // malformed word was a usage error before this point and
+                    // this parse of the same words reads each value's type.
+                    let launch_args =
+                        cerulion_cli_engine::graph_launch_args::parse_overrides(&launch_args)?;
+                    let started = std::time::Instant::now();
+                    let handler = setup_ctrlc_handler();
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_STARTED,
+                        telemetry_events::graph_run_started(single_process),
+                    );
+                    let running = handler.inspect_err(|_| {
+                        telemetry::emit(
+                            telemetry_events::GRAPH_RUN_COMPLETED,
+                            telemetry_events::graph_run_completed(started.elapsed(), false),
+                        );
+                    })?;
                     let consent = partition_emit::PartitionConsent {
                         auto_partition,
                         assume_yes: yes,
-                        is_tty: std::io::stdin().is_terminal(),
-                        confirm: &mut confirm,
                     };
-                    graph_cmd::graph_run(
+                    let result = graph_cmd::graph_run(
                         &ws.root,
                         &ws.graphs_dir,
                         &name,
@@ -1551,7 +1876,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         single_process,
                         // `--network off` is the only accepted value
                         // (clap-enforced), so presence == the kill-switch.
-                        network.is_some(),
+                        local || network.is_some(),
                         // Clap enforces `1..` (0 rejected at parse).
                         trace_limit as usize,
                         record,
@@ -1561,7 +1886,13 @@ fn run(cli: Cli) -> CliResult<()> {
                         // `--no-rings` — decline this run's per-rank
                         // scheduler-trace rings and its window recorder.
                         no_rings,
-                    )
+                        &launch_args,
+                    );
+                    telemetry::emit(
+                        telemetry_events::GRAPH_RUN_COMPLETED,
+                        telemetry_events::graph_run_completed(started.elapsed(), result.is_ok()),
+                    );
+                    result
                 }
                 GraphAction::Validate { name, release } => {
                     let report = graph_cmd::graph_validate(&ws.root, &name, release)?;
@@ -1770,6 +2101,12 @@ fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Pause { .. } | GraphAction::Resume { .. } => {
+                    unreachable!(
+                        "`graph pause|resume` are dispatched in `main` before the workspace \
+                         lookup, because they address a live run"
+                    )
+                }
                 GraphAction::RunWorker { plan } => {
                     // Hidden verb: run ONE worker of a multi-process
                     // deployment from its serialized plan. The supervisor
@@ -1799,114 +2136,52 @@ fn run(cli: Cli) -> CliResult<()> {
                 connect,
                 listen,
                 scan,
+                show_types,
             } => {
-                // LOCAL topics print FIRST/instantly, so a slow or
-                // failing remote query never delays or hides them.
-                //
-                // A LOCAL `*/data` service that is really a
-                // MIRROR of a remote robot (its canonical name is in the
-                // `/__cerulion/mirrors` provenance registry) must NOT present as a
-                // second LOCAL topic (the "one data source = one topic"
-                // decision). Gather provenance (best-effort; instant on a desk with
-                // no live mirror) and PARTITION the local enumeration before
-                // printing: genuine-local topics stay under LOCAL, mirrored ones
-                // fold into the REMOTE section as `● streaming` rows attributed to
-                // their origin robot.
-                //
-                // The framework's own channels (`/bagd/status` while a
-                // recording runs, anything under `/__cerulion/`) are HIDDEN
-                // from this LOCAL section by default and named by a count
-                // line; `--all` shows them with an `internal` marker. REMOTE
-                // rows (network and mirror alike) are never filtered. The renderer is the
-                // engine's oracle-tested `render_local_topics_section`; the
-                // binary prints its string verbatim.
-                let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_provenance();
-                let (genuine_local, streaming) =
-                    topic_cmd::partition_local_topics(topics, &mirrors);
-                print!(
-                    "{}",
-                    topic_cmd::render_local_topics_section(&genuine_local, all)
-                );
-                // Automagic: remote discovery runs BY DEFAULT with
-                // scouting ON — unpaired robots on the LAN show up with no
-                // flags. `--no-network` skips it (scripts / CI / offline).
-                // The options are built by the ENGINE's unit-pinned builder
-                // (`remote_discovery_options` — the
-                // scouting-ON default lives there, not in an untested literal
-                // here). Because remote discovery is the DEFAULT, a
-                // session/query failure must NOT fail the whole command (the
-                // LOCAL list is already printed) — it is a LOUD note + exit 0.
-                // Never a silent empty, never a fake-success.
-                //
-                // The mirror-streaming rows are LOCAL knowledge (read from
-                // SHM, not the network), so they must ALWAYS render — even under
-                // `--no-network` and even when the network query fails — or a
-                // partitioned-out mirror would vanish entirely. `remote_rendered`
-                // tracks whether an Ok remote render already folded them in.
-                let mut remote_rendered = false;
-                if let Some(opts) = topic_cmd::remote_discovery_options(no_network, connect, listen)
-                {
-                    // Discovery rung 4: `--scan` (opt-in) appends the unicast
-                    // subnet-sweep rung to the discovery ladder. This flag is the
-                    // SOLE producer of a `true` scan — the structural guarantee
-                    // that the sweep never fires on a default run (a horizontal
-                    // SYN sweep reads as port-scan recon to corporate IDS).
-                    match topic_cmd::query_remote_topics_with_scan(&opts, scan) {
-                        Ok(disc) => {
-                            print!(
-                                "{}",
-                                topic_cmd::render_remote_topics_section_with_mirrors(
-                                    &disc,
-                                    opts.has_endpoints(),
-                                    &streaming
-                                )
-                            );
-                            remote_rendered = true;
-                        }
-                        Err(e) => {
-                            // Loud note — the remote half is best-effort;
-                            // the local topics already printed. `--no-network`
-                            // skips this query entirely.
-                            // One line, the shape of the empty-success
-                            // `remote:` line (no header with no rows under it).
-                            // The ENGINE renders it (exact oracle there, the
-                            // docs quote that sentence); printed verbatim, the
-                            // newline is part of the returned string.
-                            eprint!("{}", topic_cmd::render_remote_discovery_unavailable(&e));
-                        }
-                    }
-                }
-                // Render the LOCAL mirror-streaming rows if an Ok remote
-                // render did not already fold them in (--no-network, or a remote
-                // query failure). A mirror is REMOTE regardless of the network
-                // query, since its provenance is read from local SHM.
-                if !remote_rendered && !streaming.is_empty() {
-                    print!(
-                        "{}",
-                        topic_cmd::render_remote_topics_section_with_mirrors(
-                            &topic_cmd::RemoteDiscovery::empty(),
-                            false,
-                            &streaming
-                        )
-                    );
-                }
-                Ok(())
+                // The engine owns the whole listing flow (local first, the
+                // mirror fold, the best-effort remote half) for the plain and
+                // the `-t` listing alike; the binary hands it the parsed flags.
+                // The remote options come from the engine's unit-pinned
+                // builder, which holds the automagic default. Only `-t`
+                // names types, so only `-t` looks for the workspace.
+                let ws = if show_types {
+                    discover_optional_workspace()?
+                } else {
+                    None
+                };
+                topic_cmd::introspect::print_topic_list(
+                    all,
+                    if show_types {
+                        topic_cmd::introspect::TypeColumn::Shown
+                    } else {
+                        topic_cmd::introspect::TypeColumn::Hidden
+                    },
+                    topic_cmd::remote_discovery_options(no_network, connect, listen),
+                    scan,
+                    ws.as_ref().map(|w| w.schemas_dir.as_path()),
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
             }
-            TopicAction::Info { topic } => {
+            TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info(&topic, schemas_dir)?;
+                let info = topic_cmd::topic_info_with_scope(
+                    &topic,
+                    schemas_dir,
+                    topic_cmd::TopicScope::from_local(local),
+                )?;
                 println!("{}", info);
                 Ok(())
             }
             TopicAction::Echo {
                 topic,
                 truncate_length,
+                local,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -1919,15 +2194,16 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo(
+                topic_cmd::topic_echo_with_scope(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
+                    topic_cmd::TopicScope::from_local(local),
                 )
             }
-            TopicAction::Hz { topic } => {
+            TopicAction::Hz { topic, local } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -1936,7 +2212,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz(&topic, schemas_dir, running, &mut std::io::stdout())
+                topic_cmd::topic_hz_with_scope(
+                    &topic,
+                    schemas_dir,
+                    running,
+                    &mut std::io::stdout(),
+                    topic_cmd::TopicScope::from_local(local),
+                )
             }
         },
         Commands::Viz {
@@ -1966,7 +2248,30 @@ fn run(cli: Cli) -> CliResult<()> {
         // flow (re-auth / account switch); the first identity-needing command
         // auto-triggers the SAME flow via the gate. The prompt rides stderr.
         Commands::Login => {
-            login_cmd::run_login(&mut std::io::stderr())?;
+            let outcome =
+                login_cmd::run_login_carrying(&mut std::io::stderr(), telemetry::login_anon_id)?;
+            telemetry::login_completed(&outcome);
+            Ok(())
+        }
+        Commands::Logout => {
+            match login_cmd::run_logout()? {
+                login_cmd::LogoutOutcome::SignedOut { account_id } => {
+                    println!("signed_out: account={account_id}");
+                    eprintln!("Signed out. Run `cerulion login` to sign in again.");
+                }
+                login_cmd::LogoutOutcome::SignedOutUnrevoked { account_id, reason } => {
+                    println!("signed_out: account={account_id}");
+                    return Err(cerulion_cli_engine::error::CliError::Login(format!(
+                        "signed out on this machine, but the account service did not confirm \
+                         the session was revoked, so it stays valid there until it expires: \
+                         {reason}"
+                    )));
+                }
+                login_cmd::LogoutOutcome::NotSignedIn => {
+                    println!("not_signed_in");
+                    eprintln!("This machine was not signed in; nothing changed.");
+                }
+            }
             Ok(())
         }
         // Account self-service device management (list / revoke). The
@@ -2012,6 +2317,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
             }
         },
+        Commands::Telemetry { action } => telemetry::run_verb(action, &mut std::io::stdout()),
         Commands::Tui => cerulion_cli_tui::run().map_err(|e| {
             cerulion_cli_engine::error::CliError::Validation(format!(
                 "`cerulion tui` failed: {e}. It needs an interactive terminal: if you ran it \
@@ -2070,7 +2376,11 @@ fn run(cli: Cli) -> CliResult<()> {
              driven by SIGTERM lifecycle signals and does not build on this platform"
                 .to_string(),
         )),
-        Commands::Clean { report_only } => clean_iceoryx2_state(report_only),
+        Commands::Clean { report_only } => clean_iceoryx2_state(if report_only {
+            SweepMode::ReportOnly
+        } else {
+            SweepMode::Remove
+        }),
         // `cerulion connect` never reaches `run()`: `main`
         // intercepts it to spawn `cerulion-connectd` + forward its exit code.
         Commands::Connect { .. } => {
@@ -2087,130 +2397,6 @@ fn run(cli: Cli) -> CliResult<()> {
         Commands::Bagd(_) => unreachable!("`cerulion bagd` is dispatched in main() before run()"),
         #[cfg(not(unix))]
         Commands::Bagd => unreachable!("`cerulion bagd` is rejected in main() before run()"),
-        Commands::Schema { action } => {
-            match action {
-                // Create/Delete WRITE into the workspace `schemas/` dir, so a
-                // workspace is required (loud error naming `workspace create`).
-                SchemaAction::Create { name } => {
-                    let ws = discover_workspace()?;
-                    schema_cmd::schema_create(&ws.schemas_dir, &name)?;
-                    println!("Created schema '{}'", name);
-                    Ok(())
-                }
-                SchemaAction::Delete { name } => {
-                    let ws = discover_workspace()?;
-                    schema_cmd::schema_delete(&ws.schemas_dir, &name)?;
-                    println!("Deleted schema '{}'", name);
-                    Ok(())
-                }
-                SchemaAction::Info { name } => {
-                    // `schema info` does NOT require a
-                    // workspace — the intended use is a brand-new laptop
-                    // resolving a robot's types with zero setup. A missing
-                    // workspace ⇒ skip the workspace + `.msg`-store tiers and
-                    // resolve builtin → remote exactly as designed; a workspace
-                    // present ⇒ the full resolution ladder (workspace
-                    // wins). `schema_info_unified_opt` keeps the provenance
-                    // accurate either way.
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    // Unified lookup — workspace schemas first,
-                    // then the embedded built-in ROS 2 registry (the exact
-                    // .msg text the generated types compiled against), with
-                    // ONE renderer for both sources. Replaces the sibling
-                    // `../native_ros2_messages/msg` path probe, which only
-                    // worked for workspaces created inside this repository.
-                    let info = match schema_cmd::schema_info_unified_opt(schemas_dir, &name) {
-                        Ok(info) => info,
-                        // Unresolvable locally (neither workspace
-                        // nor built-in). If it is a QUALIFIED `pkg/Type` and robots
-                        // are discoverable, ask THEM — the automagic bar: a desk
-                        // with zero local knowledge of a robot's custom types can
-                        // still `schema info` them. Best-effort: a failed/empty
-                        // fetch re-raises the original local error (exit code
-                        // unchanged). A found remote schema prints with a loud
-                        // provenance header, then returns Ok.
-                        Err(
-                            local_err @ cerulion_cli_engine::error::CliError::SchemaNotFound {
-                                ..
-                            },
-                        ) => match schema_cmd::remote_fetch_target(&name) {
-                            Some(requested) => {
-                                let opts = topic_cmd::RemoteTopicsOptions {
-                                    connect: vec![],
-                                    listen: vec![],
-                                    scouting: true,
-                                };
-                                // An empty remote answer means two different
-                                // things. Only a SETTLED discovery licenses re-raising
-                                // the terminal local "schema not found"; a cold
-                                // `cerulion-netd` (or a transient gather that read
-                                // nothing) searched NOTHING, so saying the type does
-                                // not exist would be a claim with no evidence — the
-                                // same false absence already removed from the topic
-                                // path.
-                                //
-                                // The variant match lives in
-                                // `topic_cmd::schema_info_remote_outcome`, NOT here —
-                                // as a `match` in this file the mapping has no test,
-                                // and a mutation reverting its cold-start arm would pass
-                                // the whole suite. One `?` leaves no arm to mis-route.
-                                let fetched = topic_cmd::fetch_remote_schema(&requested, &opts)?;
-                                let reply = topic_cmd::schema_info_remote_outcome(
-                                    &requested, fetched, local_err,
-                                )?;
-                                print!("{}", schema_cmd::render_remote_schema(&reply));
-                                return Ok(());
-                            }
-                            None => return Err(local_err),
-                        },
-                        Err(e) => return Err(e),
-                    };
-                    // A workspace schema colliding with a
-                    // built-in name is LOUD — one stderr warning per
-                    // (workspace schema, shadowed built-in) pair, BEFORE
-                    // the rendered output. `shadowed_builtin` is only
-                    // `Some` on workspace results; the ", "-joined list
-                    // splits back losslessly (names carry no commas).
-                    if let Some(shadowed) = &info.shadowed_builtin {
-                        for builtin in shadowed.split(", ") {
-                            let bare = builtin.rsplit('/').next().unwrap_or(builtin);
-                            for entry in &info.result.entries {
-                                // The ONE canonical identity (the engine's
-                                // `shadowed_builtin_names` decided the shadow
-                                // that way): an entry declared `pkg::Type`
-                                // must get the warning its `pkg/Type` twin
-                                // gets, or the loud line goes missing on
-                                // exactly the spelling the engine flagged.
-                                let declared =
-                                    cerulion_cli_engine::schema_cmd::normalize_schema(&entry.name);
-                                if declared == builtin || declared == bare {
-                                    eprintln!(
-                                        "WARNING: workspace schema '{}' shadows built-in '{}' \
-                                         — workspace wins for schema info",
-                                        entry.name, builtin
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    print!("{}", info);
-                    Ok(())
-                }
-                SchemaAction::List => {
-                    // Workspace-local schemas + the embedded
-                    // built-in ROS 2 registry grouped by package, with
-                    // shadowed built-ins marked inline. One renderer.
-                    // Workspace-OPTIONAL — no workspace ⇒ the
-                    // built-in registry alone (never a stray cwd `schemas/`).
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    let listing = schema_cmd::schema_list_opt(schemas_dir);
-                    print!("{}", listing);
-                    Ok(())
-                }
-            }
-        }
         // The REMOVED `cerulion ros` family: `main` intercepts it above the
         // login gate and exits 2 with the migration message. Belt-and-braces
         // here in case a future reorder lets it through — the same message,
@@ -2240,7 +2426,17 @@ fn run(cli: Cli) -> CliResult<()> {
                 robot_name,
             } => {
                 use std::io::IsTerminal as _;
-                let ws = discover_workspace()?;
+                // The attach root is the discovered workspace or, for a
+                // workspace-less `--dry-run` only, an exclusively created
+                // empty temp dir; the engine (`ros_attach_root`) owns that
+                // decision and hands the cleanup guard back with the root, so
+                // this root has exactly one guard. The guard lives to the end
+                // of the verb, so the temp dir is removed on every exit path
+                // and no dir that is not provably empty stays behind for a
+                // PID-reusing successor to read.
+                let (attach_root, _root_guard) =
+                    ros_attach_root::AttachRoot::resolve(&std::env::current_dir()?, dry_run)?;
+                let workspace_root = attach_root.path().to_path_buf();
                 let running = setup_ctrlc_handler()?;
                 // Resolve --topic-prefix at the CLI
                 // boundary (the resolve-and-report shape): a missing
@@ -2283,6 +2479,9 @@ fn run(cli: Cli) -> CliResult<()> {
                 };
                 // The live ros2-client/rustdds backend is wired HERE (the
                 // composition root); the engine stays DDS-free over the seam.
+                if !opts.dry_run && !graph_cmd::remote_network_suppressed() {
+                    login_cmd::require_serving_login()?;
+                }
                 let discovery = cerulion_dds::LiveDiscovery;
                 // Compose the production schema-acquisition
                 // ladder — the wire-native `~/get_type_description` rung FIRST
@@ -2314,7 +2513,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 let report = ros_cmd::ros_attach_with_acquirer(
                     &discovery,
                     &chain,
-                    &ws.root,
+                    &workspace_root,
                     &opts,
                     is_tty,
                     &mut confirm,
@@ -2395,9 +2594,17 @@ fn run(cli: Cli) -> CliResult<()> {
                                     "ros2 attach: running `cerulion graph run {graph} \
                                      --single-process` (Ctrl+C to stop)"
                                 );
-                                graph_cmd::graph_run(
-                                    &ws.root,
-                                    &ws.graphs_dir,
+                                telemetry::emit(telemetry_events::ROS2_BRIDGE_STARTED, Vec::new());
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_STARTED,
+                                    telemetry_events::graph_run_started(true),
+                                );
+                                let started = std::time::Instant::now();
+                                // The graphs dir the engine just wrote the
+                                // graph into (`<root>/graphs`).
+                                let result = graph_cmd::graph_run(
+                                    &workspace_root,
+                                    &workspace_root.join("graphs"),
                                     &graph,
                                     running,
                                     graph_cmd::TimeSource::Real,
@@ -2424,7 +2631,16 @@ fn run(cli: Cli) -> CliResult<()> {
                                     // path (the gating clock is wall-driven), so
                                     // there is nothing to decline.
                                     false, // no_rings
-                                )
+                                    &[],   // launch_args: the generated graph declares none
+                                );
+                                telemetry::emit(
+                                    telemetry_events::GRAPH_RUN_COMPLETED,
+                                    telemetry_events::graph_run_completed(
+                                        started.elapsed(),
+                                        result.is_ok(),
+                                    ),
+                                );
+                                result
                             }
                             None => Ok(()),
                         }
@@ -2478,6 +2694,18 @@ fn discover_workspace() -> CliResult<CerulionWorkspace> {
     CerulionWorkspace::discover(&cwd)
 }
 
+/// The workspace for a verb that also works outside one: `None` when the
+/// current directory is in no workspace, and any other discovery failure (a
+/// workspace `Cargo.toml` that cannot be read) returned, so the verb never
+/// quietly drops the workspace types it was asked to name.
+fn discover_optional_workspace() -> CliResult<Option<CerulionWorkspace>> {
+    match discover_workspace() {
+        Ok(ws) => Ok(Some(ws)),
+        Err(cerulion_cli_engine::error::CliError::WorkspaceNotFound { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// `cerulion viz [TOPIC…] [--robot NAME] [--detach]` — the
 /// daemon CLIENT path. `cerulion viz` compiles no graph per run: it
 /// ensures the long-lived `cerulion-vizd` daemon is running (spawning it detached
@@ -2510,6 +2738,11 @@ fn run_viz(
     listen: &[String],
     detach: bool,
 ) -> CliResult<()> {
+    if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
+        return Err(cerulion_cli_engine::error::CliError::Validation(
+            message.to_string(),
+        ));
+    }
     #[cfg(not(unix))]
     {
         let _ = (running, topics, robot, connect, listen, detach);
@@ -2580,11 +2813,30 @@ fn run_viz_unix(
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
 
+    // A remote attach under a kill switch is refused after the arg-shape checks
+    // and before any daemon is spawned or contacted.
+    if let Some(refusal) = robot.and_then(cerulion_cli_engine::viz_cmd::remote_viz_refusal) {
+        return Err(val(refusal));
+    }
+    // Resolve account identity before starting the viewer. Keep the control
+    // connection alive until vizd owns its demand; no CLI WAN endpoint is opened.
+    let account_target = robot
+        .map(|selector| {
+            cerulion_cli_engine::account_robot_access::prepare_viz_target(selector, connect, listen)
+        })
+        .transpose()?;
+    if let Some(target) = &account_target {
+        for diagnostic in &target.diagnostics {
+            eprintln!("cerulion viz: {diagnostic}");
+        }
+    }
+    let robot = account_target.as_ref().map(|target| target.route.as_str());
+
     // 1. Ensure the daemon is running (spawn it detached if absent), then connect.
     //    When THIS command starts the daemon, the --connect/--listen locators are
     //    threaded into its network config (env-at-spawn); a daemon already running
     //    keeps its own boot-time locators (a shared long-lived daemon's config is
-    //    fixed at start — scouting covers the LAN regardless).
+    //    fixed at start).
     let socket = viz_client::vizd_socket_path();
     let log_path = viz_client::vizd_log_path(&socket);
     let log_for_spawn = log_path.clone();
@@ -2626,14 +2878,13 @@ fn run_viz_unix(
 
     // Note to the user: locators given, but the daemon was ALREADY running — this
     // command's locators do not reconfigure a live shared daemon (its network
-    // config is fixed at start). Scouting (on by default) still covers a LAN
-    // robot; restart the daemon to bake in new locators for a robot scouting
-    // can't reach. Never a silent drop (the project's loud-inference rule).
+    // config is fixed at start). Restart the daemon to bake in new locators.
+    // Never a silent drop (the project's loud-inference rule).
     if !spawned && (!connect.is_empty() || !listen.is_empty()) {
         eprintln!(
             "cerulion viz: note — the cerulion-vizd daemon was already running, so \
              --connect/--listen apply only to a daemon THIS command starts; the running daemon \
-             keeps its boot-time locators (scouting still covers LAN robots). Restart it \
+             keeps its boot-time locators. Restart it \
              (stop the daemon, then re-run) to bake in these locators."
         );
     }
@@ -2836,7 +3087,7 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 ///
 /// Both `cerulion clean` and the implicit cleanup at the top of
 /// `graph_run` route through
-/// `cerulion_cli_engine::ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics`.
+/// `cerulion_cli_engine::ipc_cleanup::sweep_dead_nodes`.
 ///
 /// After the sweep, the verb reports the two POPULATIONS every
 /// sweep has to walk — iceoryx2's node registry, and (on macOS/FreeBSD) the
@@ -2846,16 +3097,22 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 /// removes state files of its own through iceoryx2's `shm_unlink`, so a
 /// population reported before it would over-count, and a reclamation running
 /// first would unlink objects the sweep was about to inspect.
-fn clean_iceoryx2_state(report_only: bool) -> CliResult<()> {
-    let (result, converged) = clean_dead_nodes(report_only);
+///
+/// `--report-only` performs NO side effect anywhere in the verb. The mode
+/// reaches the dead-node walk before it starts, so the walk classifies and
+/// removes nothing and the report lists the nodes a bare run would have
+/// removed; the state-file half stays a bounded read; and the report closes
+/// by saying nothing was removed.
+fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
+    let (result, converged) = clean_dead_nodes(mode);
     // The reclamation is DOWNGRADED to a report when the sweep above
     // left dead nodes registered. A `.shm_state` file is the only mapping from
     // an iceoryx2 resource name to the object behind it, so removing one that a
     // still-registered dead node needs makes that node permanently
     // unreclaimable — the sweep can never read its details again. The
     // population is still reported; only the destructive half stands down.
-    let reclaim = !report_only && converged;
-    if !report_only && !converged {
+    let reclaim = mode.removes() && converged;
+    if mode.removes() && !converged {
         println!(
             "Skipping stale `.shm_state` reclamation: the dead-node sweep did not converge \
              (see above — a refused node is still registered, or the registry could not be \
@@ -2863,16 +3120,37 @@ fn clean_iceoryx2_state(report_only: bool) -> CliResult<()> {
              make it permanently unreclaimable. Clear the failures, then re-run `cerulion clean`."
         );
     }
-    report_shm_state_population(!reclaim);
+    report_shm_state_population(if reclaim {
+        SweepMode::Remove
+    } else {
+        SweepMode::ReportOnly
+    });
+    if mode.reports_only() {
+        println!("{NOTHING_WAS_REMOVED}");
+    }
     result
 }
+
+/// The closing line of every `--report-only` run: the whole verb's promise,
+/// stated once, after both halves have reported.
+///
+/// It is unconditional under the flag. A report over an empty registry with
+/// no state files still ends here, because "nothing to clean" and "nothing
+/// was removed" are different claims and the operator asked for the second.
+const NOTHING_WAS_REMOVED: &str =
+    "Report only: nothing was removed. Run `cerulion clean` without `--report-only` to act on \
+     everything listed above.";
 
 /// The diagnostic block: the two populations, and the reclamation.
 ///
 /// Never fails the verb. It is a diagnostic bolted onto a cleanup command, so
 /// an unreadable directory or a refused unlink is reported in the block and
 /// leaves `cerulion clean`'s own exit code to the sweep.
-fn report_shm_state_population(report_only: bool) {
+///
+/// `mode` is NOT the operator's flag: the caller downgrades a `Remove` run to
+/// `ReportOnly` when the dead-node sweep left the registry unconverged, so
+/// this block reclaims only when the operator asked AND the sweep converged.
+fn report_shm_state_population(mode: SweepMode) {
     use cerulion_cli_engine::shm_state;
 
     let nodes = shm_state::count_node_registry(
@@ -2890,28 +3168,28 @@ fn report_shm_state_population(report_only: bool) {
         // and may hand back a floor. A RECLAIM was explicitly asked for and
         // is the remedy, so it is bounded long enough to clear the measured
         // pathological directory in ONE run — bounded either way.
-        let (mode, budget) = if report_only {
-            (
-                shm_state::ScanMode::ReportOnly,
-                shm_state::SHM_STATE_REPORT_BUDGET,
-            )
-        } else {
+        let (scan_mode, budget) = if mode.removes() {
             (
                 shm_state::ScanMode::Reclaim,
                 shm_state::SHM_STATE_RECLAIM_BUDGET,
+            )
+        } else {
+            (
+                shm_state::ScanMode::ReportOnly,
+                shm_state::SHM_STATE_REPORT_BUDGET,
             )
         };
         shm_state::scan(
             std::path::Path::new(shm_state::SHM_STATE_DIRECTORY),
             budget,
             shm_state::classify_budget(budget),
-            mode,
+            scan_mode,
             &shm_state::LibcProbe,
         )
     });
     #[cfg(not(unix))]
     let shm: Option<shm_state::ShmStateReport> = {
-        let _ = report_only;
+        let _ = mode;
         None
     };
 
@@ -2926,152 +3204,25 @@ fn report_shm_state_population(report_only: bool) {
 /// left registered. The `.shm_state` reclamation is gated on that second
 /// value; see [`clean_iceoryx2_state`].
 ///
-/// ONE refusal shape is healed here rather than reported and
-/// left standing. A dead node whose directory holds nothing but orphan port
-/// tags — a publisher was destroyed while one of its loaned samples had been
-/// leaked, so the port was deregistered but its tag outlived it — fails the
-/// sweep at the final `rmdir` on EVERY sweep, forever, and one such node blocks
-/// the `.shm_state` reclamation for good. After the first sweep, the nodes
-/// whose refusal is EXACTLY that chain
-/// (`orphan_port_tags::orphan_port_tag_candidates`) have their tags removed
-/// (`orphan_port_tags::reclaim_orphan_port_tags`: the process must be provably
-/// gone, and the directory — re-listed at that instant — must hold nothing
-/// else; anything else is refused and named), then ONE more sweep runs and its
-/// summary is printed; the convergence handed back is the SECOND sweep's, so
-/// the reclamation gate sees the healed registry. That sweep runs whenever
-/// candidates EXISTED — not only when a tag came off: a candidate whose
-/// directory was already empty (`ReclaimVerdict::AlreadyEmpty` — another
-/// session, or an interrupted earlier run, removed its tags) has nothing to
-/// reclaim and converges on exactly that sweep. `--report-only` prints what
-/// WOULD be removed, removes nothing, and skips the second sweep — nothing
-/// changed, so it would re-find the same refusals. The source fix (the rmw
-/// destroy path) is what stops the shape being minted; this only heals a
-/// robot already carrying it.
-fn clean_dead_nodes(report_only: bool) -> (CliResult<()>, bool) {
+/// ONE sweep, and the shape that used to need a second one is gone. A dead
+/// node's directory holding nothing but the orphan port tags of ports it had
+/// already deregistered used to fail the final `rmdir` on every sweep forever,
+/// and one such node blocked the `.shm_state` reclamation for good. iceoryx2
+/// 0.10 removes a dead port's tag with the rest of its stale resources
+/// (`service/stale_resource_cleanup.rs`, the port tag arm), so the shape cannot
+/// arise and the reclaim that healed it is gone with it. The convergence handed
+/// back is this sweep's.
+fn clean_dead_nodes(mode: SweepMode) -> (CliResult<()>, bool) {
     use cerulion_cli_engine::ipc_cleanup;
-    use cerulion_cli_engine::orphan_port_tags;
-    use cerulion_cli_engine::shm_state::creator_verdict;
 
-    let report = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();
-    report_sweep(&report);
+    let report = ipc_cleanup::sweep_dead_nodes(mode);
+    report_sweep(&report, mode);
     // A failure of the registry WALK itself (printed first by `report_sweep`)
     // blocks convergence exactly as a refused node does: a dead node the walk
     // never reached is still registered and counted nowhere, so the
     // `.shm_state` reclamation must stand down for it.
     let converged = report.failed_cleanups == 0 && report.registry_errors.is_empty();
-    if report.failed_cleanups == 0 {
-        return (Ok(()), converged);
-    }
-
-    let config = orphan_port_tags::Iceoryx2Config::global_config();
-    let candidates = orphan_port_tags::orphan_port_tag_candidates(&report.failures, config);
-    if candidates.is_empty() {
-        return (Ok(()), false);
-    }
-    // The liveness evidence is `shm_state`'s ONE predicate, reached through its
-    // exported verdict — never re-spelt here.
-    let reclaims = orphan_port_tags::reclaim_orphan_port_tags(
-        &candidates,
-        config,
-        report_only,
-        &creator_verdict,
-    );
-    for line in render_orphan_tag_reclaims(&reclaims, report_only) {
-        println!("{line}");
-    }
-    if report_only {
-        // Nothing changed: what WOULD be removed is listed above, and a
-        // second sweep would only re-find the same refusals.
-        return (Ok(()), false);
-    }
-
-    // ONE more sweep, whenever candidates EXISTED: a reclaimed node's
-    // directory now holds nothing, and an `AlreadyEmpty` one never did, so
-    // `remove_node` can finish what every earlier sweep could not. Its
-    // counters are the proof the shape is healed (`cleanups` counts the
-    // converged nodes), and its convergence is what the `.shm_state` gate
-    // must see. A refused candidate costs one re-sweep that re-finds it —
-    // cheap, and the report it prints is the truth of the registry NOW.
-    println!("Second sweep after the orphan port-tag reclaim:");
-    let second = ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics();
-    report_sweep(&second);
-    (
-        Ok(()),
-        second.failed_cleanups == 0 && second.registry_errors.is_empty(),
-    )
-}
-
-/// Render the orphan port-tag reclaim for `cerulion clean`, one line per
-/// candidate, exactly as the outcome was:
-///
-/// * `node <id> (pid <pid>, process gone): directory not empty — removed <k>
-///   orphan port tag(s) [<port ids>]` — or `would remove` under
-///   `--report-only`, which also closes with a line saying nothing was
-///   removed;
-/// * `node <id> (pid <pid>, process gone): directory already empty — nothing
-///   to reclaim; the next sweep removes it` for an `AlreadyEmpty` verdict —
-///   converged pending sweep, never rendered as a refusal;
-/// * `node <id> (pid <pid>): not reclaimed — <reason>` for a refusal, with
-///   any tags removed before a mid-way failure stated rather than hidden.
-///
-/// PURE (a `Vec` of lines) so `clean_diagnostic_tests` pins it against hand
-/// oracles. Empty input renders NOTHING.
-fn render_orphan_tag_reclaims(
-    reclaims: &[cerulion_cli_engine::orphan_port_tags::OrphanTagReclaim],
-    report_only: bool,
-) -> Vec<String> {
-    if reclaims.is_empty() {
-        return Vec::new();
-    }
-    let ids = |removed: &[u128]| {
-        removed
-            .iter()
-            .map(u128::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut lines = vec![if report_only {
-        "Orphan port tags `cerulion clean` would reclaim (report only — nothing removed):"
-            .to_string()
-    } else {
-        "Reclaiming orphan port tags (a leaked loan kept each tag alive past its port's \
-         deregistration; the process is gone and iceoryx2 already reclaimed the ports' resources):"
-            .to_string()
-    }];
-    for reclaim in reclaims {
-        use cerulion_cli_engine::orphan_port_tags::ReclaimVerdict;
-        match &reclaim.verdict {
-            ReclaimVerdict::AlreadyEmpty => lines.push(format!(
-                "node {} (pid {}, process gone): directory already empty — nothing to reclaim; \
-                 the next sweep removes it",
-                reclaim.node_id, reclaim.pid
-            )),
-            ReclaimVerdict::Reclaimed => lines.push(format!(
-                "node {} (pid {}, process gone): directory not empty — {} {} orphan port tag(s) [{}]",
-                reclaim.node_id,
-                reclaim.pid,
-                if report_only { "would remove" } else { "removed" },
-                reclaim.removed.len(),
-                ids(&reclaim.removed)
-            )),
-            ReclaimVerdict::Refused(reason) if reclaim.removed.is_empty() => lines.push(format!(
-                "node {} (pid {}): not reclaimed — {reason}",
-                reclaim.node_id, reclaim.pid
-            )),
-            ReclaimVerdict::Refused(reason) => lines.push(format!(
-                "node {} (pid {}): not fully reclaimed — {reason}; {} tag(s) removed before the \
-                 failure [{}]",
-                reclaim.node_id,
-                reclaim.pid,
-                reclaim.removed.len(),
-                ids(&reclaim.removed)
-            )),
-        }
-    }
-    if report_only {
-        lines.push("(run `cerulion clean` without `--report-only` to reclaim them)".to_string());
-    }
-    lines
+    (Ok(()), converged)
 }
 
 /// Print one sweep's outcome: the registry-wide block first (if any), the
@@ -3080,7 +3231,12 @@ fn render_orphan_tag_reclaims(
 /// breakdown, the per-node refusal listing and the unclassified arm. Every
 /// pre-existing line is byte-identical to what `cerulion clean` printed
 /// before the orphan-tag reclaim existed; called once per sweep.
-fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
+///
+/// Under [`SweepMode::ReportOnly`] the counters are both zero because nothing
+/// was attempted, so the summary line would read as a converged sweep. The
+/// would-remove listing takes its place: the same nodes, named, with the
+/// registry they sit under and the statement that none of them was touched.
+fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport, mode: SweepMode) {
     // A failure of the registry WALK itself is printed first and
     // under its own heading, so the operator reads a global failure as
     // global — never as the cause of whichever node happens to be listed
@@ -3088,6 +3244,15 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
     // counters would otherwise hide that nothing was reached.
     for line in render_registry_errors(&report.registry_errors) {
         println!("{line}");
+    }
+    if mode.reports_only() && !report.dead_nodes.is_empty() {
+        for line in render_would_remove(
+            &report.dead_nodes,
+            &cerulion_cli_engine::shm_state::iceoryx2_node_dir(),
+        ) {
+            println!("{line}");
+        }
+        return;
     }
     if report.cleanups == 0 && report.failed_cleanups == 0 {
         if report.registry_errors.is_empty() {
@@ -3135,10 +3300,7 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
                 "iceoryx2 internal error" => {
                     "iceoryx2 refused to remove the node's registry entry; \
                      the node ids of the refused nodes listed below name the \
-                     culprit and carry the sub-causes iceoryx2 logged. A directory \
-                     holding only orphan port tags (a publisher destroyed while a \
-                     loaned sample was leaked — the tag outlives the port) is \
-                     reclaimed by this verb right after this listing; any other \
+                     culprit and carry the sub-causes iceoryx2 logged. A \
                      stranded entry never converges on its own"
                 }
                 _ => "see iceoryx2 logs for details",
@@ -3158,18 +3320,71 @@ fn report_sweep(report: &cerulion_cli_engine::ipc_cleanup::CleanupReport) {
     }
 }
 
-/// How many refused nodes `cerulion clean` lists in full before folding the
-/// rest into an `… and N more` line. A pathological desk (for example
-/// session-accumulated dead nodes) can hold dozens; the listing exists to
-/// attribute ONE stranded node, so ten is plenty and keeps the verb's output
-/// readable.
-const REFUSED_NODES_SHOWN: usize = 10;
+/// How many nodes `cerulion clean` lists in full — refused, or would-remove —
+/// before folding the rest into an `… and N more` line. A pathological desk
+/// (for example session-accumulated dead nodes) can hold dozens; a listing
+/// exists to name the nodes in play, so ten is plenty and keeps the verb's
+/// output readable. ONE number for both listings: a reader who learns the
+/// fold from one report reads the other the same way.
+const NODES_SHOWN: usize = 10;
+
+/// The line that keeps the would-sweep listing from over-promising.
+///
+/// The listing names the nodes a bare run ACTS ON, which is not the same set
+/// as the nodes it gets off disk: iceoryx2 raises
+/// `InsufficientPermissions` or `VersionMismatch` only from inside the
+/// removal, so which of them refuse is knowable ONLY by attempting, and a
+/// report attempts nothing. Saying "would remove" of the whole set would
+/// promise a deletion this run cannot know will happen, which is the same
+/// over-claim, one surface over, that `--report-only` exists to stop.
+const REMOVAL_CAN_STILL_BE_REFUSED: &str =
+    "  (what the sweep would ATTEMPT, not a promise each one comes off: iceoryx2 reports \
+     insufficient permissions or a version mismatch only when it tries to remove a node, which \
+     a report does not do)";
+
+/// Render the would-remove listing for `cerulion clean --report-only`: the
+/// dead nodes the sweep classified, by the NAME each carries under the
+/// registry directory (its entry name, checkable against `ls`), capped at
+/// [`NODES_SHOWN`] with the same `… and N more` fold the refusal listing
+/// uses.
+///
+/// The set is the sweep's own [`cerulion_cli_engine::ipc_cleanup::CleanupReport::dead_nodes`],
+/// which a destructive run over the same registry produces from the same
+/// classification — so this listing names exactly the nodes that run removes.
+///
+/// PURE (a `Vec` of lines) so `clean_diagnostic_tests` pins it against hand
+/// oracles. Empty input renders NOTHING: a report over a registry with no
+/// dead node falls through to the "nothing to clean" summary instead.
+fn render_would_remove(
+    dead: &[cerulion_cli_engine::ipc_cleanup::DeadNodeIdentity],
+    nodes_dir: &Path,
+) -> Vec<String> {
+    if dead.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Dead iceoryx2 node(s) `cerulion clean` would sweep: {} under {} (report only; \
+         none was removed)",
+        dead.len(),
+        nodes_dir.display()
+    )];
+    lines.extend(
+        dead.iter()
+            .take(NODES_SHOWN)
+            .map(|node| format!("  node {}", node.name)),
+    );
+    if dead.len() > NODES_SHOWN {
+        lines.push(format!("  … and {} more", dead.len() - NODES_SHOWN));
+    }
+    lines.push(REMOVAL_CAN_STILL_BE_REFUSED.to_string());
+    lines
+}
 
 /// The hint kept for the arms the listing cannot serve — a refusal iceoryx2
 /// gave NO captured explanation for, and the unclassified variants.
 ///
 /// `RUST_LOG`, not `IOX2_LOG_LEVEL`: the diagnostic sweep
-/// (`cleanup_dead_iceoryx2_nodes_with_diagnostics`) already pins iceoryx2's
+/// (`sweep_dead_nodes`) already pins iceoryx2's
 /// own level at `Trace` for its duration and the bridge forwards every line
 /// to `tracing` under `target: "iceoryx2"`, so the only gate left between the
 /// raw lines and the terminal is this process's `RUST_LOG` filter. The
@@ -3203,7 +3418,7 @@ fn render_registry_errors(errors: &[String]) -> Vec<String> {
 
 /// Render the per-node refusal listing for `cerulion clean`:
 /// `  node <id>: <variant>` followed by the sub-cause lines iceoryx2 logged
-/// about that node, indented beneath it, capped at [`REFUSED_NODES_SHOWN`]
+/// about that node, indented beneath it, capped at [`NODES_SHOWN`]
 /// nodes with an `… and N more` line. Empty input renders NOTHING — a
 /// converged sweep must not print a header for a listing that has no rows.
 ///
@@ -3220,7 +3435,7 @@ fn render_refused_nodes(
         return Vec::new();
     }
     let mut lines = vec!["Refused nodes:".to_string()];
-    for failure in failures.iter().take(REFUSED_NODES_SHOWN) {
+    for failure in failures.iter().take(NODES_SHOWN) {
         let variant = if failure.variant.is_empty() {
             "(variant not reported)"
         } else {
@@ -3236,11 +3451,8 @@ fn render_refused_nodes(
             lines.push(format!("    {cause}"));
         }
     }
-    if failures.len() > REFUSED_NODES_SHOWN {
-        lines.push(format!(
-            "  … and {} more",
-            failures.len() - REFUSED_NODES_SHOWN
-        ));
+    if failures.len() > NODES_SHOWN {
+        lines.push(format!("  … and {} more", failures.len() - NODES_SHOWN));
     }
     lines
 }
@@ -3421,91 +3633,6 @@ fn check_dash_t_dash_i_name_collision(
     Ok(())
 }
 
-/// Resolve the trigger policy for `cerulion node create` from the
-/// `--policy` flag, the `-T` flag, and the regular `-i` inputs.
-///
-/// Defaulting rules (when `--policy` is absent):
-/// - `-T` set → `DataTrigger { input_name: <T's name> }`
-///   (an explicit `-T` declares the trigger, so the policy is
-///   threaded through as `data_trigger=NAME`).
-/// - 0 inputs (no `-i` and no `-T`) → error: a source-only node
-///   must declare a non-data policy explicitly
-///   (`--policy period_ms=N` or `--policy external`).
-/// - 1+ inputs via `-i` only → `None` (the source emits no
-///   node-level policy attribute; the runtime fires on any input
-///   arrival and emits a warning at graph-build time so the
-///   user notices). The warning is intentional: a user might want
-///   a different policy (Sync, data_trigger on a
-///   specific input), and silence would let unintended firing
-///   behavior ship.
-///
-/// When `--policy` is present:
-/// - `--policy data_trigger=NAME` and `-T NAME'` must agree on the
-///   trigger input.
-/// - `--policy data_trigger=NAME` requires NAME to match exactly
-///   one of the `-i` or `-T` inputs.
-/// - Non-data policies (Period/Sync/External) ignore the
-///   `-T` / `-i` set and use the explicit policy as-is. `-T` is
-///   incompatible with non-data policies — the caller errors.
-fn resolve_create_policy(
-    explicit: Option<&cerulion_core::MacroPolicy>,
-    trigger_input: Option<&(String, String)>,
-    regular_inputs: &[(String, String)],
-) -> CliResult<Option<cerulion_core::MacroPolicy>> {
-    use cerulion_cli_engine::error::CliError;
-    use cerulion_core::MacroPolicy;
-    match (explicit, trigger_input) {
-        (Some(MacroPolicy::DataTrigger { input_name }), Some((_, t_name))) => {
-            if input_name != t_name {
-                return Err(CliError::Validation(format!(
-                    "`--policy data_trigger={input_name}` and `-T <SCHEMA> {t_name}` disagree \
-                     on the trigger input"
-                )));
-            }
-            Ok(Some(MacroPolicy::DataTrigger {
-                input_name: input_name.clone(),
-            }))
-        }
-        (Some(_non_data), Some(_)) => Err(CliError::Validation(
-            "`-T` declares a data-trigger input, which conflicts with a non-data `--policy`. \
-             Drop `-T` or change the policy."
-                .to_string(),
-        )),
-        (Some(MacroPolicy::DataTrigger { input_name }), None) => {
-            let matches_input = regular_inputs.iter().any(|(_, n)| n == input_name);
-            if !matches_input {
-                return Err(CliError::Validation(format!(
-                    "`--policy data_trigger={input_name}` requires `-i SCHEMA {input_name}` \
-                     (or `-T SCHEMA {input_name}`) to declare the trigger input"
-                )));
-            }
-            Ok(Some(MacroPolicy::DataTrigger {
-                input_name: input_name.clone(),
-            }))
-        }
-        (Some(p), None) => Ok(Some(p.clone())),
-        (None, Some((_, name))) => Ok(Some(MacroPolicy::DataTrigger {
-            input_name: name.clone(),
-        })),
-        (None, None) => {
-            if regular_inputs.is_empty() {
-                Err(CliError::Validation(
-                    "source-only nodes (no `-i` or `-T`) must declare a non-data trigger policy. \
-                     Pass `--policy period_ms=N` or `--policy external`."
-                        .to_string(),
-                ))
-            } else {
-                // 1+ inputs with no explicit `--policy` or `-T`:
-                // emit no node-level policy attribute. The runtime
-                // fires on any input arrival and emits a warning
-                // at graph-build time so the user notices and can
-                // pick a more specific policy if desired.
-                Ok(None)
-            }
-        }
-    }
-}
-
 /// The stderr note `node create` prints for the two macro-node shapes it
 /// accepts but `#[cerulion_node]` refuses at build time: inputs with no trigger
 /// policy at all, and a sync policy (which needs two or more trigger inputs,
@@ -3619,9 +3746,7 @@ fn parse_policy_spec(spec: &str) -> CliResult<cerulion_core::MacroPolicy> {
 
 /// The shared interactive partition confirm: displays the
 /// engine-built preview, asks y/N on the real stdin, and returns the answer.
-/// Used by BOTH `graph partition` and `graph run`'s auto-partition pre-flight
-/// (the engine threads it as the consent seam's `confirm` provider and only
-/// invokes it on the interactive arm).
+/// Used by `graph partition` for an explicit interactive save.
 fn stdin_yes_no_confirm(preview: &str) -> CliResult<bool> {
     prompt_yes_no(preview, "Apply this partition to the graph file?")
 }
@@ -3653,9 +3778,10 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 /// exempting them would only move the failure later and word it worse.
 ///
 /// Two more things answer above this gate and therefore need no exemption here:
-/// clap's own `--help` and `--version`, which exit inside `Cli::parse()` before
-/// `main` has a body to run, and the usage refusals `main` performs before the
-/// gate call (a moved verb, a malformed resim invocation). You do not have to
+/// clap's own `--help` and `--version`, which exit inside the clap parse
+/// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
+/// refusals `main` performs before the gate call (a moved verb, a malformed
+/// resim invocation). You do not have to
 /// prove who you are to be told a command line is wrong.
 ///
 /// The exemptions are:
@@ -3670,6 +3796,13 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 ///   auth cache — auto-trigger an interactive device-code login MID-SPAWN,
 ///   wedging the whole run. (`bagd` is also internal but is dispatched away in
 ///   `main` BEFORE this hook, so it never reaches here.)
+/// - **`clean`** — it sweeps the iceoryx2 bookkeeping that provably dead
+///   processes left behind on THIS machine: it reads no account, sends nothing
+///   anywhere and reaches no network. The desks that need it most have never
+///   signed in — a CI runner, a fresh install a `kill -9` left wedged — and a
+///   machine must be able to clear its own state. Gating it would also make the
+///   remedy for a wedged desk depend on a device-code flow that the wedge is
+///   perfectly capable of outliving.
 ///
 /// The enforcement boundary: `run-worker` and `run-gateway` are hidden from
 /// help but still reachable as standalone `cerulion graph run-worker`
@@ -3680,15 +3813,33 @@ fn command_needs_identity(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Login
+            // Consent must be changeable without an account: opting out
+            // may not require signing in first.
+            | Commands::Telemetry { .. }
+            // Signing out must work on a machine whose session is gone or
+            // expired, and must never start a sign-in.
+            | Commands::Logout
             // Emitting a completion script is a pure local text
             // render — gating it behind the login flow would make `cerulion
             // completions zsh` in a shell rc file block startup on a device
             // -code prompt nobody is watching.
             | Commands::Completions { .. }
+            | Commands::Clean { .. }
             | Commands::Graph {
                 action: GraphAction::RunWorker { .. } | GraphAction::RunGateway { .. },
             }
     )
+}
+
+/// The platform refusal for `cerulion viz`, when the platform cannot run it,
+/// lifted out of `run_viz` so `dispatch` can refuse BEFORE the identity gate.
+/// `is_android` is an argument (not a cfg read) so the decision is
+/// oracle-testable on host. PURE.
+fn viz_refusal(command: &Commands, is_android: bool) -> Option<&'static str> {
+    if !matches!(command, Commands::Viz { .. }) {
+        return None;
+    }
+    cerulion_cli_engine::viz_client::unsupported_viz_message(is_android)
 }
 
 /// Install the process-wide shutdown-signal handler and return the shared
@@ -3762,12 +3913,12 @@ fn parse_port_args(args: &[String]) -> (String, String) {
 /// Bare names resolve via [`schema_cmd::resolve_port_schema`]
 /// (workspace YAML schemas win, then the workspace `.msg` store, then
 /// built-ins; a unique short name qualifies; ambiguous/unknown names are
-/// loud errors that propagate to the standard `Error:` handler). A name
-/// resolving to the `.msg` store — bare or qualified — is REFUSED via
-/// [`schema_cmd::refuse_store_port_scaffold`]: a store type has no
-/// generated Rust type, so the scaffolded import could never compile,
-/// and the refusal (naming the store type + the remedy) is the store
-/// hit's loud surface here. The engine re-refuses as the enforcement
+/// loud errors that propagate to the standard `Error:` handler). For a
+/// Rust port (`rust_port`), a name resolving to the `.msg` store, bare or
+/// qualified, goes through [`schema_cmd::refuse_store_port_scaffold`]: it is
+/// refused, with the config line to add, in a workspace that does not
+/// generate its store types into the message crate. A Python port reads the
+/// store through `cerulion.msgs`. The engine re-checks as the enforcement
 /// backstop. The presentation contract (the stderr-note option) for what
 /// proceeds:
 /// - a bare name resolved to a built-in prints a `note:` on EVERY
@@ -3780,10 +3931,12 @@ fn parse_port_args(args: &[String]) -> (String, String) {
 /// Returns the RESOLVED schema string to pass down to the engine,
 /// which re-resolves as the enforcement backstop (idempotent, so the
 /// double resolution is free and byte-identical).
-fn resolve_and_report(schemas_dir: &Path, raw: &str) -> CliResult<String> {
+fn resolve_and_report(schemas_dir: &Path, raw: &str, rust_port: bool) -> CliResult<String> {
     use cerulion_cli_engine::schema_cmd::PortSchemaProvenance;
     let resolved = schema_cmd::resolve_port_schema(schemas_dir, raw)?;
-    schema_cmd::refuse_store_port_scaffold(&resolved, raw)?;
+    if rust_port {
+        schema_cmd::refuse_store_port_scaffold(&resolved, raw, schemas_dir)?;
+    }
     match &resolved.provenance {
         PortSchemaProvenance::ResolvedBuiltin { qualified } => {
             eprintln!(
@@ -3865,12 +4018,21 @@ mod login_gate_exemption_tests {
 
     // Pin the load-bearing exemption surface so a
     // future edit that drops/reorders the match — un-exempting `login` (a doubled
-    // login) or the worker/gateway subprocess verbs (a mid-spawn wedge) — fails
-    // CI instead of shipping green.
+    // login), the worker/gateway subprocess verbs (a mid-spawn wedge) or `clean`
+    // (a wedged desk with no way to clear its own state) — fails CI instead of
+    // shipping green.
 
     #[test]
     fn login_verb_is_exempt() {
         assert!(!command_needs_identity(&Commands::Login));
+        assert!(!command_needs_identity(&Commands::Logout));
+    }
+
+    #[test]
+    fn telemetry_verb_is_exempt() {
+        assert!(!command_needs_identity(&Commands::Telemetry {
+            action: cli::TelemetryAction::Off,
+        }));
     }
 
     #[test]
@@ -3888,10 +4050,56 @@ mod login_gate_exemption_tests {
     }
 
     #[test]
-    fn ordinary_verbs_are_gated() {
-        // A representative spread of user-facing verbs must gate.
-        assert!(command_needs_identity(&Commands::Clean {
+    fn the_clean_verb_is_exempt() {
+        // `clean` sweeps provably dead local shared-memory bookkeeping: no
+        // account is read and nothing leaves the machine. The exemption is the
+        // VERB, so both forms of the flag carry it — a desk wedged badly enough
+        // to need the destructive form is exactly the desk that cannot sign in.
+        assert!(!command_needs_identity(&Commands::Clean {
+            report_only: true
+        }));
+        assert!(!command_needs_identity(&Commands::Clean {
             report_only: false
+        }));
+    }
+
+    #[test]
+    fn the_android_viz_refusal_fires_before_the_identity_gate() {
+        // A never-signed-in Android device must see the platform refusal, not
+        // a sign-in prompt: `viz_refusal` is what `dispatch` checks above the
+        // gate, and `viz` stays gated underneath it (it is NOT exempted).
+        let viz = Commands::Viz {
+            topics: vec!["/t".to_string()],
+            robot: None,
+            connect: Vec::new(),
+            listen: Vec::new(),
+            detach: false,
+        };
+        assert!(command_needs_identity(&viz));
+        assert_eq!(
+            viz_refusal(&viz, true),
+            cerulion_cli_engine::viz_client::unsupported_viz_message(true)
+        );
+        assert!(viz_refusal(&viz, true).is_some());
+        assert!(viz_refusal(&viz, false).is_none());
+        assert!(viz_refusal(&Commands::Login, true).is_none());
+    }
+
+    #[test]
+    fn ordinary_verbs_are_gated() {
+        // A representative spread of user-facing verbs must gate. Without this
+        // arm every assertion above would still hold for a build that exempted
+        // everything. `topic list` is the twin of the behavioural control in
+        // `tests/login_gate_e2e_test.rs`.
+        assert!(command_needs_identity(&Commands::Topic {
+            action: TopicAction::List {
+                all: false,
+                no_network: true,
+                connect: Vec::new(),
+                listen: Vec::new(),
+                scan: false,
+                show_types: false,
+            },
         }));
         assert!(command_needs_identity(&Commands::Graph {
             action: GraphAction::List,
@@ -3963,7 +4171,7 @@ mod resolve_and_report_tests {
         // resolves to the one qualified built-in.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_and_report(tmp.path(), "Vector3").unwrap(),
+            resolve_and_report(tmp.path(), "Vector3", true).unwrap(),
             "geometry_msgs/Vector3"
         );
     }
@@ -3974,7 +4182,7 @@ mod resolve_and_report_tests {
         // shape `parse_port_args` canonicalizes to) round-trip.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_and_report(tmp.path(), "geometry_msgs/Vector3").unwrap(),
+            resolve_and_report(tmp.path(), "geometry_msgs/Vector3", true).unwrap(),
             "geometry_msgs/Vector3"
         );
     }
@@ -3985,7 +4193,7 @@ mod resolve_and_report_tests {
         // resolver's Validation error propagates untouched (the
         // standard `Error:` handler renders it).
         let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_and_report(tmp.path(), "Pose2D").unwrap_err();
+        let err = resolve_and_report(tmp.path(), "Pose2D", true).unwrap_err();
         assert!(
             matches!(err, cerulion_cli_engine::error::CliError::Validation(_)),
             "expected Validation error, got {err:?}"
@@ -4000,7 +4208,7 @@ mod resolve_and_report_tests {
     #[test]
     fn unknown_bare_name_propagates_schema_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_and_report(tmp.path(), "Vectorr3").unwrap_err();
+        let err = resolve_and_report(tmp.path(), "Vectorr3", true).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -4281,7 +4489,7 @@ mod clap_parse_tests {
     //! touch the filesystem. They only verify clap accepts/rejects
     //! the args and that the parsed shape (Vec lengths) is what the
     //! handler expects.
-    use super::cli::{Cli, Commands, GraphAction, NodeAction};
+    use super::cli::{Cli, Commands, GraphAction, NodeAction, NodeLanguage};
     use clap::Parser;
 
     fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
@@ -4457,6 +4665,22 @@ mod clap_parse_tests {
     }
 
     #[test]
+    fn node_new_alias_and_python_language_parse() {
+        let cli = try_parse(&["cerulion", "node", "new", "counter", "--lang", "python"])
+            .expect("node new --lang python must parse");
+        let Commands::Node {
+            action: NodeAction::Create {
+                node_type, lang, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected NodeAction::Create");
+        };
+        assert_eq!(node_type, "counter");
+        assert_eq!(lang, NodeLanguage::Python);
+    }
+
+    #[test]
     fn dash_t_with_only_schema_is_rejected_by_clap() {
         // num_args = 2 means clap rejects single-arg invocations
         // BEFORE the handler runs. The earlier `num_args = 1..=2`
@@ -4586,6 +4810,35 @@ mod clap_parse_tests {
     }
 
     #[test]
+    fn python_create_with_raw_ffi_returns_validation_error() {
+        let _lock = crate::completion_wiring_tests::env_lock();
+        let _guard = crate::completion_wiring_tests::EnvGuard::capture();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = cerulion_cli_engine::workspace::workspace_create(tmp.path(), "test_ws")
+            .expect("workspace");
+        std::env::set_current_dir(&ws.root).expect("enter workspace");
+        let cli = try_parse(&[
+            "cerulion",
+            "node",
+            "create",
+            "python_raw",
+            "--lang",
+            "python",
+            "--raw-ffi",
+            "--policy",
+            "period_ms=1",
+        ])
+        .expect("parse Python raw FFI create");
+        let result = super::run(cli);
+        let err = result.expect_err("Python raw FFI must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+        );
+        assert!(!ws.nodes_dir.join("python_raw").exists());
+    }
+
+    #[test]
     fn policy_period_ms_parses() {
         let cli = try_parse(&[
             "cerulion",
@@ -4683,6 +4936,10 @@ mod resim_flag_mapping_tests {
             report: Some(PathBuf::from("/tmp/r.json")),
             tolerance: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state,
+            // The other bool that is inert on a step-0 bag rides the same
+            // switch, so both arms below cover it.
+            allow_param_change: strict_state,
+            record_out: Some(PathBuf::from("/tmp/o.mcap")),
         }
     }
 
@@ -4701,11 +4958,20 @@ mod resim_flag_mapping_tests {
             f.tolerance.as_deref(),
             Some(std::path::Path::new("/tmp/t.yaml"))
         );
+        assert_eq!(
+            f.record_out.as_deref(),
+            Some(std::path::Path::new("/tmp/o.mcap")),
+            "`--record-out` must survive the variant -> PlayFlags mapping"
+        );
         // THE one this exists for: inert on a step-0 bag, so no CLI e2e in this
         // repo can observe it being dropped.
         assert!(
             f.strict_state,
             "`--strict-state` must survive the variant -> PlayFlags mapping"
+        );
+        assert!(
+            f.allow_param_change,
+            "`--allow-param-change` must survive the variant -> PlayFlags mapping"
         );
     }
 
@@ -4715,6 +4981,7 @@ mod resim_flag_mapping_tests {
         // every bool would pass the arm above.
         let f = play_flags_of(&play(false, false)).expect("a `bag play` maps");
         assert!(!f.strict_state);
+        assert!(!f.allow_param_change);
         assert!(!f.verify);
         assert!(!f.repeat);
         assert!(f.rate.is_none());
@@ -4760,6 +5027,8 @@ mod is_resim_family_tests {
         report: Option<PathBuf>,
         tolerance: Option<PathBuf>,
         strict_state: bool,
+        allow_param_change: bool,
+        record_out: Option<PathBuf>,
     }
 
     fn play(f: Flags) -> BagAction {
@@ -4775,6 +5044,8 @@ mod is_resim_family_tests {
             report: f.report,
             tolerance: f.tolerance,
             strict_state: f.strict_state,
+            allow_param_change: f.allow_param_change,
+            record_out: f.record_out,
         }
     }
 
@@ -4873,6 +5144,20 @@ mod is_resim_family_tests {
                     ..Flags::default()
                 }),
             ),
+            (
+                "--allow-param-change",
+                play(Flags {
+                    allow_param_change: true,
+                    ..Flags::default()
+                }),
+            ),
+            (
+                "--record-out",
+                play(Flags {
+                    record_out: Some(PathBuf::from("/tmp/o.mcap")),
+                    ..Flags::default()
+                }),
+            ),
         ] {
             assert!(
                 is_resim_family(&action),
@@ -4886,5 +5171,29 @@ mod is_resim_family_tests {
         assert!(!is_resim_family(&BagAction::Info {
             bag: PathBuf::from("/tmp/b.mcap"),
         }));
+    }
+}
+
+#[cfg(test)]
+mod cli_error_exit_code_tests {
+    use super::cli_error_exit_code;
+    use cerulion_cli_engine::error::CliError;
+
+    /// A run that stopped a node on a fatal error exits 3, in process or in
+    /// a worker group; every other error exits 1.
+    #[test]
+    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+        let in_process = CliError::NodeFatal {
+            nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
+        };
+        let worker = CliError::WorkerNodeFatal {
+            groups: vec!["g0".to_string()],
+        };
+        assert_eq!(cli_error_exit_code(&in_process), 3);
+        assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::Validation("x".to_string())),
+            1
+        );
     }
 }

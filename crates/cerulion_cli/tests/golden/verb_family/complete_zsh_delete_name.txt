@@ -1,0 +1,4 @@
+exit: Some(0)
+--- stdout
+geometry_msgs/Pose:built-ingeometry_msgs/Pose2D:built-ingeometry_msgs/PoseArray:built-ingeometry_msgs/PoseStamped:built-ingeometry_msgs/PoseWithCovariance:built-ingeometry_msgs/PoseWithCovarianceStamped:built-in
+--- stderr

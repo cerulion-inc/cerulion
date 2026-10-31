@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cerulion_tf` - rigid transforms for Cerulion frames.
+#
+# WHY A CRATE. The SE(3) math (compose, invert, apply, interpolate) is pure:
+# no transport, no allocation, no I/O. Every later frame feature (the lookup
+# buffer, `/tf` and `/tf_static`, frame tree checks, `tf echo`, the robot state
+# publisher) builds on it, and its results must be bit-identical on every
+# machine so that frame lookups replay byte-exact. A leaf crate keeps it free of
+# the runtime's dependency tree and keeps its mutation check fast.
+# std + thiserror ONLY.
+[package]
+name = "cerulion_tf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Deterministic SE(3) rigid transform math for Cerulion frames: compose, invert, apply and SLERP interpolation with bit-identical results on every machine"
+keywords = ["robotics", "tf", "quaternion", "slerp", "cerulion"]
+categories = ["science::robotics", "mathematics"]
+# Not published to crates.io: no published crate depends on it.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"

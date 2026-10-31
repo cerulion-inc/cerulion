@@ -17,7 +17,7 @@ use cerulion_core::testing::TestTransport;
 use cerulion_core::transport::publisher::CerulionPublisher;
 use cerulion_core::transport::subscriber::CerulionSubscriber;
 
-use native_ros2_messages::control_msgs::MotionPrimitiveSnapshot;
+use native_ros2_messages::control_msgs::{CANopenState, MotionPrimitiveSnapshot, VDA5050State};
 use native_ros2_messages::geometry_msgs::{Pose, PoseShm, PoseSnapshot, QuaternionShm};
 use native_ros2_messages::moveit_msgs::{
     AllowedCollisionEntry, AllowedCollisionEntryShm, PlanningScene,
@@ -92,6 +92,23 @@ fn quaternion_default_is_identity() {
 fn motion_primitive_type_defaults_to_sentinel() {
     let m = MotionPrimitiveSnapshot::default();
     assert_eq!(m.r#type, -1);
+}
+
+// =====================================================================
+// message constants
+// =====================================================================
+
+/// Constants declared in a vendored `.msg` are associated constants on the
+/// marker, typed and valued as declared (`uint8 NMT_OPERATIONAL = 5`,
+/// `string MODE_MANUAL = "MANUAL"  # comment`).
+#[test]
+fn vendored_constants_are_typed_associated_constants() {
+    let operational: u8 = CANopenState::NMT_OPERATIONAL;
+    assert_eq!(operational, 5);
+    assert_eq!(CANopenState::DSP402_FAULT, 7);
+    let waiting: &str = VDA5050State::ACTION_WAITING;
+    assert_eq!(waiting, "WAITING");
+    assert_eq!(VDA5050State::MODE_MANUAL, "MANUAL");
 }
 
 // =====================================================================

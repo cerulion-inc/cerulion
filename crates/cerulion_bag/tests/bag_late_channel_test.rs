@@ -925,9 +925,9 @@ fn a_late_registration_is_one_write_and_no_extra_chunk_boundary() {
     // them by hand.
     let chan = channel_record_oracle(5, 6, "/late", &[]);
     // Schema record: opcode 0x03, u64 content len, id u16, name, encoding,
-    // u32-prefixed 18-byte descriptor.
+    // u32-prefixed 20-byte descriptor.
     const ENC: &str = "cerulion";
-    const DESCRIPTOR_LEN: usize = 18;
+    const DESCRIPTOR_LEN: usize = 20;
     let name = "sensor_msgs/Image";
     let schema_len = 1 + 8 + (2 + 4 + name.len() + 4 + ENC.len() + 4 + DESCRIPTOR_LEN);
     assert_eq!(

@@ -280,7 +280,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "bagd could not open {} of the {} trace ring(s) this run DECL#e0c05e73",
-            "bagd found node-state rings for HIGHER ranks than {gap} but #f4ea4579",
+            "bagd found node-state rings for HIGHER ranks than {gap} but #7d29717d",
             "bagd was BOUND to a run it NEVER HEARD — the watcher opened #777053d7",
             "bagd was BOUND to a run it NEVER HEARD, and it was stopped a#b9e6463c",
             "flashback: {complaint}#0a9cb805",
@@ -326,17 +326,6 @@ const DECLARED_SITES: &[Declared] = &[
                  forward a whole notice string a helper chose, where the value IS the\
                  message. The count is EXACT; lowering the interpolating half is the\
                  intended motion",
-    },
-    Declared {
-        path: "cerulion_cli_engine/src/multiprocess.rs",
-        interpolation: 1,
-        pass_through: 0,
-        messages: &["this partition SPLITS a same-level non-trigger edge across p#40255334"],
-        reason: "DEBT (CLI operator surface): lines splicing a runtime \
-                 value into the message. Not migrated — several \
-                 are matched by real-binary e2e oracles (`--peer-loss is ignored`,\
-                 `could not be acquired`), so each rewrite needs a paired test edit. The\
-                 count is EXACT; lowering it is the intended motion",
     },
     Declared {
         path: "cerulion_cli_engine/src/node_cmd.rs",
@@ -456,14 +445,13 @@ const DECLARED_SITES: &[Declared] = &[
     },
     Declared {
         path: "cerulion_netd/src/discovery_fold.rs",
-        interpolation: 5,
+        interpolation: 4,
         pass_through: 0,
         messages: &[
             "cerulion-netd: BUG — explicit {} locators are trusted by fia#62222164",
-            "cerulion-netd: no cached peers to fold — first contact relie#e7cc5b80",
-            "cerulion-netd: no home directory; cannot locate the peer cac#eaa6138a",
-            "every cached peer failed the reachability probe — none diall#8b5497af",
-            "folded verified cached peers into the netd session — first c#32676781",
+            "cerulion-netd: no peer answered the `_cerulion._tcp` browse #4c49cde7",
+            "every discovered peer failed the reachability probe, none di#3243729f",
+            "folded verified discovered peers (mDNS + cache) into the net#e45bfc87",
         ],
         reason: "DEBT (iroh-linking daemon, outside `default-members`): \
                  lines splicing a runtime value into the message. Not migrated: \
@@ -540,7 +528,7 @@ const DECLARED_SITES: &[Declared] = &[
         pass_through: 0,
         messages: &[
             "cerulion_viz skeleton: NONE of the {missing_count} URDF link#a3432342",
-            "cerulion_viz skeleton: only {resolved}/{expected} motor join#7b8540a5",
+            "cerulion_viz skeleton: only {resolved}/{expected} motor join#cf585b80",
             "cerulion_viz skeleton: resolved {resolved} link mesh(es) (.g#f1c4d44e",
             "cerulion_viz skeleton: {missing_count} of {total} URDF link #04a87128",
         ],
@@ -549,6 +537,33 @@ const DECLARED_SITES: &[Declared] = &[
                  migrated — the viz suite is its own matrixed CI \
                  job and the rerun tree is a multi-minute cold build. The count is EXACT; \
                  lowering it is the intended motion",
+    },
+    // ── rmw_cerulion ─────────────────────────────────────────────────────────
+    Declared {
+        path: "rmw_cerulion/src/api/init.rs",
+        interpolation: 0,
+        pass_through: 1,
+        messages: &["{why}#fdb1d293"],
+        reason: "PASS-THROUGH: forwards the replay refusal paragraph \
+                 `replay::on_init` built, the same string `rmw_init` hands \
+                 rcl as its error state, so the string is the whole message",
+    },
+    Declared {
+        path: "rmw_cerulion/src/replay/mod.rs",
+        interpolation: 0,
+        pass_through: 4,
+        messages: &[
+            "{line}#a697ae9f",
+            "{line}#a697ae9f",
+            "{line}#a697ae9f",
+            "{why}#fdb1d293",
+        ],
+        reason: "PASS-THROUGH: `note` forwards a replay report line (the \
+                 verdict line `docs/ros2_replay.md` shows) that it writes to \
+                 fd 2 verbatim when `tracing` is unusable at exit, so the line \
+                 is the whole message at one level per arm; `refuse` forwards \
+                 the refusal paragraph `refusal_message` built, the same \
+                 string set as the rcl error state",
     },
 ];
 
@@ -2067,7 +2082,7 @@ fn two_sites_share_a_ledger_key_only_if_they_share_a_message() {
 /// whether this line is the loud first of a regime or a counted repeat.
 const FORMERLY_COLLIDING_PAIR: (&str, &str) = (
     "cerulion_core/src/transport/network.rs",
-    "ingress: local publisher mutex poisoned — validated frame dr",
+    "ingress: local publisher mutex poisoned: validated frame dro",
 );
 
 #[test]

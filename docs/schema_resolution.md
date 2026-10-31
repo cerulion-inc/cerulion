@@ -88,10 +88,11 @@ schema-hash-divergence check, `graph run --record`'s recorded per-channel
 `wire_fixed_size` (as its cross-check and fallback; see "The recorded
 layout comes from the node" below), and `cerulion bag play --resim`'s
 tolerance field resolution. In `node create` / `node modify` port resolution the store is
-a RECOGNIZED tier between workspace YAML and the built-in corpus, but a
-store-typed port is refused with a precise error rather than scaffolded:
-a store type has no generated Rust type yet, so the scaffolded import
-could never compile (see "Port `SCHEMA` resolution" in `docs/user-api.md`).
+a tier between workspace YAML and the built-in corpus, and a store-typed
+port scaffolds as the type generated from the store file in both languages;
+a Rust port is refused, naming the line to add, in a workspace whose
+`.cargo/config.toml` does not generate its messages (see "Port `SCHEMA`
+resolution" and "Workspace messages" in `docs/user-api.md`).
 Everywhere, a workspace YAML schema outranks a same-named store type.
 
 A bare name two store packages define is never silently guessed, but each
@@ -153,7 +154,7 @@ no entries claims nothing.
 Every size surface (`schema info`'s resolved layout, the gateway's served
 hash bindings, the recorded `wire_fixed_size`, the replay registry and the
 recorder's schema corpus) applies one wire-representability rule: a schema is representable only if
-its smallest frame (the 32-byte wire header, the fixed section, and one
+its smallest frame (the 40-byte wire header, the fixed section, and one
 8-byte offset-table entry per variable field) fits the wire's `u32`
 `total_size`. A definition past that ceiling is refused by `schema info`
 (a `.msg` store definition and a workspace YAML entry alike; the entry is

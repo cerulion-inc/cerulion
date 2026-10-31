@@ -1,0 +1,3 @@
+[INFO] [T] [host_endpoint_manager]: Initialized shared memory registry for domain 0 on host <HOST>
+[INFO] [T] [rclcpp]: signal_handler(signum=15)
+[INFO] [T] [rclcpp]: signal_handler(signum=15)

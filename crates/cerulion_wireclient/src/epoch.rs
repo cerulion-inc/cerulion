@@ -4,7 +4,7 @@
 //!
 //! # Why this lives here (one implementation, two callers)
 //!
-//! Two desk paths dial the SAME `cerulion/wire/1` control plane and therefore both
+//! Two desk paths dial the SAME `cerulion/wire/2` control plane and therefore both
 //! carry the epoch (revocation propagation is NOT opt-in):
 //!
 //! - `cerulion_netd`'s iroh WAN plane, on every dial of a WAN robot;

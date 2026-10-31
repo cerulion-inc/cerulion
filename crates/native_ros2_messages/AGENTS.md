@@ -21,6 +21,14 @@ upstream ROS 2: only `upstream_drift_test` compares against an external truth
 - Hash-affecting corpus changes deploy to desk AND robot in lockstep - nothing on
   the wire signals the skew; affected topics render nothing, silently.
 
+- Workspace mode: with `CERULION_WORKSPACE_MSGS=<workspace root>` in the build
+  env (a user workspace's `.cargo/config.toml` sets it) `build.rs` generates
+  EVERY module from `SchemaSet::from_workspace_with_builtins`, the set the
+  Python front ends resolve, and prints resolver warnings instead of panicking.
+  Without it the output is the vendored corpus alone; `BUILTIN_MSGS` is the
+  vendored corpus in both modes. The CLI pins the variable's spelling against
+  this file (`workspace.rs`).
+
 ## Testing
 
 ```bash

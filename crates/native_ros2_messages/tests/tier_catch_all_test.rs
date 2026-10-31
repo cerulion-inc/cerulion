@@ -261,14 +261,14 @@ fn the_fixed_types_in_the_catch_all_packages_never_consult_the_tier_table() {
         vm::Pose2D,
     );
 
-    // The headline number, spelled out: UUID's whole frame is 48 bytes, and the
+    // The headline number, spelled out: UUID's whole frame is 56 bytes, and the
     // 16 of them that are payload are `uint8[16]`.
     assert_eq!(<ui::UUID as ShmMessage>::WIRE_FIXED_SIZE, 16);
     assert_eq!(
         <ui::UUID as ShmMessage>::MAX_SLICE_LEN,
-        MaxSliceLen::try_new(48),
-        "unique_identifier_msgs/UUID is a 48-byte frame — 32 B of WireHeader plus 16 B of \
-         payload — and reaches that number without the tier table's involvement",
+        MaxSliceLen::try_new(56),
+        "unique_identifier_msgs/UUID is a 56-byte frame: 40 B of WireHeader plus 16 B of \
+         payload, and it reaches that number without the tier table's involvement",
     );
 }
 

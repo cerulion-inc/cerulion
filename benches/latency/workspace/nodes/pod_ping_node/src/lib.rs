@@ -38,6 +38,21 @@ use cerulion_core::prelude::*;
 
 use cer_bench_msgs::{PodPayload, PODPAYLOAD_WIRE_SIZE};
 
+/// The wall-grid slot decision, identical to ping_node's `grid_slot` (the
+/// two nodes are separate cdylib crates); its docs and tests live there.
+pub(crate) fn grid_slot(
+    anchor_ns: u64,
+    last_slot: u64,
+    now_ns: u64,
+    period_ns: u64,
+) -> Option<(u64, u64)> {
+    let slot = (now_ns.saturating_sub(anchor_ns) + period_ns / 2) / period_ns;
+    if slot <= last_slot {
+        return None;
+    }
+    Some((slot, slot - last_slot - 1))
+}
+
 #[cerulion_node(period_ms = 1)]
 pub struct PodPingNode {
     #[output]
@@ -51,7 +66,10 @@ pub struct PodPingNode {
     /// rate from CER_BENCH_TARGET_RATE_HZ (0 = ungated, backtoback).
     rate_hz: u64,
     period_ns: u64,
-    next_slot_ns: u64,
+    /// Wall time of the first tick (grid slot 0); 0 until it arrives.
+    anchor_ns: u64,
+    /// The grid slot the last publish filled (see [`grid_slot`]).
+    last_slot: u64,
     /// Grid slots the graph failed to reach in time (skip-forward,
     /// never burst) — the cannot-sustain observable.
     slots_skipped: u64,
@@ -169,17 +187,20 @@ impl PodPingNode {
         // real_ns() read is OUTSIDE the stamp→publish span.
         if self.period_ns > 0 {
             let now = self.real_ns();
-            if self.next_slot_ns == 0 {
-                self.next_slot_ns = now;
-            }
-            if now < self.next_slot_ns {
-                return Ok(());
-            }
-            self.next_slot_ns += self.period_ns;
-            if self.next_slot_ns <= now {
-                let missed = (now - self.next_slot_ns) / self.period_ns + 1;
-                self.slots_skipped += missed;
-                self.next_slot_ns += missed * self.period_ns;
+            if self.anchor_ns == 0 {
+                // Anchor the grid at the first fire, which publishes.
+                self.anchor_ns = now;
+            } else {
+                // A tick nearer the slot already filled than the next one
+                // publishes nothing; every slot it jumped past is counted
+                // as skipped (never burst). See `grid_slot`.
+                match grid_slot(self.anchor_ns, self.last_slot, now, self.period_ns) {
+                    None => return Ok(()),
+                    Some((slot, skipped)) => {
+                        self.last_slot = slot;
+                        self.slots_skipped += skipped;
+                    }
+                }
             }
         }
         // G3: the prep write triggers the lazy SHM loan BEFORE the
@@ -209,5 +230,25 @@ impl PodPingNode {
             self.leg, self.published, self.slots_skipped
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod grid_slot_tests {
+    use super::grid_slot;
+
+    /// The copy answers what ping_node's `grid_slot` answers on the shapes
+    /// its tests pin (early anchor, stall, half-period boundary).
+    #[test]
+    fn the_copy_matches_ping_nodes_rule() {
+        const P: u64 = 10_000_000;
+        assert_eq!(
+            grid_slot(1_000_300_000, 0, 1_000_000_000 + P + 40_000, P),
+            Some((1, 0))
+        );
+        assert_eq!(grid_slot(0, 0, 4 * P + 100_000, P), Some((4, 3)));
+        assert_eq!(grid_slot(0, 4, 4 * P + 101_000, P), None);
+        assert_eq!(grid_slot(0, 0, P + P / 2 + 1, P), Some((2, 1)));
+        assert_eq!(grid_slot(0, 0, P / 2 - 1, P), None);
     }
 }

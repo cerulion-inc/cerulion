@@ -1512,6 +1512,7 @@ fn build_probe_frame(time_frame: u64, video_height: u32, au: &[u8], timestamp_ns
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1826,6 +1827,7 @@ fn build_compressed_image_frame(format: &[u8], blob: &[u8], timestamp_ns: u64) -
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

@@ -1,0 +1,22 @@
+// The proto3 schema the hand-written prost structs in src/pb.rs implement.
+// src/pb.rs is written by hand in the shape prost-build emits for this file
+// (the `#[derive(prost::Message)]` structs), so a build needs no protoc.
+syntax = "proto3";
+package wirecmp;
+message Time { int32 sec = 1; uint32 nanosec = 2; }
+message Header { Time stamp = 1; string frame_id = 2; }
+message ImuSample {
+  uint64 stamp_ns = 1; uint32 seq = 2; uint32 status = 3;
+  double ox = 4; double oy = 5; double oz = 6; double ow = 7;
+  double avx = 8; double avy = 9; double avz = 10;
+  double lax = 11; double lay = 12; double laz = 13;
+}
+message Image {
+  Header header = 1; uint32 height = 2; uint32 width = 3; string encoding = 4;
+  uint32 is_bigendian = 5; uint32 step = 6; bytes data = 7;
+}
+message PointField { string name = 1; uint32 offset = 2; uint32 datatype = 3; uint32 count = 4; }
+message PointCloud2 {
+  Header header = 1; uint32 height = 2; uint32 width = 3; repeated PointField fields = 4;
+  bool is_bigendian = 5; uint32 point_step = 6; uint32 row_step = 7; bytes data = 8; bool is_dense = 9;
+}

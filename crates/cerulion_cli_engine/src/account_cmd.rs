@@ -765,7 +765,8 @@ mod tests {
     #[test]
     fn the_writer_resolves_the_shared_epoch_cache_path() {
         let _lock = env_lock();
-        let _snap = EnvSnapshot::take(&["HOME", EPOCH_DIR_ENV]);
+        let _snap = EnvSnapshot::take(&["HOME", "CERULION_HOME", EPOCH_DIR_ENV]);
+        std::env::remove_var("CERULION_HOME");
 
         // The env NAME is the shared desk-wide one (never a writer-private alias).
         assert_eq!(EPOCH_DIR_ENV, "CERULION_EPOCH_DIR");

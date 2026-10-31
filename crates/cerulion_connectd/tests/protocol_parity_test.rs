@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The SHAPE-PARITY pin between `cerulion_connectd`'s MIRRORED
-//! `cerulion/wire/1` control types and the ROBOT's serve types
+//! `cerulion/wire/2` control types and the ROBOT's serve types
 //! (`cerulion_remoted::wire`).
 //!
 //! `cerulion_connectd` MIRRORS the wire protocol instead of importing
@@ -44,6 +44,7 @@ where
 /// A catalog reply carrying both a hashed and a silent (None) topic.
 fn a_catalog() -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: "go2".to_string(),
         entries: vec![

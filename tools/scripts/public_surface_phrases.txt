@@ -6,3 +6,4 @@
 not yet published to crates.io
 closed alpha
 Rust 1.88
+waitlist

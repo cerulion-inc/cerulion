@@ -7,7 +7,8 @@
 //!
 //! * a whole anchor really crossing a `MAP_SHARED` segment and coming back
 //!   byte-identical, with `node_idx` resolving through the ring MANIFEST and the
-//!   producer RANK riding the ring HEADER (rank does not ride the record);
+//!   producer RANK riding the ring HEADER and, from state record format version 1,
+//!   every RECORD too;
 //! * the ring really selecting [`OverrunPolicy::Backpressure`], and a consumer
 //!   REFUSING one that did not — the "no inert shipping" proof that the mode is not
 //!   a comment;
@@ -31,8 +32,9 @@ use cerulion_core::shm_ring::{OverrunPolicy, ShmRingOwner};
 use cerulion_core::state_ring::{
     encode_record, scan_state_ring_ranks, state_ring_shm_name, state_ring_tag,
     unlink_stale_state_rings, StateAnchorEvent, StateAssembler, StateRecordHeader,
-    StateRingConsumer, StateRingError, StateRingOwner, TornCause, RECORD_KIND_CHUNK,
-    RECORD_KIND_FINAL, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE, STATE_RING_PROBE_GAP_TOLERANCE,
+    StateRingConsumer, StateRingError, StateRingOwner, TornCause, RECORD_KIND_CHUNK_V2,
+    RECORD_KIND_FINAL_V2, STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
+    STATE_RING_PROBE_GAP_TOLERANCE,
 };
 use cerulion_core::trace_ring::encode_manifest;
 
@@ -51,7 +53,7 @@ fn tag(name: &str) -> String {
 const DEADLINE: Duration = Duration::from_secs(30);
 
 /// A blob that is its OWN oracle: byte `i` is `(i * 7 + 3) % 251`, so a reassembly
-/// that dropped, duplicated or reordered a 480-byte chunk cannot look right.
+/// that dropped, duplicated or reordered a 472-byte chunk cannot look right.
 fn blob(n: usize) -> Vec<u8> {
     (0..n).map(|i| ((i * 7 + 3) % 251) as u8).collect()
 }
@@ -74,12 +76,15 @@ fn drain_all(c: &mut StateRingConsumer, asm: &mut StateAssembler) -> Vec<StateAn
 ///
 /// It also pins the two identity halves kept deliberately separate: `node_idx` is an
 /// INDEX resolved through the ring MANIFEST (a fixed-width name field would collide
-/// two nodes sharing a prefix), and `rank` rides the ring HEADER, not the record.
+/// two nodes sharing a prefix), and `rank` is a ring HEADER field AND, from state
+/// record format version 1, a RECORD field, because a record that has left its ring
+/// must still name the rank that produced it. The halves stay separate in that
+/// `node_idx` is still resolved through THAT rank's manifest.
 #[test]
 fn a_multi_record_anchor_crosses_the_segment_and_reassembles_byte_identically() {
     const RUN: u64 = 0xDEAD_BEEF_0000_0001;
     const STEP: u64 = 4_242;
-    let want = blob(1_100); // 3 records: 480 + 480 + 140
+    let want = blob(1_100); // 3 records: 472 + 472 + 156
 
     let mut owner = StateRingOwner::create(
         &tag("roundtrip"),
@@ -147,7 +152,7 @@ fn a_boundary_exact_anchor_and_the_one_byte_over_twin_differ_by_exactly_one_reco
 
     let mut sink = producer.sink(1, 0);
     sink.append(&exact);
-    assert_eq!(sink.finish(), 3, "3 * 480 becomes exactly 3 records");
+    assert_eq!(sink.finish(), 3, "3 * 472 becomes exactly 3 records");
     let after_exact = producer.pushed();
     assert_eq!(after_exact, 3);
 
@@ -216,11 +221,13 @@ fn two_nodes_written_interleaved_reassemble_independently() {
                 node_idx,
                 part: i as u32,
                 kind: if i == 2 {
-                    RECORD_KIND_FINAL
+                    RECORD_KIND_FINAL_V2
                 } else {
-                    RECORD_KIND_CHUNK
+                    RECORD_KIND_CHUNK_V2
                 },
                 len: piece.len() as u32,
+                rank: 0,
+                format_version: STATE_RECORD_FORMAT_VERSION,
             };
             producer.push_record(&encode_record(&header, piece));
         }
@@ -276,11 +283,13 @@ fn an_omitted_middle_record_is_torn_over_the_real_ring_and_serves_no_short_blob(
             node_idx: 0,
             part: i as u32,
             kind: if i == 3 {
-                RECORD_KIND_FINAL
+                RECORD_KIND_FINAL_V2
             } else {
-                RECORD_KIND_CHUNK
+                RECORD_KIND_CHUNK_V2
             },
             len: piece.len() as u32,
+            rank: 0,
+            format_version: STATE_RECORD_FORMAT_VERSION,
         };
         producer.push_record(&encode_record(&header, piece));
     }
@@ -318,8 +327,9 @@ fn an_omitted_middle_record_is_torn_over_the_real_ring_and_serves_no_short_blob(
 /// and at OPEN.
 ///
 /// A state ring under `FailLoud` does not merely go slower: the writer never waits,
-/// so a 1.09 M-record anchor laps a fixed ring and the anchor is LOST. Refusing at
-/// open turns that into one error instead of a bag full of torn anchors.
+/// so a 500 MB anchor, which is ~1.11 M records at the 472-byte payload region, laps
+/// a fixed ring and the anchor is LOST. Refusing at open turns that into one error
+/// instead of a bag full of torn anchors.
 ///
 /// Its ANTI-TAUTOLOGY half is the headline round trip above, which opens a
 /// backpressure ring through the same code path and succeeds.

@@ -1,0 +1,12 @@
+exit: Some(0)
+--- stdout
+
+set edit:completion:arg-completer[cerulion] = { |@words|
+    var index = (count $words)
+    set index = (- $index 1)
+
+    put (env _CLAP_IFS="\n" _CLAP_COMPLETE_INDEX=(to-string $index) COMPLETE="elvish" <BIN> -- $@words) | to-lines
+}
+
+
+--- stderr

@@ -78,6 +78,8 @@ fn producer_graph(
         identity: format!("{prefix}_{node_id}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: node_id.to_string(),
             node_type: "cam".to_string(),

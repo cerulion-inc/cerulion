@@ -607,7 +607,7 @@ impl<T: ForkCaptureTarget> NodeEncoder for ForkSetEncoder<'_, T> {
                         //
                         // Dropping publishes nothing at all when nothing has filled a
                         // record yet (the common case — a header is 16 bytes against a
-                        // 480-byte payload), and leaves an explicitly TRUNCATED stream
+                        // 472-byte payload), and leaves an explicitly TRUNCATED stream
                         // when the encode had already flushed records. Both are accurate,
                         // and the skip below names the cause.
                         drop(sink);

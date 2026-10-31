@@ -99,6 +99,8 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
         prefix: "pw".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -112,6 +114,8 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),
@@ -274,7 +278,7 @@ fn send_overflow_frame_resets_promise_within() {
 ///
 /// `send_raw_loan` is the rmw bridge's publish (flatten-into-loan, plus the
 /// loaned-message borrow window). It had ZERO test callers anywhere in the tree:
-/// `max_loaned_samples_test` and `clean_orphan_port_tag_test` loan and DROP
+/// `max_loaned_samples_test` loans and DROPS
 /// without sending, and every other caller is in `rmw_cerulion`'s own `api`
 /// module. The reason nobody noticed is that `record_promise_within_published`'s
 /// own doc asserted it was "covered e2e by `promise_within_iox2_test`" — the
@@ -552,6 +556,8 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
         prefix: "pwd".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "drainpromise".to_string(),
@@ -565,6 +571,8 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),

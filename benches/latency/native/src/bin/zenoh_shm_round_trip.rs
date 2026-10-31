@@ -41,9 +41,9 @@ fn run_round_trip(
     payload_size: usize,
     plan: &mut BenchPlan,
 ) -> Vec<u64> {
-    // Provider sized 2x payload with a 1 MiB floor — zenoh 1.7.2's
-    // default Talc backend rejects sub-MiB allocations on Linux
-    // ("Error initializing Talc backend!" panic on small backends).
+    // Provider sized 2x payload with a 1 MiB floor. zenoh 1.7.2's
+    // default Talc backend panicked on sub-MiB backends on Linux
+    // ("Error initializing Talc backend!"); the floor is kept on 1.10.1.
     // The floor doesn't change observed latency for the small payloads:
     // the SHM region is mmap'd lazily, so unused headroom is free.
     let backend_size = (payload_size * 2).max(1024 * 1024);

@@ -140,6 +140,8 @@ fn build_graph(val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
         prefix: "chb".to_string(),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -147,6 +149,8 @@ fn build_graph(val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "hold_block_probe".to_string(),
@@ -157,6 +161,8 @@ fn build_graph(val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "drain".to_string(),

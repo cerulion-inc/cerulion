@@ -7,8 +7,8 @@
 //! Pins, over the REAL binary (`CARGO_BIN_EXE_cerulion`):
 //! 1. the NEW spelling works — `ros2 attach --help` serves the attach flag
 //!    surface, `ros2 --help` lists the verb, and a non-workspace invocation
-//!    reaches the ENGINE path (it fails on workspace discovery, not on verb
-//!    resolution);
+//!    reaches the ENGINE path (a write from outside a workspace fails on
+//!    workspace discovery, not on verb resolution; `--dry-run` does not);
 //! 2. the OLD spelling fails LOUDLY — exit 2 (usage, the "your command line
 //!    is stale" code) with stderr EXACTLY the migration message naming
 //!    `cerulion ros2 attach`, byte-pinned against `main.rs`'s
@@ -23,7 +23,9 @@
 //! the exit code and the stderr text.
 //!
 //! Every subprocess is a plain, self-terminating call under an ISOLATED
-//! `HOME` and a temp (non-workspace) cwd — no transport, no `#[serial]`.
+//! `HOME` and a temp (non-workspace) cwd. The write-path arm stops before
+//! discovery. The dry-run arm reaches discovery and is bounded by a short
+//! `--timeout`. No `#[serial]`.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -33,6 +35,10 @@ use std::process::{Command, Output};
 /// so the byte-for-byte duplication is what pins the shipped text.
 const MIGRATION_MSG: &str = "`cerulion ros attach` has moved: the verb is now `cerulion ros2 attach` (the `ros` family was folded into `ros2`). Re-run the same invocation with `ros2` in place of `ros`.";
 
+/// The name prefix of the temporary root a workspace-less `--dry-run`
+/// creates; the engine derives the rest of the name from the pid.
+const DRY_RUN_ROOT_PREFIX: &str = "cerulion-attach-dry-run-";
+
 fn run(args: &[&str], home: &Path, cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cerulion"))
         .args(args)
@@ -41,6 +47,23 @@ fn run(args: &[&str], home: &Path, cwd: &Path) -> Output {
         // `IOX2_LOG_LEVEL` makes `init_iceoryx_log_level_from_env` print a
         // fallback line, which would break the EXACT stderr oracle below for
         // an env reason rather than a verb reason.
+        .env("IOX2_LOG_LEVEL", "error")
+        .current_dir(cwd)
+        .output()
+        .expect("run cerulion")
+}
+
+/// `run` with the child's `TMPDIR` pinned INSIDE this test's tempdir, so
+/// (a) the workspace-less `--dry-run` creates its exclusive root under a
+/// directory the test owns (the leftover scan below then asserts about this
+/// test's own files, never the machine's shared `/tmp`, the same hermetic
+/// rule the `cerulion clean` tests follow), and (b) the child is isolated
+/// from an ambient `TMPDIR` a CI host might set.
+fn run_with_pinned_tmp(args: &[&str], home: &Path, cwd: &Path, tmp_root: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .args(args)
+        .env("HOME", home)
+        .env("TMPDIR", tmp_root)
         .env("IOX2_LOG_LEVEL", "error")
         .current_dir(cwd)
         .output()
@@ -86,6 +109,62 @@ fn command_entries(help: &str) -> Vec<String> {
         }
     }
     entries
+}
+
+/// Names under `dir` that a workspace-less `--dry-run` could have left behind.
+///
+/// FAIL CLOSED on both reads. A directory that cannot be listed, and an entry
+/// that cannot be read, are errors rather than absences: the oracle below is
+/// "no leftovers", and a scan that skipped what it could not read would report
+/// exactly that for a directory it never saw.
+fn leftover_root_names(dir: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    leftover_root_names_in(std::fs::read_dir(dir)?)
+}
+
+/// [`leftover_root_names`] over an already-opened listing, so an arm can hand
+/// it an entry that fails to read. The name is matched on its raw bytes, so a
+/// name that is not UTF-8 cannot be skipped either.
+fn leftover_root_names_in(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        if name
+            .as_encoded_bytes()
+            .starts_with(DRY_RUN_ROOT_PREFIX.as_bytes())
+        {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// The leftover scan the dry-run arm relies on refuses what it cannot read.
+#[test]
+fn the_leftover_scan_fails_closed_on_a_read_it_cannot_complete() {
+    // An entry that fails to read is a failure, never a skipped entry.
+    let unreadable: Vec<std::io::Result<std::fs::DirEntry>> =
+        vec![Err(std::io::Error::other("entry could not be read"))];
+    let err = leftover_root_names_in(unreadable).expect_err("an unreadable entry must fail");
+    assert_eq!(err.to_string(), "entry could not be read");
+    // A listing it CAN read yields the verb's leftovers and nothing else, so
+    // the empty result the dry-run arm asserts on is not vacuous.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leftover = format!("{DRY_RUN_ROOT_PREFIX}4242");
+    std::fs::create_dir(dir.path().join(&leftover)).expect("a leftover root");
+    std::fs::create_dir(dir.path().join("unrelated")).expect("an unrelated entry");
+    assert_eq!(
+        leftover_root_names(dir.path()).expect("a listable directory"),
+        vec![std::ffi::OsString::from(&leftover)]
+    );
+    // A directory that cannot be listed is a failure too, never "no leftovers".
+    let not_a_dir = dir.path().join("plain-file");
+    std::fs::write(&not_a_dir, b"").expect("a plain file");
+    assert!(
+        leftover_root_names(&not_a_dir).is_err(),
+        "a listing that cannot be opened must fail, not read as empty"
+    );
 }
 
 #[test]
@@ -187,25 +266,94 @@ fn the_new_spelling_serves_help_and_reaches_the_engine_path() {
          not the migration stub; stderr:\n{noiface_err}"
     );
 
-    // Behavior parity: a well-formed invocation from a NON-workspace cwd
-    // reaches the engine dispatch (the same `discover_workspace()`-first path
-    // the old spelling took) and fails there — exit 1, no migration text.
+    // The WRITE path from a non-workspace cwd reaches workspace discovery
+    // (exit 1) and never the old-spelling migration text. `--yes` is what
+    // would write; it still needs a workspace, and the check runs before
+    // DDS discovery.
     let engine = run(
-        &["ros2", "attach", "--iface", "10.0.0.7", "--dry-run"],
+        &["ros2", "attach", "--iface", "10.0.0.7", "--yes"],
         &home,
         tmp.path(),
     );
     assert_eq!(
         engine.status.code(),
         Some(1),
-        "a non-workspace `ros2 attach` must fail in the engine (workspace \
-         discovery), not at verb resolution"
+        "a non-workspace `ros2 attach` that would write must fail on \
+         workspace discovery, not at verb resolution"
     );
     let engine_err = String::from_utf8_lossy(&engine.stderr);
     assert!(
-        engine_err.contains("workspace") && !engine_err.contains(MIGRATION_MSG),
+        engine_err.contains("Workspace not found") && !engine_err.contains(MIGRATION_MSG),
         "the failure must be workspace discovery reached THROUGH the verb, \
          with no migration text; stderr:\n{engine_err}"
+    );
+
+    // `--dry-run` writes nothing, so the same directory is not an error.
+    // `10.0.0.7` is not a local interface, so discovery itself refuses. That
+    // refusal is what shows the command got past the workspace gate. The
+    // window is short so the arm stays bounded if a bind does wait.
+    // `TMPDIR` is pinned inside this test's tempdir, so the exclusive root
+    // the verb creates lands where the leftover scan below can see it (and
+    // only it).
+    let pinned_tmp = tmp.path().join("pinned-tmp");
+    std::fs::create_dir_all(&pinned_tmp).expect("pinned tmpdir");
+    let dry = run_with_pinned_tmp(
+        &[
+            "ros2",
+            "attach",
+            "--iface",
+            "10.0.0.7",
+            "--timeout",
+            "0.05",
+            "--dry-run",
+        ],
+        &home,
+        tmp.path(),
+        &pinned_tmp,
+    );
+    let dry_err = String::from_utf8_lossy(&dry.stderr);
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        !dry_err.contains("Workspace not found") && !dry_err.contains(MIGRATION_MSG),
+        "`ros2 attach --dry-run` outside a workspace must not be a workspace \
+         error or the old spelling; stderr:\n{dry_err}"
+    );
+    // A COMPLETE-OUTCOME oracle: exactly two completions are legitimate,
+    // each pinned with its own evidence, so non-empty stdout alone never
+    // counts as the dry-run working:
+    // (a) discovery REFUSED: exit 1, the refusal names DDS, no report; or
+    // (b) discovery COMPLETED (e.g. an empty window): exit 0, the report
+    // printed, ending with the automatic MIGRATION section every attach
+    // report carries. An early exit (workspace error, clap usage exit 2, a
+    // crash) matches neither arm.
+    let code = dry.status.code();
+    let refused = code == Some(1) && dry_err.contains("DDS discovery failed") && dry_out.is_empty();
+    // The completed arm requires the report's HEADLINE too, not just its
+    // MIGRATION tail: an implementation that printed only the tail with no
+    // discovery report must not pass as "completed".
+    let completed = code == Some(0)
+        && dry_out.contains("DISCOVERED DDS TOPICS")
+        // The literal quotes the renderer's shipped headline verbatim, dash
+        // included; the diff-scoped gate takes this comment as the waiver.
+        && dry_out.contains("MIGRATION — what could run natively"); // dash-ok
+    assert!(
+        refused || completed,
+        "`ros2 attach --dry-run` outside a workspace must either refuse AT discovery \
+         (exit 1, DDS named, no report) or complete and print the report (exit 0, with \
+         its MIGRATION tail); got code={code:?}\nstderr:\n{dry_err}\nstdout:\n{dry_out}"
+    );
+    // The exclusively created temp root is dropped again on the failure
+    // path: no `cerulion-attach-dry-run-*` entry may remain under the
+    // PINNED temp dir (this test's own directory, never the machine's
+    // shared temp) for a PID-reusing successor to read. The scan reads the
+    // directory FAIL CLOSED, so a leftover it could not read fails the arm
+    // instead of passing as an absence.
+    let leftovers =
+        leftover_root_names(&pinned_tmp).expect("the pinned tempdir must read completely");
+    assert!(
+        leftovers.is_empty(),
+        "the workspace-less dry-run must remove its temporary root on every \
+         exit path; found: {leftovers:?}"
     );
 }
 

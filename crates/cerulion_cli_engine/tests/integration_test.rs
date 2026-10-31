@@ -205,62 +205,74 @@ fn test_node_modify_promote_missing_input_errors() {
     );
 }
 
-/// The generated workspace `Cargo.toml` must NOT carry its own
-/// `iceoryx2` pin. The user inherits `cerulion_core`'s EXACT `=0.9.1`
-/// transitive pin — Cargo honours an exact (`=`) requirement through the
-/// dependency graph, so any consumer of `cerulion_core` already resolves
-/// iceoryx2 to exactly the version `cerulion_core` chose, today (path dep)
-/// and post-publish (crates.io dep). Adding an independent iceoryx2 line
-/// to the scaffold would create a SECOND source of truth that could drift
-/// from `cerulion_core`'s choice and would block the planned
-/// `cerulion_core` auto-updater (which bumps the pin in one place).
+/// The generated workspace `Cargo.toml` must NOT carry its own `iceoryx2`
+/// DEPENDENCY. The version requirement comes from `cerulion_core` alone, so a
+/// dependency line here would be a second source of truth that could drift
+/// from `cerulion_core`'s choice.
+///
+/// The one place an `iceoryx2` key may appear is `[patch.crates-io]`: Cargo
+/// applies `[patch]` only from the root manifest, never from a dependency, so
+/// the scaffold must redirect the iceoryx2 family to the same fork build the
+/// CLI links. That patch changes the source, not the requirement, and
+/// `workspace::tests::generated_manifests_patch_the_whole_iceoryx2_family_at_the_root_pin`
+/// holds its revision to the root `Cargo.toml` pin.
 ///
 /// This is the cheap, always-on regression guard: a future accidental
-/// stray pin in `workspace.rs` / `templates.rs` is caught here in CI
-/// without needing the toolchain or a full dependency resolution.
+/// stray dependency pin in `workspace.rs` / `templates.rs` is caught here in
+/// CI without needing the toolchain or a full dependency resolution.
 #[test]
-fn generated_workspace_has_no_iceoryx2_pin_and_depends_on_cerulion_core() {
+fn generated_workspace_patches_iceoryx2_without_depending_on_it() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = workspace::workspace_create(tmp.path(), "no_pin_ws").unwrap();
     let content = std::fs::read_to_string(ws.root.join("Cargo.toml")).unwrap();
 
-    // The transitive-pin SOURCE must be present: the scaffold depends on
-    // cerulion_core, which is where the `=0.9.1` iceoryx2 pin lives.
+    // The requirement SOURCE must be present: the scaffold depends on
+    // cerulion_core, which is where the iceoryx2 requirement lives.
     assert!(
         content.contains("cerulion_core"),
-        "scaffold must depend on cerulion_core (the transitive iceoryx2-pin source); \
+        "scaffold must depend on cerulion_core (the iceoryx2 requirement source); \
          got:\n{content}"
     );
 
-    // The regression guard: no `iceoryx2` DEPENDENCY entry. We match on a
-    // line whose first non-whitespace token is `iceoryx2` followed by `=`
-    // (a TOML dependency key like `iceoryx2 = "..."` or `iceoryx2 = {...}`),
-    // NOT a bare substring — the word may one day appear legitimately inside
-    // a path string or a comment (e.g. `# pinned via iceoryx2`) and that
-    // must not trip the guard. There are no such occurrences today; this is
-    // robustness for the future.
+    // The regression guard: no `iceoryx2` key outside `[patch.crates-io]`. We
+    // match on a line whose first non-whitespace token is `iceoryx2` followed
+    // by `=` (a TOML key like `iceoryx2 = "..."` or `iceoryx2 = {...}`), NOT a
+    // bare substring, so the word inside a path string or a comment does not
+    // trip the guard.
+    let mut section = String::new();
+    let mut patched = false;
     for line in content.lines() {
         let trimmed = line.trim_start();
-        let is_iceoryx2_dep = trimmed
+        if trimmed.starts_with('[') {
+            section = trimmed.trim_end().to_string();
+            continue;
+        }
+        let is_iceoryx2_key = trimmed
             .strip_prefix("iceoryx2")
             .map(|rest| {
                 // Next non-whitespace char must be `=` (the TOML key/value
-                // separator) to count as a dependency entry. This rejects
-                // e.g. `iceoryx2-log = ...` (the char after the prefix is
-                // `-`, not whitespace-then-`=`).
+                // separator). This rejects e.g. `iceoryx2-log = ...` (the
+                // char after the prefix is `-`, not whitespace-then-`=`).
                 let rest = rest.trim_start();
                 rest.starts_with('=')
             })
             .unwrap_or(false);
-        assert!(
-            !is_iceoryx2_dep,
-            "generated workspace Cargo.toml must NOT pin iceoryx2 directly — \
-             the user inherits cerulion_core's transitive `=0.9.1` pin. \
-             A stray pin here would be a second source of truth and would \
-             block the cerulion_core auto-updater. Offending line:\n  {line}\n\
+        if !is_iceoryx2_key {
+            continue;
+        }
+        assert_eq!(
+            section, "[patch.crates-io]",
+            "generated workspace Cargo.toml must NOT depend on iceoryx2 directly; \
+             the requirement comes from cerulion_core, and only `[patch.crates-io]` \
+             may name iceoryx2. Offending line in `{section}`:\n  {line}\n\
              Full Cargo.toml:\n{content}"
         );
+        patched = true;
     }
+    assert!(
+        patched,
+        "the scaffold must patch iceoryx2 to the CLI's fork build; got:\n{content}"
+    );
 }
 
 /// The gated, RESOLUTION-true companion to the cheap guard above.

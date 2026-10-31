@@ -69,6 +69,20 @@ ctrlc = { version = "3", features = ["termination"] }
 # script cannot complete live names, and sourcing both mechanisms would have the
 # last one win. Only the dynamic engine is wired.
 clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
+# Usage telemetry (`src/telemetry.rs`): the `telemetry` verb, the first-run
+# notice and `cli_command_run`. Sends nothing unless the build carries a
+# PostHog key and consent resolves enabled. Never linked into a robot crate.
+cerulion_telemetry = { workspace = true }
+# Reads the installer's provenance marker (`src/install_marker.rs`). Already in
+# the build through `cerulion_cli_engine`.
+serde_json = "1"
+
+[features]
+default = ["telemetry"]
+# The PostHog client behind `src/telemetry.rs`. Off, every telemetry call is
+# a no-op, `cerulion telemetry status` reports "not compiled", and no network
+# dependency is linked.
+telemetry = ["cerulion_telemetry/posthog"]
 
 # bagd is folded into this binary as the
 # `cerulion bagd` subcommand (`BagdArgs` + `bagd_cli_main`). Unix-gated —
@@ -83,6 +97,8 @@ cerulion_bagd = { workspace = true }
 # bags with cerulion_bag's reader. Path-only (publish-cycle clean, matches the
 # cerulion_core dev-dep note below).
 cerulion_bag = { path = "../cerulion_bag" }
+# `config_home_test` pins the robot-state root mirror in this crate.
+cerulion_discovery = { path = "../cerulion_discovery" }
 # The multi-process SUPERVISOR test
 # (`tests/mp_supervisor_box_test.rs`) spawns the REAL `cerulion` binary as a
 # supervisor, reads the workers' dumped fire traces, and runs an in-process
@@ -102,7 +118,7 @@ serial_test = "3"
 # is iceoryx2's `LogLevel`) through the engine's classifier and into the
 # `cerulion clean` listing, pinning capture → attribution → render end to end.
 # Same exact pin as `cerulion_cli_engine` (the lockstep contract).
-iceoryx2 = "=0.9.1"
+iceoryx2 = "=0.10.0"
 # The schema CLI e2e (tests/schema_cli_test.rs) pins the
 # `schema info sensor_msgs::Image` stdout hash against the generated
 # `<Image as ShmMessage>::SCHEMA_HASH` oracle. Path-only, NOT
@@ -111,9 +127,12 @@ iceoryx2 = "=0.9.1"
 native_ros2_messages = { path = "../native_ros2_messages" }
 # Scaffold workspace + per-run plan/trace directories.
 tempfile = "3"
-# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`.
+# `tests/scaffold_dir_test.rs` parses the `.cargo/config.toml` a box scaffold
+# is pinned to its target directory with. Same pin as `cerulion_cli_engine`.
+toml = "0.9"
+# Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`
+# (`serde_json` is a regular dependency above).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 # Serialize the constructed `GraphConfig` into the graph YAML the supervisor
 # parses (serializing the same struct the parser reads → parse-compat by
 # construction).

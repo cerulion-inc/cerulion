@@ -109,6 +109,7 @@ fn frame(seq: u32, payload: &[u8]) -> Vec<u8> {
         // allocation added inside the rate-bound branch would NOT be caught
         // here.
         timestamp_ns: 1_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut buf = vec![0u8; total];
     header.write_to_buf(&mut buf[..WireHeader::SIZE]);
@@ -160,6 +161,26 @@ fn min_over_reps(mut f: impl FnMut() -> usize) -> usize {
     (0..REPS).map(|_| f()).min().expect("REPS > 0")
 }
 
+/// The ONE iceoryx2 namespace every manager in this binary uses.
+///
+/// iceoryx2 0.10.0 numbers a namespace's nodes from a counter in its global
+/// management segment, which it creates without initializing (`init_impl`
+/// writes `MaybeUninit::uninit()` over it). A node id carries that counter in
+/// its top 32 bits and is printed in decimal into every node-scoped path, and
+/// iceoryx2 escapes each path with one heap allocation per byte
+/// (`as_escaped_string`). With a fresh namespace per manager, a node whose
+/// counter came from leftover bytes printed 37 digits where a zeroed one printed
+/// 26 (MEASURED on Linux), moving that play's setup by about 460 one-byte
+/// allocations whatever its frame count. In one namespace the counter only
+/// increments, so successive node ids differ by at most a digit (a few dozen
+/// allocations, inside the band).
+fn shared_iceoryx_config() -> iceoryx2::config::Config {
+    static CONFIG: std::sync::OnceLock<iceoryx2::config::Config> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(cerulion_core::testing::iceoryx_test_config)
+        .clone()
+}
+
 /// Play one bag on the CURRENT thread with the counter armed, returning the
 /// allocation count for the whole call.
 fn measured_play_once(bag: &Path) -> usize {
@@ -168,7 +189,7 @@ fn measured_play_once(bag: &Path) -> usize {
             node_name: format!("play_alloc_{}", unique()),
             ..Default::default()
         },
-        cerulion_core::testing::iceoryx_test_config(),
+        shared_iceoryx_config(),
     )
     .expect("init_for_test");
 
@@ -191,7 +212,7 @@ fn measured_play_once(bag: &Path) -> usize {
             node_name: format!("play_alloc_{}", unique()),
             ..Default::default()
         },
-        cerulion_core::testing::iceoryx_test_config(),
+        shared_iceoryx_config(),
     )
     .expect("init_for_test");
     let mut sink2 = Vec::with_capacity(4096);
@@ -336,13 +357,23 @@ fn the_play_loop_allocates_nothing_per_frame() {
     // allocation costs N (500) here, so requiring |delta| under 4% of N fails
     // that by 25x while absorbing the setup jitter. The scan half above is
     // asserted at EXACTLY zero because it builds no walker and so has no jitter.
-    let delta = a_large as i64 - a_small as i64;
+    // WAIVED, bounded, upstream iceoryx2 0.10.0 issue 2035: every
+    // `Publisher::loan` allocates once, and the play loop publishes each frame,
+    // so the waived amount scales with the frame count exactly as a per frame
+    // regression would. Subtract the known loans for the EXTRA frames and keep
+    // the original band on the remainder, which leaves the discriminator at
+    // full strength: a genuine per frame allocation still costs another N and
+    // still fails by 25x. `cerulion_core/tests/upstream_waivers_test` fails
+    // closed when the iceoryx2 pin moves off the version this waiver names.
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(N as u64) as i64;
+    let delta = (a_large as i64 - a_small as i64) - waived;
     let scaled_bound = (N / 25) as i64;
     assert!(
         delta.abs() <= scaled_bound,
-        "the play loop must allocate NOTHING PER FRAME: {N} extra frames moved the count by \
-         {delta} allocation(s) ({a_small} for {N} frames, {a_large} for {}), which exceeds the \
-         +/-{scaled_bound} noise band. A per-frame allocation would cost about {N}.",
+        "the play loop must allocate NOTHING PER FRAME beyond the {waived} that upstream 2035 \
+         costs: {N} extra frames moved the count by {delta} allocation(s) after subtracting \
+         those ({a_small} for {N} frames, {a_large} for {}), which exceeds the \
+         +/-{scaled_bound} noise band. A per-frame allocation of ours would cost about {N}.",
         N * 2
     );
 }

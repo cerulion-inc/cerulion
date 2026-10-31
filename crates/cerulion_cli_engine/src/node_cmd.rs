@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Node commands: create, delete, modify, build, stage, run, list, info.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use cerulion_core::graph::node::BackpressurePolicy;
+use cerulion_core::graph::node::{BackpressurePolicy, MacroPolicy};
 
 use crate::error::{CliError, CliResult};
-use crate::node_metadata::{parse_node_metadata, NodeMetadata, PortDef};
+use crate::node_metadata::{parse_node_metadata, NodeMetadata, PortDef, PORT_SCHEMAS_MARKER};
 use crate::schema_cmd;
 use crate::system_deps;
 use crate::templates;
@@ -43,6 +44,42 @@ fn acquire_workspace_lock(dir: &Path) -> CliResult<(WorkspaceLock, std::path::Pa
     Ok((lock, canonical_dir))
 }
 
+/// Inputs the scaffold marks `trigger=True`: the data-trigger input, or every
+/// input of a sync node (the aligned set).
+fn python_trigger_inputs(policy: Option<&MacroPolicy>, inputs: &[(String, String)]) -> Vec<String> {
+    match policy {
+        Some(MacroPolicy::DataTrigger { input_name }) => vec![input_name.clone()],
+        Some(MacroPolicy::Sync { .. }) => inputs.iter().map(|(name, _)| name.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn python_policy(policy: Option<&MacroPolicy>) -> CliResult<(serde_json::Value, String)> {
+    match policy {
+        Some(MacroPolicy::Period { period_ms }) => Ok((
+            serde_json::json!({ "period_ms": period_ms }),
+            format!("period_ms={period_ms}"),
+        )),
+        Some(MacroPolicy::DataTrigger { input_name }) => Ok((
+            serde_json::json!({ "data_trigger": { "input_name": input_name } }),
+            format!("trigger={input_name:?}"),
+        )),
+        Some(MacroPolicy::Sync { window_ms }) => Ok((
+            serde_json::json!({ "sync_window_ms": window_ms }),
+            format!("sync_window_ms={window_ms}"),
+        )),
+        Some(MacroPolicy::External) | Some(MacroPolicy::UnboundedSync) => {
+            Err(CliError::Validation(
+                "Python node policy is not supported by the Python decorator".to_string(),
+            ))
+        }
+        None => Err(CliError::Validation(
+            "Python nodes need a trigger policy: pass -T SCHEMA NAME or --policy period_ms=N (Python nodes cannot be modified after creation)"
+                .to_string(),
+        )),
+    }
+}
+
 /// Options for `node_create` controlling port declarations and template style.
 #[derive(Debug, Default)]
 pub struct NodeCreateOptions {
@@ -60,6 +97,18 @@ pub struct NodeCreateOptions {
     pub trigger: Option<String>,
     /// Use the legacy raw FFI template instead of `#[cerulion_node]` macro.
     pub raw_ffi: bool,
+    /// Authoring language for the generated node.
+    pub language: NodeLanguage,
+}
+
+/// Supported node authoring languages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeLanguage {
+    /// Rust macro node.
+    #[default]
+    Rust,
+    /// Embedded-CPython node.
+    Python,
 }
 
 /// Create a new node type in the workspace — convenience wrapper.
@@ -124,6 +173,36 @@ pub fn node_create_with_options(
     let (_lock, nodes_dir) = acquire_workspace_lock(nodes_dir)?;
     let canonical_workspace_cargo_toml = workspace_cargo_toml.canonicalize()?;
     utils::validate_node_type(node_type)?;
+    if options.language == NodeLanguage::Python && options.raw_ffi {
+        return Err(CliError::Validation(
+            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+                .to_string(),
+        ));
+    }
+    let policy = if options.language == NodeLanguage::Python && policy.is_none() {
+        match options.trigger.as_deref() {
+            Some(input_name) => Some(cerulion_core::MacroPolicy::DataTrigger {
+                input_name: input_name.to_string(),
+            }),
+            None => {
+                return Err(CliError::Validation(
+                    "Python nodes need a trigger policy: pass -T SCHEMA NAME or --policy period_ms=N (Python nodes cannot be modified after creation)"
+                        .to_string(),
+                ));
+            }
+        }
+    } else {
+        policy
+    };
+    if options.language == NodeLanguage::Python
+        && matches!(policy, Some(cerulion_core::MacroPolicy::Sync { .. }))
+        && options.inputs.len() < 2
+    {
+        return Err(CliError::Validation(
+            "a sync_window_ms Python node aligns two or more inputs: repeat `-i SCHEMA NAME` for each"
+                .to_string(),
+        ));
+    }
 
     if policy.is_none() && options.inputs.is_empty() && options.trigger.is_none() {
         return Err(CliError::Validation(
@@ -145,6 +224,11 @@ pub fn node_create_with_options(
     // mirror that gate at the engine API boundary per the
     // CLI-vs-engine contract alignment rule, so future direct
     // engine callers don't bypass it.
+    //
+    // Outputs are fields of the same generated struct, so the same holds for
+    // two outputs of one name and, in the macro template, for an output named
+    // like an input. The raw-FFI template declares no fields: it keeps inputs
+    // and outputs in separate metadata lists, so a shared name is legal there.
     {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (_, name) in &options.inputs {
@@ -152,6 +236,54 @@ pub fn node_create_with_options(
                 return Err(CliError::Validation(format!(
                     "duplicate input port name '{name}' in NodeCreateOptions::inputs. \
                      Each input port name must be unique."
+                )));
+            }
+        }
+        let mut outputs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in &options.outputs {
+            if !outputs.insert(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "duplicate output port name '{name}' in NodeCreateOptions::outputs. \
+                     Each output port name must be unique."
+                )));
+            }
+            if !options.raw_ffi && seen.contains(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "port name '{name}' is declared as both an input and an output. \
+                     Every port of a node needs its own name."
+                )));
+            }
+        }
+    }
+    if options.language == NodeLanguage::Python {
+        for (_, name) in options.inputs.iter().chain(options.outputs.iter()) {
+            utils::validate_python_identifier(name)?;
+        }
+        if let Some(name) = &options.trigger {
+            utils::validate_python_identifier(name)?;
+            if !options.inputs.iter().any(|(_, input)| input == name) {
+                return Err(CliError::Validation(format!(
+                    "trigger '{name}' does not name an input port"
+                )));
+            }
+        }
+        if let Some(MacroPolicy::DataTrigger { input_name }) = policy.as_ref() {
+            if !options.inputs.iter().any(|(_, input)| input == input_name) {
+                return Err(CliError::Validation(format!(
+                    "data_trigger policy input '{input_name}' does not name an input port"
+                )));
+            }
+            if let Some(name) = options.trigger.as_ref().filter(|name| *name != input_name) {
+                return Err(CliError::Validation(format!(
+                    "trigger '{name}' conflicts with data_trigger policy input '{input_name}'"
+                )));
+            }
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in options.inputs.iter().chain(options.outputs.iter()) {
+            if !seen.insert(name.as_str()) {
+                return Err(CliError::Validation(format!(
+                    "duplicate port name '{name}': a Python node's inputs and outputs share one namespace"
                 )));
             }
         }
@@ -163,6 +295,14 @@ pub fn node_create_with_options(
             node_type: node_type.to_string(),
         });
     }
+    let python_paths = if options.language == NodeLanguage::Python {
+        Some(python_paths_for_new_node(&node_dir, node_type)?)
+    } else {
+        None
+    };
+
+    let inputs = options.inputs.clone();
+    let outputs = options.outputs.clone();
 
     // Resolve every port schema BEFORE any filesystem
     // mutation, so a bare built-in name (`Vector3`) scaffolds a
@@ -177,13 +317,16 @@ pub fn node_create_with_options(
     // contract alignment rule), so direct engine callers get the
     // same contract.
     let schemas_dir = workspace_schemas_dir(&nodes_dir);
-    let mut metadata = NodeMetadata::new(node_type, policy);
-    for (schema, name) in &options.outputs {
+    let mut metadata = NodeMetadata::new(node_type, policy.clone());
+    for (schema, name) in &outputs {
         let resolved = schema_cmd::resolve_port_schema(&schemas_dir, schema)?;
-        // A `.msg` store type has no generated Rust type, so a port
-        // scaffolded from it could never compile — refuse loudly BEFORE any
-        // filesystem mutation (see `refuse_store_port_scaffold`).
-        schema_cmd::refuse_store_port_scaffold(&resolved, schema)?;
+        // A `.msg` store type types a Rust port only where the workspace
+        // generates its messages: refuse otherwise BEFORE any filesystem
+        // mutation (see `refuse_store_port_scaffold`). A Python port reads
+        // the store through `cerulion.msgs`.
+        if options.language != NodeLanguage::Python {
+            schema_cmd::refuse_store_port_scaffold(&resolved, schema, &schemas_dir)?;
+        }
         metadata.outputs.push(PortDef {
             name: name.clone(),
             schema: Some(resolved.schema),
@@ -192,9 +335,11 @@ pub fn node_create_with_options(
             backpressure: BackpressurePolicy::DropOldest,
         });
     }
-    for (schema, name) in &options.inputs {
+    for (schema, name) in &inputs {
         let resolved = schema_cmd::resolve_port_schema(&schemas_dir, schema)?;
-        schema_cmd::refuse_store_port_scaffold(&resolved, schema)?;
+        if options.language != NodeLanguage::Python {
+            schema_cmd::refuse_store_port_scaffold(&resolved, schema, &schemas_dir)?;
+        }
         // `node create` scaffolds plain (non-trigger) inputs. A
         // trigger input is ADDED later via `node modify -T/--trigger-input
         // SCHEMA NAME` (a new `#[input(trigger)]` field); promoting an
@@ -209,28 +354,219 @@ pub fn node_create_with_options(
         });
     }
 
+    let python = options.language == NodeLanguage::Python;
+    let python_policy = if python {
+        Some(python_policy(policy.as_ref())?)
+    } else {
+        None
+    };
+    let python_inputs = metadata
+        .inputs
+        .iter()
+        .map(|port| {
+            let schema = port.schema.clone().ok_or_else(|| {
+                CliError::Validation(format!(
+                    "Python nodes require a schema for port '{}'",
+                    port.name
+                ))
+            })?;
+            Ok((port.name.clone(), schema))
+        })
+        .collect::<CliResult<Vec<(String, String)>>>()?;
+    let python_outputs = metadata
+        .outputs
+        .iter()
+        .map(|port| {
+            let schema = port.schema.clone().ok_or_else(|| {
+                CliError::Validation(format!(
+                    "Python nodes require a schema for port '{}'",
+                    port.name
+                ))
+            })?;
+            Ok((port.name.clone(), schema))
+        })
+        .collect::<CliResult<Vec<(String, String)>>>()?;
+    let python_pynode_path = if python {
+        let base = crate::workspace::find_cerulion_root().ok_or_else(|| {
+            CliError::Validation(
+                "Python nodes need a Cerulion checkout: cerulion_pynode is not published to a registry"
+                    .to_string(),
+            )
+        })?;
+        let path = base.join("crates/cerulion_py/crates/cerulion_pynode");
+        if !path.is_dir() {
+            return Err(CliError::Validation(format!(
+                "Python nodes need cerulion_pynode at {}",
+                path.display()
+            )));
+        }
+        Some(path)
+    } else {
+        None
+    };
+
     let src_dir = node_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
 
     // Generate Cargo.toml
+    let python_node_dir = node_dir
+        .canonicalize()
+        .unwrap_or_else(|_| node_dir.clone())
+        .display()
+        .to_string();
     std::fs::write(
         node_dir.join("Cargo.toml"),
-        templates::generate_cargo_toml(node_type),
+        if python {
+            templates::generate_python_cargo_toml(
+                node_type,
+                &python_pynode_path
+                    .as_ref()
+                    .expect("python path validated above")
+                    .display()
+                    .to_string(),
+            )
+        } else {
+            templates::generate_cargo_toml(node_type)
+        },
     )?;
 
     // Generate lib.rs — macro template by default, raw FFI with --raw-ffi
-    let lib_source = if options.raw_ffi {
+    let lib_source = if python {
+        let (python_policy_json, _) = python_policy.as_ref().ok_or_else(|| {
+            CliError::Validation("Python node policy was not prepared".to_string())
+        })?;
+        templates::generate_python_lib_rs(
+            &python_node_dir,
+            &python_inputs,
+            &python_outputs,
+            python_policy_json,
+            &python_paths
+                .as_ref()
+                .expect("Python paths prepared above")
+                .site_paths,
+        )
+        .map_err(|error| {
+            CliError::Validation(format!("failed to serialize Python metadata: {error}"))
+        })?
+    } else if options.raw_ffi {
         templates::generate_lib_rs(&metadata)
     } else {
         templates::generate_macro_lib_rs(&metadata, options.trigger.as_deref())
     };
     std::fs::write(src_dir.join("lib.rs"), lib_source)?;
+    if python {
+        let (_, python_policy_expr) = python_policy.as_ref().ok_or_else(|| {
+            CliError::Validation("Python node policy was not prepared".to_string())
+        })?;
+        std::fs::write(
+            node_dir.join("build.rs"),
+            templates::generate_python_build_rs(
+                &python_paths
+                    .as_ref()
+                    .expect("Python paths prepared above")
+                    .libdir,
+            ),
+        )?;
+        std::fs::write(
+            node_dir.join("node.py"),
+            templates::generate_python_node_py(
+                &python_inputs,
+                &python_outputs,
+                python_policy_expr,
+                &python_trigger_inputs(policy.as_ref(), &python_inputs),
+            ),
+        )?;
+    }
 
     // Update workspace Cargo.toml members
     add_workspace_member(&canonical_workspace_cargo_toml, node_type)?;
 
     tracing::info!(node_type = %node_type, "node created");
     Ok(())
+}
+
+/// Resolve the trigger policy for `cerulion node create` (and `cerulion-wsd`'s `node.create`) from the
+/// `--policy` flag, the `-T` flag, and the regular `-i` inputs.
+///
+/// Defaulting rules (when `--policy` is absent):
+/// - `-T` set: `DataTrigger { input_name: <T's name> }`
+///   (an explicit `-T` declares the trigger, so the policy is
+///   threaded through as `data_trigger=NAME`).
+/// - 0 inputs (no `-i` and no `-T`): error, a source-only node
+///   must declare a non-data policy explicitly
+///   (`--policy period_ms=N` or `--policy external`).
+/// - 1+ inputs via `-i` only: `None` (the source emits no
+///   node-level policy attribute; the runtime fires on any input
+///   arrival and emits a warning at graph-build time so the
+///   user notices). The warning is intentional: a user might want
+///   a different policy (Sync, data_trigger on a
+///   specific input), and silence would let unintended firing
+///   behavior ship.
+///
+/// When `--policy` is present:
+/// - `--policy data_trigger=NAME` and `-T NAME'` must agree on the
+///   trigger input.
+/// - `--policy data_trigger=NAME` requires NAME to match exactly
+///   one of the `-i` or `-T` inputs.
+/// - Non-data policies (Period/Sync/External) ignore the
+///   `-T` / `-i` set and use the explicit policy as-is. `-T` is
+///   incompatible with non-data policies, so the caller errors.
+pub fn resolve_create_policy(
+    explicit: Option<&cerulion_core::MacroPolicy>,
+    trigger_input: Option<&(String, String)>,
+    regular_inputs: &[(String, String)],
+) -> CliResult<Option<cerulion_core::MacroPolicy>> {
+    use cerulion_core::MacroPolicy;
+    match (explicit, trigger_input) {
+        (Some(MacroPolicy::DataTrigger { input_name }), Some((_, t_name))) => {
+            if input_name != t_name {
+                return Err(CliError::Validation(format!(
+                    "`--policy data_trigger={input_name}` and `-T <SCHEMA> {t_name}` disagree \
+                     on the trigger input"
+                )));
+            }
+            Ok(Some(MacroPolicy::DataTrigger {
+                input_name: input_name.clone(),
+            }))
+        }
+        (Some(_non_data), Some(_)) => Err(CliError::Validation(
+            "`-T` declares a data-trigger input, which conflicts with a non-data `--policy`. \
+             Drop `-T` or change the policy."
+                .to_string(),
+        )),
+        (Some(MacroPolicy::DataTrigger { input_name }), None) => {
+            let matches_input = regular_inputs.iter().any(|(_, n)| n == input_name);
+            if !matches_input {
+                return Err(CliError::Validation(format!(
+                    "`--policy data_trigger={input_name}` requires `-i SCHEMA {input_name}` \
+                     (or `-T SCHEMA {input_name}`) to declare the trigger input"
+                )));
+            }
+            Ok(Some(MacroPolicy::DataTrigger {
+                input_name: input_name.clone(),
+            }))
+        }
+        (Some(p), None) => Ok(Some(p.clone())),
+        (None, Some((_, name))) => Ok(Some(MacroPolicy::DataTrigger {
+            input_name: name.clone(),
+        })),
+        (None, None) => {
+            if regular_inputs.is_empty() {
+                Err(CliError::Validation(
+                    "source-only nodes (no `-i` or `-T`) must declare a non-data trigger policy. \
+                     Pass `--policy period_ms=N` or `--policy external`."
+                        .to_string(),
+                ))
+            } else {
+                // 1+ inputs with no explicit `--policy` or `-T`:
+                // emit no node-level policy attribute. The runtime
+                // fires on any input arrival and emits a warning
+                // at graph-build time so the user notices and can
+                // pick a more specific policy if desired.
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Delete a node type from the workspace.
@@ -252,6 +588,15 @@ pub fn node_delete(
     remove_workspace_member(&workspace_cargo_toml, node_type)?;
 
     tracing::info!(node_type = %node_type, "node deleted");
+    Ok(())
+}
+
+fn refuse_python_node_modify(node_dir: &Path, node_type: &str) -> CliResult<()> {
+    if node_dir.join("node.py").is_file() {
+        return Err(CliError::Validation(format!(
+            "node '{node_type}' is a Python node; edit nodes/{node_type}/node.py and run `cerulion node build {node_type}`"
+        )));
+    }
     Ok(())
 }
 
@@ -298,6 +643,7 @@ pub fn node_modify_add_port(
             node_type: node_type.to_string(),
         });
     }
+    refuse_python_node_modify(&node_dir, node_type)?;
 
     // Resolve the schema argument BEFORE reading or writing
     // any source, so a bare built-in name (`Vector3`) splices a
@@ -312,11 +658,12 @@ pub fn node_modify_add_port(
     // backstop for the CLI's own pre-call resolution.
     let resolved_schema = schema
         .map(|raw| {
-            let resolved =
-                schema_cmd::resolve_port_schema(&workspace_schemas_dir(&nodes_dir), raw)?;
-            // A `.msg` store type has no generated Rust type — refuse loudly
-            // with lib.rs byte-untouched (see `refuse_store_port_scaffold`).
-            schema_cmd::refuse_store_port_scaffold(&resolved, raw)?;
+            let schemas_dir = workspace_schemas_dir(&nodes_dir);
+            let resolved = schema_cmd::resolve_port_schema(&schemas_dir, raw)?;
+            // A `.msg` store type types a Rust port only where the workspace
+            // generates its messages: refuse otherwise with lib.rs
+            // byte-untouched (see `refuse_store_port_scaffold`).
+            schema_cmd::refuse_store_port_scaffold(&resolved, raw, &schemas_dir)?;
             Ok::<String, crate::error::CliError>(resolved.schema)
         })
         .transpose()?;
@@ -466,6 +813,7 @@ pub fn node_modify_clear_trigger(nodes_dir: &Path, node_type: &str) -> CliResult
             node_type: node_type.to_string(),
         });
     }
+    refuse_python_node_modify(&node_dir, node_type)?;
     let lib_path = node_dir.join("src/lib.rs");
     let source = std::fs::read_to_string(&lib_path)?;
     if !templates::is_macro_based(&source) {
@@ -504,6 +852,7 @@ pub fn node_modify_ext_trigger(nodes_dir: &Path, node_type: &str, ext: bool) -> 
             node_type: node_type.to_string(),
         });
     }
+    refuse_python_node_modify(&node_dir, node_type)?;
 
     let lib_path = node_dir.join("src/lib.rs");
     let source = std::fs::read_to_string(&lib_path)?;
@@ -550,6 +899,7 @@ pub fn node_modify_set_policy(
             node_type: node_type.to_string(),
         });
     }
+    refuse_python_node_modify(&node_dir, node_type)?;
     let lib_path = node_dir.join("src/lib.rs");
     let source = std::fs::read_to_string(&lib_path)?;
     if !templates::is_macro_based(&source) {
@@ -618,6 +968,7 @@ pub fn node_modify_promote_input_to_trigger(
             node_type: node_type.to_string(),
         });
     }
+    refuse_python_node_modify(&node_dir, node_type)?;
     let metadata = parse_node_metadata(&node_dir)?;
     let input_exists = metadata.inputs.iter().any(|p| p.name == input_name);
     if !input_exists {
@@ -684,7 +1035,69 @@ pub fn node_list(nodes_dir: &Path) -> CliResult<Vec<NodeMetadata>> {
 
 /// Get info about a specific node type.
 pub fn node_info(nodes_dir: &Path, node_type: &str) -> CliResult<NodeMetadata> {
-    parse_node_metadata(&nodes_dir.join(node_type))
+    let node_dir = nodes_dir.join(node_type);
+    let mut metadata = parse_node_metadata(&node_dir)?;
+    let source = std::fs::read_to_string(node_dir.join("src/lib.rs"))?;
+    let Some(start) = source.find("static INFO_BYTES: &[u8] = b\"") else {
+        return Ok(metadata);
+    };
+    let after_open = start + "static INFO_BYTES: &[u8] = b\"".len();
+    let Some(close) = source[after_open..].find("\\0\"") else {
+        return Ok(metadata);
+    };
+    let literal = syn::parse_str::<syn::LitByteStr>(&format!(
+        "b\"{}\"",
+        &source[after_open..after_open + close]
+    ))
+    .map_err(|error| {
+        CliError::Validation(format!(
+            "node '{}' INFO_BYTES literal failed to parse: {}",
+            node_type, error
+        ))
+    })?;
+    let info: serde_json::Value = serde_json::from_slice(&literal.value()).map_err(|error| {
+        CliError::Validation(format!(
+            "node '{}' INFO_BYTES JSON failed to parse: {}",
+            node_type, error
+        ))
+    })?;
+    let schemas =
+        crate::graph_cmd::build_workspace_schema_hashes(nodes_dir.parent().unwrap_or(nodes_dir));
+    let schema_name = |hash: Option<u64>| {
+        hash.and_then(|hash| {
+            schemas
+                .iter()
+                .filter(|(name, candidate)| **candidate == hash && name.contains('/'))
+                .map(|(name, _)| name.clone())
+                .next()
+                .or_else(|| {
+                    schemas
+                        .iter()
+                        .find_map(|(name, candidate)| (*candidate == hash).then(|| name.clone()))
+                })
+        })
+    };
+    for (port, value) in metadata.inputs.iter_mut().zip(
+        info.get("inputs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+    ) {
+        if port.schema.is_none() {
+            port.schema = schema_name(value.get("schema_hash").and_then(|v| v.as_u64()));
+        }
+    }
+    for (port, value) in metadata.outputs.iter_mut().zip(
+        info.get("outputs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+    ) {
+        if port.schema.is_none() {
+            port.schema = schema_name(value.get("schema_hash").and_then(|v| v.as_u64()));
+        }
+    }
+    Ok(metadata)
 }
 
 /// What a build did about the node's optional SYSTEM dependencies,
@@ -803,12 +1216,168 @@ pub fn node_build_with_progress(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
 ) -> CliResult<NodeBuildOutcome> {
+    build_node(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        None,
+    )
+}
+
+/// [`node_build_with_progress`] with cargo's machine-readable output handed
+/// to `on_message` as it is produced, one `--message-format=json` line per
+/// call, instead of captured and shown only on failure.
+///
+/// This is what `cerulion-wsd`'s `node.build` streams to Studio. Everything
+/// before cargo runs is the same function as the CLI's build: the unknown-node
+/// and malformed-metadata refusals, the optional-system-dependency probe and
+/// notice, the PATH compiler advisory. `on_cargo_start` is called exactly
+/// once, as soon as cargo has been spawned (a spawn that fails never calls
+/// it), so a caller can tell a build
+/// that was refused up front (an `Err` before the call) from one that ran and
+/// failed (an `Err` after it).
+///
+/// Setting `cancel` (from any thread; Unix hosts) kills cargo and everything
+/// it spawned within a fraction of a second, whether or not cargo is printing, and the
+/// call returns [`CliError::BuildFailed`] with a `reason` of `cancelled`. On a
+/// cargo failure the `reason` is cargo's own stderr (status lines and errors
+/// that are not compiler messages; the compiler messages went to
+/// `on_message`), capped at 1 MiB.
+pub fn node_build_streaming(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    on_message: &mut dyn FnMut(&str),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> CliResult<NodeBuildOutcome> {
+    build_node(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        Some((on_message, cancel)),
+    )
+}
+
+/// Cargo's stderr is kept only for the failure reason (its LAST bytes, where a
+/// failure is reported); the streaming build reads it on its own thread so a
+/// full pipe can never stall cargo.
+const STREAMING_STDERR_CAP: usize = 1024 * 1024;
+/// The longest stdout line kept; a longer one is dropped whole and replaced
+/// by [`DROPPED_MESSAGE_LINE`], so the client is told it is missing one.
+const STREAMING_LINE_CAP: usize = 1024 * 1024;
+/// How every compiler message line of `cargo --message-format=json` begins.
+const COMPILER_MESSAGE_HEAD: &[u8] = br#"{"reason":"compiler-message""#;
+/// What `on_message` gets in place of a cargo line over the cap: a compiler
+/// message in cargo's own JSON shape, with no span, saying what happened.
+pub const DROPPED_MESSAGE_LINE: &str = r#"{"reason":"compiler-message","message":{"level":"warning","message":"a compiler message over 1 MiB was left out; run `cerulion node build` for the full output","spans":[],"children":[],"code":null,"rendered":null}}"#;
+
+/// One stdout line from [`for_each_capped_line`].
+enum CappedLine<'a> {
+    Whole(&'a [u8]),
+    /// A line over the cap: only its first bytes are kept.
+    Dropped {
+        head: &'a [u8],
+    },
+}
+
+/// How much of a dropped line is kept, enough to read cargo's `reason` key.
+const DROPPED_HEAD_BYTES: usize = 64;
+
+/// Call `on_line` for each `\n` terminated line of `reader`, holding at most
+/// `cap` bytes of one line. A longer line is read to its end without being
+/// kept; `on_line` gets `Dropped` once for it, with its first bytes. A final
+/// line with no newline is delivered. Stops at the first read error.
+fn for_each_capped_line(
+    mut reader: impl std::io::BufRead,
+    cap: usize,
+    on_line: &mut dyn FnMut(CappedLine<'_>),
+) {
+    let mut line: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            if overflowed {
+                on_line(CappedLine::Dropped { head: &line });
+            } else if !line.is_empty() {
+                on_line(CappedLine::Whole(&line));
+            }
+            return;
+        }
+        let (piece, ends_line, consumed) = match available.iter().position(|b| *b == b'\n') {
+            Some(at) => (&available[..at], true, at + 1),
+            None => (available, false, available.len()),
+        };
+        if overflowed || line.len() + piece.len() > cap {
+            overflowed = true;
+            // Past the cap only the head keeps growing, up to its own bound.
+            let room = DROPPED_HEAD_BYTES.saturating_sub(line.len());
+            line.extend_from_slice(&piece[..piece.len().min(room)]);
+            line.truncate(DROPPED_HEAD_BYTES);
+        } else {
+            line.extend_from_slice(piece);
+        }
+        reader.consume(consumed);
+        if ends_line {
+            if overflowed {
+                on_line(CappedLine::Dropped { head: &line });
+            } else {
+                on_line(CappedLine::Whole(&line));
+            }
+            line.clear();
+            overflowed = false;
+        }
+    }
+}
+
+/// The message sink and cancel flag of a streaming build.
+type StreamingBuild<'a> = (&'a mut dyn FnMut(&str), &'a std::sync::atomic::AtomicBool);
+
+fn build_node(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    streaming: Option<StreamingBuild<'_>>,
+) -> CliResult<NodeBuildOutcome> {
     let nodes_dir = workspace_root.join("nodes");
     let node_dir = nodes_dir.join(node_type);
     if !node_dir.exists() {
         return Err(CliError::NodeNotFound {
             node_type: node_type.to_string(),
         });
+    }
+
+    let mut pyo3_python = None;
+    if node_dir.join("node.py").is_file() {
+        // A Python build rewrites `src/lib.rs` and `build.rs` from `node.py`:
+        // a workspace-file write, so it holds the workspace lock across the
+        // check-and-write like every other writer. The lock is released before
+        // Cargo runs; a build takes minutes and writes nothing the lock guards.
+        let (_lock, _) = acquire_workspace_lock(&nodes_dir)?;
+        let python = resolve_python(&node_dir);
+        regenerate_python_info_with(&node_dir, node_type, &python)?;
+        let paths = query_python_paths(&python).map_err(|reason| CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: format!(
+                "Python interpreter {} path query failed: {reason}",
+                python.display()
+            ),
+        })?;
+        regenerate_python_build_rs_with(&node_dir, node_type, &python, &paths)?;
+        regenerate_python_sys_path_with(&node_dir, node_type, &paths.site_paths)?;
+        pyo3_python = Some(python);
     }
 
     // Probe BEFORE invoking cargo: a malformed declaration must stop the build
@@ -886,12 +1455,32 @@ pub fn node_build_with_progress(
     let mut cmd = std::process::Command::new("cargo");
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
+    if let Some(python) = &pyo3_python {
+        cmd.env("PYO3_PYTHON", python);
+    }
 
-    on_cargo_start(&node_build_progress_line(node_type));
-    let output = cmd.output().map_err(|e| CliError::BuildFailed {
+    let progress_line = node_build_progress_line(node_type);
+    let spawn_failure = |e: std::io::Error| CliError::BuildFailed {
         target: node_type.to_string(),
-        reason: cargo_spawn_failure_reason(&e, workspace_root),
-    })?;
+        reason: cargo_spawn_failure_reason(&e, workspace_root, cfg!(target_os = "android")),
+    };
+    let output = match streaming {
+        None => {
+            on_cargo_start(&progress_line);
+            cmd.output().map_err(spawn_failure)?
+        }
+        Some((on_message, cancel)) => {
+            cmd.arg("--message-format=json");
+            run_cargo_streaming(
+                cmd,
+                &mut || on_cargo_start(&progress_line),
+                on_message,
+                cancel,
+                node_type,
+                spawn_failure,
+            )?
+        }
+    };
 
     if !output.status.success() {
         return Err(CliError::BuildFailed {
@@ -907,6 +1496,139 @@ pub fn node_build_with_progress(
         notice,
     })
 }
+
+/// Run `cmd` (stdout and stderr piped), handing each stdout line to
+/// `on_message` as it arrives. The returned `Output` carries cargo's stderr
+/// and an EMPTY stdout: the lines already went to the callback. `on_spawned`
+/// runs once cargo has actually started. `cancel` kills cargo's whole process
+/// group.
+fn run_cargo_streaming(
+    mut cmd: std::process::Command,
+    on_spawned: &mut dyn FnMut(),
+    on_message: &mut dyn FnMut(&str),
+    cancel: &std::sync::atomic::AtomicBool,
+    node_type: &str,
+    spawn_failure: impl FnOnce(std::io::Error) -> CliError,
+) -> CliResult<std::process::Output> {
+    use std::io::{BufReader, Read};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Cargo gets its own process group so a cancel ends it and every compiler
+    // it spawned with one signal.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().map_err(spawn_failure)?;
+    on_spawned();
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let pid = child.id();
+    let output_closed = AtomicBool::new(false);
+
+    let (status, stderr) = std::thread::scope(|scope| {
+        // Its own thread, so a full stderr pipe can never stall cargo. Reading
+        // continues past the cap; only the last STREAMING_STDERR_CAP bytes
+        // are kept.
+        let stderr_reader = scope.spawn(move || {
+            let mut kept = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(read) = stderr.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                kept.extend_from_slice(&chunk[..read]);
+                // Trim in batches, so a long log costs one copy per cap's worth.
+                if kept.len() > 2 * STREAMING_STDERR_CAP {
+                    kept.drain(..kept.len() - STREAMING_STDERR_CAP);
+                }
+            }
+            if kept.len() > STREAMING_STDERR_CAP {
+                kept.drain(..kept.len() - STREAMING_STDERR_CAP);
+            }
+            kept
+        });
+        // Cargo may be silent for minutes (a long compile, a build script), so
+        // the stdout loop below cannot be the one to notice a cancel.
+        let watcher = scope.spawn(|| {
+            while !output_closed.load(Ordering::Acquire) {
+                if cancel.load(Ordering::Acquire) {
+                    kill_process_group(pid);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        for_each_capped_line(
+            BufReader::new(stdout),
+            STREAMING_LINE_CAP,
+            &mut |line| match line {
+                CappedLine::Whole(line) => on_message(&String::from_utf8_lossy(line)),
+                // Cargo writes `reason` first. Only a compiler message is
+                // worth saying was left out; an oversized artifact or
+                // build-script record carried nothing the client shows.
+                CappedLine::Dropped { head } if head.starts_with(COMPILER_MESSAGE_HEAD) => {
+                    on_message(DROPPED_MESSAGE_LINE)
+                }
+                CappedLine::Dropped { .. } => {}
+            },
+        );
+        // Closed stdout does not mean cargo is done (it can close the pipe and
+        // keep running), so cancel is still honoured until the child is
+        // reaped. The watcher stops first, so only one thread ever signals,
+        // and nothing signals a reaped pid.
+        output_closed.store(true, Ordering::Release);
+        let _ = watcher.join();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if cancel.load(Ordering::Acquire) {
+                        kill_process_group(pid);
+                        break child.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    // No signal here: after this error the pid may no longer
+                    // be ours (an ignored SIGCHLD reaps it for us, and the id
+                    // can be reused), and a group kill could hit an unrelated
+                    // process. Reaping waits for cargo to end by itself, so
+                    // the failure is reported after the build, not during it.
+                    let _ = child.wait();
+                    break Err(error);
+                }
+            }
+        };
+        (status, stderr_reader.join().unwrap_or_default())
+    });
+    let status = status?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: "cancelled".to_string(),
+        });
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // SAFETY: `killpg` takes a process-group id and touches no memory; the
+    // group is the one `process_group(0)` made for this child.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// Probe PATH's `rustc -vV` in the workspace directory. Rustup's directory
 /// selection is honored, but Cargo-specific compiler overrides need not match
@@ -984,16 +1706,27 @@ fn rustc_release_mismatch_warning(
 /// hand rather than tracking through unread. Pure and side-effect-free
 /// so the NotFound/other split is a plain unit test, never
 /// a process spawn.
-fn cargo_spawn_failure_reason(err: &std::io::Error, workspace_root: &Path) -> String {
+fn cargo_spawn_failure_reason(
+    err: &std::io::Error,
+    workspace_root: &Path,
+    is_android: bool,
+) -> String {
     if err.kind() == std::io::ErrorKind::NotFound && workspace_root.is_dir() {
-        concat!(
-            "`cargo` was not found on PATH. `cerulion node build` compiles the node with the ",
-            "Rust toolchain: install Rust ",
-            env!("CARGO_PKG_RUST_VERSION"),
-            "+ from https://rustup.rs (plus a C linker: build-essential on Ubuntu/Debian, ",
-            "Xcode Command Line Tools on macOS) and retry"
-        )
-        .to_string()
+        if is_android {
+            "`cargo` was not found on PATH. Node libraries cannot be built on the device; \
+             cross-build the workspace on the host with `cargo ndk -t <abi> --platform 30 \
+             build`, then push the workspace and its node libraries to the device"
+                .to_string()
+        } else {
+            concat!(
+                "`cargo` was not found on PATH. `cerulion node build` compiles the node with the ",
+                "Rust toolchain: install Rust ",
+                env!("CARGO_PKG_RUST_VERSION"),
+                "+ from https://rustup.rs (plus a C linker: build-essential on Ubuntu/Debian, ",
+                "Xcode Command Line Tools on macOS) and retry"
+            )
+            .to_string()
+        }
     } else {
         err.to_string()
     }
@@ -1120,6 +1853,411 @@ fn update_info_fn(source: &str, metadata: &NodeMetadata) -> CliResult<String> {
     }
 }
 
+/// Replace the embedded Python INFO_BYTES marker block with freshly generated
+/// declaration metadata.
+pub fn regenerate_info_block(source: &str, json: &str) -> CliResult<String> {
+    regenerate_info_block_with_port_schemas(source, json, None)
+}
+
+fn regenerate_info_block_with_port_schemas(
+    source: &str,
+    json: &str,
+    port_schemas: Option<&str>,
+) -> CliResult<String> {
+    let start_marker = "// CERULION:INFO_START";
+    let end_marker = "// CERULION:INFO_END";
+    let start = source
+        .find(start_marker)
+        .ok_or_else(|| CliError::Validation("missing CERULION:INFO_START marker".to_string()))?;
+    let end_rel = source[start..]
+        .find(end_marker)
+        .ok_or_else(|| CliError::Validation("missing CERULION:INFO_END marker".to_string()))?;
+    let end = start + end_rel + end_marker.len();
+    let escaped = json.replace('\\', "\\\\").replace('"', "\\\"");
+    let schemas_line = port_schemas
+        .map(|schemas| format!("{PORT_SCHEMAS_MARKER}{schemas}\n"))
+        .unwrap_or_default();
+    let block = format!(
+        "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{escaped}\\0\";\n{schemas_line}// CERULION:INFO_END"
+    );
+    let mut result = String::with_capacity(source.len() + block.len());
+    result.push_str(&source[..start]);
+    result.push_str(&block);
+    result.push_str(&source[end..]);
+    Ok(result)
+}
+
+/// Moves each port's `schema` name out of the Python info document: the
+/// runtime reads the rest as INFO_BYTES, `node_metadata` reads the names from
+/// the `CERULION:PORT_SCHEMAS` line.
+fn split_port_schemas(mut value: serde_json::Value) -> Result<(String, Option<String>), String> {
+    let mut schemas = serde_json::Map::new();
+    for section in ["inputs", "outputs"] {
+        let mut names = serde_json::Map::new();
+        if let Some(ports) = value
+            .get_mut(section)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for port in ports {
+                let Some(object) = port.as_object_mut() else {
+                    continue;
+                };
+                let Some(schema) = object.remove("schema") else {
+                    continue;
+                };
+                let name = object
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("{section} entry with a schema has no string name"))?;
+                if !schema.is_string() {
+                    return Err(format!("{section} port '{name}' schema is not a string"));
+                }
+                if names.insert(name.to_string(), schema).is_some() {
+                    return Err(format!("{section} port '{name}' is declared twice"));
+                }
+            }
+        }
+        if !names.is_empty() {
+            schemas.insert(section.to_string(), serde_json::Value::Object(names));
+        }
+    }
+    let info = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    if schemas.is_empty() {
+        return Ok((info, None));
+    }
+    let schemas = serde_json::to_string(&serde_json::Value::Object(schemas))
+        .map_err(|error| error.to_string())?;
+    Ok((info, Some(schemas)))
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug)]
+struct PythonInterpreterPaths {
+    libdir: String,
+    site_paths: Vec<String>,
+}
+
+fn query_python_paths(python: &Path) -> Result<PythonInterpreterPaths, String> {
+    let output = std::process::Command::new(python)
+        .args([
+            "-c",
+            // The user site (`pip install --user`) is baked only when this
+            // interpreter enables it; the host otherwise never sees packages
+            // the build's own import of `node.py` resolved.
+            "import json, site, sysconfig; print(json.dumps({'libdir': sysconfig.get_config_var('LIBDIR') or '', 'purelib': sysconfig.get_path('purelib') or '', 'platlib': sysconfig.get_path('platlib') or '', 'usersite': (site.getusersitepackages() or '') if site.ENABLE_USER_SITE else ''}))",
+        ])
+        .output()
+        .map_err(|error| format!("interpreter query failed: {error}"))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("interpreter query failed: {stderr}{stdout}"));
+    }
+    let paths: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("interpreter query returned invalid JSON: {error}"))?;
+    let libdir = paths
+        .get("libdir")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut site_paths = Vec::new();
+    for key in ["purelib", "platlib", "usersite"] {
+        let Some(path) = paths.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if path.is_empty() || !Path::new(path).is_dir() || site_paths.iter().any(|p| p == path) {
+            continue;
+        }
+        site_paths.push(path.to_string());
+    }
+    Ok(PythonInterpreterPaths { libdir, site_paths })
+}
+
+/// A `CERULION_PYTHON` value as the interpreter path the build uses.
+///
+/// Anchored to the CLI's `cwd` BEFORE any subprocess is launched: the
+/// metadata query runs with `current_dir(node_dir)`, so a relative value such
+/// as `./.venv/bin/python` that resolves in the workspace root would otherwise
+/// be looked up under `nodes/<TYPE>` and fail there. `None` when the anchored
+/// path is not a file, which falls through to the workspace venv and `python3`.
+fn python_override(value: &std::ffi::OsStr, cwd: &Path) -> Option<PathBuf> {
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.is_file().then_some(path)
+}
+
+fn resolve_python(node_dir: &Path) -> PathBuf {
+    std::env::var_os("CERULION_PYTHON")
+        .and_then(|value| {
+            let cwd = std::env::current_dir().ok()?;
+            python_override(&value, &cwd)
+        })
+        .or_else(|| {
+            let path = node_dir
+                .ancestors()
+                .nth(2)
+                .map(|root| root.join(".venv/bin/python"))?;
+            path.is_file().then_some(path)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("python3"))
+}
+
+fn python_paths_for_new_node(
+    node_dir: &Path,
+    node_type: &str,
+) -> CliResult<PythonInterpreterPaths> {
+    let python = resolve_python(node_dir);
+    query_python_paths(&python).map_err(|reason| {
+        CliError::Validation(format!(
+            "Python interpreter {} path query failed for node '{}': {reason}",
+            python.display(),
+            node_type
+        ))
+    })
+}
+
+fn regenerate_python_info_with(node_dir: &Path, node_type: &str, python: &Path) -> CliResult<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let info_path = node_dir.join(format!(
+        ".cerulion_info.{}.{}.json",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&info_path)
+        .map_err(|error| CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: format!("python metadata temp file {}: {error}", info_path.display()),
+        })?;
+    drop(file);
+    // The import path the embedded host resolves at run time, so the build
+    // imports `node.py` against the same modules the node will: a file beside
+    // `node.py` first (the host's node-directory finder outranks every path
+    // entry), then `CERULION_PY_PATH`, then the interpreter's own path. A
+    // `helpers.py` on `CERULION_PY_PATH` must not supply the build a period or
+    // schema the host then reads from the node's own `helpers.py`: the baked
+    // metadata would fail the host's stale-metadata check at init. The same
+    // process then writes the workspace's `cerulion.msgs` type stubs to
+    // `<workspace>/.cerulion/python/cerulion-stubs/` for editors (skipped by
+    // a `cerulion` that predates them; a failure to write them is a warning,
+    // never a failed build).
+    let script = r#"
+import importlib.util
+import os
+import pathlib
+import sys
+for entry in reversed([p for p in os.environ.get("CERULION_PY_PATH", "").split(os.pathsep) if p]):
+    sys.path.insert(0, entry)
+root = pathlib.Path.cwd()
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location("node", root / "node.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+classes = [value for value in vars(module).values()
+           if isinstance(value, type) and hasattr(value, "__cerulion_info__")]
+if len(classes) != 1:
+    raise RuntimeError("expected exactly one decorated node class")
+pathlib.Path(sys.argv[1]).write_text(classes[0].__cerulion_info__(), encoding="utf-8")
+try:
+    from cerulion.msgs._stubs import write_workspace_stubs
+except ImportError:
+    write_workspace_stubs = None
+if write_workspace_stubs is not None:
+    try:
+        write_workspace_stubs(os.path.join(os.environ["CERULION_WORKSPACE"], ".cerulion", "python"))
+    except Exception as error:
+        print(f"warning: the workspace type stubs were not written: {error}", file=sys.stderr)
+"#;
+    let _remove_info = RemoveOnDrop(info_path.clone());
+    let output = std::process::Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(&info_path)
+        .current_dir(node_dir)
+        .env(
+            "CERULION_WORKSPACE",
+            node_dir.parent().and_then(Path::parent).unwrap_or(node_dir),
+        )
+        .output()
+        .map_err(|error| CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: format!("python metadata generation failed: {error}"),
+        })?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = if stderr.contains("No module named 'cerulion'") {
+            format!(
+                "{stderr}{stdout}Python interpreter {} cannot import cerulion; install it with `{} -m pip install cerulion`",
+                python.display(),
+                python.display()
+            )
+        } else {
+            format!("{stderr}{stdout}")
+        };
+        return Err(CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: format!("python metadata generation failed: {reason}"),
+        });
+    }
+    let json = std::fs::read_to_string(&info_path).map_err(|error| CliError::BuildFailed {
+        target: node_type.to_string(),
+        reason: format!("python metadata generation produced invalid JSON: {error}"),
+    })?;
+    let mut documents = serde_json::Deserializer::from_str(&json).into_iter::<serde_json::Value>();
+    let first = documents
+        .next()
+        .transpose()
+        .map_err(|error| CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: format!("python metadata generation produced invalid JSON: {error}"),
+        })?;
+    let value = match (first, documents.next()) {
+        (Some(value), None) => value,
+        _ => {
+            return Err(CliError::BuildFailed {
+                target: node_type.to_string(),
+                reason:
+                    "python metadata generation produced invalid JSON: expected exactly one document"
+                        .to_string(),
+            });
+        }
+    };
+    if !value.is_object()
+        || !value.get("inputs").is_some_and(serde_json::Value::is_array)
+        || !value
+            .get("outputs")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err(CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: "python metadata generation produced invalid JSON: expected object with inputs and outputs arrays"
+                .to_string(),
+        });
+    }
+    let (info_json, port_schemas) =
+        split_port_schemas(value).map_err(|reason| CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason: format!("python metadata generation produced invalid JSON: {reason}"),
+        })?;
+    let lib_path = node_dir.join("src/lib.rs");
+    let source = std::fs::read_to_string(&lib_path)?;
+    let updated =
+        regenerate_info_block_with_port_schemas(&source, &info_json, port_schemas.as_deref())?;
+    std::fs::write(lib_path, updated)?;
+    Ok(())
+}
+
+fn regenerate_python_build_rs_with(
+    node_dir: &Path,
+    node_type: &str,
+    python: &Path,
+    paths: &PythonInterpreterPaths,
+) -> CliResult<()> {
+    let libdir = paths.libdir.as_str();
+    if libdir.is_empty() {
+        tracing::warn!(
+            python = %python.display(),
+            "Python interpreter LIBDIR is empty; the node cdylib will not carry a libpython rpath"
+        );
+    }
+
+    let build_path = node_dir.join("build.rs");
+    let source = std::fs::read_to_string(&build_path).unwrap_or_default();
+    let start_marker = "// CERULION:LIBDIR_START";
+    let end_marker = "// CERULION:LIBDIR_END";
+    let updated = if let Some(start) = source.find(start_marker) {
+        let end_rel = source[start..].find(end_marker).ok_or_else(|| {
+            CliError::Validation("missing CERULION:LIBDIR_END marker".to_string())
+        })?;
+        let end = start + end_rel + end_marker.len();
+        let replacement = templates::generate_python_build_rs(libdir);
+        let replacement_start = replacement
+            .find(start_marker)
+            .expect("Python build template must have a LIBDIR start marker");
+        let replacement_end = replacement
+            .find(end_marker)
+            .expect("Python build template must have a LIBDIR end marker")
+            + end_marker.len();
+        let mut result = String::with_capacity(source.len() + replacement.len());
+        result.push_str(&source[..start]);
+        result.push_str(&replacement[replacement_start..replacement_end]);
+        result.push_str(&source[end..]);
+        result
+    } else {
+        templates::generate_python_build_rs(libdir)
+    };
+    std::fs::write(build_path, updated).map_err(|error| CliError::BuildFailed {
+        target: node_type.to_string(),
+        reason: format!("Python build script generation failed: {error}"),
+    })?;
+    Ok(())
+}
+
+fn regenerate_python_sys_path_with(
+    node_dir: &Path,
+    node_type: &str,
+    site_paths: &[String],
+) -> CliResult<()> {
+    let lib_path = node_dir.join("src/lib.rs");
+    let source = std::fs::read_to_string(&lib_path)?;
+    let block =
+        templates::generate_python_sys_path_block(&node_dir.display().to_string(), site_paths);
+    let updated = if let Some(start) = source.find("// CERULION:SYSPATH_START") {
+        let end_rel = source[start..]
+            .find("// CERULION:SYSPATH_END")
+            .ok_or_else(|| {
+                CliError::Validation("missing CERULION:SYSPATH_END marker".to_string())
+            })?;
+        let end = start + end_rel + "// CERULION:SYSPATH_END".len();
+        let block_start = block
+            .find("// CERULION:SYSPATH_START")
+            .expect("Python sys.path template must have a start marker");
+        let block_end = block
+            .find("// CERULION:SYSPATH_END")
+            .expect("Python sys.path template must have an end marker")
+            + "// CERULION:SYSPATH_END".len();
+        let mut result = String::with_capacity(source.len() + block.len());
+        result.push_str(&source[..start]);
+        result.push_str(&block[block_start..block_end]);
+        result.push_str(&source[end..]);
+        result
+    } else {
+        let start = source
+            .find("    sys_path: [")
+            .ok_or_else(|| CliError::Validation("missing Python sys_path list".to_string()))?;
+        let end = start
+            + source[start..].find("    ],").ok_or_else(|| {
+                CliError::Validation("missing Python sys_path list end".to_string())
+            })?
+            + "    ],".len();
+        let replacement = format!("{block},");
+        let mut result = String::with_capacity(source.len() + replacement.len());
+        result.push_str(&source[..start]);
+        result.push_str(&replacement);
+        result.push_str(&source[end..]);
+        result
+    };
+    std::fs::write(&lib_path, updated).map_err(|error| CliError::BuildFailed {
+        target: node_type.to_string(),
+        reason: format!("Python sys.path generation failed: {error}"),
+    })?;
+    Ok(())
+}
+
 /// Add a `use` import for a schema type if not already present.
 fn add_import_if_needed(source: &str, schema: &str) -> String {
     let import = templates::schema_to_import(schema);
@@ -1203,6 +2341,212 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    /// Run `f` with `CERULION_PY_PATH` set to `value`, then put the previous
+    /// value back. The variable is process-wide and the library tests run in
+    /// parallel, so every test that sets it takes this one lock: without it
+    /// one test's `remove_var` can land before another's interpreter starts.
+    fn with_cerulion_py_path<T>(value: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        static PY_PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PY_PATH_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("CERULION_PY_PATH");
+        std::env::set_var("CERULION_PY_PATH", value);
+        let result = f();
+        match previous {
+            Some(previous) => std::env::set_var("CERULION_PY_PATH", previous),
+            None => std::env::remove_var("CERULION_PY_PATH"),
+        }
+        result
+    }
+
+    #[test]
+    fn python_metadata_generation_imports_through_cerulion_py_path() {
+        // `node.py` imports a helper that lives only on `CERULION_PY_PATH`,
+        // exactly as the embedded host would resolve it at run time; the
+        // regenerated INFO block carries the metadata that helper supplied.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).expect("extra dir");
+        std::fs::write(
+            extra.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":7}}'\n",
+        )
+        .expect("shim");
+        let node_dir = temp.path().join("nodes/probe");
+        std::fs::create_dir_all(node_dir.join("src")).expect("node dir");
+        std::fs::write(
+            node_dir.join("node.py"),
+            "import py_path_shim\n\n\nclass Probe:\n    __cerulion_info__ = staticmethod(lambda: py_path_shim.INFO)\n",
+        )
+        .expect("node.py");
+        std::fs::write(
+            node_dir.join("src/lib.rs"),
+            "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
+        )
+        .expect("lib.rs");
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !python {
+            eprintln!("python3 is not available; skipping");
+            return;
+        }
+
+        with_cerulion_py_path(&extra, || {
+            super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+        })
+        .expect("metadata regenerates through CERULION_PY_PATH");
+        let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
+        assert!(
+            source.contains(r#"\"period_ms\":7"#),
+            "the shim's metadata must reach INFO_BYTES: {source}"
+        );
+    }
+
+    #[test]
+    fn python_metadata_generation_prefers_a_sibling_over_cerulion_py_path() {
+        // The same helper name beside `node.py` and on `CERULION_PY_PATH`: the
+        // embedded host serves the sibling, so the build must read its
+        // metadata from the sibling too, or the baked INFO disagrees with the
+        // node the host runs and init fails the stale-metadata check.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).expect("extra dir");
+        std::fs::write(
+            extra.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":7}}'\n",
+        )
+        .expect("path shim");
+        let node_dir = temp.path().join("nodes/probe");
+        std::fs::create_dir_all(node_dir.join("src")).expect("node dir");
+        std::fs::write(
+            node_dir.join("py_path_shim.py"),
+            "INFO = '{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":5}}'\n",
+        )
+        .expect("sibling shim");
+        std::fs::write(
+            node_dir.join("node.py"),
+            "import py_path_shim\n\n\nclass Probe:\n    __cerulion_info__ = staticmethod(lambda: py_path_shim.INFO)\n",
+        )
+        .expect("node.py");
+        std::fs::write(
+            node_dir.join("src/lib.rs"),
+            "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{}\\0\";\n// CERULION:INFO_END\n",
+        )
+        .expect("lib.rs");
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !python {
+            eprintln!("python3 is not available; skipping");
+            return;
+        }
+
+        with_cerulion_py_path(&extra, || {
+            super::regenerate_python_info_with(&node_dir, "probe", Path::new("python3"))
+        })
+        .expect("metadata regenerates");
+        let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).expect("lib.rs");
+        assert!(
+            source.contains(r#"\"period_ms\":5"#) && !source.contains(r#"\"period_ms\":7"#),
+            "the sibling's metadata must win over CERULION_PY_PATH: {source}"
+        );
+    }
+
+    #[test]
+    fn relative_python_override_is_anchored_to_the_cli_cwd() {
+        // `CERULION_PYTHON=./.venv/bin/python` names a file under the cwd;
+        // the build must hand its subprocesses an absolute path, because the
+        // metadata query runs from the node directory where `./.venv` is not.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::fs::create_dir_all(cwd.join(".venv/bin")).expect("venv dir");
+        std::fs::write(cwd.join(".venv/bin/python"), b"").expect("python");
+
+        let resolved = super::python_override(std::ffi::OsStr::new("./.venv/bin/python"), cwd)
+            .expect("an existing relative interpreter resolves");
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(resolved, cwd.join("./.venv/bin/python"));
+
+        // An absolute value is taken as given; a missing file is no override.
+        let absolute = cwd.join(".venv/bin/python");
+        assert_eq!(
+            super::python_override(absolute.as_os_str(), Path::new("/nowhere")),
+            Some(absolute)
+        );
+        assert_eq!(
+            super::python_override(std::ffi::OsStr::new("./missing/python"), cwd),
+            None
+        );
+    }
+
+    /// Each delivered line, with the head of one that was dropped as `Err`.
+    fn capped_lines(input: &[u8], cap: usize) -> Vec<Result<Vec<u8>, Vec<u8>>> {
+        let out = std::cell::RefCell::new(Vec::new());
+        // A one byte buffer forces the line to span many fill_buf calls.
+        for_each_capped_line(std::io::BufReader::with_capacity(1, input), cap, &mut |l| {
+            out.borrow_mut().push(match l {
+                CappedLine::Whole(bytes) => Ok(bytes.to_vec()),
+                CappedLine::Dropped { head } => Err(head.to_vec()),
+            })
+        });
+        out.into_inner()
+    }
+
+    #[test]
+    fn capped_lines_split_on_newline_and_keep_a_final_unterminated_line() {
+        let ok = |bytes: &[u8]| Ok(bytes.to_vec());
+        assert_eq!(
+            capped_lines(b"ab\n\ncd\nef", 16),
+            vec![ok(b"ab"), ok(b""), ok(b"cd"), ok(b"ef")]
+        );
+        assert!(capped_lines(b"", 16).is_empty());
+    }
+
+    #[test]
+    fn capped_lines_report_an_over_long_line_with_its_head_and_keep_its_neighbours() {
+        let ok = |bytes: &[u8]| Ok(bytes.to_vec());
+        let dropped = |bytes: &[u8]| Err(bytes.to_vec());
+        assert_eq!(
+            capped_lines(b"ok\n0123456789\nnext\n", 4),
+            vec![ok(b"ok"), dropped(b"0123456789"), ok(b"next")]
+        );
+        // Exactly at the cap is kept; one past is reported.
+        assert_eq!(capped_lines(b"abcd\n", 4), vec![ok(b"abcd")]);
+        assert_eq!(capped_lines(b"abcde\n", 4), vec![dropped(b"abcde")]);
+        // An over-long unterminated tail is reported too.
+        assert_eq!(capped_lines(b"abcde", 4), vec![dropped(b"abcde")]);
+        // The head is bounded.
+        let long = vec![b'z'; 1000];
+        let got = capped_lines(&long, 4);
+        assert_eq!(got, vec![Err(vec![b'z'; DROPPED_HEAD_BYTES])]);
+    }
+
+    #[test]
+    fn the_head_kept_of_a_dropped_line_tells_a_compiler_message_from_an_artifact() {
+        let message = br#"{"reason":"compiler-message","package_id":"x","message":{}}"#;
+        let artifact = br#"{"reason":"compiler-artifact","package_id":"x"}"#;
+        assert!(message.starts_with(COMPILER_MESSAGE_HEAD));
+        assert!(!artifact.starts_with(COMPILER_MESSAGE_HEAD));
+        assert!(DROPPED_HEAD_BYTES >= COMPILER_MESSAGE_HEAD.len());
+    }
+
+    #[test]
+    fn the_stand_in_for_a_dropped_line_is_a_compiler_message() {
+        let value: serde_json::Value = serde_json::from_str(DROPPED_MESSAGE_LINE).unwrap();
+        assert_eq!(value["reason"], "compiler-message");
+        assert_eq!(value["message"]["level"], "warning");
+        assert!(value["message"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 MiB"));
+    }
+
     use super::*;
 
     fn setup_workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -1235,6 +2579,821 @@ mod tests {
 
         assert!(nodes_dir.join("camera/Cargo.toml").exists());
         assert!(nodes_dir.join("camera/src/lib.rs").exists());
+    }
+
+    #[test]
+    fn python_port_schemas_move_out_of_info_bytes_and_round_trip_through_metadata() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"inputs":[{"name":"inp","schema":"std_msgs/Float64","schema_hash":7}],"outputs":[{"name":"out","schema":"geometry_msgs/Vector3","schema_hash":15293913555552287199}],"policy":{"period_ms":5}}"#,
+        )
+        .unwrap();
+        let (info, schemas) = split_port_schemas(value).unwrap();
+        assert!(!info.contains("\"schema\""), "{info}");
+        assert!(info.contains("15293913555552287199"), "{info}");
+        let schemas = schemas.unwrap();
+        assert_eq!(
+            schemas,
+            r#"{"inputs":{"inp":"std_msgs/Float64"},"outputs":{"out":"geometry_msgs/Vector3"}}"#
+        );
+        let source = "// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"old\\0\";\n// CERULION:INFO_END\n";
+        let block = regenerate_info_block_with_port_schemas(source, &info, Some(&schemas)).unwrap();
+        assert_eq!(
+            regenerate_info_block_with_port_schemas(&block, &info, Some(&schemas)).unwrap(),
+            block
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let node_dir = tmp.path().join("pyecho");
+        std::fs::create_dir_all(node_dir.join("src")).unwrap();
+        std::fs::write(node_dir.join("src/lib.rs"), &block).unwrap();
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("std_msgs/Float64")
+        );
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+    }
+
+    #[test]
+    fn python_port_schemas_reject_non_string_and_duplicate_ports() {
+        let bad: serde_json::Value =
+            serde_json::from_str(r#"{"inputs":[{"name":"inp","schema":3}],"outputs":[]}"#).unwrap();
+        assert!(split_port_schemas(bad)
+            .unwrap_err()
+            .contains("not a string"));
+        let dup: serde_json::Value = serde_json::from_str(
+            r#"{"inputs":[],"outputs":[{"name":"o","schema":"a/B"},{"name":"o","schema":"a/B"}]}"#,
+        )
+        .unwrap();
+        assert!(split_port_schemas(dup)
+            .unwrap_err()
+            .contains("declared twice"));
+        let none: serde_json::Value =
+            serde_json::from_str(r#"{"inputs":["inp"],"outputs":[]}"#).unwrap();
+        assert_eq!(split_port_schemas(none).unwrap().1, None);
+    }
+
+    #[test]
+    fn python_info_block_replacement_is_idempotent_and_requires_markers() {
+        let source = "before\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"old\\0\";\n// CERULION:INFO_END\nafter\n";
+        let json = r#"{"inputs":[],"outputs":[],"policy":{"period_ms":1}}"#;
+        let replaced = regenerate_info_block(source, json).unwrap();
+        assert!(replaced.contains(r#"static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":1}}\0";"#));
+        assert_eq!(regenerate_info_block(&replaced, json).unwrap(), replaced);
+        assert!(regenerate_info_block("no markers", json).is_err());
+    }
+
+    #[test]
+    fn python_node_create_rejects_unusable_port_sets_before_writing() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let port = |name: &str| ("geometry_msgs/Vector3".to_string(), name.to_string());
+        let cases = [
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("inp")],
+                    trigger: Some("missing".to_string()),
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                None,
+                "trigger 'missing' does not name an input port",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("same")],
+                    outputs: vec![port("same")],
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 10 }),
+                "port name 'same' is declared as both an input and an output",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![port("only")],
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                },
+                Some(cerulion_core::MacroPolicy::Sync { window_ms: 10 }),
+                "a sync_window_ms Python node aligns two or more inputs",
+            ),
+        ];
+        for (options, policy, expected) in cases {
+            let err = node_create_with_options(&nodes_dir, &cargo_toml, "bad", policy, &options)
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            assert!(!nodes_dir.join("bad").exists());
+        }
+    }
+
+    #[test]
+    fn python_node_create_writes_scaffold() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            outputs: vec![("geometry_msgs/Vector3".to_string(), "out".to_string())],
+            inputs: vec![("geometry_msgs/Vector3".to_string(), "inp".to_string())],
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "camera",
+            Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
+            &options,
+        )
+        .unwrap();
+        let root = nodes_dir.join("camera");
+        assert!(std::fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap()
+            .contains("cerulion_pynode"));
+        assert!(std::fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("export_node!"));
+        let build_rs = std::fs::read_to_string(root.join("build.rs")).unwrap();
+        assert!(build_rs.contains("// CERULION:LIBDIR_START"));
+        assert!(build_rs.contains("cargo:rustc-link-arg=-Wl,-rpath,"));
+        assert!(build_rs.contains("cargo:rerun-if-changed=build.rs"));
+        assert!(std::fs::read_to_string(root.join("node.py"))
+            .unwrap()
+            .contains("cerulion"));
+        // The schema names are readable before the first `node build`, so a
+        // `node stage` straight after `node create` stages them, not blanks.
+        let metadata = parse_node_metadata(&root).unwrap();
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+    }
+
+    #[test]
+    fn python_node_without_policy_or_trigger_is_rejected_before_write() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            inputs: vec![("geometry_msgs/Vector3".to_string(), "inp".to_string())],
+            outputs: vec![("geometry_msgs/Vector3".to_string(), "out".to_string())],
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        let err =
+            node_create_with_options(&nodes_dir, &cargo_toml, "missing_policy", None, &options)
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Python nodes need a trigger policy: pass -T SCHEMA NAME or --policy period_ms=N (Python nodes cannot be modified after creation)"
+        );
+        assert!(!nodes_dir.join("missing_policy").exists());
+    }
+
+    #[test]
+    fn python_node_trigger_without_policy_emits_data_trigger() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            inputs: vec![("geometry_msgs/Vector3".to_string(), "inp".to_string())],
+            outputs: vec![("geometry_msgs/Vector3".to_string(), "out".to_string())],
+            trigger: Some("inp".to_string()),
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "triggered", None, &options).unwrap();
+        let root = nodes_dir.join("triggered");
+        let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let source = std::fs::read_to_string(root.join("node.py")).unwrap();
+        assert!(lib.contains(r#"\"data_trigger\":{\"input_name\":\"inp\"}"#));
+        assert!(source.contains(r#"@cerulion.node(trigger="inp")"#));
+        assert!(source.contains("inp = cerulion.input(Vector3, trigger=True)"));
+    }
+
+    #[test]
+    fn python_node_data_trigger_policy_must_name_the_trigger_input_before_write() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let policy = || {
+            Some(MacroPolicy::DataTrigger {
+                input_name: "missing".to_string(),
+            })
+        };
+        let mut options = NodeCreateOptions {
+            inputs: vec![("geometry_msgs/Vector3".to_string(), "inp".to_string())],
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        let err = node_create_with_options(&nodes_dir, &cargo_toml, "unknown", policy(), &options)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "data_trigger policy input 'missing' does not name an input port"
+        );
+        options
+            .inputs
+            .push(("geometry_msgs/Vector3".to_string(), "missing".to_string()));
+        options.trigger = Some("inp".to_string());
+        let err = node_create_with_options(&nodes_dir, &cargo_toml, "conflict", policy(), &options)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trigger 'inp' conflicts with data_trigger policy input 'missing'"
+        );
+        assert!(!nodes_dir.join("unknown").exists());
+        assert!(!nodes_dir.join("conflict").exists());
+    }
+
+    #[test]
+    fn python_template_quotes_a_schema_no_import_can_name() {
+        // A leaf no Python import can spell keeps the quoted-name escape
+        // hatch, escaped as a Python literal; a nameable one is imported.
+        let inputs = vec![("inp".to_string(), "pkg/Q\"uo\\te\nd".to_string())];
+        let outputs = vec![
+            ("out".to_string(), "pkg/Plain".to_string()),
+            ("kw".to_string(), "pkg/class".to_string()),
+            ("deep".to_string(), "a/b/C".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert!(source.contains("    inp = cerulion.input(\"pkg/Q\\\"uo\\\\te\\nd\")\n"));
+        assert!(source.contains("from cerulion.msgs.pkg import Plain\n"));
+        assert!(source.contains("    out = cerulion.output(Plain)\n"));
+        assert!(source.contains("    kw = cerulion.output(\"pkg/class\")\n"));
+        assert!(source.contains("    deep = cerulion.output(\"a/b/C\")\n"));
+    }
+
+    #[test]
+    fn python_template_reaches_a_leaf_a_port_rebinds_through_its_module() {
+        // A port named like an imported class rebinds that name in the class
+        // body, so every later port reaches the class through its module.
+        let inputs = vec![
+            ("Header".to_string(), "std_msgs/Header".to_string()),
+            ("Reading".to_string(), "Reading".to_string()),
+        ];
+        let outputs = vec![
+            ("out".to_string(), "std_msgs/Header".to_string()),
+            ("raw".to_string(), "Reading".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion import msgs\n\
+             from cerulion.msgs import std_msgs"
+        );
+        for line in [
+            "    Header = cerulion.input(std_msgs.Header)\n",
+            "    Reading = cerulion.input(msgs.Reading)\n",
+            "    out = cerulion.output(std_msgs.Header)\n",
+            "    raw = cerulion.output(msgs.Reading)\n",
+        ] {
+            assert!(source.contains(line), "missing {line:?} in:\n{source}");
+        }
+    }
+
+    #[test]
+    fn python_template_reaches_a_shared_leaf_through_its_module() {
+        let inputs = vec![
+            ("a".to_string(), "geometry_msgs/Pose2D".to_string()),
+            ("b".to_string(), "vision_msgs/Pose2D".to_string()),
+            ("c".to_string(), "my-pkg/Node".to_string()),
+            ("d".to_string(), "Reading".to_string()),
+            ("e".to_string(), "std_msgs/Int32".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion.msgs import Reading\n\
+             from cerulion.msgs import geometry_msgs, my_pkg, vision_msgs\n\
+             from cerulion.msgs.std_msgs import Int32"
+        );
+        for line in [
+            "    a = cerulion.input(geometry_msgs.Pose2D)\n",
+            "    b = cerulion.input(vision_msgs.Pose2D)\n",
+            "    c = cerulion.input(my_pkg.Node)\n",
+            "    d = cerulion.input(Reading)\n",
+            "    e = cerulion.input(Int32)\n",
+        ] {
+            assert!(source.contains(line), "{line:?} in {source}");
+        }
+    }
+
+    #[test]
+    fn python_node_rejects_raw_ffi_before_any_write() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            raw_ffi: true,
+            ..NodeCreateOptions::default()
+        };
+        let err = node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "python_raw",
+            Some(MacroPolicy::Period { period_ms: 1 }),
+            &options,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template"
+        );
+        assert!(!nodes_dir.join("python_raw").exists());
+    }
+
+    #[test]
+    fn python_port_names_are_validated_before_any_write() {
+        let cases = [
+            ("1abc", "is not a valid Python identifier"),
+            ("with-dash", "is not a valid Python identifier"),
+            ("class", "is a Python keyword"),
+            ("None", "is a Python keyword"),
+            ("loan", "is reserved by the Python node runtime"),
+            ("tick", "is reserved by the Python node runtime"),
+        ];
+        for (index, (name, expected)) in cases.into_iter().enumerate() {
+            for position in ["input", "output", "trigger"] {
+                let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+                let mut options = NodeCreateOptions {
+                    language: NodeLanguage::Python,
+                    ..NodeCreateOptions::default()
+                };
+                match position {
+                    "input" => options
+                        .inputs
+                        .push(("geometry_msgs/Vector3".to_string(), name.to_string())),
+                    "output" => options
+                        .outputs
+                        .push(("geometry_msgs/Vector3".to_string(), name.to_string())),
+                    "trigger" => options.trigger = Some(name.to_string()),
+                    _ => unreachable!(),
+                }
+                let node_type = format!("bad_{index}_{position}");
+                let err = node_create_with_options(
+                    &nodes_dir,
+                    &cargo_toml,
+                    &node_type,
+                    Some(MacroPolicy::Period { period_ms: 1 }),
+                    &options,
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains(expected),
+                    "{name} ({position}) produced: {err}"
+                );
+                assert!(!nodes_dir.join(node_type).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn python_prerequisite_failure_creates_no_directory() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        let err = node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "unsupported",
+            Some(MacroPolicy::External),
+            &options,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Python node policy is not supported by the Python decorator"));
+        assert!(!nodes_dir.join("unsupported").exists());
+    }
+
+    #[test]
+    fn python_node_with_no_ports_and_period_policy_scaffolds_empty_class() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "empty_python",
+            Some(MacroPolicy::Period { period_ms: 1 }),
+            &options,
+        )
+        .unwrap();
+        let source = std::fs::read_to_string(nodes_dir.join("empty_python/node.py")).unwrap();
+        assert!(source.contains("class Node:"));
+        assert!(source.contains("        return\n"));
+        assert!(!source.contains("Vector3"));
+    }
+
+    #[test]
+    fn python_node_refuses_every_modify_verb() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            inputs: vec![("geometry_msgs/Vector3".to_string(), "inp".to_string())],
+            outputs: vec![("geometry_msgs/Vector3".to_string(), "out".to_string())],
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "python_node",
+            Some(MacroPolicy::Period { period_ms: 1 }),
+            &options,
+        )
+        .unwrap();
+        let lib_path = nodes_dir.join("python_node/src/lib.rs");
+        let py_path = nodes_dir.join("python_node/node.py");
+        let expected = "node 'python_node' is a Python node; edit nodes/python_node/node.py and run `cerulion node build python_node`";
+        let verbs: [Box<dyn Fn() -> CliResult<()> + '_>; 7] = [
+            Box::new(|| {
+                node_modify_add_port(
+                    &nodes_dir,
+                    "python_node",
+                    "extra",
+                    Some("geometry_msgs/Vector3"),
+                    true,
+                    false,
+                )
+            }),
+            Box::new(|| node_modify_clear_trigger(&nodes_dir, "python_node")),
+            Box::new(|| node_modify_ext_trigger(&nodes_dir, "python_node", true)),
+            Box::new(|| {
+                node_modify_set_policy(
+                    &nodes_dir,
+                    "python_node",
+                    &MacroPolicy::Period { period_ms: 2 },
+                )
+            }),
+            Box::new(|| node_modify_set_period(&nodes_dir, "python_node", 2)),
+            Box::new(|| node_modify_set_sync(&nodes_dir, "python_node", 2)),
+            Box::new(|| node_modify_promote_input_to_trigger(&nodes_dir, "python_node", "inp")),
+        ];
+        for modify in verbs {
+            let lib_before = std::fs::read(&lib_path).unwrap();
+            let py_before = std::fs::read(&py_path).unwrap();
+            let err = modify().unwrap_err();
+            assert_eq!(err.to_string(), expected);
+            assert_eq!(std::fs::read(&lib_path).unwrap(), lib_before);
+            assert_eq!(std::fs::read(&py_path).unwrap(), py_before);
+        }
+    }
+
+    /// Probe runs of a freshly written stub before `wait_until_stub_runs` gives up.
+    #[cfg(unix)]
+    const STUB_PROBE_ATTEMPTS: u32 = 500;
+
+    /// Writes an executable shell stub at `path` and returns once it can be
+    /// executed. A process forked by a concurrent test before its exec holds a
+    /// copy of this write descriptor, and while it does, executing the stub
+    /// fails with ETXTBSY; a probe run (which exits before `body`) is retried
+    /// every 10 ms, at most `STUB_PROBE_ATTEMPTS` times.
+    #[cfg(unix)]
+    fn install_python_stub(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_stub_runs(path);
+    }
+
+    #[cfg(unix)]
+    fn wait_until_stub_runs(path: &Path) {
+        for _ in 0..STUB_PROBE_ATTEMPTS {
+            match std::process::Command::new(path)
+                .env("CERULION_TEST_PROBE", "1")
+                .status()
+            {
+                Ok(status) => {
+                    assert!(
+                        status.success(),
+                        "probe run of {}: {status}",
+                        path.display()
+                    );
+                    return;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("probe run of {}: {error}", path.display()),
+            }
+        }
+        panic!(
+            "{} stayed busy for {STUB_PROBE_ATTEMPTS} probe runs",
+            path.display()
+        );
+    }
+
+    /// Holds a write descriptor on a stub, the way a concurrently forked child
+    /// does, and checks that running it fails with ETXTBSY and that
+    /// `wait_until_stub_runs` returns only after the descriptor is closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_stub_install_waits_out_a_held_write_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy");
+        install_python_stub(&path, "exit 0");
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let error = std::process::Command::new(&path)
+            .env("CERULION_TEST_PROBE", "1")
+            .status()
+            .expect_err("a stub open for writing must not run");
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "{error} (kernel {})",
+            kernel.trim()
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let released = std::time::Instant::now();
+            drop(writer);
+            released
+        });
+        wait_until_stub_runs(&path);
+        let returned = std::time::Instant::now();
+        let released = release.join().unwrap();
+        assert!(
+            returned > released,
+            "wait_until_stub_runs returned before the writer closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regenerate_python_info_cleans_temp_file_on_every_result() {
+        fn make_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            install_python_stub(&path, body);
+            path
+        }
+
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "valid",
+                r#"printf '%s' '{"inputs":[],"outputs":[]}' > "$3"; printf 'noise'"#,
+                Some(r#"static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";"#),
+            ),
+            (
+                "two",
+                r#"printf '%s%s' '{"inputs":[],"outputs":[]}' '{"inputs":[],"outputs":[]}' > "$3""#,
+                None,
+            ),
+            ("bad", r#"printf '%s' 'not json' > "$3""#, None),
+            ("array", r#"printf '%s' '[]' > "$3""#, None),
+            ("stderr", r#"printf '%s' 'stub stderr' >&2; exit 1"#, None),
+        ];
+        for (name, body, oracle) in cases {
+            let node_type = format!("metadata_{name}");
+            let options = NodeCreateOptions {
+                language: NodeLanguage::Python,
+                ..NodeCreateOptions::default()
+            };
+            node_create_with_options(
+                &nodes_dir,
+                &cargo_toml,
+                &node_type,
+                Some(MacroPolicy::Period { period_ms: 1 }),
+                &options,
+            )
+            .unwrap();
+            let node_dir = nodes_dir.join(&node_type);
+            let stub = make_stub(stub_dir.path(), name, body);
+            let result = regenerate_python_info_with(&node_dir, &node_type, &stub);
+            match (name, result, oracle) {
+                ("valid", Ok(()), Some(expected)) => {
+                    let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).unwrap();
+                    assert!(
+                        source.contains(expected),
+                        "lib.rs lacks {expected}: {source}"
+                    );
+                }
+                ("two", Err(err), None) => {
+                    assert!(
+                        err.to_string().contains("expected exactly one document"),
+                        "{err}"
+                    );
+                }
+                ("bad", Err(err), None) => {
+                    assert!(err.to_string().contains("produced invalid JSON"), "{err}");
+                }
+                ("array", Err(err), None) => {
+                    assert!(
+                        err.to_string()
+                            .contains("expected object with inputs and outputs arrays"),
+                        "{err}"
+                    );
+                }
+                ("stderr", Err(err), None) => {
+                    assert!(err.to_string().contains("stub stderr"), "{err}");
+                }
+                other => panic!("unexpected metadata result: {other:?}"),
+            }
+            assert!(!node_dir.join(".cerulion_info.json").exists());
+            let leftovers = std::fs::read_dir(&node_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(".cerulion_info.") && name.ends_with(".json")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "metadata temp files remain: {leftovers:?}"
+            );
+        }
+
+        let node_type = "metadata_unique";
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            node_type,
+            Some(MacroPolicy::Period { period_ms: 1 }),
+            &options,
+        )
+        .unwrap();
+        let node_dir = nodes_dir.join(node_type);
+        std::fs::write(node_dir.join(".cerulion_info.json"), "preserve me").unwrap();
+        let stub = make_stub(
+            stub_dir.path(),
+            "unique",
+            r#"printf '%s\n' "$3" >> "$(dirname "$0")/paths.log"; printf '%s' '{"inputs":[],"outputs":[]}' > "$3""#,
+        );
+        regenerate_python_info_with(&node_dir, node_type, &stub).unwrap();
+        regenerate_python_info_with(&node_dir, node_type, &stub).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(node_dir.join(".cerulion_info.json")).unwrap(),
+            "preserve me"
+        );
+        let paths = std::fs::read_to_string(stub_dir.path().join("paths.log")).unwrap();
+        let paths = paths.lines().collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regenerate_python_build_rs_bakes_interpreter_libdir() {
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "rpath_node",
+            Some(MacroPolicy::Period { period_ms: 1 }),
+            &options,
+        )
+        .unwrap();
+        let stub = nodes_dir.join("python-stub");
+        let site = stub_dir.path().join("site");
+        std::fs::create_dir(&site).unwrap();
+        install_python_stub(
+            &stub,
+            &format!(
+                "if [ \"$1\" = \"-c\" ]; then printf '%s\\n' '{{\"libdir\":\"/opt/python/lib\",\"purelib\":\"{}\",\"platlib\":\"{}\"}}'; fi",
+                site.display(),
+                site.display()
+            ),
+        );
+
+        let node_dir = nodes_dir.join("rpath_node");
+        let paths = query_python_paths(&stub).unwrap();
+        regenerate_python_build_rs_with(&node_dir, "rpath_node", &stub, &paths).unwrap();
+        regenerate_python_sys_path_with(&node_dir, "rpath_node", &paths.site_paths).unwrap();
+        let source = std::fs::read_to_string(node_dir.join("build.rs")).unwrap();
+        assert!(source.contains("// CERULION:LIBDIR_START"));
+        assert!(source.contains("const PYTHON_LIBDIR: &str = \"/opt/python/lib\";"));
+        assert!(source.contains("cargo:rustc-link-arg=-Wl,-rpath,"));
+        assert!(source.contains("cargo:rerun-if-changed=build.rs"));
+        let lib_source = std::fs::read_to_string(node_dir.join("src/lib.rs")).unwrap();
+        assert!(lib_source.contains("// CERULION:SYSPATH_START"));
+        assert!(lib_source.contains(&format!("{:?}", site.display().to_string())));
+        assert_eq!(
+            lib_source
+                .matches(&format!("{:?}", site.display().to_string()))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn python_templates_match_exact_snapshot() {
+        let inputs = vec![("inp".to_string(), "geometry_msgs/Vector3".to_string())];
+        let outputs = vec![("out".to_string(), "geometry_msgs/Vector3".to_string())];
+        assert_eq!(
+            templates::generate_python_cargo_toml("echo", "/checkout/cerulion_pynode"),
+            "[package]\nname = \"echo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\ncerulion_pynode = { path = \"/checkout/cerulion_pynode\" }\n\n[profile.release]\nstrip = true\n"
+        );
+        assert_eq!(
+            templates::generate_python_lib_rs(
+                "/workspace/nodes/echo",
+                &inputs,
+                &outputs,
+                &serde_json::json!({"period_ms": 100}),
+                &[],
+            )
+            .unwrap(),
+            "// SPDX-License-Identifier: AGPL-3.0-only\n// CERULION:INFO_START\nstatic INFO_BYTES: &[u8] = b\"{\\\"inputs\\\":[{\\\"name\\\":\\\"inp\\\",\\\"schema_hash\\\":0}],\\\"outputs\\\":[{\\\"max_slice_len_default\\\":null,\\\"name\\\":\\\"out\\\",\\\"promise_within_ms\\\":null,\\\"schema_hash\\\":0,\\\"wire_fixed_size\\\":null}],\\\"policy\\\":{\\\"period_ms\\\":100}}\\0\";\n// CERULION:PORT_SCHEMAS {\"inputs\":{\"inp\":\"geometry_msgs/Vector3\"},\"outputs\":{\"out\":\"geometry_msgs/Vector3\"}}\n// CERULION:INFO_END\n\ncerulion_pynode::export_node! {\n    module: \"node\",\n    sys_path: [\n// CERULION:SYSPATH_START\n    \"/workspace/nodes/echo\",\n// CERULION:SYSPATH_END\n    ],\n    info: INFO_BYTES\n}\n"
+        );
+        // A node with no ports carries no schema line, so the block stays the
+        // shape `regenerate_info_block` writes for it.
+        assert!(!templates::generate_python_lib_rs(
+            "/workspace/nodes/clock",
+            &[],
+            &[],
+            &serde_json::json!({"period_ms": 100}),
+            &[],
+        )
+        .unwrap()
+        .contains("CERULION:PORT_SCHEMAS"));
+        assert_eq!(
+            templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
+            "import cerulion\nfrom cerulion.msgs.geometry_msgs import Vector3\n\n\n@cerulion.node(period_ms=100)\nclass Node:\n    inp = cerulion.input(Vector3)\n    out = cerulion.output(Vector3)\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n"
+        );
+    }
+
+    #[test]
+    fn python_cargo_toml_escapes_the_pynode_path() {
+        let manifest =
+            templates::generate_python_cargo_toml("echo", "/check\"out\\x/cerulion_pynode");
+        let parsed: toml::Value = toml::from_str(&manifest).expect("manifest parses");
+        assert_eq!(
+            parsed["dependencies"]["cerulion_pynode"]["path"].as_str(),
+            Some("/check\"out\\x/cerulion_pynode")
+        );
+    }
+
+    #[test]
+    fn python_sync_scaffold_marks_every_input_as_a_trigger() {
+        let inputs = vec![
+            ("left".to_string(), "Probe".to_string()),
+            ("right".to_string(), "Probe".to_string()),
+        ];
+        let triggers = python_trigger_inputs(Some(&MacroPolicy::Sync { window_ms: 10 }), &inputs);
+        assert_eq!(triggers, vec!["left".to_string(), "right".to_string()]);
+        let source =
+            templates::generate_python_node_py(&inputs, &[], "sync_window_ms=10", &triggers);
+        assert!(source.contains("left = cerulion.input(Probe, trigger=True)"));
+        assert!(source.contains("right = cerulion.input(Probe, trigger=True)"));
+        assert_eq!(
+            python_trigger_inputs(Some(&MacroPolicy::Period { period_ms: 5 }), &inputs),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn python_template_covers_all_ports_and_empty_sides() {
+        let inputs = vec![
+            ("left".to_string(), "Probe".to_string()),
+            ("triggered".to_string(), "Probe".to_string()),
+        ];
+        let outputs = vec![
+            ("first".to_string(), "Probe".to_string()),
+            ("second".to_string(), "Probe".to_string()),
+        ];
+        let source = templates::generate_python_node_py(
+            &inputs,
+            &outputs,
+            "trigger=\"triggered\"",
+            &["triggered".to_string()],
+        );
+        assert!(source.contains("from cerulion.msgs import Probe\n"));
+        assert!(source.contains("left = cerulion.input(Probe)"));
+        assert!(source.contains("triggered = cerulion.input(Probe, trigger=True)"));
+        assert!(source.contains("first = cerulion.output(Probe)"));
+        assert!(source.contains("second = cerulion.output(Probe)"));
+        assert!(
+            templates::generate_python_node_py(&[], &[], "period_ms=1", &[])
+                .contains("        return\n")
+        );
+        assert!(
+            templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[])
+                .contains("msg = self.left")
+        );
+        assert!(
+            templates::generate_python_node_py(&[], &outputs, "period_ms=1", &[])
+                .contains("out = self.first")
+        );
     }
 
     #[test]
@@ -1999,6 +4158,65 @@ mod tests {
     }
 
     #[test]
+    fn test_node_create_rejects_duplicate_output_and_shared_port_names() {
+        // Inputs and outputs are fields of one generated struct, so a repeated
+        // output name, or an output named like an input, would scaffold a node
+        // that cannot build. Both are refused before anything is written.
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let cases = [
+            (
+                NodeCreateOptions {
+                    outputs: vec![
+                        ("sensor_msgs/Image".to_string(), "out".to_string()),
+                        ("sensor_msgs/Imu".to_string(), "out".to_string()),
+                    ],
+                    ..Default::default()
+                },
+                "duplicate output port name 'out'",
+            ),
+            (
+                NodeCreateOptions {
+                    inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+                    outputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+                    ..Default::default()
+                },
+                "port name 'image' is declared as both an input and an output",
+            ),
+        ];
+        for (opts, expected) in cases {
+            let err = node_create_with_options(
+                &nodes_dir,
+                &cargo_toml,
+                "dup",
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
+                &opts,
+            )
+            .expect_err(expected);
+            assert!(matches!(err, CliError::Validation(_)), "{err:?}");
+            assert!(err.to_string().contains(expected), "got: {err}");
+            assert!(!nodes_dir.join("dup").exists(), "nothing is written");
+        }
+        // Distinct names across both lists still scaffold.
+        let ok = NodeCreateOptions {
+            inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            outputs: vec![("sensor_msgs/Image".to_string(), "annotated".to_string())],
+            ..Default::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "dup", None, &ok)
+            .expect("distinct names scaffold");
+        // The raw-FFI template has no struct fields, so an input and an output
+        // may share a name there.
+        let raw = NodeCreateOptions {
+            inputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            outputs: vec![("sensor_msgs/Image".to_string(), "image".to_string())],
+            raw_ffi: true,
+            ..Default::default()
+        };
+        node_create_with_options(&nodes_dir, &cargo_toml, "rawshared", None, &raw)
+            .expect("a raw-FFI node may name an input and an output alike");
+    }
+
+    #[test]
     fn test_node_create_convenience_supplies_bootstrap_default() {
         // `node_create` (the convenience wrapper) explicitly
         // supplies `Some(Period { 100 })` when called with
@@ -2275,11 +4493,12 @@ mod tests {
         );
     }
 
-    /// Workspace schemas WIN over built-ins and stay BARE: a workspace
-    /// `schemas/Foo.yaml` supplied as `-o Foo` passes through unchanged
-    /// (`use Foo;`), never hijacked to a built-in path.
+    /// Workspace schemas WIN over built-ins and stay BARE as the port's
+    /// schema name: a workspace `schemas/Foo.yaml` supplied as `-o Foo` is
+    /// imported from the message crate's root, where the workspace's
+    /// generated `Foo` lives, never hijacked to a built-in package path.
     #[test]
-    fn test_node_create_workspace_bare_schema_passes_through() {
+    fn test_node_create_workspace_bare_schema_imports_the_generated_root_type() {
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         // `workspace_create` lays `schemas/` out as `nodes/`'s sibling.
         let schemas_dir = nodes_dir.parent().unwrap().join("schemas");
@@ -2303,14 +4522,10 @@ mod tests {
 
         let src = std::fs::read_to_string(nodes_dir.join("wsnode/src/lib.rs")).unwrap();
         assert!(
-            src.contains("use Foo;"),
-            "workspace bare name must pass through unchanged; got:\n{src}"
+            src.contains("use native_ros2_messages::Foo;"),
+            "workspace bare name imports the generated root type; got:\n{src}"
         );
         assert!(src.contains("foo_out: Foo,"));
-        assert!(
-            !src.contains("native_ros2_messages::Foo"),
-            "workspace name must not be rewritten to a built-in path; got:\n{src}"
-        );
     }
 
     /// Raw-FFI arm: bare `Vector3` resolves on BOTH raw-FFI paths.
@@ -2467,18 +4682,33 @@ mod tests {
         // The workspace still exists, so a NotFound is a missing `cargo`.
         let ws = tempfile::tempdir().unwrap();
         let err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let reason = cargo_spawn_failure_reason(&err, ws.path());
+        let reason = cargo_spawn_failure_reason(&err, ws.path(), false);
         assert_eq!(
             reason,
             "`cargo` was not found on PATH. `cerulion node build` compiles the node with \
-             the Rust toolchain: install Rust 1.93+ from https://rustup.rs (plus a C \
+             the Rust toolchain: install Rust 1.95+ from https://rustup.rs (plus a C \
              linker: build-essential on Ubuntu/Debian, Xcode Command Line Tools on macOS) \
              and retry"
         );
         // The KIND decides, not the message: a NotFound carrying custom text
         // still names the toolchain.
         let custom = std::io::Error::new(std::io::ErrorKind::NotFound, "custom spawn text");
-        assert_eq!(cargo_spawn_failure_reason(&custom, ws.path()), reason);
+        assert_eq!(
+            cargo_spawn_failure_reason(&custom, ws.path(), false),
+            reason
+        );
+    }
+
+    #[test]
+    fn cargo_spawn_failure_reason_on_android_recommends_host_cross_build() {
+        let ws = tempfile::tempdir().unwrap();
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            cargo_spawn_failure_reason(&err, ws.path(), true),
+            "`cargo` was not found on PATH. Node libraries cannot be built on the device; \
+             cross-build the workspace on the host with `cargo ndk -t <abi> --platform 30 \
+             build`, then push the workspace and its node libraries to the device"
+        );
     }
 
     /// A NotFound whose `current_dir` (the workspace) vanished after
@@ -2496,7 +4726,7 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "No such file or directory (os error 2)",
         );
-        let reason = cargo_spawn_failure_reason(&err, &gone);
+        let reason = cargo_spawn_failure_reason(&err, &gone, false);
         assert_eq!(reason, err.to_string());
         assert!(
             !reason.contains("rustup.rs"),
@@ -2521,7 +4751,7 @@ mod tests {
         ];
         let ws = tempfile::tempdir().unwrap();
         for err in &errors {
-            let reason = cargo_spawn_failure_reason(err, ws.path());
+            let reason = cargo_spawn_failure_reason(err, ws.path(), false);
             assert_eq!(
                 reason,
                 err.to_string(),
@@ -2591,5 +4821,83 @@ mod tests {
         // `release:` is always `<major>.<minor>.<patch>` optionally suffixed
         // (`-nightly`, `-beta.N`): never empty, never containing a space.
         assert!(!detected.contains(' '), "{detected}");
+    }
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn stream(
+        cmd: std::process::Command,
+        started: &mut bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> CliResult<std::process::Output> {
+        run_cargo_streaming(
+            cmd,
+            &mut || *started = true,
+            &mut |_| {},
+            cancel,
+            "n",
+            |e| CliError::BuildFailed {
+                target: "n".to_string(),
+                reason: e.to_string(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streaming_build_that_cannot_spawn_never_reports_started() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let result = stream(
+            std::process::Command::new("cerulion-no-such-program"),
+            &mut started,
+            &cancel,
+        );
+        assert!(result.is_err());
+        assert!(!started);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streaming_build_keeps_the_end_of_a_long_stderr() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let output = stream(
+            sh("head -c 3000000 /dev/zero | tr '\\0' x >&2; echo final-error >&2; exit 1"),
+            &mut started,
+            &cancel,
+        )
+        .expect("ran");
+        assert!(started);
+        assert!(!output.status.success());
+        assert!(output.stderr.len() <= STREAMING_STDERR_CAP);
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .trim_end()
+            .ends_with("final-error"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_still_kills_a_build_that_closed_its_stdout() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut started = false;
+        let began = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            });
+            stream(sh("exec 1>&-; sleep 60"), &mut started, &cancel)
+        });
+        assert!(matches!(
+            result,
+            Err(CliError::BuildFailed { ref reason, .. }) if reason == "cancelled"
+        ));
+        assert!(began.elapsed() < std::time::Duration::from_secs(30));
     }
 }

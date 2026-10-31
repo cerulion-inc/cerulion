@@ -1,0 +1,766 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Frame -> YAML.
+
+use std::fmt::Write as _;
+
+use super::{
+    push_field, push_index, shown, type_name, MAX_YAML_BYTES, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG,
+};
+use crate::codegen::layout::WireLayout;
+use crate::codegen::{FieldType, FrameValue, FrameValueKind, FrameWalker, MessageSchema, PrimType};
+use crate::dynamic::DynamicError;
+use crate::wire::WireHeader;
+
+/// Display options for [`message_to_yaml_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct YamlEncodeOptions {
+    /// Show at most this many elements of each array; the rest are counted
+    /// in a closing `!truncated <n>` element. `None` (the default) shows
+    /// every element, which is the only form [`super::yaml_to_message`]
+    /// accepts back. The frame is decoded holding only the elements shown
+    /// ([`FrameWalker::walk_by_hash_keeping`]): every element is still read
+    /// once to check the frame, but the decoded tree is never larger than
+    /// what is printed.
+    pub truncate_arrays: Option<usize>,
+    /// Stop after this many lines: the output is the first `n` lines and
+    /// then a column-0 [`YAML_TRUNCATED_TAG`] line, which no YAML reader
+    /// accepts, so cut output never reads back as a shorter message. The
+    /// encoder stops writing at the cut, so the work is bounded by `n`,
+    /// not by the size of the message. `None` (the default) writes every
+    /// line.
+    pub max_lines: Option<usize>,
+}
+
+/// Render the wire `frame` (header included) as YAML, every element shown.
+///
+/// The frame's `schema_hash` picks the schema from `walker`; the output is
+/// one block mapping in declaration order, ending in a newline (see the
+/// module docs for the form). The same frame always gives the same bytes.
+///
+/// # Errors
+///
+/// - [`DynamicError::Walk`]: the walker refused the frame (unknown hash,
+///   truncated or malformed bytes).
+/// - [`DynamicError::YamlUnencodable`]: a value has no YAML form (a string
+///   field that is not UTF-8, an array that is not in the canonical element
+///   framing, a `bool` or `bool[]` byte that is neither 0 nor 1).
+/// - [`DynamicError::YamlUnsupportedField`]: the schema has a field type the
+///   YAML form does not cover (an array of arrays, an array of
+///   `string_fixed[n]` outside a fixed array).
+/// - [`DynamicError::YamlTooDeep`]: the schema nests deeper than
+///   [`super::MAX_YAML_DEPTH`].
+/// - [`DynamicError::YamlOutputTooLarge`]: the YAML would be longer than
+///   [`super::MAX_YAML_BYTES`].
+pub fn message_to_yaml(walker: &FrameWalker, frame: &[u8]) -> Result<String, DynamicError> {
+    message_to_yaml_with(walker, frame, YamlEncodeOptions::default())
+}
+
+/// [`message_to_yaml`] with display options (array truncation for a
+/// terminal). Truncated output is for reading only: decoding it back fails
+/// loudly at the first `!truncated` element.
+///
+/// # Errors
+///
+/// As [`message_to_yaml`].
+pub fn message_to_yaml_with(
+    walker: &FrameWalker,
+    frame: &[u8],
+    options: YamlEncodeOptions,
+) -> Result<String, DynamicError> {
+    message_to_yaml_capped(walker, frame, options, MAX_YAML_BYTES)
+}
+
+/// [`message_to_yaml_with`] with the output cap as a parameter, so tests
+/// can reach it with small messages.
+pub(super) fn message_to_yaml_capped(
+    walker: &FrameWalker,
+    frame: &[u8],
+    options: YamlEncodeOptions,
+    max_bytes: usize,
+) -> Result<String, DynamicError> {
+    let keep = options.truncate_arrays.unwrap_or(usize::MAX);
+    let value = walker.walk_by_hash_keeping_raw_bools(frame, keep)?;
+    // The walk read a whole header, so `frame` holds one. The hash picks the
+    // schema the walk decoded with: a twin can own `value.schema_name`.
+    let schema = WireHeader::read_from_buf(frame)
+        .and_then(|header| walker.schema_for_hash(header.schema_hash))
+        .ok_or_else(|| DynamicError::YamlUnresolvedNested {
+            path: shown(""),
+            target: value.schema_name.clone(),
+        })?;
+    let mut emitter = Emitter {
+        walker,
+        options,
+        max_bytes,
+        out: String::new(),
+        lines: 0,
+        cut: false,
+        path: String::new(),
+    };
+    let written = if schema.fields.is_empty() {
+        emitter.put("{}\n")
+    } else {
+        emitter.mapping(schema, Some(&value), 0, 0, false)
+    };
+    match written {
+        Ok(()) => Ok(emitter.out),
+        // The line budget ran out: the output so far ends at a whole line.
+        Err(_) if emitter.cut => {
+            emitter.fits(YAML_TRUNCATED_TAG.len() + 1)?;
+            emitter.out.push_str(YAML_TRUNCATED_TAG);
+            emitter.out.push('\n');
+            Ok(emitter.out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+struct Emitter<'w> {
+    walker: &'w FrameWalker,
+    options: YamlEncodeOptions,
+    /// The longest output allowed, in bytes.
+    max_bytes: usize,
+    out: String,
+    /// The number of whole lines in `out`.
+    lines: usize,
+    /// Set when [`YamlEncodeOptions::max_lines`] stopped the output; the
+    /// error that unwinds the emitter is then the stop, not a failure.
+    cut: bool,
+    /// The field path of the value being emitted (for error text).
+    path: String,
+}
+
+impl<'w> Emitter<'w> {
+    fn unencodable(&self, detail: impl Into<String>) -> DynamicError {
+        DynamicError::YamlUnencodable {
+            path: shown(&self.path),
+            detail: detail.into(),
+        }
+    }
+
+    fn too_large(&self) -> DynamicError {
+        DynamicError::YamlOutputTooLarge {
+            path: shown(&self.path),
+            max_bytes: self.max_bytes,
+        }
+    }
+
+    /// Refuse once `extra` more bytes would take the output past the cap.
+    fn fits(&self, extra: usize) -> Result<(), DynamicError> {
+        if self.out.len().saturating_add(extra) > self.max_bytes {
+            return Err(self.too_large());
+        }
+        Ok(())
+    }
+
+    /// `s` as a quoted scalar, refused once it alone would take the output
+    /// past the cap. Escapes grow a string up to four times, so the check
+    /// runs while the escapes are written, not after.
+    fn quoted(&self, s: &str) -> Result<String, DynamicError> {
+        quote_within(s, self.max_bytes.saturating_sub(self.out.len()))
+            .ok_or_else(|| self.too_large())
+    }
+
+    /// The ONE way text reaches the output: every write is counted against
+    /// the byte cap and the line budget first. `s` holds at most one
+    /// newline, at its end.
+    fn put(&mut self, s: &str) -> Result<(), DynamicError> {
+        // The budget is spent once a write would start or end one more
+        // line, so nothing past it is rendered.
+        let at_line_start = self.out.is_empty() || self.out.ends_with('\n');
+        if self.options.max_lines == Some(self.lines) && (at_line_start || s.ends_with('\n')) {
+            // Drop any unfinished line, so the output ends at a whole line.
+            let end = self.out.rfind('\n').map_or(0, |i| i + 1);
+            self.out.truncate(end);
+            self.cut = true;
+            return Err(self.too_large());
+        }
+        self.fits(s.len())?;
+        self.out.push_str(s);
+        if s.ends_with('\n') {
+            self.lines += 1;
+        }
+        Ok(())
+    }
+
+    fn unsupported(&self, ft: &FieldType) -> DynamicError {
+        DynamicError::YamlUnsupportedField {
+            path: shown(&self.path),
+            field_type: type_name(ft),
+        }
+    }
+
+    /// Emit `schema`'s fields as block-mapping lines at `indent` spaces.
+    /// `value` is `None` for a zero-default message: an empty variable
+    /// nested field (the producer idiom for "not set") renders as the
+    /// target's zero values, so the output stays complete YAML. `dash`
+    /// starts the first line with a sequence-element `- ` in its last two
+    /// columns of indent.
+    fn mapping(
+        &mut self,
+        schema: &MessageSchema,
+        value: Option<&FrameValue<'_>>,
+        indent: usize,
+        depth: usize,
+        dash: bool,
+    ) -> Result<(), DynamicError> {
+        self.too_deep(depth)?;
+        // An empty variable nested blob decodes to a value with no fields:
+        // treat it as the zero default.
+        let value = value.filter(|v| !v.fields.is_empty() || schema.fields.is_empty());
+        let parent = schema.package.as_deref();
+        for (i, field) in schema.fields.iter().enumerate() {
+            let kind = match value {
+                Some(v) => {
+                    Some(
+                        v.field(&field.name)
+                            .ok_or_else(|| DynamicError::YamlUnencodable {
+                                path: shown(&self.path),
+                                detail: format!("decoded frame has no field {}", field.name),
+                            })?,
+                    )
+                }
+                None => None,
+            };
+            let mark = self.path.len();
+            push_field(&mut self.path, &field.name);
+            let lead = if dash && i == 0 {
+                format!("{:w$}- ", "", w = indent - 2)
+            } else {
+                format!("{:indent$}", "")
+            };
+            self.put(&format!("{lead}{}:", key(&field.name)))?;
+            self.value(&field.field_type, kind, parent, indent, depth)?;
+            self.path.truncate(mark);
+        }
+        Ok(())
+    }
+
+    /// Refuse a message nested past [`MAX_YAML_DEPTH`], as the reader does.
+    fn too_deep(&self, depth: usize) -> Result<(), DynamicError> {
+        if depth > MAX_YAML_DEPTH {
+            return Err(DynamicError::YamlTooDeep {
+                path: shown(&self.path),
+                max: MAX_YAML_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
+    /// Emit one field value after its `key:`; writes the rest of the line
+    /// (` <inline>\n`) or a newline plus a block.
+    fn value(
+        &mut self,
+        ft: &FieldType,
+        kind: Option<&FrameValueKind<'_>>,
+        parent: Option<&str>,
+        indent: usize,
+        depth: usize,
+    ) -> Result<(), DynamicError> {
+        match ft {
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => {
+                let (layout, target) = self.nested_target(schema_name, package, parent)?;
+                let inner = match kind {
+                    None => None,
+                    // No bytes: the schema alone gives the value.
+                    Some(_) if zero_size(layout) => None,
+                    Some(FrameValueKind::Nested(v)) => Some(v.as_ref()),
+                    Some(_) => return Err(self.unencodable("decoded value is not a message")),
+                };
+                if target.fields.is_empty() {
+                    // `{}` is a level too: the reader refuses it past the
+                    // bound, so it is never written there.
+                    self.too_deep(depth + 1)?;
+                    return self.put(" {}\n");
+                }
+                self.put("\n")?;
+                self.mapping(target, inner, indent + 2, depth + 1, false)
+            }
+            FieldType::DynamicArray { element_type }
+            | FieldType::FixedArray { element_type, .. }
+                if matches!(element_type.as_ref(), FieldType::Nested { .. }) =>
+            {
+                self.message_array(ft, element_type, kind, parent, indent, depth)
+            }
+            _ => {
+                let inline = self.inline(ft, kind)?;
+                self.put(&format!(" {inline}\n"))
+            }
+        }
+    }
+
+    /// The layout and schema a nested reference, written inside a schema
+    /// of package `parent`, resolves to.
+    fn nested_target(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent: Option<&str>,
+    ) -> Result<(&'w WireLayout, &'w MessageSchema), DynamicError> {
+        self.walker
+            .nested_target(schema_name, package, parent)
+            .ok_or_else(|| DynamicError::YamlUnresolvedNested {
+                path: shown(&self.path),
+                target: match package {
+                    Some(p) => format!("{p}/{schema_name}"),
+                    None => schema_name.to_string(),
+                },
+            })
+    }
+
+    /// An array of messages: a block sequence (`[]` when empty).
+    fn message_array(
+        &mut self,
+        ft: &FieldType,
+        element_type: &FieldType,
+        kind: Option<&FrameValueKind<'_>>,
+        parent: Option<&str>,
+        indent: usize,
+        depth: usize,
+    ) -> Result<(), DynamicError> {
+        let FieldType::Nested {
+            schema_name,
+            package,
+            ..
+        } = element_type
+        else {
+            return Err(self.unsupported(ft));
+        };
+        let (layout, target) = self.nested_target(schema_name, package, parent)?;
+        // A zero-default fixed array is counted, never built: its length
+        // comes from the schema, not from the frame. A decoded array holds
+        // only the elements shown (see `YamlEncodeOptions::truncate_arrays`),
+        // so its length comes from the schema or the array's own bytes.
+        // A fixed array of zero-size messages is rendered from the schema
+        // too: its elements carry no bytes, and the walker holds none of
+        // them (see `FrameWalker::walk_keeping`).
+        let kind = match ft {
+            FieldType::FixedArray { .. } if zero_size(layout) => None,
+            _ => kind,
+        };
+        let (len, elems): (usize, &[FrameValueKind<'_>]) = match (kind, ft) {
+            (None, FieldType::FixedArray { length, .. }) => (*length, &[]),
+            (None, _) => (0, &[]),
+            (Some(FrameValueKind::Array(elems)), FieldType::FixedArray { length, .. }) => {
+                (*length, elems)
+            }
+            (Some(FrameValueKind::NestedArray { elements, raw }), _) => {
+                (element_count(raw, Some(layout)), elements)
+            }
+            (Some(FrameValueKind::NestedArrayOpaque(_)), _) => {
+                return Err(self.unencodable("array bytes are not in the canonical element framing"))
+            }
+            (Some(_), _) => return Err(self.unencodable("decoded value is not an array")),
+        };
+        if len == 0 {
+            return self.put(" []\n");
+        }
+        self.put("\n")?;
+        let shown_count = self.shown_count(len);
+        for i in 0..shown_count {
+            let elem = match (kind, elems.get(i)) {
+                (None, _) => None,
+                (Some(_), Some(FrameValueKind::Nested(v))) => Some(v.as_ref()),
+                (Some(_), Some(_)) => {
+                    return Err(self.unencodable("array element is not a message"))
+                }
+                (Some(_), None) => {
+                    return Err(
+                        self.unencodable("decoded array holds fewer elements than it counts")
+                    )
+                }
+            };
+            let mark = self.path.len();
+            push_index(&mut self.path, i);
+            if target.fields.is_empty() {
+                self.too_deep(depth + 2)?;
+                self.put(&format!("{:w$}- {{}}\n", "", w = indent + 2))?;
+            } else {
+                // The element's fields sit at indent + 4; its first line
+                // carries the `- ` at indent + 2.
+                // The sequence and the element mapping are a level each.
+                self.mapping(target, elem, indent + 4, depth + 2, true)?;
+            }
+            self.path.truncate(mark);
+        }
+        if shown_count < len {
+            self.put(&format!(
+                "{:w$}- {YAML_TRUNCATED_TAG} {}\n",
+                "",
+                len - shown_count,
+                w = indent + 2
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn shown_count(&self, len: usize) -> usize {
+        self.options.truncate_arrays.map_or(len, |n| n.min(len))
+    }
+
+    /// A flow sequence of already-rendered scalars, honouring truncation.
+    /// `len` is the array's full length; `items` yields at least the
+    /// elements shown.
+    fn flow(
+        &self,
+        len: usize,
+        items: impl Iterator<Item = Result<String, DynamicError>>,
+    ) -> Result<String, DynamicError> {
+        let shown_count = self.shown_count(len);
+        // The sequence is written into one buffer as it is rendered; `[`,
+        // `]`, each `, ` and the truncation marker count toward the cap
+        // with the items, so a long array stops before it is built.
+        let mut out = String::from("[");
+        let add = |part: &str, out: &mut String| {
+            let sep = if out.len() > 1 { 2 } else { 0 };
+            // The closing `]` is counted from the start.
+            self.fits(out.len() + sep + part.len() + 1)?;
+            if sep > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(part);
+            Ok::<(), DynamicError>(())
+        };
+        let mut items = items;
+        for _ in 0..shown_count {
+            let item = items.next().ok_or_else(|| {
+                self.unencodable("decoded array holds fewer elements than it counts")
+            })?;
+            add(&item?, &mut out)?;
+        }
+        if shown_count < len {
+            add(
+                &format!("{YAML_TRUNCATED_TAG} {}", len - shown_count),
+                &mut out,
+            )?;
+        }
+        out.push(']');
+        Ok(out)
+    }
+
+    /// The inline (single-line) form of a non-message value.
+    fn inline(
+        &self,
+        ft: &FieldType,
+        kind: Option<&FrameValueKind<'_>>,
+    ) -> Result<String, DynamicError> {
+        let Some(kind) = kind else {
+            return self.zero_inline(ft);
+        };
+        type K<'a> = FrameValueKind<'a>;
+        Ok(match (ft, kind) {
+            (FieldType::Bool, K::Bool(v)) => v.to_string(),
+            // The walk keeps a bool byte past 1 as its byte: `true` would
+            // read back as 1, so the frame has no YAML form (as in `bool[]`).
+            (FieldType::Bool, K::U8(b)) => {
+                return Err(self.unencodable(format!("bool byte {b} is neither 0 nor 1")))
+            }
+            (FieldType::I8, K::I8(v)) => v.to_string(),
+            (FieldType::U8, K::U8(v)) => v.to_string(),
+            (FieldType::I16, K::I16(v)) => v.to_string(),
+            (FieldType::U16, K::U16(v)) => v.to_string(),
+            (FieldType::I32, K::I32(v)) => v.to_string(),
+            (FieldType::U32, K::U32(v)) => v.to_string(),
+            (FieldType::I64, K::I64(v)) => v.to_string(),
+            (FieldType::U64, K::U64(v)) => v.to_string(),
+            (FieldType::F32, K::F32(v)) => format_f32(*v),
+            (FieldType::F64, K::F64(v)) => format_f64(*v),
+            (FieldType::String | FieldType::StringFixed(_), K::Str(s)) => self.quoted(s)?,
+            (FieldType::String | FieldType::StringFixed(_), K::Bytes(_)) => {
+                return Err(self.unencodable("string field is not valid UTF-8"))
+            }
+            (FieldType::Bytes, K::Bytes(b)) => {
+                self.flow(b.len(), b.iter().map(|b| Ok(b.to_string())))?
+            }
+            (
+                FieldType::DynamicArray { element_type }
+                | FieldType::FixedArray { element_type, .. },
+                _,
+            ) => self.scalar_array(ft, element_type, kind)?,
+            _ => return Err(self.unencodable("decoded value does not match the schema type")),
+        })
+    }
+
+    fn scalar_array(
+        &self,
+        ft: &FieldType,
+        element_type: &FieldType,
+        kind: &FrameValueKind<'_>,
+    ) -> Result<String, DynamicError> {
+        type K<'a> = FrameValueKind<'a>;
+        match (element_type, kind) {
+            (FieldType::U8, K::Bytes(b)) => self.flow(b.len(), b.iter().map(|b| Ok(b.to_string()))),
+            (FieldType::I8, K::Bytes(b)) => {
+                self.flow(b.len(), b.iter().map(|b| Ok((*b as i8).to_string())))
+            }
+            (FieldType::Bool, K::Bytes(b) | K::NestedArrayOpaque(b)) => self.flow(
+                b.len(),
+                b.iter().map(|b| match b {
+                    0 => Ok("false".to_string()),
+                    1 => Ok("true".to_string()),
+                    other => Err(self.unencodable(format!("bool byte {other} is neither 0 nor 1"))),
+                }),
+            ),
+            // The walker reads an empty `bool[]` blob as an empty element
+            // array: zero elements, the same `[]` the decoder reads back.
+            (FieldType::Bool, K::NestedArray { elements, raw })
+                if elements.is_empty() && raw.is_empty() =>
+            {
+                self.flow(0, std::iter::empty())
+            }
+            (_, K::PrimArray(a)) if prim_of(element_type) == Some(a.elem) => {
+                let size = a.elem.size();
+                // The walker counts whole elements; bytes past the last one
+                // would be dropped from the YAML, so the frame has no form.
+                if a.count.checked_mul(size) != Some(a.bytes.len()) {
+                    return Err(self.unencodable(format!(
+                        "{} array bytes are not a whole number of elements",
+                        a.bytes.len()
+                    )));
+                }
+                self.flow(
+                    a.count,
+                    (0..a.count)
+                        .map(|i| Ok(format_prim(a.elem, &a.bytes[i * size..(i + 1) * size]))),
+                )
+            }
+            (FieldType::String, K::NestedArray { elements, raw }) => self.flow(
+                element_count(raw, None),
+                elements.iter().map(|e| match e {
+                    K::Str(s) => self.quoted(s),
+                    _ => Err(self.unencodable("string element is not valid UTF-8")),
+                }),
+            ),
+            // Zero-width strings carry no bytes: the declared length says
+            // how many empty ones there are.
+            (FieldType::StringFixed(0), K::NestedArrayOpaque(_)) => match ft {
+                FieldType::FixedArray { length, .. } => {
+                    self.flow(*length, (0..*length).map(|_| Ok("\"\"".to_string())))
+                }
+                _ => Err(self.unsupported(ft)),
+            },
+            (FieldType::StringFixed(n), K::NestedArrayOpaque(raw))
+                if matches!(ft, FieldType::FixedArray { .. }) =>
+            {
+                self.flow(
+                    raw.len().div_ceil(*n),
+                    raw.chunks(*n).map(|chunk| {
+                        let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
+                        std::str::from_utf8(&chunk[..end])
+                            .map_err(|_| self.unencodable("string element is not valid UTF-8"))
+                            .and_then(|s| self.quoted(s))
+                    }),
+                )
+            }
+            (FieldType::String, K::NestedArrayOpaque(_)) => {
+                Err(self.unencodable("array bytes are not in the canonical element framing"))
+            }
+            // Every supported shape matched above (the walker derives each
+            // value from the same schema), so what is left has no YAML form.
+            _ => Err(self.unsupported(ft)),
+        }
+    }
+
+    /// The zero value of a non-message field (for a zero-default message).
+    fn zero_inline(&self, ft: &FieldType) -> Result<String, DynamicError> {
+        Ok(match ft {
+            FieldType::Bool => "false".to_string(),
+            FieldType::I8
+            | FieldType::U8
+            | FieldType::I16
+            | FieldType::U16
+            | FieldType::I32
+            | FieldType::U32
+            | FieldType::I64
+            | FieldType::U64 => "0".to_string(),
+            FieldType::F32 | FieldType::F64 => "0.0".to_string(),
+            FieldType::String | FieldType::StringFixed(_) => "\"\"".to_string(),
+            FieldType::Bytes => "[]".to_string(),
+            FieldType::DynamicArray { .. } if scalar_array_supported(ft) => "[]".to_string(),
+            FieldType::FixedArray {
+                element_type,
+                length,
+            } if scalar_array_supported(ft) => {
+                let elem = self.zero_inline(element_type)?;
+                self.flow(*length, (0..*length).map(|_| Ok(elem.clone())))?
+            }
+            _ => return Err(self.unsupported(ft)),
+        })
+    }
+}
+
+/// True for a message with no bytes on the wire: its value is the
+/// schema's empty value whatever the frame holds.
+fn zero_size(layout: &WireLayout) -> bool {
+    layout.is_fixed() && layout.fixed_size == 0
+}
+
+/// True for the array shapes the flow form covers.
+fn scalar_array_supported(ft: &FieldType) -> bool {
+    match ft {
+        FieldType::DynamicArray { element_type } => matches!(
+            element_type.as_ref(),
+            FieldType::Bool
+                | FieldType::I8
+                | FieldType::U8
+                | FieldType::I16
+                | FieldType::U16
+                | FieldType::I32
+                | FieldType::U32
+                | FieldType::I64
+                | FieldType::U64
+                | FieldType::F32
+                | FieldType::F64
+                | FieldType::String
+        ),
+        FieldType::FixedArray { element_type, .. } => matches!(
+            element_type.as_ref(),
+            FieldType::Bool
+                | FieldType::I8
+                | FieldType::U8
+                | FieldType::I16
+                | FieldType::U16
+                | FieldType::I32
+                | FieldType::U32
+                | FieldType::I64
+                | FieldType::U64
+                | FieldType::F32
+                | FieldType::F64
+                | FieldType::String
+                | FieldType::StringFixed(_)
+        ),
+        _ => false,
+    }
+}
+
+fn prim_of(ft: &FieldType) -> Option<PrimType> {
+    Some(match ft {
+        FieldType::I16 => PrimType::I16,
+        FieldType::U16 => PrimType::U16,
+        FieldType::I32 => PrimType::I32,
+        FieldType::U32 => PrimType::U32,
+        FieldType::I64 => PrimType::I64,
+        FieldType::U64 => PrimType::U64,
+        FieldType::F32 => PrimType::F32,
+        FieldType::F64 => PrimType::F64,
+        _ => return None,
+    })
+}
+
+/// One little-endian element of a primitive array, in its own type.
+fn format_prim(elem: PrimType, b: &[u8]) -> String {
+    let a2 = || [b[0], b[1]];
+    let a4 = || [b[0], b[1], b[2], b[3]];
+    let a8 = || [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+    match elem {
+        PrimType::I16 => i16::from_le_bytes(a2()).to_string(),
+        PrimType::U16 => u16::from_le_bytes(a2()).to_string(),
+        PrimType::I32 => i32::from_le_bytes(a4()).to_string(),
+        PrimType::U32 => u32::from_le_bytes(a4()).to_string(),
+        PrimType::I64 => i64::from_le_bytes(a8()).to_string(),
+        PrimType::U64 => u64::from_le_bytes(a8()).to_string(),
+        PrimType::F32 => format_f32(f32::from_le_bytes(a4())),
+        PrimType::F64 => format_f64(f64::from_le_bytes(a8())),
+    }
+}
+
+/// Shortest decimal that reads back to `v` (Rust's `{:?}`), YAML spellings
+/// for the non-finite values. Every NaN is `.nan`: its sign and payload
+/// bits are not kept (see the module docs).
+pub(super) fn format_f64(v: f64) -> String {
+    if v.is_nan() {
+        ".nan".to_string()
+    } else if v.is_infinite() {
+        if v.is_sign_positive() {
+            ".inf"
+        } else {
+            "-.inf"
+        }
+        .to_string()
+    } else {
+        format!("{v:?}")
+    }
+}
+
+/// As [`format_f64`], with the shortest decimal for the `f32` itself.
+pub(super) fn format_f32(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:?}")
+    } else {
+        format_f64(f64::from(v))
+    }
+}
+
+/// A mapping key: plain when it is an identifier YAML reads as a string,
+/// double quoted otherwise (`"null"`, `"true"`, names with odd characters).
+pub(super) fn key(name: &str) -> String {
+    let identifier = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let reserved = matches!(
+        name,
+        "null" | "Null" | "NULL" | "true" | "True" | "TRUE" | "false" | "False" | "FALSE"
+    );
+    if identifier && !reserved {
+        name.to_string()
+    } else {
+        quote(name)
+    }
+}
+
+/// A YAML double-quoted scalar. Escapes `"` and `\`, every character YAML
+/// does not allow raw (C0 and C1 controls, DEL, U+FEFF, U+FFFE, U+FFFF)
+/// and the characters a YAML reader folds as line breaks (U+0085,
+/// U+2028, U+2029).
+pub(super) fn quote(s: &str) -> String {
+    quote_within(s, usize::MAX).expect("no limit")
+}
+
+/// [`quote`], or `None` once the quoted form passes `limit` bytes: no more
+/// than `limit` plus one escape is ever built.
+pub(super) fn quote_within(s: &str, limit: usize) -> Option<String> {
+    let mut out = String::with_capacity(s.len().min(limit).saturating_add(2));
+    out.push('"');
+    for c in s.chars() {
+        if out.len() > limit {
+            return None;
+        }
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 0x20 || ('\u{7F}'..='\u{9F}').contains(&c) => {
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
+            '\u{2028}' | '\u{2029}' | '\u{FEFF}' | '\u{FFFE}' | '\u{FFFF}' => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    (out.len() <= limit).then_some(out)
+}
+
+/// The element count of a canonically framed element array from its raw
+/// bytes: back-to-back fixed elements (`layout` fixed) carry none and divide
+/// by the stride; counted ones (`string[]`, variable messages) open with a
+/// little-endian `u32` count. The walker accepted the framing, so the bytes
+/// are well formed; an empty blob is zero elements.
+fn element_count(raw: &[u8], layout: Option<&WireLayout>) -> usize {
+    match layout {
+        Some(l) if l.is_fixed() => raw.len().checked_div(l.fixed_size).unwrap_or(0),
+        _ => raw
+            .first_chunk::<4>()
+            .map_or(0, |b| u32::from_le_bytes(*b) as usize),
+    }
+}

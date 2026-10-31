@@ -2,9 +2,19 @@
 
 A "how it works and why" reference. A graph that declares
 `process_groups:` in its YAML runs as N OS **processes** (one per group)
-instead of one, with the SAME deterministic execution contract as the
-single-process monolith: the merged cross-process fire trace is
-byte-identical to the monolith's (the determinism firewall, Principle #7).
+instead of one. By DEFAULT those processes **free-run**: no shared barrier,
+no handed gating quantum, each rank on its own wall-following clock, and each
+rank's own boundary stream is what a recording carries and what
+`cerulion bag play --resim` re-executes (RANK BY RANK).
+`CERULION_EXECUTION_MODE=lockstep` opts a run out into **barrier lockstep**,
+and only there does the deployment hold the SAME deterministic execution
+contract as the single-process monolith: the merged cross-process fire trace
+is byte-identical to the monolith's (the determinism firewall: the barrier changes only when a process advances, never what fires).
+Most of this page describes that lockstep machinery, because the barrier is
+the mechanism the split has to explain; each section that does is marked at
+its head, and the free-run default is described under
+[Recording a multi-process run](#recording-a-multi-process-run---record) and
+[Replaying a multi-process recording](#replaying-a-multi-process-recording).
 Multi-process buys you **fault isolation** (a crashed group takes down only
 its own nodes) and OS-level resource separation, not latency: intra-process
 fusion remains the fastest path.
@@ -22,7 +32,14 @@ recording's per-edge read log offline).
   node ids into named groups. `cerulion graph run <name>` then becomes the
   **supervisor**: it plans the deployment, spawns one worker process per
   group, and joins them under a loud lifecycle contract.
-- Workers run in **lockstep**: a shared-memory barrier gates every DAG-level
+- Workers **free-run by DEFAULT**: no shared barrier, no handed quantum, each
+  rank on its own wall-following clock, per-rank boundary streams sharing only
+  the GO epoch. A recording of such a run stamps `coordination: free_run` and
+  is re-executed rank by rank; what a free-run run does NOT give you is the
+  cross-rank equality the barrier buys, so the merged cross-process trace is
+  not the monolith's.
+- **Under the `CERULION_EXECUTION_MODE=lockstep` opt-out** workers run in
+  lockstep: a shared-memory barrier gates every DAG-level
   boundary, and every worker advances the same deterministic-live logical
   clock quantum, so the merged cross-process fire TRACE is
   replay-deterministic, and so is the DATA on every edge the DAG orders. The
@@ -57,15 +74,22 @@ recording's per-edge read log offline).
   and there is no detector for it. See
   [Hard constraints](auto_partitioning.md#hard-constraints-block-edges-are-not-a-cost-input).
 - A crashed worker does NOT (by default) kill the deployment: the supervisor
-  drops it from the barrier and the survivors continue **degraded, loudly**
+  drops it from the barrier cohort (under the `lockstep` opt-out; a free-run
+  deployment has no cohort to repair) and the survivors continue
+  **degraded, loudly**
   (`--peer-loss continue`, the default). CI/replay runs can opt into
   fail-loud (`--peer-loss fail`).
-- Unix (Linux + macOS): the barrier is a portable POSIX
+- Unix (Linux + macOS): the lockstep barrier is a portable POSIX
   `shm_open` `MAP_SHARED` primitive. The wake shape is per-OS (Linux: a
-  process-shared futex; macOS: a bounded boundary spin then chunked
-  ~100µs sleep-rechecks, never a busy-spin). On non-Unix hosts the SAME
-  graph runs single-process (monolith fallback) with a loud notice:
-  identical results, no process isolation.
+  process-shared futex; macOS 14.4 and later: a bounded boundary spin then
+  an `os_sync_wait_on_address` kernel wake, with chunked ~100 µs
+  sleep-rechecks as the fallback on older macOS and under
+  `CERULION_BARRIER_OS_SYNC=0`; never a busy-spin). On non-Unix hosts the SAME
+  graph runs single-process (monolith fallback) with a loud notice: you lose
+  process isolation. Under the `lockstep` opt-out the fallback's results match
+  the split's. Under the free-run default they need not: a split's cross-rank
+  pairings are decided by OS scheduling, and what reproduces such a run is its
+  recorded bag, not a second live run.
 
 ## When does a run go multi-process? (the auto-partition default)
 
@@ -77,31 +101,37 @@ UNPARTITIONED graph goes multi-process **by default**:
 - **No `process_groups:` + Unix + the real (default) clock** →
   `graph run` DERIVES a partition: a cost-aware partition derived by greedy
   fusion when `graphs/<name>.costs.yaml` exists (from `cerulion graph profile`),
-  else the **process-per-node baseline** (maximal fault isolation). It then runs the
-  consent ladder for persisting the derivation into the YAML:
+  else the **process-per-node baseline** (maximal fault isolation). The run uses
+  the derived groups in memory without prompting or showing a partition diff.
 
   | You ran | File | Run |
   |---|---|---|
+  | Terminal or non-terminal, no `--yes` | **Untouched** | multi-process, derived groups in memory |
   | `--yes` | Written (surgical splice, `.bak` backup) | multi-process, derived groups |
-  | TTY, answered `y` | Written (same) | multi-process, derived groups |
-  | TTY, answered `N` | **Untouched** | multi-process, derived groups held IN-MEMORY (decline ≠ abort; Ctrl-C is abort). Logged at `info`, not `warn`: you were asked and this is what you chose |
-  | no TTY, no `--yes` | **Untouched** (the floor: never mutate without consent) | multi-process, derived groups IN-MEMORY + a loud notice naming `--yes` and `--single-process` |
-  | `--single-process` | Untouched | the plain MONOLITH: no derivation, no prompt (the opt-out) |
+  | `--single-process` | Untouched | a single process without process isolation; no derivation |
 
-  An in-memory derivation produces EXACTLY the deployment a written file
-  would (same plan, ranks, subgraphs; pinned by test).
-- **`--auto-partition`** → re-derive even over an existing `process_groups:`
-  block: shows the diff vs your block; TTY `y` applies, `N` KEEPS your block
-  (decline means "don't change what I wrote"); `--yes` applies; no TTY runs
-  the re-derivation in-memory. Uses replace-scoped validation, so it also
-  recovers a stale/broken block. Conflicts with `--single-process`.
+  An in-memory derivation produces exactly the deployment a written file
+  would: the same plan, ranks and subgraphs. Once the workers are ready, the
+  run reports its node count, multi-process mode and Ctrl-C stop instruction.
+- **`--auto-partition`** re-derives over an existing `process_groups:` block
+  and runs the new groups in memory. The graph file remains unchanged unless
+  `--yes` explicitly saves the new groups. Uses replace-scoped validation,
+  so it also recovers a stale or broken block. Conflicts with `--single-process`.
+  Under `--time-source external` it is REFUSED before any derivation (a
+  multi-process deployment cannot follow an external clock), so no derivation
+  runs and the graph file is never touched; drop the flag or the external clock.
 - **`--time-source virtual`/`external` on an unpartitioned graph** → the
   monolith paths (the default derives on the REAL-clock live path only).
 - **Non-Unix** → monolith fallback (below), derivation skipped entirely.
 
-Persist once and forget: `cerulion graph partition <name>` (see
-`docs/auto_partitioning.md`) writes the same derivation with a preview +
-confirm, after which every run takes the declared-`process_groups:` path.
+The run bands over the graph's own levels; `cerulion graph partition <name>`
+is the cost-refined inspection surface (`--dry-run` inspects only), so its
+layout can differ from the run's when a cost snapshot moves a node to another
+level. Save with `cerulion graph partition <name>` after its preview and
+confirmation, or add `--yes` to `graph run` to save the layout that run
+derives. Subsequent runs use the saved `process_groups:`. The run directory's
+`graph.yaml` holds the layout a run executed. See
+[Auto-partitioning](auto_partitioning.md).
 
 ## Authoring `process_groups:` in graph YAML
 
@@ -141,11 +171,11 @@ graph load by `validate_process_groups`, the fourth at plan time by
 | Every node id appears in **exactly one** group | graph load | The groups are a partition: an orphan node would silently never run; a double-listed node would run twice |
 | Every listed id **exists** in `nodes:` | graph load | Rejects dangling references |
 | `process_group_order` (if present) is a **permutation** of the group names | graph load | Every group ranked exactly once |
-| Each group owns a **contiguous band** of global DAG levels | plan time | The cross-process barrier supports contiguous splits only; an interleaved partition (a group owning levels {0, 2} while another owns {1}) is rejected |
+| Each group owns a **contiguous band** of global DAG levels | plan time | Every rank re-levelizes its own subgraph onto the band it owns, in every execution mode, and the `lockstep` opt-out's participant map needs the same band; an interleaved partition (a group owning levels {0, 2} while another owns {1}) is rejected |
 
 **Listed order is the contract.** `process_groups` is an ordered map
 (`IndexMap`): the **declaration order defines each group's rank** (the
-cross-process trace-merge tiebreaker and barrier ordering) unless the
+cross-process trace-merge tiebreaker in every mode, and the barrier's ordering under the `lockstep` opt-out) unless the
 optional `process_group_order` list overrides it. Reordering the YAML
 entries changes ranks; treat the listing order as meaningful, exactly like
 node declaration order elsewhere in the graph file.
@@ -159,10 +189,13 @@ node declaration order elsewhere in the graph file.
    extracts the global levelization + the graph's tightest timing.
 2. **Plan**: one `WorkerPlan` per group: its subgraph, the topics it
    consumes from sibling groups (so the worker's own validation does not
-   report a correct cross-group edge as a possible typo), rank, barrier
+   report a correct cross-group edge as a possible typo), rank, the resolved
+   execution mode, the barrier
    participant-map, the shared **handed quantum** (the global tightest
    timing, identical for every worker, so all gating clocks advance in
-   lockstep), and the deployment's shared iceoryx2 config: a
+   lockstep; the participant-map and the quantum are what the `lockstep`
+   opt-out consumes, and a free-run worker mints a wall-following clock
+   instead), and the deployment's shared iceoryx2 config: a
    snapshot of the supervisor's **resolved global config** (the **default**
    iceoryx2 namespace; prefix `iox2_` on a config-file-free machine),
    identical for every worker, so cross-group topics connect AND the data
@@ -173,17 +206,37 @@ node declaration order elsewhere in the graph file.
    producer created it.
 4. **GO gate**: no worker enters its live loop until EVERY worker is
    built + READY. This kills the startup first-sample race: all
-   subscribers are connected before the first publish, so the run is
-   deterministic **from step 0**.
-5. **Lockstep execution**: every worker runs the deterministic-live loop;
-   a shared SHM barrier (`MappedBarrier`) gates every global DAG-level
+   subscribers are connected before the first publish, so no step's inputs
+   depend on which worker started first. The GO sentinel carries the
+   deployment's shared start epoch, 20 ms after the supervisor writes it;
+   every worker waits for that instant before its first step, so the ranks
+   that reach their live loop in time start together to within one wake
+   rather than one GO poll apart. A rank with a gating quantum (a free-run
+   `--record` rank, whose quantum is the graph's tightest declared timing
+   and at least 1 ms) that is more than one quantum late warns and starts
+   its own timeline instead; a plain free-run or lockstep rank starts
+   whenever it gets there. What that buys depends on the
+   execution mode below. Under the `CERULION_EXECUTION_MODE=lockstep`
+   opt-out the run is deterministic **from step 0**. Under the DEFAULT
+   free run each rank advances on its own wall clock, so two live runs of
+   one graph can pair different frames on a split same-level edge; a
+   default run reproduces **from its recorded bag** instead, which is what
+   `bag play --resim` re-executes byte for byte.
+5. **Execution**: every worker runs the deterministic-live loop. By DEFAULT
+   the run free-runs: no barrier is created, no rank maps one, and each
+   worker's gating clock follows the wall from the shared GO epoch, so the
+   ranks' boundary times differ and carry each rank's own jitter. Under the
+   `CERULION_EXECUTION_MODE=lockstep` opt-out a shared SHM barrier
+   (`MappedBarrier`) gates every global DAG-level
    boundary, and each worker's gating clock advances by the same handed
-   quantum per step. The merged trace (by `(step, global_level, rank,
-   seq)`) is byte-identical to a single-process run of the same graph.
+   quantum per step; the merged trace (by `(step, global_level, rank,
+   seq)`) is then byte-identical to a single-process run of the same graph.
 6. **Join**: the supervisor monitors workers until shutdown (Ctrl-C, a
    clean worker exit, or the peer-loss machinery below). On a clean
-   shutdown every worker gracefully leaves the barrier cohort and exits 0
-   (no poison stalls).
+   shutdown every worker exits 0; under the
+   `CERULION_EXECUTION_MODE=lockstep` opt-out it also gracefully leaves the
+   barrier cohort first (no poison stalls). A free-run run has no cohort to
+   leave.
 
 > **Host tuning for the latency tail:** the millisecond-class MAX you may
 > see on an untuned host is dominated by ambient kernel run-queue delay (the
@@ -193,6 +246,12 @@ node declaration order elsewhere in the graph file.
 > reduces it.
 
 ### Scope of the data guarantee: DAG-ordered edges
+
+**This section is about the `CERULION_EXECUTION_MODE=lockstep` opt-out**, the
+mode that has a barrier. A free-run run (the default) creates none, so nothing
+below orders a cross-group edge for it: each rank is deterministic on its own
+recorded boundary stream and is re-executed on its own, and the
+cross-rank properties stated here are exactly what the opt-out buys.
 
 The barrier gates **level boundaries**, so what it orders is edges that CROSS
 one. Read the guarantee in two halves, because they have different scopes:
@@ -234,6 +293,10 @@ ordered, which is what the rendezvous below does. Marking the edge
 `#[input(trigger)]` or co-locating the two nodes removes the shape entirely.
 
 #### The conditional MID-LEVEL barrier
+
+(Still the `lockstep` opt-out: the rendezvous IS the barrier, so a free-run
+run takes none. The classification is planned and stamped either way, and a
+free-run worker simply never crosses one.)
 
 The level is not one indivisible unit of work. `run_level` is split into a
 **snapshot phase** (drain, decide, freeze every firing node's non-trigger
@@ -320,10 +383,11 @@ A multi-process run is network-viewable exactly like a monolith. The
 **workers carry NO zenoh session**: they publish into and read from shared
 memory only. The deployment's produced topics reach the network through a
 GATEWAY, which taps them on the deployment's iceoryx2 namespace.
-One robot = one network peer (Principle #8).
+One robot = one network peer: only the gateway process holds a zenoh session.
 
 - **Which gateway you get follows the posture.** A run with NO `network:`
-  block is PERMISSIVE (every produced topic is announced + egressable), and on
+  block is PERMISSIVE (every produced topic is egressable; topic announce tokens
+  are declared when LAN access is open), and on
   Unix the supervisor registers the deployment's egress plan with the
   machine's shared `cerulion-netd` daemon, forwarding the supervisor-minted
   worker namespace so netd's gateway taps the right shared memory. An explicit
@@ -365,9 +429,9 @@ Only the deployment's **infrastructure** stays run-scoped/isolated:
 
 | Object | Name shape | Scope |
 |---|---|---|
-| Cross-process level barrier | `cerdep_{graph}_{nonce}` (POSIX SHM) | per run |
+| Cross-process level barrier (`CERULION_EXECUTION_MODE=lockstep` opt-out only; a free-run run creates none) | `cerdep_{graph}_{nonce}` (POSIX SHM) | per run |
 | Trace/recording rings | `cer_rec_*` / `cer_rg_*` (POSIX SHM) | per run |
-| Doorbells | `/cer_db_<user>_*` | per `$USER` |
+| Doorbells | `cer_db_*` (POSIX SHM; the `$USER` namespace is a literal segment of the name on Linux and folded into its hash on macOS, where a POSIX SHM name is capped at 31 characters) | per `$USER` |
 | Supervisor **planning** namespace | `cer_p_{hex}` (iceoryx2) | per run: the planning build attaches real single-writer publishers for every graph-owned topic; on the shared data-plane namespace it would collide with the workers' own |
 
 Two consequences to know:
@@ -396,26 +460,35 @@ Two consequences to know:
 
 ### Barrier boundary spin (default-on)
 
-At every level boundary each worker waits on the shared barrier (a
-process-shared futex on Linux; on macOS a chunked ~100µs sleep-recheck).
-By default that wait first **spins for a bounded,
-per-OS budget: 20µs on Linux, 150µs on macOS** (the chunked sleep-recheck
-observes arrivals with up to ~100µs skew, which a 20µs spin would miss),
-a bounded spin-then-block that rides through the lockstep rendezvous
-instead of paying the kernel sleep/wake round-trip at every boundary, then
-falls back to the kernel wait (futex block / sleep-recheck).
+(A property of the `lockstep` opt-out, the mode that has a barrier to wait on;
+a free-run worker never reaches this wait.)
 
-`CERULION_BARRIER_SPIN_US` overrides the
-budget; `=0` is the kill switch: it restores the legacy 50-iteration
-pre-block spin + futex path (a hard-bounded read loop with no `Instant`
-reads, then the unchanged kernel block), **not** a pure futex wait, for
-power-sensitive deployments. Values above **100ms** are clamped to 100ms
+At every level boundary each worker waits on the shared barrier. The
+blocking tier is a process-shared futex on Linux and, on macOS 14.4 and
+later, an `os_sync_wait_on_address` kernel wake; a chunked ~100 µs
+sleep-recheck is the fallback on older macOS and under
+`CERULION_BARRIER_OS_SYNC=0`. By default that wait first **spins for a
+bounded budget: 20 µs on the kernel-wake tiers, 150 µs on the macOS
+sleep-recheck fallback** (that fallback observes arrivals with up to
+~100 µs skew, which a 20 µs spin would miss), a bounded spin-then-block
+that rides through the lockstep rendezvous instead of paying a kernel
+sleep/wake round-trip at every boundary, then falls back to the blocking
+tier.
+
+`CERULION_BARRIER_OS_SYNC=0` selects the sleep-recheck tier on macOS, and
+with it the 150 µs spin default. `CERULION_BARRIER_SPIN_US` overrides the
+budget on every tier; `=0` is the kill switch, for power-sensitive
+deployments. On Linux it restores the legacy 50-iteration pre-block spin +
+futex path (a hard-bounded read loop with no `Instant` reads, then the
+unchanged kernel block), **not** a pure futex wait; on macOS it goes
+straight to the blocking tier, since no pre-block iteration loop exists on
+the macOS paths. Values above **100ms** are clamped to 100ms
 with a loud warning (still far below the ~5s barrier
 boundary timeout), so a fat-fingered budget can never turn the bounded
 spin-then-block into a busy-spin for the whole boundary window. (Even at
 the 100ms ceiling every cycle still reaches a real kernel block within
 ~110ms, but during a stalled-peer teardown window such a misconfigured
-budget spends most of its wait spinning; the 20µs default spends almost none.) Determinism
+budget spends most of its wait spinning; the default budget spends almost none.) Determinism
 firewall: the bounded spin-then-block changes only WHEN a waiter proceeds,
 never the fire set/order.
 
@@ -562,11 +635,14 @@ latch's DECADE re-announcement is pinned by an in-crate unit arm in
 ## Peer loss: `--peer-loss <continue|fail>`
 
 What happens when a worker process **dies** (crash, OOM-kill, `kill -9`)
-while the deployment is live:
+while the deployment is live. The POLICY is the same in both execution modes;
+only the barrier repair it performs belongs to the
+`CERULION_EXECUTION_MODE=lockstep` opt-out, because a free-run run (the
+default) has no cohort to repair:
 
 | Policy | Behavior |
 |---|---|
-| `continue` (**default**) | The supervisor logs a loud error naming the lost group, drops the dead peer from the shared barrier (so the survivors do not stall at the next level boundary), and keeps the survivors running **degraded**. The run still exits 0, unless EVERY worker crashed (no survivors), which is an error. Near-simultaneous deaths are dropped as a batch (one disambiguation grace total). |
+| `continue` (**default**) | The supervisor logs a loud error naming the lost group and keeps the survivors running **degraded**. Under the `lockstep` opt-out it also drops the dead peer from the shared barrier, so the survivors do not stall at the next level boundary; under the free-run default there is no cohort to drop from and the survivors were never stalled by the death, which the degraded summary says in those words. The run still exits 0, unless EVERY worker crashed (no survivors), which is an error. Near-simultaneous deaths are dropped as a batch (one disambiguation grace total). |
 | `fail` | Any worker death stops the WHOLE deployment: the supervisor SIGKILLs every sibling and returns a loud error (non-zero exit). Deterministic: choose this for CI and replay-comparison runs. |
 
 The flag wins outright; when absent, the hidden `CERULION_MP_PEER_LOSS`
@@ -577,10 +653,12 @@ default is `continue`.
 fault instant. A recorded run captures the
 departure: the supervisor writes a Departure record naming the lost group's
 rank into the bag (see "Recording a multi-process run" below), so the bag
-documents WHERE the cohort degraded. The post-fault trace is still
+documents WHERE the deployment degraded. The post-fault trace is still
 live-only evidence (the crash instant itself is not re-executable); use
 `--peer-loss fail` when you need a run that either completes
-identically-replayable or stops.
+identically-replayable or stops. Under the free-run default that
+re-executability is per rank, as everywhere else on this page; the
+`lockstep` opt-out is what makes it a cross-rank property.
 
 ## Recording a multi-process run (`--record`)
 
@@ -604,7 +682,7 @@ manifests land as bag attachments: `__cerulion/trace_manifest_rank{N}.json`
 manifest is `rank4294967295` (`u32::MAX`, the reserved sentinel a worker
 rank can never take) with an empty `node_ids`.
 
-**Quantum-timed, not wall-faithful, under the default barrier lockstep.**
+**Quantum-timed, not wall-faithful, under the `CERULION_EXECUTION_MODE=lockstep` opt-out.**
 An mp recording's workers advance their gating clocks by the SAME handed
 global quantum in barrier lockstep; that lockstep is the whole point of the
 split, and it is what makes the merged `(step, global_level, rank, seq)`
@@ -615,15 +693,18 @@ jitter and desync it from its peers. Per-step boundary times are therefore
 EQUAL across ranks. Want the wall-faithful recording? Run
 `--single-process --record`, the single-process path.
 
-**Under the `CERULION_EXECUTION_MODE=free_run` opt-in** the
-paragraph above does not apply: there is no barrier and no handed gating
-quantum, and each rank records its OWN wall-faithful timeline, a controlled
-clock placed at a shared `real_ns()` epoch (read by every rank at its live
-loop's clock anchor, after GO) that then follows the wall, so
-per-step boundary times DIFFER across ranks and carry each rank's real
-jitter. The bag's `coordination` stamp (`lockstep` / `free_run`) and the run
-directory's `gating` label (`quantum` / `recorded_wall`) say which shape a
-bag is. The default is lockstep.
+**By default (free-run)** the paragraph above does not apply: there is no
+barrier and no handed gating quantum, and each rank records its OWN
+wall-faithful timeline, a controlled clock placed at the deployment's shared
+start epoch (the `real_ns()` instant the GO sentinel carries; a rank that
+reaches its live loop within one gating quantum of it places exactly that value
+and counts the overshoot into its first step, and a later rank warns and places
+its own `real_ns()` at its live loop instead) that then follows the wall, so
+per-step boundary times DIFFER across ranks and carry each
+rank's real jitter. The quantum-timed lockstep recording above is what you get
+under the `CERULION_EXECUTION_MODE=lockstep` opt-out. The bag's `coordination`
+stamp (`lockstep` / `free_run`) and the run directory's `gating` label
+(`quantum` / `recorded_wall`) say which shape a bag is.
 
 **Departure records.** Under `--peer-loss continue`, each lost worker gets a
 Departure record (`record_type` 2) on the supervisor's departure ring:
@@ -642,15 +723,16 @@ part of the determinism contract; replay canonicalizes records by
 
 ### The bag says which coordination it was recorded under
 
-The two paragraphs above describe a **lockstep** recording. The contract is
+The paragraphs above describe both shapes: the free-run default and the
+**lockstep** recording the opt-out takes. The contract is
 stamped rather than assumed: `__cerulion/recorder.json` carries a
 `coordination` key, and re-execution applies the contract the bag names.
 
 | Stamp | Recorded under | What re-execution applies |
 |---|---|---|
 | absent | Any bag recorded before the stamp existed | **Lockstep, INFERRED**: the verdict says so out loud (`coordination: lockstep (inferred: no coordination stamp)`), because an absence is not a claim |
-| `lockstep` | The barrier path, and every MONOLITH recording (a monolith is the degenerate one-rank lockstep timeline) | Lockstep: one authoritative clock, cross-rank boundary equality, one first boundary to anchor a mid-run resume |
-| `free_run` | The free-run path: per-rank wall-faithful boundary streams sharing only the GO epoch. Reachable ONLY by opting in (`CERULION_EXECUTION_MODE=free_run` on a multi-process run); lockstep is the default | **Per-rank re-execution** (below). The bag also stamps a `trace_format` past 3, so an older binary refuses it instead of mis-applying the lockstep contract (a bag stamps 6 by default, or 5 when it is recorded with `CERULION_READ_LOG_FOLD=off`, see [`docs/bag.md`](bag.md)) |
+| `lockstep` | The barrier path (the `CERULION_EXECUTION_MODE=lockstep` opt-out), and every MONOLITH recording (a monolith is the degenerate one-rank lockstep timeline) | Lockstep: one authoritative clock, cross-rank boundary equality, one first boundary to anchor a mid-run resume |
+| `free_run` | The free-run path: per-rank wall-faithful boundary streams sharing only the GO epoch. The DEFAULT for a multi-process `graph run --record` (`CERULION_EXECUTION_MODE=lockstep` opts a run out) | **Per-rank re-execution** (below). The bag also stamps a `trace_format` past 3, so an older binary refuses it instead of mis-applying the lockstep contract (a bag this binary writes stamps 7, see [`docs/bag.md`](bag.md)) |
 | anything else | Nothing this binary knows: a newer recorder, or a hand-edited bag | **Refused, exit 2**, naming the value. Never inferred to lockstep: an unknown coordination is exactly the case where guessing is a silent mis-replay |
 
 **Why an unknown value is refused rather than tolerated.** A format-3 reader
@@ -665,14 +747,15 @@ Two properties invert with the mode, and they are the reason the stamp exists:
 | | `lockstep` | `free_run` |
 |---|---|---|
 | Per-step boundary times | EQUAL across ranks (the handed quantum) | Per-rank and wall-faithful, sharing only the GO epoch |
-| Mid-run resume | Anchors on the ONE first recorded boundary | **Refused loudly** if the recording begins mid-run: there is no single first boundary, k clocks cannot be placed off one value, and a stamp compared against it crosses per-rank clock domains. Per-rank anchors are not supported |
+| Mid-run resume | Anchors on the ONE first recorded boundary | Anchors on the recording's first recorded boundary (the same resume, from the same anchor the capture carries) when the recording holds ONE worker rank, and the resumed pass is then re-executed like any free-run bag; a recording with several worker ranks is refused by name, since per-rank anchors are not supported |
 
-**Recording a `free_run` bag is opt-in.** The reader and the per-rank
-executor handle such a bag with no switch; the recording arm is behind the execution-mode
-variable: a multi-process `graph run --record` under
-`CERULION_EXECUTION_MODE=free_run` stamps `free_run` and records each rank's
-own wall-faithful timeline from the shared epoch. Without the variable every
-`graph run --record` bag stamps `lockstep`.
+**Recording a `free_run` bag is the default.** The reader and the per-rank
+executor handle such a bag with no switch, and so does the recording arm: a
+multi-process `graph run --record` stamps `free_run` and records each rank's
+own wall-faithful timeline from the shared epoch unless the run opted out with
+`CERULION_EXECUTION_MODE=lockstep`, in which case the bag stamps `lockstep` and
+is quantum-timed. A monolith recording (`--single-process --record`) always
+stamps `lockstep`.
 
 ## Replaying a multi-process recording
 
@@ -696,7 +779,7 @@ each driven to its own recorded boundary targets:
   single-writer, so the next pass can only take an injection publisher on a
   cross-rank topic once the producing rank's own publisher is gone. Because the
   passes are sequential there is no second `TransportManager` and therefore no
-  Principle-#8 exemption, and no k-clock multiplexing scheduler.
+  exception to one transport per process, and no k-clock multiplexing scheduler.
 - **Injection is re-keyed per CONSUMING rank.** `inject_up_to(target)` has no
   single "the target" once each rank has its own clock, so each pass opens its
   own injectors (for the external sources THAT rank reads, and for the topics
@@ -752,11 +835,15 @@ For reading a recording's per-edge read log WITHOUT re-executing it, see
 
 ## Platform matrix
 
+The barrier rows describe the `CERULION_EXECUTION_MODE=lockstep` opt-out. A
+free-run run (the default) maps no barrier on any host, so only the
+process model in each row applies to it.
+
 | Host | `process_groups:` graph |
 |---|---|
-| Linux | Multi-process (supervisor + workers); futex-woken barrier + CPU-park primitives |
-| macOS | Multi-process (supervisor + workers). Same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then chunked ~100µs sleep-rechecks (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
-| other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice. Results are identical (determinism firewall); you lose only process isolation. |
+| Linux | Multi-process (supervisor + workers); under the `lockstep` opt-out, futex-woken barrier + CPU-park primitives |
+| macOS | Multi-process (supervisor + workers). Under the `lockstep` opt-out, the same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then an `os_sync_wait_on_address` kernel wake on macOS 14.4 and later, or chunked ~100 µs sleep-rechecks below that and under `CERULION_BARRIER_OS_SYNC=0` (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
+| other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice; you lose process isolation. Under the `lockstep` opt-out its results match the split's (determinism firewall). Under the free-run default a split's cross-rank pairings are decided by OS scheduling, so what reproduces such a run is its recorded bag, not a second live run. |
 
 `--single-process` forces the monolith path on ANY host (useful for
 debugging a multi-process graph in one process, or for an
@@ -765,11 +852,20 @@ externally-clocked run; see below).
 **macOS wake-latency tier:** any host without a CPU monitor-wait
 primitive (macOS included, whether running the real multi-process split
 or a `--single-process` monolith) gets a live-loop park via the
-**degraded sleep-recheck tier**, on by default for live runs. The park
-falls back to a chunked ~100 µs bounded sleep loop (never a busy-spin).
+**degraded sleep-recheck tier**, on by default for live runs. The park is a
+bounded ~100 µs recheck nap (never a busy-spin): on macOS 14.4 and later each
+nap is an `os_sync_wait_on_address` timed wait; below 14.4, or under
+`CERULION_PARK_OS_SYNC=0`, it is a plain sleep.
 Measured on macOS: a stable and lower median wake latency than the
-plain blocking wait, whose median was unstable from run to run. Opt out with
-`CERULION_MONITOR_WAIT=0` or `--no-monitor-wait`; see "Live-loop tuning" under
+plain blocking wait, whose median was unstable from run to run.
+On macOS 14.4 and later the park also kernel-blocks on the data doorbell's wake
+word, so a producer's publish wakes a consuming worker directly instead of at the
+next recheck. That is the rung for a worker whose only wake source is data: a
+process blocks on one address, so a `lockstep` barrier participant blocks on the
+barrier's word instead, and a producer held at a `block` gate on that edge's
+credit word. Opt out with
+`CERULION_MONITOR_WAIT=0` or `--no-monitor-wait` (or with
+`CERULION_DOORBELL_OS_SYNC=0`, which drops the data wake on macOS alone); see "Live-loop tuning" under
 "Environment variables" in [`docs/user-api.md`](user-api.md).
 
 ## Flags
@@ -793,19 +889,22 @@ cerulion graph run perception_stack --trace-limit 500000
 | `--peer-loss <continue\|fail>` | Applies to every multi-process run, including one whose groups were derived automatically. A single-process run warns once that the option does not apply. Default `continue`. |
 | `--single-process` | Forces the monolith even with `process_groups:` (info log names the override). On a graph WITHOUT `process_groups:` it opts out of the multi-process auto-partition default entirely: no derivation, no confirm, the plain monolith run (info log). |
 | `--trace-limit <N>` | Caps the in-memory fire-trace ring (default 100 000 entries, stamped into every worker). The trace is a bounded observability window, NOT the replay record (recording is the bag's job). Unbounded growth costs ~2 GB/h at 1 kHz × 10 nodes, so `0` is rejected at parse; there is no unbounded escape hatch. |
-| `--record[=DIR]` | Records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring, which exist on every multi-process run, recording or not (see `--no-rings`), all drained by one `bagd`; rank-stamped provenance in every record's `reserved`. Quantum-timed under the default barrier lockstep (see "Recording a multi-process run" above); under the `CERULION_EXECUTION_MODE=free_run` opt-in each rank records its OWN wall-faithful timeline from a shared epoch; the bag's `coordination` stamp and the run directory's `gating` label say which. `--single-process --record` takes the single-process wall-faithful path instead. Unix-only; requires the live clock. |
+| `--record[=DIR]` | Records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring, which exist on every multi-process run, recording or not (see `--no-rings`), all drained by one `bagd`; rank-stamped provenance in every record's `reserved`. By default (free-run) each rank records its OWN wall-faithful timeline from a shared epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the recording is quantum-timed (see "Recording a multi-process run" above); the bag's `coordination` stamp and the run directory's `gating` label say which. `--single-process --record` takes the single-process wall-faithful path instead. Unix-only; requires the live clock. |
 | `--no-rings` | Declines this run's per-rank SCHEDULER-TRACE rings. They are provisioned by DEFAULT on every multi-process run so that a Flashback capture of ANY serving graph can be RE-EXECUTED (`cerulion bag play --resim`) rather than only a run somebody decided in advance to record; this is the opt-out for a memory-tight robot. Cost declined: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. It ALSO stops the Flashback window recorder being started for this run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). **Conflicts with `--record`** at parse time: `--record` requires the scheduler trace, because that is what a deterministic re-execution reads. On shapes that mint no ring anyway it is NOT a no-op: a `--single-process` or `--time-source external` run still has its window recorder stopped by it, so the run takes no captures. Each says at launch which it was. (`cerulion ros2 attach` and `node run` define no such flag at all.) NOT `--trace-limit`, which caps the IN-MEMORY fire-trace ring above; these are the SHARED-MEMORY rings a recorder drains. |
-| `--time-source external` | **Rejected** for multi-process: every worker runs on the real clock (barrier-gated lockstep by default, or free-run (`CERULION_EXECUTION_MODE=free_run`) with each rank on its own wall-faithful clock) and an external time master driving N separate processes is unspecified either way. Drop the flag, or use `--single-process`. |
-| `--time-source virtual` | Ignored with a loud warning: multi-process workers always run on the real clock (barrier lockstep or free-run). With `--record` it is rejected outright: recording requires the live clock (`--time-source real`, the default). |
+| `--time-source external` | **Rejected** for multi-process: every worker runs on the real clock (free-run by default, each rank on its own wall-faithful clock, or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`) and an external time master driving N separate processes is unspecified either way. Drop the flag, or use `--single-process`. |
+| `--time-source virtual` | Ignored with a loud warning: multi-process workers always run on the real clock (free-run by default, barrier lockstep under the opt-out). With `--record` it is rejected outright: recording requires the live clock (`--time-source real`, the default). |
 
 ## Exit-code contract
 
 | Exit | Meaning |
 |---|---|
 | `0` | Clean shutdown (Ctrl-C or a clean worker exit → coordinated drain, every worker exits 0), OR a **degraded** `continue` run where at least one worker survived (the degraded summary is logged loudly). |
+| `3` | A node returned `NodeError::Fatal` and was stopped. Its worker kept running, exited `3` at the drain with an `Error:` line naming the node, and the supervisor reports the worker group and exits `3` too. A worker exit `3` is a clean exit, never a worker death: the run is not degraded. A failure that fails the run takes precedence (a worker death under `--peer-loss fail`, every worker crashing, a recording failure); a degraded `continue` run with a stopped node still exits `3`. |
 | non-zero | Fail-loud: a worker death under `--peer-loss fail`; ALL workers crashed under `continue`; a refused run (validation error, `--time-source external` × multi-process, a `HostDriven` external node on the live path); or an internal supervisor failure. |
 
-Individual **workers** exit `2` when terminally poisoned by a barrier
-boundary timeout (a peer stalled/crashed past the ~5s rendezvous deadline);
-the supervisor's drain machinery tolerates and reports that; it never
-surfaces as a supervisor success/failure on its own.
+Individual **workers** exit `3` after a clean drain when one of their nodes
+stopped on `NodeError::Fatal`, and exit `2` when terminally poisoned by a barrier
+boundary timeout (a peer stalled/crashed past the ~5s rendezvous deadline),
+which is reachable under the `lockstep` opt-out only, since a free-run worker
+maps no barrier; the supervisor's drain machinery tolerates and reports
+that; it never surfaces as a supervisor success/failure on its own.

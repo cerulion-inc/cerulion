@@ -50,9 +50,9 @@ use cerulion_dds::{
 
 // Acquired `.msg` text is parsed with the SAME `parse_rosmsg`
 // the store reader + codegen use, and its nested closure is walked over the
-// resulting `MessageSchema` — resolved through the codec's SHARED nested-ref
-// ladder (`resolve_nested_qname_ladder`) so the completeness check predicts the
-// CDR decoder exactly — for the partial-closure completeness check.
+// resulting `MessageSchema`, resolved through the names-only nested-ref
+// ladder (`resolve_nested_qname_ladder`), which binds what the CDR decoder
+// binds on any name set, for the partial-closure completeness check.
 use cerulion_core::codegen::{parse_rosmsg, resolve_nested_qname_ladder, FieldType, MessageSchema};
 
 use crate::error::{CliError, CliResult};
@@ -1865,10 +1865,9 @@ impl NestedRef {
     }
 }
 
-/// Resolve one nested reference through the codec's canonical ladder against a
-/// resolvable universe — the SINGLE shared ladder the completeness walk and the
-/// CDR decoder both use (see [`resolve_nested_qname_ladder`]), so they cannot
-/// drift.
+/// Resolve one nested reference through the names-only ladder against a
+/// resolvable universe. On a name set it binds the same target the CDR
+/// decoder's identity binding does (see [`resolve_nested_qname_ladder`]).
 fn resolve_nested_ref(r: &NestedRef, universe: &BTreeSet<String>) -> Option<String> {
     resolve_nested_qname_ladder(
         &r.schema_name,

@@ -82,7 +82,7 @@ schema: test/Data
 //
 // `String` (std_msgs::String) is a variable schema with one variable field
 // (`data`). The minimum loanable buffer is:
-//   WireHeader (32) + WIRE_FIXED_SIZE (0) + 8 * VARIABLE_FIELD_COUNT (8) = 40.
+//   WireHeader (40) + WIRE_FIXED_SIZE (0) + 8 * VARIABLE_FIELD_COUNT (8) = 48.
 // Anything smaller must reject `loan_proxy::<RosString>()` with
 // MaxSliceLenRequired. (For fixed schemas the equivalent error is
 // BufferTooSmall — covered by the existing output_proxy_test.)
@@ -90,14 +90,14 @@ schema: test/Data
 
 #[test]
 fn test_loan_proxy_undersized_variable_schema_errors_max_slice_len_required() {
-    // 32 = WireHeader::SIZE (smallest legal MaxSliceLen, header-only slot).
-    // std_msgs::String needs header (32) + offset table for 1 variable field (8) = 40 bytes
-    // before any payload bytes — so 32 < 40 → loan_proxy must return MaxSliceLenRequired.
+    // 40 = WireHeader::SIZE (smallest legal MaxSliceLen, header-only slot).
+    // std_msgs::String needs header (40) + offset table for 1 variable field (8) = 48 bytes
+    // before any payload bytes, so 40 < 48 → loan_proxy must return MaxSliceLenRequired.
     // The newtype rejects anything < WireHeader::SIZE at construction (compile-time),
     // so this test now pins the *runtime* lower bound (schema-specific) rather than the
     // type-system lower bound.
     let tt = TestTransport::with_buffer_size(16);
-    let mut publisher = tt.publisher("test/undersized_var", MaxSliceLen::const_new(32), 0);
+    let mut publisher = tt.publisher("test/undersized_var", MaxSliceLen::const_new(40), 0);
     let result = publisher.loan_proxy::<RosString>();
     match result {
         Err(TransportError::MaxSliceLenRequired { topic }) => {
@@ -112,7 +112,7 @@ fn test_loan_proxy_undersized_variable_schema_errors_max_slice_len_required() {
 // ProxyBufferTooSmall: setter requested more bytes than the loaned slot.
 //
 // The proxy holds a max_slice_len-sized SHM region. Once the WireHeader
-// (32 B) and the offset table (8 B per variable field) are subtracted the
+// (40 B) and the offset table (8 B per variable field) are subtracted the
 // remainder is what `set_data`/`loan_data`/`push_data` can fill. Going
 // past that returns ProxyBufferTooSmall synchronously — no allocation, no
 // publish.
@@ -127,8 +127,8 @@ fn test_loan_proxy_undersized_variable_schema_errors_max_slice_len_required() {
 
 #[test]
 fn test_set_data_oversized_returns_payload_too_large() {
-    // 64 bytes total: 32 (header) + 8 (offset table) → 24 bytes max payload.
-    // max_capacity = 64 - 32 = 32 (post-header ceiling). A 1 KiB payload
+    // 64 bytes total: 40 (header) + 8 (offset table) → 16 bytes max payload.
+    // max_capacity = 64 - 40 = 24 (post-header ceiling). A 1 KiB payload
     // exceeds even max_capacity → PayloadTooLarge (no rescue possible).
     let tt = TestTransport::with_buffer_size(16);
     let mut publisher = tt.publisher("test/oversize", MaxSliceLen::const_new(64), 0);
@@ -146,7 +146,7 @@ fn test_set_data_oversized_returns_payload_too_large() {
             assert!(requested >= 1024, "requested includes the 1 KiB write");
             assert_eq!(
                 max,
-                64 - 32,
+                64 - 40,
                 "max_capacity = max_slice_len - WireHeader::SIZE"
             );
         }
@@ -162,7 +162,7 @@ fn test_loan_data_oversized_returns_payload_too_large() {
     let mut proxy = publisher.loan_proxy::<RosString>().expect("loan_proxy");
 
     // String's `data` is a `Bytes` field → emits `loan_data(n) -> &mut [u8]`.
-    // 2048 > max_capacity (32) → PayloadTooLarge.
+    // 2048 > max_capacity (24) → PayloadTooLarge.
     let result = proxy.loan_data(2048);
     match result {
         Err(TransportError::PayloadTooLarge {
@@ -172,7 +172,7 @@ fn test_loan_data_oversized_returns_payload_too_large() {
         }) => {
             assert_eq!(topic, "test/loan_oversize");
             assert!(requested >= 2048);
-            assert_eq!(max, 64 - 32);
+            assert_eq!(max, 64 - 40);
         }
         Err(other) => panic!("expected PayloadTooLarge, got: {:?}", other),
         Ok(_) => panic!("expected PayloadTooLarge, got Ok"),
@@ -221,8 +221,8 @@ fn test_proxy_not_poisoned_by_failed_setter() {
 fn test_set_data_exact_fit_succeeds() {
     // Sanity check the available-bytes accounting: ask for exactly the
     // remainder after header + offset table and confirm publish succeeds.
-    // 32 (header) + 8 (offset table) + 16 (payload room) = 56-byte buffer.
-    let buffer_size: u32 = 56;
+    // 40 (header) + 8 (offset table) + 16 (payload room) = 64-byte buffer.
+    let buffer_size: u32 = 64;
     let tt = TestTransport::with_buffer_size(8);
     let mut publisher = tt.publisher("test/exact_fit", MaxSliceLen::const_new(buffer_size), 0);
     let mut subscriber = tt.subscriber("test/exact_fit");

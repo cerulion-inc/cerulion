@@ -14,13 +14,13 @@
 # to build a >=2-fire-level graph. So `graph/` and `scheduler/` are scanned too.
 #
 # Usage:
-#   ./scripts/check_hot_path_allocs.sh        # exit 0 = clean, 1 = findings
-#   ./scripts/check_hot_path_allocs.sh --self-test
-#                                             # drive the classifier over
-#                                             # synthetic fixtures with hand
-#                                             # oracles (the annotation grammar
-#                                             # is never exercised by the real
-#                                             # tree, which is clean)
+#   ./tools/scripts/check_hot_path_allocs.sh        # exit 0 = clean, 1 = findings
+#   ./tools/scripts/check_hot_path_allocs.sh --self-test
+#                                                   # drive the classifier over
+#                                                   # synthetic fixtures with hand
+#                                                   # oracles (the annotation grammar
+#                                                   # is never exercised by the real
+#                                                   # tree, which is clean)
 #
 # Allowlisting a genuine cold-path allocation (constructor, error path,
 # late-joiner history, test-only helper):
@@ -146,12 +146,26 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 #                       matching rmw_iceoryx.
 #   shm_guard.rs        init-time THP/RLIMIT detection + a create-time
 #                       /proc/self/maps scan that madvises our SHM pool VMAs.
+#   team_auth.rs        team-session credentials: certificate checks and PEM
+#                       encoding when the credentials are built
+#                       (`TeamAuth::new`), and the locator checks and zenoh
+#                       config entries (TLS, protocols, scouting autoconnect,
+#                       access control), set when `NetworkManager` opens its
+#                       zenoh session. No message, sample or payload passes
+#                       through it.
+#   test_ca.rs          `cfg(any(test, feature = "test-helpers"))` only: an
+#                       in-memory test team issuer for networked tests.
 TRANSPORT_EXCLUDE="adaptive_sizer.rs bridge.rs cerulion_q.rs discovery.rs \
 gateway.rs mirror_registry.rs mod.rs network.rs \
-reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
+reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs \
+team_auth.rs test_ca.rs"
 
 # cerulion_core/src/graph — the level executor lives here (runtime.rs).
 #
+#   chain.rs       the STATIC chain-fusion census; `census_chains` walks the
+#                  topology, the trigger edges and the levels once at graph
+#                  build and no execution path reads its result. Same class as
+#                  topology.rs below, which it is built on top of.
 #   config.rs      serde YAML types; parsed once at graph LOAD.
 #   node.rs        NodeEntry loading + the cdylib FFI shim. Its per-step half is
 #                  a thin dispatch, but the file is dominated by dlopen/info-JSON
@@ -159,11 +173,21 @@ reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
 #                  run at LOAD. Excluded rather than swept: a real sweep
 #                  of its 125 findings has not been done, and the exclusion
 #                  says so instead of annotating them away here.
+#   launch_args.rs launch-argument resolution (`args:` defaults, `name:=value`
+#                  overrides) and the `${name}` substitution into the graph
+#                  document; runs once per graph parse, before the graph types
+#                  read the YAML and before any transport resource exists.
+#   params.rs      param resolution (default, then graph YAML) and the JSON
+#                  handoff to a cdylib; runs once per node at graph build, before
+#                  any transport resource exists. The tick path reads a plain
+#                  struct field the build wrote once.
+#   param_resume.rs the resume rule for params: one comparison per resumed
+#                  node, before the first step of a resumed replay.
 #   partition.rs   the auto-partitioner; runs at `graph run` preflight.
 #   topology.rs    the STATIC build-time dataflow model; `build()`/`validate()`
 #                  run once at graph build.
 #   validation.rs  build-time graph validation.
-GRAPH_EXCLUDE="config.rs node.rs partition.rs topology.rs validation.rs"
+GRAPH_EXCLUDE="chain.rs config.rs launch_args.rs node.rs param_resume.rs params.rs partition.rs topology.rs validation.rs"
 
 # cerulion_core/src/scheduler — the fire/decide engine.
 #
@@ -180,10 +204,18 @@ GRAPH_EXCLUDE="config.rs node.rs partition.rs topology.rs validation.rs"
 # Everything else is per-step code or a pure state machine, and is scanned.
 SCHEDULER_EXCLUDE="catchup_clamp_wiring_tests.rs wake.rs"
 
+# cerulion_tf/src: the SE(3) frame math a node tick calls for every lookup.
+#
+# Pure arithmetic with no cold half, so nothing is excluded: an allocation
+# anywhere in it is a finding. `crates/cerulion_tf/tests/zero_alloc_test.rs`
+# is the runtime half of the same contract.
+TF_EXCLUDE=""
+
 TARGETS=(
     "crates/cerulion_core/src/transport|$TRANSPORT_EXCLUDE"
     "crates/cerulion_core/src/graph|$GRAPH_EXCLUDE"
     "crates/cerulion_core/src/scheduler|$SCHEDULER_EXCLUDE"
+    "crates/cerulion_tf/src|$TF_EXCLUDE"
 )
 
 # nullglob: a missing/empty target dir must yield an empty array (and trip the

@@ -1,0 +1,11 @@
+error: `#[param(live)]` is reserved for the live tier and not yet supported; remove `live`. A static param is fixed at graph load for the whole run.
+  --> tests/ui/param_live_reserved.rs:11:28
+   |
+11 |     #[param(default = 1.0, live)]
+   |                            ^^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_live_reserved.rs:9:7
+  |
+9 |     #[output]
+  |       ^^^^^^

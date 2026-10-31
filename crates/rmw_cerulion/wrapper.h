@@ -54,10 +54,18 @@
 #if defined(CERULION_HAS_QOS_STRING_CONVERSIONS_H)
 #include "rmw/qos_string_conversions.h" // Galactic+
 #endif
+#if defined(CERULION_HAS_SERVICE_ENDPOINT_INFO_ARRAY_H)
+#include "rmw/service_endpoint_info_array.h" // Lyrical+
+#endif
 
 #include "rosidl_runtime_c/message_type_support_struct.h"
 #include "rosidl_runtime_c/service_type_support_struct.h"
 #include "rosidl_runtime_c/sequence_bound.h"
+// The primitive and string sequence structs: the compile-time pins of the
+// bridge's hand-written sequence mirrors name their bindgen twins, so the
+// twins must exist on every era (on Humble nothing else pulls them in).
+#include "rosidl_runtime_c/primitives_sequence.h"
+#include "rosidl_runtime_c/string.h"
 
 #include "rosidl_typesupport_introspection_c/message_introspection.h"
 #include "rosidl_typesupport_introspection_c/service_introspection.h"

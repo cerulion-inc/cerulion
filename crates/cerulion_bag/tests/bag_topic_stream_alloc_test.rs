@@ -57,7 +57,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use cerulion_bag::{BagReader, BagWriter, BagWriterConfig, TopicSchema, STATE_TOPIC};
-use cerulion_core::state_ring::{encode_record, StateRecordHeader, RECORD_KIND_FINAL};
+use cerulion_core::state_ring::{
+    encode_record, StateRecordHeader, RECORD_KIND_FINAL_V2, STATE_RECORD_FORMAT_VERSION,
+};
 
 thread_local! {
     static MEASURED_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -194,8 +196,10 @@ fn write_mixed_bag(path: &std::path::Path) {
                     step: 40 + i as u64,
                     node_idx: 0,
                     part: 0,
-                    kind: RECORD_KIND_FINAL,
+                    kind: RECORD_KIND_FINAL_V2,
                     len: 8,
+                    rank: 0,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
                 },
                 &(i as u64).to_le_bytes(),
             )

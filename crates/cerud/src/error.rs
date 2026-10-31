@@ -144,3 +144,48 @@ impl CerudError {
         }
     }
 }
+
+/// The `kind` string [`cerulion_ops_proto::Response::from_error`] writes into
+/// a `Response::Err` frame for a `cerud` error: [`CerudError::kind`].
+impl cerulion_ops_proto::ErrorKind for CerudError {
+    fn kind(&self) -> &'static str {
+        CerudError::kind(self)
+    }
+}
+
+/// Variant-for-variant conversion from the protocol crate's error: each
+/// [`cerulion_ops_proto::OpsProtoError`] variant maps onto the `CerudError`
+/// variant of the same name, carrying the same fields.
+impl From<cerulion_ops_proto::OpsProtoError> for CerudError {
+    fn from(err: cerulion_ops_proto::OpsProtoError) -> Self {
+        use cerulion_ops_proto::OpsProtoError as P;
+        match err {
+            P::Io(e) => CerudError::Io(e),
+            P::Json(e) => CerudError::Json(e),
+            P::FrameTooLarge { size, max } => CerudError::FrameTooLarge { size, max },
+            P::Decode(msg) => CerudError::Decode(msg),
+            P::VersionMismatch {
+                client_min,
+                client_max,
+                server_min,
+                server_max,
+            } => CerudError::VersionMismatch {
+                client_min,
+                client_max,
+                server_min,
+                server_max,
+            },
+            P::HandshakeRejected {
+                reason,
+                server_min,
+                server_max,
+            } => CerudError::HandshakeRejected {
+                reason,
+                server_min,
+                server_max,
+            },
+            P::ConnectionClosed => CerudError::ConnectionClosed,
+            P::Remote { kind, message } => CerudError::Remote { kind, message },
+        }
+    }
+}

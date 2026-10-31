@@ -76,8 +76,8 @@ fn iox2_warms_after_window_size_publishes() {
         "iceoryx2 publisher must warm after WINDOW_SIZE drops — proves \
          OutputProxy::Drop's iceoryx2 branch calls record_payload_size"
     );
-    // Vector3 wire frame = 32 (header) + 24 (3× f64) = 56. Warm loan
-    // = 56 × 1.5 = 84.
+    // Vector3 wire frame = 40 (header) + 24 (3× f64) = 64. Warm loan
+    // = 64 × 1.5 = 96.
     let warm_loan = publisher.adaptive_loan_size_for_min_required(40);
     assert!(
         warm_loan < 16 * 1024,

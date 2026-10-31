@@ -12,7 +12,7 @@
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![crates.io: cerulion_cli 1.0.0](https://img.shields.io/badge/crates.io-cerulion__cli%201.0.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
-[![Rust 1.93+](https://img.shields.io/badge/rust-1.93%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-docs.cerulion.com-blue.svg)](https://docs.cerulion.com)
 
 Cerulion connects the software running on a robot to the tools that inspect it and the tests that keep it working. Run your nodes, see their data in Studio, capture a failure, and re-execute that recording against a code or model change before deploying it.
@@ -46,10 +46,10 @@ Built for **Physical AI**, Cerulion combines [iceoryx2](https://github.com/eclip
 ### CLI for robots and headless machines
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
 ```
 
-The installer puts the programs on the PATH of every new shell, so open a new terminal and sign in once with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with.
+In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with. To remove it, run the same script with `sh -s -- --uninstall`.
 
 **Homebrew**
 
@@ -63,10 +63,17 @@ Homebrew treats a third-party tap as untrusted until you install a fully qualifi
 **Debian / Ubuntu**
 
 ```bash
-curl -fsSL https://d2tdat71jcoj6e.cloudfront.net/cerulion-archive-keyring.gpg | sudo tee /usr/share/keyrings/cerulion-archive-keyring.gpg >/dev/null
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://d2tdat71jcoj6e.cloudfront.net stable main" | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null
-sudo apt-get update && sudo apt-get install cerulion
+sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
+keyring=$(mktemp) &&
+  curl -fsSL https://apt.cerulion.com/cerulion-archive-keyring.gpg -o "$keyring" &&
+  [ "$(gpg --show-keys --with-colons "$keyring" | awk -F: '$1 == "fpr" { print $10 }' | sort -u)" = "$(printf '%s\n' 953C69FD279D9256FA4B71C5DA5FDE5D0DC6D91B | sort -u)" ] &&
+  sudo install -m 0644 "$keyring" /usr/share/keyrings/cerulion-archive-keyring.gpg &&
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] https://apt.cerulion.com stable main" | sudo tee /etc/apt/sources.list.d/cerulion.list >/dev/null &&
+  rm -f "$keyring" &&
+  sudo apt-get update && sudo apt-get install cerulion
 ```
+
+The first line installs the three programs the second needs. The second is one chain, where every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the key the archive signs with, stops it before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprints in the same form, lists both during a key rotation, and carries a longer form of this recipe that names which step failed.
 
 Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
 
@@ -77,11 +84,11 @@ Homebrew and the Debian package do not provision Rust. To build your own nodes, 
 cargo install --locked cerulion_cli cerulion_netd
 ```
 
-The release installer places `cerulion-connectd` beside the CLI for remote connections. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
+The release installer places `cerulion-connectd` (the desk side of a remote connection) and `cerulion-remoted` (the robot side) beside the CLI. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
 
 </details>
 
-Release binaries support Linux x86_64 and ARM64 (glibc 2.35+) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries.
+Release binaries support Linux x86_64 and ARM64 (glibc 2.35+) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64: unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI but has not been run on a robot, and unlike the Jazzy package it is not installed in a clean container before release.
 
 Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and the **same compiler that built your `cerulion` binary**: a node is a shared library loaded into the CLI's own process, so the loader refuses a node built by a different rustc and names both compilers. The install script installs that compiler (Rust 1.93.0 for the 1.0.0 binaries), and `cerulion-install-rust` does on the other routes. A workspace created with `cerulion workspace create` or `cerulion workspace init` records it in its `rust-toolchain.toml` when that compiler is installed. Elsewhere, when your rustup default is a different compiler, name it: `RUSTUP_TOOLCHAIN=1.93.0 cerulion node build <node>`. The [installation details](docs/install.md) cover `CERULION_NO_MODIFY_PATH`, machines without rustup, `CARGO_HOME` and `RUSTUP_HOME`, hand-unpacked archives, workspaces without a `rust-toolchain.toml`, and a CLI built with `cargo install`.
 
@@ -111,13 +118,38 @@ Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Mult
 
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
 
-```bash
-git clone https://github.com/cerulion-inc/cerulion
-```
+Choose the acquisition route for your installed CLI.
+
+### Released CLI 1.0.0
+
+The public 1.0.0 binaries do not include the starter option. Obtain the matching
+source tag and enter its complete example workspace:
 
 ```bash
-cd cerulion/examples/obstacle_avoidance
+git clone --depth 1 --branch v1.0.0 https://github.com/cerulion-inc/cerulion cerulion-starter-source
+cd cerulion-starter-source/examples/obstacle_avoidance
 ```
+
+Continue with the sign-in, build and run commands below. The
+[example runbook](examples/obstacle_avoidance/README.md) describes the source.
+
+### CLI builds with --starter
+
+Use this route only when `cerulion workspace create --help` lists `--starter`:
+
+```bash
+cerulion workspace create safety_demo --starter obstacle_avoidance
+cd safety_demo
+```
+
+This obtains complete source bundled with your CLI, including tests and all
+variable-length scan fields, without GitHub credentials or a source download.
+Exact release dependencies are selected and `starter.toml` records compiler
+requirements. Existing paths are refused; failed installation leaves no partial
+workspace. The generated README also shows explicit graph creation, staging and
+wiring. To write nodes from scratch, start with
+`cerulion workspace create my_robot` and the
+[getting-started tutorial](docs/tutorials/01-getting-started.md).
 
 Sign in once per machine. Cerulion commands run under an account, and the result is read locally from then on, so later commands keep working offline.
 
@@ -136,7 +168,7 @@ cerulion graph validate obstacle_avoidance
 cerulion graph run obstacle_avoidance --release --record
 ```
 
-On the first run, Cerulion proposes one process per node and asks `Apply this partition to the graph file? [y/N]`. Press **Enter** to use that layout for this run, or **y** to save it in the graph YAML.
+The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
 By default a run is visible to other machines on your network, so Studio and the CLI on another computer can find it; the log says so when the run starts. Add `--network off` to keep a run on this machine.
 
@@ -227,6 +259,18 @@ The native benchmark loans that payload without filling it. Timing starts after 
 
 This workload comparison uses a nominal 100 Hz offered load. The stock ROS 2 lane pipelines requests: at 16 MiB a round trip outlasts the 10 ms pacing interval, so requests overlap in flight. Native Cerulion includes recording; the ROS 2 and zenoh lanes do not. The [benchmark suite](benches/latency/README.md) documents the process layouts and timing boundaries.
 
+### Free run and lockstep
+
+A multi-process graph free-runs by default: each process steps on its own clock and none waits on a barrier. `CERULION_EXECUTION_MODE=lockstep` opts out into barrier lockstep. Measured on one build and one Linux x86_64 machine, two processes, fixed 100 Hz, six interleaved reps per mode, recording enabled:
+
+| Payload | Free run (default), p50 / p99 in µs | Lockstep, p50 / p99 in µs |
+|---|---:|---:|
+| 64 B | 4.23 / 7.60 | 5.08 / 10.47 |
+| 1 MiB | 4.56 / 9.01 | 5.44 / 10.63 |
+| 16 MiB | 5.22 / 12.34 | 7.22 / 13.64 |
+
+Free run has the lower median and the lower p99 at every measured size; the lockstep median is about 20% higher up to 1 MiB. This machine is not the one behind the table above, so compare within each table. [All ten sizes](docs/PERFORMANCE.md#free-run-against-lockstep) · [Results and provenance](docs/benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/).
+
 ### ROS 2 over Cerulion
 
 The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion's transport, measured in the same harness, posture and pacing as every other line: three ROS 2 nodes in three processes, with loaned publishing and loaned subscription takes. At 1 MiB that is **11.12 µs p50 / 37.21 µs p99**, beside **11.0 ms / 43.4 ms** for stock `rmw_fastrtps_cpp`, the chart's own stock ROS 2 line. The median stays between 10.43 and 10.65 µs from 64 B to 256 KiB and reaches 17.47 µs at 16 MiB. [Methodology](benches/latency/METHODOLOGY.md) · [Results and provenance](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/).
@@ -235,7 +279,15 @@ The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion'
 
 ![Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.](docs/media/platform-rtt.svg)
 
-These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. A producer-driven macOS wake path is on the [roadmap](#roadmap).
+These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. That M4 row predates the macOS data wake: on macOS 14.4 and later, a two-process consumer now blocks on a kernel wake word that the producer's publish rings, instead of waking on the park's recheck timer. Measured before and after that change on an Apple M3 Max, five reps per cell with the two builds alternating. This pair uses quiescent pacing rather than the charts' fixed 100 Hz and a different machine, so compare within the table only, and its recorder state is not recorded:
+
+| Payload | Two-process before, p50 / p99 in µs | Two-process after, p50 / p99 in µs |
+|---|---:|---:|
+| 64 B | 70.17 / 141.54 | 10.42 / 28.21 |
+| 4 KiB | 77.75 / 143.79 | 12.79 / 29.83 |
+| 1 MiB | 80.12 / 152.42 | 16.14 / 41.67 |
+
+Single-process medians on that machine rose by one to three ticks of its 24 MHz clock, inside overlapping per-rep ranges (64 B: 4.46 before, 4.50 µs after). The M4 chart row has not been re-measured since the change. [Results and provenance](docs/benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/).
 
 Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99; both figures show round trips.
 
@@ -404,13 +456,13 @@ The roadmap is open for use cases and contributions: [discuss a feature](https:/
 
 ## Documentation and contributing
 
-[Documentation](https://docs.cerulion.com) · [API reference](docs/user-api.md) · [Contributing](.github/CONTRIBUTING.md) · [Issues](https://github.com/cerulion-inc/cerulion/issues) · [Code of conduct](.github/CODE_OF_CONDUCT.md)
+[Documentation](https://docs.cerulion.com) · [API reference](docs/user-api.md) · [Android build support](docs/android.md) · [Contributing](.github/CONTRIBUTING.md) · [Issues](https://github.com/cerulion-inc/cerulion/issues) · [Code of conduct](.github/CODE_OF_CONDUCT.md)
 
 Report vulnerabilities through the [security policy](.github/SECURITY.md). Cerulion is built by [Cerulion Inc.](https://cerulion.com), a YC company. Commercial questions: licensing@cerulion.com.
 
 ## License
 
-[AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side `cerulion_wire`, `cerulion_link` and `cerulion_pairing` crates are MIT OR Apache-2.0; each manifest states its license.
+[AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side `cerulion_wire`, `cerulion_link`, `cerulion_ops_proto` and `cerulion_pairing` crates are MIT OR Apache-2.0; each manifest states its license.
 
 ## Citing Cerulion
 

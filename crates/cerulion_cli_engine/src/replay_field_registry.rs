@@ -637,6 +637,21 @@ impl FieldRegistry {
             .and_then(|(_, e)| e.expected_schema_hash)
     }
 
+    /// Every topic the registry knows, in its own order.
+    pub fn topics(&self) -> impl Iterator<Item = &str> {
+        self.topics.iter().map(|(t, _)| t.as_str())
+    }
+
+    /// The qualified name of `topic`'s CURRENT root schema, or `None` under the
+    /// same conditions as [`Self::expected_schema_hash`]. `--record-out` labels
+    /// a produced topic the input bag has no channel for with it.
+    pub fn expected_schema_name(&self, topic: &str) -> Option<&str> {
+        self.topics
+            .iter()
+            .find(|(t, _)| t == topic)
+            .and_then(|(_, e)| e.schema_qname.as_deref())
+    }
+
     /// The topic's [`TopicClass`], or `None` if the topic is unknown.
     pub fn topic_class(&self, topic: &str) -> Option<&TopicClass> {
         self.topics
@@ -964,8 +979,8 @@ pub struct LocatedField<'f> {
 /// Why a frame field could not be decoded (a corrupt bag → loud error, never UB).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DecodeError {
-    /// The frame is shorter than the 32-byte wire header.
-    #[error("frame is {len} bytes, shorter than the 32-byte wire header")]
+    /// The frame is shorter than the 40-byte wire header.
+    #[error("frame is {len} bytes, shorter than the 40-byte wire header")]
     FrameTooShort {
         /// The frame length.
         len: usize,
@@ -1788,7 +1803,7 @@ mod tests {
     #[test]
     fn fixed_field_resolves_to_offset_and_type() {
         let reg = registry_over(vec![image_schema()], "/cam", "test_msgs/Img");
-        // Build a frame: 32-byte header + fixed section (16 B) + offset table
+        // Build a frame: 40-byte header + fixed section (16 B) + offset table
         // (2 × 8 = 16) + variable payload.
         let mut frame = vec![0u8; WireHeader::SIZE];
         // fixed section

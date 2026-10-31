@@ -1,0 +1,26 @@
+# The sample app's graph. Every node type here is linked into the app's
+# runtime library (android/runtime/src/lib.rs). `prefix:` is set because the
+# runtime would otherwise use the device host name: the topics are
+# /app/timer/count and /app/relay/echo.
+prefix: app
+nodes:
+  - id: timer
+    type: timer
+    params:
+      step: 2
+    outputs:
+      - name: count
+        schema: std_msgs/Int32
+  - id: relay
+    type: relay
+    inputs:
+      - name: count
+        source: timer/count
+    outputs:
+      - name: echo
+        schema: std_msgs/Int32
+  - id: printer
+    type: printer
+    inputs:
+      - name: count
+        source: relay/echo

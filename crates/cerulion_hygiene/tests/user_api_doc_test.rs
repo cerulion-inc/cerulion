@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The socket-directory rule is a USER-facing contract — it can chmod a
 //! directory of the user's, and it can refuse to start a daemon — and
-//! `USER_API.md` is where a user reads it. The rule itself is pinned by the
+//! `docs/user-api.md` is where a user reads it. The rule itself is pinned by the
 //! oracle vectors in `socket_dir_verdict`'s own tests; what those cannot see
 //! is the DOCUMENTATION drifting away from them, which is how a user learns a
 //! behaviour the code no longer has.
@@ -62,7 +62,7 @@ fn select_unique_row<'a>(doc: &'a str, needle: &str) -> &'a str {
     assert_eq!(
         rows.len(),
         1,
-        "USER_API.md must carry EXACTLY ONE row starting {needle:?} — its row in the \
+        "docs/user-api.md must carry EXACTLY ONE row starting {needle:?}: its row in the \
          environment table, where the socket-directory rule is documented (grep for it). \
          Found {} of them; a second copy drifts from the first, and this gate would only \
          ever read the first.\nrows: {rows:#?}",
@@ -145,7 +145,7 @@ fn the_user_api_socket_directory_cell_states_every_arm_of_the_rule() {
     ] {
         assert!(
             cell.contains(phrase),
-            "USER_API.md's socket-directory cell no longer states {why}.\n\
+            "docs/user-api.md's socket-directory cell no longer states {why}.\n\
              missing phrase: {phrase:?}\n\
              cell: {cell}"
         );
@@ -171,7 +171,7 @@ fn the_wsd_row_defers_to_the_one_rule_instead_of_restating_it() {
 }
 
 /// `select_unique_row`'s own oracle, on a HAND-BUILT document rather than
-/// `USER_API.md`: the real file has one row of each today, so nothing here
+/// `docs/user-api.md`: the real file has one row of each today, so nothing here
 /// could otherwise tell "took the first" from "required the only one", and a
 /// duplicate cannot be demonstrated by editing the document the other pins
 /// read.

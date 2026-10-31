@@ -95,6 +95,7 @@ pub mod barrier;
 pub mod clock;
 #[allow(missing_docs)]
 pub mod codegen;
+pub mod dynamic;
 // The cross-process `block`-edge CREDIT word — one SHM word
 // per split block edge, so a producer and consumer in different process groups
 // can share the backpressure gate. `pub` (mirroring
@@ -112,6 +113,10 @@ pub mod dma_lock;
 pub mod doorbell;
 #[allow(missing_docs)]
 pub mod error;
+// The open-file limit of a node-hosting process: the once-per-process raise
+// every transport constructor makes, and the pure start-up check `graph run`
+// refuses a graph with. `pub` because that check lives in `cerulion_cli_engine`.
+pub mod fd_limit;
 #[allow(missing_docs)]
 pub mod graph;
 #[allow(missing_docs)]
@@ -133,7 +138,7 @@ pub mod message;
 // engine. It lived in `cerulion_viz` while its only consumer was the desk
 // daemon; the Flashback monitors-verdict trigger gave it a SECOND consumer —
 // `cerulion_bagd`, robot-side — and `cerulion_viz` cannot be a dependency of a
-// robot-side crate (rerun, openh264, ureq, `rust-version = 1.93`, excluded from
+// robot-side crate (rerun, openh264, ureq, `rust-version = 1.95`, excluded from
 // `default-members`), while a `cerulion_core → cerulion_viz` edge would be a
 // cycle. It moves here rather than into a new leaf crate because there is no
 // cyclic package edge to break — both consumers already depend on this crate —
@@ -160,6 +165,16 @@ pub mod monitor_wait;
 // pub(crate): every consumer is in-crate; the module is macOS-only.
 #[cfg(target_os = "macos")]
 pub(crate) mod os_sync;
+// The cross-process PAUSE PAGE behind `cerulion graph pause`: one control word
+// that holds a live run at its next step boundary and stops its run clock. Real
+// POSIX SHM, hence `#[cfg(unix)]`; `pub` because the owner, the workers and the CLI
+// verb live in `cerulion_cli_engine`.
+#[cfg(unix)]
+pub mod pause_page;
+/// Runtime-internal seam for named shared-memory operations. Stability-exempt;
+/// the CLI engine can use this libc-shaped interface when opening named objects.
+#[allow(missing_docs)]
+pub mod posix_shm;
 #[allow(missing_docs)]
 pub mod prelude;
 pub mod read_outcome;
@@ -660,9 +675,122 @@ pub mod wire;
 ///   `cerulion_node_pump_history` bump established for a missing symbol.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 22;
+/// - v23: the whole iceoryx2 family moves to 0.10.0, and `CerulionPublisher`
+///   gains three fields (`last_listener_count`, `self_drains_armed`,
+///   `next_self_drain_rearm`) for the gate on its self drain and the idle
+///   deadline that bounds it in time.
+///
+///   Either half alone would bump this constant; the iceoryx2 half is the one
+///   that MUST. A node cdylib statically links its own `cerulion_core` and
+///   therefore its own iceoryx2, and 0.10 partitions a machine by version:
+///   iceoryx2 0.9.3 added the package version to the global management
+///   segment's name, so a 0.9.1 process and a 0.10.0 process on one machine
+///   keep SEPARATE node registries and cannot see each other's services at all.
+///   Mixing a host and a cdylib across that line gives no data, no node fires
+///   and no actionable error. Nothing detected it at load time before this
+///   bump: the `RUSTC_FINGERPRINT` check (v22) compares compilers, not linked
+///   library versions, and the `abi_layout` pin holds every iceoryx2-embedding
+///   struct `FieldSetOnly` precisely because those layouts are not ours to
+///   assert. Bumping here converts a silent data-plane death into a loud load
+///   refusal naming the rebuild.
+///
+///   The field-set half is the ordinary M1 shape: both new fields live in
+///   `CerulionPublisher`, which is pinned `FieldSetOnly` (it embeds iceoryx2
+///   ports by value), so the `abi_layout` row re-snapshots its field list and
+///   asserts no offset.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+/// - v24: `CerulionSubscriber` carries one more field,
+///   `replay_plan: Option<Arc<read_outcome::ReadPlanStage>>`, the REPLAY read
+///   gate for this input's stage, installed at graph wiring time and armed only
+///   by a replay. `CerulionSubscriber` is `repr(Rust)`, so nothing pins where
+///   the new field lands or what the fields around it keep; that is not
+///   an additive change, because `NodeContext` owns this struct through
+///   `AnySubscriber`, and a cdylib built against ANY earlier core, v23 included,
+///   would index the struct at stale offsets.
+///   The plan's own chain (`ReadPlanStage`, `PlanInner`, `DueRead`,
+///   `ReplayReadViolation` and its kind) is reached through a crate-owned
+///   `Arc` from that field, so those rows enter the `abi_layout` table at this
+///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
+///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
+///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v25: `CerulionSubscriber`'s event listener became optional, because an input
+///   that declares no trigger is woken by nothing and the port that would sit in
+///   every publisher's notifier send loop for it need not exist. The field SET and
+///   the struct's size and alignment can all stay as they were and rustc still
+///   re-packs a `repr(Rust)` struct when a field's type changes, so a node library
+///   built against the previous packing reads a field at an offset this core does
+///   not write, drops whatever bytes live there, and dies inside the node library
+///   with no panic text. That is the same drop path the v22 entry describes,
+///   reached by a different divergence. The host reads the cdylib's exported
+///   version at load and names the stale node instead of faulting inside it.
+///
+///   This lands on top of v24's own re-pack of the same struct, so a node library
+///   built against v23 or v24 is stale either way.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v26: a topic's doorbell became a real mapping on macOS, and the publisher
+///   that holds one by value re-packed. `CerulionPublisher.doorbell` is
+///   `Option<crate::doorbell::Doorbell>`, whose macOS definition carried a boxed
+///   word and now carries four fields: a pointer to the mapped page, the object's
+///   name, the topic the page serves and the flag that says whether this handle
+///   owns the name. The publisher's field SET is unchanged and its measured ORDER is
+///   not: the doorbell's offset rank moves from 19 to 3, the sixteen fields that
+///   ranked 3 to 18 each move up by one, and the remaining twenty one fields keep
+///   their rank. A node library crossing the cdylib boundary indexes this struct
+///   through `NodeContext.publishers`, so a macOS node built against an earlier
+///   core would read those fields at offsets this core does not write.
+///
+///   What is pinned and what is not: this struct's row pins the field NAMES and
+///   their count on every target, and the ORDER of their offsets as measured on
+///   aarch64-apple-darwin, which is the one target
+///   `every_field_set_only_struct_keeps_its_pinned_field_order` judges; the
+///   sibling arm that judges absolute offsets discards size and alignment for
+///   such a row, so neither is pinned here on any target. The Linux definition is
+///   byte identical to the previous core's, and the no-primitive definition keeps
+///   its single boxed word while its `#[cfg]` gate narrows to exclude macOS, so
+///   neither re-packs; the version is global, so the rebuild is asked for on every
+///   target all the same.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v27: the replay read gate carries the RECORDING's consult rule.
+///   `PlanInner` gains `rule: ConsultRule` and `ReplayReadViolationKind` gains
+///   `UnplannedConsult { consult, planned }`, both reached through the
+///   crate-owned `Arc` on `CerulionSubscriber::replay_plan`; the capture twin
+///   `ReadOutcomeStage` gains `records_every_consult: AtomicBool`, the same
+///   question on the staging side. The rule decides what a consult the step's
+///   plan holds no position for IS: a recording whose empty drains wrote no
+///   record is short of positions by construction, so an over-run is a counted
+///   number, while a recording that holds a record at every consult makes the
+///   same over-run a schedule the recording never took. `PlanInner` is pinned
+///   by offset and the violation enum by variant set, so a cdylib built against
+///   an earlier core reads both at stale places and the two halves disagree
+///   about whether a replay diverged.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v28: the wire header grows from 32 to 40 bytes. [`wire::WireHeader`] gains
+///   `step_tag` at byte 32, `WireHeader::SIZE` becomes 40 and
+///   [`wire::WIRE_HEADER_VERSION`] becomes 2. No struct in the `abi_layout`
+///   table changes, so the pin's rows are unchanged; the bump is for the
+///   frames themselves. A node library compiles `WireHeader::SIZE` into every
+///   loan, every header write and every payload slice it makes, so one built
+///   against an earlier core writes 32-byte headers into slots this core reads
+///   as 40-byte ones: the schema hash still matches, the sequence and timestamp
+///   still parse, and every payload field is read eight bytes off. Bumping here
+///   turns that silent misread into a load refusal naming the rebuild.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 28;
 
 // Re-export commonly used types
+#[cfg(unix)]
+pub use clock::PausableClock;
 pub use clock::{real_ns, thread_cpu_ns, Clock, ExternalClock, RealClock, VirtualClock};
 pub use error::{InertReason, NodeNameRefusal, TransportError, TransportResult};
 #[cfg(any(test, feature = "test-helpers"))]
@@ -679,18 +807,22 @@ pub use message::ShmMessage;
 pub use monitor_wait::MonitorWaitPolicy;
 pub use rustc_fingerprint::{rustc_fingerprint_cstr, RUSTC_FINGERPRINT, RUSTC_RELEASE};
 pub use scheduler::{
-    merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, Scheduler,
-    SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
+    merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, RefillEmptyCause,
+    RefillOutcome, Scheduler, SyncAlignSite, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
+pub use transport::carrier::{
+    classify_locator, Carrier, EgressQos, EgressReliability, MixedRel, NetworkTls,
+};
 pub use transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, RunEntry, RunEntryState, RunsCompleteness,
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,
 };
 pub use transport::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
+pub use transport::egress_send::{EgressStats, EgressTopicStats};
 pub use transport::events::PubSubEvent;
 pub use transport::gateway::{
     GatewayDriveStats, GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime,
@@ -708,12 +840,13 @@ pub use transport::network::{
 pub use transport::output_proxy::OutputProxy;
 pub use transport::publisher::CerulionPublisher;
 pub use transport::subscriber::{CerulionSubscriber, ReceivedMessage};
+pub use transport::team_auth::{NetworkAuth, TeamAnchors, TeamAuth, TeamAuthError};
 pub use transport::uds_write::{prepare_accepted_stream, write_line_bounded, UdsWriteOutcome};
 pub use transport::{
     ix_config_shm_identity_from_json, IceoryxShmIdentity, NetworkPosture, TopicRequirements,
     TransportConfig, TransportManager,
 };
-pub use wire::{WireError, WireHeader};
+pub use wire::{StepTag, WireError, WireHeader};
 
 // Re-export `tracing` at the crate root so codegen-
 // emitted code can use the fully-qualified `::cerulion_core::tracing::warn!`

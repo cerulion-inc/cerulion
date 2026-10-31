@@ -9,7 +9,7 @@ use crate::error::WireError;
 /// One offset-table entry: where a variable-length field's bytes live.
 ///
 /// Both fields are little-endian `u32`. `offset` is measured from the start of
-/// the POST-HEADER payload (the first byte after the 32-byte
+/// the POST-HEADER payload (the first byte after the 40-byte
 /// [`crate::WireHeader`]), NOT from the frame start — the convention every
 /// Cerulion producer stamps and every reader assumes.
 #[repr(C)]

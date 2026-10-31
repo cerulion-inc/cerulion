@@ -40,7 +40,7 @@ else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
 **no output**: its `dds_bridge` node still needs its external DDS inputs. Use
 plain playback to view an attached ROS 2 recording without the robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
-what makes it deterministic (Principle #7). Together those two properties mean
+what makes it deterministic: a replay matches the live run. Together those two properties mean
 `--resim` cannot drive a viewer.
 
 ### `--resim` is NEUTRAL; `--verify` is the verdict
@@ -50,13 +50,53 @@ claim** about whether the result matches the recording (divergence is the
 product, not a failure), so a completed re-execution always exits **0**.
 
 The line between the two flag classes: a flag that shapes what EXECUTES
-(`--duration`, `--strict-state`) works in both modes; a flag that shapes the
-VERDICT (`--report`, `--tolerance`) needs `--verify`.
+(`--duration`, `--strict-state`, `--allow-param-change`) or PRODUCES (`--record-out`) works in both
+modes; a flag that shapes the VERDICT (`--report`, `--tolerance`) needs `--verify`.
 
 `--verify` adds the byte-comparison and its stable exit contract: 0 = identical,
 1 = data violation, 2 = bag I/O or not-replay-grade, 3 = node cdylib load error
 or a node that panicked, 4 = tolerance-YAML validation error, 5 = internal, 6 =
 structural trace divergence.
+
+A pass ends the verdict with one line naming the bag, the ticks it re-executed
+and the topics it credited:
+
+```
+replay PASS: <bag> (<N> tick(s) replayed, <P>/<M> topic(s) matched byte-for-byte and were credited)
+```
+
+Data violations (exit 1) print a block instead, also printed beside an exit-3
+node failure or an exit-6 schedule divergence report: a header naming the bag,
+the tally, one line per violation with its topic, its class and what was
+measured, and the count of topics passed at the end:
+
+```
+FRAME-CONTENT DIVERGENCE: <bag>
+  <N> tick(s) replayed; <P>/<M> topic(s) matched and were credited; <V> violation(s):
+  - <topic> [<class>]: <detail>
+  Topics passed: <P>/<M>
+```
+
+The class is one of `missing-topic`, `extra-topic`, `missing-messages`,
+`extra-messages`, `byte-mismatch`, `record-side-tap-loss` and
+`tolerance-exceeded`. A `tolerance-exceeded` detail names the field, the metric
+and the worst frame:
+
+```
+field '<field>' exceeded the <metric> tolerance on '<topic>': worst value <x> vs threshold <t> (worst at frame <k>)
+```
+
+For the set and list metrics the worst value is `1` against a threshold of `0`.
+When the worst frame has no finite value, `worst value <x>` reads
+`numeric overflow computing <metric>` or
+`worst frame structurally incomparable (length mismatch / NaN / ragged bbox / decode failure)`
+instead.
+
+When the verifier left a topic out of the full comparison, the PASS line and
+the block's first tally add
+`; <K> DECLINED (<J> of them matched under the fallback, not credited)` after
+"credited" (the closing `Topics passed` line does not), and a declined topic is
+not counted in `<P>` even when it matched.
 
 One refusal worth knowing by name: a bag (or graph file) whose declared `name:`
 iceoryx2 cannot represent (longer than 128 bytes, or carrying any non-ASCII
@@ -75,25 +115,50 @@ soften failure to re-execute: an unreadable bag, a cdylib that will not load, a
 candidate that panicked and an internal error keep their loud codes in both
 modes.
 
-**A multi-process recording's shutdown tail is tolerated, and reported.**
-A multi-process run's frame stream and its per-rank trace rings
-are cut independently at shutdown, so a rank that outlives rank 0 can commit a
-final step's frames past the last boundary the authoritative (rank 0) stream
-carries: routinely one step at SIGINT, and unboundedly many when a survivor
-outlives a dead rank 0 under `--peer-loss continue`. Those trailing frames are
-IN the bag and readable; a resim excludes them from what it re-executes and
-from the verify comparison (its authoritative clock ends at rank 0's last
-boundary, so they could match nothing and be re-produced by nothing), and the
-verdict reports the derived covered range plus a per-topic count rather than
-excluding them silently. The tolerance is scoped to topics a PEER rank
+**A multi-process recording's shutdown tail, per mode.** A multi-process run's
+frame stream and its per-rank trace rings are cut independently at shutdown, so
+what a resim does with the frames past the last boundary a stream carries is
+decided by WHICH stream bounds a rank, and that is what the bag's `coordination`
+stamp sets (the table under *The `coordination` contract* below). The default and
+the opt-out are therefore stated apart. Single-rank bags are unchanged under
+both: their frames and trace are written by one thread from one batch, so a tail
+frame there really is corruption.
+
+*Under the free-run default*, each rank's OWN recorded boundary stream bounds its
+own pass, and a peer cannot out-run the authoritative stream because there is
+none. A pass is driven from one `BoundaryCursor` over the pass's own rank
+(`PassBoundaries::Rank`, whose doc says why: pulling rank 0's targets for rank
+1's runtime is the cross-clock arithmetic the coordination stamp exists to
+forbid), and the tolerated window's upper bound is that rank's own last recorded
+step (`RaggedTailContext::from_summaries`, its `CoordinationMode::FreeRun` arm).
+Nothing is excluded from the comparison as a peer tail, and nothing is derived to
+exclude it with: the derived covered range and the peer-owned topic set it
+forgives are both built ONLY for a multi-rank lockstep bag, and the resolver says
+so in its own words, that single-rank and free-run bags keep no derived range. A
+produced frame stamped past its own rank's last boundary keeps the refusal, and
+on a FINALIZED continuous recording it cannot arise: a rank banks step *k*'s
+boundary into its own trace ring before any fire of step *k* publishes, and the
+recorder drains those rings only after the batch's tap frames were consumed, so
+the ring cut is strictly later than the tap cut in every batch.
+
+*Under the `CERULION_EXECUTION_MODE=lockstep` opt-out*, rank 0's boundary stream
+is the one authoritative clock and every rank is driven to rank 0's last step
+(`PassBoundaries::Lockstep` pulls rank 0's boundary and advances every peer's
+cursor index-locked; `from_summaries` gives every rank rank 0's last step). So a
+rank that outlives rank 0 can commit a final step's frames past the last boundary
+the authoritative stream carries: routinely one step at SIGINT, and unboundedly
+many when a survivor outlives a dead rank 0 under `--peer-loss continue`. Those
+trailing frames are IN the bag and readable; a resim excludes them from what it
+re-executes and from the verify comparison (its authoritative clock ends at rank
+0's last boundary, so they could match nothing and be re-produced by nothing),
+and the verdict reports the derived covered range plus a per-topic count rather
+than excluding them silently. The tolerance is scoped to topics a PEER rank
 produces: only a peer can legitimately out-run the authoritative stream, so a
 rank-0-produced frame past rank 0's own last boundary is still refused (on a
-healthy recording that shape cannot occur; seeing it means the bag was edited
-or the recorder misbehaved). A frame that matches no boundary INSIDE the range
-is likewise still refused as a corrupt recording (the tolerance is the peer
-tail, never the body), and single-rank bags are unchanged (their frames and
-trace are written by one thread from one batch, so a tail frame there really
-is corruption).
+healthy recording that shape cannot occur; seeing it means the bag was edited or
+the recorder misbehaved). A frame that matches no boundary INSIDE the range is
+likewise still refused as a corrupt recording (the tolerance is the peer tail,
+never the body).
 
 **The mirror shape, a final step boundary with no fires behind it, is
 tolerated too.** A worker banks each step's boundary record BEFORE
@@ -120,6 +185,70 @@ step completed and the final step has none. The cost is the same under either
 reading, and the note states it: an over-fire in that one
 step, for that one rank, is not caught.
 
+### `--tolerance`: relaxing the comparison per field
+
+`--verify` is byte-exact unless a tolerance document says otherwise. The
+document names topics, and inside each topic the fields to judge by a metric;
+everything it does not cover stays byte-exact.
+
+```yaml
+# tolerance.yaml
+default_metric:          # optional; omitted means bit_exact
+  kind: bit_exact
+topics:
+  /percepmin/detector/detections:
+    fields:
+      boxes:
+        kind: bbox_iou
+        min_iou: 0.5
+      scores:
+        kind: max_abs
+        threshold: 0.05
+      class_ids:
+        kind: set_equal
+```
+
+```
+cerulion bag play "$BAG" --resim all --verify --tolerance tolerance.yaml
+```
+
+| `kind` | Parameter | Passes when |
+|---|---|---|
+| `bit_exact` | none | the bytes are identical (the default) |
+| `max_abs` | `threshold` (`>= 0`) | every element is within `threshold` of its recorded value |
+| `max_rel` | `threshold` (`>= 0`) | every element's absolute difference, divided by the larger of its recorded value's magnitude and `1e-12`, is within `threshold` |
+| `rmse` | `threshold` (`>= 0`) | the root mean square error over the field is within `threshold` |
+| `bbox_iou` | `min_iou` (in `[0, 1]`) | the boxes (a flattened `[x, y, w, h]` `float64[]`) pair one to one with the recorded boxes, in any order, with every pair at or above `min_iou` intersection over union, and no box has zero or negative width or height |
+| `set_equal` | none | the same set of values, in any order |
+| `set_subset` | none | the recorded set is a subset of the replayed set |
+| `ordered_list_equal` | none | the same values in the same positions |
+
+Each field's metric resolves in this order: its own `fields:` entry, then a
+topic-wide `metric:` (a key beside that topic's `fields:`, taking the same
+`kind` and parameter), then the document's `default_metric:`. A topic-wide
+`metric:` therefore covers every field of that topic, and a non-`bit_exact`
+`default_metric` covers every field of every other topic, except a topic whose
+schema the workspace cannot resolve, which stays byte-exact under the default (a
+non-`bit_exact` topic-wide `metric:` on such a topic is an exit-4 error). A
+field that resolves to `bit_exact` stays byte-exact, and so does every topic the
+document does not name while `default_metric` is `bit_exact` (the default), so a
+drifting sibling field is still caught. A NaN or infinity in a field under any
+metric other than `bit_exact` never passes, whatever the threshold. A field past
+its bound is an exit-1 `tolerance-exceeded` violation. A document in which every
+metric resolves to `bit_exact` has no effect, and the run warns that it has
+none.
+
+The document is validated strictly before any node loads, and every failure is
+exit 4: an unreadable file, an unknown or misspelled key at any level, a missing
+or out-of-range parameter, a topic the bag's graph does not carry or a field its
+schema does not have (with a suggestion when one is close), a `fields:` entry on
+a topic whose schema the workspace cannot resolve, and a non-`bit_exact` metric
+on a field that cannot be decoded field by field, whether named directly or
+covered by a topic-wide or default metric (`max_rel` and `rmse` on a 64-bit
+integer field are refused the same way, as they would lose precision).
+[`examples/perception/tolerance.yaml`](../examples/perception/tolerance.yaml) is
+the document behind the perception regression example.
+
 ---
 
 ## `cerulion bag play`
@@ -128,6 +257,7 @@ step, for that one rank, is not caught.
 cerulion bag play <BAG> [-r|--rate N] [--loop] [--topics TOPIC]...
                         [-s|--start-offset S] [-u|--duration D]
 cerulion bag play <BAG> --resim all [--verify] [-u|--duration D] [--strict-state]
+                                    [--allow-param-change] [--record-out PATH]
                                     [--report PATH] [--tolerance PATH]
 ```
 
@@ -139,21 +269,23 @@ combination is refused by name with the reason, never silently ignored.
 | `-r`, `--rate N` | playback | Playback rate multiplier. `1.0` = the recorded pace (default), `2.0` = twice as fast, `0.5` = half speed. Must be finite and `> 0`. |
 | `--loop` | playback | Restart at the beginning when the bag ends, until interrupted. |
 | `--topics TOPIC` | playback | Play only these topics (repeatable). A name the bag does not carry is a loud error listing what it does. |
-| `-s`, `--start-offset S` | playback | Skip the first `S` SECONDS of BAG TIME (fractional accepted). Per CHANNEL, measured from that channel's own first frame: wire stamps in different channels are different producers' clocks, so there is no one bag-wide `t0` to seek against. Re-applied on every `--loop` pass. Refused under `--resim` by name: re-executing from the middle needs a per-rank resume ANCHOR, which no recording carries. |
+| `-s`, `--start-offset S` | playback | Skip the first `S` SECONDS of BAG TIME (fractional accepted). Per CHANNEL, measured from that channel's own first frame: wire stamps in different channels are different producers' clocks, so there is no one bag-wide `t0` to seek against. Re-applied on every `--loop` pass. Refused under `--resim` by name: a resim re-executes from the anchor the recording carries, not from an arbitrary offset into it. |
 | `--resim <NODES\|all>` | n/a | RE-EXECUTE the bag's graph instead of republishing its frames. `all` re-executes every node; a node subset is not supported and is refused by name rather than widened to `all`. |
 | `--verify` | resim | Byte-compare every re-executed frame against the recording and apply the 0 to 6 exit contract. Without it, the run claims nothing and exits 0. |
 | `-u`, `--duration D` | both | Cover only the first `D` SECONDS of BAG TIME (fractional accepted). Playback stops republishing a channel once it has advanced that far through its OWN timeline, and it stays stopped for the rest of the pass, because the one way a later frame reads as back inside the window is a stamp that went BACKWARDS, which is a producer RESTART (the epoch reset) rather than a new window; a resim stops re-executing a rank once a recorded boundary reaches the run's bag-time ORIGIN plus `D`. The window is half-open on BOTH halves (ONE rule, `replay_rank::beyond_duration_bound`), so `--duration 0` covers nothing and a bound EXACTLY equal to a frame's (or a boundary's) own bag-time elapsed EXCLUDES it. (One rule for both halves matters: if playback excluded at `> D` while a resim excluded at `>= D`, `bag play --duration 0` would republish each channel's first frame while `bag play --resim all --duration 0` executed nothing.) Legal in both resim modes: it bounds the RUN, not the comparison. **The bound is in TIME, not in steps**: a per-rank resim has k step axes and no shared step number, while a bound in TIME has a shared ORIGIN: `replay_rank::run_epoch_ns`, the MINIMUM first-boundary target across the ranks. That is what makes `D` mean one thing for the whole run; it does NOT make the run rank-uniform. Under free-run each rank's clock starts at its own live-loop entry, so the ranks share an origin rather than an epoch value, `D` names one wall interval measured from that origin rather than each rank's own first `D` seconds, and a rank that entered later loses more of its OWN tail. Expect per-rank `ticks_replayed` under a bound to differ (see `rank_execution` in the report). `--max-ticks` is not accepted: it is clap's unknown-argument error (exit 2), never a silently accepted no-op. |
 | `--strict-state` | resim | Refuse the re-execution unless EVERY executed node's state was restored. Inert on a bag that begins at step 0: nothing is restored there. Legal in both resim modes: it is a PRECONDITION on the run, not a claim about the recording, so a neutral resim honours it too (its refusal is the exit-2 not-replay-grade arm, which neutral mode never swallows). |
+| `--allow-param-change` | resim | On a bag that begins MID-RUN, resume on the param values in force even where they differ from the ones the recording names. A param is not node state, so a restore never writes one; without this flag each difference refuses the run with exit 2, one line per param naming the node, the param, the recorded value and the current value. Inert on a bag that begins at step 0. Legal in both resim modes. |
+| `--record-out PATH` | resim | Write the re-executed frames to a new bag at `PATH`: one channel per graph-produced topic holding every frame the re-executed graph published, as the full wire frame stamped with the sequence and timestamp in its own header (a frame shorter than the header is written whole with sequence and timestamp 0, as the recorder does). Each channel's schema hash is the one the re-executed graph publishes: the current workspace's when it resolves, otherwise the input channel's when it was recorded under this build's hash recipe, otherwise the hash in the topic's first frame. Provisioning is copied from the input bag's channel. Its schema name and fixed wire size are copied too when the input channel's hash, under this build's recipe, is the label; otherwise (a schema changed since recording, a legacy recipe, a node added since the recording) the channel takes the current workspace's schema name, else the input's, else `unknown`, and a fixed wire size of 0. A frame whose header names a different schema hash than its channel fails the run, so the output never mislabels a frame; a channel waiting for its first frame to learn its hash, whose first frame has no header, is labelled 0 and holds to it (a headerless frame on a channel already labelled is written under that label). The recorded external inputs a resim injects are not copied, including those re-published on a topic that another rank's graph also writes: they are unchanged and already in the input bag. A custom-type schema catalog in the input bag is carried over, pruned to the schema hashes the output's channels carry (a legacy recipe's hash is not bound in it, so it brings no definition). The output carries no scheduler trace, so it is a recording to read or index, not a bag `--resim` can re-execute. `PATH` must not exist: an existing file (the input bag included) is refused with exit 2 and never overwritten. A run that does not finish removes the partial file. Legal in both resim modes: it shapes what the run produces, not the comparison. With `--report`, the JSON gains a `record_out` field naming the written path (absent without the flag). `--record-out` and `--report` may not name the same file, however each is spelled (`out.mcap` and `./out.mcap`, or a symlink to it). A bag that cannot be finished fails a run that would otherwise exit 0 with exit 5 and removes the file. |
 | `--report PATH` | resim + `--verify` | Persist the machine-readable verdict JSON. Needs `--verify`: its `passed` / `violations` fields ARE the verdict a bare `--resim` declines to make. Beside the verdict it carries the per-rank REPORT-ONLY arrays, none of which move the exit code: `rank_execution` (one entry per pass: steps executed, first/last step, and whether the `--duration` bound is what stopped it; the per-rank breakdown `ticks_replayed` sums away), `injection_anomalies` (a bag-fed topic whose injected stream differed from the recording's: a sequence the plan did not name, a schedule that over-named the stream, or recorded frames a steered schedule left unaccounted for), and `replay_input_shortfalls` (a node whose trace-driven burst asked for the next recorded frame and got nothing, so it fired on its held head). Read all three before attributing a byte mismatch to the candidate: each says the replay's INPUT differed first. |
 | `--tolerance PATH` | resim + `--verify` | Relax the byte-comparison per field. Needs `--verify`: there is no comparison to relax without it. |
 
 Why the playback flags are refused under `--resim`: `--rate` has no wall pace to
 multiply (a resim runs on the recording's own gating clock), `--loop` would not
 re-execute the same starting state a second time, a resim's topic set follows
-the nodes that execute rather than a filter, and `--start-offset` would need a
-per-rank resume ANCHOR (the graph state each worker held at that instant),
-which is the same thing a mid-run free-run bag is refused for; neither
-is supported.
+the nodes that execute rather than a filter, and `--start-offset` would need an
+ANCHOR at an arbitrary instant (the graph state each worker held there), where
+a resim re-executes from the anchor the recording carries. Anchors at an
+arbitrary offset are not supported.
 
 `--duration` is the one bound that crosses the line, because it answers a
 question about the RUN rather than about the comparison: "how much of this
@@ -476,7 +608,10 @@ into it.
 advances (`quantum` / `recorded_wall` / `wall` / `polled`). It is there because
 a resim judge cannot recover it from a bag: a boundary produced by a clock the
 scheduler ADVANCES and one produced by a clock it merely READS are
-byte-identical records with opposite meanings.
+byte-identical records with opposite meanings. Unlike `trace`, it is the
+OUTCOME: a multi-process run writes the arm it asked for before its workers are
+planned, then re-stamps the arm it got once its trace plane is decided, so a
+run whose rings were refused reads `wall` rather than `recorded_wall`.
 
 **`run.json`'s `trace` is the INTENT; `record_coverage.json` is the OUTCOME.**
 Those two cases are the healthy ones. There is a third, and it is ordinary
@@ -568,6 +703,65 @@ per-topic accounting, rendered from its **per-tap** health record so that:
 The bag carries the full detail (including first/last sequence and the
 reconciliation terms) in its `__cerulion/record_health.json` attachment, which
 the summary always names.
+
+---
+
+## `cerulion bag migrate`
+
+```
+cerulion bag migrate <BAG> [-o PATH] [--dry-run] [--yes]
+```
+
+`bag migrate` writes a corrected copy of a bag the current release cannot
+re-simulate as recorded. It covers two cases:
+
+- **Undefined graph keys.** An older bag may embed the on-disk
+  `graphs/<name>.yaml` rather than the config the run executed, so a setting the
+  graph format no longer defines (for example, a legacy
+  `policy:` block) travels into the bag, and `bag play --resim` refuses it
+  (exit 2). An MCAP attachment is sealed, so there is no way to edit it in
+  place. The copy carries the same graph with those keys removed.
+- **The 32-byte wire header.** A bag recorded by a release with the 32-byte
+  wire header is migrated even when its graph parses, or when it has no graph
+  at all (a `cerulion bag record` bag). Every whole user frame is written with
+  the current 40-byte header (an untagged step tag). Readers already upgrade
+  such frames as they read them, but a frame walk refuses a bag whose upgraded
+  copy would pass 2 GiB; `bag migrate` upgrades one message at a time and
+  writes a current copy of any size.
+
+It lists every key it would remove, with its path and its line in the embedded
+document, and every topic whose frames it upgrades, and asks before writing.
+`--dry-run` shows the list and writes nothing (it wins over `--yes`); `--yes`
+writes without asking and is required when stdin is not a terminal.
+
+| Property | Behaviour |
+|---|---|
+| Input | Read, never modified. The migrated bag is a second file, `<name>.migrated.mcap` beside the original unless `-o` says otherwise. |
+| Output path | A path that already exists, or that is the input, is refused rather than overwritten. |
+| Frames | Every recorded frame (user topics and Cerulion's internal streams alike) is copied with its topic, sequence, timestamps and payload bytes, in file order, except the header upgrade above. |
+| Attachments | The scheduler trace and every other attachment are copied unchanged. `graph.yaml`, when the bag has one, is replaced by the corrected graph, and one new `__cerulion/migration.json` attachment records the date, the source bag's name, size and SHA-256, the keys removed, and the upgraded topics under `wire_header_upgraded_topics`. |
+| The migrated graph | When the bag has one, re-rendered from the parsed config, so YAML comments and key order do not survive (the same normalization `graph run --record` applies). Your own `graphs/<name>.yaml` is not touched. |
+
+It refuses, writing nothing, when:
+
+- the bag's graph already parses and its frames already carry the current
+  header, or it has no embedded graph and its frames carry the current header
+  (nothing to migrate);
+- a 32-byte-header frame cannot be upgraded (shorter than the header, or
+  declaring a size past its end); `cerulion bag info` counts such frames;
+- the bag is not finalized (a torn bag has no attachment index;
+  `cerulion bag info` reports what is readable in it);
+- the graph fails to parse for a reason other than an undefined key, which is
+  YAML damage a rewrite cannot repair;
+- the bag already carries a `__cerulion/migration.json` attachment and still
+  needs migrating; migrate the original recording instead;
+- the bag records a channel this build's bag writer cannot register (it was
+  written by a newer release); migrate with that release;
+- a channel's schema descriptor, hash recipe or encoding is one this build
+  cannot reproduce faithfully.
+
+If the graph has simply moved on, re-recording from the current graph is the
+better answer; migration is for a recording of something you cannot do again.
 
 ---
 
@@ -719,37 +913,45 @@ trace stream's FORMAT and the run's COORDINATION contract.
 "recorded before the stamp existed".** That is what makes the inferred reading safe to print as a
 fact rather than a hedge.
 
-**Recording a `free_run` bag is an opt-in.** A multi-process
-`graph run --record` under `CERULION_EXECUTION_MODE=free_run` stamps `free_run`
-and records each rank's own wall-faithful timeline from the shared epoch; the
-reader re-executes such a bag PER RANK. Without the variable every bag
-`graph run --record` produces stamps `lockstep`, and that is the default.
-The variable is an execution-mode switch rather than a tuning knob; see
+**A `free_run` bag is what a multi-process `graph run --record` produces by
+default.** The reader re-executes such a bag PER RANK. A `lockstep` stamp means
+one of two things: the run opted out with `CERULION_EXECUTION_MODE=lockstep`,
+or it was a MONOLITH recording (`--single-process --record`; a monolith has no
+ranks); the `lockstep` row above covers both. The variable is an execution-mode
+switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 6 by default, or 5 when it was recorded with
-`CERULION_READ_LOG_FOLD=off`.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 6; a
+`recorder.json` stamps 7.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 7; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Two encodings set the number. Every kind-6 record carries a
+in it. Three encodings set the number. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
-record, and reading that count is what `trace_format` 6 means. Folding is on by
-default, so a bag this binary writes is a format-6 bag whether it is lockstep
-or free-run; `CERULION_READ_LOG_FOLD=off` turns folding off, and a bag recorded
-that way stamps 5, so a bag never claims an encoding it did not use. A bag
+record, and reading that count is what `trace_format` 6 means. The recorder
+also writes a kind-6 record at every gated consult a replay of the bag also
+makes, an empty boundary drain's `none` record included, and reading a `drain`
+role on a `none` record as that empty consult is what `trace_format` 7 means.
+(The one empty consult it does not record is a burst's between-fires refill,
+whose empty answer ends a burst a replay does not re-derive.) Every bag this
+binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
+fold-off stream's run words are structurally zero, which a format-7 reader
+decodes as one occurrence each). A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
 
 Nothing REFUSES an older stamp. A format-5 bag replays with every record read
 as one occurrence (the run count's half of the word is structurally zero
-there). A format <= 4 bag replays with every
+there). A bag stamped below 7 replays with its recorder's SILENCE at an empty
+consult adopted: the replay stages no record there either, so the two logs hold
+the same positions, and a consult its read gate holds no position for is the
+reported `unplanned_consults` count rather than a divergence. A format <= 4 bag
+replays with every
 read-site rule on its pre-roles arm (the bits were never written, so
 `read_site_role` decodes `Unstamped` and the KIND is the site vocabulary). What
 the raised stamp costs is a bag this build writes being unreadable by a binary that
@@ -794,9 +996,22 @@ a frame by its `WireHeader.schema_hash`; a bag's schema NAME never reaches it.
 
 ### What a bag carries about its own types
 
-A Cerulion MCAP schema record carries an 18-byte descriptor (recipe +
-`schema_hash` + fixed size) plus the qualified schema name. That is per-CHANNEL
-and cannot hold a schema CLOSURE: `unitree_go/LowState` needs
+A Cerulion MCAP schema record carries a 20-byte descriptor (recipe +
+`schema_hash` + fixed size + the wire header version its frames were recorded
+with) plus the qualified schema name. A bag recorded before the header grew to
+40 bytes carries the older 18-byte descriptor, which means 32-byte headers:
+every reader (`bag play`, `bag play --resim`, `bag migrate`, the Python
+`open_bag`) upgrades those frames to the current layout as it reads them, with
+an untagged step tag, so its frames reach every consumer in the layout a current
+recording has. A message stream (`bag migrate`, `messages()`) upgrades one
+message at a time. A frame walk (`bag play`, `--resim`, the Python frame
+iterator) builds one upgraded copy of the bag's user frames on its first walk,
+reserved at its exact size and held for as long as the bag is open, and refuses
+a bag whose copy would pass 2 GiB, naming `cerulion bag migrate`, which writes a
+current copy of any size. `bag info` reads the recorded bytes and builds no
+copy; it reports how much a walk would hold.
+
+The descriptor is per-CHANNEL and cannot hold a schema CLOSURE: `unitree_go/LowState` needs
 `unitree_go/BmsState` and friends, which are not channels of the bag at all. So
 the definitions ride ONE bag-level attachment, `__cerulion/schemas.json`,
 alongside `__cerulion/recorder.json` and `__cerulion/record_health.json`:

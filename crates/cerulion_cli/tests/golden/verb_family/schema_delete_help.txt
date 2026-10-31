@@ -1,0 +1,14 @@
+exit: Some(0)
+--- stdout
+Delete a schema
+
+Usage: cerulion schema delete [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Schema name
+
+Options:
+  -v, --verbose  Enable verbose (debug-level) logging (`-v` or `--verbose`)
+  -h, --help     Print help
+
+--- stderr

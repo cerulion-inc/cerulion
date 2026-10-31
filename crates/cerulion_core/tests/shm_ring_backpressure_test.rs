@@ -5,10 +5,11 @@
 //! Two changes to a SHIPPED primitive, so the arms here are shaped around what
 //! must NOT move as much as what must:
 //!
-//! * **`BACKPRESSURE`** — a checkpoint anchor is ~1.09 M chunked records for
-//!   500 MB of node state, so it cannot fit a fixed ring, and a lapped anchor is a
-//!   LOST anchor. The writer is a short-lived `fork` child, not a hot loop, so it
-//!   can afford to wait. The arms prove the producer WAITS rather than lapping, that
+//! * **`BACKPRESSURE`**: a checkpoint anchor is ~1.11 M chunked records for 500 MB
+//!   of node state at the state plane's 472-byte payload region, so it cannot fit a
+//!   fixed ring, and a lapped anchor is a LOST anchor. The writer is a short-lived
+//!   `fork` child, not a hot loop, so it can afford to wait. The arms prove the
+//!   producer WAITS rather than lapping, that
 //!   a drain-side commit RELEASES it, that the wait observables count exactly the
 //!   pushes that waited, and — the other half — that a `FailLoud` (i.e. every trace)
 //!   ring is untouched: its policy word stays 0, its read-cursor word is never
@@ -113,7 +114,7 @@ impl RawMap {
 fn open_raw(name: &str) -> RawMap {
     let cname = std::ffi::CString::new(name).unwrap();
     // SAFETY: FFI open of an existing named SHM object; `cname` is valid.
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+    let fd = unsafe { cerulion_core::posix_shm::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
     assert!(
         fd >= 0,
         "open_raw shm_open({name}): {}",

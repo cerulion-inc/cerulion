@@ -41,7 +41,7 @@
 #
 #   `--single-process` is RECOMMENDED, not required: networked multi-process
 #   runs are first-class, but this graph is validated as one process, and
-#   the flag also skips the partition prompt.
+#   the flag also skips deriving a partition.
 #
 # Experimental: `odom` to `base` is an IDENTITY placeholder, because the
 # `SportModeState` projection on /go2/odom is not validated against real robot

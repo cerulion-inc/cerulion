@@ -1,0 +1,11 @@
+error: `#[param]` field `frame_id` has an unsupported type; a param is one of: bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, String
+  --> tests/ui/param_custom_string_path.rs:16:15
+   |
+16 |     frame_id: custom::String,
+   |               ^^^^^^^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+  --> tests/ui/param_custom_string_path.rs:13:7
+   |
+13 |     #[output]
+   |       ^^^^^^

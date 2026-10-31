@@ -320,6 +320,12 @@ fn demand_queryable_get_path_alone_delivers_byte_identical() {
         "the demander must have received at least one ENABLED ack; got {}",
         rig.gateway_cons.demand_enabled_ack_count()
     );
+    // The ack names its sender: the producer is the only robot that answered.
+    assert_eq!(
+        rig.gateway_cons.demand_ack_peers(),
+        vec![PROD_ROBOT.to_string()],
+        "the enabled ack must be attributed to the producer's robot identity"
+    );
     assert_eq!(
         rig.gateway_prod.reconciler_enabled_count(),
         0,
@@ -397,6 +403,11 @@ fn allowlist_refuses_non_egress_topic_get() {
         rig.gateway_cons.demand_refused_ack_count() >= 1,
         "the demander must have received a REFUSED ack for the non-egress topic; got {}",
         rig.gateway_cons.demand_refused_ack_count()
+    );
+    assert_eq!(
+        rig.gateway_cons.demand_ack_peers(),
+        vec![PROD_ROBOT.to_string()],
+        "the refused ack must be attributed to the producer's robot identity"
     );
     assert!(
         rig.gateway_prod.demand_refusal_count() >= 1,

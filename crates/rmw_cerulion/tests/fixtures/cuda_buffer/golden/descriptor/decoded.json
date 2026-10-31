@@ -1,0 +1,629 @@
+{
+  "decoded": {
+    "descriptor_fixed.ddscdr.cdr": {
+      "file": "descriptor_fixed.ddscdr.cdr",
+      "bytes": 140,
+      "value": {
+        "size": 48,
+        "element_type_name": "h",
+        "device_id": 0,
+        "use_ipc": true,
+        "vmm_pid": 4242,
+        "vmm_block_id": 7,
+        "vmm_block_size": 2097152,
+        "vmm_socket_path": "cuda_vmm_4242_7",
+        "ipc_uid": 81985529216486895,
+        "ipc_event_handle": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+      },
+      "fields": [
+        {
+          "field": "size",
+          "offset": 4,
+          "len": 8,
+          "value": 48
+        },
+        {
+          "field": "element_type_name",
+          "offset": 12,
+          "len": 6,
+          "value": "h"
+        },
+        {
+          "field": "device_id",
+          "offset": 20,
+          "len": 4,
+          "value": 0
+        },
+        {
+          "field": "use_ipc",
+          "offset": 24,
+          "len": 1,
+          "value": 1
+        },
+        {
+          "field": "vmm_pid",
+          "offset": 28,
+          "len": 4,
+          "value": 4242
+        },
+        {
+          "field": "vmm_block_id",
+          "offset": 32,
+          "len": 4,
+          "value": 7
+        },
+        {
+          "field": "vmm_block_size",
+          "offset": 36,
+          "len": 8,
+          "value": 2097152
+        },
+        {
+          "field": "vmm_socket_path",
+          "offset": 44,
+          "len": 20,
+          "value": "cuda_vmm_4242_7"
+        },
+        {
+          "field": "ipc_uid",
+          "offset": 68,
+          "len": 8,
+          "value": 81985529216486895
+        },
+        {
+          "field": "ipc_event_handle",
+          "offset": 76,
+          "len": 64,
+          "value": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        }
+      ]
+    },
+    "descriptor_fixed.xcdr1.cdr": {
+      "file": "descriptor_fixed.xcdr1.cdr",
+      "bytes": 140,
+      "value": {
+        "size": 48,
+        "element_type_name": "h",
+        "device_id": 0,
+        "use_ipc": true,
+        "vmm_pid": 4242,
+        "vmm_block_id": 7,
+        "vmm_block_size": 2097152,
+        "vmm_socket_path": "cuda_vmm_4242_7",
+        "ipc_uid": 81985529216486895,
+        "ipc_event_handle": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+      },
+      "fields": [
+        {
+          "field": "size",
+          "offset": 4,
+          "len": 8,
+          "value": 48
+        },
+        {
+          "field": "element_type_name",
+          "offset": 12,
+          "len": 6,
+          "value": "h"
+        },
+        {
+          "field": "device_id",
+          "offset": 20,
+          "len": 4,
+          "value": 0
+        },
+        {
+          "field": "use_ipc",
+          "offset": 24,
+          "len": 1,
+          "value": 1
+        },
+        {
+          "field": "vmm_pid",
+          "offset": 28,
+          "len": 4,
+          "value": 4242
+        },
+        {
+          "field": "vmm_block_id",
+          "offset": 32,
+          "len": 4,
+          "value": 7
+        },
+        {
+          "field": "vmm_block_size",
+          "offset": 36,
+          "len": 8,
+          "value": 2097152
+        },
+        {
+          "field": "vmm_socket_path",
+          "offset": 44,
+          "len": 20,
+          "value": "cuda_vmm_4242_7"
+        },
+        {
+          "field": "ipc_uid",
+          "offset": 68,
+          "len": 8,
+          "value": 81985529216486895
+        },
+        {
+          "field": "ipc_event_handle",
+          "offset": 76,
+          "len": 64,
+          "value": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        }
+      ]
+    },
+    "image_cpu_legacy.xcdr1.cdr": {
+      "file": "image_cpu_legacy.xcdr1.cdr",
+      "bytes": 96,
+      "value": {
+        "sec": 1,
+        "nanosec": 2,
+        "frame_id": "s2",
+        "height": 4,
+        "width": 4,
+        "encoding": "rgb8",
+        "is_bigendian": 0,
+        "step": 12,
+        "data_form": "legacy_sequence",
+        "data": "abababababababababababababababababababababababababababababababababababababababababababababababab"
+      },
+      "fields": [
+        {
+          "field": "header.stamp.sec",
+          "offset": 4,
+          "len": 4,
+          "value": 1
+        },
+        {
+          "field": "header.stamp.nanosec",
+          "offset": 8,
+          "len": 4,
+          "value": 2
+        },
+        {
+          "field": "header.frame_id",
+          "offset": 12,
+          "len": 7,
+          "value": "s2"
+        },
+        {
+          "field": "height",
+          "offset": 20,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "width",
+          "offset": 24,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "encoding",
+          "offset": 28,
+          "len": 9,
+          "value": "rgb8"
+        },
+        {
+          "field": "is_bigendian",
+          "offset": 37,
+          "len": 1,
+          "value": 0
+        },
+        {
+          "field": "step",
+          "offset": 40,
+          "len": 4,
+          "value": 12
+        },
+        {
+          "field": "data.length",
+          "offset": 44,
+          "len": 4,
+          "value": 48
+        },
+        {
+          "field": "data.bytes",
+          "offset": 48,
+          "len": 48,
+          "value": "abababababababababababababababababababababababababababababababababababababababababababababababab"
+        }
+      ]
+    },
+    "image_cuda_descriptor.ddscdr.cdr": {
+      "file": "image_cuda_descriptor.ddscdr.cdr",
+      "bytes": 204,
+      "value": {
+        "sec": 1,
+        "nanosec": 2,
+        "frame_id": "s2",
+        "height": 4,
+        "width": 4,
+        "encoding": "rgb8",
+        "is_bigendian": 0,
+        "step": 12,
+        "data_form": "descriptor",
+        "backend_type": "cuda",
+        "descriptor": {
+          "size": 48,
+          "element_type_name": "h",
+          "device_id": 0,
+          "use_ipc": true,
+          "vmm_pid": 8393,
+          "vmm_block_id": 0,
+          "vmm_block_size": 2097152,
+          "vmm_socket_path": "cuda_vmm_8393_0",
+          "ipc_uid": 4120325463928950868,
+          "ipc_event_handle": "c9200000000000000100000000000000ff0f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "fields": [
+        {
+          "field": "header.stamp.sec",
+          "offset": 4,
+          "len": 4,
+          "value": 1
+        },
+        {
+          "field": "header.stamp.nanosec",
+          "offset": 8,
+          "len": 4,
+          "value": 2
+        },
+        {
+          "field": "header.frame_id",
+          "offset": 12,
+          "len": 7,
+          "value": "s2"
+        },
+        {
+          "field": "height",
+          "offset": 20,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "width",
+          "offset": 24,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "encoding",
+          "offset": 28,
+          "len": 9,
+          "value": "rgb8"
+        },
+        {
+          "field": "is_bigendian",
+          "offset": 37,
+          "len": 1,
+          "value": 0
+        },
+        {
+          "field": "step",
+          "offset": 40,
+          "len": 4,
+          "value": 12
+        },
+        {
+          "field": "data.marker1",
+          "offset": 44,
+          "len": 4,
+          "value": 4294967295
+        },
+        {
+          "field": "data.marker2",
+          "offset": 48,
+          "len": 4,
+          "value": 1380930354
+        },
+        {
+          "field": "data.backend_type",
+          "offset": 52,
+          "len": 9,
+          "value": "cuda"
+        },
+        {
+          "field": "data.descriptor.size",
+          "offset": 68,
+          "len": 8,
+          "value": 48
+        },
+        {
+          "field": "data.descriptor.element_type_name",
+          "offset": 76,
+          "len": 6,
+          "value": "h"
+        },
+        {
+          "field": "data.descriptor.device_id",
+          "offset": 84,
+          "len": 4,
+          "value": 0
+        },
+        {
+          "field": "data.descriptor.use_ipc",
+          "offset": 88,
+          "len": 1,
+          "value": 1
+        },
+        {
+          "field": "data.descriptor.vmm_pid",
+          "offset": 92,
+          "len": 4,
+          "value": 8393
+        },
+        {
+          "field": "data.descriptor.vmm_block_id",
+          "offset": 96,
+          "len": 4,
+          "value": 0
+        },
+        {
+          "field": "data.descriptor.vmm_block_size",
+          "offset": 100,
+          "len": 8,
+          "value": 2097152
+        },
+        {
+          "field": "data.descriptor.vmm_socket_path",
+          "offset": 108,
+          "len": 20,
+          "value": "cuda_vmm_8393_0"
+        },
+        {
+          "field": "data.descriptor.ipc_uid",
+          "offset": 132,
+          "len": 8,
+          "value": 4120325463928950868
+        },
+        {
+          "field": "data.descriptor.ipc_event_handle",
+          "offset": 140,
+          "len": 64,
+          "value": "c9200000000000000100000000000000ff0f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    "image_cuda_descriptor.xcdr1.cdr": {
+      "file": "image_cuda_descriptor.xcdr1.cdr",
+      "bytes": 204,
+      "value": {
+        "sec": 1,
+        "nanosec": 2,
+        "frame_id": "s2",
+        "height": 4,
+        "width": 4,
+        "encoding": "rgb8",
+        "is_bigendian": 0,
+        "step": 12,
+        "data_form": "descriptor",
+        "backend_type": "cuda",
+        "descriptor": {
+          "size": 48,
+          "element_type_name": "h",
+          "device_id": 0,
+          "use_ipc": true,
+          "vmm_pid": 8393,
+          "vmm_block_id": 0,
+          "vmm_block_size": 2097152,
+          "vmm_socket_path": "cuda_vmm_8393_0",
+          "ipc_uid": 4120325463928950868,
+          "ipc_event_handle": "c9200000000000000100000000000000ff0f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "fields": [
+        {
+          "field": "header.stamp.sec",
+          "offset": 4,
+          "len": 4,
+          "value": 1
+        },
+        {
+          "field": "header.stamp.nanosec",
+          "offset": 8,
+          "len": 4,
+          "value": 2
+        },
+        {
+          "field": "header.frame_id",
+          "offset": 12,
+          "len": 7,
+          "value": "s2"
+        },
+        {
+          "field": "height",
+          "offset": 20,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "width",
+          "offset": 24,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "encoding",
+          "offset": 28,
+          "len": 9,
+          "value": "rgb8"
+        },
+        {
+          "field": "is_bigendian",
+          "offset": 37,
+          "len": 1,
+          "value": 0
+        },
+        {
+          "field": "step",
+          "offset": 40,
+          "len": 4,
+          "value": 12
+        },
+        {
+          "field": "data.marker1",
+          "offset": 44,
+          "len": 4,
+          "value": 4294967295
+        },
+        {
+          "field": "data.marker2",
+          "offset": 48,
+          "len": 4,
+          "value": 1380930354
+        },
+        {
+          "field": "data.backend_type",
+          "offset": 52,
+          "len": 9,
+          "value": "cuda"
+        },
+        {
+          "field": "data.descriptor.size",
+          "offset": 68,
+          "len": 8,
+          "value": 48
+        },
+        {
+          "field": "data.descriptor.element_type_name",
+          "offset": 76,
+          "len": 6,
+          "value": "h"
+        },
+        {
+          "field": "data.descriptor.device_id",
+          "offset": 84,
+          "len": 4,
+          "value": 0
+        },
+        {
+          "field": "data.descriptor.use_ipc",
+          "offset": 88,
+          "len": 1,
+          "value": 1
+        },
+        {
+          "field": "data.descriptor.vmm_pid",
+          "offset": 92,
+          "len": 4,
+          "value": 8393
+        },
+        {
+          "field": "data.descriptor.vmm_block_id",
+          "offset": 96,
+          "len": 4,
+          "value": 0
+        },
+        {
+          "field": "data.descriptor.vmm_block_size",
+          "offset": 100,
+          "len": 8,
+          "value": 2097152
+        },
+        {
+          "field": "data.descriptor.vmm_socket_path",
+          "offset": 108,
+          "len": 20,
+          "value": "cuda_vmm_8393_0"
+        },
+        {
+          "field": "data.descriptor.ipc_uid",
+          "offset": 132,
+          "len": 8,
+          "value": 4120325463928950868
+        },
+        {
+          "field": "data.descriptor.ipc_event_handle",
+          "offset": 140,
+          "len": 64,
+          "value": "c9200000000000000100000000000000ff0f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    "image_cuda_plain.xcdr1.cdr": {
+      "file": "image_cuda_plain.xcdr1.cdr",
+      "bytes": 96,
+      "value": {
+        "sec": 1,
+        "nanosec": 2,
+        "frame_id": "s2",
+        "height": 4,
+        "width": 4,
+        "encoding": "rgb8",
+        "is_bigendian": 0,
+        "step": 12,
+        "data_form": "legacy_sequence",
+        "data": "abababababababababababababababababababababababababababababababababababababababababababababababab"
+      },
+      "fields": [
+        {
+          "field": "header.stamp.sec",
+          "offset": 4,
+          "len": 4,
+          "value": 1
+        },
+        {
+          "field": "header.stamp.nanosec",
+          "offset": 8,
+          "len": 4,
+          "value": 2
+        },
+        {
+          "field": "header.frame_id",
+          "offset": 12,
+          "len": 7,
+          "value": "s2"
+        },
+        {
+          "field": "height",
+          "offset": 20,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "width",
+          "offset": 24,
+          "len": 4,
+          "value": 4
+        },
+        {
+          "field": "encoding",
+          "offset": 28,
+          "len": 9,
+          "value": "rgb8"
+        },
+        {
+          "field": "is_bigendian",
+          "offset": 37,
+          "len": 1,
+          "value": 0
+        },
+        {
+          "field": "step",
+          "offset": 40,
+          "len": 4,
+          "value": 12
+        },
+        {
+          "field": "data.length",
+          "offset": 44,
+          "len": 4,
+          "value": 48
+        },
+        {
+          "field": "data.bytes",
+          "offset": 48,
+          "len": 48,
+          "value": "abababababababababababababababababababababababababababababababababababababababababababababababab"
+        }
+      ]
+    }
+  },
+  "errors": []
+}

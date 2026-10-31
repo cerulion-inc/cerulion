@@ -281,6 +281,7 @@ fn make_wire_frame(schema_hash: u64, seq: u32, ts: u64, payload: &[u8]) -> Vec<u
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -539,6 +540,7 @@ fn iroh_wan_plane_registers_and_removes_mirror_provenance() {
         .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
         .expect("ensure");
     let _ = collect_frames(&manager_b, &topic, 2);
+    assert!(manager_b.is_network_mirror(&topic).unwrap());
 
     // Provenance registered, attributed to the DEMAND's robot (not the robot's
     // self-declared catalog identity) — so `topic list` folds it into REMOTE.
@@ -554,6 +556,7 @@ fn iroh_wan_plane_registers_and_removes_mirror_provenance() {
         gather_absent(&manager_b, &topic),
         "release removes the mirror provenance"
     );
+    assert!(!manager_b.is_network_mirror(&topic).unwrap());
 
     stop.store(true, Ordering::Relaxed);
     let _ = producer.join();
@@ -627,12 +630,12 @@ fn dual_plane_routes_wan_robot_to_iroh_and_delivers() {
 
     // The routing decision (the picker through the DualMirrorPlane surface).
     assert_eq!(
-        dual.plane_for(&TopicKey::new("ubuntu", &topic)),
+        dual.plane_for(&TopicKey::new("ubuntu", &topic)).unwrap(),
         Plane::Iroh,
         "a WAN-registered robot routes to iroh"
     );
     assert_eq!(
-        dual.plane_for(&TopicKey::new("lan-bot", "/tf")),
+        dual.plane_for(&TopicKey::new("lan-bot", "/tf")).unwrap(),
         Plane::Zenoh,
         "an unregistered robot routes to the zenoh LAN default"
     );
@@ -1015,6 +1018,7 @@ async fn recording_robot_recording_epochs(
         };
         let resp = match req {
             WireRequest::Catalog => WireResponse::Catalog(CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: CATALOG_WIRE_VERSION,
                 robot: "rec-robot".to_string(),
                 entries: catalog_topics
@@ -2034,3 +2038,12 @@ fn the_desk_account_is_resolved_at_the_dial_not_before() {
     let _ = producer.join();
     drop(plane);
 }
+
+#[path = "wan_plane_iroh_test/owner_pair.rs"]
+mod owner_pair;
+
+#[path = "wan_plane_iroh_test/poison_retirement.rs"]
+mod poison_retirement;
+
+#[path = "wan_plane_iroh_test/serving_plane.rs"]
+mod serving_plane;

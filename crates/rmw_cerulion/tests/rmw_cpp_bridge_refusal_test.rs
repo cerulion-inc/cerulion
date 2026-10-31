@@ -11,11 +11,14 @@
 //! `tracing_field_discipline_test`) refuses a bare
 //! `error!("{}", refusal)` pass-through from the resolvers.
 //!
-//! Each refusing verdict emits ONE `error!` whose message is the
+//! A refusing verdict emits ONE `error!` whose message is the
 //! `{SCREAMING_CONST}` capture of its OWN paragraph. That makes a drift
-//! a `"{}", msg` forwarding structurally could not have — the
-//! seam rendering the OTHER verdict's text — a real defect, so every
-//! emitted line is cross-checked against `refusal_message()`.
+//! a `"{}", msg` forwarding structurally could not have (the
+//! seam rendering a paragraph that is not this verdict's) a real
+//! defect, so every emitted line is cross-checked against
+//! `refusal_message()`. One verdict refuses today (a vendored build
+//! under a runtime the snapshot does not admit): every era the bindings
+//! can carry has a C++ mirror, so none is refused on layout grounds.
 #![cfg(unix)]
 
 use rmw_cerulion::era::{built_for, CppBridgeGate};
@@ -144,14 +147,15 @@ fn check_refusal_line(
     lines: &[&str],
     gate: CppBridgeGate,
     verdict_token: &str,
-    other: CppBridgeGate,
+    foreign: &str,
 ) -> Result<(), String> {
     let own = gate
         .refusal_message()
         .expect("a refusing verdict carries text");
-    let others = other
-        .refusal_message()
-        .expect("the other verdict carries text");
+    // A paragraph that must never appear on this verdict's line: the
+    // post-Jazzy refusal text that the Lyrical mirror retired, kept as the
+    // regression guard against it returning under any verdict.
+    let others = foreign;
     let hits: Vec<&str> = lines
         .iter()
         .copied()
@@ -289,7 +293,7 @@ fn the_tightened_field_oracles_reject_what_they_claim_to() {
     assert!(!is_decade_suffix(" total_failures=10 suppressed_count=8\n"));
     // A field value is bounded on BOTH sides: a trailing corruption is
     // no longer a match, and a prefixed KEY still is not.
-    let line = "msg built_for=distro=x caps=a,b verdict=RefusePreJazzy";
+    let line = "msg built_for=distro=x caps=a,b verdict=RefuseVendoredUnnamedRuntime";
     let next = &["verdict"];
     assert!(has_field_starting_a_token(
         line,
@@ -342,7 +346,7 @@ fn the_tightened_field_oracles_reject_what_they_claim_to() {
         &[]
     ));
     assert!(!has_field_starting_a_token(
-        "msg built_for=distro=x caps=a,b verdict=RefusePreJazzy",
+        "msg built_for=distro=x caps=a,b verdict=RefuseVendoredUnnamedRuntime",
         "built_for",
         "distro=x caps=a,b",
         &[]
@@ -373,7 +377,7 @@ fn a_refusing_verdict_is_loud_first_then_latched_and_re_announces_at_a_decade() 
     let asks_before = rmw_cerulion::ffi::rcl_error_asks();
     let drive = decade_above(before + 1) - before + 2;
     for _ in 0..drive {
-        assert!(CppBridgeGate::RefusePreJazzy.emit_refusal());
+        assert!(CppBridgeGate::RefuseVendoredUnnamedRuntime.emit_refusal());
     }
     // EVERY refusal asks rcl's error channel, suppressed repeats included
     // (the last text alone cannot tell "set on
@@ -396,7 +400,7 @@ fn a_refusing_verdict_is_loud_first_then_latched_and_re_announces_at_a_decade() 
     // checkable: the verdict's own paragraph plus the two fields.
     let asked = rmw_cerulion::ffi::last_rcl_error_text()
         .expect("the refusal must have asked rcl's error channel");
-    let paragraph = CppBridgeGate::RefusePreJazzy
+    let paragraph = CppBridgeGate::RefuseVendoredUnnamedRuntime
         .refusal_message()
         .expect("a refusing verdict carries a paragraph");
     // EXACT, not a prefix + two `contains` (the same oracle
@@ -405,7 +409,7 @@ fn a_refusing_verdict_is_loud_first_then_latched_and_re_announces_at_a_decade() 
     assert_eq!(
         asked,
         format!(
-            "{paragraph} built_for={} verdict=RefusePreJazzy",
+            "{paragraph} built_for={} verdict=RefuseVendoredUnnamedRuntime",
             built_for()
         ),
         "the rcl channel was asked with the wrong text"
@@ -500,7 +504,7 @@ fn a_refusing_verdict_is_loud_first_then_latched_and_re_announces_at_a_decade() 
         // Quieter, never thinner: every line keeps the remedy paragraph,
         // the build identity, the verdict and the rcl outcome.
         for line in &hits {
-            if !has_field(line, "verdict", "RefusePreJazzy") {
+            if !has_field(line, "verdict", "RefuseVendoredUnnamedRuntime") {
                 return Err(format!("refusal line missing verdict: {line}"));
             }
             if !has_field(line, "rcl_error_channel", "unavailable") {
@@ -526,37 +530,18 @@ fn a_refusing_verdict_is_loud_first_then_latched_and_re_announces_at_a_decade() 
 #[traced_test]
 #[test]
 #[serial]
-fn a_pre_jazzy_verdict_refuses_at_error_with_its_own_constant_paragraph() {
+fn a_vendored_unnamed_runtime_verdict_refuses_at_error_with_its_own_constant_paragraph() {
     rearm();
     assert!(
-        CppBridgeGate::RefusePreJazzy.emit_refusal(),
-        "a pre-Jazzy verdict must tell the caller to refuse"
+        CppBridgeGate::RefuseVendoredUnnamedRuntime.emit_refusal(),
+        "a vendored build under an unnamed runtime must tell the caller to refuse"
     );
     logs_assert(|lines: &[&str]| {
         check_refusal_line(
             lines,
-            CppBridgeGate::RefusePreJazzy,
-            "RefusePreJazzy",
-            CppBridgeGate::RefusePostJazzy,
-        )
-    });
-}
-
-#[traced_test]
-#[test]
-#[serial]
-fn a_post_jazzy_verdict_refuses_at_error_with_its_own_constant_paragraph() {
-    rearm();
-    assert!(
-        CppBridgeGate::RefusePostJazzy.emit_refusal(),
-        "a post-Jazzy verdict must tell the caller to refuse"
-    );
-    logs_assert(|lines: &[&str]| {
-        check_refusal_line(
-            lines,
-            CppBridgeGate::RefusePostJazzy,
-            "RefusePostJazzy",
-            CppBridgeGate::RefusePreJazzy,
+            CppBridgeGate::RefuseVendoredUnnamedRuntime,
+            "RefuseVendoredUnnamedRuntime",
+            "rosidl-Buffer struct growth",
         )
     });
 }
@@ -587,7 +572,7 @@ fn a_supported_verdict_emits_nothing_and_does_not_refuse() {
     // Anti-tautology, same capture: a zero above proves nothing if the
     // capture is blind to the seam, so a refusing verdict must now show —
     // and as the ONLY line, so the whole-capture oracle stays meaningful.
-    assert!(CppBridgeGate::RefusePreJazzy.emit_refusal());
+    assert!(CppBridgeGate::RefuseVendoredUnnamedRuntime.emit_refusal());
     logs_assert(|lines: &[&str]| {
         if lines.len() != 1 || !lines[0].contains(REFUSAL_MARKER) {
             return Err(format!(

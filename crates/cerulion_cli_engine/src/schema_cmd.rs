@@ -17,13 +17,9 @@ use crate::schema_store::{builtin_has_qualified, SchemaStore, StoredSchema};
 use crate::utils::to_pascal_case;
 use crate::workspace_lock::WorkspaceLock;
 
-/// Maximum accepted `FixedArray` length in workspace schema YAML.
-///
-/// `MessageSchema::wire_fixed_size()` uses checked arithmetic and panics
-/// (with a field-naming message) on hostile lengths at codegen time; this
-/// CLI pre-validation rejects oversized lengths with a `CliError` so user
-/// input can never reach that panic.
-pub const MAX_FIXED_ARRAY_LEN: usize = 1_048_576;
+/// Inline fixed-length cap, shared with `cerulion_core::dynamic` (the ONE
+/// YAML schema parser) so CLI and bindings refuse the same declarations.
+pub use cerulion_core::dynamic::MAX_FIXED_ARRAY_LEN;
 
 /// `schema info`-context remedy for [`CliError::SchemaNotFound`]:
 /// names BOTH lookup sources and the
@@ -61,6 +57,17 @@ pub fn normalize_schema(s: &str) -> String {
 /// Example: `sensor_msgs/LaserScan` -> `sensor_msgs::LaserScan`
 pub fn display_schema(s: &str) -> String {
     s.replace('/', "::")
+}
+
+/// Would `schema_create` write a file the loader reads: the PascalCased name
+/// must be a YAML string key. A name such as `123` or `true` becomes a number
+/// or a boolean key, and the schema parser then skips the file.
+pub fn schema_name_makes_a_string_key(name: &str) -> bool {
+    let key = to_pascal_case(name);
+    matches!(
+        serde_yaml::from_str::<serde_yaml::Value>(&format!("{key}: x\n")),
+        Ok(serde_yaml::Value::Mapping(map)) if map.len() == 1 && map.keys().all(|k| k.is_string())
+    )
 }
 
 /// Create a new schema YAML file.
@@ -197,7 +204,7 @@ fn schema_info_entries(
         // nothing before resolution, so the parse-time size is bounded by
         // fields × 2^20 × 8 bytes and no usize overflow is declarable — but
         // 512 such fields DO declare a fixed section past the u32 wire
-        // ceiling (the frame prefix: 32-byte header + fixed section + offset
+        // ceiling (the frame prefix: 40-byte header + fixed section + offset
         // table), and a hash/size of that entry is a contract no frame can
         // carry. Such an entry is REFUSED with the same message the store
         // tier gives a rejected definition, never rendered with its
@@ -245,8 +252,8 @@ fn schema_info_entries(
 /// The graph-run path uses this to compute each workspace
 /// schema's recipe-3 `schema_hash` for the YAML-`schema:`-vs-macro-output
 /// divergence warn. It shares the IR-building loop with [`schema_info`]
-/// (via `parse_schema_fields_into` — same strict field-key parsing +
-/// `FixedArray` length guards) but discards the per-field display
+/// (both call the core parser - same strict field-key parsing +
+/// `FixedArray` length guards) but skips the per-field display
 /// rendering `schema info` needs — this caller only wants the hashable IR.
 ///
 /// The returned schemas are UNRESOLVED (every `Nested` reference is
@@ -262,61 +269,12 @@ fn schema_info_entries(
 /// Workspace schemas are package-less, so each returned schema's
 /// [`MessageSchema::qualified_name`] is its bare name.
 pub fn parse_message_schemas(content: &str) -> CliResult<Vec<MessageSchema>> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(content)?;
-
-    let schemas = doc
-        .get("schemas")
-        .and_then(|s| s.as_mapping())
-        .ok_or_else(|| {
-            CliError::Validation("invalid schema format: missing 'schemas' key".to_string())
-        })?;
-
-    let mut out = Vec::new();
-    for (schema_name, schema_def) in schemas {
-        // A non-string schema-NAME key (e.g. a YAML int/bool) cannot match
-        // a real `schema:` string and, as a map KEY downstream, would
-        // collide other coerced names under one "unknown" bucket — silently
-        // defeating the divergence check. Reject loudly, mirroring the
-        // field-key path in `parse_schema_fields_into`. (The caller
-        // downgrades this to a warn + skip, so it stays non-fatal but
-        // visible — never silent.)
-        let name_str = schema_name
-            .as_str()
-            .ok_or_else(|| {
-                CliError::Validation(format!(
-                    "schema name key {:?} is not a string; schema names must be \
-                     strings (e.g. 'Image')",
-                    schema_name
-                ))
-            })?
-            .to_string();
-        // An EMPTY (or blank) entry key is refused at the ONE parse
-        // gate every consumer routes through — a `Foo.yaml` whose sole entry
-        // is keyed `""` otherwise parses, so its stem bound a validated port
-        // `Foo` to the empty schema key: an unusable topic binding, silently.
-        // Refusing it here makes the file unparseable everywhere at once
-        // (the stem tier ERRORS at validation, the listing skips it with a
-        // warn, no claim is minted) instead of one guard per consumer.
-        if name_str.trim().is_empty() {
-            return Err(CliError::Validation(
-                "schema entry key is empty; schema names must be non-empty strings (a `schemas:` \
-                 mapping key like `Goal` or `pkg/Type`)"
-                    .to_string(),
-            ));
-        }
-        // The IR keeps the DECLARED spelling: the entry name is
-        // the wire-hash identity, and a workspace node's build script reads
-        // the same YAML key into `MessageSchema::new` ("one yaml, one hash"),
-        // so canonicalizing it here made the CLI hash `pkg/Type`
-        // while the built node hashed `pkg::Type` — a live divergence. The
-        // ONE identity for CLAIMS and lookups is applied where those are
-        // keyed (`workspace_yaml_bare_claims_of`, the listing, `schema info`),
-        // never on the hashed name.
-        let mut schema = MessageSchema::new(name_str.clone());
-        let _ = parse_schema_fields_into(&name_str, schema_def, &mut schema)?;
-        out.push(schema);
-    }
-    Ok(out)
+    // Parse twice on purpose (this is a cold path): the raw parse preserves
+    // `CliError::Yaml` for malformed documents, while the core parse remains
+    // the ONE schema-rule implementation shared with bindings.
+    serde_yaml::from_str::<serde_yaml::Value>(content)?;
+    cerulion_core::dynamic::parse_yaml_schemas(content)
+        .map_err(|e| CliError::Validation(e.to_string()))
 }
 
 /// Drop every schema whose fixed-section size arithmetic overflows
@@ -415,9 +373,9 @@ pub(crate) fn offset_table_entries(schema: &MessageSchema, moment: SizeMoment) -
 
 /// The wire-representability CEILING — the ONE rule every size-fold
 /// surface applies, stated by `cerulion_core::wire` and consulted here:
-/// a schema is representable iff its FRAME PREFIX — the 32-byte
+/// a schema is representable iff its FRAME PREFIX (the 40-byte
 /// `WireHeader`, the fixed section and one 8-byte `OffsetEntry` per
-/// variable field, i.e. its smallest possible frame — fits the wire's
+/// variable field, i.e. its smallest possible frame) fits the wire's
 /// `u32` `total_size` (which is also the type of every recorded
 /// `wire_fixed_size` descriptor). A ceiling on the fixed section alone
 /// (`fixed_size <= u32::MAX`, the earlier rule) accepted a schema
@@ -465,7 +423,7 @@ pub(crate) fn representable_layout(
             offset_table_entries = entries,
             max_fixed_size = cerulion_core::wire::max_wire_fixed_size(entries),
             context = %context,
-            "schema's RESOLVED frame prefix (the 32-byte header, the fixed section after \
+            "schema's RESOLVED frame prefix (the 40-byte header, the fixed section after \
              fixed-nested inlining, and the offset table) exceeds the u32 wire \
              total_size — unrepresentable on the wire, reported as unresolved (hostile \
              or corrupt declaration; the rest still resolve)"
@@ -503,7 +461,7 @@ pub(crate) fn wire_representable_or_warn(
             max_fixed_size = cerulion_core::wire::max_wire_fixed_size(entries),
             moment = ?moment,
             context = %context,
-            "schema's frame prefix (the 32-byte header, the fixed section and the offset \
+            "schema's frame prefix (the 40-byte header, the fixed section and the offset \
              table) exceeds the u32 wire total_size — unrepresentable on the wire, \
              skipped (hostile or corrupt declaration; the rest still load)"
         );
@@ -1055,7 +1013,7 @@ pub fn builtin_layout_resolver() -> (LayoutResolver, Vec<String>) {
 /// already parsed at build time to emit the types this crate links
 /// against. It panics loudly rather than silently degrade the registry
 /// if that codegen invariant is ever broken.
-pub(crate) fn parse_builtin_schemas() -> Vec<MessageSchema> {
+pub fn parse_builtin_schemas() -> Vec<MessageSchema> {
     let entries = native_ros2_messages::BUILTIN_MSGS;
     let mut schemas = Vec::with_capacity(entries.len());
     for &(package, name, text) in entries {
@@ -2800,7 +2758,7 @@ pub(crate) fn preflight_resolution_set(schemas: &mut Vec<MessageSchema>, context
     // remote render) served a hash and size for a frame no producer can
     // emit (the fold defect, at the resolver seam). What this seam
     // must exclude is ONLY what would PANIC the layout walker: a declared
-    // section so close to `usize::MAX` that adding the 32-byte header and
+    // section so close to `usize::MAX` that adding the 40-byte header and
     // the offset table overflows (`float64[2^61 − 1]` = 2^64 − 8 bytes,
     // measured). A member past the u32 ceiling but within `usize` stays,
     // composes, and is refused — with every parent that inlines it — by
@@ -3808,10 +3766,10 @@ fn shadowed_builtin_names(result: &SchemaInfoResult) -> Option<String> {
 /// surfaces can never drift. `bare` is already `::`-normalized and carries
 /// no `/`. EXISTENCE + IDENTITY ONLY — deliberately not
 /// [`store_schema_lookup`]: that one builds a full [`SchemaEntry`], which
-/// RESOLVES the schema's layout, and layout resolution PANICS on fixed-array
-/// size overflow (`cerulion_core`'s `layout.rs`: `fixed-array size overflow
-/// (8 x 18446744073709551615)`). Calling it from `port_schema_exists` —
-/// which only ever asks a yes/no question — meant a single
+/// RESOLVES the schema's layout, and layout resolution PANICKED on fixed-array
+/// size overflow when this probe was written (`cerulion_core`'s `layout.rs`,
+/// now a typed `FixedSectionOverflow`). Calling it from `port_schema_exists`,
+/// which only ever asks a yes/no question, meant a single
 /// hostile-but-parseable `.msg` anywhere in `schemas/` CRASHED `cerulion
 /// graph validate` and `graph run`. `float64[18446744073709551615]
 /// a` in a store `.msg`, referenced by a graph output, panics the verb; with
@@ -4011,7 +3969,7 @@ fn store_schema_entry(
 /// [`WorkspaceSchemaEntry::schema_hash`] is `None`). The workspace-YAML
 /// parser caps every `FixedArray` length up front, so the ARITHMETIC arm is
 /// reachable from the `.msg` store only; the wire-ceiling arm is reachable
-/// from both (4096 capped `uint8` fields sit past `u32::MAX − 32`).
+/// from both (4096 capped `uint8` fields sit past `u32::MAX - 40`).
 fn preflight_rejection_error(qualified: &str, location: &str, schema: &MessageSchema) -> CliError {
     let entries = offset_table_entries(schema, SizeMoment::Declared);
     let reason = match schema.checked_wire_fixed_size() {
@@ -4019,7 +3977,7 @@ fn preflight_rejection_error(qualified: &str, location: &str, schema: &MessageSc
         Ok(size) if exceeds_wire_ceiling(size, entries) => {
             let max = cerulion_core::wire::max_wire_fixed_size(entries);
             format!(
-                "its declared frame prefix — the 32-byte header, the fixed section ({size} \
+                "its declared frame prefix, the 40-byte header, the fixed section ({size} \
                  bytes) and the offset table ({entries} entries) — exceeds the u32 wire \
                  ceiling (the largest fixed section that frame can carry is {max} bytes)"
             )
@@ -4063,10 +4021,10 @@ pub enum PortSchemaProvenance {
     /// parity; workspace YAML outranks the store on qualified names too)
     /// — VALIDATED against the store rather than passed through blind.
     /// `schema` is the normalized string unchanged; the arm a prior STORE
-    /// resolver output lands on when fed back in (idempotence). Scaffold
-    /// call sites REFUSE this provenance via
-    /// [`refuse_store_port_scaffold`] — a store type has no generated
-    /// Rust type to import.
+    /// resolver output lands on when fed back in (idempotence). Rust
+    /// scaffold call sites gate this provenance through
+    /// [`refuse_store_port_scaffold`]: the store type has a generated Rust
+    /// type only where the workspace generates its messages.
     QualifiedStore,
     /// A bare name resolved to exactly ONE built-in ROS 2 message.
     /// `qualified` is its canonical `pkg/Name` form.
@@ -4083,10 +4041,10 @@ pub enum PortSchemaProvenance {
     /// workspace YAML schema and WINS over same-short-named built-ins.
     /// `qualified` is the store's `pkg/Type`; `shadowed` carries the
     /// qualified built-in(s) the store hit outranks (comma-joined), `None`
-    /// when the bare name collides with no built-in. Scaffold call sites
-    /// REFUSE this provenance via [`refuse_store_port_scaffold`] — a store
-    /// type has no generated Rust type to import — so the outranked
-    /// built-in is never silently scaffolded in its place either.
+    /// when the bare name collides with no built-in. Rust scaffold call
+    /// sites gate this provenance through [`refuse_store_port_scaffold`]
+    /// (generated only where the workspace generates its messages), and the
+    /// outranked built-in is never silently scaffolded in its place.
     ResolvedStore {
         qualified: String,
         shadowed: Option<String>,
@@ -4110,20 +4068,26 @@ pub struct ResolvedPortSchema {
     pub provenance: PortSchemaProvenance,
 }
 
-/// Refuse a port-schema resolution the NODE SCAFFOLDER cannot honor.
+/// Refuse a port-schema resolution the RUST node scaffolder cannot honor.
 ///
-/// A `.msg` store type has no generated Rust type: `templates::
-/// schema_to_import` maps every qualified name to
-/// `native_ros2_messages::pkg::Type`, and that crate holds ONLY the
-/// built-in corpus — so a port scaffolded from a store type mints a node
-/// crate whose `use` can NEVER compile (unlike a bare workspace-YAML name,
-/// which the author can satisfy in-crate). Until the store codegen front
-/// door exists, the scaffold-consuming call sites (`node create` /
-/// `node modify`, engine AND CLI) call this to refuse LOUDLY with the
-/// remedy; store resolutions stay fully valid on every surface that needs
-/// only the name/hash (`port_schema_exists`, `graph validate`'s identity
-/// comparison, the combined-set hash/wire-size/replay folds).
-pub fn refuse_store_port_scaffold(resolved: &ResolvedPortSchema, raw: &str) -> CliResult<()> {
+/// A `.msg` store type gets a generated Rust type only in a workspace whose
+/// `.cargo/config.toml` names it to the message crate's build script
+/// ([`crate::workspace::WORKSPACE_MSGS_ENV`]; every workspace `workspace
+/// create` / `workspace init` makes has the line): `native_ros2_messages` then
+/// generates the store's packages beside the built-ins, so
+/// `templates::schema_to_import`'s `native_ros2_messages::pkg::Type` compiles.
+/// Without the line that import could never compile, so the Rust
+/// scaffold-consuming call sites (`node create` / `node modify`, engine AND
+/// CLI) call this to refuse LOUDLY with the line to add. A Python node never
+/// calls it: `cerulion.msgs` reads the store at import. Store resolutions stay
+/// valid on every surface that needs only the name/hash
+/// (`port_schema_exists`, `graph validate`'s identity comparison, the
+/// combined-set hash/wire-size/replay folds).
+pub fn refuse_store_port_scaffold(
+    resolved: &ResolvedPortSchema,
+    raw: &str,
+    schemas_dir: &Path,
+) -> CliResult<()> {
     let qualified = match &resolved.provenance {
         PortSchemaProvenance::ResolvedStore { qualified, .. } => qualified.as_str(),
         PortSchemaProvenance::QualifiedStore => resolved.schema.as_str(),
@@ -4131,12 +4095,18 @@ pub fn refuse_store_port_scaffold(resolved: &ResolvedPortSchema, raw: &str) -> C
         | PortSchemaProvenance::ResolvedBuiltin { .. }
         | PortSchemaProvenance::Workspace { .. } => return Ok(()),
     };
+    let root = schemas_dir.parent().unwrap_or(schemas_dir);
+    if crate::workspace::workspace_generates_messages(root) {
+        return Ok(());
+    }
     Err(CliError::Validation(format!(
-        "schema '{raw}' names the workspace .msg store type '{qualified}', which has no \
-         generated Rust type — the scaffolded `use native_ros2_messages::...;` import \
-         could never compile, so no node port is created. For node ports use a built-in \
-         ROS 2 type or a workspace YAML schema (`cerulion schema create`); `.msg` store \
-         types remain first-class for `graph validate`, recording and replay."
+        "schema '{raw}' names the workspace .msg store type '{qualified}', and this \
+         workspace does not generate its .msg types into the message crate, so the \
+         scaffolded `use native_ros2_messages::...;` import could not compile and no \
+         node port is created. Add `{env} = {{ value = \".\", relative = true }}` under \
+         `[env]` in {config} (new workspaces have it), then run the command again.",
+        env = crate::workspace::WORKSPACE_MSGS_ENV,
+        config = root.join(".cargo/config.toml").display(),
     )))
 }
 
@@ -4191,10 +4161,11 @@ pub fn refuse_store_port_scaffold(resolved: &ResolvedPortSchema, raw: &str) -> C
 ///      today is to remove one of the two definitions; naming one of them is
 ///      not supported.
 ///
-///    NOTE: resolution succeeding is not scaffolding consent — the
+///    NOTE: resolution succeeding is not scaffolding consent: the Rust
 ///    scaffold-consuming call sites (`node create` / `node modify`) refuse
-///    BOTH store provenances via [`refuse_store_port_scaffold`], because a
-///    store type has no generated Rust type to import.
+///    BOTH store provenances via [`refuse_store_port_scaffold`] in a
+///    workspace that does not generate its store types into the message
+///    crate.
 /// 5. Bare + in neither workspace tier → resolved against the built-in
 ///    registry by unique short name:
 ///    - exactly 1 built-in → [`PortSchemaProvenance::ResolvedBuiltin`];
@@ -4774,24 +4745,36 @@ pub fn schema_list_opt(schemas_dir: Option<&Path>) -> SchemaListing {
     }
 }
 
-/// Shared field-parse loop for [`schema_info`] and [`parse_message_schemas`].
+/// Field-parse loop for [`schema_info`]'s display rows.
 ///
 /// Walks the `fields:` mapping of one schema document in declaration order,
 /// rejecting non-string field keys loudly, parsing each `<type> <name>` key
-/// (strict 2-token form + `FixedArray`/`StringFixed` length guards via
-/// [`parse_schema_field_key`]), and pushing each parsed field onto `schema`.
-/// Returns the per-field display entries `schema info` needs;
-/// `parse_message_schemas` discards them.
-///
-/// Single source of truth for the parse so the two callers can never drift
-/// on field-key strictness or the nested-marker rendering.
+/// through the core parser ([`cerulion_core::dynamic::parse_field_key`] -
+/// the same strict 2-token form + `FixedArray`/`StringFixed` length guards
+/// [`parse_message_schemas`] applies), and pushing each parsed field onto
+/// `schema`. Returns the per-field display entries `schema info` needs.
 fn parse_schema_fields_into(
     schema_name: &str,
     schema_def: &serde_yaml::Value,
     schema: &mut MessageSchema,
 ) -> CliResult<Vec<SchemaFieldEntry>> {
+    let schema_def = schema_def.as_mapping().ok_or_else(|| {
+        CliError::Validation(format!(
+            "schema '{}': definition must be a mapping (`description:` / `fields:`), got a scalar, sequence or null",
+            schema_name
+        ))
+    })?;
     let mut field_entries = vec![];
-    if let Some(fields) = schema_def.get("fields").and_then(|f| f.as_mapping()) {
+    let fields = schema_def
+        .get(serde_yaml::Value::from("fields"))
+        .filter(|value| !value.is_null());
+    if let Some(fields) = fields {
+        let fields = fields.as_mapping().ok_or_else(|| {
+            CliError::Validation(format!(
+                "schema '{}': `fields:` must be a mapping of '<type> <name>' keys",
+                schema_name
+            ))
+        })?;
         for (field_key, _value) in fields {
             let key_str = field_key.as_str().ok_or_else(|| {
                 CliError::Validation(format!(
@@ -4800,7 +4783,9 @@ fn parse_schema_fields_into(
                     schema_name, field_key
                 ))
             })?;
-            let (field_type, field_name) = parse_schema_field_key(schema_name, key_str)?;
+            let (field_type, field_name) =
+                cerulion_core::dynamic::parse_field_key(schema_name, key_str)
+                    .map_err(|e| CliError::Validation(e.to_string()))?;
             let is_nested = field_type_is_nested(&field_type);
             field_entries.push(SchemaFieldEntry {
                 name: field_name.clone(),
@@ -4821,38 +4806,6 @@ fn parse_schema_fields_into(
         }
     }
     Ok(field_entries)
-}
-
-/// Parse one schema-YAML field key of the form `<type> <name>`.
-///
-/// Strict and loud (parser hardening):
-/// - keys without exactly 2 whitespace tokens are rejected with a
-///   `CliError` naming the offending key and the expected form;
-/// - `FixedArray` lengths above [`MAX_FIXED_ARRAY_LEN`] are rejected with
-///   a `CliError` so the CLI never reaches the codegen-time
-///   `wire_fixed_size()` overflow panic.
-fn parse_schema_field_key(schema_name: &str, key: &str) -> CliResult<(FieldType, String)> {
-    let tokens: Vec<&str> = key.split_whitespace().collect();
-    let [type_token, name_token] = tokens.as_slice() else {
-        return Err(CliError::Validation(format!(
-            "schema '{}': invalid field key {:?} — expected exactly \
-             '<type> <name>' (e.g. 'uint32 height'), got {} token(s)",
-            schema_name,
-            key,
-            tokens.len()
-        )));
-    };
-
-    let field_type = FieldType::parse(type_token).map_err(|e| {
-        CliError::Validation(format!(
-            "schema '{}': invalid type in field key {:?}: {}",
-            schema_name, key, e
-        ))
-    })?;
-
-    validate_fixed_array_lengths(schema_name, key, &field_type)?;
-
-    Ok((field_type, name_token.to_string()))
 }
 
 /// True if `field_type` is a nested schema reference, OR an array
@@ -4876,53 +4829,6 @@ fn field_type_is_nested(field_type: &FieldType) -> bool {
             field_type_is_nested(element_type)
         }
         _ => false,
-    }
-}
-
-/// Recursively reject inline fixed-length declarations above
-/// [`MAX_FIXED_ARRAY_LEN`].
-///
-/// Covers BOTH inline-sized variants that feed
-/// `MessageSchema::wire_fixed_size()`'s checked arithmetic:
-/// - `FixedArray { length }` — the element count, and
-/// - `StringFixed(n)` — the inline byte capacity.
-///
-/// `StringFixed` is `is_definitely_fixed()`, so a hostile `n` (e.g.
-/// `string_fixed[18446744073709551615]`) reaches `wire_fixed_size()` and
-/// overflows `offset.checked_add(n)` → codegen-time panic. Pre-validating
-/// it here (same cap as `FixedArray`) keeps user input on the `CliError`
-/// path instead of the panic path. An earlier `_ => Ok(())` fallthrough
-/// let `StringFixed` slip past this guard.
-fn validate_fixed_array_lengths(
-    schema_name: &str,
-    key: &str,
-    field_type: &FieldType,
-) -> CliResult<()> {
-    match field_type {
-        FieldType::FixedArray {
-            element_type,
-            length,
-        } => {
-            if *length > MAX_FIXED_ARRAY_LEN {
-                return Err(CliError::Validation(format!(
-                    "schema '{}': field key {:?} declares a FixedArray of \
-                     length {} — the maximum supported length is {}",
-                    schema_name, key, length, MAX_FIXED_ARRAY_LEN
-                )));
-            }
-            validate_fixed_array_lengths(schema_name, key, element_type)
-        }
-        FieldType::StringFixed(length) => {
-            if *length > MAX_FIXED_ARRAY_LEN {
-                return Err(CliError::Validation(format!(
-                    "schema '{}': field key {:?} declares a StringFixed of \
-                     length {} — the maximum supported length is {}",
-                    schema_name, key, length, MAX_FIXED_ARRAY_LEN
-                )));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
 }
 
@@ -4995,6 +4901,17 @@ pub struct SchemaFieldEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_name_that_pascal_cases_to_a_non_string_key_is_not_loadable() {
+        for name in ["123", "true", "null", "1e5", "0x1f", "yes_no_", ""] {
+            let expected = name == "yes_no_";
+            assert_eq!(schema_name_makes_a_string_key(name), expected, "{name:?}");
+        }
+        for name in ["lidar_scan", "1scan", "scan-2", "Pose2D", "a"] {
+            assert!(schema_name_makes_a_string_key(name), "{name:?}");
+        }
+    }
+
     use super::*;
 
     // ======================================================================
@@ -5341,7 +5258,7 @@ mod tests {
 
         // Over the u32 wire ceiling: the PRE-EXISTING rejection, on the
         // `Validation` channel. `uint8[1048576]` × 4096 fields sits past
-        // `u32::MAX - 32`; one capped field is not enough, so the file
+        // `u32::MAX - 40`; one capped field is not enough, so the file
         // declares the maximum the YAML parser accepts, repeated.
         let hostile = dir.join("Huge.yaml");
         let mut yaml = String::from("schemas:\n  Huge:\n    fields:\n");
@@ -5494,7 +5411,7 @@ mod tests {
                 cerulion_core::SchemaDoc {
                     qualified: "hostile/Inner".to_string(),
                     encoding: cerulion_core::SchemaEncoding::Msg,
-                    text: "float64[536870907] v\n".to_string(),
+                    text: "float64[536870906] v\n".to_string(),
                     deps: vec![],
                 },
                 cerulion_core::SchemaDoc {
@@ -5692,7 +5609,7 @@ mod tests {
 
     #[test]
     fn render_remote_schema_refuses_a_root_composed_past_the_wire_ceiling() {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         let docs = || {
             vec![
                 cerulion_core::SchemaDoc {
@@ -5725,7 +5642,7 @@ mod tests {
             "a root composed past the ceiling takes the verbatim fallback; got:\n{out}"
         );
         assert!(
-            !out.contains("wire fixed size: 4294967264 bytes"),
+            !out.contains("wire fixed size: 4294967256 bytes"),
             "never a size no frame can carry; got:\n{out}"
         );
         let out = render_remote_schema(&cerulion_core::SchemaReply::found(
@@ -5734,7 +5651,7 @@ mod tests {
             docs(),
         ));
         assert!(
-            out.contains("wire fixed size: 4294967256 bytes"),
+            out.contains("wire fixed size: 4294967248 bytes"),
             "one byte under (via the same inlining) renders its exact size; got:\n{out}"
         );
     }
@@ -6283,6 +6200,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_message_schemas_keeps_malformed_yaml_as_yaml_error() {
+        let err = parse_message_schemas("schemas: [unclosed").expect_err("malformed YAML");
+        assert!(matches!(err, CliError::Yaml(_)));
+        assert!(err.to_string().starts_with("YAML error:"));
+    }
+
+    #[test]
+    fn test_parse_message_schemas_rejects_scalar_schema_definition() {
+        let err = parse_message_schemas("schemas:\n  Foo: 3\n").expect_err("scalar schema");
+        assert!(
+            matches!(err, CliError::Validation(message) if message.contains("must be a mapping"))
+        );
+    }
+
+    #[test]
+    fn test_parse_message_schemas_rejects_invalid_fields_shape() {
+        let err = parse_message_schemas("schemas:\n  Foo:\n    fields: bad\n")
+            .expect_err("scalar fields");
+        assert!(matches!(err, CliError::Validation(message) if message.contains("fields")));
+    }
+
     /// A well-formed workspace schema parses to a single `MessageSchema`
     /// keyed by its bare (package-less) qualified name — the shape
     /// `build_workspace_schema_hashes` relies on.
@@ -6744,7 +6683,7 @@ mod tests {
     /// layout — a hostile-but-parseable `.msg` crashed `graph validate`.
     ///
     /// `store_schema_lookup` builds a full `SchemaEntry`, which resolves the
-    /// layout, and layout resolution PANICS on fixed-array size overflow. The
+    /// layout, and layout resolution PANICKED on fixed-array size overflow. The
     /// `.msg`-store tier added one commit earlier called it, so a single
     /// `float64[18446744073709551615] a` anywhere in `schemas/` panicked
     /// `cerulion graph validate` and `graph run` on the real

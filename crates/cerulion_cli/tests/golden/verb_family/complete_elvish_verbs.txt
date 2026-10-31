@@ -1,0 +1,4 @@
+exit: Some(0)
+--- stdout
+createdeleteinfolisthelp--verbose--help
+--- stderr

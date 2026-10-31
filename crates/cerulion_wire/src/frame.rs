@@ -4,7 +4,7 @@
 //! A Cerulion frame lays out as:
 //!
 //! ```text
-//! [WireHeader (32 B)][fixed section][offset table (8·N B)][variable payload]
+//! [WireHeader (40 B)][fixed section][offset table (8·N B)][variable payload]
 //! ```
 //!
 //! Everything the STRUCTURAL layer needs is self-describing in the header:
@@ -42,7 +42,7 @@ impl<'a> Frame<'a> {
     ///
     /// `buf` must contain at least `total_size` bytes (it may be larger — the
     /// excess is ignored). Validation:
-    /// - the buffer holds a full 32-byte header,
+    /// - the buffer holds a full 40-byte header,
     /// - `total_size >= WireHeader::SIZE`,
     /// - the buffer is at least `total_size` bytes (not truncated),
     /// - when `offset_table_count > 0`, the offset table fits within the
@@ -116,7 +116,7 @@ impl<'a> Frame<'a> {
         self.bytes
     }
 
-    /// The post-header payload: everything after the 32-byte header
+    /// The post-header payload: everything after the 40-byte header
     /// (`[fixed section][offset table][variable payload]`). Offsets carried
     /// in the offset table are relative to the FIRST byte of this slice.
     #[inline]

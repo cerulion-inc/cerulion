@@ -83,7 +83,7 @@ class Cerulion < Formula
   end
 
   def install
-    ["cerulion", "cerulion-netd", "cerulion-connectd"].each do |binary|
+    ["cerulion", "cerulion-netd", "cerulion-connectd", "cerulion-remoted"].each do |binary|
       path = Dir["{,*/}#{binary}"].find { |candidate| File.file?(candidate) }
       odie "release archive is missing #{binary}" unless path
       bin.install path
@@ -113,6 +113,11 @@ class Cerulion < Formula
       odie "release archive is missing #{notice}" unless path
       doc.install path
     end
+
+    # The install-provenance marker the CLI reports as its install method in
+    # usage telemetry: share/cerulion/install.json one level above its bin.
+    (share/"cerulion").mkpath
+    (share/"cerulion/install.json").write "{\"method\":\"brew\",\"version\":\"#{version}\"}\n"
 
     # Homebrew runs the install with HOME pointing at a directory it deletes
     # afterwards, so a formula cannot put a Rust toolchain in the home folder

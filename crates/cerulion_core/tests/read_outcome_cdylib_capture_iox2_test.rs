@@ -149,6 +149,8 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
         prefix: format!("roc{}", std::process::id()),
         nodes: vec![
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "drive_producer".to_string(),
@@ -162,6 +164,8 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
                 }],
             },
             NodeDef {
+                fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cdy".to_string(),
                 node_type: "period_input".to_string(),

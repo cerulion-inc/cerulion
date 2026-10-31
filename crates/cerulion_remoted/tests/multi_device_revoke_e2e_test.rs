@@ -4,7 +4,7 @@
 //! sweep paths — no inert shipping.
 //!
 //! Two desks (A + B) of the SAME account pair to a robot and each demand + stream a
-//! topic over the real `cerulion/wire/1` plane (loopback iroh + a per-test iceoryx2
+//! topic over the real `cerulion/wire/2` plane (loopback iroh + a per-test iceoryx2
 //! SHM root). Mid-session the robot applies a CA-signed epoch revoking ONLY desk A's
 //! DEVICE key. Desk A is EVICTED (its uni stream resets) while desk B stays
 //! connected — the surgical, account-preserving device revocation.
@@ -262,6 +262,7 @@ fn make_frame(seq: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 1_000_000 + seq as u64 * 10_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -366,6 +367,10 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
     let manager = test_manager("evict");
     let topic = format!("/wire/a6/{}", unique_id());
     let stop = Arc::new(AtomicBool::new(false));
+    // The producer signals once its publisher exists, and neither desk demands
+    // before that signal: the plane's tap opens the data service and never
+    // creates it, so a demand that arrives first is refused with DoesNotExist.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let producer = {
         let manager = manager.clone();
         let topic = topic.clone();
@@ -374,6 +379,9 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
             let mut publisher = manager
                 .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
                 .expect("producer");
+            ready_tx
+                .send(())
+                .expect("the test must still be waiting for the producer");
             let mut seq = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let _ = publisher.publish_raw(&make_frame(seq));
@@ -405,6 +413,9 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
     };
 
     // ── both desks connect + stream (healthy pre-revoke) ──
+    ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|err| panic!("the producer must create its publisher: {err}"));
     let mut desk_a = connect_and_demand(&desk_a_ep, robot_addr.clone(), &topic, "desk-A").await;
     let mut desk_b = connect_and_demand(&desk_b_ep, robot_addr.clone(), &topic, "desk-B").await;
 

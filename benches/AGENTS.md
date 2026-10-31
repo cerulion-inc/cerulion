@@ -32,7 +32,7 @@ nothing about delivery: a misconfigured bench runs to completion flowing ZERO da
 - THE public latency suite: `python3 benches/latency/bench.py` (`native` / `workspace` /
   `ros2` / `compile-csv` / `plots` / `smoke` / `full` / `list-cells`; `--variant
   quiescent|fixed100|backtoback`). Legs: Cerulion workspace (real `cerulion graph run`,
-  split + mono), raw iceoryx2 floor, zenoh-SHM, ROS 2 cells. `quiescent` = sensor-rate
+  split/split3/mono, opt-in lockstep rows), iceoryx2 floor, zenoh-SHM, ROS 2. `quiescent` = sensor-rate
   realism (default); `fixed100` = uniform 100 Hz at every size, fallback ladder - THE
   payload-flatness variant; `backtoback` = saturation. `smoke` = regression gate (per-host
   baseline in `expected-ranges.yaml`; see `latency/README.md`).
@@ -42,8 +42,8 @@ nothing about delivery: a misconfigured bench runs to completion flowing ZERO da
 
 ## Gotchas
 
-- iceoryx2 version skew HANGS, it does not error: exact-pin iceoryx2 (`=0.9.1`) in every
-  bench workspace - a loose `"0.9"` floats, and a binary<->cdylib skew breaks the SHM
+- iceoryx2 version skew HANGS, it does not error: exact-pin iceoryx2 (`=0.10.0`) in every
+  bench workspace - a loose `"0.10"` floats, and a binary<->cdylib skew breaks the SHM
   event protocol ("Unable to establish connection" flood / 0 samples). Rebuild binary +
   cdylibs under ONE lock; give scripts a per-size watchdog + flood guard so a skew
   aborts loudly.

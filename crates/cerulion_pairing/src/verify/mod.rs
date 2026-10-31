@@ -9,7 +9,7 @@
 //! (rollback floor, revocation, ownership lifecycle) lives on the store.
 
 mod access;
-mod chain;
+pub(crate) mod chain;
 mod store;
 
 pub use access::{AccessRow, EpochOutcome, OwnershipState, PairingSource};
@@ -36,6 +36,69 @@ pub struct PairingPresentation {
     pub grant: SignedGrant,
     /// Present only for a depth-1 (delegated) grant.
     pub delegation: Option<Delegation>,
+}
+
+/// The owner account's device certificate chain for a new device binding.
+/// This proof carries no robot grant: the store must already belong to the
+/// certified account. It cannot create or replace an owner access row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerCertificatePresentationWire {
+    /// Envelope version, first on the wire.
+    pub version: u16,
+    /// Root-signed intermediate certificate.
+    pub intermediate: SignedIntermediateCert,
+    /// Device certificate bound to the authenticated transport key.
+    pub device_cert: SignedDeviceCert,
+}
+
+impl OwnerCertificatePresentationWire {
+    /// Version of the first owner-certificate envelope.
+    pub const FORMAT_VERSION: u16 = 1;
+
+    /// Construct the current envelope from its signed certificates.
+    pub fn new(intermediate: SignedIntermediateCert, device_cert: SignedDeviceCert) -> Self {
+        Self {
+            version: Self::FORMAT_VERSION,
+            intermediate,
+            device_cert,
+        }
+    }
+
+    /// Encode the shared desk/robot postcard representation.
+    pub fn to_postcard(&self) -> Result<Vec<u8>, PairingError> {
+        self.validate_version()?;
+        postcard::to_stdvec(self).map_err(crate::error::ser_err)
+    }
+
+    /// Decode exactly one supported envelope, refusing appended fields.
+    pub fn from_postcard(bytes: &[u8]) -> Result<Self, PairingError> {
+        let (version, _): (u16, _) =
+            postcard::take_from_bytes(bytes).map_err(crate::error::ser_err)?;
+        if version != Self::FORMAT_VERSION {
+            return Err(Self::unsupported_version(version));
+        }
+        let (wire, rest): (Self, _) =
+            postcard::take_from_bytes(bytes).map_err(crate::error::ser_err)?;
+        if !rest.is_empty() {
+            return Err(PairingError::Serialization(
+                "owner-certificate artifact has trailing bytes".into(),
+            ));
+        }
+        Ok(wire)
+    }
+
+    pub(crate) fn validate_version(&self) -> Result<(), PairingError> {
+        if self.version != Self::FORMAT_VERSION {
+            return Err(Self::unsupported_version(self.version));
+        }
+        Ok(())
+    }
+
+    fn unsupported_version(version: u16) -> PairingError {
+        PairingError::Serialization(format!(
+            "owner-certificate artifact version {version} is unsupported"
+        ))
+    }
 }
 
 /// Everything the DESK carries + presents to establish access from a
@@ -114,7 +177,7 @@ impl OwnerGrantPresentationWire {
 /// The **serde-transportable** access-list-epoch SYNC artifact — the ONE
 /// canonical wire shape shared by BOTH the desk carriage (`cerulion_wireclient`,
 /// which reads it from the desk's epoch cache and encodes it) and the robot's
-/// `sync_epoch` `cerulion/wire/1` control verb (`cerulion_remoted`, which decodes it
+/// `sync_epoch` `cerulion/wire/2` control verb (`cerulion_remoted`, which decodes it
 /// and feeds [`TrustStore::apply_epoch`]). Homed here — in the crate that owns the
 /// byte-oriented serde for these cert/epoch types and is the common dependency of
 /// both sides — so the two can NEVER drift in field order and there is no

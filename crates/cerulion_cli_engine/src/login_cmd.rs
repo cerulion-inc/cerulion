@@ -55,6 +55,13 @@ use serde::Deserialize;
 use crate::auth::{self, AuthState, LocalGate};
 use crate::error::{CliError, CliResult};
 
+/// Require a saved prior login before serving, including when tokens have expired.
+/// This local check never starts the interactive login flow.
+pub fn require_serving_login() -> CliResult<()> {
+    cerulion_netd::serving_login::require_prior_login()
+        .map_err(|reason| CliError::Login(reason.to_string()))
+}
+
 /// The production account-service base URL: the Supabase-backed issuer the web
 /// app serves (`/v1/auth/device/*`, `/v1/auth/refresh`, `/v1/auth/revoke`,
 /// `/v1/me`), so `cerulion login` and app.cerulion.com are ONE identity —
@@ -88,7 +95,7 @@ pub const EXIT_AUTH_REQUIRED: u8 = 7;
 const POLL_HARD_CAP: Duration = Duration::from_secs(600);
 
 /// Per-request HTTP timeout.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_TIMEOUT: Duration = cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT;
 
 /// Resolve the account-service base URL (env override → production default),
 /// trailing slash trimmed.
@@ -138,9 +145,66 @@ struct RegisterDeviceResponse {
     #[allow(dead_code)]
     device_id: String,
     device_cert: String,
-    #[allow(dead_code)]
     intermediate: String,
     account_id: String,
+}
+
+struct IssuedRegistration {
+    response: RegisterDeviceResponse,
+    challenge_account: [u8; 32],
+    device_key: [u8; 32],
+}
+
+#[derive(Deserialize)]
+struct AccountProfile {
+    account_id: String,
+    #[serde(default)]
+    pairing_account_id: Option<String>,
+}
+
+fn verified_session_account(
+    profile: AccountProfile,
+    issued: &IssuedRegistration,
+) -> CliResult<String> {
+    let registration = &issued.response;
+    if crate::account_identity::uuid_bytes(&profile.account_id).is_some() {
+        let expected = crate::account_identity::pairing_account_id(&profile.account_id)?;
+        let wire_id = URL_SAFE_NO_PAD.encode(expected.0);
+        if profile.pairing_account_id.as_deref() != Some(wire_id.as_str())
+            || registration.account_id != wire_id
+            || issued.challenge_account != expected.0
+        {
+            return Err(CliError::Login(
+                "the account service returned inconsistent UUID pairing identities".into(),
+            ));
+        }
+        let binding = crate::device_binding::verify_device_binding(
+            &registration.device_cert,
+            &issued.device_key,
+        )?;
+        if binding.account != expected {
+            return Err(CliError::Login(
+                "the issued device certificate names a different pairing account".into(),
+            ));
+        }
+    } else {
+        // Preserve legacy authentication responses. An opaque auth label still
+        // cannot pass the strict pairing resolver used by owner access.
+        if profile.account_id != registration.account_id {
+            return Err(CliError::Login(
+                "the registered device and /v1/me name different accounts".into(),
+            ));
+        }
+        if let Some(advertised) = profile.pairing_account_id.as_deref() {
+            let expected = crate::account_identity::pairing_account_id(&profile.account_id)?;
+            if URL_SAFE_NO_PAD.encode(expected.0) != advertised {
+                return Err(CliError::Login(
+                    "the account service returned an inconsistent pairing identity".into(),
+                ));
+            }
+        }
+    }
+    Ok(profile.account_id)
 }
 
 // ===========================================================================
@@ -187,6 +251,10 @@ fn gate_off_breadcrumb() {
 /// signed in, and the gate reads that state instead.
 pub const NON_INTERACTIVE_REFUSAL: &str = "This machine has never signed in to a Cerulion account, and every command needs one.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
 
+/// The refusal an identity-needing command gets on a signed-out machine
+/// ([`LocalGate::RefuseSignedOut`]) when no terminal can run the login.
+pub const SIGNED_OUT_REFUSAL: &str = "This machine is signed out of its Cerulion account, and every command needs one.\nRun `cerulion login` in a terminal to sign in again.";
+
 /// Whether the device-code flow can actually reach a person here.
 ///
 /// The flow prints a short code and a URL and then blocks for up to ten minutes
@@ -214,11 +282,23 @@ fn interactive_login_possible() -> bool {
 /// The one exception is this repository's own runs, which set
 /// `CERULION_LOGIN_GATE=off`. See the module docs.
 pub fn ensure_login_gate(out: &mut dyn Write) -> CliResult<()> {
+    ensure_login_gate_carrying(out, || None).map(|_| ())
+}
+
+/// [`ensure_login_gate`] that carries a telemetry anonymous id into the login
+/// it may trigger (see [`run_login_carrying`]). `telemetry_anon_id` is asked
+/// only once the gate has decided to run a login, so a refusal, or a gate
+/// that proceeds on local state, never takes the id. `Ok(Some)` when a login
+/// ran, `Ok(None)` when the gate proceeded on local state.
+pub fn ensure_login_gate_carrying(
+    out: &mut dyn Write,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
+) -> CliResult<Option<LoginOutcome>> {
     if gate_switched_off() {
         gate_off_breadcrumb();
-        return Ok(());
+        return Ok(None);
     }
-    ensure_login_gate_with(out, interactive_login_possible())
+    gate_with(out, interactive_login_possible(), telemetry_anon_id)
 }
 
 /// [`ensure_login_gate`] with the terminal question already answered, so both
@@ -230,22 +310,45 @@ pub fn ensure_login_gate(out: &mut dyn Write) -> CliResult<()> {
 /// chooses is which of the two never-signed-in answers a caller gets.
 #[doc(hidden)]
 pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResult<()> {
+    gate_with(out, interactive, || None).map(|_| ())
+}
+
+fn gate_with(
+    out: &mut dyn Write,
+    interactive: bool,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
+) -> CliResult<Option<LoginOutcome>> {
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
-        LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(()),
-        LocalGate::RefuseNeverLoggedIn => {
+        LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(None),
+        gate @ (LocalGate::RefuseNeverLoggedIn | LocalGate::RefuseSignedOut) => {
             if !interactive {
-                return Err(CliError::Login(NON_INTERACTIVE_REFUSAL.to_string()));
+                let refusal = if gate == LocalGate::RefuseSignedOut {
+                    SIGNED_OUT_REFUSAL
+                } else {
+                    NON_INTERACTIVE_REFUSAL
+                };
+                return Err(CliError::Login(refusal.to_string()));
             }
             writeln!(
                 out,
                 "\nThis machine is not signed in to a Cerulion account, and Cerulion requires \
                  one. Signing you in now (you can also run `cerulion login` yourself)...\n"
             )?;
-            run_login(out)?;
-            Ok(())
+            run_login_carrying(out, telemetry_anon_id).map(Some)
         }
     }
+}
+
+/// What a successful login produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginOutcome {
+    pub state: AuthState,
+    /// `auth.json` named a DIFFERENT account before this login. A first
+    /// login on a machine is not a switch.
+    pub switched_account: bool,
+    /// The telemetry anonymous id the device-start body carried, if any.
+    pub telemetry_anon_id: Option<String>,
 }
 
 // ===========================================================================
@@ -260,11 +363,29 @@ pub fn ensure_login_gate_with(out: &mut dyn Write, interactive: bool) -> CliResu
 /// `out` receives the human-facing prompt (the `user_code` + verification URL +
 /// progress) — write it to stderr so it does not pollute a command's stdout.
 pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
+    run_login_carrying(out, || None).map(|outcome| outcome.state)
+}
+
+/// [`run_login`] with a telemetry anonymous id in the device-start body, so
+/// an account service that supports it can merge the anonymous history into
+/// the account it signs in. `telemetry_anon_id` is asked right before that
+/// request is sent, and only then: an id it answers is on its way to the
+/// service whatever the login does next. `None` sends the plain `{}` body.
+pub fn run_login_carrying(
+    out: &mut dyn Write,
+    telemetry_anon_id: impl FnOnce() -> Option<String>,
+) -> CliResult<LoginOutcome> {
     let base = account_service_base();
     let client = http_client()?;
 
     // 1. Start the device-authorization request.
-    let start: DeviceStart = post_json(&client, &base, "/v1/auth/device/start", &empty_body())?;
+    let telemetry_anon_id = telemetry_anon_id();
+    let start: DeviceStart = post_json(
+        &client,
+        &base,
+        "/v1/auth/device/start",
+        &device_start_body(telemetry_anon_id.as_deref()),
+    )?;
 
     // 2. Print the headless-friendly prompt.
     print_device_prompt(out, &start)?;
@@ -274,7 +395,8 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
 
     // 4. Register the device key (→ device cert) and resolve the account id.
     //    Device registration is the design's "register the device key at login"
-    //    — the returned cert is cached and the account id taken from it.
+    //    The returned certificate binds the device to the pairing identity.
+    //    `/v1/me` remains authoritative for the stored authentication identity.
     //    A service that does not implement `/v1/devices` at all (the hosted
     //    Supabase issuer is identity-only) is the ORDINARY case, not a failure:
     //    `register_device` answers `Ok(None)` for that CONFIRMED 404 surface and
@@ -298,10 +420,14 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
     //    previous sign-in and its cert stay exactly as they were.
     let mut discard_cert = false;
     let mut issued_cert: Option<String> = None;
+    let mut issued_intermediate: Option<String> = None;
     let account_id = match register_device(&client, &base, &tokens.session_token)? {
-        Some(reg) => {
-            issued_cert = Some(reg.device_cert);
-            reg.account_id
+        Some(issued) => {
+            let profile = fetch_account_profile(&client, &base, &tokens.session_token)?;
+            let account = verified_session_account(profile, &issued)?;
+            issued_cert = Some(issued.response.device_cert);
+            issued_intermediate = Some(issued.response.intermediate);
+            account
         }
         None => {
             tracing::info!(
@@ -309,7 +435,7 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
                 "the account service issues no device certificates; resolving the account id via /v1/me"
             );
             discard_cert = true;
-            fetch_account_id(&client, &base, &tokens.session_token)?
+            fetch_account_profile(&client, &base, &tokens.session_token)?.account_id
         }
     };
 
@@ -365,6 +491,7 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
     let mut cert_commit_failure: Option<String> = None;
     let mut certs_cached: Vec<String> = Vec::new();
     let mut certs_lost: Vec<String> = Vec::new();
+    let mut switched_account = false;
     let written = auth::with_store_lock(&auth_path, || {
         // An earlier login may have been killed between its clear and its
         // publication, leaving a cert moved aside. Under this same lock, and
@@ -372,23 +499,23 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
         // other: put back when the store still names the account it certifies,
         // dropped when it does not.
         auth::recover_superseded_device_certs();
-        let prior = auth::load_from(&auth_path).state().cloned();
+        let prior = auth::load_from(&auth_path);
+        let (prior_account, prior_role) = prior.prior_identity();
         let state = AuthState {
             account_id,
             session_token: tokens.session_token,
             refresh_token: tokens.refresh_token,
             expires_at_ns: now.saturating_add(tokens.expires_in.saturating_mul(1_000_000_000)),
             logged_in_ever: true,
-            role: prior.as_ref().and_then(|s| s.role),
+            role: prior_role,
         };
         // Nothing is published yet, so a clear that refuses needs no rollback of
         // the store: the previous sign-in is still the one on disk, untouched,
         // including a corrupt `auth.json` (a recovery artifact, never deleted).
-        let switching_accounts = prior
-            .as_ref()
-            .is_none_or(|p| p.account_id != state.account_id);
+        let switching_accounts = prior_account.is_none_or(|p| p != state.account_id);
+        switched_account = prior_account.is_some_and(|p| p != state.account_id);
         let cleared = if discard_cert || (issued_cert.is_some() && switching_accounts) {
-            match auth::clear_device_cert(prior.as_ref().map(|p| p.account_id.as_str())) {
+            match auth::clear_device_cert(prior_account) {
                 Ok(cleared) => {
                     if cleared.any() {
                         tracing::info!(
@@ -478,6 +605,29 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
                         }
                         return Err(std::io::Error::other("device cert target"));
                     }
+                }
+            }
+        }
+        // Publish the coupled leaf + issuer cache LAST. Its reader also holds
+        // this lock and requires the leaf to equal device.cert and the current
+        // account/key. A crash, failed rename, or identity-only login therefore
+        // leaves either a matching chain or an explicit re-login requirement.
+        // Identity-only login clears device.cert above, invalidating any old
+        // chain without changing the existing cert recovery protocol.
+        if let (Some(cert), Some(intermediate)) =
+            (issued_cert.as_deref(), issued_intermediate.as_deref())
+        {
+            let chain_path = crate::owner_certificate::cache_path(&auth_path);
+            match crate::owner_certificate::stage_at(&chain_path, cert, intermediate) {
+                Ok(pending) => staged.push(pending),
+                Err(e) => {
+                    cert_target_failure = Some(format!("{}: {e}", chain_path.display()));
+                    if let Some(cleared) = &cleared {
+                        if let Err(lost) = cleared.put_back() {
+                            certs_lost = lost;
+                        }
+                    }
+                    return Err(std::io::Error::other("device chain target"));
                 }
             }
         }
@@ -600,7 +750,11 @@ pub fn run_login(out: &mut dyn Write) -> CliResult<AuthState> {
     // NOT "account owner" — ownership binds at robot registration (`POST /v1/robots`); a desk
     // (Studio ⊃ CLI) signs in but owns no robot.
     writeln!(out, "\nSigned in as {}.", state.account_id)?;
-    Ok(state)
+    Ok(LoginOutcome {
+        state,
+        switched_account,
+        telemetry_anon_id,
+    })
 }
 
 /// Whether `path` is a SYMLINK that already resolves to exactly `cert` — the one
@@ -758,6 +912,129 @@ fn poll_for_tokens(
     }
 }
 
+// ===========================================================================
+// sign-out
+// ===========================================================================
+
+/// What [`run_logout`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogoutOutcome {
+    /// No session was stored here (never signed in, or already signed out);
+    /// nothing was changed.
+    NotSignedIn,
+    /// The local session was removed and the account service revoked it.
+    SignedOut {
+        /// The account this machine was signed in to.
+        account_id: String,
+    },
+    /// The local session was removed, but the account service did not confirm
+    /// the revoke, so the session stays valid there until it expires.
+    SignedOutUnrevoked {
+        /// The account this machine was signed in to.
+        account_id: String,
+        /// Why the revoke was not confirmed.
+        reason: String,
+    },
+}
+
+/// Sign this machine out: remove the session from `~/.cerulion/auth.json`,
+/// then revoke it at the account service (`POST /v1/auth/revoke`).
+///
+/// The local credential goes FIRST, under the store lock, so a sign-out with
+/// no network still signs the machine out; the rewritten store keeps the
+/// account id and `logged_in_ever` (see [`auth::signed_out_store`]) and every
+/// identity-needing command is then refused until the next `cerulion login`.
+/// The revoke is the same request Studio's "Sign out" sends, and the service
+/// treats an unknown token as success, so a repeat is harmless.
+///
+/// A device certificate cached by a certifying issuer (`cerulion-accountd`)
+/// is left in place: it is revoked with `cerulion account devices revoke`,
+/// and the next `cerulion login` replaces it.
+///
+/// A machine with no `auth.json` is left untouched (not even the store lock
+/// file is created).
+///
+/// # Errors
+///
+/// The store could not be read or rewritten; nothing was signed out. A revoke
+/// the service did not confirm is [`LogoutOutcome::SignedOutUnrevoked`], not
+/// an error: the machine IS signed out.
+pub fn run_logout() -> CliResult<LogoutOutcome> {
+    let auth_path = auth::auth_json_path().ok_or_else(|| {
+        CliError::Login(
+            "no home directory (set CERULION_HOME) to locate ~/.cerulion/auth.json".to_string(),
+        )
+    })?;
+    if !auth_path.try_exists().unwrap_or(true) {
+        return Ok(LogoutOutcome::NotSignedIn);
+    }
+    let signed_out = auth::with_store_lock(&auth_path, || {
+        let state = match auth::load_from(&auth_path) {
+            auth::LoadedAuth::Present(state) => state,
+            auth::LoadedAuth::Absent | auth::LoadedAuth::SignedOut { .. } => return Ok(None),
+            auth::LoadedAuth::Corrupt(reason) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+            }
+        };
+        let prior = std::fs::read(&auth_path)?;
+        let body = auth::signed_out_store(&prior)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        auth::publish_store_bytes(&auth_path, &body)?;
+        Ok(Some(state))
+    })
+    .map_err(|e| {
+        CliError::Login(format!(
+            "could not sign out: {} was not changed ({e})",
+            auth_path.display()
+        ))
+    })?;
+    let Some(state) = signed_out else {
+        return Ok(LogoutOutcome::NotSignedIn);
+    };
+    Ok(match revoke_session(&state) {
+        Ok(()) => LogoutOutcome::SignedOut {
+            account_id: state.account_id,
+        },
+        Err(e) => LogoutOutcome::SignedOutUnrevoked {
+            account_id: state.account_id,
+            reason: e.to_string(),
+        },
+    })
+}
+
+/// `POST /v1/auth/revoke` for `state`'s session. The body names both tokens:
+/// the hosted issuer retires the session by its `refresh_token`,
+/// `cerulion-accountd` by `token` (either of the pair).
+fn revoke_session(state: &AuthState) -> CliResult<()> {
+    let base = account_service_base();
+    let client = http_client()?;
+    let path = "/v1/auth/revoke";
+    let resp = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(&state.session_token)
+        .json(&serde_json::json!({
+            "refresh_token": state.refresh_token,
+            "token": state.refresh_token,
+        }))
+        .send()
+        .map_err(|e| {
+            CliError::Login(format!("the account service ({base}) is unreachable: {e}"))
+        })?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let err: ErrorBody = resp.json().unwrap_or_default();
+    Err(CliError::Login(format!(
+        "{path} refused ({status}): {}",
+        if err.error_description.is_empty() {
+            err.error
+        } else {
+            err.error_description
+        }
+    )))
+}
+
 /// Opportunistically refresh a STALE session: if this
 /// logged-in-ever machine's cached session is expired, exchange the refresh
 /// token for a fresh session (`POST /v1/auth/refresh`) and persist it. Returns
@@ -784,6 +1061,24 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     };
     if state.session_is_valid(auth::now_unix_ns()) {
         return Ok(None); // still fresh — no cloud call.
+    }
+    // A refresh token is single-use (beyond the account service's short reuse
+    // window), so refreshes are serialized across processes: hold the refresh
+    // lock, re-read, and exchange only if the stored session is still stale. A process that waited finds the session a peer
+    // just refreshed and returns without a request.
+    let auth_path = auth::auth_json_path().ok_or_else(|| {
+        CliError::Login(
+            "no home directory (set CERULION_HOME) to store ~/.cerulion/auth.json".to_string(),
+        )
+    })?;
+    let _refreshing = auth::hold_refresh_lock(&auth_path)
+        .map_err(|e| CliError::Login(format!("could not refresh the session: {e}")))?;
+    let loaded = auth::load_from(&auth_path);
+    let Some(state) = loaded.state() else {
+        return Ok(None);
+    };
+    if state.session_is_valid(auth::now_unix_ns()) {
+        return Ok(None);
     }
     let base = account_service_base();
     let client = http_client()?;
@@ -812,24 +1107,36 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     // So the exchange runs unlocked and the publication is conditional — a peer
     // that signed out or logged in while we were refreshing is NOT overwritten
     // with the session it just retired.
-    let auth_path = auth::auth_json_path().ok_or_else(|| {
-        CliError::Login(
-            "no home directory (set CERULION_HOME) to store ~/.cerulion/auth.json".to_string(),
-        )
-    })?;
-    let published = auth::with_store_lock(&auth_path, || {
-        match auth::load_from(&auth_path).state() {
-            Some(current) if current.refresh_token == state.refresh_token => {
-                auth::write_to(&auth_path, &new_state).map(|()| true)
+    let publication = auth::with_store_lock(&auth_path, || {
+        let current = auth::load_from(&auth_path);
+        let current_refresh = current.state().map(|c| c.refresh_token.as_str());
+        match refresh_publication(
+            current_refresh,
+            &state.refresh_token,
+            &new_state.refresh_token,
+        ) {
+            RefreshPublication::Publish => {
+                auth::write_to(&auth_path, &new_state).map(|()| RefreshPublication::Publish)
             }
-            // Absent, corrupt, or a different pair: another writer moved the
-            // store while the exchange was in flight, and its state is newer
-            // than ours.
-            _ => Ok(false),
+            other => Ok(other),
         }
     })
     .map_err(|e| CliError::Login(format!("could not persist the refreshed session: {e}")))?;
-    if !published {
+    if publication == RefreshPublication::AlreadyStored {
+        // A peer writer (Studio's team page) stored this same pair first: the
+        // service's reuse window answered both exchanges with the pair one
+        // rotation issued. It is the live pair, so it is kept, not revoked.
+        return Ok(Some(new_state));
+    }
+    if publication == RefreshPublication::Superseded {
+        // The exchange rotated the session onto `new_state` (refresh is
+        // single-use), and nothing on this machine holds that pair: a sign-out
+        // revoked only the pair we exchanged, and a login or a peer's refresh
+        // holds a different session. Retire it whatever replaced it, so no
+        // session stays live at the service that this machine cannot sign out.
+        if let Err(e) = revoke_session(&new_state) {
+            tracing::warn!(error = %e, "could not revoke the unpublished refreshed session");
+        }
         tracing::warn!(
             path = %auth_path.display(),
             "the local account state changed while the session was being refreshed — the \
@@ -838,6 +1145,32 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
         return Ok(None);
     }
     Ok(Some(new_state))
+}
+
+/// What [`refresh_session_if_stale`] does with the pair an exchange returned,
+/// decided under the store lock from the refresh token the store holds now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshPublication {
+    /// The store still holds the exchanged token: write the new pair.
+    Publish,
+    /// The store already holds the new pair (a peer stored the same replayed
+    /// pair): keep it.
+    AlreadyStored,
+    /// The store is absent, corrupt, or holds a different pair: a newer writer
+    /// moved it, and the new pair is revoked unpublished.
+    Superseded,
+}
+
+fn refresh_publication(
+    current_refresh: Option<&str>,
+    exchanged_refresh: &str,
+    new_refresh: &str,
+) -> RefreshPublication {
+    match current_refresh {
+        Some(c) if c == exchanged_refresh => RefreshPublication::Publish,
+        Some(c) if c == new_refresh => RefreshPublication::AlreadyStored,
+        _ => RefreshPublication::Superseded,
+    }
 }
 
 /// Register this machine's ed25519 device key with the account (`POST
@@ -853,7 +1186,7 @@ fn register_device(
     client: &reqwest::blocking::Client,
     base: &str,
     session_token: &str,
-) -> CliResult<Option<RegisterDeviceResponse>> {
+) -> CliResult<Option<IssuedRegistration>> {
     let seed = ensure_device_key_seed()?;
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     let public_key = signing.verifying_key().to_bytes();
@@ -896,7 +1229,13 @@ fn register_device(
         )));
     }
     resp.json::<RegisterDeviceResponse>()
-        .map(Some)
+        .map(|response| {
+            Some(IssuedRegistration {
+                response,
+                challenge_account: pop_account,
+                device_key: public_key,
+            })
+        })
         .map_err(|e| CliError::Login(format!("could not parse the device-cert response: {e}")))
 }
 
@@ -969,17 +1308,12 @@ pub(crate) fn fetch_pop_challenge(
     Ok(Some((ch.challenge, account)))
 }
 
-/// Resolve the caller's account id via `/v1/me` (the fallback when device
-/// registration did not return it).
-fn fetch_account_id(
+/// Fetch the authenticated account identity, preserving a hosted UUID as itself.
+fn fetch_account_profile(
     client: &reqwest::blocking::Client,
     base: &str,
     session_token: &str,
-) -> CliResult<String> {
-    #[derive(Deserialize)]
-    struct Me {
-        account_id: String,
-    }
+) -> CliResult<AccountProfile> {
     let resp = client
         .get(format!("{base}/v1/me"))
         .bearer_auth(session_token)
@@ -991,91 +1325,44 @@ fn fetch_account_id(
             resp.status()
         )));
     }
-    resp.json::<Me>()
-        .map(|m| m.account_id)
+    resp.json::<AccountProfile>()
         .map_err(|e| CliError::Login(format!("could not parse /v1/me: {e}")))
 }
 
-/// Load the 32-byte ed25519 device seed from `~/.cerulion/desk.key`, creating it
-/// (0600) if absent. Shared with the `cerulion connect`/`pair` desk identity —
-/// one device key per machine (Studio ⊃ CLI). `pub(crate)` so the robot-claim
-/// flow ([`crate::robot_cmd`]) presents the SAME machine key as its transport
-/// identity (never a second device key).
+/// Load this machine's 32-byte ed25519 device seed, creating it (0600) if no
+/// key exists. The one machine key of [`auth::identity_layout`]: shared with the
+/// `cerulion connect`/`pair` desk identity (Studio and CLI alike). `pub(crate)`
+/// so the robot-claim flow ([`crate::robot_cmd`]) presents the SAME machine key
+/// as its transport identity (never a second device key).
 pub(crate) fn ensure_device_key_seed() -> CliResult<[u8; 32]> {
-    let path = auth::device_key_path().ok_or_else(|| {
+    let layout = auth::identity_layout().ok_or_else(|| {
         CliError::Login("no home directory (set CERULION_HOME) to store the device key".into())
     })?;
-    ensure_device_key_seed_at(&path)
+    ensure_device_key_seed_in(&layout)
 }
 
-/// The path-explicit body of [`ensure_device_key_seed`] (testable without env).
-fn ensure_device_key_seed_at(path: &Path) -> CliResult<[u8; 32]> {
-    if path.exists() {
-        let bytes = std::fs::read(path).map_err(|e| {
-            CliError::Login(format!("reading the device key {}: {e}", path.display()))
-        })?;
-        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            CliError::Login(format!(
-                "the device key {} is not 32 bytes (delete it to regenerate)",
-                path.display()
-            ))
-        })?;
-        return Ok(seed);
+/// The layout-explicit body of [`ensure_device_key_seed`] (testable without env).
+fn ensure_device_key_seed_in(
+    layout: &cerulion_pairing::identity::IdentityLayout,
+) -> CliResult<[u8; 32]> {
+    use cerulion_pairing::identity::KeyOrigin;
+    let (key, origin) = layout
+        .load_or_create_machine_key()
+        .map_err(|e| CliError::Login(e.to_string()))?;
+    match origin {
+        KeyOrigin::Created => tracing::info!(
+            fingerprint = %key.short_fingerprint(),
+            path = %layout.device_key_path().display(),
+            "created this machine's device key"
+        ),
+        KeyOrigin::AdoptedLegacy => tracing::info!(
+            fingerprint = %key.short_fingerprint(),
+            path = %layout.device_key_path().display(),
+            "this machine's existing desk.key is now also its identity/device.key"
+        ),
+        KeyOrigin::Existing => {}
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            // 0700 (not the umask default 0755): ~/.cerulion also holds the
-            // 0600 secrets (auth.json / desk.key / device.cert). Creating it
-            // here — the device-key path can run FIRST, before any
-            // `atomic_write_secret` — with umask perms would leave the config
-            // dir world-listable.
-            auth::create_secret_dir(parent)
-                .map_err(|e| CliError::Login(format!("creating {}: {e}", parent.display())))?;
-        }
-    }
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)
-        .map_err(|e| CliError::Login(format!("generating the device key failed: {e}")))?;
-    write_new_device_key(path, &seed)?;
-    Ok(seed)
-}
-
-/// Create `path` (0600 on Unix, `create_new` so a racing writer never
-/// overwrites) and write the 32-byte seed.
-#[cfg(unix)]
-fn write_new_device_key(path: &Path, seed: &[u8; 32]) -> CliResult<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CliError::Login(format!("creating the device key {}: {e}", path.display())))?;
-    f.write_all(seed)
-        .map_err(|e| CliError::Login(format!("writing the device key {}: {e}", path.display())))?;
-    // fsync so a crash between the buffer and the flush cannot leave a
-    // 0/partial-byte key that later fails `try_into::<[u8; 32]>()` (a
-    // manual-deletion recovery). Mirrors `auth::write_new_secret_file`.
-    f.sync_all()
-        .map_err(|e| CliError::Login(format!("syncing the device key {}: {e}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn write_new_device_key(path: &Path, seed: &[u8; 32]) -> CliResult<()> {
-    use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| CliError::Login(format!("creating the device key {}: {e}", path.display())))?;
-    f.write_all(seed)
-        .map_err(|e| CliError::Login(format!("writing the device key {}: {e}", path.display())))?;
-    // fsync so a crash between the buffer and the flush cannot leave a
-    // 0/partial-byte key that later fails `try_into::<[u8; 32]>()` (a
-    // manual-deletion recovery). Mirrors `auth::write_new_secret_file`.
-    f.sync_all()
-        .map_err(|e| CliError::Login(format!("syncing the device key {}: {e}", path.display())))
+    Ok(*key.seed())
 }
 
 // ===========================================================================
@@ -1087,11 +1374,27 @@ fn write_new_device_key(path: &Path, seed: &[u8; 32]) -> CliResult<()> {
 /// anywhere else would be one that forgets it), so account_cmd and robot_cmd
 /// build through here too.
 pub(crate) fn http_client() -> CliResult<reqwest::blocking::Client> {
+    build_http_client(reqwest::redirect::Policy::default())
+}
+
+/// Keep account catalog and trust-root requests at their validated service origin.
+pub(crate) fn http_client_without_redirects() -> CliResult<reqwest::blocking::Client> {
+    build_http_client(reqwest::redirect::Policy::none())
+}
+
+fn build_http_client(redirect: reqwest::redirect::Policy) -> CliResult<reqwest::blocking::Client> {
     // `install_default` refuses a second install and hands the provider back in
     // the Err — the already-installed case (an earlier client here, or a host
     // that set one), not a failure.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "cerulion-pairing-protocol",
+        reqwest::header::HeaderValue::from_static("1"),
+    );
     reqwest::blocking::Client::builder()
+        .redirect(redirect)
+        .default_headers(headers)
         .timeout(HTTP_TIMEOUT)
         .user_agent(concat!("cerulion-cli/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -1100,6 +1403,14 @@ pub(crate) fn http_client() -> CliResult<reqwest::blocking::Client> {
 
 fn empty_body() -> serde_json::Value {
     serde_json::json!({})
+}
+
+/// The device-start body: `{}`, or `{"telemetry_anon_id": ...}`.
+fn device_start_body(telemetry_anon_id: Option<&str>) -> serde_json::Value {
+    match telemetry_anon_id {
+        Some(anon_id) => serde_json::json!({ "telemetry_anon_id": anon_id }),
+        None => empty_body(),
+    }
 }
 
 /// POST a JSON body and deserialize a successful JSON response; non-2xx maps to a
@@ -1136,6 +1447,24 @@ fn post_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refreshed_pair_a_peer_already_stored_is_kept_not_revoked() {
+        use RefreshPublication::*;
+        assert_eq!(refresh_publication(Some("A"), "A", "B"), Publish);
+        assert_eq!(refresh_publication(Some("B"), "A", "B"), AlreadyStored);
+        assert_eq!(refresh_publication(Some("C"), "A", "B"), Superseded);
+        assert_eq!(refresh_publication(None, "A", "B"), Superseded);
+    }
+
+    #[test]
+    fn device_start_body_carries_only_the_anon_id() {
+        assert_eq!(device_start_body(None), serde_json::json!({}));
+        assert_eq!(
+            device_start_body(Some("anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8")),
+            serde_json::json!({ "telemetry_anon_id": "anon:6ba7b810-9dad-41d1-80b4-00c04fd430c8" })
+        );
+    }
 
     /// A cert that was REMOVED and could not be put back is a lost device
     /// binding, and the remedy differs: the user must sign in again to be
@@ -1366,9 +1695,11 @@ mod tests {
     #[test]
     fn device_key_seed_is_created_0600_then_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("desk.key");
-        let s1 = ensure_device_key_seed_at(&path).unwrap();
-        assert!(path.exists());
+        let layout = cerulion_pairing::identity::IdentityLayout::at(dir.path());
+        let s1 = ensure_device_key_seed_in(&layout).unwrap();
+        let path = layout.device_key_path();
+        assert_eq!(std::fs::read(&path).unwrap(), s1);
+        assert_eq!(std::fs::read(layout.legacy_desk_key_path()).unwrap(), s1);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1376,7 +1707,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         // Second call REUSES the existing key (never regenerates).
-        let s2 = ensure_device_key_seed_at(&path).unwrap();
+        let s2 = ensure_device_key_seed_in(&layout).unwrap();
         assert_eq!(
             s1, s2,
             "an existing device key is reused, never regenerated"
@@ -1388,29 +1719,33 @@ mod tests {
     fn device_key_path_creates_fresh_config_dir_0700() {
         // The device-key seed can be the FIRST thing to create ~/.cerulion (before
         // any auth.json / device.cert write), so it MUST create the parent at 0700
-        // — not the umask default 0755 — since that dir also holds the 0600 secrets
-        // whose filenames would otherwise be world-listable. Regression guard:
-        // a plain create_dir_all here leaves it 0755.
+        // (not the umask default 0755), since that dir also holds the 0600 secrets
+        // whose filenames would otherwise be world-listable.
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
-        // A NESTED, not-yet-existing parent so the dir-creation branch actually
-        // runs (the sibling 0600 test writes into the pre-existing tempdir root).
         let cfg_dir = base.path().join("nested").join(".cerulion");
-        let path = cfg_dir.join("desk.key");
         assert!(!cfg_dir.exists(), "precondition: parent must not pre-exist");
-        ensure_device_key_seed_at(&path).unwrap();
-        let mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "~/.cerulion must be owner-only (0700)");
+        let layout = cerulion_pairing::identity::IdentityLayout::at(&cfg_dir);
+        ensure_device_key_seed_in(&layout).unwrap();
+        for dir in [cfg_dir.clone(), layout.identity_dir()] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be owner-only (0700)", dir.display());
+        }
     }
 
     #[test]
     fn wrong_size_device_key_is_a_loud_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("desk.key");
-        std::fs::write(&path, b"too short").unwrap();
-        let err = ensure_device_key_seed_at(&path).unwrap_err();
+        let layout = cerulion_pairing::identity::IdentityLayout::at(dir.path());
+        std::fs::write(layout.legacy_desk_key_path(), b"too short").unwrap();
+        let err = ensure_device_key_seed_in(&layout).unwrap_err();
         assert!(matches!(err, CliError::Login(_)));
-        assert!(err.to_string().contains("32 bytes"));
+        assert!(err.to_string().contains("not 32"), "{err}");
+        assert_eq!(
+            std::fs::read(layout.legacy_desk_key_path()).unwrap(),
+            b"too short",
+            "a wrong-size key is never regenerated in place"
+        );
     }
 
     #[test]

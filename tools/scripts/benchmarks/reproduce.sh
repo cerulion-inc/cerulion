@@ -47,7 +47,7 @@
 
 set -euo pipefail
 
-# readlink -f: resolve through the scripts/reproduce_benchmarks.sh
+# readlink -f: resolve through the tools/scripts/reproduce_benchmarks.sh
 # symlink — BASH_SOURCE[0] is the symlink path when invoked that way,
 # and dirname alone would anchor SCRIPT_DIR one directory too high.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -66,7 +66,7 @@ CHECK_ONLY=0
 # the cut into the middle of the exit-code table, so `--help` stopped
 # mid-sentence and lost the pointer to benches/latency/README.md. The
 # block's own end is already unambiguous and needs no maintenance. Same
-# shape as scripts/ci_test_shard.sh::usage (which strips no prefix and
+# shape as tools/scripts/ci_test_shard.sh::usage (which strips no prefix and
 # writes to stderr, but bounds its block the same way and for the same
 # reason).
 usage() {
@@ -188,7 +188,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Machine identity (canonical impl: scripts/benchmarks/lib/machine_hash.sh).
+# Machine identity (canonical impl: tools/scripts/benchmarks/lib/machine_hash.sh).
 # ---------------------------------------------------------------------------
 # shellcheck source=lib/machine_hash.sh
 source "$SCRIPT_DIR/lib/machine_hash.sh"

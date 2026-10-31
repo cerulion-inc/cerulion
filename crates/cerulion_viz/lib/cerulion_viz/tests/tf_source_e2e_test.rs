@@ -10,8 +10,8 @@
 //! RAW frames and the desk decodes + renders). Inverting the edge — the DESK
 //! crate dev-depends on the producer, instead of the producer dev-depending on
 //! the desk stack — keeps the exact same oracles while leaving `go2_tf_source`
-//! with ZERO rerun edges even under `-e normal,dev`. The `rerun-leanness` CI
-//! job pins both halves.
+//! with ZERO rerun edges under every edge kind.
+//! `the_robot_demo_workspace_is_rerun_free` in cerulion_hygiene pins both halves.
 //!
 //! `go2_tf_source` (period node) publishes `odom → base` on `/tf` and the
 //! static mount table on `/tf_static`. Two drain-all closure consumers apply

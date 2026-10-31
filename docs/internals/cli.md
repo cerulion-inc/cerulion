@@ -15,7 +15,7 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 ## 1. `cerulion bag play --resim`: exit-code contract
 
 The surface is `cerulion bag play <bag> --resim all [--verify] [-u|--duration D]
-[--strict-state] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
+[--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
 the neutral renderer, `replay_cmd.rs` the entry gates and the stable exit-code surface, and
 `replay_engine.rs` the deterministic re-execution itself. The bag is the golden: it carries
 the graph, env snapshot, recorded frames, and scheduler trace, and the run re-executes the
@@ -32,7 +32,11 @@ and carries the whole contract below. Neutrality scopes EXACTLY the two comparis
 (1 and 6); 2, 3 and 5 mean the re-execution could not be performed and stay loud in both
 modes. `--duration D` bounds the run in SECONDS OF BAG TIME and is legal in both modes (a
 per-rank resim has k step axes and no shared step number, which is why there is no tick
-bound); `--report` and `--tolerance` REQUIRE `--verify`. Every misuse exits 2, never 1:
+bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
+(`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic labelled
+with the schema the re-executed graph publishes, a partial file removed on any run that does not finish, and the
+engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
+REQUIRE `--verify`. Every misuse exits 2, never 1:
 under `--verify` 1 means "your code diverged", so a malformed invocation reported as 1
 would make CI announce a regression that does not exist.
 
@@ -104,7 +108,8 @@ Rules that must not drift:
   is dropped, not reported, which keeps every pre-existing multi-rank bag's outcome
   and report byte-identical.
 - **A refused read log DECLINES the frame comparison it steered; it never fails
-  it.** The read log is report-only, and on a multi-process bag it also steers
+  it.** A read-log condition never produces a data violation, and on a
+  multi-process bag the read log also steers
   the cross-rank injection window. When it is refused for **a rank whose
   read-log-steered injection fell back**, that fallback can hand an injected
   frame to a fire early or late, so the rank's producers legitimately emit
@@ -221,11 +226,13 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   derives a partition (cost-fused via `graphs/<name>.costs.yaml` when present, else
   process-per-node) and runs supervisor + one worker per group. A `process_groups:`
   block is respected as written. Non-Unix falls back to the monolith with a loud notice.
-- **Consent ladder (the never-mutate floor)**: persisting a derived partition into the
-  YAML needs consent. `--yes` writes it (with a `.bak`); a TTY previews and asks y/N
-  (N = run the derived groups in-memory, file untouched); no-TTY runs in-memory with a
-  loud notice naming `--yes` and `--single-process`. A refused/failed run never mutates
-  the graph file and never leaves a `.bak`.
+- **Explicit save only**: terminal and non-terminal runs adopt derived groups in
+  memory without a prompt or a partition preview. `--yes` writes the groups with a
+  `.bak` backup; `graph partition` retains the detailed preview and interactive
+  confirmation. `--auto-partition` uses the same policy over an existing block.
+  Partition refusals leave the graph file and its backup untouched. The real CLI
+  tests exercise empty PTY stdin and non-terminal stdin, verify both nodes' recorded
+  output against hand-written bytes, and assert the owned workers disappear on Ctrl-C.
 - `--single-process` opts out entirely; `--auto-partition` re-derives over an existing
   block and conflicts with `--single-process`; virtual/external clocks keep the monolith
   routing. The in-memory derived plan and the written plan must be equal, pinned by a
@@ -247,6 +254,59 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   before deployment dispatch, and the recorded `process_groups` comes from the RESOLVED
   deployment, never from the config's own flag (the config may not reflect an in-memory
   derived partition).
+- **Launch arguments**: `graph run <NAME> [NAME:=VALUE]...` reads the graph through
+  `graph_launch_args::graph_read_raw_with_launch_args`, the same read `graph_read_raw` makes
+  with no overrides, so every verb sees the resolved graph. The resolution is
+  `cerulion_core::graph::launch_args` (pure): it lifts `args:` out of the YAML tree and
+  substitutes `${name}` into `prefix`, output `topic`, input `source` and `params:` values
+  before `GraphConfig` deserializes, so `GraphConfig` carries no `args` field and keeps
+  `deny_unknown_fields`. The words are checked by a clap value parser at parse (a word that is
+  not `name:=value` is a usage error, which keeps the bare `--record` positional contract), and
+  the run's embedded config is the resolved graph, so the recorded `graph.yaml` has no `args:`
+  and no reference, and a resim resolves nothing: a document with no `args:` and no overrides is
+  read as written, `$` included, so resolution is a fixed point (Replay = Live over a `$$`
+  escape or a `$$` in an override value). The parse returns an `ArgProvenance` beside the
+  config (which argument fed which whole-reference `params:` value); `graph_read_raw_with_launch_args`
+  threads it to `graph_params_check`, whose refusal names the argument and the override.
+  `graph_edit` wires from `parse_graph_as_written` (the output's `topic` text with its
+  reference) while judging and guarding on the resolved config. `graph run --yes` under
+  overrides that change the wiring (`graph_launch_args::overrides_change_wiring`, judged on the
+  bytes read, before the prefix fill) runs the pre-flight with saving off, so it never writes;
+  when the outcome would have written (`InMemory`) the `--yes` run is refused, and when the file
+  already carries exactly the derived partition (`AlreadyCurrent`) the run proceeds.
+
+### Engine library migration from 1.0.0
+
+The published `cerulion_cli_engine` 1.0.0 package exposes the graph-run partition
+APIs in [`partition_emit`](https://github.com/cerulion-inc/cerulion/blob/36135c33a10a09aa0dc6e7e7317c7f93c4f63ef8/crates/cerulion_cli_engine/src/partition_emit.rs#L1515).
+Removing their public fields, lifetime parameter, function argument and outcome
+variant breaks Rust callers. SemVer in 1.x does not cover the `cerulion_cli_engine`
+library API (see `CHANGELOG.md`), and these changes ship in a 1.x minor release with
+the workspace version and internal dependency pins updated together under the
+lockstep release policy in `Cargo.toml`. Rust code that calls the engine directly
+applies the migrations below.
+
+| 1.0.0 API | Migration |
+|---|---|
+| `PartitionConsent<'a>` with `auto_partition`, `assume_yes`, `is_tty` and `confirm` | Use `PartitionConsent` without a lifetime and initialize only `auto_partition` and `assume_yes`. Remove the terminal probe and confirmation provider. |
+| `PreflightOptions` with `re_derive`, `lenient_costs`, `assume_yes` and `is_tty` | Initialize only `lenient_costs` and `assume_yes`. |
+| `run_auto_partition_preflight(root, name, config, raw, opts, confirm)` | Remove the final confirmation argument. The helper derives groups and adopts them in memory unless `assume_yes` requests persistence. |
+| `RunPartitionOutcome::KeptExisting` | Remove this match arm. To keep declared groups, skip re-derivation and retain the original config through the declared-layout path. |
+| `PartitionIntent::Derive { re_derive }` | Match `PartitionIntent::Derive` as a unit variant. The pre-flight detects an already-current file itself, so no caller needs the flag. |
+| `run_dir::PartitionProvenance::KeptExisting` (`run.json` label `kept-existing`) | Remove this match arm. No run writes the label any more; a reader keeps accepting it only for run directories written by 1.0.0. |
+
+`graph_run` accepts `Option<PartitionConsent>` with the same two choices. A caller
+that wants to respect an existing `process_groups:` block passes
+`auto_partition: false`. When the resolved intent derives groups, the derivation
+becomes the runtime layout even when the file stays unchanged. Direct preflight callers
+that want to retain the original layout must make that decision before invoking the
+helper, because it no longer has a declined-confirmation result.
+
+`assume_yes: false` leaves the graph file and backup untouched on terminal and
+non-terminal runs. Set `assume_yes: true` only for an explicit save decision; it uses
+the atomic writer and backup. For detailed inspection and interactive saving, use
+`cerulion graph partition <NAME>` or the engine's `graph_partition` API. Its separate
+inspection and confirmation contract remains available.
 
 ### `ros2:` graph entries (spawn + supervise only)
 
@@ -476,9 +536,30 @@ the recovery tool for stale/broken partition blocks.
 
 ---
 
+### `graph pause` / `graph resume`
+
+- A run owns one pause page (a 4 KiB shared-memory word, `cerulion_core::pause_page`),
+  created by `graph_run` and unlinked when the run returns; each worker plan carries its
+  tag (`WorkerPlan::pause_tag`, additive, absent in an older plan).
+- The verb (`cerulion_cli_engine::run_control`) resolves the run through the live-run
+  registry, flips the page with one compare-and-swap, and mirrors the state into
+  `run.json` (`"paused"`). The flip, the read-back and the mirror are one step under a
+  lock on the run directory (`run_dir::transition_run_paused`), so two commands on one
+  run take turns and the manifest always shows the state the page ended in. The verb
+  writes only in a direct child of the run directory root whose `run.json` names the
+  run, and refuses an unsettled registry gather rather than guess. The page is the
+  truth, so running the verb again repairs a manifest a killed verb left behind.
+- A graph with ROS 2 entries, a run on virtual time and a worker that cannot open the
+  page get no page, or fail before ready; the stale-run sweep unlinks the page of a
+  run that died without cleaning up.
+- The live loop holds at the step boundary, the run clock (`PausableClock`) reads the
+  page, and a barrier timeout that a pause overlaps is waited out instead of poisoning
+  the run. Exit codes: 0, 4 not running, 1 not pausable or ambiguous.
+
 ## 3. `topic list`: discovery ladder and remote topics
 
-Local topics list first and instantly; remote discovery runs by default (`--no-network`
+Local topics list first and instantly; remote discovery runs by default (`--local`,
+its `--no-network` compatibility alias, or the shared environment kill-switch
 skips the whole remote half; `--connect`/`--listen` are repeatable and additive; the
 opt-in `--scan` subnet sweep is a separate rung that must stay opt-in). The remote half
 is best-effort: a session/query failure is a loud note plus exit 0, never silently
@@ -540,6 +621,52 @@ empty, never a hang.
   fold logic lives in `cerulion_core::transport::mirror_registry` (shared with the viz
   daemon); `topic_cmd` keeps only a thin adapter; do not re-implement the fold here.
 
+### Explicit local scope
+
+- `graph run` and `node run` OR `--local` with legacy `--network off`, then
+  use the existing `resolve_run_network` gate. Local selection therefore cannot
+  register/spawn a gateway or enable declared ingress/egress.
+- The binary passes `TopicScope::Local` to the scoped echo/hz/info engine
+  functions. The existing engine entry points delegate with `Automatic` for
+  compatibility. The observer availability seam suppresses remote resolution
+  and demand before any daemon connection. The local schema fallback also
+  skips remote resolution, including when a local frame has an unknown type.
+- `topic list` keeps one clap boolean: `--local` with visible alias
+  `--no-network`. `remote_discovery_options` honors both the explicit boolean
+  and the shared fail-closed environment parser before the discovery ladder,
+  session or opt-in scan can run. Explicit locators do not override local scope.
+- The account login gate is independent and remains first. Tests seed the
+  logged-in-ever marker to isolate the runtime/topic network boundary.
+- Local listing keeps SHM mirror provenance under REMOTE. Local observers
+  refuse mirrors rather than take a daemon demand; they do not stop an existing
+  daemon or remove another process's mirrors.
+- `mirror_origin` marks the shared desk mirrors (`cerulion-netd`'s demand plane,
+  the remote plane) before data exposure, independently of the best-effort robot
+  provenance registry. The per-run strict gateway registers its declared
+  `ingress:` topics unmarked (`register_run_ingress_topic`): they are the run's
+  own topics, so `classify_observed_topic` routes them LocalDirect and a local
+  observer may hold their lease. Listing
+  folds a marked, unattributed source under REMOTE as `origin unavailable`;
+  malformed reserved marker identities fail closed. Availability checks both
+  before and after opening a subscriber. Explicit local observation acquires a
+  marker listener lease before opening its subscriber and retains it until after
+  that subscriber drops, so a remote injector cannot replace its local producer
+  during the observation. Automatic local-direct behavior keeps its prior source
+  selection. `ScopedSubscriber` owns the subscriber first and the local lease or
+  remote demand guard last; error returns keep the same destruction order.
+  Its local lease is boxed once during setup; delivery has no new allocation.
+  Older unmarked injectors with failed
+  attribution cannot be identified: upgrade/restart them. The low-level
+  `NetworkManager::register_ingress` compatibility seam and raw local
+  DDS/bag injectors remain unmarked; custom network writers use the marked APIs.
+- Pins: `local_scope_flag_tests`, `local_scope_e2e_test`,
+  `topic_list_scope_and_environment_precedence` and the explicit-local arms in
+  the serial `topic_observer_iox2_test` binary.
+- Release migration: the canonical README and downstream first-project lesson
+  use released CLI 1.0.0 spellings until a release includes `--local`; update
+  run/list/echo/hz commands together after that release. The source reference
+  distinguishes the new spelling from the currently released binary.
+
 ### Observer verbs (`topic echo` / `info` / `hz`)
 
 - `classify_observed_topic` routes each verb: a genuine local producer is read directly;
@@ -562,6 +689,15 @@ empty, never a hang.
   malformed-frame storm. The load-bearing test assertion is the pacing counter
   (`observer_pacing_engaged_count`), never a CPU percentage; CPU gates fail open on a
   loaded runner.
+- **Echo renders through the message YAML codec** (`cerulion_core::dynamic::
+  message_to_yaml_with`, arrays cut at `--truncate-length`), local walker first, then
+  the remote-seeded one. Every line that is not the message is a `#` comment and each
+  frame ends with `---`, so a frame block is valid YAML and an uncut message is valid
+  input to anything that reads the codec. There are no per-type printers: one render
+  path means one YAML form. The 2000-line cap (`ECHO_MAX_LINES`) is passed to the codec
+  as `YamlEncodeOptions::max_lines`, so the encoder stops writing at the cap (a small
+  frame that names a huge zero-default form costs 2000 lines of work, not the whole form)
+  and ends the cut frame with a column-0 `!truncated` line that no YAML reader accepts.
 
 ---
 
@@ -774,7 +910,8 @@ callers. Contracts:
 `completions.rs` (value sources) + `crates/cerulion_cli/src/completion.rs` (shell adapters).
 
 - **One mechanism**: `clap_complete`'s dynamic `CompleteEnv`, wired as the FIRST
-  statement of `main()` from the same `Cli::command` factory the binary parses with;
+  statement of `main()` from the same `families::cli_command` factory the binary parses
+  with (the `Commands` verbs plus every registered verb family, §14);
   the whole tree completes for free and cannot drift. No static script is ever
   generated (a frozen snapshot cannot complete a live name, and sourcing both would
   leave whichever loaded last in charge).
@@ -846,19 +983,21 @@ own binary.
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
+| `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
 | `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over the untouched `graph create` scaffold takes no `.bak` and no warn, any other byte keeps both | no | none |
 | `graph_partition_test.rs` | `graph partition` verb: cost-mode selection, consent ladder, replace-scoped validation | no | none |
-| `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, consent ladder, lenient-costs degrade, in-memory==written plan equality | no | none |
+| `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, explicit save and ephemeral adoption, lenient-costs degrade, in-memory==written plan equality | no | none |
 | `network_run_gate_test.rs` | `resolve_run_network` decision matrix + gateway-port parse (env-mutating; file-local mutex inside) | no | none |
 | `completions_test.rs` | Completion value sources vs hand-written candidate lists; wire-safety filter; structural no-side-effect walk | no | none |
 | `discovery_ladder_test.rs` | Hermetic injected-rung ladder pins | no | none |
 | `topic_network_live_test.rs` | Live loopback remote-topic e2e (real zenoh sessions, no shared memory) | no | none |
 | `mdns_live_test.rs` | Real-multicast mDNS loopback | `#[ignore]` (hardware only) | none |
+| `topic_type_iox2_test.rs` | `topic type` error arms (silent topic, unnamed hash), the retry past a sample-less event, the typed listing's mirror recheck, its batches (more topics than one batch holds) and a topic that sends nothing, and `topic bw` on a publisher slower than one report a second (stamped apart from its send delay) and on two publishers whose clocks disagree | yes (process-global transport singleton) | none |
+| `topic_types_network_live_test.rs` | `topic list -t` / `find` remote typing from a loopback robot's catalog, and the `topic type` remote-walker ladder | no | none |
 | `topic_observer_iox2_test.rs` | `topic echo`/`hz` observer loops: multiplicity oracle, timeout drain, rate-line math, notify-flood pacing counter | yes (process-global transport singleton) | none |
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
 | `convergence_adoption_test.rs` | Structural walk: the observer seams adopt the converged query verbs | no | none |
 | `bag_record_run_attach_test.rs` | `bag record --run` mid-run attach over a real lapped live trace ring | no | none |
-| `clean_orphan_port_tag_test.rs` | The orphan port-tag reclaim over a REAL shape (self-re-exec child on an isolated root): first sweep refuses, selector picks the node, reclaim removes the one tag, second sweep converges; stray-entry refusal, live-pid death guard, dry run; each anti-tautology arm paired with the regression it catches | yes (`#[serial]`; the diagnostics sweep pins the process-global iceoryx2 log level) | none |
 | `ros2_cmd_test.rs` | The `cerulion ros2` pass-through plan builder: verbatim argv (never parsed or validated), exact env pairs (prepend order + separator), missing-rmw exit 69, the heap-hook preload matrix (`decide_preload` + composition: auto / off / none / explicit), ament-prefix staging (symlink, idempotence, stale refresh, installed layout), exec `NotFound` → 127; and the `--adopt-take` decision: both verbs REFUSE it (exit 69, before any file is inspected, on every host), the refusal is the LEADING flag only (a non-leading one still forwards verbatim), the direct-launch recipe it prints PREPENDS each path var to the sourced value (shell-quoted, with the expansion outside the quotes, asserted through a real `sh`) and is WITHHELD entirely for a path the loader cannot carry or that is not valid UTF-8, and the RETAINED gate keeps its own arms through a `test-seams`-gated seam | env-touching tests `#[serial]` | none |
 | `ros2_migrate_test.rs` | `ros2 migrate` orchestration over an injected fixture engine + a synthetic colcon ws in a real temp git repo: dry-run byte-determinism, manifest lifecycle (decision-slot preservation; write consumes candidates), consent ladder, dirty refusal, `git apply -R` reversibility oracle, build-failure revert text, changed-file refusal | no | none |
 | `ros2_resim_no_respawn_test.rs` | Structural walk (comment-stripped): no replay-path module references the ros2 spawner or builds a `ros2` command; a resim classifies-and-skips `ros2:` entries, never respawns them | no | none |
@@ -874,60 +1013,113 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
+| `tests/node_fatal_e2e_test.rs` | A node returning `NodeError::Fatal` on a temp workspace, `--single-process`: exact delivered frames, ONE fatal log line, `graph run` exit 3 (record and plain arms), `bag play --resim all --verify` exit 0 on the recording; a recorded `Logic` error keeps the node firing (a second failure is logged), exit 0 and the same two frames | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
+| `tests/node_fatal_mp_e2e_test.rs` | The same workspace on the multi-process default (Linux only, iceoryx2 2034 waiver on macOS): two workers, ONE fatal line, the worker's and the supervisor's `Error:` lines, exit 3, not degraded, no orphan; a `Logic` error keeps the node firing (a second failure is logged) and exits 0 | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, per-rank manifests, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
-| `tests/mp_auto_partition_e2e_test.rs` | Multi-process-by-default consent ladder over the real binary (no-TTY floor, persist, opt-out, refusal never mutates the file) | yes | same two |
-| `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
+| `tests/mp_auto_partition_e2e_test.rs` | Unix nonrecording and refusal arms; Linux recording and orphan cleanup (macOS runs none of this binary under the iceoryx2 2034 waiver). Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out, refusal never mutates the file | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib`, `test_node_macro_trigger_block_cdylib` |
+| `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Pins the `CERULION_EXECUTION_MODE=lockstep` opt-out on purpose: a free-run deployment has no barrier to plumb, so the property under test only exists there. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
+| `tests/mp_execution_mode_e2e_test.rs` | The execution-mode default over the real binary: a `process_groups:` run FREE-RUNS by default (`run.json` `gating: recorded_wall`, both workers `build_path=FreeRunTraced`, no shared barrier), `CERULION_EXECUTION_MODE=lockstep` opts out (`gating: quantum`, both workers `build_path=Lockstep`, both leave the cohort), and `--single-process` is the untouched negative control (`process_groups: false`, no worker line, no barrier breadcrumb). Positive `run.json` + per-worker witnesses first; breadcrumb absences second. | yes | same two |
+| `tests/mp_live_determinism_box_test.rs` | The live determinism oracle (Linux only, `#[ignore]`, iceoryx2 2034 waiver on macOS): the 3-node chain split into two ranks and into three ranks, each under `CERULION_EXECUTION_MODE=lockstep` and under the shipped free-run default (the variable REMOVED), `CER_DET_RUNS` live runs per arm (default 5) with busy-loop threads loading every CPU. Every run's merged worker trace is compared on `(node_id, step, global_level)` over `[0, k]` against an in-process monolith and a hand oracle, and prints one `DET_ORACLE mode= ranks= run= verdict= first_diff= k=` line, after the run proves its mode (one `build_path=` line per rank of the expected family) and, under lockstep, a per-rank drift of at most 2 steps; the arm prints a `DET_ORACLE_SUMMARY` line and asserts every run equal. Every harness failure panics with a `DET_HARNESS:` prefix, so a red arm made only of `DET_ORACLE` lines is a divergence, not a broken run. The free-run arms are expected to fail on a current build: free-run ranks do not agree on the step a cross-process input lands on. One pure arm pins the verdict function against hand vectors | yes | none (it scaffolds and builds its own node workspace) |
 | `tests/network_gateway_e2e_test.rs` | Permissive gateway lifecycle: notice exactly once, child reaped on SIGINT/SIGTERM, graceful-forward discriminator (the gateway's own shutdown line, not just exit 0 + reap) | yes | same two |
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |
 | `tests/signal_matrix_e2e_test.rs` | SIGINT/SIGTERM/SIGHUP each exit EXACTLY 0 (`code()==None` would mean a default-disposition kill) + repeat-SIGINT idempotency, the behavioral floor for the §7 signal contract | yes | `test_node_macro_period_cdylib` |
 | `tests/viz_interrupt_e2e_test.rs` | A SIGINT'd viz attach exits 0 with no absence-claim vocabulary | no | none |
 | `tests/ros2_run_e2e_test.rs` | Both `cerulion ros2` verbs over the real binary with a fixture `ros2` first on PATH: exit-code INHERITANCE through `exec()` (42 → 42) on EACH verb, LEADING-hyphen verbatim forwarding (the raw-argv intercept pin), the heap-hook auto-inject + kill switch + explicit preload, the staged env + ament symlink, and the 69 / 127 / 2 contract; plus the `--adopt-take` refusal over the real binary (both verbs, exit 69, `ros2` never exec'd, the cause and the direct-launch recipe on stderr, with a flagless control that still execs; and that the refusal is decided BEFORE any staging, so it creates nothing) and the pin that `cerulion ros2 --help` says the flag is REFUSED rather than that it arms the child; no ROS 2 needed | no (per-child env only) | none |
+| `tests/graph_launch_args_e2e_test.rs` | Launch arguments over the real binary: a graph with `args:` referenced in `prefix`, an output `topic`, an input `source` and `params:` runs once with defaults and once with `name:=value` overrides; the delivered topic names and the recorded frames match hand oracles from the two fixture bodies, `graph validate` lists the resolved param values, the recorded `graph.yaml` is the resolved graph (overrides applied, no `args:`, no reference) and `bag play --resim all --verify` passes for both bags; a `$$` escape in the file and a `$$` in an override value reach the node once and resim byte for byte from the recorded graph read as written; `--yes` under an override that moves a topic is refused and nothing is written (the graph file byte-identical, no backup); each load error (unknown override, undeclared reference, unterminated reference, wrong type from an override and from a default naming the argument behind the param, a word that is not `name:=value`) exits non-zero naming the argument, and a mistake in the file names its location | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_data_trigger_cdylib` |
+| `tests/graph_launch_args_mp_e2e_test.rs` | The other side of the `--yes` guard over a real multi-process run (Linux only, the iceoryx2 2034 waiver): with the declared partition saved by `graph partition --yes`, `graph run side:=right --auto-partition --yes` finds the file already carries the derived partition, reaches the supervisor GO, exits 0 on Ctrl-C with its workers reaped, and leaves the file byte-identical with no backup | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/ros2_graph_e2e_test.rs` | `ros2:` graph entries over the real binary: spawn on `rmw_cerulion` with the declared argv, graceful SIGINT fan-out recorded by the child + no orphan, `--peer-loss fail` stops the run / `continue` runs degraded, missing rmw refuses before spawning, `validate` + `levels` accept the mixed graph, the multi-process default arm; the record→resim round trip (a mixed bag resims exit-0, the skip warn + report JSON name the entry, no respawn); plus an `#[ignore]`d real-`demo_nodes_cpp` machine arm with its recipe | yes | `test_node_macro_period_cdylib` |
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
+| `tests/verb_family_golden_test.rs` | The `schema` family byte for byte against its capture from before it moved onto the verb-family registry: root and family help, usage errors, a representative run of each verb, the `-v` log path, and completion (registration script and candidates) for all five shells. A diff is a user-visible change: fix the code, never re-capture | no | none |
+| `src/families/mod.rs` (unit tests) | The verb-family registry with a test-only family: one registration puts it in help, completion and dispatch with its own log class; `route` applies the class, runs the gate only for a family that needs an identity and returns a refusal without running the family; duplicate names, a shadowed built-in name, alias or `help`, a taken family alias, an unknown listing anchor, every wrong `augment` and a rewritten root help are each refused; run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
-| `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the orphan port-tag reclaim between exactly two sweeps with `--report-only` as its dry-run bit and the SECOND sweep's convergence handed to the gate, plus hand-oracle pins of the two pure renderers. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
+| `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the single dead-node sweep with the verb's mode threaded into it and that sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 
-## 10. `cerulion clean`: dead-node sweep, orphan port-tag reclaim, state-file gate
+**Execution mode in these spawns (hermetic in three directions).** A `graph
+run` that reaches the SUPERVISOR route (a `process_groups:` graph, or any
+unpartitioned graph the non-TTY floor derives a partition for) FREE-RUNS by
+default, and `CERULION_EXECUTION_MODE=lockstep` opts out, so no e2e spawn may
+INHERIT the variable from the developer's shell: one exported value would move
+a whole binary onto the other contract without a single assertion changing. The
+rule is `mp_support::SpawnExecutionMode` (pin `lockstep`, spell out `free_run`,
+or REMOVE the variable). `mp_execution_mode` drives all three directions, and
+`mp_record`, `plain_run_resim` and `credit_death` carry per-arm pins.
+`mp_split_pair` and `mp_supervisor_box_test` pin the `lockstep` OPT-OUT,
+because their whole property is the barrier and a free-run deployment has none.
+`mp_live_determinism_box_test` drives BOTH directions on purpose: each of its
+shapes runs once with `lockstep` pinned and once with the variable REMOVED, because
+its property, run to run agreement with the monolith, is asked of both contracts.
+Every other binary whose spawn can reach the supervisor REMOVES the variable,
+so that it exercises the shipped default: `mp_auto_partition`,
+`mp_default_ns`, `mp_consumer_first_spawn`, `network_gateway_mp`,
+`graph_run_validate_gate` (its no-`--single-process` recovery arms),
+`wedge_alarm`, and `ros2_graph` (its multi-process default arm, through the
+sandbox helper). `flashback_resim` removes it on a `--single-process` run,
+where the variable is inert and removing it only keeps the inert-request warn
+out of a log the test reads.
 
-`cerulion clean` runs iceoryx2's dead-node sweep with its trace lines captured
-(`ipc_cleanup::cleanup_dead_iceoryx2_nodes_with_diagnostics`), attributes every
+## 10. `cerulion clean`: dead-node sweep and state-file gate
+
+`cerulion clean` walks iceoryx2's node registry ONCE with its trace lines
+captured (`ipc_cleanup::sweep_dead_nodes`), attributes every
 refusal to its node with the sub-causes iceoryx2 logged, and reclaims
 `.shm_state` name mappings only when the sweep left the registry CONVERGED: a
 still-registered dead node needs its mappings, and one removed underneath it
 can never be reaped again.
 
-One refusal shape is healed rather than reported. A publisher destroyed while
-one of its loaned samples had been leaked deregisters its port but leaves the
-port's `.port_tag` under `<root>/nodes/<id>/` (the tag is owned by the
-publisher's shared state, which every forgotten sample keeps alive until the
-process dies). The sweep then reclaims the port's resources, never deletes the
-tag, removes the `.details` storage, and fails the final `rmdir`, every sweep,
-forever. `orphan_port_tags::orphan_port_tag_candidates` selects a refused node ONLY
-when its variant is `InternalError` and its sub-causes are exactly that
-four-line chain with the quoted directory equal to the registry's own
-`<node_dir>/<id>`; `orphan_port_tags::reclaim_orphan_port_tags` then removes the tags
-only if the recorded pid is provably gone (`shm_state::creator_verdict`, the one
-`kill(pid, 0)` predicate the state-file reclamation trusts; the reclaim names no
-liveness type of its own) and the directory (re-listed at that instant, never
-from the sweep's memory of it) holds nothing but regular files named
-`<prefix><port id><port-tag suffix>`. Anything else refuses the whole directory
-and names the offenders. The verb prints one line per node, runs ONE more
-sweep, prints its summary, and hands the SECOND sweep's convergence to the
-state-file gate. `--report-only` still runs the FIRST dead-node sweep (iceoryx2's
-own reclaim of a dead node's resources), prints the
-candidates the reclaim WOULD act on, removes no port tag, and skips the second
-sweep; "removes nothing" is true of the reclaim, not of the sweep. The reclaimer heals a machine that already carries the shape; the
-rmw destroy path is what stops it being minted. Extend the
-refusals, never the acceptance.
+A publisher destroyed while one of its loaned samples had been leaked used to
+strand its node directory: the port was deregistered, its `.port_tag` under
+`<root>/nodes/<id>/` outlived it, and the sweep failed the final `rmdir` on
+every sweep, forever. iceoryx2 removes that tag with the rest of a dead port's
+stale resources, so the shape no longer arises and the verb reports the sweep
+rather than healing it.
+
+### `--report-only` reads the mode before the walk
+
+`SweepMode` (`ipc_cleanup`) governs the dead-node half and the state-file half
+both. `sweep_dead_nodes` walks the registry once and reaches every dead node
+through `sweep_one_node`, which is the ONE classification: `SweepMode::Remove`
+is that classification followed by `DeadNodeView::blocking_remove_stale_resources`,
+and `SweepMode::ReportOnly` is the same classification with the removal never
+called, so a report names exactly the nodes a bare run removes. The per-node
+bookkeeping lines iceoryx2's own loop emitted are re-emitted through
+`cerulion_core::iceoryx_logger::emit_iceoryx_log` in the same order, so
+`classify_cleanup_failures` reads the shapes it always read.
+
+A report renders `CleanupReport::dead_nodes` as the would-sweep listing, by
+the entry name each node carries under the registry directory, capped at
+`NODES_SHOWN` with the fold the refusal listing uses, and closes the whole verb
+with one line saying nothing was removed. The listing is the set the sweep
+ACTS ON, which is not the set it gets off disk: `InsufficientPermissions` and
+`VersionMismatch` are raised from inside the removal, so which nodes refuse is
+knowable only by attempting, and `REMOVAL_CAN_STILL_BE_REFUSED` states that
+under the list rather than letting the heading promise a deletion. The counters stay at zero because
+nothing was attempted, not because nothing was refused, which is why the
+listing replaces the summary line rather than sitting beside it.
+
+WHERE THE TESTS LIVE, and why they are split. A bare `cerulion clean` reclaims
+`/tmp/*.shm_state` MACHINE WIDE: `shm_state::SHM_STATE_DIRECTORY` is a
+compile-time constant mirroring `iceoryx2_pal_configuration::TEMP_DIRECTORY`,
+iceoryx2 honours no `TMPDIR`, and no environment variable moves it, so the
+reclaim unlinks every state file whose creator is provably gone whoever owns
+it. No test may run the verb bare. The CLI arms
+(`crates/cerulion_cli/tests/trace_inspect_and_clean_cli_test.rs`) therefore pass
+`--report-only` only and prove what needs the real binary: the lines a user
+reads, and the registry byte for byte beneath them. The destructive direction
+is proven where it CAN be confined, over the isolated root in
+`crates/cerulion_cli_engine/tests/sweep_dead_nodes_test.rs`: `sweep_dead_nodes_with_config` takes the
+registry config explicitly and never reaches the state-file pass, so
+`SweepMode::Remove` there touches exactly one root and nothing else.
 
 ## 11. Workspace dependencies and compiler compatibility
 
-`workspace create` writes root `[workspace.dependencies]` by the BINARY's location
-(`find_cerulion_base` from `current_exe`, then baked `CARGO_MANIFEST_DIR`), never
-cwd: checkout builds use absolute `path` deps, others exact registry pins. Exposed
-as `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
-user overrides rewritten on recreation.
+`workspace create` writes root `[workspace.dependencies]` by the BINARY's location,
+never the current directory. The source checkout finder in `workspace.rs` first walks up
+from the CLI executable; if that finds no checkout, it checks the checkout recorded at
+build time (`CARGO_MANIFEST_DIR`); if neither is usable, it writes exact registry pins.
+Checkout dependencies use absolute `path` entries. The result is exposed as
+`CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
+and user overrides are rewritten on recreation.
 
 New workspaces pin the CLI's stable `RUSTC_RELEASE` in `rust-toolchain.toml`
 with the minimal profile only after installed-only `rustup run` verifies its
@@ -946,18 +1138,68 @@ including filesystems without hard-link support; never fall back to overwriting.
 selection, including environment and project configuration overrides. The built
 cdylib must match the host's full compiler fingerprint, checked at load before init.
 
+### Bundled starters
+
+`workspace create NAME --starter obstacle_avoidance` calls `starter.rs`.
+Its source payload lives under the engine's `src/starters/` so registry packages
+carry every embedded file. Node manifests use a `.txt` suffix in the payload to
+avoid nested-package exclusions; installed files retain their Cargo names.
+The source-sync test compares every node and graph file with the canonical
+example. `starter.toml` records the CLI version and full compiler requirements;
+normal workspace dependency/toolchain selection still applies.
+
+Stage a payload with ordinary umask-governed permissions inside a private
+sibling container, then publish the complete payload with
+rustix `RenameFlags::NOREPLACE`: Linux `renameat2` or macOS `renameatx_np`.
+Never replace an empty directory or dangling symlink. Construct the cleanup
+guard only after the container mkdir succeeds. The container stays owned until
+cleanup; publishing its child never frees or transfers the container name.
+Population or publication errors clean up only this call's staging tree and
+leave no partial destination. A kill during population (SIGKILL, or a Ctrl+C
+before any handler runs) skips the guard and leaves the hidden, private (mode
+0700) `.cerulion-starter-<32 hex>.tmp` container beside the destination,
+holding only that run's half-written payload; the CLI never removes a
+container it did not create in the same run, so the user removes it by hand
+(`cerulion clean` does not touch it). A filesystem
+that refuses the no-replace rename (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: some
+network, FUSE and overlay filesystems on Linux; SMB and FAT volumes on macOS)
+turns into a `Validation` refusal that names the parent and suggests a local
+filesystem; every other publication error propagates as `Io`. Other platforms
+refuse atomic publication.
+Ordinary `workspace create` reserves its final directory with an atomic mkdir
+before scaffolding, so whichever creation mode acquires the destination first
+wins without a competing creator writing into it. Only parent directories use
+recursive mkdir, retaining nested-name and missing-parent support.
+`workspace init` captures whether its folder exists before checking its manifest;
+an initially absent folder uses the same reservation, while existing-folder
+initialization remains supported.
+The engine tests pin collisions, racing destinations, staging ownership,
+source determinism, both error paths and the publication error mapping;
+`starter_cli_test` pins the command,
+unknown-value refusal, umask parity and manual creation through the real binary.
+The bundled controller test drives complete scan loans through an isolated
+transport and asserts published stop/cruise velocities, including empty and NaN
+scans; CI runs both canonical node crates serially.
+
 ## 12. The login gate
 
 Every command runs under a logged-in-ever identity. `command_needs_identity` in
-`crates/cerulion_cli/src/main.rs` exempts `login`, `completions` and the two
-internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help` and
-`--version` and the usage refusals `main` performs before the gate call answer
-above it and need no exemption. `ensure_login_gate` in
+`crates/cerulion_cli/src/main.rs` exempts `login`, `logout`, `completions`, `clean` and the
+two internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help`
+and `--version` and the usage refusals `main` performs before the gate call answer
+above it and need no exemption. The `clean` exemption is scoped to what the verb
+is: a sweep of this machine's own iceoryx2 bookkeeping that reads no account and
+opens no socket, and the remedy a machine that has never signed in needs most.
+It exempts the VERB, both flag forms, and it is not a precedent for a verb that
+reaches an account or a robot. `ensure_login_gate` in
 `crates/cerulion_cli_engine/src/login_cmd.rs` reads local state only: a machine
 that signed in once proceeds with zero network, offline and on an expired
 session. A machine that never signed in runs the device-code flow inline when
 stderr and stdin are both terminals, and otherwise refuses at once with exit 7
-rather than starting a ten minute poll nobody is watching.
+rather than starting a ten minute poll nobody is watching. A signed-out
+store (`cerulion logout` or Studio's "Sign out": `logged_in_ever` kept, no
+tokens) loads as `LoadedAuth::SignedOut` and the gate treats it like a machine
+that never signed in, with its own refusal text.
 
 The gate is on in every build, released or built from source. One escape exists
 for this repository's own runs: `CERULION_LOGIN_GATE` set to exactly `off`. The
@@ -973,8 +1215,93 @@ and points `CERULION_ACCOUNT_SERVICE` at a closed loopback port, so it meets the
 gate the way a user's machine does and reaches no network:
 `crates/cerulion_cli/tests/login_gate_e2e_test.rs` is the whole contract over the
 real binary, and `a_malformed_resim_is_refused_before_the_login_gate` in
-`replay_cli_test.rs` pins the one ordering property. A test that needs an
+`replay_cli_test.rs` pins the one ordering property. The `clean` exemption is
+pinned there in both directions: `cerulion clean --report-only` under an empty
+home exits 0 and prints its report, and `cerulion topic list` under the same home
+prints the whole refusal and exits 7. The family dispatch is pinned the same way:
+`cerulion schema list` (a verb family) under an empty home prints the whole refusal,
+exits 7 and writes nothing to stdout, and under a seeded home it runs. A test that needs an
 identity rather than an absent one provisions it:
 `cerulion_cli_engine::auth::seed_logged_in_at` from Rust, or
 `tools/ci/seed_test_login.sh <dir>` from a shell, both writing the `auth.json`
 a real sign-in writes, with `CERULION_HOME` pointed at the directory.
+
+## 13. Python node scaffolding
+
+`node create --lang python` (alias `node new`) emits an embedded-CPython `cdylib`
+and a `node.py` declaration. Python nodes never receive invented ports, reject
+`--raw-ffi`, validate port names as Python identifiers, and refuse every
+`node modify` operation; the author edits `node.py` and rebuilds. `node build`
+resolves Python via `CERULION_PYTHON`, `<workspace>/.venv/bin/python`, then
+`python3`, imports `node.py`, and regenerates the baked INFO block before Cargo
+runs. Schema names do not enter `INFO_BYTES` (the runtime parser binds only
+hashes and sizes): they ride a `// CERULION:PORT_SCHEMAS {...}` line inside the
+INFO markers, which `node_metadata::parse_node_metadata` reads and checks against
+the declared ports.
+
+## 14. Verb families: adding a top-level verb
+
+A new top-level verb (`cerulion <family> ...`) is a verb family in
+`crates/cerulion_cli/src/families/`, not a new `Commands` variant. `schema` is the
+worked example (`families/schema.rs`); the families still in `Commands` move over one
+at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
+
+1. Add `families/<family>.rs` with the clap definition as a one-variant
+   `#[derive(Subcommand)]` enum (the variant's doc comment is the verb's help line),
+   its action enum, and a unit struct implementing `VerbFamily`:
+   - `name`: the verb as typed.
+   - `listed_after`: the verb it is listed behind in help and completion, or `None`
+     for after every built-in verb. Families behind one verb keep their registration
+     order, and each sits behind the families already listed after an earlier one.
+   - `command`: `derived_verb::<YourCmd>()`, the family's one verb. The family never
+     sees the root command, so it cannot change a built-in verb, a root argument or the
+     root's help text.
+   - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
+   - `needs_identity`: `true` unless the verb must work on a machine that never signed
+     in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
+   - `run`: parse the action with `FromArgMatches`, run it, return the exit code;
+     `exit_code_of` gives the generic `Error: ...` mapping: exit 3 for a run that
+     stopped a node on a fatal error, exit 1 for every other error.
+2. Register it: `mod <family>;` and one entry in `FAMILIES` in `families/mod.rs`.
+3. Give every value-taking arg a completer, a `value_hint` or a free-form inventory
+   entry: `src/completion_wiring_tests.rs` walks the full command, families included.
+4. Engine logic stays in `cerulion_cli_engine`; the family module is parsing, dispatch
+   and output only, like the rest of this crate.
+
+`main` routes a registered family through `families::route` before the `Commands`
+parse: logging with the family's class, the iceoryx2 bridge, the login gate when
+`needs_identity`, then `run`. No edit to `Commands`, `log_verb_class`, `main`'s
+dispatch or the completion code is needed. `families::build` refuses, at command build
+time, two families with one name, a family whose name or alias already selects a verb
+(a built-in name or alias, clap's `help`, an earlier family), an unknown
+`listed_after` verb, and a `command` named for anything but the family (another verb,
+or a derived enum with no variant or with several). `the_registered_families_build`
+runs the production registry through it. The public-surface doc check reads the verbs
+of the families `FAMILIES` names, so a family file with no entry is not a verb there
+either.
+
+### Nested verbs: adding a verb under an existing verb
+
+A new `cerulion <parent> <verb>` under a verb that already exists (a `Commands` verb
+or a family) is a nested-verb set in `crates/cerulion_cli/src/families/nested/`, not a
+new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `find`,
+`bw`) is the worked example.
+
+1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";`, the verbs as
+   ONE `#[derive(Subcommand)]` enum, and a unit struct implementing `NestedVerbs`:
+   `parent`, `commands` (`nested::derived_verbs::<YourVerbs>()`), `log_class`,
+   `needs_identity` and `run`. Each method that takes matches gets the PARENT's
+   sub-matches, so `YourVerbs::from_arg_matches` parses them.
+2. Register it: `mod <set>;` and one entry in `NESTED` in `families/nested/mod.rs`.
+3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
+   for a family.
+
+`families::route` tries the nested sets first, then the families, with the same
+logging, bridge and login-gate order. A set hands over its verbs and never sees the
+parent, so it cannot change a built-in verb or the parent's help. `nested::attach`
+refuses, when the command is built, a parent that is not a verb, a verb with no name
+and a verb name the parent already selects (a built-in name or alias, `help`, an
+earlier set's verb). `the_registered_nested_verbs_attach` runs the production registry
+through it. The public-surface doc check reads the verbs of the sets `NESTED` names and
+files them under the verb their `PARENT` names. A flag on a built-in verb (such as
+`topic list -t`) is still a field of that verb.

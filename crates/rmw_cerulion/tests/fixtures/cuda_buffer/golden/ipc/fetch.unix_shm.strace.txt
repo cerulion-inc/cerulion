@@ -1,0 +1,8 @@
+socket(AF_UNIX, SOCK_STREAM, 0)   = 3<UNIX-STREAM:[INODE]>
+connect(3<UNIX-STREAM:[INODE]>, {sa_family=AF_UNIX, sun_path=@"cuda_vmm_<SERVE_PID>_0"}, 18) = 0
+recvmsg(3<UNIX-STREAM:[INODE]>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="X", iov_len=16}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[4</dmabuf:>]}], msg_controllen=24, msg_flags=MSG_CMSG_CLOEXEC}, MSG_CMSG_CLOEXEC) = 1
+socket(AF_UNIX, SOCK_STREAM, 0)   = 3<UNIX-STREAM:[INODE]>
+connect(3<UNIX-STREAM:[INODE]>, {sa_family=AF_UNIX, sun_path=@"cuda_vmm_<SERVE_PID>_0"}, 18) = 0
+recvmsg(3<UNIX-STREAM:[INODE]>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="X", iov_len=16}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[5</dmabuf:>]}], msg_controllen=24, msg_flags=MSG_CMSG_CLOEXEC}, MSG_CMSG_CLOEXEC) = 1
+socket(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0) = 3<UNIX:[INODE]>
+connect(3<UNIX:[INODE]>, {sa_family=AF_UNIX, sun_path="/control"}, 11) = -1 ENOENT (No such file or directory)

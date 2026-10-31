@@ -62,19 +62,24 @@ use cerulion_viz::sink::{
     classify_frame, classify_schema, non_tf_entity_for, reported_entity_for, route_key_for_topic,
     route_key_topic, ArchetypeKind, RenderProof,
 };
+use cerulion_viz::skeleton::UrdfConfig;
 use cerulion_viz::tap_manager::{AttachOutcome, TapManager, WakeMode};
-use cerulion_viz::worker::{InputFrames, VizControl, VizLogWorker, VizWorkerCounters};
+use cerulion_viz::worker::{
+    InputFrames, ModelLoadPhase, ModelLoadStatus, VizControl, VizLogWorker, VizWorkerCounters,
+};
 
 use crate::hygiene::{acquire_socket, SocketGuard};
 use crate::monitors::{MonitorPlane, WriteStamp};
 use crate::protocol::{
     parse_request, AttachResponse, AttachedEntry, ComposeLayoutResponse, ContainerSpec,
     DetachResponse, DiscoverResponse, DiscoveredEntry, DiscoveredRobot, DiscoveryLabel, Hello,
-    LayoutIntent, LayoutNode, LayoutSpec, ListResponse, MonitorsResponse, Placement,
-    RepresentationResponse, Request, Response, RetryHint, RunsResponse, SetBlueprintResponse,
-    SkippedDead, StatusResponse, TopicStatus, UndecodableReport, ViewSpec, WorkerStatus,
+    LayoutIntent, LayoutNode, LayoutSpec, ListResponse, ModelBindingStatus, ModelPhase,
+    ModelResponse, ModelStatus, MonitorsResponse, Placement, RepresentationResponse, Request,
+    Response, RetryHint, RunsResponse, SampleResponse, SetBlueprintResponse, SkippedDead,
+    StatusResponse, TopicStatus, UndecodableReport, ViewSpec, WorkerStatus,
 };
 use crate::runs::{fold_runs, local_reply, LocalArm, RemoteArm};
+use crate::sample::{rows_for, ArmError, SampleRings, SAMPLE_DEFAULT_ROWS, SAMPLE_MAX_ROWS};
 
 /// The shared retry clause of every UNKNOWN-verdict message vizd renders for a
 /// topic it could not resolve — the two arms of [`resolve_remote_attach_target`] and
@@ -291,6 +296,20 @@ struct TopicStat {
     frames_seen: u64,
     /// The once-resolved schema + archetype (set from the first decodable frame).
     resolved: Option<Resolved>,
+    /// Is [`Self::resolved`] a NAME-TABLE seed rather than a frame's verdict?
+    ///
+    /// The remote attach path seeds the resolution from the controller-provided
+    /// type name ([`classify_schema`]) so `status` / `list` show an archetype
+    /// before any frame flows. That table answers by NAME, and the sink's ladder
+    /// ([`classify_frame`]) lets CONTENT outrank it: a `sensor_msgs/PointCloud2`
+    /// whose fields are a voxel-delta layout renders as `VoxelMap`, not
+    /// `Points3D`, and an H.264 `CompressedImage` as `VideoStream`, not `Image`.
+    /// While this is `true` the poll thread still resolves the first decodable
+    /// frame and REPLACES the seed with the sink's verdict (the reflow follows),
+    /// so a seeded row cannot stay on the name table's answer for the tap's
+    /// lifetime. Cleared by the frame resolution; `false` for every resolution
+    /// that came from a frame.
+    archetype_from_name: bool,
     /// The ORIGIN ROBOT whose data THIS tap carries.
     ///
     /// Written only through [`DaemonState::set_origin_robot`], which releases the
@@ -912,6 +931,14 @@ struct DaemonState {
     ///
     /// [`MONITOR_SAMPLE_INTERVAL_NS`]: cerulion_viz::monitor::MONITOR_SAMPLE_INTERVAL_NS
     monitors: MonitorPlane,
+    /// The `sample` verb's rings: the newest frames of a topic a controller is
+    /// sampling right now, and nothing for any other topic.
+    ///
+    /// Held in the state the poll thread already locks every pass (the monitors'
+    /// reasoning, above), so feeding a ring adds no lock and no ordering. Cost on
+    /// a pass with nothing sampled: one lookup in an empty map per drained topic.
+    /// Bounds, TTL and the never-subscribes rule live in [`crate::sample`].
+    samples: SampleRings,
 }
 
 impl DaemonState {
@@ -1263,11 +1290,15 @@ impl SeedState {
         }
     }
 }
+#[cfg(test)]
+type ResetPlanHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// The shared, cloneable daemon context (all `Arc`s) passed to the poll thread +
 /// every controller thread. Its methods implement the request handlers.
 #[derive(Clone)]
 struct Ctx {
+    #[cfg(test)]
+    reset_plan_hook: ResetPlanHook,
     state: Arc<Mutex<DaemonState>>,
     manager: Arc<TransportManager>,
     /// The netd DEMAND plane — `attach_remote` demands a remote topic's
@@ -1717,6 +1748,62 @@ impl Ctx {
         })
     }
 
+    /// `sample`: the newest `n` frames of an attached topic, decoded.
+    ///
+    /// Arms (or keeps alive) the topic's ring under the state lock, copies out
+    /// shared handles to the newest frames, and decodes them AFTER the lock is
+    /// released, so a slow decode never stalls the poll thread. Opens nothing: a
+    /// topic with no tap is refused rather than attached.
+    fn sample(&self, id: u64, topic: String, n: Option<u64>) -> Response {
+        let n = match n {
+            None => SAMPLE_DEFAULT_ROWS,
+            Some(0) => {
+                return Response::error(
+                    Some(id),
+                    format!("sample: n must be between 1 and {SAMPLE_MAX_ROWS}, got 0"),
+                    Some(topic),
+                )
+            }
+            Some(n) => usize::try_from(n)
+                .unwrap_or(SAMPLE_MAX_ROWS)
+                .min(SAMPLE_MAX_ROWS),
+        };
+        let now = Instant::now();
+        let samples = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.taps.contains(&topic) {
+                return Response::error(
+                    Some(id),
+                    format!(
+                        "sample: '{topic}' is not attached. sample reads the frames an attach \
+                        already drains and opens no subscription of its own; attach the topic \
+                        first"
+                    ),
+                    Some(topic),
+                );
+            }
+            if let Err(ArmError::TooManyTopics) = st.samples.arm(&topic, now) {
+                return Response::error(
+                    Some(id),
+                    format!(
+                        "sample: {} topics are already being sampled; a topic stops counting \
+                        five seconds after its last sample",
+                        crate::sample::SAMPLE_MAX_TOPICS
+                    ),
+                    Some(topic),
+                );
+            }
+            st.samples.latest(&topic, n)
+        };
+        let walker = self.walker_snapshot();
+        Response::Sample(SampleResponse {
+            id,
+            ok: true,
+            topic,
+            rows: rows_for(samples, &walker),
+        })
+    }
+
     /// `runs`: the live `graph run`s this desk can see, this machine's
     /// own registry folded with every remote robot's.
     ///
@@ -1946,6 +2033,18 @@ impl Ctx {
                 None => self.attach(id, topic, entity),
             },
             Request::Detach { id, topic } => self.detach(id, topic),
+            Request::LoadModel {
+                id,
+                urdf_path,
+                topic,
+                model_id,
+                motor_joints,
+            } => self.load_model(id, urdf_path, topic, model_id, motor_joints),
+            Request::ModelStatus { id } => Response::Model(ModelResponse {
+                id,
+                ok: true,
+                model: self.worker_control.model_status().map(model_status_dto),
+            }),
             Request::Representation {
                 id,
                 topic,
@@ -1963,6 +2062,9 @@ impl Ctx {
             // The local run registry folded with every robot's. Two
             // bounded gathers, NO state lock, no wait (see `Ctx::runs`).
             Request::Runs { id, robot } => self.runs(id, robot),
+            // The newest frames of an ATTACHED topic from its ring. Reads what the
+            // poll thread already drains: no tap, no subscriber, no wait.
+            Request::Sample { id, topic, n } => self.sample(id, topic, n),
             // A subscription is scoped to the CONNECTION that asked for it, so
             // it is served by `dispatch_for_conn` (which knows the connection id) and
             // can never arrive here. Answering with a structured error rather than
@@ -2247,7 +2349,7 @@ impl Ctx {
     fn robot_network(&self) -> Result<&NetworkManager, String> {
         self.manager.network().ok_or_else(|| {
             "cerulion-vizd is not network-configured, so it cannot reach a remote robot — run \
-             the daemon with its network default (scouting ON), i.e. WITHOUT \
+             the daemon with its network default, i.e. WITHOUT \
              CERULION_VIZD_NETWORK=off"
                 .to_string()
         })
@@ -2264,8 +2366,8 @@ impl Ctx {
     ///    (the "no schema pin!" product bar), then resolve locally if the desk
     ///    already has that type, else fetch + seed as in (2).
     ///
-    /// A hard, precise error is returned ONLY when the robot genuinely does not
-    /// serve the topic/type, or the daemon is not network-configured.
+    /// Resolution errors include account authorization refusals, unavailable
+    /// metadata, and a daemon that is not network-configured.
     fn resolve_remote_type(
         &self,
         topic: &str,
@@ -2298,8 +2400,9 @@ impl Ctx {
 
     /// Learn a remote `topic`'s qualified ROS type from `robot`'s served CATALOG
     /// (the catalog verb). The query runs over the shared `cerulion-netd` query
-    /// plane (ONE zenoh session per computer) — a netd-unreachable error LOUDLY
-    /// degrades to vizd's OWN transient session (never a hard failure). A precise
+    /// plane (ONE zenoh session per computer). An ordinary LAN name may fall back
+    /// to vizd's OWN transient session on a netd-unreachable error; an account
+    /// route preserves the netd refusal instead. A precise
     /// error when the robot does not answer, or answers without a type name.
     ///
     /// The "no type for this topic" answer is an ABSENCE CLAIM, so it rides
@@ -2316,6 +2419,7 @@ impl Ctx {
     /// answered, netd reports `Settled` and a NON-empty gather while B's topics are
     /// still undiscovered, and that answer is a snapshot, not a verdict about the future.
     fn catalog_resolve_type(&self, robot: &str, topic: &str) -> Result<String, AttachError> {
+        let account_route = cerulion_netd::account_access::parse_robot_route(robot)?.is_some();
         match self.gather_catalog(Some(robot)) {
             Ok(gather) => {
                 let (catalogs, discovery) = (&gather.catalogs, gather.discovery);
@@ -2331,6 +2435,7 @@ impl Ctx {
                     AttachError::not_found_yet(message, &gather)
                 })
             }
+            Err(e) if account_route => Err(AttachError::from(e)),
             Err(e) => {
                 tracing::warn!(
                     robot = %robot, topic = %topic, error = %e,
@@ -2358,10 +2463,12 @@ impl Ctx {
 
     /// Fetch `name`'s `.msg` closure from `robot` (the `schema` verb), seed the
     /// walker with it, and return the now-resolvable `(name, hash)`. The
-    /// fetch runs over the shared `cerulion-netd` query plane — a netd-unreachable
-    /// error LOUDLY degrades to vizd's OWN transient session. A precise error when the
+    /// fetch runs over the shared `cerulion-netd` query plane. An ordinary LAN
+    /// name may fall back to vizd's OWN transient session; an account route
+    /// preserves the refusal instead. A precise error when the
     /// robot does not serve the type.
     fn fetch_and_seed_type(&self, robot: &str, name: &str) -> Result<(String, u64), String> {
+        let account_route = cerulion_netd::account_access::parse_robot_route(robot)?.is_some();
         match self.demand_plane.query_schema(robot, name) {
             // netd answered authoritatively — classify: the first reply carrying docs
             // wins (seed + resolve); an all-empty answer surfaces the robot's OWN
@@ -2370,6 +2477,7 @@ impl Ctx {
             Ok(replies) => {
                 self.seed_and_resolve_schema(robot, name, classify_schema_replies(replies))
             }
+            Err(e) if account_route => Err(e),
             Err(e) => {
                 tracing::warn!(
                     robot = %robot, name = %name, error = %e,
@@ -2462,6 +2570,9 @@ impl Ctx {
     /// ENQUEUED, NOT a render acknowledgement (the daemon never blocks on
     /// rendering) — or a structured error naming the problem VERBATIM.
     fn set_blueprint(&self, id: u64, layout: Option<LayoutSpec>) -> Response {
+        // Serialize derivation as well as submission: an installation reflow must
+        // never be overwritten by a reset plan built before the model existed.
+        let mut mode = self.layout_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Reset (absent/null layout) → back to the AUTO consolidated default
         // (Scene + one plot per attached topic, tiled — NOT the bare Scene-only Go2
         // default), re-enabling auto-recompose on attach/detach; a spec → validate it
@@ -2469,7 +2580,18 @@ impl Ctx {
         // error, never a silent drop) and, on a successful apply below, take over as
         // the EXPLICIT layout (attach/detach stops clobbering it).
         let (plan, reset) = match layout {
-            None => (self.consolidated_default_plan(), true),
+            None => {
+                #[cfg(test)]
+                {
+                    // Take the hook in its own statement so the mutex guard is
+                    // released before the hook runs (it may re-enter the daemon).
+                    let hook = self.reset_plan_hook.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                (self.consolidated_default_plan(), true)
+            }
             Some(spec) => match build_plan(&spec) {
                 Ok(plan) => (plan, false),
                 Err(e) => return Response::error(Some(id), e.to_string(), None),
@@ -2504,10 +2626,13 @@ impl Ctx {
             }
         }
 
-        // Soft-warn: view origins that match NO currently-attached topic. Never an
-        // error — the agent may lay out a dashboard BEFORE attaching the topics
-        // that populate it (Discover → SetLayout → Attach is a valid order too).
-        let entities: Vec<String> = attached.into_iter().map(|a| a.entity).collect();
+        // Soft-warn: view origins that match NO currently-attached topic and not the
+        // installed model root either. Never an error: the agent may lay out a
+        // dashboard BEFORE attaching the topics that populate it (Discover,
+        // SetLayout, Attach is a valid order too). The same grounding set feeds
+        // the reconnect snapshot, so a reset's own model pane (or an explicit
+        // layout naming `/models/<id>`) never draws a hint Studio cannot act on.
+        let entities = self.grounding_entities(attached);
         let origin_warnings = plan_origins_unmatched(&plan, &entities);
         for origin in &origin_warnings {
             tracing::warn!(
@@ -2532,7 +2657,7 @@ impl Ctx {
         } else {
             LayoutMode::Explicit
         };
-        match self.apply_layout_atomic(plan, new_mode) {
+        match self.apply_layout_locked(plan, new_mode, &mut mode) {
             Ok(()) => Response::SetBlueprint(SetBlueprintResponse {
                 id: Some(id),
                 ok: true,
@@ -2715,15 +2840,18 @@ impl Ctx {
         topic: Option<String>,
         opened: &[String],
     ) -> Response {
-        let msg = if opened.is_empty() {
+        let (removed, retained) = self.rollback_compose_attaches(opened);
+        let mut msg = if opened.is_empty() {
             msg
         } else {
-            format!(
-                "{msg} (rolled back {} tap(s) this compose_layout opened)",
-                opened.len()
-            )
+            format!("{msg} (rolled back {removed} tap(s) this compose_layout opened)")
         };
-        self.rollback_compose_attaches(opened);
+        if !retained.is_empty() {
+            msg.push_str(&format!(
+                "; model input attachments retained: {}",
+                retained.join("; ")
+            ));
+        }
         Response::error(Some(id), msg, topic)
     }
 
@@ -2745,14 +2873,28 @@ impl Ctx {
     /// job is to undo as much as it can, and failing it would strand the tap too.
     /// For a topic that was never demanded (a genuine local compose) the release is
     /// a documented no-op, so this is safe for every compose.
-    fn rollback_compose_attaches(&self, opened: &[String]) {
+    fn rollback_compose_attaches(&self, opened: &[String]) -> (usize, Vec<String>) {
         if opened.is_empty() {
-            return;
+            return (0, Vec::new());
         }
+        let mut removed_topics = Vec::new();
+        let mut retained = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
             for topic in opened {
+                if let Some(route) = st
+                    .stats
+                    .get(topic)
+                    .and_then(|stat| stat.route_key.as_deref())
+                {
+                    if let Err(error) = self.cancel_owned_model_load(route) {
+                        retained.push(format!("{topic}: {error}"));
+                        continue;
+                    }
+                }
                 st.taps.detach(topic);
+                st.samples.forget(topic);
+                removed_topics.push(topic);
                 let removed = st.stats.remove(topic);
                 // Monitors: and the MONITOR ROW, by the same rule the
                 // two lines around it follow — the rollback is the inverse of what
@@ -2794,7 +2936,7 @@ impl Ctx {
                 st.wake_requested.remove(topic);
             }
         }
-        for topic in opened {
+        for topic in &removed_topics {
             if let Err(e) = perform_remote_release(self.demand_plane.as_ref(), &self.state, topic) {
                 tracing::warn!(
                     topic = %topic, error = %e,
@@ -2805,9 +2947,11 @@ impl Ctx {
         }
         self.refresh_attached_snapshot();
         tracing::warn!(
-            rolled_back = opened.len(),
-            "compose_layout: a failure after attaching rolled back the tap(s) this call opened"
+            rolled_back = removed_topics.len(),
+            retained = retained.len(),
+            "compose_layout: rollback completed; model-owned attachments are retained"
         );
+        (removed_topics.len(), retained)
     }
 
     /// The entity set the compose compiler GROUNDED the
@@ -3106,6 +3250,7 @@ impl Ctx {
             return self.attach_for_compose_via_demand_plane(topic);
         }
         let mut st = self.state.lock().unwrap();
+        self.check_model_route(&st, topic, &route_key_for_topic(topic, None))?;
         // This is the LOCAL arm of compose (the remote arm above
         // routes through `attach_remote`), and it takes the same
         // `WakeMode::Listener` as `attach_local` for the same reason — a topic
@@ -3253,12 +3398,20 @@ impl Ctx {
     /// reapply grounding warn current: if every topic detaches, a later reconnect
     /// re-applying the stored layout warns it now grounds nothing.
     fn refresh_attached_snapshot(&self) {
-        let entities = self
-            .attached_render_infos()
-            .into_iter()
-            .map(|a| a.entity)
-            .collect();
-        set_attached_entities_snapshot(entities);
+        set_attached_entities_snapshot(self.grounding_entities(self.attached_render_infos()));
+    }
+
+    /// The ONE entity set a view origin can ground on: every attached render
+    /// entity plus the daemon's own installed-model root (`/models/<id>`), which
+    /// no topic attaches. Both consumers of the origin-grounding hint read it,
+    /// `set_blueprint` (reset and explicit) and the reconnect snapshot, so they
+    /// cannot disagree about the auto layout's model pane.
+    fn grounding_entities(&self, attached: Vec<AttachedRender>) -> Vec<String> {
+        let mut entities: Vec<String> = attached.into_iter().map(|a| a.entity).collect();
+        if let Some(root) = self.installed_model_root() {
+            entities.push(format!("/{root}"));
+        }
+        entities
     }
 
     /// Re-derive + apply the consolidated default layout ([`default_layout`]) from
@@ -3300,7 +3453,18 @@ impl Ctx {
     fn consolidated_default_plan(&self) -> BlueprintPlan {
         // `attached_render_infos` has already folded the current set in.
         let attached = self.attached_render_infos();
-        default_layout_excluding(&attached, &self.logged_entities_snapshot())
+        let plan = default_layout_excluding(&attached, &self.logged_entities_snapshot());
+        match self.installed_model_root() {
+            Some(root) => with_model_view(plan, &root),
+            None => plan,
+        }
+    }
+
+    fn installed_model_root(&self) -> Option<String> {
+        self.worker_control
+            .model_status()
+            .filter(|status| status.phase == ModelLoadPhase::Installed)
+            .map(|status| status.root)
     }
 
     /// Record entities into the run's EVER-LOGGED set.
@@ -3371,9 +3535,18 @@ impl Ctx {
         new_mode: LayoutMode,
     ) -> Result<(), cerulion_viz::worker::VizControlError> {
         let mut guard = self.layout_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_layout_locked(plan, new_mode, &mut guard)
+    }
+
+    fn apply_layout_locked(
+        &self,
+        plan: BlueprintPlan,
+        new_mode: LayoutMode,
+        mode: &mut std::sync::MutexGuard<'_, LayoutMode>,
+    ) -> Result<(), cerulion_viz::worker::VizControlError> {
         let result = self.worker_control.set_blueprint(plan);
         if result.is_ok() {
-            *guard = new_mode;
+            **mode = new_mode;
         }
         result
     }
@@ -3660,6 +3833,9 @@ impl Ctx {
         // — no spurious tap is opened.
         let already = {
             let mut st = self.state.lock().unwrap();
+            if let Err(error) = self.check_model_route(&st, &topic, &route_key) {
+                return Response::error(Some(id), error, Some(topic));
+            }
             let outcome = match st.taps.attach(
                 &self.manager,
                 &topic,
@@ -3826,6 +4002,12 @@ impl Ctx {
         robot: String,
         schema: Option<String>,
     ) -> Response {
+        // Validate before a pinned built-in can bypass catalog/schema lookup.
+        // Account identity routes must never become ordinary LAN robot names.
+        if let Err(error) = cerulion_netd::account_access::parse_robot_route(&robot) {
+            return Response::error(Some(id), error, Some(topic));
+        }
+
         // Guardrail 5: entity-override stability, checked EARLY (before any
         // network round-trip). A re-attach whose override resolves to a DIFFERENT
         // render entity than the one this topic is already known under is refused —
@@ -3849,8 +4031,8 @@ impl Ctx {
         // 1. Resolve the topic's ROS type → the wire hash. A pinned schema the
         //    walker already knows is a network-free fast path; otherwise the type
         //    is catalog-resolved (schema-less) and/or its closure fetched + seeded
-        //    over the daemon's ONE zenoh session. Precise errors on a
-        //    genuinely-unserved topic/type or a network-less daemon.
+        //    over netd's query plane. An account route keeps its authorization
+        //    and metadata errors without opening vizd's transient LAN session.
         let (schema_name, schema_hash) =
             match self.resolve_remote_type(&topic, &robot, schema.as_deref()) {
                 Ok(pair) => pair,
@@ -3875,7 +4057,7 @@ impl Ctx {
                 format!(
                     "remote viz for '{topic}' from robot '{robot}' needs a network-configured \
                      daemon, but this cerulion-vizd is LOCAL-ONLY (CERULION_VIZD_NETWORK=off) — \
-                     restart it with its network default (scouting ON) to enable the remote arm"
+                     restart it with its network default to enable the remote arm"
                 ),
                 Some(topic),
             );
@@ -3925,7 +4107,10 @@ impl Ctx {
         //    the controller-provided schema + its archetype (there is no frame yet
         //    to resolve from; the poll thread back-fills the archetype once frames
         //    flow). classify_schema is the name-based table; a schema not in it
-        //    stays archetype=null until the first frame (no fabrication).
+        //    stays archetype=null until the first frame (no fabrication), and a
+        //    schema IN it is a provisional seed the first frame REPLACES when the
+        //    sink's content ladder outranks the name (a voxel-delta PointCloud2 is
+        //    a `VoxelMap`, an H.264 CompressedImage a `VideoStream`).
         //    `route_key` was resolved at the top (the entity-stability check).
         let archetype = classify_schema(&schema_name);
         // Attach under the lock, but DROP the guard before any rollback (the release
@@ -3938,20 +4123,31 @@ impl Ctx {
         // error rolls the demand back.
         let commit = {
             let mut st = self.state.lock().unwrap();
-            match st.taps.attach(
-                &self.manager,
-                &topic,
-                entity_override.as_deref(),
-                // A REMOTE/mirror topic gets the wake. Its
-                // publisher is `cerulion-netd`'s OWN desk-side
-                // `create_ingress_publisher` — on THIS machine, in a process we
-                // own, never elision-armed (arming is graph-runtime-only)
-                // — so the wake costs the desk one `sendto` per frame and bills
-                // the robot nothing. This is the whole of the measured
-                // 11.8 ms p50, and it is the ONLY class that gets a listener.
-                WakeMode::Listener,
-            ) {
-                Err(e) => RemoteCommit::TapErr(e.to_string()),
+            match self
+                .check_model_route(&st, &topic, &route_key)
+                .and_then(|()| {
+                    // Refused before the tap is touched, so the surviving
+                    // attach keeps its tap, its demand and its resolution.
+                    let pinned = st
+                        .stats
+                        .get(&topic)
+                        .filter(|_| st.taps.contains(&topic))
+                        .and_then(|s| s.pinned_schema.as_deref());
+                    refuse_changed_schema_pin(&topic, pinned, &schema_name)
+                })
+                .and_then(|()| {
+                    st.taps
+                        .attach(
+                            &self.manager,
+                            &topic,
+                            entity_override.as_deref(),
+                            // Desk-side mirror publishers provide wake notifications.
+                            WakeMode::Listener,
+                        )
+                        .map_err(|error| error.to_string())
+                }) {
+                Err(e) if st.taps.contains(&topic) => RemoteCommit::Conflict(e),
+                Err(e) => RemoteCommit::TapErr(e),
                 Ok(outcome) => {
                     // This topic ASKED for a wake. Recorded
                     // under the same lock as the tap, so `status` can tell a
@@ -3986,14 +4182,11 @@ impl Ctx {
                             // tell a version skew from a type it never compiled.
                             stat.pinned_schema = Some(schema_name.clone());
                             // Seed the resolution from the known type so status/list show
-                            // it immediately (the poll thread refines the archetype on the
-                            // first frame if the name was not in the classify table).
-                            if let Some(arch) = archetype {
-                                stat.resolved = Some(Resolved {
-                                    schema: schema_name.clone(),
-                                    archetype: arch,
-                                });
-                            }
+                            // it immediately, and take the archetype this reply reports
+                            // from the stat (see `seed_name_resolution`: a re-attach of a
+                            // tap whose first frame already answered keeps and reports
+                            // that verdict, never the name table's).
+                            let archetype = seed_name_resolution(stat, &schema_name, archetype);
                             // Stamp the tap's ORIGIN ROBOT. Re-stamped on an
                             // AlreadyAttached re-attach too, so a topic tapped by a
                             // seam that could not attribute it — `compose_layout`'s
@@ -4007,14 +4200,14 @@ impl Ctx {
                             // old row being served with nothing able to release it.
                             // Last in the block because the helper takes `st` whole.
                             st.retarget_origin_robot(&topic, robot.clone());
-                            RemoteCommit::Ok(already)
+                            RemoteCommit::Ok { already, archetype }
                         }
                     }
                 }
             }
         };
-        let already = match commit {
-            RemoteCommit::Ok(already) => already,
+        let (already, archetype) = match commit {
+            RemoteCommit::Ok { already, archetype } => (already, archetype),
             RemoteCommit::Conflict(msg) => {
                 // Refuse WITHOUT releasing the demand: the surviving attach's `detach`
                 // releases the topic-keyed demand; releasing here would tear down a
@@ -4093,6 +4286,22 @@ impl Ctx {
         })
     }
 
+    /// Called under the attachment lock, which also serializes model admission.
+    /// A dead worker must not prevent cleanup of an unrelated tap or demand.
+    fn cancel_owned_model_load(
+        &self,
+        route: &str,
+    ) -> Result<(), cerulion_viz::worker::ModelLoadError> {
+        if self
+            .worker_control
+            .model_status()
+            .is_some_and(|model| model.route_key == route)
+        {
+            self.worker_control.cancel_model_load(route)?;
+        }
+        Ok(())
+    }
+
     /// `detach`: drop the tap + its stats entry, and
     /// RELEASE the topic's netd DEMAND if it held one. Releasing the demand
     /// (removing the `demanded` entry) lets netd's refcount-0 teardown tear the
@@ -4105,6 +4314,19 @@ impl Ctx {
     fn detach(&self, id: u64, topic: String) -> Response {
         let detached = {
             let mut st = self.state.lock().unwrap();
+            if let Some(route) = st
+                .stats
+                .get(&topic)
+                .and_then(|stat| stat.route_key.as_deref())
+            {
+                if let Err(error) = self.cancel_owned_model_load(route) {
+                    return Response::error(
+                        Some(id),
+                        format!("cannot detach model input: {error}; model unloading is unsupported; restart the visualization session to release it"),
+                        Some(topic),
+                    );
+                }
+            }
             let d = st.taps.detach(&topic);
             let removed = st.stats.remove(&topic);
             // Monitors: the monitor row dies with the tap it was
@@ -4125,6 +4347,9 @@ impl Ctx {
             // The wake REQUEST dies with the tap, so a later
             // local attach of the same name is not reported as a degraded remote.
             st.wake_requested.remove(&topic);
+            // A `sample` ring dies with its tap, so a re-attach never serves frames
+            // from the previous attachment.
+            st.samples.forget(&topic);
             d
         };
         // Release the netd demand (outside the tap lock — a network round-trip).
@@ -4151,6 +4376,101 @@ impl Ctx {
             topic,
             detached,
         })
+    }
+    /// Admit a model without touching the filesystem or discovering topics. Holding
+    /// `state` until admission pins the route against detach or a concurrent alias.
+    /// The drain also enqueues its batch under `state`, so an old attachment's
+    /// frames cannot arrive after an install admitted through a reused route.
+    fn load_model(
+        &self,
+        id: u64,
+        urdf_path: String,
+        topic: String,
+        model_id: String,
+        motor_joints: Vec<String>,
+    ) -> Response {
+        if let Err(error) = validate_model_request(&urdf_path, &topic, &model_id, &motor_joints) {
+            return Response::error(Some(id), error, Some(topic));
+        }
+        let st = self.state.lock().unwrap();
+        let Some(stat) = st.stats.get(&topic).filter(|_| st.taps.contains(&topic)) else {
+            return Response::error(
+                Some(id),
+                "load_model requires an existing exact topic attachment",
+                Some(topic),
+            );
+        };
+        let Some(route) = stat.route_key.as_ref() else {
+            return Response::error(
+                Some(id),
+                "attached topic has no committed render route",
+                Some(topic),
+            );
+        };
+        let schema = stat
+            .resolved
+            .as_ref()
+            .map(|r| r.schema.as_str())
+            .or(stat.pinned_schema.as_deref());
+        if let Some(schema) = schema.filter(|schema| *schema != "unitree_go/LowState") {
+            return Response::error(Some(id), format!("model joints require unitree_go/LowState, but attached topic resolves to {schema}"), Some(topic));
+        }
+        let entity = non_tf_entity_for(route);
+        if st.stats.iter().any(|(other, stat)| {
+            other != &topic
+                && stat
+                    .route_key
+                    .as_deref()
+                    .is_some_and(|key| non_tf_entity_for(key) == entity)
+        }) {
+            return Response::error(
+                Some(id),
+                "model route is shared by another attached topic; use a unique entity route",
+                Some(topic),
+            );
+        }
+        let config = UrdfConfig {
+            default_path: urdf_path.clone(),
+            robot_root: format!("models/{model_id}"),
+            motor_joints,
+        };
+        match self
+            .worker_control
+            .load_model(PathBuf::from(urdf_path), config, route.clone())
+        {
+            Ok(status) => Response::Model(ModelResponse {
+                id,
+                ok: true,
+                model: Some(model_status_dto(status)),
+            }),
+            Err(error) => Response::error(Some(id), error.to_string(), Some(topic)),
+        }
+    }
+
+    /// Called only while holding `state`, at each attachment commit seam. An
+    /// admitted model owns one input route; another topic must not feed it.
+    fn check_model_route(&self, st: &DaemonState, topic: &str, route: &str) -> Result<(), String> {
+        let Some(model) = self.worker_control.model_status() else {
+            return Ok(());
+        };
+        // All daemon admissions hold `state`, so a new load cannot replace this
+        // Failed snapshot before cancellation checks whether SDK writes began.
+        // Do not parse error text: retryable preflight failures return Ok(false),
+        // while partial SDK submissions retain ownership through RestartRequired.
+        if model.phase == ModelLoadPhase::Failed
+            && self.worker_control.cancel_model_load(&model.route_key) == Ok(false)
+        {
+            return Ok(());
+        }
+        if non_tf_entity_for(&model.route_key) == non_tf_entity_for(route)
+            && model.phase != ModelLoadPhase::Cancelled
+            && st.stats.iter().any(|(other, stat)| {
+                other != topic && stat.route_key.as_ref() == Some(&model.route_key)
+            })
+        {
+            return Err("render route is reserved by a robot model bound to another topic".into());
+        }
+        Ok(())
     }
 
     /// `list`: the attached taps with their resolved route/entity/schema.
@@ -4321,6 +4641,7 @@ impl Ctx {
             dropped_frames: self.counters.dropped_frames.load(Ordering::Relaxed),
             dropped_batches: self.counters.dropped_batches.load(Ordering::Relaxed),
             coalesced_frames: self.counters.coalesced_frames.load(Ordering::Relaxed),
+            absorbed_batches: self.counters.absorbed_batches.load(Ordering::Relaxed),
             reconnects: self.counters.reconnects.load(Ordering::Relaxed),
         };
         Response::Status(StatusResponse {
@@ -5019,8 +5340,12 @@ fn decide_route_commit(
 /// `detach`, so releasing here would tear a still-used mirror down) from a TAP error
 /// (refuse AND roll the demand back, since no tap survives).
 enum RemoteCommit {
-    /// The tap committed — `already_attached`.
-    Ok(bool),
+    /// The tap committed: `already_attached`, and the archetype to REPORT (the
+    /// stat's frame verdict when it already has one, else the name seed).
+    Ok {
+        already: bool,
+        archetype: Option<ArchetypeKind>,
+    },
     /// A conflicting override — refuse, do NOT release the demand.
     Conflict(String),
     /// The tap open failed — refuse AND release the demand (rollback).
@@ -5120,10 +5445,12 @@ fn build_plan(spec: &LayoutSpec) -> Result<BlueprintPlan, LayoutError> {
     Ok(BlueprintPlan {
         root: build_node(&spec.root)?,
         auto_views: spec.auto_views,
-        // `set_blueprint` is a HAND-AUTHORED (power-user) layout — never
-        // auto-decorated (it stays theirs). The `compose_layout` compiler AND the
-        // built-in go2 default emit DECORATED plans; only a hand-authored
-        // set_blueprint plan carries `decorate: false`.
+        // `set_blueprint` is a HAND-AUTHORED (power-user) layout: `decorate: false`
+        // keeps its plots' own time range (no trailing window, no display axis). The
+        // `compose_layout` compiler AND the built-in go2 default emit DECORATED
+        // plans; only a hand-authored set_blueprint plan carries `false`. The stage
+        // Background is viewer chrome, not a decoration: it rides EVERY spatial view
+        // regardless of this flag (see `BlueprintPlan::decorate`).
         decorate: false,
     })
 }
@@ -5232,8 +5559,8 @@ pub trait DemandPlane: Send + Sync {
     fn release(&self, robot: &str, topic: &str) -> Result<(), String>;
     /// Query `robot`'s topic CATALOG over netd's shared session (the
     /// schema-less attach's type resolve). An `Err` means netd could not RUN the query
-    /// (unreachable / not network-configured), so the caller LOUDLY degrades to its OWN
-    /// transient zenoh session. Folds vizd's per-daemon catalog GET onto netd's ONE
+    /// (unreachable / not network-configured). Ordinary LAN names may use the
+    /// transient zenoh fallback; account routes preserve the refusal. Folds onto netd's ONE
     /// session.
     ///
     /// **An `Ok` is NOT on its own authoritative.** Reading
@@ -5303,7 +5630,8 @@ pub trait DemandPlane: Send + Sync {
     }
     /// Fetch `requested`'s `.msg`/YAML closure from `robot` over netd's
     /// shared session (the schema fetch + seed). `Ok` (possibly empty) is
-    /// authoritative; an `Err` triggers the transient-session fallback.
+    /// authoritative; an `Err` may use the transient fallback for ordinary LAN names
+    /// only. Account routes preserve the error without querying another transport.
     fn query_schema(&self, robot: &str, requested: &str) -> Result<Vec<SchemaReply>, String>;
     /// Ask which runs are LIVE on `robot` (or on every announcing
     /// robot, `None`) over netd's shared session — the REMOTE arm of the `runs`
@@ -6098,7 +6426,7 @@ fn catalog_no_answer_error(robot: &str, topic: &str) -> String {
     format!(
         "robot '{robot}' did not answer a schema catalog (is it reachable, and is its gateway \
          serving schemas? try naming the type explicitly as '{topic}=pkg/Type', or add --connect \
-         <locator> if scouting can't reach it)"
+         <locator> (CERULION_VIZD_CONNECT) if discovery can't reach it)"
     )
 }
 
@@ -6360,8 +6688,10 @@ fn resolve_from_frame(
             ))
         }
     };
+    // Decode by HASH, not by `qname`: two identities can share a qualified
+    // name, and only the hash picks the frame's own layout.
     let fv = walker
-        .walk(&qname, frame)
+        .walk_by_hash(frame)
         .map_err(|_| ResolveFailure::Decode(qname.clone()))?;
     // Deliberately the UNMEMOIZED ladder, not `SinkState::archetype_for`
     // here: this is a ONE-SHOT attach/discover peek over a single drained
@@ -6451,6 +6781,29 @@ fn undecodable_report(diagnosis: &UnknownHashDiagnosis) -> UndecodableReport {
     }
 }
 
+/// The remote attach path's check that a re-attach names the type the tap
+/// already carries. `pinned` is the schema the topic's live remote tap was
+/// attached with (`None` when the topic has no remote tap). The mirror was
+/// demanded at that type's hash and its frames are that type, so a different
+/// pin is refused: answering it would report the new name for frames that are
+/// still the old type, and once a frame has decoded the reply would pair that
+/// name with the frames' archetype while `status` and `list` keep the old
+/// schema. The same name, or no earlier pin, passes.
+fn refuse_changed_schema_pin(
+    topic: &str,
+    pinned: Option<&str>,
+    requested: &str,
+) -> Result<(), String> {
+    match pinned {
+        Some(pinned) if pinned != requested => Err(format!(
+            "topic '{topic}' is already attached with schema '{pinned}', so it cannot be \
+             re-attached with schema '{requested}'; detach '{topic}' first to attach it with a \
+             different schema"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Fold one resolution attempt into a topic's stats — the ONE place
 /// the verdict, the latch and the log stay in agreement.
 ///
@@ -6460,6 +6813,74 @@ fn undecodable_report(diagnosis: &UnknownHashDiagnosis) -> UndecodableReport {
 /// topic and no failure at all, while `ShortHeader`/`Decode` are framing
 /// conditions with their own remedies, and folding them into the type-identity
 /// regime would let one swallow the other's loud head.
+/// The drain loop's resolution arm: resolve `stat` from `first` (the pass's
+/// first frame) when the stat still needs a frame's verdict, and say whether it
+/// newly resolved (the caller reflows the default layout on `true`).
+///
+/// A stat needs a frame while it is unresolved OR while its resolution is the
+/// remote attach path's NAME-TABLE seed ([`TopicStat::archetype_from_name`]):
+/// the seed is what `status` / `list` showed before any frame, and the first
+/// decodable frame replaces it with the sink's content verdict, so a remotely
+/// attached voxel-delta `PointCloud2` moves from the seeded `Points3D` to the
+/// rendered `VoxelMap` (and its layout follows) exactly as a local attach's
+/// frame peek would have reported from the start. Once a frame has answered,
+/// the resolution is final (a topic's schema is stable) and this is a no-op.
+///
+/// Classified, not a bare `Option`: a topic whose frames this build cannot
+/// decode never resolves, so it re-enters this arm on EVERY poll, which is
+/// exactly the flood `record_resolution`'s latch exists to bound, and exactly
+/// the state a Studio row must be able to show. The pinned type name (set by
+/// the remote attach path) is what lets the verdict say "rebuild" or "acquire"
+/// instead of just printing a hash.
+/// The remote attach path's resolution seed, and the archetype its reply
+/// reports. `archetype` is the name table's answer for `schema_name`
+/// ([`classify_schema`]), computed because a fresh mirror has no frame to peek
+/// at.
+///
+/// A stat that already holds a FRAME's verdict keeps it and the reply reports
+/// it: an `AlreadyAttached` re-attach of a voxel-delta `PointCloud2` stays
+/// `VoxelMap` on the reply, on `status` / `list` and in the layout, where
+/// re-seeding would have regressed all of them to `Points3D` until the next
+/// poll. A stat with no resolution, or one holding only an earlier seed, takes
+/// the seed, flagged so the first decodable frame replaces it
+/// ([`TopicStat::archetype_from_name`], [`resolve_from_first_frame`]). A name
+/// the table does not map seeds nothing (no fabrication) and reports `None`.
+fn seed_name_resolution(
+    stat: &mut TopicStat,
+    schema_name: &str,
+    archetype: Option<ArchetypeKind>,
+) -> Option<ArchetypeKind> {
+    if let Some(held) = stat.resolved.as_ref().filter(|_| !stat.archetype_from_name) {
+        return Some(held.archetype);
+    }
+    if let Some(arch) = archetype {
+        stat.resolved = Some(Resolved {
+            schema: schema_name.to_string(),
+            archetype: arch,
+        });
+        stat.archetype_from_name = true;
+    }
+    archetype
+}
+
+fn resolve_from_first_frame(
+    stat: &mut TopicStat,
+    walker: &FrameWalker,
+    first: Option<&[u8]>,
+    topic: &str,
+) -> bool {
+    if stat.resolved.is_some() && !stat.archetype_from_name {
+        return false;
+    }
+    let Some(first) = first else {
+        return false;
+    };
+    let candidate = stat.pinned_schema.clone();
+    let outcome = resolve_from_frame(walker, first, candidate.as_deref());
+    record_resolution(stat, topic, &outcome);
+    outcome.is_ok()
+}
+
 fn record_resolution(
     stat: &mut TopicStat,
     topic: &str,
@@ -6469,6 +6890,7 @@ fn record_resolution(
         Ok(r) => {
             stat.undecodable = None;
             stat.resolved = Some(r.clone());
+            stat.archetype_from_name = false;
             report_schema_hash_resolved(&mut stat.unknown_hash, DiagnosisVantage::Resolver, topic);
         }
         Err(ResolveFailure::UnknownHash(diagnosis)) => {
@@ -6530,11 +6952,20 @@ fn report_tap_gap(latch: &mut FailureRegimeLatch, topic: &str, missed: u64, tota
     }
 }
 
+#[cfg(test)]
+impl std::fmt::Debug for Ctx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Ctx (test inspection)")
+    }
+}
+
 /// A running daemon: the shutdown flag + the poll/accept/connection threads + the
 /// socket cleanup guard. Dropping it (or [`shutdown`](Self::shutdown)) stops
 /// every thread, drops the taps + worker, and removes the socket + pidfile.
 #[derive(Debug)]
 pub struct RunningDaemon {
+    #[cfg(test)]
+    test_context: Ctx,
     shutdown: Arc<AtomicBool>,
     accept_handle: Option<JoinHandle<()>>,
     poll_handle: Option<JoinHandle<()>>,
@@ -7133,6 +7564,8 @@ pub fn start_on_socket(
     let worker_control = worker.control();
     let shutdown = Arc::new(AtomicBool::new(false));
     let ctx = Ctx {
+        #[cfg(test)]
+        reset_plan_hook: Arc::new(Mutex::new(None)),
         state: Arc::new(Mutex::new(DaemonState::default())),
         manager,
         demand_plane,
@@ -7233,6 +7666,8 @@ pub fn start_on_socket(
 
     tracing::info!(socket = %socket_path.display(), "cerulion-vizd listening (NDJSON control protocol)");
     Ok(RunningDaemon {
+        #[cfg(test)]
+        test_context: ctx.clone(),
         shutdown,
         accept_handle: Some(accept_handle),
         poll_handle: Some(poll_handle),
@@ -7447,14 +7882,15 @@ fn elapsed_ns(origin: Instant) -> u64 {
 /// The most consecutive passes that may SKIP their wait on a
 /// drained backlog before one is forced to wait anyway.
 ///
-/// **This bound is the notify storm's structural defence, not a tuning knob.**
-/// The listener's event queue is drained by the multiplexer's callback, which
-/// only runs inside a wait — so a pass that skips its wait leaves the listener
-/// UNDRAINED. A topic publishing faster than the loop drains would take the
-/// backlog arm on every pass forever, its `AF_UNIX SOCK_DGRAM` socket would
-/// fill, and then EVERY publisher notify pays `FailedToDeliverSignal` plus a
-/// ~2 KB iceoryx2 warn, the exact failure listener-less taps removed, re-created on the
-/// desk's own netd.
+/// **This bound keeps the loop's waits from being skipped indefinitely, not a
+/// tuning knob.** The listener's event queue is drained by the multiplexer's
+/// callback, which only runs inside a wait, so a pass that skips its wait
+/// leaves the listener UNDRAINED. A topic publishing faster than the loop
+/// drains would otherwise take the backlog arm on every pass forever and the
+/// loop would never wait again, which is a liveness problem for everything else
+/// the multiplexer is responsible for. (Under iceoryx2 0.9.1 it was also a
+/// producer-side failure: the undrained socket filled and every publisher
+/// notify took a logged failure path. 0.10 removed that half.)
 ///
 /// Eight keeps the skip useful (a `POLL_MAX`-capped drain gets eight immediate
 /// re-drains, i.e. up to 32 768 frames per tap with no wait) while the undrained
@@ -7688,6 +8124,15 @@ fn poll_loop(
     // starting immediately is what makes those windows describe the daemon's uptime
     // rather than the sampler's phase.
     let mut last_monitor_sample: Option<Instant> = None;
+    // Route keys of detached taps the worker has not been told about yet: taken
+    // from the tap manager in the drain's lock scope, offered to the worker in
+    // front of the same pass's frames, and kept for the next pass when the queue
+    // was full (`VizLogWorker::try_enqueue_tick`). A SET, so the backlog a wedged
+    // viewer builds is bounded by the DISTINCT keys detached while it is wedged,
+    // however many times each is detached and re-attached: a forget is idempotent
+    // on the worker (`SinkState::input_detached` removes the input's state), so
+    // one entry per key says everything a repeat would.
+    let mut pending_detached: BTreeSet<String> = BTreeSet::new();
     while !shutdown.load(Ordering::Acquire) {
         let iteration_start = Instant::now();
         ctx.poll_iterations.fetch_add(1, Ordering::Relaxed);
@@ -7750,9 +8195,13 @@ fn poll_loop(
         // The topics this pass drained, for the demoter to
         // settle the PREVIOUS wait's fires against.
         let mut drained_topics: Vec<String> = Vec::new();
-        let batch = {
+        let drained_any = {
             let mut st = ctx.state.lock().unwrap();
             let polled = st.taps.poll_detailed(POLL_MAX);
+            // Same lock scope as the drain: a tap detached before this pass drained
+            // delivered nothing to it, so its key is ordered after every frame it did
+            // deliver and before any frame of a re-attach.
+            pending_detached.extend(st.taps.take_detached());
             // Settle + demote BEFORE the wake sources are read,
             // so a demoted topic's listener is gone from THIS pass's wait rather
             // than one pass later.
@@ -7773,8 +8222,14 @@ fn poll_loop(
             }
             wake_sources = st.taps.wake_sources();
             let now = Instant::now();
+            // The `sample` verb: drop any ring past its five-second deadline.
+            st.samples.sweep(now);
             let mut input_frames = Vec::with_capacity(polled.len());
             for p in polled {
+                // Feed this topic's ring, if a controller is sampling it. Before
+                // the frames move into the render batch below; with no ring this
+                // is one lookup.
+                st.samples.observe(&p.topic, &p.frames, now);
                 let stat = st.stats.entry(p.topic.clone()).or_default();
                 // Bank the arrival against this tap's own observation.
                 // A tap that yields frames IS observing, so a stats entry the
@@ -7807,22 +8262,12 @@ fn poll_loop(
                     stat.observe_seq(header.sequence, p.frames.len() as u64, now, &p.topic);
                 }
                 // Resolve the schema ONCE, from the first decodable frame.
-                if stat.resolved.is_none() {
-                    if let Some(first) = p.frames.first() {
-                        // Classified, not a bare `Option`. A topic whose
-                        // frames this build cannot decode never resolves, so it
-                        // re-enters this arm on EVERY poll — which is exactly the
-                        // flood `record_resolution`'s latch exists to bound, and
-                        // exactly the state a Studio row must be able to show.
-                        // The pinned type name (set by the remote attach path) is
-                        // what lets the verdict say "rebuild" or "acquire"
-                        // instead of just printing a hash.
-                        let candidate = stat.pinned_schema.clone();
-                        let outcome = resolve_from_frame(&walker, first, candidate.as_deref());
-                        newly_resolved |= outcome.is_ok();
-                        record_resolution(stat, &p.topic, &outcome);
-                    }
-                }
+                newly_resolved |= resolve_from_first_frame(
+                    stat,
+                    &walker,
+                    p.frames.first().map(Vec::as_slice),
+                    &p.topic,
+                );
                 // The vizd-drain stage: the frame's SHM residency ends
                 // here. `t_drain_ns` minus netd's `t_shm_ns` for the SAME wire
                 // sequence IS the netd→vizd gap (bounded below by this loop's poll
@@ -7852,7 +8297,18 @@ fn poll_loop(
                     frames: p.frames,
                 });
             }
-            input_frames
+            let drained_any = !input_frames.is_empty();
+            // Keep attachment ownership through the nonblocking handoff. Once
+            // detach can acquire `state`, every frame drained from its old tap
+            // is already queued (or explicitly dropped on a full queue). A later
+            // route reuse and model admission therefore cannot enqueue InstallModel
+            // ahead of that old batch. Releasing the lock before the handoff lets
+            // stale frames animate a new model bound to the reused route. The
+            // detached keys ride the same message, in front of this pass's frames;
+            // the ones a full queue refused are kept for the next pass.
+            let offered: Vec<String> = std::mem::take(&mut pending_detached).into_iter().collect();
+            pending_detached.extend(worker.try_enqueue_tick(input_frames, offered));
+            drained_any
         };
         // OUTSIDE the state lock (maybe_apply_default_layout re-locks `state` under
         // `layout_lock`): a late-resolve reflows the default layout. A NO-OP under an
@@ -7886,6 +8342,7 @@ fn poll_loop(
             last_layout_generation = layout_generation;
         }
         if newly_resolved || signal_changed {
+            ctx.refresh_attached_snapshot();
             // Counted where the layout was RE-DERIVED, not where the change was
             // detected: `maybe_apply_default_layout` returns whether it got past
             // the `LayoutMode::Auto` gate and rebuilt the plan, so a pass under an
@@ -7932,10 +8389,6 @@ fn poll_loop(
             last_monitor_sample = Some(iteration_start);
             ctx.sample_monitors(iteration_start);
         }
-        // Did this pass find anything? Read BEFORE the hand-off
-        // moves the batch — it decides the backlog-aware arm below.
-        let drained_any = !batch.is_empty();
-        worker.try_enqueue(batch);
         // A test-only per-pass overrun injector.
         // The duty-cycle floor is only observable on a loop whose pass genuinely
         // outruns its interval, and the MEASURED cost of a real drain is
@@ -8929,8 +9382,149 @@ mod absorb_tests {
     }
 }
 
+/// Validate the wire envelope only; XML and asset reads belong to the loader.
+fn validate_model_request(
+    path: &str,
+    topic: &str,
+    model_id: &str,
+    joints: &[String],
+) -> Result<(), String> {
+    if !Path::new(path).is_absolute() {
+        return Err("urdf_path must be an absolute local path".into());
+    }
+    if !topic.starts_with('/') || topic.len() < 2 || topic.chars().any(char::is_whitespace) {
+        return Err("topic must be an absolute nonempty topic name without whitespace".into());
+    }
+    if model_id.is_empty()
+        || model_id.len() > 128
+        || model_id.starts_with("__")
+        || !model_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(
+            "model_id must be 1..128 ASCII letters, digits, '_' or '-', without a leading '__'"
+                .into(),
+        );
+    }
+    if !(1..=12).contains(&joints.len())
+        || joints
+            .iter()
+            .any(|name| name.is_empty() || name.trim() != name)
+    {
+        return Err(
+            "motor_joints must contain 1..12 nonempty joint names in motor array order".into(),
+        );
+    }
+    if joints.iter().collect::<BTreeSet<_>>().len() != joints.len() {
+        return Err("motor_joints must not contain duplicate joint names".into());
+    }
+    Ok(())
+}
+
+fn model_status_dto(status: ModelLoadStatus) -> ModelStatus {
+    let phase = match status.phase {
+        ModelLoadPhase::Queued => ModelPhase::Queued,
+        ModelLoadPhase::Loading => ModelPhase::Loading,
+        ModelLoadPhase::Prepared => ModelPhase::Prepared,
+        ModelLoadPhase::Installing => ModelPhase::Installing,
+        ModelLoadPhase::Installed => ModelPhase::Installed,
+        ModelLoadPhase::Failed => ModelPhase::Failed,
+        ModelLoadPhase::Cancelled => ModelPhase::Cancelled,
+    };
+    ModelStatus {
+        operation_id: status.operation_id,
+        phase,
+        root: status.root,
+        route_key: status.route_key,
+        error: status.error,
+        binding: status.binding.map(|binding| ModelBindingStatus {
+            route_key: binding.route_key,
+            statics_submitted: binding.statics_submitted,
+            joint_frames_submitted: binding.joint_frames_submitted,
+            rejected_frames: binding.rejected_frames,
+            last_error: binding.last_error,
+        }),
+    }
+}
+
+/// Models own a separate coordinate tree; never place them inside the sensor
+/// world's Spatial3D origin or replace an operator's explicit layout.
+fn with_model_view(mut plan: BlueprintPlan, root: &str) -> BlueprintPlan {
+    plan.root = PlanNode::Container(PlanContainer {
+        kind: ContainerKind::Horizontal,
+        name: None,
+        shares: Some(vec![1.0, 1.0]),
+        columns: None,
+        children: vec![
+            PlanNode::View(PlanView {
+                kind: ViewKind::Spatial3d,
+                name: Some("Robot model".into()),
+                origin: Some(format!("/{root}")),
+                contents: Some(vec![format!("/{root}/**")]),
+            }),
+            plan.root,
+        ],
+    });
+    plan
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_envelope_validation_is_strict_and_does_not_read_paths() {
+        use super::validate_model_request;
+        let joints = vec!["hinge".into()];
+        assert!(
+            validate_model_request("/not/a/real/model.urdf", "/lowstate", "demo-1", &joints)
+                .is_ok()
+        );
+        for id in ["", ".", "..", "robot/a", "robot a", "__reserved", "röbot"] {
+            assert!(
+                validate_model_request("/a", "/lowstate", id, &joints).is_err(),
+                "{id}"
+            );
+        }
+        assert!(validate_model_request("/a", "/lowstate", &"a".repeat(129), &joints).is_err());
+        for topic in ["", "relative", "/", "/bad topic"] {
+            assert!(validate_model_request("/a", topic, "demo", &joints).is_err());
+        }
+        assert!(validate_model_request("relative.urdf", "/lowstate", "demo", &joints).is_err());
+        for names in [
+            vec![],
+            vec!["".into()],
+            vec![" hinge".into()],
+            vec!["a".into(), "a".into()],
+            (0..13).map(|i| format!("j{i}")).collect(),
+        ] {
+            assert!(validate_model_request("/a", "/lowstate", "demo", &names).is_err());
+        }
+    }
+
+    #[test]
+    fn model_view_owns_its_coordinate_tree_and_preserves_sensor_plan() {
+        use super::{with_model_view, BlueprintPlan, ContainerKind, PlanNode, ViewKind};
+        let sensor = BlueprintPlan::go2_default();
+        let combined = with_model_view(sensor.clone(), "models/demo");
+        assert_eq!(combined.auto_views, sensor.auto_views);
+        assert_eq!(combined.decorate, sensor.decorate);
+        let PlanNode::Container(container) = combined.root else {
+            panic!("split view")
+        };
+        assert_eq!(container.kind, ContainerKind::Horizontal);
+        assert_eq!(container.children.len(), 2);
+        assert_eq!(container.children[1], sensor.root);
+        let PlanNode::View(model) = &container.children[0] else {
+            panic!("model view")
+        };
+        assert_eq!(model.kind, ViewKind::Spatial3d);
+        assert_eq!(model.origin.as_deref(), Some("/models/demo"));
+        assert_eq!(
+            model.contents.as_deref(),
+            Some(["/models/demo/**".to_owned()].as_slice())
+        );
+    }
+
     // Test-only: the RAW derivation, kept out of production scope on purpose —
     // `discover_reports_the_same_entity_as_attach_for_a_tf_named_non_tf_topic`
     // asserts no production site calls it.
@@ -8939,6 +9533,290 @@ mod tests {
     // `TopicLiveness::wire_state`, which names no variant.
     use cerulion_core::LivenessState;
     use cerulion_viz::sink::route_for_input;
+
+    /// A real `sensor_msgs/PointCloud2` wire frame whose fields are the
+    /// voxel-delta layout (`vx_50mm`/`vy_50mm`/`vz_50mm` i16, `hits`/`op` u8,
+    /// `point_step` 8), `header.frame_id` "odom", three ops: FLOOR, SET, ROBOT.
+    fn voxel_delta_frame() -> Vec<u8> {
+        use cerulion_core::codegen::layout::LayoutResolver;
+        use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
+        use cerulion_core::message::ShmMessage;
+        use cerulion_core::shm_runtime::write_offset_entry;
+        use cerulion_core::wire::WireHeader;
+        use native_ros2_messages::sensor_msgs::PointCloud2;
+
+        let schemas: Vec<MessageSchema> = native_ros2_messages::BUILTIN_MSGS
+            .iter()
+            .filter_map(|(pkg, name, text)| parse_rosmsg(text, name, Some(pkg)).ok())
+            .collect();
+        let (mut resolver, _) = LayoutResolver::new(schemas);
+        let layout = resolver
+            .layout_of("sensor_msgs/PointCloud2")
+            .expect("PointCloud2 layout");
+        let header = resolver
+            .layout_of("std_msgs/Header")
+            .expect("Header layout");
+        let fixed_off = |name: &str| {
+            layout
+                .fixed_fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("PointCloud2 has no fixed field '{name}'"))
+                .offset
+        };
+        // Packed `fields`: name_len, name, offset, datatype, count.
+        let mut fields = Vec::new();
+        for (name, offset, datatype) in [
+            ("vx_50mm", 0u32, 3u8),
+            ("vy_50mm", 2, 3),
+            ("vz_50mm", 4, 3),
+            ("hits", 6, 2),
+            ("op", 7, 2),
+        ] {
+            fields.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            fields.extend_from_slice(name.as_bytes());
+            fields.extend_from_slice(&offset.to_le_bytes());
+            fields.push(datatype);
+            fields.extend_from_slice(&1u32.to_le_bytes());
+        }
+        let head = header.fixed_size + header.offset_table_bytes();
+        let mut header_blob = vec![0u8; head];
+        write_offset_entry(&mut header_blob, header.fixed_size, 0, head as u32, 4);
+        header_blob.extend_from_slice(b"odom");
+        let mut data = Vec::new();
+        for (x, y, z, op) in [(1i16, 0i16, 0i16, 5u8), (3, 4, 5, 0), (0, 0, 6, 4)] {
+            data.extend_from_slice(&x.to_le_bytes());
+            data.extend_from_slice(&y.to_le_bytes());
+            data.extend_from_slice(&z.to_le_bytes());
+            data.push(1);
+            data.push(op);
+        }
+        let fixed = layout.fixed_size;
+        let table = layout.offset_table_bytes();
+        let mut payload = vec![0u8; fixed + table];
+        for (name, v) in [
+            ("height", 1u32),
+            ("width", 3),
+            ("point_step", 8),
+            ("row_step", 24),
+        ] {
+            payload[fixed_off(name)..fixed_off(name) + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let header_off = (fixed + table) as u32;
+        let fields_off = header_off + header_blob.len() as u32;
+        let data_off = fields_off + fields.len() as u32;
+        write_offset_entry(&mut payload, fixed, 0, header_off, header_blob.len() as u32);
+        write_offset_entry(&mut payload, fixed, 1, fields_off, fields.len() as u32);
+        write_offset_entry(&mut payload, fixed, 2, data_off, data.len() as u32);
+        payload.extend_from_slice(&header_blob);
+        payload.extend_from_slice(&fields);
+        payload.extend_from_slice(&data);
+        let mut frame = vec![0u8; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: <PointCloud2 as ShmMessage>::SCHEMA_HASH,
+            total_size: (WireHeader::SIZE + payload.len()) as u32,
+            offset_table_offset: (WireHeader::SIZE + fixed) as u32,
+            offset_table_count: 3,
+            sequence: 0,
+            timestamp_ns: 42_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut frame);
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// A remote re-attach must name the schema the live tap was attached with:
+    /// the same name passes, a topic with no remote pin passes, and a different
+    /// name is refused with an error naming the topic and both schemas.
+    #[test]
+    fn a_remote_reattach_with_a_changed_schema_pin_is_refused() {
+        let topic = "/go2/camera";
+        let image = "sensor_msgs/CompressedImage";
+        assert_eq!(refuse_changed_schema_pin(topic, Some(image), image), Ok(()));
+        assert_eq!(refuse_changed_schema_pin(topic, None, image), Ok(()));
+        let err = refuse_changed_schema_pin(topic, Some(image), "sensor_msgs/Image")
+            .expect_err("a changed pin is refused");
+        for needle in [topic, image, "'sensor_msgs/Image'", "detach"] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
+    }
+
+    /// A remote RE-attach (`AlreadyAttached`) of a tap whose first frame already
+    /// answered must not put the name table's seed back over the frame's
+    /// verdict: the reply, `status` / `list` and the layout keep `VoxelMap`.
+    /// A stat with nothing, or with only an earlier seed, takes the seed; an
+    /// unmapped name seeds nothing.
+    #[test]
+    fn a_remote_reattach_keeps_a_frame_resolved_archetype_over_the_name_seed() {
+        use cerulion_viz::sink::ArchetypeKind;
+
+        let seed = classify_schema("sensor_msgs/PointCloud2");
+        assert_eq!(seed, Some(ArchetypeKind::Points3D));
+
+        // Resolved from a frame: kept and reported.
+        let mut stat = TopicStat {
+            resolved: Some(Resolved {
+                schema: "sensor_msgs/PointCloud2".to_string(),
+                archetype: ArchetypeKind::VoxelMap,
+            }),
+            ..TopicStat::default()
+        };
+        assert_eq!(
+            seed_name_resolution(&mut stat, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(!stat.archetype_from_name);
+
+        // Nothing held: the seed goes in, flagged.
+        let mut fresh = TopicStat::default();
+        assert_eq!(
+            seed_name_resolution(&mut fresh, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::Points3D)
+        );
+        assert!(fresh.archetype_from_name);
+
+        // Only an earlier seed held: re-seeded, still a seed.
+        assert_eq!(
+            seed_name_resolution(&mut fresh, "sensor_msgs/PointCloud2", seed),
+            Some(ArchetypeKind::Points3D)
+        );
+        assert!(fresh.archetype_from_name);
+
+        // An unmapped name seeds nothing and reports nothing.
+        let mut unmapped = TopicStat::default();
+        assert_eq!(
+            seed_name_resolution(&mut unmapped, "pkg/Custom", classify_schema("pkg/Custom")),
+            None
+        );
+        assert!(unmapped.resolved.is_none() && !unmapped.archetype_from_name);
+    }
+
+    /// The remote attach path seeds a stat's resolution from the NAME table
+    /// (`sensor_msgs/PointCloud2` → `Points3D`) because no frame exists yet.
+    /// The first decodable frame must REPLACE that seed with the sink's content
+    /// verdict: a voxel-delta cloud is a `VoxelMap`. Without this, the drain
+    /// loop's "resolve once" guard saw a resolved stat and never looked at the
+    /// frame, so a remotely attached voxel map stayed `Points3D` on `status`,
+    /// `list` and the default layout for the tap's lifetime, while the worker
+    /// rendered voxel tiles. A resolution that came FROM a frame is final.
+    #[test]
+    fn a_name_seeded_resolution_is_replaced_by_the_first_frames_content_verdict() {
+        use cerulion_viz::schema_registry::builtin_walker;
+        use cerulion_viz::sink::ArchetypeKind;
+
+        let walker = builtin_walker();
+        let frame = voxel_delta_frame();
+
+        // Exactly the remote attach seeding.
+        let mut stat = TopicStat {
+            pinned_schema: Some("sensor_msgs/PointCloud2".to_string()),
+            resolved: Some(Resolved {
+                schema: "sensor_msgs/PointCloud2".to_string(),
+                archetype: classify_schema("sensor_msgs/PointCloud2").unwrap(),
+            }),
+            archetype_from_name: true,
+            ..TopicStat::default()
+        };
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::Points3D),
+            "the name table seeds Points3D"
+        );
+
+        // An empty pass leaves the seed alone (nothing to resolve from).
+        assert!(!resolve_from_first_frame(
+            &mut stat, &walker, None, "/go2/map"
+        ));
+        assert!(stat.archetype_from_name);
+
+        // The first frame replaces the seed with what the sink renders, and
+        // reports a NEW resolution so the caller reflows the layout.
+        assert!(resolve_from_first_frame(
+            &mut stat,
+            &walker,
+            Some(&frame),
+            "/go2/map"
+        ));
+        let resolved = stat.resolved.as_ref().expect("resolved");
+        assert_eq!(resolved.schema, "sensor_msgs/PointCloud2");
+        assert_eq!(
+            resolved.archetype,
+            ArchetypeKind::VoxelMap,
+            "the frame's voxel-delta layout outranks the PointCloud2 name row"
+        );
+        assert!(!stat.archetype_from_name, "a frame's verdict is not a seed");
+
+        // Final: a later frame (even one the build could not decode) is not
+        // consulted again, so the resolution cannot flap.
+        assert!(!resolve_from_first_frame(
+            &mut stat,
+            &walker,
+            Some(&[0u8; 4]),
+            "/go2/map"
+        ));
+        assert_eq!(
+            stat.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(stat.undecodable.is_none());
+
+        // A stat with NO resolution resolves from its first frame the same way
+        // (the pre-existing path, unchanged).
+        let mut fresh = TopicStat::default();
+        assert!(resolve_from_first_frame(
+            &mut fresh,
+            &walker,
+            Some(&frame),
+            "/go2/map"
+        ));
+        assert_eq!(
+            fresh.resolved.as_ref().map(|r| r.archetype),
+            Some(ArchetypeKind::VoxelMap)
+        );
+        assert!(!fresh.archetype_from_name);
+    }
+
+    /// Two identities share the qualified name `pkg/Type`: a packaged
+    /// `{ float64 x }` and a later package-less schema NAMED `pkg/Type`
+    /// (`{ string s }`) that owns the name. A frame stamped with the
+    /// packaged hash must resolve through ITS layout. Re-reading it through
+    /// the name would take the twin's offset table out of the `1.5` bytes
+    /// and fail to decode.
+    #[test]
+    fn resolve_from_frame_decodes_a_name_twin_by_its_own_hash() {
+        use cerulion_core::codegen::{FieldDef, FieldType, MessageSchema};
+        use cerulion_core::wire::WireHeader;
+
+        let mut packaged = MessageSchema::new_in_package("Type", "pkg");
+        packaged.add_field(FieldDef::new("x", FieldType::F64));
+        let mut loose = MessageSchema::new("pkg/Type");
+        loose.add_field(FieldDef::new("s", FieldType::String));
+        let hash = packaged.schema_hash();
+        assert_ne!(hash, loose.schema_hash());
+        let (walker, _) = FrameWalker::new(vec![packaged, loose]);
+
+        let mut frame = vec![0u8; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: hash,
+            total_size: (WireHeader::SIZE + 8) as u32,
+            offset_table_offset: (WireHeader::SIZE + 8) as u32,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut frame);
+        frame.extend_from_slice(&1.5f64.to_le_bytes());
+
+        let resolved = resolve_from_frame(&walker, &frame, None).expect("resolves");
+        assert_eq!(resolved.schema, "pkg/Type");
+        assert_eq!(resolved.archetype, ArchetypeKind::Scalars);
+    }
 
     /// What the daemon REPORTS for a frame must equal what the sink
     /// RENDERS for it.
@@ -9017,6 +9895,7 @@ mod tests {
                 offset_table_count: 3,
                 sequence: 0,
                 timestamp_ns: 42_000,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             }
             .write_to_buf(&mut frame);
             frame.extend_from_slice(&payload);
@@ -9196,11 +10075,12 @@ mod tests {
 
         // No production site may derive a REPORTED entity from `route_for_input`
         // directly — that is what left `discover` behind.
-        let whole = code_only(include_str!("daemon.rs"));
+        let whole = include_str!("daemon.rs");
         let src = whole
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("this module has a test cfg gate");
+        let src = code_only(src);
         assert_eq!(
             src.matches("route_for_input(").count(),
             0,
@@ -9228,11 +10108,12 @@ mod tests {
     /// `maybe_apply_default_layout`, both of which sit behind the mode gate.
     #[test]
     fn the_logged_entity_recorder_is_fed_from_a_mode_independent_seam() {
-        let whole = code_only(include_str!("daemon.rs"));
+        let whole = include_str!("daemon.rs");
         let src = whole
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("this module has a test cfg gate");
+        let src = code_only(src);
         // Exactly one production call site, and it is the ungated one.
         assert_eq!(
             src.matches("self.note_logged_entities(").count(),
@@ -9269,6 +10150,198 @@ mod tests {
         );
     }
 
+    // Real workers write process-global blueprint state even without sensor frames.
+    static WORKER_BLUEPRINT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn worker_gone_releases_unrelated_detach_and_rollback_demands() {
+        let _blueprint = WORKER_BLUEPRINT_LOCK.lock().unwrap();
+        use cerulion_core::clock::VirtualClock;
+        use cerulion_core::transport::TransportConfig;
+        use cerulion_core::wire::MaxSliceLen;
+        use cerulion_viz::schema_registry::builtin_walker;
+        use cerulion_viz::sink::SinkState;
+
+        for with_model in [false, true] {
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("detach_worker_gone_{with_model}"),
+                    clock: Arc::new(VirtualClock::new()),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                cerulion_core::testing::iceoryx_test_config(),
+            )
+            .unwrap();
+            let topics = ["/owned", "/detach", "/rollback"];
+            let _publishers: Vec<_> = topics
+                .iter()
+                .map(|topic| {
+                    manager
+                        .create_publisher(topic, MaxSliceLen::const_new(4096), 0)
+                        .unwrap()
+                })
+                .collect();
+            let (rec, _) = rerun::RecordingStreamBuilder::new("detach-worker-gone")
+                .memory()
+                .unwrap();
+            let worker = VizLogWorker::spawn(rec, builtin_walker(), SinkState::new()).unwrap();
+            let dir = std::env::temp_dir()
+                .join(format!("detach-gone-{}-{with_model}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let spy = Arc::new(SpyDemandPlane::default());
+            let mut daemon = start_with_demand_plane(
+                dir.join("control.sock"),
+                Duration::from_millis(16),
+                manager,
+                worker,
+                builtin_walker(),
+                None,
+                spy.clone(),
+            )
+            .unwrap();
+            let ctx = &daemon.test_context;
+            for topic in topics {
+                assert!(matches!(
+                    ctx.attach(1, topic.into(), None),
+                    Response::Attach(_)
+                ));
+                perform_remote_demand(spy.as_ref(), &ctx.state, "robot", topic, 0).unwrap();
+            }
+            if with_model {
+                let path = dir.join("robot.urdf");
+                std::fs::write(&path, r#"<robot name="oracle"><link name="base"/><link name="arm"/><joint name="hinge" type="continuous"><parent link="base"/><child link="arm"/></joint></robot>"#).unwrap();
+                let response = ctx.load_model(
+                    2,
+                    path.to_str().unwrap().into(),
+                    "/owned".into(),
+                    "demo".into(),
+                    vec!["hinge".into()],
+                );
+                assert!(matches!(response, Response::Model(_)), "{response:?}");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while ctx.worker_control.model_status().unwrap().phase != ModelLoadPhase::Installed
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "model must install before worker closure"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            daemon.close_worker_control_for_test();
+            assert!(matches!(
+                ctx.worker_control.cancel_model_load("detach"),
+                Err(cerulion_viz::worker::ModelLoadError::WorkerGone)
+            ));
+            let response = ctx.detach(3, "/detach".into());
+            let Response::Detach(detached) = response else {
+                panic!("{response:?}")
+            };
+            assert!(detached.detached);
+            assert_eq!(
+                ctx.rollback_compose_attaches(&["/rollback".into()]),
+                (1, vec![])
+            );
+            assert_eq!(
+                spy.release_keys(),
+                vec![
+                    ("robot".into(), "/detach".into()),
+                    ("robot".into(), "/rollback".into())
+                ]
+            );
+            {
+                let state = ctx.state.lock().unwrap();
+                for topic in ["/detach", "/rollback"] {
+                    assert!(!state.taps.contains(topic));
+                    assert!(!state.stats.contains_key(topic));
+                    assert!(!state.demanded.contains_key(topic));
+                }
+            }
+            if with_model {
+                assert!(matches!(ctx.detach(4, "/owned".into()), Response::Error(_)));
+                let (removed, retained) = ctx.rollback_compose_attaches(&["/owned".into()]);
+                assert_eq!(removed, 0);
+                assert_eq!(retained.len(), 1);
+                let state = ctx.state.lock().unwrap();
+                assert!(state.taps.contains("/owned"));
+                assert!(state.stats.contains_key("/owned"));
+                assert!(state.demanded.contains_key("/owned"));
+                assert_eq!(spy.release_keys().len(), 2);
+            }
+            daemon.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn blueprint_reset_derivation_observes_layout_lock_and_submits_matching_response() {
+        let _blueprint = WORKER_BLUEPRINT_LOCK.lock().unwrap();
+        use cerulion_core::clock::VirtualClock;
+        use cerulion_core::transport::TransportConfig;
+        use cerulion_viz::blueprint::{clear_runtime_blueprint, current_runtime_blueprint_plan};
+        use cerulion_viz::schema_registry::builtin_walker;
+        use cerulion_viz::sink::SinkState;
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "reset_lock_oracle".into(),
+                clock: Arc::new(VirtualClock::new()),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let (rec, _) = rerun::RecordingStreamBuilder::new("reset-lock")
+            .memory()
+            .unwrap();
+        let worker = VizLogWorker::spawn(rec, builtin_walker(), SinkState::new()).unwrap();
+        worker.sync();
+        clear_runtime_blueprint();
+        let dir = std::env::temp_dir().join(format!("reset-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut daemon = start_with_demand_plane(
+            dir.join("control.sock"),
+            Duration::from_millis(16),
+            manager,
+            worker,
+            builtin_walker(),
+            None,
+            Arc::new(SpyDemandPlane::default()),
+        )
+        .unwrap();
+        let lock = Arc::clone(&daemon.test_context.layout_lock);
+        let observed = Arc::new(AtomicBool::new(false));
+        let hook_observed = Arc::clone(&observed);
+        *daemon.test_context.reset_plan_hook.lock().unwrap() = Some(Box::new(move || {
+            // Runs in the actual reset handler immediately before it derives the
+            // plan. The old derive-before-lock path lets this contender acquire it.
+            assert!(
+                lock.try_lock().is_err(),
+                "reset derivation must exclude another layout writer"
+            );
+            hook_observed.store(true, Ordering::SeqCst);
+        }));
+        let response = daemon.test_context.set_blueprint(42, None);
+        assert!(observed.load(Ordering::SeqCst));
+        daemon.shutdown(); // drains the real worker's submitted blueprint
+        let plan = current_runtime_blueprint_plan().unwrap();
+        assert_eq!(plan_views(&plan).len(), 1);
+        assert_eq!(plan_views(&plan)[0].origin.as_deref(), Some("/world"));
+        let Response::SetBlueprint(response) = response else {
+            panic!("reset must succeed")
+        };
+        assert_eq!(response.id, Some(42));
+        assert!(response.ok && response.reset);
+        assert_eq!(response.views, 1);
+        assert!(response.warnings.is_empty());
+        assert_eq!(
+            *daemon.test_context.layout_lock.lock().unwrap(),
+            LayoutMode::Auto
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// There must be exactly ONE producer of the consolidated
     /// default plan in this module.
     ///
@@ -9287,13 +10360,14 @@ mod tests {
     /// (&self.attached_render_infos(), &[])` — fails HERE.
     #[test]
     fn the_consolidated_default_plan_has_exactly_one_producer() {
-        let whole = code_only(include_str!("daemon.rs"));
+        let whole = include_str!("daemon.rs");
         // PRODUCTION code only — the test module below legitimately calls the
         // layout builder directly to assert what the daemon would apply.
         let src = whole
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .expect("this module has a test cfg gate");
+        let src = code_only(src);
         let calls = src.matches("default_layout_excluding(").count();
         assert_eq!(
             calls, 1,
@@ -9411,6 +10485,7 @@ mod tests {
     fn catalog(robot: &str, topic: &str, schema_name: Option<&str>) -> CatalogReply {
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
@@ -9456,6 +10531,7 @@ mod tests {
     fn multi_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> CatalogReply {
         use cerulion_core::CatalogProvenance;
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: entries
@@ -9566,6 +10642,7 @@ mod tests {
         use cerulion_core::CatalogProvenance;
         use std::collections::BTreeSet;
         let cat = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![
@@ -9646,6 +10723,7 @@ mod tests {
             liveness,
         };
         let cat = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![
@@ -10192,6 +11270,7 @@ mod tests {
         // (c) A REFUSED catalog serves nothing by definition, so its emptiness says
         //     nothing about any topic.
         let refused = cerulion_core::CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: Vec::new(),
@@ -10783,6 +11862,7 @@ mod tests {
         // `Settled` case that must still make the terminal claim.
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         let served = |topic: &str| CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
@@ -10975,6 +12055,7 @@ mod tests {
     fn catalog_reply_for_test(robot: &str, topic: &str) -> CatalogReply {
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
@@ -12798,6 +13879,7 @@ mod unknown_hash {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -13431,6 +14513,7 @@ mod monitor_snapshot_tests {
     /// A catalog reply carrying `entries`, each with the liveness handed in.
     fn catalog(robot: &str, entries: &[(&str, Option<TopicLiveness>)]) -> CatalogReply {
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
             robot: robot.to_string(),
             entries: entries

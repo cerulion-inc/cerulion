@@ -9,7 +9,7 @@
 //! `graph run` deployment. The data plane was moved to the machine's resolved
 //! global config (`Config::global_config()` — the DEFAULT namespace, prefix
 //! `iox2_` on a config-file-free box); only infra stays run-scoped (barrier `cerdep_*`, trace
-//! rings `cer_rec_*`/`cer_rg_*`, doorbells `/cer_db_<user>_*`, and the
+//! rings `cer_rec_*`/`cer_rg_*`, doorbells `cer_db_*`, and the
 //! supervisor's `cer_p_*` PLANNING namespace).
 //!
 //! Two subprocess-level pins over the REAL binary:
@@ -79,6 +79,12 @@
 //! namespace (unique per-test prefixes keep topic names apart; TEST B shares
 //! one prefix between its two runs DELIBERATELY).
 
+#![cfg(not(target_os = "macos"))]
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
+// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
+// process cannot create any further event resource. The mechanism, the derivation
+// that selects this file, and the coverage this costs are stated once in
+// `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -107,6 +113,12 @@ fn spawn_graph_run_mp(root: &Path, label: &str) -> (ChildGuard, PathBuf, PathBuf
     cmd.args(["graph", "run", "mpdemo", "--no-validate"])
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
+        // HERMETIC on the execution mode: REMOVED from the child, never inherited.
+        // This spawn exercises the SHIPPED DEFAULT of a `process_groups:` run (free
+        // run), so a developer with `CERULION_EXECUTION_MODE=lockstep` exported
+        // cannot silently flip this binary onto the opt-out and test the wrong
+        // contract. The same three-direction rule as `mp_support::SpawnExecutionMode`.
+        .env_remove("CERULION_EXECUTION_MODE")
         // Hermetic — no scouting session/gateway in CI (a real-clock
         // run is permissive-by-default; the kill-switch env keeps it LOCAL-ONLY).
         .env("CERULION_NETWORK", "off")

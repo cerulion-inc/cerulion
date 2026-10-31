@@ -1,0 +1,28 @@
+exit: Some(0)
+--- stdout
+workspace	Workspace management
+node	Node management
+graph	Graph management
+topic	Topic introspection
+schema	Schema management
+ros2	ROS 2 interop: run, launch, attach to and migrate a ROS 2 stack
+viz	Visualize live topics in Cerulion Studio
+connect	Connect to a remote robot and mirror its topics into local shared memory
+pair	Pair this desk with a robot
+login	Sign in to a Cerulion account
+logout	Sign this machine out of its Cerulion account
+account	Manage your Cerulion account
+telemetry	Show or change usage telemetry consent
+tui	Interactive terminal dashboard
+trace	Inspect legacy publish-trace files (`trace_*.jsonl`)
+bag	Record topics into a bag, inspect one, and play one back
+completions	Print the shell code that enables `cerulion` tab-completion
+flashback	Capture the moment: save the last ~30 seconds plus the next ~15 as a bag
+clean	Remove the shared-memory bookkeeping that dead Cerulion processes left behind
+bagd	The recorder daemon: taps live topics into a standard MCAP bag
+help	Print this message or the help of the given subcommand(s)
+--verbose	Enable verbose (debug-level) logging (`-v` or `--verbose`)
+--help	Print help
+--version	Print version
+
+--- stderr

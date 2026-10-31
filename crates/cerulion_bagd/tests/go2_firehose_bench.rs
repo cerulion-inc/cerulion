@@ -164,7 +164,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_bagd::{run_bagd, TapSpec};
 use cerulion_core::transport::recording_tap_buffer_depth;
-use cerulion_core::wire::MaxSliceLen;
+use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportManager;
 use serial_test::serial;
 
@@ -250,7 +250,7 @@ struct Row {
 }
 
 fn plan_topics(mode: &str, body_len: usize, background: usize, deep_control: bool) -> Vec<Plan> {
-    let msl = body_len + 32;
+    let msl = body_len + WireHeader::SIZE;
     let deep = recording_tap_buffer_depth(msl);
     let mut plans = Vec::new();
 
@@ -323,13 +323,15 @@ fn plan_topics(mode: &str, body_len: usize, background: usize, deep_control: boo
 /// queue's capacity — the `D` the arithmetic uses. No accessor needed, and the
 /// number is a property of the shipped constructor rather than of this file.
 fn probe_queue_depth(mgr: &TransportManager, body_len: usize, depth: Option<usize>) -> usize {
-    let msl = MaxSliceLen::const_new((body_len + 32) as u32);
+    let msl = MaxSliceLen::const_new((body_len + WireHeader::SIZE) as u32);
     let topic = unique_topic("depthprobe");
     let mut pubr = match depth {
         None => mgr
             .create_ingress_publisher(&topic, msl)
             .expect("create_ingress_publisher"),
-        Some(d) => publisher_with_provisioning(mgr, &topic, 2, d, (body_len + 32) as u32),
+        Some(d) => {
+            publisher_with_provisioning(mgr, &topic, 2, d, (body_len + WireHeader::SIZE) as u32)
+        }
     };
     let mut sub = mgr
         .create_data_only_subscriber(&topic)
@@ -444,7 +446,7 @@ fn go2_firehose_shape() {
         },
     ) as usize;
 
-    let msl = MaxSliceLen::const_new((body_len + 32) as u32);
+    let msl = MaxSliceLen::const_new((body_len + WireHeader::SIZE) as u32);
     let mgr = make_manager(16);
     let plans = plan_topics(&mode, body_len, background, deep_control);
 
@@ -486,7 +488,7 @@ fn go2_firehose_shape() {
                 &p.topic,
                 2,
                 p.depth,
-                (body_len + 32) as u32,
+                (body_len + WireHeader::SIZE) as u32,
             ));
         }
         depths.push(0usize);
@@ -621,7 +623,7 @@ fn go2_firehose_shape() {
         });
     }
 
-    let bytes = published * (body_len as u64 + 32);
+    let bytes = published * (body_len as u64 + WireHeader::SIZE as u64);
     let rate_mb_s = bytes as f64 / publish_wall.as_secs_f64() / (1024.0 * 1024.0);
     let missing = published.saturating_sub(summary.messages);
 
@@ -770,7 +772,7 @@ fn go2_firehose_shape() {
 #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
 fn list_topics_cost_by_service_count() {
     let body = 900usize;
-    let msl = MaxSliceLen::const_new((body + 32) as u32);
+    let msl = MaxSliceLen::const_new((body + WireHeader::SIZE) as u32);
     let mgr = make_manager(16);
     let mut held = Vec::new();
     let mut created = 0usize;

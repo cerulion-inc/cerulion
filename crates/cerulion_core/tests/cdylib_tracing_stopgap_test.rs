@@ -191,6 +191,8 @@ fn build_probe_graph(instances: usize) -> TransportResult<GraphRuntime> {
     for i in 0..instances {
         let id = format!("probe{i}");
         nodes.push(NodeDef {
+            fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.clone(),
             node_type: "discard_probe".to_string(),

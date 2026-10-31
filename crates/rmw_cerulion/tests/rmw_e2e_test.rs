@@ -15,6 +15,7 @@
 //! cargo test -p rmw_cerulion --test rmw_e2e_test -- --test-threads=1
 //! ```
 
+use iceoryx2::service::port_factory::PortFactory as _;
 use serial_test::serial;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
@@ -481,7 +482,7 @@ fn untouched_loan_publishes_rosidl_defaults_not_zeros() {
         // The pointer the typesupport's init just wrote through, and that
         // rclcpp will overlay the message struct on, is 8-aligned (the
         // borrow path's fail-closed alignment gate let it through; the
-        // de-facto iceoryx2 0.9.1 mechanism is chunk+40 B header @ 8, +32
+        // de-facto iceoryx2 0.9.1 mechanism is chunk+40 B header @ 8, +40
         // WireHeader — see `rmw_borrow_loaned_message`).
         assert_eq!(
             (loaned as usize) % std::mem::align_of::<CQuat>(),
@@ -771,6 +772,7 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             type_id_: ROS_TYPE_DOUBLE,
             string_upper_bound_: 0,
             members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
             is_key_: false,
             is_array_: false,
             array_size_: 0,
@@ -780,9 +782,13 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             size_function: None,
             get_const_function: None,
             get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
             assign_function: None,
             resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
         };
         let members = Box::leak(
             vec![
@@ -798,6 +804,7 @@ fn cpp_typesupport_untouched_loan_serves_defaults() {
             message_name_: cstr(&format!("Qcpp{suffix}")),
             member_count_: members.len() as u32,
             size_of_: std::mem::size_of::<CQuat>(),
+            #[cfg(cerulion_has_is_key)]
             has_any_key_member_: false,
             members_: members.as_ptr(),
             init_function: Some(cquat_cpp_init),
@@ -1402,7 +1409,13 @@ fn c_abi_serialized_take_fills_message_info() {
         serialized.allocator = malloc_allocator();
         let mut taken = false;
         let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-        info.publication_sequence_number = 12345; // poison: must be overwritten
+        // `rmw_message_info_t` carries the two sequence numbers from Humble
+        // on; the poison and its assertion ride the same capability, and the
+        // frame's own sequence is asserted through the wire header below.
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
+        {
+            info.publication_sequence_number = 12345; // poison: must be overwritten
+        }
         assert_eq!(
             rmw_take_serialized_message_with_info(
                 subscription,
@@ -1414,6 +1427,7 @@ fn c_abi_serialized_take_fills_message_info() {
             RMW_RET_OK
         );
         assert!(taken, "published frame must be taken");
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, 0, "first publish = seq 0");
         assert!(
             info.source_timestamp > 0,
@@ -1723,6 +1737,19 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
         size: usize,
         capacity: usize,
     }
+    /// Primitive and string sequences carry the two Lyrical Buffer flags after
+    /// the header (message sequences do not); the flags exist on the era the
+    /// crate is built for, so this fixture is exactly the distro's struct.
+    #[repr(C)]
+    struct CPrimSeq {
+        data: *mut c_void,
+        size: usize,
+        capacity: usize,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        is_rosidl_buffer: bool,
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        owns_rosidl_buffer: bool,
+    }
     /// std_msgs/MultiArrayDimension: { label: string, size: u32, stride: u32 }
     #[repr(C)]
     struct CDim {
@@ -1740,7 +1767,7 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
     #[repr(C)]
     struct CU8Ma {
         layout: CLayout,
-        data: CSeq,
+        data: CPrimSeq,
     }
 
     fn full_member(
@@ -1889,10 +1916,14 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
                 },
                 data_offset: 0,
             },
-            data: CSeq {
+            data: CPrimSeq {
                 data: payload.as_mut_ptr() as *mut c_void,
                 size: payload.len(),
                 capacity: payload.len(),
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
         };
 
@@ -1914,10 +1945,14 @@ fn c_abi_1mb_uint8_multi_array_publish_take_byte_identical() {
                 },
                 data_offset: 0,
             },
-            data: CSeq {
+            data: CPrimSeq {
                 data: std::ptr::null_mut(),
                 size: 0,
                 capacity: 0,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                is_rosidl_buffer: false,
+                #[cfg(cerulion_has_is_rosidl_buffer)]
+                owns_rosidl_buffer: false,
             },
         };
         let mut taken = false;
@@ -2171,7 +2206,11 @@ fn c_abi_loaned_take_round_trip_and_return() {
         let mut taken = false;
         let mut out: *mut c_void = std::ptr::null_mut();
         let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-        info.publication_sequence_number = 12345; // poison: must be overwritten
+        // Humble and later, like the serialized arm above.
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
+        {
+            info.publication_sequence_number = 12345; // poison: must be overwritten
+        }
         assert_eq!(
             rmw_take_loaned_message_with_info(
                 subscription,
@@ -2198,7 +2237,7 @@ fn c_abi_loaned_take_round_trip_and_return() {
             }
         );
         // message_info: source_timestamp is EXACTLY the wire timestamp —
-        // cross-checked against the WireHeader sitting 32 bytes before the
+        // cross-checked against the WireHeader sitting 40 bytes before the
         // loaned pointer in the SAME held frame.
         let header_bytes = std::slice::from_raw_parts(
             (out as *const u8).sub(cerulion_core::wire::WireHeader::SIZE),
@@ -2207,9 +2246,12 @@ fn c_abi_loaned_take_round_trip_and_return() {
         let header = cerulion_core::wire::WireHeader::read_from_buf(header_bytes)
             .expect("wire header before the loaned payload");
         assert_eq!(info.source_timestamp, header.timestamp_ns as i64);
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, 0, "first publish = seq 0");
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, u64::from(header.sequence));
         assert!(info.received_timestamp > 0, "received timestamp stamped");
+        #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.reception_sequence_number, u64::MAX);
 
         // rmw.h contract: a take into an out-slot that is NOT NULL is
@@ -2383,6 +2425,7 @@ fn c_abi_loaned_take_hold_across_publish_pins_the_slot() {
             );
             assert!(t, "frame {i} must still be queued");
             assert_eq!((*(p as *const CPoint)).x, 10.0 + f64::from(i), "FIFO order");
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
             assert_eq!(info.publication_sequence_number, 1 + u64::from(i));
             assert_eq!(
                 rmw_return_loaned_message_from_subscription(subscription, p),
@@ -2804,6 +2847,500 @@ fn c_abi_loaned_take_refuses_nonzero_offset_table_metadata() {
 
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+// =====================================================================
+// Port caps on a ROS topic, and zero-initialized graph out-arrays
+// =====================================================================
+
+/// iceoryx2's create-time defaults for a publish-subscribe service's port
+/// caps, read from the same global config the rmw singleton's node uses, so
+/// "one past the default" below tracks an iceoryx2 upgrade or a local config
+/// file instead of a literal.
+fn iceoryx2_default_port_caps() -> (usize, usize) {
+    let defaults = &iceoryx2::config::Config::global_config()
+        .defaults
+        .publish_subscribe;
+    (defaults.max_publishers, defaults.max_subscribers)
+}
+
+/// Every ROS node publishes `/rosout`, so a ROS topic carries one publisher
+/// per node: a third rclpy process (the ros2cli daemon is the usual one)
+/// must still attach its `/rosout` publisher, or `rcl_node_init` fails. The
+/// same holds for subscriptions (`/clock`, `/tf`, `/parameter_events`).
+///
+/// Oracle, in both creation orders (whichever endpoint creates the service
+/// decides its caps): one more publisher and one more subscription than
+/// iceoryx2's create defaults all attach on one topic, the matched counts
+/// see every peer, and a publish from the last publisher reaches every
+/// subscription.
+#[test]
+#[serial]
+fn c_abi_ros_topic_accepts_more_endpoints_than_the_iceoryx2_defaults() {
+    let (default_pubs, default_subs) = iceoryx2_default_port_caps();
+    let n_pubs = default_pubs + 1;
+    let n_subs = default_subs + 1;
+    for publishers_first in [true, false] {
+        unsafe {
+            let suffix = unique_suffix();
+            let ts = point_ts(&format!("PtCaps{suffix}"));
+            let (_, node, _opts) = setup_node(&format!("caps_node_{suffix}"));
+            let topic = CString::new(format!("/rmw_e2e/caps/{suffix}")).expect("topic");
+            let qos = default_qos();
+            let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+            let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+            let order = if publishers_first {
+                "publishers first"
+            } else {
+                "subscriptions first"
+            };
+
+            let make_pubs = || -> Vec<_> {
+                (0..n_pubs)
+                    .map(|i| {
+                        let p = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+                        assert!(
+                            !p.is_null(),
+                            "{order}: publisher {i} of {n_pubs} must attach (got NULL)"
+                        );
+                        p
+                    })
+                    .collect()
+            };
+            let make_subs = || -> Vec<_> {
+                (0..n_subs)
+                    .map(|i| {
+                        let s = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+                        assert!(
+                            !s.is_null(),
+                            "{order}: subscription {i} of {n_subs} must attach (got NULL)"
+                        );
+                        s
+                    })
+                    .collect()
+            };
+            let (publishers, subscriptions) = if publishers_first {
+                let p = make_pubs();
+                (p, make_subs())
+            } else {
+                let s = make_subs();
+                (make_pubs(), s)
+            };
+
+            let mut count = 0usize;
+            assert_eq!(
+                rmw_publisher_count_matched_subscriptions(publishers[0], &mut count),
+                RMW_RET_OK
+            );
+            assert_eq!(count, n_subs, "{order}: every subscription matched");
+            assert_eq!(
+                rmw_subscription_count_matched_publishers(subscriptions[0], &mut count),
+                RMW_RET_OK
+            );
+            assert_eq!(count, n_pubs, "{order}: every publisher matched");
+
+            let msg = CPoint {
+                x: 6.0,
+                y: 0.9,
+                z: -32.0,
+            };
+            assert_eq!(
+                rmw_publish(
+                    *publishers.last().expect("publishers"),
+                    &msg as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            for (i, s) in subscriptions.iter().enumerate() {
+                let mut out = CPoint::default();
+                let mut taken = false;
+                for _ in 0..50 {
+                    assert_eq!(
+                        rmw_take(
+                            *s,
+                            &mut out as *mut _ as *mut c_void,
+                            &mut taken,
+                            std::ptr::null_mut()
+                        ),
+                        RMW_RET_OK
+                    );
+                    if taken {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(taken, "{order}: subscription {i} must receive the publish");
+                assert_eq!(out, msg, "{order}: subscription {i} payload");
+            }
+
+            for p in publishers {
+                assert_eq!(rmw_destroy_publisher(node, p), RMW_RET_OK);
+            }
+            for s in subscriptions {
+                assert_eq!(rmw_destroy_subscription(node, s), RMW_RET_OK);
+            }
+            assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+        }
+    }
+}
+
+/// A raw iceoryx2 node with the data and event services it opened.
+type RawAttach = (
+    iceoryx2::node::Node<iceoryx2::service::ipc::Service>,
+    iceoryx2::service::port_factory::publish_subscribe::PortFactory<
+        iceoryx2::service::ipc::Service,
+        [u8],
+        (),
+    >,
+    iceoryx2::service::port_factory::event::PortFactory<iceoryx2::service::ipc::Service>,
+);
+
+/// Opens `topic`'s data and event services from a fresh raw iceoryx2 node on
+/// the rmw singleton's config (one more attached process, as iceoryx2 counts
+/// them against `max_nodes`).
+fn raw_attach(topic: &str) -> RawAttach {
+    let node = iceoryx2::node::NodeBuilder::new()
+        .config(iceoryx2::config::Config::global_config())
+        .create::<iceoryx2::service::ipc::Service>()
+        .expect("raw iceoryx2 node");
+    let data_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/data").as_str().try_into().expect("name");
+    let event_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/event").as_str().try_into().expect("name");
+    let data = node
+        .service_builder(&data_name)
+        .publish_subscribe::<[u8]>()
+        .open();
+    let data = data.unwrap_or_else(|e| panic!("raw open of {topic}/data: {e:?}"));
+    let event = node.service_builder(&event_name).event().open();
+    let event = event.unwrap_or_else(|e| panic!("raw open of {topic}/event: {e:?}"));
+    (node, data, event)
+}
+
+/// Every ROS process attaches `/rosout`, and iceoryx2 counts attached
+/// processes per service against `max_nodes` (default 20 for the data
+/// service, 36 for the event service). A topic an rmw endpoint creates takes
+/// one process per publisher and subscriber slot (32 + 32 for a small type),
+/// so more processes than either default attach. Each raw iceoryx2 node below
+/// stands in for one process.
+#[test]
+#[serial]
+fn c_abi_ros_topic_accepts_more_processes_than_the_iceoryx2_node_default() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtNodes{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("nodes_node_{suffix}"));
+        let topic_str = format!("/rmw_e2e/nodes/{suffix}");
+        let topic = CString::new(topic_str.clone()).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!publisher.is_null(), "the rmw publisher creates the topic");
+
+        let defaults = &iceoryx2::config::Config::global_config().defaults;
+        let attach = defaults
+            .publish_subscribe
+            .max_nodes
+            .max(defaults.event.max_nodes)
+            + 1;
+        let mut held = Vec::new();
+        for i in 0..attach {
+            let (raw, data, event) = raw_attach(&topic_str);
+            if i == 0 {
+                assert_eq!(data.static_config().max_publishers(), 32);
+                assert_eq!(data.static_config().max_subscribers(), 32);
+                assert_eq!(
+                    data.static_config().max_nodes(),
+                    64,
+                    "one node per publisher and subscriber slot"
+                );
+                assert_eq!(event.static_config().max_nodes(), 64);
+            }
+            held.push((raw, data, event));
+        }
+        drop(held);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The virtual size of this process, from `/proc/self/status` (`VmSize`, kB).
+#[cfg(target_os = "linux")]
+fn vm_size_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("VmSize:"))
+        .expect("VmSize line");
+    let kb: u64 = line
+        .trim_start_matches("VmSize:")
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .expect("VmSize value");
+    kb * 1024
+}
+
+/// A variable type with no tier entry takes the 128 MiB slice ceiling, and
+/// each subscriber slot adds `subscriber_max_buffer_size +
+/// subscriber_max_borrowed_samples` slices to every publisher's data segment.
+/// The rmw sizes such a topic's subscriber floor from the ceiling (8 slots at
+/// 128 MiB, the iceoryx2 default), so one publisher of this non-loanable type
+/// (2 borrowed samples per slot) reserves about 18 GiB of virtual address
+/// space instead of the 72 GiB 32 slots would. Both creation
+/// orders, since whichever endpoint creates the service sets its caps. On
+/// Linux the growth of this process's `VmSize` across the publisher create
+/// (the publisher maps its own data segment) is read too.
+#[test]
+#[serial]
+fn c_abi_large_slice_topic_floors_subscribers_by_its_ceiling() {
+    #[repr(C)]
+    struct CLabeled {
+        id: f64,
+        label: CRosString,
+    }
+    const GIB: u64 = 1 << 30;
+    for subscription_first in [false, true] {
+        let order = if subscription_first {
+            "subscription first"
+        } else {
+            "publisher first"
+        };
+        unsafe {
+            let suffix = unique_suffix();
+            let ts = make_message_ts(
+                "rmw_e2e__msg",
+                &format!("Big{suffix}"),
+                std::mem::size_of::<CLabeled>(),
+                vec![
+                    member("id", ROS_TYPE_DOUBLE, 0),
+                    member("label", ROS_TYPE_STRING, 8),
+                ],
+            );
+            let (_, node, _opts) = setup_node(&format!("big_node_{suffix}"));
+            let topic_str = format!("/rmw_e2e/big/{suffix}");
+            let topic = CString::new(topic_str.clone()).expect("topic");
+            let qos = default_qos();
+            let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+            let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+            let subscription = if subscription_first {
+                let s = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+                assert!(
+                    !s.is_null(),
+                    "{order}: the rmw subscription creates the topic"
+                );
+                Some(s)
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let before = vm_size_bytes();
+            let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+            assert!(!publisher.is_null(), "{order}: the rmw publisher attaches");
+            #[cfg(target_os = "linux")]
+            let grown = vm_size_bytes().saturating_sub(before);
+
+            let (_raw, data, _event) = raw_attach(&topic_str);
+            let config = data.static_config();
+            let (_, default_subs) = iceoryx2_default_port_caps();
+            assert_eq!(
+                config.max_subscribers(),
+                default_subs.max(8),
+                "{order}: 128 MiB slices take 8 subscriber slots (1 GiB of slice per floor)"
+            );
+            assert_eq!(
+                config.max_publishers(),
+                32,
+                "{order}: the publisher floor is unchanged"
+            );
+            // At most 4 loaned samples per publisher port (`RMW_LOANED_SAMPLES_BUDGET`).
+            let slots = config.max_subscribers()
+                * (config.subscriber_max_buffer_size() + config.subscriber_max_borrowed_samples())
+                + config.history_size()
+                + 4;
+            let reserved = slots as u64 * 128 * 1024 * 1024;
+            assert!(
+                reserved <= 24 * GIB,
+                "{order}: one publisher's segment is {reserved} bytes ({slots} slots of 128 MiB)"
+            );
+            #[cfg(target_os = "linux")]
+            assert!(
+                grown <= 24 * GIB,
+                "{order}: VmSize grew {grown} bytes across one publisher create"
+            );
+            assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+            if let Some(s) = subscription {
+                assert_eq!(rmw_destroy_subscription(node, s), RMW_RET_OK);
+            }
+            assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+        }
+    }
+}
+
+/// The open side of the same provisioning: a topic whose service a NATIVE
+/// opener created first, at iceoryx2's defaults (`cerulion topic echo`, a
+/// raw transport user), must still accept rmw endpoints up to the caps that
+/// service carries. An rmw that demanded its own larger caps as an open
+/// requirement would refuse every endpoint here.
+#[test]
+#[serial]
+fn c_abi_ros_endpoints_attach_to_a_service_a_native_opener_created() {
+    let (default_pubs, _) = iceoryx2_default_port_caps();
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtNative{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("native_first_{suffix}"));
+        let topic_str = format!("/rmw_e2e/native_first/{suffix}");
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let native = rt
+            .transport
+            .create_subscriber(&topic_str)
+            .expect("native default subscriber creates the service");
+
+        let topic = CString::new(topic_str).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(
+            !subscription.is_null(),
+            "an rmw subscription must attach to the natively created service"
+        );
+        let publishers: Vec<_> = (0..default_pubs)
+            .map(|i| {
+                let p = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+                assert!(
+                    !p.is_null(),
+                    "publisher {i} of the service's {default_pubs} slots must attach"
+                );
+                p
+            })
+            .collect();
+        for p in publishers {
+            assert_eq!(rmw_destroy_publisher(node, p), RMW_RET_OK);
+        }
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        drop(native);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// rcl hands `rmw_get_node_names` and `rmw_get_node_names_with_enclaves`
+/// out-arrays from `rcutils_get_zero_initialized_string_array()`: size 0,
+/// data NULL, and every allocator function pointer NULL. The rmw fills them
+/// with the default allocator and records that allocator in each array, and
+/// rcl later releases them with `rcutils_string_array_fini`, which frees
+/// through the recorded allocator. `ros2 node list` takes this path.
+#[test]
+#[serial]
+fn c_abi_get_node_names_fills_zero_initialized_arrays() {
+    unsafe fn release(arr: &ffi::rcutils_string_array_t) {
+        // `rcutils_string_array_fini` refuses an allocator missing any of
+        // its four functions (`rcutils_allocator_is_valid`).
+        let a = &arr.allocator;
+        assert!(
+            a.allocate.is_some()
+                && a.deallocate.is_some()
+                && a.reallocate.is_some()
+                && a.zero_allocate.is_some(),
+            "the recorded allocator must pass rcutils_allocator_is_valid"
+        );
+        let dealloc = arr
+            .allocator
+            .deallocate
+            .expect("the fill records a usable allocator in the array");
+        for i in 0..arr.size {
+            dealloc(*arr.data.add(i) as *mut c_void, arr.allocator.state);
+        }
+        if !arr.data.is_null() {
+            dealloc(arr.data as *mut c_void, arr.allocator.state);
+        }
+    }
+    unsafe fn strings(arr: &ffi::rcutils_string_array_t) -> Vec<String> {
+        (0..arr.size)
+            .map(|i| {
+                std::ffi::CStr::from_ptr(*arr.data.add(i))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+    unsafe {
+        let suffix = unique_suffix();
+        let node_name = format!("names_node_{suffix}");
+        let (_, node, _opts) = setup_node(&node_name);
+
+        let mut names: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut namespaces: ffi::rcutils_string_array_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_get_node_names(node, &mut names, &mut namespaces),
+            RMW_RET_OK,
+            "zero-initialized out-arrays (rcl's call shape) must be filled"
+        );
+        let (n, ns) = (strings(&names), strings(&namespaces));
+        assert_eq!(n.len(), ns.len(), "parallel arrays");
+        let at = n
+            .iter()
+            .position(|x| *x == node_name)
+            .unwrap_or_else(|| panic!("own node {node_name} must be listed in {n:?}"));
+        assert_eq!(ns[at], "/", "the namespace travels with the name");
+        release(&names);
+        release(&namespaces);
+
+        let mut n2: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut ns2: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut enc: ffi::rcutils_string_array_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_get_node_names_with_enclaves(node, &mut n2, &mut ns2, &mut enc),
+            RMW_RET_OK,
+            "the enclaves variant takes the same zero-initialized shape"
+        );
+        assert_eq!(n2.size, ns2.size, "parallel arrays");
+        assert_eq!(n2.size, enc.size, "enclaves parallel to names");
+        assert!(
+            strings(&n2).contains(&node_name),
+            "own node listed by the enclaves variant"
+        );
+        release(&n2);
+        release(&ns2);
+        release(&enc);
+
+        // A caller that DID set a complete allocator keeps it: the array
+        // records the caller's allocator, not a substitute.
+        unsafe extern "C" fn fixture_reallocate(
+            ptr: *mut c_void,
+            size: usize,
+            _state: *mut c_void,
+        ) -> *mut c_void {
+            libc::realloc(ptr, size)
+        }
+        unsafe extern "C" fn fixture_zero_allocate(
+            count: usize,
+            size: usize,
+            _state: *mut c_void,
+        ) -> *mut c_void {
+            libc::calloc(count, size)
+        }
+        let mut complete = malloc_allocator();
+        complete.reallocate = Some(fixture_reallocate);
+        complete.zero_allocate = Some(fixture_zero_allocate);
+        let mut n3: ffi::rcutils_string_array_t = std::mem::zeroed();
+        let mut ns3: ffi::rcutils_string_array_t = std::mem::zeroed();
+        n3.allocator = complete;
+        ns3.allocator = complete;
+        assert_eq!(rmw_get_node_names(node, &mut n3, &mut ns3), RMW_RET_OK);
+        assert_eq!(
+            n3.allocator.allocate.map(|f| f as *const () as usize),
+            Some(fixture_allocate as *const () as usize),
+            "a caller-provided allocator is the one recorded"
+        );
+        release(&n3);
+        release(&ns3);
+
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }

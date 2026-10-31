@@ -131,9 +131,13 @@ fn atomic_write_leaves_no_temp_file() {
     let s = store().with_path(&path);
     s.save(MAC_KEY).unwrap();
     assert!(path.exists());
-    // The `<name>.tmp` sibling must have been renamed away.
-    let tmp = dir.path().join("trust.store.tmp");
-    assert!(!tmp.exists(), "atomic write should leave no .tmp behind");
+    // The save's temporary sibling has been renamed away: the directory holds
+    // only the store.
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("trust.store")]);
 }
 
 #[test]
@@ -684,6 +688,29 @@ fn code_pairing_persists_a_row_given_a_valid_witness() {
     assert_eq!(row.source, PairingSource::CodePaired);
     // The principal kind comes from the witness (not a caller-chosen argument).
     assert_eq!(row.principal_kind, PrincipalKind::Human);
+}
+
+#[test]
+fn a_code_pairing_of_the_owner_account_is_refused_and_the_owner_row_is_unchanged() {
+    let mut s = store();
+    s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    let before = s.access_rows().to_vec();
+    let err = s
+        .establish_code_pairing(
+            &code_confirm(acct(OWNER)),
+            acct(OWNER),
+            "same account".into(),
+            Scope::CODE_PAIR_DEFAULT,
+            T_NOW + 1,
+        )
+        .unwrap_err();
+    assert!(matches!(err, PairingError::CodePairOwnerAccount), "{err:?}");
+    assert_eq!(s.access_rows(), before.as_slice());
+    assert_eq!(
+        s.is_allowed(&acct(OWNER), T_NOW + 1).unwrap().scope,
+        Scope::OWNER_FULL
+    );
 }
 
 #[test]

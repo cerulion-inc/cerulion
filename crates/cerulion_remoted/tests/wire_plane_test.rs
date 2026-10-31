@@ -3,7 +3,7 @@
 //! plus REAL iceoryx2 (per-test SHM roots via `init_for_test`, so parallel-safe:
 //! no `#[serial]`, no shared singleton).
 //!
-//! A paired `CAP_OBSERVE` wire client dials `cerulion/wire/1`, speaks the
+//! A paired `CAP_OBSERVE` wire client dials `cerulion/wire/2`, speaks the
 //! `cerulion_q` catalog/demand/schema/status vocabulary over the bidi control
 //! stream, and reads per-topic uni data streams — the frames flowing VERBATIM
 //! from a real SHM producer through `remoted`'s demand-driven tap, compared
@@ -150,7 +150,7 @@ fn test_manager(tag: &str) -> Arc<TransportManager> {
     .expect("init_for_test")
 }
 
-/// Hand-build a raw wire frame (32-byte little-endian header + payload) — the
+/// Hand-build a raw wire frame (40-byte little-endian header + payload), the
 /// oracle. `publish_raw` publishes these bytes VERBATIM.
 fn make_wire_frame(seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
     let header = WireHeader {
@@ -160,6 +160,7 @@ fn make_wire_frame(seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

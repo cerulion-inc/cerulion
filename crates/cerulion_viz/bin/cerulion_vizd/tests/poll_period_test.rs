@@ -180,7 +180,7 @@ impl Drop for Publisher {
     }
 }
 
-/// A `geometry_msgs/Vector3` wire frame: the 32-byte header + three f64s.
+/// A `geometry_msgs/Vector3` wire frame: the 40-byte header + three f64s.
 fn vector3_frame(seq: u32) -> Vec<u8> {
     use native_ros2_messages::geometry_msgs::Vector3;
     let mut buf = vec![0u8; WireHeader::SIZE + 24];
@@ -191,6 +191,7 @@ fn vector3_frame(seq: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 10_000_000 * (seq as u64 + 1),
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut buf);
     for (i, v) in [seq as f64, 2.0, 3.0].iter().enumerate() {

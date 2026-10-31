@@ -14,7 +14,7 @@
 #    cerulion_go2_dds/Cargo.toml) ───────────────────────────────────────────
 #   cerulion-ros2-client 0.10.1 (Apache-2.0, MSRV 1.88) ->
 #     cerulion-rustdds 0.14.2 (Apache-2.0, MSRV 1.88 — the effective floor,
-#     well under the root's 1.93 MSRV job). default-features = false keeps the
+#     well under the root's 1.95 MSRV job). default-features = false keeps the
 #     DDS-security
 #     (rustls/ring/webpki) tree OUT of the resolve; the distro feature selects
 #     the ros2-client GID width — Iron+ (`jazzy`, the default) = 16-byte,
@@ -35,9 +35,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-# Uses the workspace MSRV (1.93, the CI-enforced floor — bumped from 1.88 when
-# cerulion_viz's rerun 0.34 SDK joined the workspace). The DDS dep tree's own
-# floor is only 1.88 (cerulion-rustdds 0.14.2) — comfortably under 1.93.
+# Uses the workspace MSRV (1.95, the CI-enforced floor, set by cerulion_core's
+# `try_update` call). The DDS dep tree's own floor is only 1.88
+# (cerulion-rustdds 0.14.2), well under 1.95.
 rust-version.workspace = true
 description = "Cerulion DDS platform crate: one-per-process ros2-client/rustdds participant + discovery enumeration for `cerulion ros2 attach`"
 readme = "README.md"
