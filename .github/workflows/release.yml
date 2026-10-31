@@ -62,7 +62,7 @@ jobs:
         with:
           toolchain: stable
 
-      # The publish job verifies all 19 publishable workspace crates back to back on one
+      # The publish job verifies all 20 publishable workspace crates back to back on one
       # hosted runner: a dry run died 17 minutes in with
       # "No space left on device". On a v* tag the same job
       # uploads as it goes, so running out of disk mid-way would leave crates.io
@@ -113,7 +113,7 @@ jobs:
       # uploads anything. Both workflows fire on one tag push and this one is
       # the irreversible half (a crates.io version can never be re-published),
       # so it must refuse for every reason the artifacts workflow refuses —
-      # otherwise a stale CITATION.cff date ships 19 crates with no release.
+      # otherwise a stale CITATION.cff date ships 20 crates with no release.
       - name: Verify citation metadata matches the release
         run: |
           version=$(tools/scripts/workspace_version.sh)
