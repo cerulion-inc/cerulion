@@ -41,12 +41,13 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   takes an O(1) snapshot) and is EVENT-driven, never timed: the worker blocks on a kernel
   watch of the iceoryx2 service directory (`service_dir_watch`, inotify/kqueue) and walks
   only on a change, so an idle machine runs ZERO walks. An inline walk starves the drain;
-  a cadence burns a core. Degradations are loud AND observable via `wake_source()`; a dead
-  worker is caught by its HEARTBEAT (`ScanSilenceLatch`), never by silence, normal here.
+  a cadence burns a core. Degradations are loud (`warn!`; `wake_source()` reads the engine,
+  the recorder does not store it); a dead worker is caught by its HEARTBEAT
+  (`ScanSilenceLatch`), never by silence, normal here.
 - Live discovery defaults ON only for `--topics-json` and `--run`; OFF for
   `--topic`/`--all`/`--regex` and `BagdConfig::new`. `graph run --record` builds bagd's argv
   itself: retune with `CERULION_RECORD_DISCOVERY=off` / `CERULION_RECORD_DISCOVERY_SETTLE_MS`.
-- The settle window is a WALL, not a scan count: creation is held until `DISCOVERY_SETTLE_MIN` passes with nothing new found, AND no woken walk is still pending; an arm-time find does NOT start it.
+- The settle window is a WALL, not a scan count: creation is held until `DISCOVERY_SETTLE_MIN` passes with nothing new found, AND the worker owes no walk (`walk_pending`: baseline, a change's walk and tail, a broken watch's hand-over); an arm-time find does NOT start it.
 - Bag creation is held for max(discovery settle, schema wait) - measure it from
   `BagdSummary::channel_set_closed_after`, never the bag file's appearance (reads short).
 - Both record paths run on the default `iox2_` namespace: discovery also taps

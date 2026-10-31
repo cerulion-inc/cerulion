@@ -460,11 +460,10 @@ const RUN_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// It states the guarantee in the unit the guarantee is about (wall time before
 /// the channel set closes) and is directly measurable by a test, instead of
-/// being an emergent property of which enumerations happen to be counted. The
-/// counting form had already delivered half its documented window once, because
-/// drive-loop pass 1 enumerated microseconds after the arm-time scan and that
-/// enumeration counted - leaving one informative scan between arm and release
-/// where the constant's own doc promised two.
+/// being an emergent property of which enumerations happen to be counted. A
+/// count also depends on which enumerations are counted: one taken
+/// microseconds after the arm-time scan would count, and leave fewer
+/// informative scans between arm and release than the count promises.
 ///
 /// It is also what lets discovery be EVENT-DRIVEN at all. A watch on the
 /// iceoryx2 service directory is silent on a settled machine, so a rule phrased
@@ -13108,8 +13107,7 @@ impl Recorder {
         // A scan that added nothing records NOTHING here, deliberately. The
         // window closes by the wall going quiet, not by scans accumulating -
         // which is what lets an event-driven enumeration, silent on a settled
-        // machine, release the hold at the same instant the old counting rule
-        // did.
+        // machine, release the hold at all.
         if added > 0 {
             self.discovery_last_add = Some(Instant::now());
         }
@@ -13358,8 +13356,9 @@ impl Recorder {
     /// pays exactly the floor; a robot whose bridge is still opening routes
     /// keeps the window open until it stops finding them or the cap expires.
     ///
-    /// `walk_pending` says the enumerator has SEEN a change it has not finished
-    /// answering, which also holds: quiet time is the ABSENCE of evidence, and
+    /// `walk_pending` says the enumerator still OWES a walk (its baseline, the
+    /// answer to a change it has seen, or the walks a broken watch handed to
+    /// the timed engine), which also holds: quiet time is the ABSENCE of evidence, and
     /// an event is evidence. Releasing on the boundary while that answer is in
     /// flight would freeze the channel set against a topic set already known to
     /// have moved, omitting exactly the producer the event was about.
@@ -19293,13 +19292,15 @@ fn drive_loop(
         //
         // Shutdown always wins: a SIGINT must never wait out a discovery window.
         //
-        // A walk the enumerator has been woken for but not yet published also
-        // holds: that is positive evidence the live topic set is moving, and
-        // releasing on the quiet boundary while the answer is in flight omits
-        // the very producer the event was about.
-        let discovery_hold =
-            !shutting && rec.discovery_hold_active(start.elapsed(), scanner.walk_pending());
-        // The SECOND, independent hold. The settle above asks "has the
+        // A walk the enumerator still owes also holds: that is positive
+        // evidence the live topic set is moving, and releasing on the quiet
+        // boundary while the answer is in flight omits the very producer the
+        // event was about. The flag is read HERE, before `next_scan` below: a
+        // `false` is ordered after the scan the worker published before
+        // clearing it, so that scan is taken and applied this pass. The hold
+        // itself is decided after the apply.
+        let walk_pending = scanner.walk_pending();
+        // The SECOND, independent hold. The settle hold asks "has the
         // live topic set stopped changing?" — which a multi-second gap in a
         // bursty route build answers WRONGLY, freezing a 4-topic bag while 98
         // routes were still on their way. This asks "is a process on this
@@ -19346,6 +19347,10 @@ fn drive_loop(
         if let Some(scan) = scanner.next_scan(mgr) {
             rec.apply_discovery(mgr, scan);
         }
+        // The settle decision, AFTER this pass's scan is applied: a scan that
+        // just added a tap has restarted the quiet window, so the bag is never
+        // created in the same pass as a find that should have held it open.
+        let discovery_hold = !shutting && rec.discovery_hold_active(start.elapsed(), walk_pending);
 
         // Sweep for per-rank node-state rings on the enumeration
         // cadence, and - unlike the topic scan - INLINE. It is a bounded run of

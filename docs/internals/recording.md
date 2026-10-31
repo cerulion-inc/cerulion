@@ -102,8 +102,9 @@ upstream `mcap` crate, never only our own reader; the format claim is
   `apply_discovery` → `plan_discovery`; `next_scan` TAKES the snapshot, so one
   enumeration yields exactly one applied scan. Never put a directory walk back
   on that loop.
-- **Enumeration is driven by EVENTS, not a cadence.** iceoryx2 0.9.1 exposes no
-  discovery event, but a service's static config is a FILE under
+- **Enumeration is driven by EVENTS, not a cadence.** iceoryx2 0.10 exposes no
+  discovery event in its core API (its optional discovery service is a tracker
+  that itself calls `Service::list`), but a service's static config is a FILE under
   `global.root_path` + `global.service.directory`, and `Service::list` is a walk
   of exactly that directory - so a producer registering is a file appearing, and
   the kernel reports it. `service_dir_watch` is that watch (`inotify` on Linux,
@@ -120,10 +121,11 @@ upstream `mcap` crate, never only our own reader; the format claim is
   two. The worker still wakes ten times a second
   to check its stop flag and stamp a heartbeat; those wakes do no work.
 - **A background scanner can fail where an inline call could not, so every
-  degradation is loud and observable.** Three tiers, each with its own report:
-  the watch cannot be ARMED, or BREAKS mid-run, and the worker falls back to
-  walking on `DISCOVERY_RESCAN_INTERVAL` with one `warn!` and
-  `DiscoveryScanner::wake_source` flipping to `Poll`; or the thread cannot be
+  degradation is loud.** Three tiers, each with its own report: the watch
+  cannot be ARMED, or BREAKS mid-run, and the worker falls back to walking on
+  `DISCOVERY_RESCAN_INTERVAL` with one `warn!` (`DiscoveryScanner::wake_source`
+  reads `Poll` from then on, for a caller that owns the scanner; the recorder
+  does not store the engine in its summary or manifest); or the thread cannot be
   SPAWNED and the scanner degrades to the inline walk on the drive loop
   (correct, just costly) with one `warn!`. A worker that spawned and then
   stopped is caught by the HEARTBEAT, never by scan silence - an event-driven
@@ -146,11 +148,15 @@ upstream `mcap` crate, never only our own reader; the format claim is
 - **Settle window.** Bag creation is held until `DISCOVERY_SETTLE_MIN` has
   passed with NOTHING NEW DISCOVERED, measured from the later of the drive
   loop's start and the last discovered tap, capped at
-  `DEFAULT_DISCOVERY_SETTLE_MS`. A walk the enumerator has been WOKEN for and
-  not yet published also holds (`DiscoveryScanner::walk_pending`): quiet time is
-  the absence of evidence and an event is evidence, so releasing on the boundary
-  while that answer is in flight would freeze the channel set against a topic
-  set already known to have moved. The cap still outranks it. It is a WALL, not a count of quiet
+  `DEFAULT_DISCOVERY_SETTLE_MS`. A walk the enumerator still OWES also holds
+  (`DiscoveryScanner::walk_pending`): its baseline walk, the walk and
+  confirmation tail a directory change asked for, and, after a watch breaks,
+  the same three walks from the timed engine. On the watch the flag drops only
+  when a zero-timeout probe finds no change queued, so a change that landed
+  during the last walk is answered first. Quiet time is the absence of
+  evidence and an event is evidence, so releasing on the boundary while that
+  answer is in flight would freeze the channel set against a topic set already
+  known to have moved. The cap still outranks it. It is a WALL, not a count of quiet
   enumerations: an event-driven enumeration produces no scans on a settled
   machine, so a counting rule could never be satisfied there and every plain
   recording would pay the whole cap - and the wall is the unit the guarantee was
@@ -464,7 +470,7 @@ per-instance transport):
 | `e2e_test.rs` | In-process `run_bagd` end-to-end: hand-built frames/trace records, independent `mcap` re-read, backlog-aware drain no-loss, signal-path finalize | yes | none |
 | `wire_gap_frame_e2e_test.rs` | rmw borrow-window gap-frame byte-fidelity: a page-aligned, gap-carrying frame records + reads back byte-identical (both readers), wire stamps verbatim | yes | none |
 | `discovery_e2e_test.rs` | Coverage (an undeclared live producer is recorded) + disclosure (an unrecorded one is named with its reason); tap-attach rendezvous | yes | none |
-| `discovery_event_e2e_test.rs` | Enumeration is event-driven: every walk has a directory change behind it while the timed engine's are uncaused, a real topic still wakes the worker, a burst is coalesced, and an unarmable watch degrades loudly to the timed walk | no | none |
+| `discovery_event_e2e_test.rs` | Enumeration is event-driven: every walk has a directory change behind it while the timed engine's are uncaused, a real topic still wakes the worker, a burst is coalesced, and an unarmable watch degrades loudly to the timed walk; the settle hold stays up through the baseline walk and through a broken watch's hand-over, and is decided after the pass's scan is applied | yes | none |
 | `prefix_loss_e2e_test.rs` | The head-loss marker: `prove_prefix_loss` + `armed_before_producers` gating, `is_incomplete()` escalation | yes | none |
 | `run_lifetime_e2e_test.rs` | A bound recorder finalizes when its run ends without ever being signalled; the unbound control keeps that meaningful | yes | none |
 | `schema_resolve_e2e_test.rs` | Channels named from the wire hash via the local corpus; wire-size derivation; explicit `Unresolved`; the non-waiting-verb source walk | yes | none |

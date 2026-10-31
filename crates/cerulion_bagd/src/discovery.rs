@@ -777,8 +777,9 @@ pub fn resolve_mirror_snapshot<E>(
 ///
 /// # The pending term
 ///
-/// `walk_pending` says the enumerator has SEEN a change and has not finished
-/// answering. Quiet time is the ABSENCE of evidence, and an event is evidence;
+/// `walk_pending` says the enumerator still OWES a walk: its baseline, the
+/// answer to a change it has seen, or the walks a broken watch handed to the
+/// timed engine. Quiet time is the ABSENCE of evidence, and an event is evidence;
 /// releasing on the boundary while the answer is in flight freezes the channel
 /// set against a topic set already known to have moved, and omits exactly the
 /// producer the event was about. So a pending answer holds, and the `cap` still
@@ -1724,7 +1725,8 @@ mod tests {
             // An OLD find on a settled machine is not a reason to hold.
             (true, 1800, Some(1700), false, false),
             // A PENDING answer holds where quiet alone would have released:
-            // the enumerator has seen a change and has not reported it yet.
+            // the enumerator still owes a walk (its baseline, a change's walk
+            // and tail, or a broken watch's hand-over).
             (true, 1800, Some(1700), true, true),
             (true, 500, None, true, true),
             (true, 1000, Some(500), true, true),

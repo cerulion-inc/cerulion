@@ -3,9 +3,10 @@
 //!
 //! # Why the filesystem is the event source
 //!
-//! The recorder has to learn that a new producer exists. iceoryx2 0.9.1 exposes
-//! no discovery EVENT: the only way to ask "what is live?" is
-//! `Service::list`, a directory walk whose cost scales with the machine's
+//! The recorder has to learn that a new producer exists. iceoryx2 0.10 exposes
+//! no discovery EVENT in its core API (its optional discovery service is a
+//! tracker that itself calls `Service::list`): the only way to ask "what is
+//! live?" is `Service::list`, a directory walk whose cost scales with the machine's
 //! service count (MEASURED at 117.5 ms with 86 live topics on a robot's
 //! compute module). Any
 //! design built on asking that question on a cadence is a poll, and a poll is
@@ -26,7 +27,7 @@
 //!
 //! The general-purpose watcher crates are recursive, cross-platform, thread-and-
 //! channel-owning engines. What is needed here is one flag from one directory,
-//! and the whole of it is the fifty lines below per platform. Taking a watcher
+//! and the whole of it is one short module per platform below. Taking a watcher
 //! dependency would add five crates to a recorder that ships on a robot, and one
 //! of them carries a license the workspace's `deny.toml` does not allow, for
 //! machinery none of which is used. `libc` is already in the tree.
@@ -55,7 +56,8 @@
 //!   that), which happens shortly AFTER the file is created. On Linux the chmod
 //!   is itself an event (`IN_ATTRIB`); on macOS a chmod of a file inside a
 //!   directory does not change the directory, so it is not. The caller absorbs
-//!   both cases with a coalescing delay and one bounded confirmation walk.
+//!   both cases with a coalescing delay and a short, fixed tail of
+//!   confirmation walks.
 //! * Events are edges, not a queue of facts. A burst of twenty routes may
 //!   collapse into one wake, which is correct and desirable: the answer is a
 //!   walk either way.
@@ -221,12 +223,12 @@ impl ServiceDirWatch {
     /// STANDING IN is what covers a NESTED `service_dir` (`a/b/services`): the
     /// root watch sees `a` appear but not `a/b/services`, so the promotion
     /// comes from the stat rather than from an event. That state is transient
-    /// and its stat is bounded, where an idle tick's would be forever. Residual, stated plainly: on Linux, deleting the WATCHED service
-    /// directory invalidates the inotify watch, so no further event arrives and
-    /// nothing prompts the re-check. iceoryx2 removes service FILES and never
-    /// the directory that holds them, so this is unreachable through the
-    /// recorder's own peers; an operator who deletes it by hand gets a recorder
-    /// whose discovery is quiet until it is restarted.
+    /// and its stat is bounded, where an idle tick's would be forever.
+    ///
+    /// Deleting the WATCHED service directory wakes the watch as well: its
+    /// files go first, and removing the directory itself queues `IN_IGNORED`
+    /// on Linux (delivered whatever the mask) and `NOTE_DELETE` on macOS, so
+    /// the re-check that follows falls back to the root.
     pub fn wait(&mut self, timeout: Duration) -> WatchWake {
         let changed = match self.imp.wait(timeout) {
             Ok(c) => c,
@@ -358,9 +360,11 @@ mod imp {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // Round UP, never down: a sub-millisecond remainder truncated to
-            // zero makes `poll` return immediately, and a caller waiting out a
+            // A NONZERO timeout never becomes zero: `as_millis` truncates, so a
+            // sub-millisecond remainder is raised to 1 ms. Truncated to zero it
+            // would make `poll` return immediately, and a caller waiting out a
             // deadline in a loop would spin on it until the deadline expired.
+            // A zero timeout stays zero: that is the probe.
             let ms = timeout
                 .as_millis()
                 .min(i32::MAX as u128)
@@ -428,8 +432,8 @@ mod imp {
     /// removed. `NOTE_ATTRIB` here is the DIRECTORY's own attributes, not its
     /// children's: kqueue watches a vnode, and a chmod of a file inside the
     /// directory is not a change to the directory. That asymmetry against Linux
-    /// is why the caller runs one bounded confirmation walk after an
-    /// event-driven one.
+    /// is why the caller runs a short, fixed tail of confirmation walks after
+    /// an event-driven one.
     const FFLAGS: u32 = libc::NOTE_WRITE
         | libc::NOTE_EXTEND
         | libc::NOTE_LINK
@@ -675,6 +679,93 @@ mod tests {
             watch.wait(Duration::from_secs(5)),
             WatchWake::Changed,
             "the promoted watch must see files in the directory it was promoted to"
+        );
+    }
+
+    /// A NESTED service directory is promoted to even when its creation sends
+    /// the root watch no event at all.
+    ///
+    /// The watch on the root is not recursive, so with `a` already there,
+    /// creating `a/b/services` changes nothing the root watch can see. The
+    /// promotion comes from the stat `wait` runs on every call while standing
+    /// in, which is why that stat is not limited to calls that saw a change.
+    #[test]
+    fn a_nested_service_directory_is_promoted_to_without_an_event_on_the_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let nested = "a/b/services";
+        let services = root.path().join(nested);
+        // `a` exists BEFORE the watch, so nothing below creates an entry in the
+        // root and the root watch has nothing to report.
+        std::fs::create_dir(root.path().join("a")).expect("create a");
+
+        let mut watch = match ServiceDirWatch::arm(root.path(), nested) {
+            Ok(w) => w,
+            Err(WatchError::Unsupported) => return,
+            Err(e) => panic!("a missing nested service directory must stand in on the root: {e}"),
+        };
+        assert!(!watch.watching_service_dir());
+        assert_eq!(watch.watched_path(), root.path());
+        // CONTROL: with nothing created, the stand-in stays where it is.
+        assert_eq!(watch.wait(Duration::from_millis(50)), WatchWake::Idle);
+        assert!(!watch.watching_service_dir());
+
+        std::fs::create_dir_all(&services).expect("create the nested service directory");
+        // A seconds-scale ceiling: fifty waits of one slice each.
+        let promoted = (0..50).find_map(|_| {
+            let wake = watch.wait(Duration::from_millis(100));
+            watch.watching_service_dir().then_some(wake)
+        });
+        assert_eq!(
+            promoted,
+            Some(WatchWake::Changed),
+            "a nested service directory must be promoted to, and the promotion reported as a \
+             change, even though its creation sent the root watch no event"
+        );
+        assert_eq!(watch.watched_path(), services);
+
+        std::fs::write(services.join("d.service"), b"x").expect("write");
+        assert_eq!(
+            watch.wait(Duration::from_secs(5)),
+            WatchWake::Changed,
+            "the promoted watch must see files in the nested directory"
+        );
+    }
+
+    /// A ZERO-timeout wait is a probe: it reports a change already queued and
+    /// answers `Idle` when there is none.
+    ///
+    /// The scanner clears its pending flag only on an `Idle` answer to this
+    /// probe, so both halves matter: a probe that missed a queued change would
+    /// clear the flag with a change still unanswered, and one that reported a
+    /// change with none queued would hold every recording to its settle cap.
+    #[test]
+    fn a_zero_timeout_wait_reports_a_queued_change_and_idle_otherwise() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let services = root.path().join("services");
+        std::fs::create_dir(&services).expect("create services dir");
+
+        let mut watch = match ServiceDirWatch::arm(root.path(), "services") {
+            Ok(w) => w,
+            Err(WatchError::Unsupported) => return,
+            Err(e) => panic!("arming on a real directory must succeed: {e}"),
+        };
+        while watch.wait(Duration::from_millis(120)) == WatchWake::Changed {}
+
+        assert_eq!(
+            watch.wait(Duration::ZERO),
+            WatchWake::Idle,
+            "nothing queued"
+        );
+        std::fs::write(services.join("e.service"), b"x").expect("write");
+        assert_eq!(
+            watch.wait(Duration::ZERO),
+            WatchWake::Changed,
+            "a change queued before the probe must be reported by the probe"
+        );
+        assert_eq!(
+            watch.wait(Duration::ZERO),
+            WatchWake::Idle,
+            "the probe consumed the change"
         );
     }
 

@@ -95,9 +95,12 @@
 //! * The watch cannot be ARMED (an unsupported platform, no directory, a
 //!   descriptor limit) - the worker falls back to walking on
 //!   [`DISCOVERY_RESCAN_INTERVAL`], with one `warn!` naming why.
-//! * The watch BREAKS mid-run - same fallback, same loudness, and
-//!   [`DiscoveryScanner::wake_source`] reports the degraded engine so the
-//!   change is observable and not merely logged.
+//! * The watch BREAKS mid-run - same fallback, same loudness. The timed engine
+//!   is then owed the walk and confirmations one change is answered with, so a
+//!   change the watch saw and never answered still holds the settle window
+//!   until the timed engine has looked.
+//!   [`DiscoveryScanner::wake_source`] reads `Poll` from then on; in a
+//!   recording the degrade is reported by the `warn!`.
 //! * The thread cannot be SPAWNED - the scanner degrades to the earlier INLINE
 //!   walk on the drive loop at the same cadence, which costs frames but never
 //!   coverage, with one `warn!`.
@@ -164,6 +167,16 @@ pub const EVENT_CONFIRM_DELAY: Duration = Duration::from_millis(250);
 /// real event, and a settled machine runs none of them.
 pub const CONFIRM_WALKS: u32 = 2;
 
+/// The walks one change is answered with: the walk itself and its
+/// [`CONFIRM_WALKS`] confirmations.
+///
+/// Also what a watch that BREAKS hands the timed engine. A break can follow a
+/// change the watch saw and never walked (it broke while absorbing the burst),
+/// and it can be a change itself (the watched directory was replaced and could
+/// not be re-opened), so the settle hold stays up until the timed engine has
+/// given the full answer.
+const WALKS_OWED_PER_CHANGE: u32 = 1 + CONFIRM_WALKS;
+
 /// The closest together two walks are ever STARTED.
 ///
 /// A rate limit, not a cadence: it can only make an event-driven scanner walk
@@ -202,10 +215,11 @@ pub struct TopicScan {
 
 /// What is driving the enumeration for this recording.
 ///
-/// Observable (Principle #3) because the difference is not cosmetic: `Events`
-/// costs a settled machine nothing, `Poll` costs it a directory walk four times
-/// a second, and `Inline` costs the drive loop itself. An operator reading a
-/// slow recording needs to be able to tell which one they have.
+/// Read back through [`DiscoveryScanner::wake_source`], because the difference
+/// is not cosmetic: `Events` costs a settled machine nothing, `Poll` costs it a
+/// directory walk four times a second, and `Inline` costs the drive loop
+/// itself. A recording does not store it in its summary or coverage manifest;
+/// it reports a fall from `Events` with one `warn!` naming the failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WakeSource {
@@ -335,6 +349,98 @@ pub fn next_step(wake: &WatchWake, confirm_due: Option<Instant>, now: Instant) -
     }
 }
 
+/// What the worker still OWES the settle hold, once its baseline walk is in.
+///
+/// [`DiscoveryScanner::walk_pending`] is [`Owed::pending`] of this, so the
+/// rule for when that flag may drop lives in one pure fold ([`owed_after`])
+/// rather than in the stores scattered through the worker loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// Nothing: no change the worker has seen is still unanswered. On the
+    /// watch, a probe has found nothing queued since the last owed walk; on the
+    /// timed engine, it has run every walk it was owed.
+    Nothing,
+    /// The last owed walk has run. The next wait is a zero-timeout PROBE: a
+    /// change that landed during that walk is queued on the watch, and only an
+    /// `Idle` answer here means nothing more is owed.
+    Probe,
+    /// A change's answer is in flight: its walk, or its confirmation tail.
+    Answer,
+    /// The watch broke; the timed engine owes this many walks (never zero).
+    Timed(u32),
+}
+
+impl Owed {
+    /// What the worker owes once its BASELINE walk has published. With a watch,
+    /// a change that landed during the baseline is queued on it, so the answer
+    /// waits on a probe; the timed engine has nothing to probe.
+    fn after_baseline(watching: bool) -> Self {
+        if watching {
+            Self::Probe
+        } else {
+            Self::Nothing
+        }
+    }
+
+    /// Whether the settle hold must treat the worker's answer as still in flight.
+    fn pending(self) -> bool {
+        self != Self::Nothing
+    }
+
+    /// How long the worker's next wait on the watch may block: not at all for a
+    /// probe, one [`SCANNER_STOP_SLICE`] otherwise.
+    fn wait_budget(self) -> Duration {
+        if self == Self::Probe {
+            Duration::ZERO
+        } else {
+            SCANNER_STOP_SLICE
+        }
+    }
+}
+
+/// One thing the worker did, as far as the settle hold is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Happened {
+    /// A directory change woke the worker ([`ScanStep::WalkAndConfirm`]).
+    Changed,
+    /// A wait came back with nothing to do ([`ScanStep::Idle`]).
+    Idle,
+    /// A confirmation walk published, with `left` more still to run.
+    Confirmed {
+        /// Confirmations still to run after this one.
+        left: u32,
+    },
+    /// The watch broke, on a wait or while a burst was being absorbed.
+    Broke,
+    /// The timed engine walked once.
+    TimedWalk,
+}
+
+/// PURE: fold one thing the worker did into what it still owes.
+///
+/// The rows that matter: an idle wait clears ONLY a probe, never a tail that is
+/// waiting for its next confirmation; the last confirmation hands over to a
+/// probe rather than clearing; and a break of any kind owes the timed engine
+/// the walks one change is answered with ([`WALKS_OWED_PER_CHANGE`]), because
+/// the break may have cut a tail short, may itself be a change, and leaves
+/// nothing watching from then on.
+fn owed_after(owed: Owed, happened: Happened) -> Owed {
+    match happened {
+        Happened::Changed => Owed::Answer,
+        Happened::Idle => match owed {
+            Owed::Probe => Owed::Nothing,
+            other => other,
+        },
+        Happened::Confirmed { left: 0 } => Owed::Probe,
+        Happened::Confirmed { .. } => Owed::Answer,
+        Happened::Broke => Owed::Timed(WALKS_OWED_PER_CHANGE),
+        Happened::TimedWalk => match owed {
+            Owed::Timed(n) if n > 1 => Owed::Timed(n - 1),
+            _ => Owed::Nothing,
+        },
+    }
+}
+
 /// The threaded half: a worker publishing into a one-slot mailbox.
 struct ThreadedScanner {
     /// The newest completed scan, or `None` when the loop has already taken it.
@@ -344,21 +450,25 @@ struct ThreadedScanner {
     /// Enumerations the worker ran because it was WOKEN by a directory change,
     /// as opposed to a baseline, a confirmation or a timed fallback walk
     /// (Principle #3). A burst counts once, because a burst is one change.
-    /// Zero on every engine but the watch, which is how "is this really
-    /// event-driven?" is answered without reading a log.
+    /// Zero on every engine but the watch, which is how a caller that owns the
+    /// scanner tells a real watch from a timer. The recorder does not store it.
     wakes: Arc<AtomicU64>,
     /// Milliseconds since the worker started, stamped on every wait return. The
     /// liveness signal a silent-but-healthy event-driven worker still produces.
     heartbeat_ms: Arc<AtomicU64>,
-    /// Whether the worker has been WOKEN and has not yet finished answering.
+    /// Whether the worker OWES a walk it has not finished: `true` until the
+    /// baseline has published, then [`Owed::pending`] of the worker's state.
     ///
-    /// True from the moment a directory change is seen until the walk it caused
-    /// and its confirmation tail have all published. The settle hold reads it,
-    /// because "something changed and we have not looked yet" is the one state
-    /// in which freezing the channel set is knowably premature.
+    /// Stored with `Release` after the scan it covers is published, read with
+    /// `Acquire`, so a drive pass that reads `false` takes that scan on its
+    /// next `next_scan`.
+    ///
+    /// The settle hold reads it, because "something changed and we have not
+    /// looked yet" is the one state in which freezing the channel set is
+    /// knowably premature.
     walk_pending: Arc<AtomicBool>,
-    /// The LIVE wake source, so a mid-run degrade is observable and not merely
-    /// logged.
+    /// The LIVE wake source, so a mid-run degrade reads back through
+    /// [`DiscoveryScanner::wake_source`].
     source: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
 }
@@ -384,7 +494,9 @@ impl ThreadedScanner {
         let scans_run = Arc::new(AtomicU64::new(0));
         let wakes = Arc::new(AtomicU64::new(0));
         let heartbeat_ms = Arc::new(AtomicU64::new(0));
-        let walk_pending = Arc::new(AtomicBool::new(false));
+        // TRUE from the start: the worker's baseline walk is owed, and the
+        // settle hold must not read a worker that has not looked yet as quiet.
+        let walk_pending = Arc::new(AtomicBool::new(true));
         let source = Arc::new(AtomicU8::new(WakeSource::Events as u8));
         let stop = Arc::new(AtomicBool::new(false));
         let channels = WorkerChannels {
@@ -492,25 +604,33 @@ fn scan_loop(
     // reports a CHANGE, so nothing that was already live when the watch was
     // armed would otherwise be seen. (The arm-time inline scan in
     // `Recorder::setup` covers the tap set; this covers the worker's own view.)
+    let mut last_walk_started = Instant::now();
     publish(&ch, &mgr, &origin);
+
+    // `walk_pending` has read true since the scanner was built, because the
+    // baseline was owed. From here it is `owed.pending()`, and every change to
+    // `owed` goes through `owed_after`.
+    let mut owed = Owed::after_baseline(watch.is_some());
+    report_owed(&ch, owed);
 
     let mut confirm_due: Option<Instant> = None;
     let mut confirms_left: u32 = 0;
-    let mut last_walk_started = Instant::now();
     while !ch.stop.load(Ordering::Relaxed) {
         let Some(w) = watch.as_mut() else {
-            // The degraded engine: the earlier timed walk, unchanged. It owes no
-            // pending answer, because it answers on every cadence regardless.
-            ch.walk_pending.store(false, Ordering::Relaxed);
+            // The degraded engine: the earlier timed walk, unchanged. It walks
+            // on every cadence regardless, so once it has run the walks a broken
+            // watch handed it, it owes nothing.
             sleep_unless_stopped(interval, &ch.stop, &ch.heartbeat_ms, &origin);
             if ch.stop.load(Ordering::Relaxed) {
                 return;
             }
             publish(&ch, &mgr, &origin);
+            owed = owed_after(owed, Happened::TimedWalk);
+            report_owed(&ch, owed);
             continue;
         };
 
-        let wake = w.wait(SCANNER_STOP_SLICE);
+        let wake = w.wait(owed.wait_budget());
         stamp_heartbeat(&ch.heartbeat_ms, &origin);
         if ch.stop.load(Ordering::Relaxed) {
             return;
@@ -522,7 +642,8 @@ fn scan_loop(
             // Something changed and we have not looked yet. Said BEFORE the
             // absorption and the rate floor, because that delay is exactly the
             // window in which the settle hold must not freeze the channel set.
-            ch.walk_pending.store(true, Ordering::Relaxed);
+            owed = owed_after(owed, Happened::Changed);
+            report_owed(&ch, owed);
             // Absorb the rest of the burst. Seventy routes opening back to back
             // are one logical change and deserve one walk.
             broke_while_coalescing = coalesce(w, &ch.stop, &ch.heartbeat_ms, &origin);
@@ -536,20 +657,27 @@ fn scan_loop(
         // decided is wrong - so a dropped break there is permanent blindness
         // rather than a report one pass late.
         if let Some(reason) = broke_while_coalescing {
+            // Owed BEFORE the engine flips, so a reader that sees `Poll` also
+            // sees the walks the timed engine now owes.
+            owed = owed_after(owed, Happened::Broke);
+            report_owed(&ch, owed);
             degrade_to_poll(&ch, &reason, WatchFailure::BrokeMidRun, interval);
             watch = None;
             confirm_due = None;
             confirms_left = 0;
-            // The timed engine answers every cadence, so nothing is owed.
-            ch.walk_pending.store(false, Ordering::Relaxed);
             continue;
         }
 
         // Everything below is done with the watch borrow, which is what lets
         // the degrade arm replace it.
         match step {
-            ScanStep::Idle => continue,
+            ScanStep::Idle => {
+                owed = owed_after(owed, Happened::Idle);
+                report_owed(&ch, owed);
+            }
             ScanStep::Degrade => {
+                owed = owed_after(owed, Happened::Broke);
+                report_owed(&ch, owed);
                 degrade_to_poll(
                     &ch,
                     &broken_reason(&wake),
@@ -557,6 +685,8 @@ fn scan_loop(
                     interval,
                 );
                 watch = None;
+                confirm_due = None;
+                confirms_left = 0;
             }
             ScanStep::WalkAndConfirm => {
                 // Never start two walks closer together than the floor.
@@ -577,10 +707,16 @@ fn scan_loop(
                 confirms_left = confirms_left.saturating_sub(1);
                 confirm_due = (confirms_left > 0).then(|| Instant::now() + EVENT_CONFIRM_DELAY);
                 // The tail is what covers a service that was not listable yet,
-                // so the answer is not complete until the tail is spent.
-                if confirm_due.is_none() {
-                    ch.walk_pending.store(false, Ordering::Relaxed);
-                }
+                // so the answer is not complete until the tail is spent, and
+                // even then a change that landed during this walk is queued on
+                // the watch: the last confirmation hands over to a probe.
+                owed = owed_after(
+                    owed,
+                    Happened::Confirmed {
+                        left: confirms_left,
+                    },
+                );
+                report_owed(&ch, owed);
             }
         }
     }
@@ -618,6 +754,12 @@ fn stamp_heartbeat(heartbeat_ms: &AtomicU64, origin: &Instant) {
     heartbeat_ms.store(origin.elapsed().as_millis() as u64, Ordering::Relaxed);
 }
 
+/// Publish whether the worker owes a walk. `Release`, so a reader that sees
+/// `false` also sees the scan published before it.
+fn report_owed(ch: &WorkerChannels, owed: Owed) {
+    ch.walk_pending.store(owed.pending(), Ordering::Release);
+}
+
 /// Which way the watch failed. A FIELD rather than a phrase spliced into the
 /// message: an operator greps by key, and a message that changes shape with its
 /// data cannot be grepped for at all.
@@ -641,7 +783,7 @@ impl WatchFailure {
 
 /// Report the fall back to a timed walk, and flip the observable engine.
 fn degrade_to_poll(ch: &WorkerChannels, reason: &str, failure: WatchFailure, interval: Duration) {
-    ch.source.store(WakeSource::Poll as u8, Ordering::Relaxed);
+    ch.source.store(WakeSource::Poll as u8, Ordering::Release);
     tracing::warn!(
         watch_failure = failure.as_str(),
         reason = %reason,
@@ -874,31 +1016,37 @@ impl DiscoveryScanner {
         }
     }
 
-    /// Whether the worker has SEEN a change it has not finished answering.
+    /// Whether the worker OWES a walk it has not finished.
     ///
-    /// True from a directory event until the walk it caused and its confirmation
-    /// tail have published. The settle hold reads it, because an event inside
-    /// the window is positive evidence that the live topic set is still moving,
-    /// and freezing the channel set on the quiet boundary while that answer is
-    /// in flight omits exactly the producer the event was about - which is the
-    /// defect live discovery exists to prevent, arriving by a new route.
+    /// True until the worker's baseline walk has published; from a directory
+    /// event until the walk it caused and its confirmation tail have published
+    /// and a probe of the watch finds nothing more queued; and, after a watch
+    /// breaks, until the timed engine has run the walks a change is owed. The
+    /// settle hold reads it, because an event inside the window is positive
+    /// evidence that the live topic set is still moving, and freezing the
+    /// channel set on the quiet boundary while that answer is in flight omits
+    /// exactly the producer the event was about - which is the defect live
+    /// discovery exists to prevent, arriving by a new route.
     ///
-    /// `false` on the timed and inline engines, which owe no pending answer:
-    /// they walk on every cadence whether or not anything happened.
+    /// Read with `Acquire`: a `false` here is ordered after the scan the worker
+    /// published before clearing it, so the `next_scan` that follows takes it.
+    ///
+    /// `false` when discovery is off, and on the inline engine, which walks on
+    /// the drive loop itself.
     pub fn walk_pending(&self) -> bool {
         match &self.engine {
-            ScanEngine::Threaded(t) => t.walk_pending.load(Ordering::Relaxed),
+            ScanEngine::Threaded(t) => t.walk_pending.load(Ordering::Acquire),
             _ => false,
         }
     }
 
-    /// What is driving the enumeration right now (Principle #3) - including a
-    /// mid-run degrade from [`WakeSource::Events`] to [`WakeSource::Poll`].
+    /// What is driving the enumeration right now, including a mid-run degrade
+    /// from [`WakeSource::Events`] to [`WakeSource::Poll`].
     pub fn wake_source(&self) -> WakeSource {
         match &self.engine {
             ScanEngine::Off => WakeSource::Off,
             ScanEngine::Inline { .. } => WakeSource::Inline,
-            ScanEngine::Threaded(t) => WakeSource::from_u8(t.source.load(Ordering::Relaxed)),
+            ScanEngine::Threaded(t) => WakeSource::from_u8(t.source.load(Ordering::Acquire)),
         }
     }
 
@@ -1077,6 +1225,73 @@ mod tests {
             ScanStep::WalkConfirming,
             "a confirmation must run at its delay"
         );
+    }
+
+    /// What the worker owes, against a HAND-WRITTEN transition table.
+    ///
+    /// The settle hold reads `walk_pending`, and every value it can read is a
+    /// row here. A table rather than separate checks, because the defects this
+    /// pins are each one wrong row: an idle wait clearing a confirmation tail
+    /// that is waiting for its next walk, the last confirmation clearing
+    /// instead of handing over to a probe, and a break that drops what was
+    /// owed instead of handing it to the timed engine.
+    #[test]
+    fn what_the_worker_owes_follows_its_hand_written_transition_table() {
+        use Happened::{Broke, Changed, Confirmed, Idle, TimedWalk};
+        use Owed::{Answer, Nothing, Probe, Timed};
+        // (owed before, what happened, owed after)
+        let oracle = [
+            // A change is answered whatever was owed before it.
+            (Nothing, Changed, Answer),
+            (Probe, Changed, Answer),
+            (Answer, Changed, Answer),
+            // An idle wait clears a PROBE and nothing else.
+            (Probe, Idle, Nothing),
+            (Answer, Idle, Answer),
+            (Nothing, Idle, Nothing),
+            // The tail: a confirmation with more to come keeps the answer in
+            // flight; the last one hands over to a probe, never straight to
+            // nothing.
+            (Answer, Confirmed { left: 1 }, Answer),
+            (Answer, Confirmed { left: 0 }, Probe),
+            // A break owes the timed engine three walks, from every state.
+            (Nothing, Broke, Timed(3)),
+            (Probe, Broke, Timed(3)),
+            (Answer, Broke, Timed(3)),
+            // The timed engine pays them off one walk at a time.
+            (Timed(3), TimedWalk, Timed(2)),
+            (Timed(2), TimedWalk, Timed(1)),
+            (Timed(1), TimedWalk, Nothing),
+            (Nothing, TimedWalk, Nothing),
+        ];
+        for (i, (before, happened, want)) in oracle.into_iter().enumerate() {
+            assert_eq!(
+                owed_after(before, happened),
+                want,
+                "row {i}: {before:?} then {happened:?} must owe {want:?}"
+            );
+        }
+        // The three walks are the walk and its confirmations.
+        assert_eq!(WALKS_OWED_PER_CHANGE, 1 + CONFIRM_WALKS);
+    }
+
+    /// Only `Nothing` reads as quiet, only a probe skips the wait, and the
+    /// baseline hands over to a probe exactly when there is a watch to probe.
+    #[test]
+    fn only_nothing_owed_reads_quiet_and_only_a_probe_skips_the_wait() {
+        // (owed, pending, wait budget)
+        let oracle = [
+            (Owed::Nothing, false, SCANNER_STOP_SLICE),
+            (Owed::Probe, true, Duration::ZERO),
+            (Owed::Answer, true, SCANNER_STOP_SLICE),
+            (Owed::Timed(1), true, SCANNER_STOP_SLICE),
+        ];
+        for (owed, pending, budget) in oracle {
+            assert_eq!(owed.pending(), pending, "{owed:?} pending");
+            assert_eq!(owed.wait_budget(), budget, "{owed:?} wait budget");
+        }
+        assert_eq!(Owed::after_baseline(true), Owed::Probe);
+        assert_eq!(Owed::after_baseline(false), Owed::Nothing);
     }
 
     /// The engine byte round-trips, so a mid-run degrade cannot read back as

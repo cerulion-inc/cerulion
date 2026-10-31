@@ -347,8 +347,8 @@ fn a_burst_of_topics_is_coalesced_into_far_fewer_wakes_than_topics() {
     assert!(
         walks <= u64::from(1 + CONFIRM_WALKS) * wakes + 1,
         "{walks} walk(s) from {wakes} wake(s): every walk must be a change plus a tail of at \
-         most {CONFIRM_WALKS} confirmations, with one allowance for a confirmation armed by \
-         the baseline"
+         most {CONFIRM_WALKS} confirmations, with one allowance for a walk that straddles \
+         the start of the count"
     );
 }
 
@@ -446,6 +446,262 @@ fn a_watch_that_cannot_be_armed_falls_back_to_a_timed_walk_loudly() {
         0,
         "the degraded engine walks on a timer, so it can never report a directory CHANGE - a \
          nonzero count here means the two engines' observables have been crossed"
+    );
+}
+
+// ===========================================================================
+// The settle hold: a walk the worker owes is never reported as done.
+// ===========================================================================
+
+/// The walks a change is answered with: the walk itself plus the
+/// [`CONFIRM_WALKS`] confirmations behind it. Written out by hand so a change
+/// to the tail shows up here as a failing oracle, not as a silently moved bar.
+const WALKS_OWED_PER_CHANGE: u64 = 3;
+const _: () = assert!(WALKS_OWED_PER_CHANGE == 1 + CONFIRM_WALKS as u64);
+
+/// A watch that BREAKS mid-run hands the timed engine the walks it owed, and
+/// the settle hold stays up until the timed engine has run them.
+///
+/// The defect this pins: the worker saw a change, the watch broke before the
+/// change was walked, and the degrade cleared `walk_pending` at once. The timed
+/// engine then slept a whole cadence before its first walk, so for that cadence
+/// the drive loop read "nothing pending" and could close the channel set
+/// without the producer whose file had just appeared.
+///
+/// The break is made by deleting the watched directory and its root, which is
+/// a real change (the files go) and leaves the watch nothing to re-target to.
+/// Depending on when the worker reads it, the break lands while it is
+/// absorbing the burst, on a plain wait inside the confirmation tail, or after
+/// the tail is spent. Each of them must owe the timed engine its walks.
+///
+/// The cadence is long on purpose: the read just after the degrade then lands
+/// well before the timed engine's first walk, so `walk_pending` there is the
+/// degrade's own verdict and not a later walk's.
+#[test]
+fn a_watch_that_breaks_mid_run_holds_the_settle_until_the_timed_engine_has_walked() {
+    const CADENCE: Duration = Duration::from_millis(1000);
+
+    let mgr: Arc<TransportManager> = make_manager(8);
+    let root = std::env::temp_dir().join(unique_topic("break-root").replace('/', "_"));
+    let services = root.join(&mgr.iox_shm_identity().service_dir);
+    std::fs::create_dir_all(&services).expect("create the watched service directory");
+
+    let mut scanner =
+        DiscoveryScanner::start_with_interval_and_root(&mgr, true, CADENCE, Some(root.clone()));
+    await_condition("the worker's baseline enumeration", || {
+        scanner.next_scan(&mgr).is_some()
+    });
+    if scanner.wake_source() != WakeSource::Events {
+        // No watch on this platform: there is no break to adjudicate.
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    await_condition("the baseline's answer to complete", || {
+        let _ = scanner.next_scan(&mgr);
+        !scanner.walk_pending()
+    });
+
+    // NONZERO CONTROL: a real change in the watched directory wakes the worker.
+    // Waited on through the wake count, which only grows, rather than through
+    // the pending flag, which is up for well under a second.
+    let wakes_before = scanner.wakes();
+    std::fs::write(services.join("appeared.service"), b"x").expect("write a service file");
+    await_condition("the worker to wake on the change", || {
+        let _ = scanner.next_scan(&mgr);
+        scanner.wakes() > wakes_before
+    });
+
+    // THE BREAK.
+    std::fs::remove_dir_all(&root).expect("remove the watched directory and its root");
+    let mut last_seen_events = Instant::now();
+    await_condition("the worker to degrade to the timed engine", || {
+        let _ = scanner.next_scan(&mgr);
+        if scanner.wake_source() == WakeSource::Events {
+            last_seen_events = Instant::now();
+            return false;
+        }
+        true
+    });
+    assert_eq!(scanner.wake_source(), WakeSource::Poll);
+    // Count and flag are both read before `since_degrade` is measured, so a
+    // `since_degrade` under one cadence means neither read can include a timed
+    // walk: the first one comes a whole cadence after the degrade.
+    let walks_at_degrade = scanner.scans_run();
+    let pending_at_degrade = scanner.walk_pending();
+    let since_degrade = last_seen_events.elapsed();
+    let wakes_at_degrade = scanner.wakes();
+
+    if since_degrade < CADENCE {
+        // No timed walk can have run yet: its first one is a whole cadence
+        // after the degrade.
+        assert!(
+            pending_at_degrade,
+            "the watch broke with a change seen and not answered, and the degrade reported \
+             nothing pending {since_degrade:?} later, before the timed engine had walked once. \
+             The drive loop reads that as quiet and can close the channel set without the \
+             producer the change was about"
+        );
+    } else {
+        println!(
+            "the test thread read the degrade {since_degrade:?} late; the strict half of this arm \
+             is skipped because a timed walk may already have run"
+        );
+    }
+
+    // And it does clear: a hold that never released would ride every recording
+    // to the settle cap.
+    await_condition("the timed engine to finish the walks it was handed", || {
+        let _ = scanner.next_scan(&mgr);
+        !scanner.walk_pending()
+    });
+    let walks_at_clear = scanner.scans_run();
+    if since_degrade < CADENCE {
+        assert!(
+            walks_at_clear >= walks_at_degrade + WALKS_OWED_PER_CHANGE,
+            "the hold cleared after {} timed walk(s); the change the broken watch saw is owed \
+             {WALKS_OWED_PER_CHANGE} (the walk and its {CONFIRM_WALKS} confirmations), the same \
+             answer the watch would have given it",
+            walks_at_clear - walks_at_degrade
+        );
+    }
+    // The deletion itself may have been read as one more change before the
+    // break, so the wakes up to the degrade are one or two; after it, the
+    // timed engine walks on a cadence and never counts one.
+    assert!(wakes_at_degrade > wakes_before);
+    assert_eq!(
+        scanner.wakes(),
+        wakes_at_degrade,
+        "the timed engine walks on a cadence and must never count a wake"
+    );
+}
+
+/// The settle hold stays up while the worker's BASELINE walk is running.
+///
+/// The baseline is the worker's first look at the directory, and the only one
+/// that can see a producer that registered between the arm-time scan and the
+/// watch being armed. It is also the longest walk the worker runs (117.5 ms at
+/// 86 live topics, and it grows with the machine), and a change landing during
+/// it is queued on the watch until the next wait. A worker that reported
+/// "nothing pending" through all of that let the drive loop close the channel
+/// set before either answer was in.
+///
+/// The watch is on a private directory, so changes other tests make in the
+/// shared service directory cannot hold the flag up. The baseline still walks
+/// the shared one, and the live topics stood up first make that walk long
+/// enough for the reads below to land inside it.
+#[test]
+fn the_settle_hold_stays_up_until_the_workers_baseline_has_published() {
+    const TOPICS: usize = 96;
+    // Fresh scanners tried before the arm counts as having seen nothing: one
+    // whose first read a busy machine delays past its baseline proves nothing
+    // either way, so it is retried rather than failed.
+    const ATTEMPTS: u32 = 5;
+
+    let mgr: Arc<TransportManager> = make_manager(8);
+    let _held: Vec<_> = (0..TOPICS)
+        .map(|i| publisher(&mgr, &unique_topic(&format!("baseline-{i}")), 64))
+        .collect();
+
+    let mut reads_inside_baseline = 0u32;
+    for attempt in 1..=ATTEMPTS {
+        let root = std::env::temp_dir().join(unique_topic("baseline-root").replace('/', "_"));
+        std::fs::create_dir_all(root.join(&mgr.iox_shm_identity().service_dir))
+            .expect("create the watched service directory");
+        let mut scanner = DiscoveryScanner::start_with_interval_and_root(
+            &mgr,
+            true,
+            FALLBACK_CADENCE,
+            Some(root.clone()),
+        );
+        let start = Instant::now();
+        loop {
+            // Flag first, then the count: the clear is stored after the
+            // baseline's count moves, so a `false` flag read before a zero
+            // count is a real "nothing pending" from a worker that had not
+            // published.
+            let pending = scanner.walk_pending();
+            let walks = scanner.scans_run();
+            if walks > 0 {
+                break;
+            }
+            reads_inside_baseline += 1;
+            assert!(
+                pending,
+                "the worker reported nothing pending before its baseline walk had published \
+                 (attempt {attempt}). The drive loop reads that as quiet and can close the \
+                 channel set before the worker's first answer is in"
+            );
+            assert!(
+                start.elapsed() < DEADLINE,
+                "the worker's baseline walk never published"
+            );
+            std::thread::yield_now();
+        }
+        // NONZERO CONTROL beside the `true` reads: the hold does clear once the
+        // baseline's answer is complete.
+        await_condition("the baseline's answer to complete", || {
+            let _ = scanner.next_scan(&mgr);
+            !scanner.walk_pending()
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        if reads_inside_baseline > 0 {
+            break;
+        }
+    }
+    // ANTI-VACUITY: the loop above asserted something.
+    assert!(
+        reads_inside_baseline >= 1,
+        "none of {ATTEMPTS} fresh scanners was read inside its baseline walk, so this arm saw \
+         nothing; raise TOPICS so the baseline walk outlasts the first read"
+    );
+    println!("{reads_inside_baseline} read(s) landed inside the baseline walk");
+}
+
+/// The drive loop decides the settle hold AFTER it has applied this pass's scan.
+///
+/// # Why this is a source walk and not a behavioural arm
+///
+/// The failure is an ordering inside one drive pass: the worker publishes the
+/// walk that finds a topic and clears `walk_pending` microseconds later. A pass
+/// that decided the hold first saw nothing pending and an old last find, so it
+/// released the hold, then applied the scan, and created the bag in the same
+/// pass, with the quiet window that find should have restarted never read.
+/// Landing a find inside that window on purpose is a coin flip; the order is
+/// the property, and the source states it exactly.
+#[test]
+fn the_settle_hold_is_decided_after_the_passes_scan_is_applied() {
+    let src = code_only(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read cerulion_bagd/src/lib.rs"),
+    );
+    let body = fn_body(&src, "drive_loop");
+    let at = |needle: &str| {
+        let found: Vec<usize> = body.match_indices(needle).map(|(i, _)| i).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "`drive_loop` must contain `{needle}` exactly once; found {}",
+            found.len()
+        );
+        found[0]
+    };
+    let read_pending = at("scanner.walk_pending()");
+    let take_scan = at("scanner.next_scan(");
+    let decide = at("discovery_hold_active(");
+    let create = at("ensure_writer(");
+    assert!(
+        read_pending < take_scan,
+        "the pending flag must be read BEFORE the scan is taken: a `false` read is ordered after \
+         the scan the worker published before clearing it, so the take that follows gets it"
+    );
+    assert!(
+        take_scan < decide,
+        "the settle hold must be decided AFTER this pass's scan is applied, or a find in that \
+         scan is created into a bag whose quiet window it should have restarted"
+    );
+    assert!(
+        decide < create,
+        "the hold must be decided before the bag is created"
     );
 }
 
