@@ -124,7 +124,9 @@ rollback) is `crates/cerulion_pairing/tests/chain_verify_test.rs`.
   (`lib.rs`), encoded in every grant and enforced at verify time
   (`chain_verify_test.rs`).
 - **Revocation is not expiry.** The robot-local durable access list is truth;
-  established pairings never rot offline; short-lived certs gate NEW pairings
+  an established pairing lapses offline only at a finite expiry its row carries
+  (an owner-signed grant's `not_after`; for a cloud device, no later than its
+  certificate's `not_after`); short-lived certs otherwise gate NEW pairings
   only. Revocation propagates via the monotonic signed epoch (§9).
 - **The trust store is tamper-evident and anti-rollback** (`verify/store.rs`):
   HMAC-SHA256 over a versioned envelope, constant-time verify on load, atomic

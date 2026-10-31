@@ -30,7 +30,16 @@ fn code_confirm(account: AccountId) -> CpaceConfirmed {
 /// (the responder key) — lets a test mint a witness for a DIFFERENT robot to
 /// exercise the cross-robot replay guard.
 fn code_confirm_for_robot(account: AccountId, robot_key: PublicKey) -> CpaceConfirmed {
-    let ids = PakeIdentities::new(pk(&sk(60)), robot_key, b"store-test".to_vec());
+    code_confirm_from_device(account, robot_key, 60)
+}
+
+/// Mint a witness whose initiator (the pairing device) has key seed `device_seed`.
+fn code_confirm_from_device(
+    account: AccountId,
+    robot_key: PublicKey,
+    device_seed: u8,
+) -> CpaceConfirmed {
+    let ids = PakeIdentities::new(pk(&sk(device_seed)), robot_key, b"store-test".to_vec());
     let mut resp = CpaceResponder::new("code", ids.clone(), CeremonyConfig::default(), 0);
     let init = CpaceInitiator::new("code", ids);
     let (attempt, msg1) = init.begin().unwrap();
@@ -663,6 +672,88 @@ fn code_pairing_cannot_readmit_an_owner_revoked_account() {
     );
     // Only an explicit owner_readmit restores access.
     s.owner_readmit(&acct(OWNER), &acct(GUEST)).unwrap();
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
+}
+
+#[test]
+fn code_pairing_from_a_new_device_cannot_readmit_an_owner_revoked_account() {
+    let mut s = store();
+    s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    code_pair(&mut s, acct(GUEST), "phone", T_NOW);
+    s.owner_revoke(&acct(OWNER), &acct(GUEST)).unwrap();
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
+
+    // A second device of the same account completes a code pairing.
+    let other_device = code_confirm_from_device(acct(GUEST), pk(&sk(ROBOT_TRANSPORT_SEED)), 62);
+    s.establish_code_pairing(
+        &other_device,
+        acct(GUEST),
+        "laptop".into(),
+        Scope::CODE_PAIR_DEFAULT,
+        T_NOW,
+    )
+    .unwrap();
+    assert!(
+        s.account_access(&acct(GUEST), T_NOW).is_none(),
+        "a new device's code pairing must not readmit an owner-revoked account"
+    );
+    let laptop = pk(&sk(62));
+    assert!(s.is_allowed(&acct(GUEST), &laptop, T_NOW).is_none());
+    s.owner_readmit(&acct(OWNER), &acct(GUEST)).unwrap();
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
+    assert_eq!(
+        s.is_allowed(&acct(GUEST), &laptop, T_NOW).unwrap().device,
+        Some(laptop)
+    );
+}
+
+#[test]
+fn a_strong_pairing_from_a_new_device_cannot_readmit_an_owner_revoked_account() {
+    let mut s = store();
+    s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    let phone = pk(&sk(20));
+    let laptop = pk(&sk(21));
+    s.verify_and_establish(&presentation_for(20, acct(GUEST)), &phone, T_NOW, None)
+        .unwrap();
+    // The laptop's chain verifies while the account still has access.
+    let laptop_pairing = s
+        .verify_new_pairing(&presentation_for(21, acct(GUEST)), &laptop, T_NOW)
+        .unwrap();
+    s.owner_revoke(&acct(OWNER), &acct(GUEST)).unwrap();
+
+    // A fresh presentation from the laptop is refused and writes no row.
+    let rows = s.access_rows().to_vec();
+    assert!(matches!(
+        s.verify_and_establish(&presentation_for(21, acct(GUEST)), &laptop, T_NOW, None),
+        Err(PairingError::RevokedByOwner)
+    ));
+    assert_eq!(s.access_rows(), rows.as_slice());
+    assert!(s.is_allowed(&acct(GUEST), &laptop, T_NOW).is_none());
+
+    // The pairing verified before the revoke writes the laptop's row revoked.
+    s.establish_pairing(
+        &laptop_pairing,
+        PairingSource::StrongChain,
+        None,
+        T_NOW,
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.access_rows().len(), rows.len() + 1);
+    assert!(
+        s.is_allowed(&acct(GUEST), &laptop, T_NOW).is_none(),
+        "a new device's strong pairing must not readmit an owner-revoked account"
+    );
+    assert!(s.is_allowed(&acct(GUEST), &phone, T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
+
+    s.owner_readmit(&acct(OWNER), &acct(GUEST)).unwrap();
+    assert_eq!(
+        s.is_allowed(&acct(GUEST), &laptop, T_NOW).unwrap().device,
+        Some(laptop)
+    );
     assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 }
 

@@ -676,6 +676,59 @@ fn refuses_a_subject_revoked_by_the_owner() {
 }
 
 #[test]
+fn an_owner_grant_from_a_new_device_cannot_readmit_an_owner_revoked_subject() {
+    let mut store = claimed_store();
+    store
+        .establish_by_owner_grant(&good_presentation(), &subject_peer(), T_NOW, None)
+        .unwrap();
+    // The subject's second device presents the same owner-signed grant.
+    let laptop = pk(&sk(22));
+    let mut pres = good_presentation();
+    pres.subject_cert = device_cert(acct(SUBJECT), laptop, op_scope(), wide_validity());
+    // Verified while the subject still has access.
+    let laptop_pairing = store.verify_owner_grant(&pres, &laptop, T_NOW).unwrap();
+    store.owner_revoke(&acct(OWNER), &acct(SUBJECT)).unwrap();
+
+    // A fresh presentation from the laptop is refused and writes no row.
+    let rows = store.access_rows().to_vec();
+    let err = store
+        .establish_by_owner_grant(&pres, &laptop, T_NOW, None)
+        .unwrap_err();
+    assert!(matches!(err, PairingError::RevokedByOwner), "got {err:?}");
+    assert_eq!(store.access_rows(), rows.as_slice());
+    assert!(store.is_allowed(&acct(SUBJECT), &laptop, T_NOW).is_none());
+
+    // The grant verified before the revoke writes the laptop's row revoked.
+    store
+        .establish_pairing(
+            &laptop_pairing,
+            PairingSource::OwnerSignedGrant,
+            None,
+            T_NOW,
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.access_rows().len(), rows.len() + 1);
+    assert!(
+        store.is_allowed(&acct(SUBJECT), &laptop, T_NOW).is_none(),
+        "a new device's owner grant must not readmit an owner-revoked subject"
+    );
+    assert!(store.account_access(&acct(SUBJECT), T_NOW).is_none());
+
+    store.owner_readmit(&acct(OWNER), &acct(SUBJECT)).unwrap();
+    assert_eq!(
+        store
+            .is_allowed(&acct(SUBJECT), &laptop, T_NOW)
+            .unwrap()
+            .device,
+        Some(laptop)
+    );
+    assert!(store
+        .establish_by_owner_grant(&pres, &laptop, T_NOW, None)
+        .is_ok());
+}
+
+#[test]
 fn refuses_a_subject_revoked_by_epoch() {
     let mut store = claimed_store();
     // Push an epoch revoking the subject.

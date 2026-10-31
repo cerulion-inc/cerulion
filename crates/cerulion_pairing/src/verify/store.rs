@@ -379,13 +379,20 @@ impl TrustStore {
         self.inner.revoked_devices.contains(device_key)
     }
 
-    /// Whether `account` currently has access at `now_ns`: it has a
-    /// non-owner-revoked row that is not revoked by the current epoch AND is not past
-    /// its expiry. Established pairings never expire (their `expires_at_ns` is
-    /// `None`); a **desk-carried owner-signed grant** MAY carry a finite
-    /// `expires_at_ns`, so an owner's time-boxed guest access DENIES here once
-    /// `now_ns >= expires_at_ns` — offline, with no explicit revoke needed. The
-    /// robot's own trusted clock supplies `now_ns` (the same anti-rollback-protected
+    /// The access row that admits `device` of `account` at `now_ns`, if any. The
+    /// row read is the device's own `(account, Some(device))` row, else the
+    /// account's account-wide `(account, None)` row; a device row that is revoked
+    /// or expired does not fall back to the account-wide row. That row admits when
+    /// `account` is not in the current epoch's revoked accounts, the row's
+    /// `revoked` flag is clear, and `now_ns` is before its `expires_at_ns` (`None`
+    /// does not lapse). A desk-carried owner-signed grant's row carries the
+    /// grant's finite `not_after_ns`, and a [`crate::format::PrincipalKind::Cloud`] row
+    /// written from a certificate carries that certificate's finite `not_after`
+    /// when it is earlier ([`AccessRow::expires_at_ns`]), so each DENIES here once
+    /// `now_ns >= expires_at_ns`, offline, with no explicit revoke. The epoch's
+    /// revoked device keys ([`TrustStore::is_device_revoked`]) and the
+    /// allow-from-cloud switch ([`TrustStore::cloud_allowed`]) are not read here.
+    /// The robot's own trusted clock supplies `now_ns` (the same anti-rollback-protected
     /// time every credential path uses); the accept gate reads it here, so an expired
     /// grant refuses at connection accept.
     pub fn is_allowed(
@@ -510,7 +517,7 @@ impl TrustStore {
             source: PairingSource::Claim,
             name: Some("owner".to_string()),
             added_at_ns: now_ns,
-            // The owner row never expires (only owner-signed guest grants can).
+            // The owner's account-wide row is written with no expiry.
             expires_at_ns: None,
             revoked: false,
         });
@@ -807,8 +814,8 @@ impl TrustStore {
         name: Option<String>,
     ) -> Result<VerifiedPairing, PairingError> {
         let verified = self.verify_new_pairing(pres, authenticated_peer_key, now_ns)?;
-        // A strong-path (cloud-issued grant) pairing is an established pairing — it
-        // never rots offline (ongoing access is gated by revocation, not expiry).
+        // A strong-path (cloud-issued grant) pairing passes no expiry of its own;
+        // establish_pairing caps a Cloud principal's row at the certificate's not_after.
         self.establish_pairing(&verified, PairingSource::StrongChain, name, now_ns, None)?;
         Ok(verified)
     }
@@ -903,7 +910,7 @@ impl TrustStore {
             source: PairingSource::OwnerGrant,
             name: Some("owner".to_string()),
             added_at_ns: now_ns,
-            // The owner row never expires (only owner-signed guest grants can).
+            // The owner's account-wide row is written with no expiry.
             expires_at_ns: None,
             revoked: false,
         });
@@ -1093,12 +1100,17 @@ impl TrustStore {
     /// Whether an account is currently revoked — either by the current epoch's
     /// revocation set OR by a sticky owner "revoke-now" on its access row.
     fn is_account_revoked(&self, account: &AccountId) -> bool {
-        self.inner.revoked_accounts.contains(account)
-            || self
-                .inner
-                .access_rows
-                .iter()
-                .any(|r| &r.account == account && r.revoked)
+        self.inner.revoked_accounts.contains(account) || self.is_account_owner_revoked(account)
+    }
+
+    /// Whether any access row of `account` carries a sticky owner revocation. An
+    /// owner revocation is per account, so a row for a device the account has not
+    /// used before is written revoked while this holds.
+    fn is_account_owner_revoked(&self, account: &AccountId) -> bool {
+        self.inner
+            .access_rows
+            .iter()
+            .any(|r| &r.account == account && r.revoked)
     }
 
     /// Establish (persist) a verified pairing as the presenting device's own
@@ -1107,14 +1119,19 @@ impl TrustStore {
     /// If that device already has a row, its scope/name/source/expiry are updated
     /// **but a prior owner-revocation sticks** (a re-presented grant does not
     /// silently un-revoke a locally revoked account — call
-    /// [`TrustStore::owner_readmit`]).
+    /// [`TrustStore::owner_readmit`]). A row for a device new to the account is
+    /// written revoked while any row of the account carries an owner revocation.
     ///
-    /// `expires_at_ns` is the row's finite access expiry: the strong
-    /// path and code pairing pass `None` (an established pairing never rots), while
-    /// a desk-carried owner-signed grant passes the grant's finite `not_after_ns` so
-    /// [`TrustStore::is_allowed`] denies the row once the clock passes it. Because a
-    /// re-presented grant REFRESHES the expiry (the update branch overwrites it), a
-    /// renewed owner grant extends access and a shorter re-grant tightens it.
+    /// `expires_at_ns` is the caller's finite access expiry for the row: the
+    /// strong path passes `None`, and a desk-carried owner-signed grant passes the
+    /// grant's finite `not_after_ns`. A [`crate::format::PrincipalKind::Cloud`]
+    /// principal's row stores the earlier of `expires_at_ns` and the verified
+    /// device certificate's `not_after` (a `not_after` of `u64::MAX` adds no
+    /// bound); any other principal's row stores `expires_at_ns`.
+    /// [`TrustStore::is_allowed`] denies the row once the clock passes the stored
+    /// expiry. Because a re-presented grant REFRESHES the expiry (the update branch
+    /// overwrites it), a renewed owner grant extends access and a shorter re-grant
+    /// tightens it.
     ///
     /// Refuses with [`PairingError::RobotUnclaimed`] on an unclaimed robot: no
     /// access row may exist before the owner claims. This is checked
@@ -1158,6 +1175,7 @@ impl TrustStore {
             row.expires_at_ns = expires_at_ns;
             // row.revoked deliberately preserved (sticky owner-revocation).
         } else {
+            let revoked = self.is_account_owner_revoked(&verified.account);
             self.inner.access_rows.push(AccessRow {
                 account: verified.account,
                 device,
@@ -1167,7 +1185,7 @@ impl TrustStore {
                 name,
                 added_at_ns: now_ns,
                 expires_at_ns,
-                revoked: false,
+                revoked,
             });
         }
         Ok(())
@@ -1234,8 +1252,7 @@ impl TrustStore {
             source: PairingSource::CodePaired,
             name: Some(name),
             added_at_ns: now_ns,
-            // A code-paired row is an established local pairing — it never rots
-            // (only owner-signed guest grants carry a finite expiry).
+            // A code-paired row is written with no expiry.
             expires_at_ns: None,
             revoked: false,
         });
@@ -1404,9 +1421,11 @@ impl TrustStore {
     /// Insert a row, or update the existing row for the same `(account, device)`. A prior
     /// **owner-revocation sticks** — a re-pairing (code pairing or claim) must NOT
     /// silently readmit a revoked account; only [`TrustStore::owner_readmit`]
-    /// clears it. (After a factory reset the list is empty, so the owner claim is
-    /// always a fresh, non-revoked insert.)
-    fn upsert_active_row(&mut self, new_row: AccessRow) {
+    /// clears it. A new row is written revoked while any row of its account
+    /// carries an owner revocation. (After a factory reset the list is empty, so
+    /// the owner claim is always a fresh, non-revoked insert.)
+    fn upsert_active_row(&mut self, mut new_row: AccessRow) {
+        let account_revoked = self.is_account_owner_revoked(&new_row.account);
         if let Some(row) = self
             .inner
             .access_rows
@@ -1423,6 +1442,13 @@ impl TrustStore {
                 );
             }
         } else {
+            if account_revoked {
+                new_row.revoked = true;
+                tracing::warn!(
+                    "pairing adds a device to an owner-revoked account; the row is written \
+                     revoked until an explicit owner_readmit"
+                );
+            }
             self.inner.access_rows.push(new_row);
         }
     }
@@ -1457,7 +1483,7 @@ fn row_active(row: &AccessRow, now_ns: u64) -> bool {
 /// Map an owner-signed grant's validity upper bound (`not_after_ns`) to a durable
 /// [`AccessRow`] expiry: a finite bound becomes the row's honorable expiry, while the
 /// unbounded sentinel (`u64::MAX`, the [`crate::format::AccessGrant`] "no expiry"
-/// encoding) becomes `None` so the row never rots. Pure so it is oracle-testable.
+/// encoding) becomes `None`, so the grant adds no expiry. Pure so it is oracle-testable.
 fn access_row_expiry(not_after_ns: u64) -> Option<u64> {
     (not_after_ns != u64::MAX).then_some(not_after_ns)
 }
@@ -2617,5 +2643,83 @@ mod owner_certificate_state_tests {
             TrustStore::load(&path, &[0x33; 32]),
             Err(PairingError::StoreCorrupt("format version mismatch"))
         ));
+    }
+
+    /// A code-pairing witness for `account` from device `device_seed`, proven
+    /// against the v3 fixture robot's transport key (`key(3)`).
+    fn code_witness(account: AccountId, device_seed: u8) -> CpaceConfirmed {
+        use crate::pake::{CeremonyConfig, CpaceInitiator, CpaceResponder, PakeIdentities};
+        let ids = PakeIdentities::new(key(device_seed), key(3), b"store-test".to_vec());
+        let mut responder = CpaceResponder::new("code", ids.clone(), CeremonyConfig::default(), 0);
+        let (attempt, msg1) = CpaceInitiator::new("code", ids).begin().unwrap();
+        let reply = responder.respond(&msg1, 0).unwrap();
+        let (_, confirm) = attempt
+            .finish(&reply.msg2, &reply.responder_confirm)
+            .unwrap();
+        responder
+            .finish(&confirm, 0, account, PrincipalKind::Human)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_new_device_cannot_readmit_an_account_owner_revoked_in_a_v3_store() {
+        let mac = [0x33; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::write(&path, v3_file(&mac, 3)).unwrap();
+        let mut store = TrustStore::load(&path, &mac).unwrap();
+        let guest = AccountId([6; 32]);
+        let (laptop, tablet) = (key(40), key(41));
+        // The migrated guest row is account-wide and owner-revoked.
+        assert_eq!(store.access_rows()[1].device, None);
+        assert!(store.access_rows()[1].revoked);
+
+        // A code pairing from a device the account never used.
+        store
+            .establish_code_pairing(
+                &code_witness(guest, 40),
+                guest,
+                "laptop".into(),
+                Scope::CODE_PAIR_DEFAULT,
+                50,
+            )
+            .unwrap();
+        // An establish_pairing call for a second new device.
+        let tablet_pairing = VerifiedPairing::new(
+            guest,
+            Scope::CODE_PAIR_DEFAULT,
+            PrincipalKind::Human,
+            tablet,
+            u64::MAX,
+        );
+        store
+            .establish_pairing(&tablet_pairing, PairingSource::StrongChain, None, 50, None)
+            .unwrap();
+
+        let rows: Vec<(AccountId, Option<PublicKey>, bool)> = store.access_rows()[1..]
+            .iter()
+            .map(|r| (r.account, r.device, r.revoked))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (guest, None, true),
+                (guest, Some(laptop), true),
+                (guest, Some(tablet), true),
+            ]
+        );
+        for device in [laptop, tablet] {
+            assert!(store.is_allowed(&guest, &device, 50).is_none());
+        }
+        assert!(store.account_access(&guest, 50).is_none());
+
+        store.owner_readmit(&OWNER, &guest).unwrap();
+        for device in [laptop, tablet] {
+            assert_eq!(
+                store.is_allowed(&guest, &device, 50).unwrap().device,
+                Some(device)
+            );
+        }
+        assert!(store.account_access(&guest, 50).is_some());
     }
 }

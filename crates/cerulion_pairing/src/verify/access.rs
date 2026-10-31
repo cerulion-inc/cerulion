@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Access-list rows and ownership state — the durable, robot-local source of
-//! truth for who may access the robot. Established pairings live here and never
-//! rot offline; certs only gate *new* pairings.
+//! truth for who may access the robot. Established pairings live here; a row
+//! lapses offline only at the finite expiry it carries (see
+//! [`AccessRow::expires_at_ns`]), and certs otherwise gate *new* pairings.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,16 +65,21 @@ pub struct AccessRow {
     pub name: Option<String>,
     /// When the row was added (Unix ns).
     pub added_at_ns: u64,
-    /// The row's finite access expiry (Unix ns), if any. An
+    /// The row's finite access expiry (Unix ns), if any; `None` does not lapse.
+    /// [`crate::verify::TrustStore::is_allowed`] denies the row once
+    /// `now_ns >= expires_at_ns`, offline, without an explicit revoke. An
     /// owner-signed-grant row ([`PairingSource::OwnerSignedGrant`]) carries the
-    /// grant's `not_after_ns` here so the owner's time-boxed access is honored
-    /// OFFLINE at every access check — an expired grant DENIES (see
-    /// [`crate::verify::TrustStore::is_allowed`]) without an explicit revoke. Every
-    /// OTHER pairing source (`Claim`/`OwnerGrant`/`StrongChain`/`CodePaired`) carries
-    /// `None` — an established pairing never rots offline (an unbounded grant, whose
-    /// `not_after_ns == u64::MAX`, likewise maps to `None`).
+    /// grant's finite `not_after_ns`; a [`PairingSource::CertificatePresentation`] row
+    /// carries the owner row's expiry; `Claim`, `OwnerGrant`, `StrongChain` and
+    /// `CodePaired` rows carry `None`. A [`PrincipalKind::Cloud`] row written from
+    /// a certificate (`StrongChain`, `OwnerSignedGrant` or
+    /// `CertificatePresentation`) carries instead the earlier of that value and
+    /// the certificate's `not_after`, and a later accepted presentation from that
+    /// device rewrites it. A `not_after` of `u64::MAX` (unbounded) adds no expiry.
     pub expires_at_ns: Option<u64>,
-    /// Whether the row has been revoked (by epoch or owner "revoke-now").
+    /// Whether the owner revoked the row's account ([`crate::verify::TrustStore::owner_revoke`]);
+    /// only [`crate::verify::TrustStore::owner_readmit`] clears it. Epoch revocation
+    /// is held in the store's revocation sets, not here.
     pub revoked: bool,
 }
 
