@@ -87,6 +87,16 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original
   recipe.
+- A data service created with a history floor (`TopicServiceConfig::create_history_floor`,
+  set by every `rmw_cerulion` endpoint) also carries the attribute `cerulion.history_floor`.
+  Its history then holds what every publisher sent, VOLATILE ones included, so a subscriber
+  port that asks for no particular history (a graph input, a Python subscriber, `topic echo`
+  and `hz`) takes none from it; on any other service it takes the service history, capped at
+  its buffer. An rmw subscription asks for its own: 0 when VOLATILE, its depth when
+  TRANSIENT_LOCAL. The attribute marks the whole service, so on a topic an rmw endpoint
+  created, a native publisher's declared history does not reach native subscribers either.
+  Data-only taps (`bag record`, the viz daemon) do not read the attribute and take the
+  service history either way.
 - Writer cursor contract (for anyone writing an independent frame reader): the
   variable-payload write cursor starts at `wire_fixed_size + 8·N` and only advances
   forward; a re-written variable field is appended at the tail, leaving interior dead

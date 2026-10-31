@@ -1016,6 +1016,18 @@ pub struct TopicServiceConfig {
     /// to every publisher's pool on the topic; those slots are demand-paged,
     /// so the cost is virtual address space, not resident memory.
     pub create_subscriber_floor: Option<usize>,
+    /// A CREATE-leg-only native history floor: a service THIS opener creates
+    /// gets `history_size = max(history_size, floor)` and a subscriber buffer
+    /// ceiling of at least `(floor * 4).div_ceil(3)`, the smallest ceiling
+    /// whose three quarters holds `floor`. Neither value arms an open-time
+    /// requirement: the open leg keeps [`Self::history_size`] and
+    /// [`Self::subscriber_max_buffer_size`]. Set by `rmw_cerulion`'s publisher
+    /// and subscription create paths, so every rmw endpoint creates a ROS
+    /// topic with the same history and buffer and a later opener is never
+    /// refused for asking more than the first opener did. A pre-existing
+    /// service below the floor still attaches and is warned about once.
+    /// `None` (the default everywhere) changes nothing.
+    pub create_history_floor: Option<usize>,
     /// Service-level `max_subscribers`. `Some(n)`
     /// provisions the topic for at most `n` subscribers AND requires ≥ `n`
     /// when opening an existing service; `None` leaves the setter uncalled
@@ -1208,6 +1220,8 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DataLeg {
     borrowed_samples: Option<usize>,
+    history_size: usize,
+    subscriber_max_buffer_size: usize,
     max_publishers: Option<usize>,
     max_subscribers: Option<usize>,
     max_nodes: Option<usize>,
@@ -1476,6 +1490,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers,
             max_publishers,
             publisher_provisioning,
@@ -1569,6 +1584,26 @@ impl TopicServiceConfig {
             .filter(|&floor| floor > ICEORYX2_DEFAULT_BORROWED_SAMPLES)
     }
 
+    /// The `history_size` for the CREATE leg of a data-service acquisition:
+    /// the open requirement [`Self::history_size`] raised to
+    /// [`Self::create_history_floor`].
+    pub(crate) fn create_history_size(&self) -> usize {
+        self.history_size
+            .max(self.create_history_floor.unwrap_or(0))
+    }
+
+    /// The `subscriber_max_buffer_size` for the CREATE leg: the open
+    /// requirement raised to `(floor * 4).div_ceil(3)` when a
+    /// [`Self::create_history_floor`] is set.
+    pub(crate) fn create_subscriber_max_buffer_size(&self) -> usize {
+        match self.create_history_floor {
+            Some(floor) if floor > 0 => {
+                self.subscriber_max_buffer_size.max((floor * 4).div_ceil(3))
+            }
+            _ => self.subscriber_max_buffer_size,
+        }
+    }
+
     /// The `(max_publishers, max_subscribers)` for the CREATE leg of a
     /// service acquisition. Each axis is the open requirement
     /// (`self.max_publishers` / `self.max_subscribers`) unless that axis's
@@ -1654,6 +1689,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             max_publishers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             publisher_provisioning: PublisherProvisioning::Multi,
@@ -1683,6 +1719,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: Some(1),
             publisher_provisioning: PublisherProvisioning::SingleWriter,
@@ -4880,7 +4917,30 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
-        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true)
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true, None)
+    }
+
+    /// [`Self::create_subscriber_with_buffers`] with an explicit late-joiner
+    /// history request: the port receives at most `history_request` retained
+    /// frames when it connects (0 = none), clamped to the service's
+    /// `history_size` and this port's `buffer_size`. A plain
+    /// [`Self::create_subscriber_with_buffers`] receives the service history
+    /// capped at its buffer.
+    #[must_use = "subscriber creation result must be checked"]
+    pub fn create_subscriber_with_history_request(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+        history_request: usize,
+    ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_with_buffers_inner(
+            topic,
+            topic_config,
+            buffer_size,
+            true,
+            Some(history_request),
+        )
     }
 
     /// A subscriber built the way a latest-value input is built: with no event
@@ -4911,7 +4971,7 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
-        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false)
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false, None)
     }
 
     fn create_subscriber_with_buffers_inner(
@@ -4920,6 +4980,7 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
         with_listener: bool,
+        history_request: Option<usize>,
     ) -> TransportResult<CerulionSubscriber> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::SubscriberCreation {
@@ -4937,6 +4998,7 @@ impl TransportManager {
             Some(buffer_size),
             with_listener,
             topic_config.create_subscriber_floor,
+            history_request,
             &map_err,
         )
     }
@@ -4990,6 +5052,7 @@ impl TransportManager {
             &event_service,
             None,
             true,
+            None,
             None,
             &map_err,
         )
@@ -5469,6 +5532,7 @@ impl TransportManager {
             Some(buffer_size),
             with_listener,
             None,
+            None,
             &map_err,
         )
     }
@@ -5711,6 +5775,10 @@ impl TransportManager {
         // The opener's `create_subscriber_floor`, named in a slot-exhaustion
         // error when the service holds fewer slots than it.
         create_subscriber_floor: Option<usize>,
+        // How many retained frames this port asks for when it connects.
+        // `None` takes iceoryx2's default (the service history, capped at the
+        // port buffer); `Some(n)` is clamped to that same bound.
+        history_request: Option<usize>,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionSubscriber> {
         // Slot exhaustion at port creation is the
@@ -5724,6 +5792,19 @@ impl TransportManager {
         let mut subscriber_builder = data_service.subscriber_builder();
         if let Some(buffer_size) = buffer_size {
             subscriber_builder = subscriber_builder.buffer_size(buffer_size);
+        }
+        // A caller that asks for no particular history takes iceoryx2's default
+        // (the service history, capped at the port buffer), except on a service
+        // whose history is a create-leg floor: every publisher there retains
+        // frames, VOLATILE ones included, so such a caller takes none.
+        let history_request = history_request.or_else(|| {
+            wire_header_attribute::history_is_floor(data_service.attributes()).then_some(0)
+        });
+        if let Some(requested) = history_request {
+            let static_config = data_service.static_config();
+            let port_buffer = buffer_size.unwrap_or(static_config.subscriber_max_buffer_size());
+            subscriber_builder = subscriber_builder
+                .history_request(requested.min(static_config.history_size()).min(port_buffer));
         }
         let subscriber = subscriber_builder.create().map_err(|e| {
             use iceoryx2::port::subscriber::SubscriberCreateError;
@@ -6103,6 +6184,7 @@ impl TransportManager {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             // A default opener owns nothing — External is the declared
@@ -6416,6 +6498,8 @@ impl TransportManager {
         let make_data_builder = |legs: DataLeg| {
             let DataLeg {
                 borrowed_samples,
+                history_size,
+                subscriber_max_buffer_size,
                 max_publishers,
                 max_subscribers,
                 max_nodes,
@@ -6424,7 +6508,7 @@ impl TransportManager {
                 .node
                 .service_builder(&data_service_name)
                 .publish_subscribe::<[u8]>()
-                .subscriber_max_buffer_size(topic_config.subscriber_max_buffer_size);
+                .subscriber_max_buffer_size(subscriber_max_buffer_size);
             if let Some(borrowed) = borrowed_samples {
                 // Raise the per-connection borrowed-sample ceiling above
                 // the iceoryx2 default (2) on snapshot-source topics — a macro
@@ -6450,7 +6534,7 @@ impl TransportManager {
                 // requirement.
                 data_builder = data_builder.max_nodes(max_nodes);
             }
-            if topic_config.history_size > 0 {
+            if history_size > 0 {
                 // Arm iceoryx2 NATIVE publisher history at the
                 // CREATOR/precreate site. The publisher port iceoryx2 hands back
                 // on this service automatically gets a history queue of this size
@@ -6467,7 +6551,7 @@ impl TransportManager {
                 // publisher_max_loaned). `enable_safe_overflow` stays at its
                 // default (true), so `history_size > subscriber buffer` is a soft
                 // per-consumer truncation, not a hard open failure.
-                data_builder = data_builder.history_size(topic_config.history_size);
+                data_builder = data_builder.history_size(history_size);
             }
             data_builder
         };
@@ -6508,18 +6592,29 @@ impl TransportManager {
         // its frames carry; an opened one is checked after the open (see
         // `wire_header_attribute`), so the open leg requires nothing and the
         // create leg defines the attribute.
-        let wire_header_specifier = wire_header_attribute::data_service_specifier()?;
+        // A service created with a history floor also states the floor, so a
+        // native subscriber that asks for no particular history can tell that
+        // the history is a floor and ask for none (see `finish_subscriber`).
+        let mut wire_header_specifier = wire_header_attribute::data_service_specifier()?;
+        if let Some(floor) = topic_config.create_history_floor.filter(|&floor| floor > 0) {
+            wire_header_specifier =
+                wire_header_attribute::with_history_floor(wire_header_specifier, floor)?;
+        }
         let node_defaults = &self.node.config().defaults.publish_subscribe;
         let default_caps = (node_defaults.max_publishers, node_defaults.max_subscribers);
         let (create_publishers, create_subscribers) = topic_config.create_port_caps(default_caps);
         let open_leg = DataLeg {
             borrowed_samples: topic_config.subscriber_max_borrowed_samples,
+            history_size: topic_config.history_size,
+            subscriber_max_buffer_size: topic_config.subscriber_max_buffer_size,
             max_publishers: topic_config.max_publishers,
             max_subscribers: topic_config.max_subscribers,
             max_nodes: None,
         };
         let create_leg = DataLeg {
             borrowed_samples: topic_config.create_borrowed_samples(),
+            history_size: topic_config.create_history_size(),
+            subscriber_max_buffer_size: topic_config.create_subscriber_max_buffer_size(),
             max_publishers: create_publishers,
             max_subscribers: create_subscribers,
             max_nodes: topic_config.create_node_cap(default_caps, node_defaults.max_nodes),
@@ -6816,6 +6911,29 @@ impl TransportManager {
                      smaller pre-existing value (a subscriber holding that many \
                      loaned takes is refused its next receive); stop the earlier \
                      creator and restart this opener to reclaim the floor"
+                );
+            }
+        }
+        // The history floor twin: a service WE created carries
+        // `create_history_size()`, which is never below the floor, so
+        // `live < floor` means the service pre-existed shallower and the open
+        // leg attached anyway; late joiners then receive at most `live` frames.
+        // Only an opener that retains frames itself (`history_size > 0`) is
+        // degraded by that, so only it warns.
+        if let Some(floor) = topic_config.create_history_floor {
+            let live = data_service.static_config().history_size();
+            if topic_config.history_size > 0
+                && live < floor
+                && self.mark_degraded_once(topic, "history_floor")
+            {
+                tracing::warn!(
+                    topic = %topic,
+                    floor,
+                    live,
+                    "history floor degraded, the service pre-existed with a \
+                     smaller history_size than this opener's create floor, so a \
+                     late joiner receives at most the pre-existing value; stop \
+                     the earlier creator and restart this opener to reclaim the floor"
                 );
             }
         }
@@ -8493,6 +8611,7 @@ mod tests {
             create_borrow_floor: Some(66),
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(99),
             max_publishers: Some(99),
             // Deliberately WRONG intent in the seed: for_topology must
@@ -8645,6 +8764,59 @@ mod tests {
         assert_eq!(
             ext.create_borrowed_samples(),
             Some(SUBSCRIBER_MAX_BORROWED_HELD)
+        );
+    }
+
+    /// `create_history_floor` raises the CREATE leg's history and buffer
+    /// ceiling only; the open requirement (the pub fields) is untouched, so a
+    /// later opener with a deeper ask finds a service it can open and a
+    /// pre-existing shallower service is still attached. Hand oracle per arm.
+    #[test]
+    fn create_history_floor_raises_the_create_leg_only() {
+        let mut cfg = default_seed_cfg();
+        assert_eq!(cfg.create_history_size(), 0, "no floor: history as asked");
+        assert_eq!(
+            cfg.create_subscriber_max_buffer_size(),
+            DEFAULT_SUBSCRIBER_BUFFER_SIZE,
+            "no floor: buffer as asked"
+        );
+
+        // The rmw shape for small types: floor 16, a VOLATILE opener (0).
+        cfg.create_history_floor = Some(16);
+        assert_eq!(cfg.history_size, 0, "the floor arms no open requirement");
+        assert_eq!(cfg.create_history_size(), 16);
+        // (16 * 4).div_ceil(3) = 22, the smallest c with 16 <= c * 3 / 4.
+        assert_eq!(cfg.create_subscriber_max_buffer_size(), 22);
+
+        // A TRANSIENT_LOCAL depth-5 opener under the same floor creates the
+        // same service as the VOLATILE one: open order cannot change it.
+        cfg.history_size = 5;
+        cfg.subscriber_max_buffer_size = DEFAULT_SUBSCRIBER_BUFFER_SIZE;
+        assert_eq!(cfg.create_history_size(), 16);
+        assert_eq!(cfg.create_subscriber_max_buffer_size(), 22);
+
+        // The large-slice floor 12 fits the default buffer: no raise.
+        cfg.create_history_floor = Some(12);
+        assert_eq!(cfg.create_history_size(), 12);
+        assert_eq!(
+            cfg.create_subscriber_max_buffer_size(),
+            DEFAULT_SUBSCRIBER_BUFFER_SIZE
+        );
+
+        // A larger genuine requirement wins on both axes.
+        cfg.history_size = 20;
+        cfg.subscriber_max_buffer_size = 40;
+        assert_eq!(cfg.create_history_size(), 20);
+        assert_eq!(cfg.create_subscriber_max_buffer_size(), 40);
+
+        // A zero floor changes nothing.
+        cfg.history_size = 0;
+        cfg.subscriber_max_buffer_size = DEFAULT_SUBSCRIBER_BUFFER_SIZE;
+        cfg.create_history_floor = Some(0);
+        assert_eq!(cfg.create_history_size(), 0);
+        assert_eq!(
+            cfg.create_subscriber_max_buffer_size(),
+            DEFAULT_SUBSCRIBER_BUFFER_SIZE
         );
     }
 
@@ -8803,6 +8975,7 @@ mod tests {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             publisher_provisioning: PublisherProvisioning::SingleWriter,
