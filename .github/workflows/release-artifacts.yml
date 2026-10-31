@@ -634,9 +634,17 @@ jobs:
       # waited for by name. A publish that stops at one of the twelve
       # never-published names (the crates.io new-crate rate-limit shape) would
       # otherwise leave this smoke GREEN while `cargo install cerulion_cli`
-      # resolves nothing.
+      # resolves nothing. The umbrella is added to the list only when the
+      # checked-out tag contains crates/cerulion: a smoke-only dispatch
+      # against a release cut before the umbrella existed never published it.
       - name: Wait for crates.io publication
-        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd cerulion
+        run: |
+          crates="cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd"
+          if [ -f source-checkout/crates/cerulion/Cargo.toml ]; then
+            crates="$crates cerulion"
+          fi
+          # shellcheck disable=SC2086 # one crate name per word
+          source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 $crates
 
       - name: Run README quick-start
         run: |

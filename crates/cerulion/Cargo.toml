@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# `cerulion` is the umbrella crate: the one dependency a Rust project adds to
-# write Cerulion nodes. It brings the runtime, the node macros and the
-# generated ROS 2 message types in together, so a new user runs
-# `cargo add cerulion` instead of naming three crates and keeping their
-# versions in step by hand.
+# `cerulion` is the umbrella crate: it brings the runtime, the node macros and
+# the generated ROS 2 message types in together at one version. A project
+# that uses the node macros also names `cerulion_core` directly, because the
+# macros expand to paths rooted at `::cerulion_core`.
 #
 # It holds no logic of its own. Every item it exposes is a re-export, which is
 # what lets it pin its three dependencies exactly: the four crates are
@@ -18,7 +17,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Zero-copy robotics middleware: one dependency for the Cerulion runtime, node macros and ROS 2 message types"
+description = "Zero-copy robotics middleware: re-exports the Cerulion runtime, node macros and ROS 2 message types at one version (node macros also need cerulion_core as a direct dependency)"
 readme = "README.md"
 keywords = ["robotics", "zero-copy", "ros2", "real-time", "cerulion"]
 categories = ["science::robotics", "concurrency", "network-programming"]
