@@ -189,8 +189,7 @@ fn run(ctx: &Context) -> Outcome {
         None => cerulion_core::fd_limit::current_open_file_limit(),
     };
     let (graphs, unparsed) = ctx
-        .workspace_root
-        .as_deref()
+        .workspace_root()
         .map(|root| workspace_graphs(&root.join("graphs")))
         .unwrap_or_default();
     decide(

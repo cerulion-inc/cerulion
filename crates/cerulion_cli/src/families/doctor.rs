@@ -107,13 +107,9 @@ fn run(args: &DoctorArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let workspace_root = cerulion_cli_engine::workspace::CerulionWorkspace::discover(&cwd)
-        .ok()
-        .map(|ws| ws.root);
-    let ctx = doctor::Context {
-        cwd,
-        workspace_root,
-    };
+    // The workspace is discovered inside the checks that read it, under the
+    // deadline: a stalled filesystem above `cwd` cannot hold the report.
+    let ctx = doctor::Context { cwd };
     let timeout = args
         .timeout_ms
         .map_or(doctor::DEFAULT_TIMEOUT, Duration::from_millis);

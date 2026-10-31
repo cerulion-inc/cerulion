@@ -162,7 +162,7 @@ fn is_tmpfs(_path: &Path) -> bool {
 
 #[cfg(unix)]
 fn run(ctx: &Context) -> Outcome {
-    let (dir, destination) = recording_dir(&ctx.cwd, ctx.workspace_root.as_deref());
+    let (dir, destination) = recording_dir(&ctx.cwd, ctx.workspace_root().as_deref());
     decide(&read(&dir), destination)
 }
 

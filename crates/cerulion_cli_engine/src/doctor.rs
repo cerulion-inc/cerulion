@@ -148,8 +148,18 @@ impl Outcome {
 pub struct Context {
     /// The directory the command runs in.
     pub cwd: PathBuf,
-    /// The workspace root when the command runs inside one.
-    pub workspace_root: Option<PathBuf>,
+}
+
+impl Context {
+    /// The root of the workspace `cwd` is inside, if any. It walks up from
+    /// `cwd` on every call, so a check calls it on its own thread, where a
+    /// stalled filesystem on the way up counts against the deadline.
+    #[must_use]
+    pub fn workspace_root(&self) -> Option<PathBuf> {
+        crate::workspace::CerulionWorkspace::discover(&self.cwd)
+            .ok()
+            .map(|ws| ws.root)
+    }
 }
 
 /// A check in the catalogue.
@@ -540,8 +550,24 @@ mod tests {
     fn ctx() -> Context {
         Context {
             cwd: PathBuf::from("/"),
-            workspace_root: None,
         }
+    }
+
+    #[test]
+    fn workspace_root_resolves_from_a_subdirectory_of_the_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("graphs")).expect("graphs dir");
+        std::fs::create_dir_all(root.join("nodes/a")).expect("nodes dir");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("Cargo.toml");
+        let inside = Context {
+            cwd: root.join("nodes/a"),
+        };
+        assert_eq!(inside.workspace_root(), Some(root));
+        let outside = Context {
+            cwd: tmp.path().to_path_buf(),
+        };
+        assert_eq!(outside.workspace_root(), None);
     }
 
     fn finding(id: &'static str, status: Status) -> Finding {
