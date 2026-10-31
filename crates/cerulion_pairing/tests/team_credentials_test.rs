@@ -210,10 +210,11 @@ fn missing_or_garbled_files_name_the_file() {
     );
 
     std::fs::write(layout.active_team_path(), "Not A Label\n").unwrap();
-    assert!(matches!(
-        layout.load_team_credentials(&[roots], T_NOW),
-        Err(PairingError::InvalidTeamName(_))
-    ));
+    let err = reason(layout.load_team_credentials(&[roots], T_NOW).unwrap_err());
+    assert!(
+        err.contains("active_team") && err.contains("Not A Label"),
+        "{err}"
+    );
 }
 
 #[test]

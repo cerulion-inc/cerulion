@@ -478,8 +478,18 @@ impl IdentityLayout {
         now_ns: u64,
     ) -> Result<Option<TeamCredentials>, PairingError> {
         use crate::team::{check_team_ca, verify_leaf_issued_by, verify_team_trust_bundle};
-        let Some(team) = self.active_team()? else {
-            return Ok(None);
+        let team = match self.active_team() {
+            Ok(Some(team)) => team,
+            Ok(None) => return Ok(None),
+            Err(PairingError::InvalidTeamName(name)) => {
+                return Err(PairingError::TeamCredentials {
+                    path: self.active_team_path(),
+                    reason: format!(
+                        "the active_team file holds '{name}', which is not a team name; sign in to the team again (a development build: cerulion-dev-issuer init)"
+                    ),
+                })
+            }
+            Err(e) => return Err(e),
         };
         let refuse = |path: PathBuf, reason: String| PairingError::TeamCredentials { path, reason };
         let key = self.load_machine_key()?.ok_or_else(|| {

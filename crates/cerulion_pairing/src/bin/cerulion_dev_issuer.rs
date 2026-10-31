@@ -47,6 +47,24 @@ fn now_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
+/// The root sets team credentials are checked against. Prints the
+/// development-issuer trust warning to stderr when a development issuer is
+/// present; `trusted_root_sets` logs it through `tracing`, and this program
+/// installs no subscriber.
+fn trusted(layout: &IdentityLayout) -> Result<Vec<cerulion_pairing::format::RootSet>, Failure> {
+    let sets = trusted_root_sets(layout).map_err(run)?;
+    if dev_issuer_dir(layout)
+        .join(DEV_ISSUER_STATE_FILENAME)
+        .exists()
+    {
+        eprintln!(
+            "cerulion-dev-issuer: warning: this build trusts team credentials from the development issuer in {}; release builds do not",
+            dev_issuer_dir(layout).display()
+        );
+    }
+    Ok(sets)
+}
+
 fn init(args: &[String]) -> Result<String, Failure> {
     let mut team: Option<String> = None;
     let mut role: Option<TeamRole> = None;
@@ -106,7 +124,7 @@ fn init(args: &[String]) -> Result<String, Failure> {
             return Err(wrong_team(issuer.team(), t));
         }
     }
-    let roots = trusted_root_sets(&layout).map_err(run)?;
+    let roots = trusted(&layout)?;
     let role = match role {
         Some(r) => r,
         None => current_role(&layout, issuer.team()).unwrap_or(TeamRole::Operator),
@@ -148,7 +166,7 @@ fn status(args: &[String]) -> Result<String, Failure> {
         return Err(Failure::Usage(format!("unknown argument '{extra}'")));
     }
     let layout = IdentityLayout::resolve().map_err(run)?;
-    let roots = trusted_root_sets(&layout).map_err(run)?;
+    let roots = trusted(&layout)?;
     match layout
         .load_team_credentials(&roots, now_ns())
         .map_err(run)?
