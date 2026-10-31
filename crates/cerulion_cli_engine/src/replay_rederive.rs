@@ -2139,11 +2139,12 @@ fn unproducible_read_shape(read: &RecordedRead, trust: RoleTrust) -> bool {
             ReadOutcomeKind::DrainedBatch
             | ReadOutcomeKind::Decimated
             | ReadOutcomeKind::Truncated
-            | ReadOutcomeKind::Producer => false,
+            | ReadOutcomeKind::Producer
+            | ReadOutcomeKind::BatchFrame => false,
         },
         ReadSiteRole::Peek => !matches!(
             read.kind,
-            ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Producer
+            ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Producer | ReadOutcomeKind::BatchFrame
         ),
         // A body site mints every read kind, and an unbelieved role convicts
         // nothing (guarded above).
@@ -3245,6 +3246,9 @@ fn verify_conservation(
                     ReadOutcomeKind::Truncated => truncated = true,
                     // Its `popped` slot is part of the producer token.
                     ReadOutcomeKind::Producer => {}
+                    // One frame of the read that follows; that read carries
+                    // the pop count.
+                    ReadOutcomeKind::BatchFrame => {}
                     ReadOutcomeKind::Served
                     | ReadOutcomeKind::Held
                     | ReadOutcomeKind::NoFrame

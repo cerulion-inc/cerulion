@@ -1260,6 +1260,11 @@ pub struct CerulionSubscriber {
     /// hook clears — so `Some(0)` errors the very next call, `Some(1)` the
     /// second.
     fault_inject_receive_after: std::cell::Cell<Option<u32>>,
+    /// `(sequence, producer token)` of each frame the current drain popped,
+    /// in pop order, while the read log is armed. The staging wrappers write
+    /// one `BatchFrame` record per entry before a multi-frame read, then clear
+    /// it. Reserved to the queue depth when the stage is installed.
+    batch_frames: std::cell::RefCell<Vec<(u32, u64)>>,
     /// The topic's EFFECTIVE iceoryx2
     /// `subscriber_max_borrowed_samples` — the borrow budget this
     /// subscriber's takes are really bounded by, read from the data
@@ -1698,6 +1703,7 @@ impl CerulionSubscriber {
             probe: None,
             pending_backpressure_event: None,
             fault_inject_receive_after: std::cell::Cell::new(None),
+            batch_frames: std::cell::RefCell::new(Vec::new()),
             max_publishers,
             max_borrowed_samples,
             // hot-path-alloc-ok: constructor — once per subscriber. Empty (no
@@ -1739,6 +1745,8 @@ impl CerulionSubscriber {
     /// runtime retains a clone: arming (recording only) and the level-end
     /// merge both happen through that side.
     pub(crate) fn set_read_outcome_stage(&mut self, stage: Arc<ReadOutcomeStage>) {
+        let depth = self.subscriber.buffer_size();
+        self.batch_frames.get_mut().reserve(depth);
         self.read_stage = Some(stage);
     }
 
@@ -1851,8 +1859,49 @@ impl CerulionSubscriber {
         role: ReadSiteRole,
     ) {
         if let Some(stage) = &self.read_stage {
+            self.stage_batch_frames(stage, kind, served_seq, popped, role);
             stage.record(kind, served_seq, popped, role);
         }
+    }
+
+    /// Before a read that popped more than one frame, stage one `BatchFrame`
+    /// record per popped frame other than the one the read names, in pop
+    /// order, each with its writer annotation when the edge carries writers.
+    /// Clears the drain's frame list either way.
+    fn stage_batch_frames(
+        &self,
+        stage: &ReadOutcomeStage,
+        kind: ReadOutcomeKind,
+        served_seq: Option<u32>,
+        popped: u64,
+        role: ReadSiteRole,
+    ) {
+        let mut frames = self.batch_frames.borrow_mut();
+        let consumes = matches!(
+            kind,
+            ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch
+        );
+        if consumes && popped > 1 {
+            let named = match frames.last() {
+                Some(&(seq, _)) if Some(seq) == served_seq => frames.len() - 1,
+                _ => frames.len(),
+            };
+            let annotate = self.capture_producer_token();
+            for &(seq, token) in &frames[..named] {
+                if annotate {
+                    stage.record_with_producer(
+                        ReadOutcomeKind::BatchFrame,
+                        Some(seq),
+                        0,
+                        token,
+                        role,
+                    );
+                } else {
+                    stage.record(ReadOutcomeKind::BatchFrame, Some(seq), 0, role);
+                }
+            }
+        }
+        frames.clear();
     }
 
     /// Stage one read outcome PRECEDED by its producer
@@ -1869,6 +1918,7 @@ impl CerulionSubscriber {
         role: ReadSiteRole,
     ) {
         if let Some(stage) = &self.read_stage {
+            self.stage_batch_frames(stage, kind, served_seq, popped, role);
             stage.record_with_producer(kind, served_seq, popped, token, role);
         }
     }
@@ -3096,6 +3146,7 @@ impl CerulionSubscriber {
         // the recording's own empty drain wrote at this position.
         let capture = self.read_capture_armed();
         let consult_capture = self.consult_capture_armed();
+        self.batch_frames.borrow_mut().clear();
         let granted = match self.replay_gate() {
             None => None,
             Some(gate) => match Self::gate_admission(gate) {
@@ -3200,6 +3251,14 @@ impl CerulionSubscriber {
                     // one sequence mismatch per drain over a clean replay.
                     if capture || granted.is_some() {
                         if let Some(seq) = wire_sequence(sample.payload()) {
+                            if capture {
+                                let token = if annotate {
+                                    producer_token(sample.origin())
+                                } else {
+                                    0
+                                };
+                                self.batch_frames.borrow_mut().push((seq, token));
+                            }
                             newest_seq = Some(seq);
                             if capture && annotate {
                                 newest_origin = Some(sample.origin());
@@ -3736,6 +3795,10 @@ impl CerulionSubscriber {
         // decrements it — that is this consumer's queue depth on arrival, i.e.
         // whether the producer was being deferred on its behalf.
         let pre_drain_outstanding = self.block_probe().map(|p| p.outstanding.outstanding());
+        let capture = self.read_capture_armed();
+        let annotate = capture && self.capture_producer_token();
+        self.batch_frames.get_mut().clear();
+        let batch_frames = &self.batch_frames;
         let sub = &self.subscriber;
         let topic = &self.topic;
         let mut latest: Option<InboundSample> = None;
@@ -3871,6 +3934,16 @@ impl CerulionSubscriber {
                 if limit_one && sample.payload().len() < WireHeader::SIZE {
                     junk_skipped.set(junk_skipped.get() + 1);
                     return;
+                }
+                if capture {
+                    if let Some(seq) = wire_sequence(sample.payload()) {
+                        let token = if annotate {
+                            producer_token(sample.origin())
+                        } else {
+                            0
+                        };
+                        batch_frames.borrow_mut().push((seq, token));
+                    }
                 }
                 latest = Some(sample);
                 delivered.set(delivered.get() + 1);
@@ -5787,6 +5860,9 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             probe,
             pending_backpressure_event,
             fault_inject_receive_after,
+            // ABI v30: the drain's per-frame `(sequence, token)` list, staged as
+            // `BatchFrame` records before a multi-frame read.
+            batch_frames,
             // ABI v18: the topic's effective iceoryx2
             // `subscriber_max_borrowed_samples`, cached at creation for the
             // rmw's adopt-take refusal diagnostics. A `usize` that moves
@@ -6313,17 +6389,29 @@ mod tests {
         assert_eq!(
             staged,
             // hot-path-alloc-ok: test-only hand oracle.
-            vec![StagedReadOutcome {
-                kind: ReadOutcomeKind::DrainedBatch,
-                served_seq: 1,
-                popped: 2,
-                token: None,
-                // This test drives `drain_samples` through the
-                // BODY entry point (`try_receive`), so the staged record
-                // carries the BODY call-site role.
-                role: ReadSiteRole::Body,
-                run_count: 1,
-            }],
+            vec![
+                // Frame 0 of the two delivered, named ahead of the read
+                // (`trace_format` 9).
+                StagedReadOutcome {
+                    kind: ReadOutcomeKind::BatchFrame,
+                    served_seq: 0,
+                    popped: 0,
+                    token: None,
+                    role: ReadSiteRole::Body,
+                    run_count: 1,
+                },
+                StagedReadOutcome {
+                    kind: ReadOutcomeKind::DrainedBatch,
+                    served_seq: 1,
+                    popped: 2,
+                    token: None,
+                    // This test drives `drain_samples` through the
+                    // BODY entry point (`try_receive`), so the staged record
+                    // carries the BODY call-site role.
+                    role: ReadSiteRole::Body,
+                    run_count: 1,
+                },
+            ],
             "the PARTIAL batch is staged before the Err propagates (newest \
              delivered seq 1, popped 2)"
         );
@@ -6361,6 +6449,85 @@ mod tests {
         assert!(
             staged2.is_empty(),
             "an all-or-nothing Err stages NO batch record: {staged2:?}"
+        );
+    }
+
+    /// A batch drain on a depth-two `drop_oldest` queue whose writer publishes
+    /// while the batch runs: the callback for frame 1 publishes 3 to 20, which
+    /// evicts 2 to 18, so the batch delivers 1, 19 and 20. The read log names
+    /// all three: `BatchFrame` 1 and 19, then `DrainedBatch` 20 popped 3. A
+    /// replay that derived the frames from the newest sequence would feed 18,
+    /// 19 and 20.
+    #[test]
+    fn a_batch_overflowed_mid_drain_records_every_frame_it_consumed() {
+        use crate::read_outcome::{ReadOutcomeKind, ReadOutcomeStage, ReadStageRole};
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "batch_overflow".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 2,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let frame = |seq: u32| -> Vec<u8> {
+            let mut header = crate::wire::WireHeader::new(0xC1289, seq, 1_000 + u64::from(seq));
+            let total = crate::wire::WireHeader::SIZE + 8;
+            header.total_size = total as u32;
+            let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+            header.write_to_buf(&mut buf);
+            buf
+        };
+        let topic = "batch_overflow";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let stage = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Drain,
+            hand_wired_drain_sizing(),
+        ));
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        publisher.publish_raw(&frame(1)).expect("publish");
+        publisher.publish_raw(&frame(2)).expect("publish");
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        sub.try_receive(|msg| {
+            let seq = msg.header().sequence;
+            seen.push(seq);
+            if seq == 1 {
+                for later in 3..=20u32 {
+                    publisher.publish_raw(&frame(later)).expect("publish");
+                }
+            }
+        })
+        .expect("drain");
+        assert_eq!(
+            seen,
+            vec![1, 19, 20],
+            "PREMISE: 2 to 18 were evicted mid-batch"
+        );
+        let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            staged.push(r);
+            true
+        });
+        let shape: Vec<(ReadOutcomeKind, u64, u32)> = staged
+            .iter()
+            .map(|r| (r.kind, r.served_seq, r.popped))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (ReadOutcomeKind::BatchFrame, 1, 0),
+                (ReadOutcomeKind::BatchFrame, 19, 0),
+                (ReadOutcomeKind::DrainedBatch, 20, 3),
+            ]
         );
     }
 

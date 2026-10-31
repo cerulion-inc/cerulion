@@ -1211,6 +1211,12 @@ pub enum ReadOutcomeKind {
     /// join key), and the token rides the FULL 64-bit aux word — see
     /// [`StagedReadOutcome::token`].
     Producer = 7,
+    /// ONE frame of a multi-frame read that is not the frame the read names:
+    /// the read record that follows on the same stage and read site popped it.
+    /// `served_seq` is that frame's wire sequence, `popped` is 0. Staged in pop
+    /// order, before the read, one per consumed frame, so the read log names
+    /// every frame a read consumed (`trace_format` 9).
+    BatchFrame = 8,
 }
 
 impl ReadOutcomeKind {
@@ -1415,9 +1421,10 @@ fn resolve_seq_slot(inner: &mut StageInner, kind: ReadOutcomeKind, served_seq: O
         // — but the match is exhaustive so a future variant cannot be added
         // without deciding what its served-seq slot means.
         ReadOutcomeKind::Truncated | ReadOutcomeKind::Producer => STAGE_NO_FRAME,
-        ReadOutcomeKind::Served | ReadOutcomeKind::Held | ReadOutcomeKind::DrainedBatch => {
-            served_seq.map(u64::from).unwrap_or(STAGE_NO_FRAME)
-        }
+        ReadOutcomeKind::Served
+        | ReadOutcomeKind::Held
+        | ReadOutcomeKind::DrainedBatch
+        | ReadOutcomeKind::BatchFrame => served_seq.map(u64::from).unwrap_or(STAGE_NO_FRAME),
     };
     if matches!(
         kind,
@@ -3255,7 +3262,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             // not be added silently.
             run_count
         }),
-        abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer }),
+        abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer, ReadOutcomeKind::BatchFrame }),
         abi_pin_enum!(ReadSiteRole { ReadSiteRole::Unstamped, ReadSiteRole::Drain, ReadSiteRole::Body, ReadSiteRole::Peek }),
         abi_pin_enum!(ReadStageRole { ReadStageRole::Body, ReadStageRole::Drain }),
         // ABI v27: the ENFORCEMENT side. The subscriber owns a

@@ -1551,7 +1551,9 @@ pub fn stamp_trace_format(
         // 7 reader reads such a stream correctly (it strips annotations before
         // its compare) but would replay it by queue re-creation and call the
         // result clean, so the stamp moves and that reader refuses instead.
-        return 8;
+        // From 9 a multi-frame read also names every frame it consumed
+        // (`BatchFrame` records), which a format 8 reader would skip.
+        return 9;
     }
     if records_consults {
         // A stream in which EVERY gated consult wrote a record holds a
@@ -1795,16 +1797,21 @@ pub fn replay_stages_every_consult(
 /// ([`READ_IDENTITY_MIN_TRACE_FORMAT`]). Formats 1 to 7 stay fully readable and
 /// replay on the queue re-creation path, best effort.
 ///
+/// Bumped to 9 by per-frame batch identity: a read that pops more than one
+/// frame is preceded by one `BatchFrame` record per frame it did not name, so a
+/// fed replay feeds every consumed frame by its own identity. A format 8 bag
+/// stays readable; a fed replay of it refuses a multi-frame read by name.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 8,
-/// because every one records every consult and every read's frames), but the
-/// two remain separate functions serving separate questions, and the READ gate
-/// still admits 1 to 7
+/// them to zero for the bags this binary writes (every one of them stamps 9,
+/// because every one records every consult and every frame each read
+/// consumed), but the two remain separate functions serving separate
+/// questions, and the READ gate still admits 1 to 8
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 8;
+pub const SUPPORTED_TRACE_FORMAT: u32 = 9;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -9234,6 +9241,7 @@ fn read_outcome_kind_from_wire(wire: u16) -> Option<ReadOutcomeKind> {
         READ_OUTCOME_DECIMATED => ReadOutcomeKind::Decimated,
         READ_OUTCOME_TRUNCATED => ReadOutcomeKind::Truncated,
         READ_OUTCOME_PRODUCER => ReadOutcomeKind::Producer,
+        cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME => ReadOutcomeKind::BatchFrame,
         _ => return None,
     })
 }
@@ -11636,6 +11644,10 @@ fn decode_enforcement_read(
             resolve_producer_token(producer_tokens, r.aux),
             r.aux,
         ),
+        None if kind == ReadOutcomeKind::BatchFrame => match served_seq {
+            Some(seq) => replay_inject::RecordedRead::batch_frame(r.step, seq),
+            None => return Ok(None),
+        },
         None => replay_inject::RecordedRead::truncated(r.step, r.popped),
     };
     Ok(Some(DecodedRead {
@@ -19173,6 +19185,7 @@ mod admission_cursor_tests {
                 served_seq: None,
                 popped: 0,
                 kind: None,
+                batch: Vec::new(),
             })
             .collect();
         replay_inject::StepAdmission {
@@ -26535,7 +26548,7 @@ mod recorder_info_version_tests {
         // stamped v8 is NOT newer than this binary, and the absent-field
         // back-compat default stays v1 (`trace_format_v1`). A bump must move
         // this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 8);
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 9);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -26644,17 +26657,17 @@ mod recorder_info_version_tests {
                     7,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
                 );
-                // Read identity rides the consult term: 8 over every axis, and
-                // it claims nothing without the consult records under it.
+                // Read identity rides the consult term: 9 over every axis (8
+                // plus per-frame batch identity), and it claims nothing without
+                // the consult records under it.
                 assert_eq!(
                     stamp_trace_format(mode, needs_v4, roles, folds, true, true),
-                    8,
+                    9,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, identity)"
                 );
-                assert_ne!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true),
-                    8,
-                    "identity without the consult records is not format 8"
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true) < 8,
+                    "identity without the consult records is not format 8 or 9"
                 );
             }
         }

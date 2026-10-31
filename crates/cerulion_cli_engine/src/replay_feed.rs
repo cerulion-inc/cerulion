@@ -214,8 +214,8 @@ pub enum FeedRefusalReason {
         /// How many frames share the identity.
         frames: usize,
     },
-    /// A read popped `popped` frames on a topic with several writers, and the
-    /// recording names only the newest.
+    /// A read popped `popped` frames and the recording does not name each one
+    /// (a bag below `trace_format` 9 names only the newest).
     BatchUnattributed {
         /// Frames the read popped.
         popped: u32,
@@ -311,8 +311,8 @@ impl fmt::Display for FeedRefusal {
             ),
             FeedRefusalReason::BatchUnattributed { popped } => write!(
                 f,
-                "the read popped {popped} frames on a topic with several writers and the \
-                 recording names only the newest"
+                "the read popped {popped} frames and the recording does not name each of \
+                 them (recorded below trace format 9, or a frame record was lost)"
             ),
             FeedRefusalReason::DecimatedUnattributed { popped } => write!(
                 f,
@@ -557,7 +557,11 @@ pub fn plan_feeds(
                             FeedRefusalReason::FramesUnattributed { writers: named },
                         ));
                     }
-                } else if pops > 1 && topic.writers.len() > 1 {
+                }
+                // Every consumed frame, oldest first: the recorded batch frames,
+                // then the frame the read names. A multi-frame read recorded
+                // without them is refused rather than derived from `served`.
+                if pops > 1 && id.batch.len() + 1 != pops as usize {
                     return Err(refuse(
                         step.step,
                         Some(writer),
@@ -586,11 +590,13 @@ pub fn plan_feeds(
                     plan.insert(key, step.step, ordinal, read);
                     continue;
                 }
-                // Oldest first: the writer's `pops` frames ending at the served
-                // one.
-                for back in (0..pops).rev() {
-                    let seq = served.wrapping_sub(back);
-                    let lookup_writer = if topic.labeled { writer } else { 0 };
+                let consumed = id
+                    .batch
+                    .iter()
+                    .map(|(w, seq)| (w.unwrap_or(writer), *seq))
+                    .chain(std::iter::once((writer, served)));
+                for (frame_writer, seq) in consumed {
+                    let lookup_writer = if topic.labeled { frame_writer } else { 0 };
                     if let Some(first_step) = claimed.insert((lookup_writer, seq), step.step) {
                         return Err(refuse(
                             step.step,
@@ -602,7 +608,7 @@ pub fn plan_feeds(
                     match topic.by_id.get(&(lookup_writer, seq)) {
                         Some(Slot::One(span)) => {
                             read.frames.push(*span);
-                            read.ids.push((writer, seq));
+                            read.ids.push((frame_writer, seq));
                         }
                         Some(Slot::Many(frames)) => {
                             return Err(refuse(
@@ -823,6 +829,7 @@ mod tests {
                 served_seq: Some(seq),
                 popped,
                 kind: Some(kind),
+                batch: Vec::new(),
             });
         }
         StageAdmission {
@@ -868,13 +875,42 @@ mod tests {
     #[test]
     fn a_batch_on_one_writer_is_fed_the_run_ending_at_the_served_frame() {
         let idx = index(vec![frame(10, 1), frame(20, 2), frame(30, 3)], vec![]);
-        let adm = admission(&[(4, 3, Some(7), 2, ReadKind::Served)]);
+        let mut adm = admission(&[(4, 3, Some(7), 2, ReadKind::Served)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(7), 2)];
         let p = plan(&adm, &idx).expect("plans");
         let read = p.read(&key(), 4, 0).expect("read planned");
         assert_eq!(read.frames, vec![span(20), span(30)]);
         assert_eq!(read.ids, vec![(7, 2), (7, 3)]);
         assert_eq!((p.reads_planned(), p.frames_planned()), (1, 2));
         assert_eq!(p.buffers().get(&key()), Some(&2));
+    }
+
+    /// A depth-two `drop_oldest` queue overflowed mid-batch: the batch
+    /// consumed 1, then 19 and 20 after 2 to 18 were evicted. The recording
+    /// names 1 and 19 as batch frames, and the feed takes exactly 1, 19, 20,
+    /// never the 18, 19, 20 a count back from the served frame would name.
+    #[test]
+    fn a_batch_overflowed_mid_drain_is_fed_the_frames_it_recorded() {
+        let frames = (1..=20u32).map(|s| frame(s as usize * 10, s)).collect();
+        let idx = index(frames, vec![]);
+        let mut adm = admission(&[(4, 20, Some(7), 3, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(7), 1), (Some(7), 19)];
+        let p = plan(&adm, &idx).expect("plans");
+        let read = p.read(&key(), 4, 0).expect("read planned");
+        assert_eq!(read.frames, vec![span(10), span(190), span(200)]);
+        assert_eq!(read.ids, vec![(7, 1), (7, 19), (7, 20)]);
+    }
+
+    /// A multi-frame read whose recording names only its newest frame (a bag
+    /// below trace format 9) is refused by name, never fed a derived run.
+    #[test]
+    fn a_batch_recorded_without_its_frames_is_refused() {
+        let idx = index(vec![frame(10, 1), frame(20, 2), frame(30, 3)], vec![]);
+        let adm = admission(&[(4, 3, Some(7), 2, ReadKind::DrainedBatch)]);
+        assert_eq!(
+            plan(&adm, &idx).unwrap_err().reason,
+            FeedRefusalReason::BatchUnattributed { popped: 2 }
+        );
     }
 
     /// Three writers, each at sequence 5: the label decides which frame.
@@ -915,7 +951,8 @@ mod tests {
     #[test]
     fn a_missing_frame_is_refused_naming_its_sequence() {
         let idx = index(vec![frame(1, 5), frame(2, 7)], vec![]);
-        let adm = admission(&[(3, 7, Some(9), 2, ReadKind::Served)]);
+        let mut adm = admission(&[(3, 7, Some(9), 2, ReadKind::Served)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(9), 6)];
         let r = plan(&adm, &idx).unwrap_err();
         assert_eq!(r.reason, FeedRefusalReason::FrameMissing);
         assert_eq!(r.sequence, Some(6));
@@ -1067,6 +1104,7 @@ mod tests {
                 served_seq: None,
                 popped: 0,
                 kind: Some(ReadKind::NoFrame),
+                batch: Vec::new(),
             },
         );
         let p = plan(&adm, &idx).expect("plans");

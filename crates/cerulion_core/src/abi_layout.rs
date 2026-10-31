@@ -328,7 +328,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 29;
+const EXPECTED_ABI: u32 = 30;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -453,6 +453,9 @@ static EXPECTED: &[Expected] = &[
             "probe",
             "pending_backpressure_event",
             "fault_inject_receive_after",
+            // v30: the drain's per-frame `(sequence, token)` list, staged as
+            // `BatchFrame` records before a multi-frame read.
+            "batch_frames",
             // v18: the cached effective borrow budget — see the
             // field doc and the v18 paragraph on `CERULION_ABI_VERSION`.
             "max_borrowed_samples",
@@ -484,9 +487,12 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS,
+            // Re-measured at ABI 30 on aarch64-apple-darwin (`dump_measured_table`):
+            // `batch_frames` takes rank 2 and every field ranked 2 or above
+            // before it moves up by one.
             ranks: &[
-                7, 10, 5, 0, 9, 6, 11, 12, 13, 8, 14, 19, 1, 2, 24, 20, 3, 4, 25, 15, 21, 22, 16,
-                23, 17, 18,
+                8, 11, 6, 0, 10, 7, 12, 2, 13, 14, 9, 15, 20, 1, 3, 25, 21, 4, 5, 26, 16, 22, 23,
+                17, 24, 18, 19,
             ],
         },
     },

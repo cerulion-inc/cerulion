@@ -19703,7 +19703,10 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // stated once here and applies to every `recorded_trace_format` assertion
     // in this file that is fed by `production_recorder_json`; the arms that
     // stamp 4, 5 or 6 EXPLICITLY are the ones testing old-format reading.
-    assert_eq!(recorded_trace_format(&stamped), 8);
+    assert_eq!(
+        recorded_trace_format(&stamped),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o5 =
         replay(&stamped, source_relay_factories, None, None).expect("the format-5 bag replays");
     let rl = o5
@@ -31585,7 +31588,10 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
         &stamped,
         inject_duplicate_drain_batch,
     );
-    assert_eq!(recorded_trace_format(&stamped), 8);
+    assert_eq!(
+        recorded_trace_format(&stamped),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o5 = replay(&stamped, sy_bounded_factories, None, None).expect("the format-5 bag replays");
     assert!(
         has_stand_down(
@@ -31735,7 +31741,10 @@ fn a_pre_format_seven_sync_bag_replays_with_the_matchers_silence_adopted() {
         &modern,
         |_rec| {},
     );
-    assert_eq!(recorded_trace_format(&modern), 8);
+    assert_eq!(
+        recorded_trace_format(&modern),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o7 = replay(&modern, sy_bounded_factories, None, None)
         .expect("a format-7 per-set Sync bag replays");
     assert!(
@@ -31896,7 +31905,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &named,
         |_| {},
     );
-    assert_eq!(recorded_trace_format(&named), 8);
+    assert_eq!(
+        recorded_trace_format(&named),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let onamed = replay(&named, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&onamed),
@@ -31918,7 +31930,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &explicit,
         inject_duplicate_drain_batch,
     );
-    assert_eq!(recorded_trace_format(&explicit), 8);
+    assert_eq!(
+        recorded_trace_format(&explicit),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let oexp = replay(&explicit, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&oexp),
@@ -31937,7 +31952,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &impossible,
         inject_impossible_shape_read,
     );
-    assert_eq!(recorded_trace_format(&impossible), 8);
+    assert_eq!(
+        recorded_trace_format(&impossible),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let oimp = replay(&impossible, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&oimp),
@@ -32861,7 +32879,11 @@ fn a_body_role_batch_is_steered_to_the_body_queue() {
             &bag,
             |rec| inject_frame_neutral_batch_with_role(rec, role),
         );
-        assert_eq!(recorded_trace_format(&bag), 8, "{role:?}: role-stamped bag");
+        assert_eq!(
+            recorded_trace_format(&bag),
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            "{role:?}: role-stamped bag"
+        );
 
         let outcome = replay(&bag, sy_bounded_factories, None, None)
             .expect("the replay runs whatever the read log says");
@@ -32962,7 +32984,11 @@ fn a_truncated_marker_reaches_both_queues_under_every_role() {
                 );
             },
         );
-        assert_eq!(recorded_trace_format(&bag), 8, "role {wire}: stamped bag");
+        assert_eq!(
+            recorded_trace_format(&bag),
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            "role {wire}: stamped bag"
+        );
 
         let outcome = replay(&bag, sy_bounded_factories, None, None)
             .expect("a truncated read log never refuses the replay");
@@ -33035,7 +33061,10 @@ fn a_truncated_marker_reaches_both_queues_under_every_role() {
             );
         },
     );
-    assert_eq!(recorded_trace_format(&peek_bag), 8);
+    assert_eq!(
+        recorded_trace_format(&peek_bag),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let opeek = replay(&peek_bag, sy_bounded_factories, None, None)
         .expect("an impossible marker never refuses the replay");
     assert!(
@@ -33130,7 +33159,10 @@ fn a_peek_steers_to_the_drain_queue_and_an_unwritten_role_steers_by_kind() {
             );
         },
     );
-    assert_eq!(recorded_trace_format(&peek_bag), 8);
+    assert_eq!(
+        recorded_trace_format(&peek_bag),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let opeek = replay(&peek_bag, sy_bounded_factories, None, None)
         .expect("a peek-role record never refuses the replay");
     let sd = injection_stand_down(&opeek, SY_A_TOPIC).unwrap_or_else(|| {

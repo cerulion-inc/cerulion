@@ -803,7 +803,18 @@ pub mod wire;
 ///   feed and serves nothing where the recording served a frame.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 29;
+///
+/// - v30: a batched read names every frame it consumed. `CerulionSubscriber`
+///   gains `batch_frames`, the `(sequence, producer token)` of each frame the
+///   current drain popped while the read log is armed, and `ReadOutcomeKind`
+///   gains `BatchFrame = 8`, which the subscriber stages once per popped frame
+///   the read does not name, before the read (`trace_format` 9). The drain
+///   paths run inside a node library, so a library built against an earlier
+///   core reads the subscriber at stale offsets and stages no `BatchFrame`
+///   records.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 30;
 
 // Re-export commonly used types
 #[cfg(unix)]

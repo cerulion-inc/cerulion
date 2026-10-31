@@ -311,7 +311,9 @@ impl ReadKind {
             ReadOutcomeKind::NoFrame => Some(Self::NoFrame),
             ReadOutcomeKind::DrainedBatch => Some(Self::DrainedBatch),
             ReadOutcomeKind::Decimated => Some(Self::Decimated),
-            ReadOutcomeKind::Truncated | ReadOutcomeKind::Producer => None,
+            ReadOutcomeKind::Truncated
+            | ReadOutcomeKind::Producer
+            | ReadOutcomeKind::BatchFrame => None,
         }
     }
 
@@ -340,6 +342,13 @@ impl ReadKind {
 /// meaning, so every one of those combinations is unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedReadBody {
+    /// One consumed frame of the NEXT read on the same stage and read site that
+    /// is not the frame that read names (`trace_format` 9). It occupies no
+    /// position in the pop stream; the read that follows carries the count.
+    BatchFrame {
+        /// The consumed frame's wire sequence.
+        served_seq: u32,
+    },
     /// An ordinary read: it consumed `popped` frames off the queue and served
     /// what `served_seq` names (`None` = the no-frame sentinel).
     Read {
@@ -451,6 +460,16 @@ impl RecordedRead {
         Self {
             step,
             body: RecordedReadBody::Producer { token, raw },
+        }
+    }
+
+    /// One consumed frame of the read that follows (see
+    /// [`RecordedReadBody::BatchFrame`]).
+    #[must_use]
+    pub fn batch_frame(step: u64, served_seq: u32) -> Self {
+        Self {
+            step,
+            body: RecordedReadBody::BatchFrame { served_seq },
         }
     }
 
@@ -1423,6 +1442,8 @@ fn fold_edge(edge: &ConsumerEdge, topic: &TopicReplay) -> Result<EdgeFold, Stand
                 run_token = Some(token);
                 continue;
             }
+            // One frame of the next read; that read's `popped` already counts it.
+            RecordedReadBody::BatchFrame { .. } => continue,
             // Both remaining bodies CONSUME the pending annotation below.
             RecordedReadBody::Read { .. } | RecordedReadBody::HandOff { .. } => {}
         }
@@ -2169,7 +2190,7 @@ pub struct StepAdmission {
 /// derivation `crate::replay_feed` applies. Where that derivation does not hold
 /// (several writers on the edge), the feed refuses the read by name rather
 /// than guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadIdentity {
     /// The raw producer token of the last annotation of the read's site before
     /// it (the writer of its run), or `None` when none precedes it.
@@ -2183,6 +2204,10 @@ pub struct ReadIdentity {
     pub popped: u32,
     /// The read's kind (`None` on a hand-off entry, which pops nothing).
     pub kind: Option<ReadKind>,
+    /// The `(writer, sequence)` of every frame the read consumed other than the
+    /// one it names, in pop order, from the `BatchFrame` records before it
+    /// (`trace_format` 9). Empty on an older recording.
+    pub batch: Vec<(Option<u64>, u32)>,
 }
 
 /// What the planner answered for one topic.
@@ -2527,7 +2552,9 @@ fn record_is_batch(body: &RecordedReadBody) -> bool {
         RecordedReadBody::Read { kind, .. } => *kind == ReadKind::DrainedBatch,
         // A promotion is staged by the per-set Sync matcher, a drain site.
         RecordedReadBody::HandOff { .. } => true,
-        RecordedReadBody::Producer { .. } | RecordedReadBody::Truncated { .. } => false,
+        RecordedReadBody::Producer { .. }
+        | RecordedReadBody::Truncated { .. }
+        | RecordedReadBody::BatchFrame { .. } => false,
     }
 }
 
@@ -2633,6 +2660,8 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
         // Per stage and site, whether an annotation was staged since the last
         // read: the next read of that site carries its own.
         let mut annotation_pending: [[bool; 2]; 2] = [[false, false], [false, false]];
+        // Per stage and site, the consumed frames the next read did not name.
+        let mut batch_pending: [[Vec<(Option<u64>, u32)>; 2]; 2] = Default::default();
         for sited in &edge.reads {
             let step = sited.read.step;
             let role = stage_of_record(sited.role, record_is_batch(&sited.read.body), roles);
@@ -2693,6 +2722,15 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                     annotation_pending[stage][site] = true;
                     continue;
                 }
+                RecordedReadBody::BatchFrame { served_seq } => {
+                    let (stage, site) = (
+                        usize::from(role == ReadStageRole::Drain),
+                        cerulion_core::read_outcome::writer_run_site(sited.role),
+                    );
+                    annotation_pending[stage][site] = false;
+                    batch_pending[stage][site].push((run_writer[stage][site], *served_seq));
+                    continue;
+                }
                 // The third meaning: the frame named reached the consumer
                 // without a dequeue, so the gate walks past this entry rather
                 // than withholding at it.
@@ -2737,6 +2775,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                 cerulion_core::read_outcome::writer_run_site(sited.role),
             );
             let writer = run_writer[stage_slot][site];
+            let batch = std::mem::take(&mut batch_pending[stage_slot][site]);
             let annotated = std::mem::take(&mut annotation_pending[stage_slot][site]);
             let identity = match &sited.read.body {
                 RecordedReadBody::Read {
@@ -2749,6 +2788,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                     served_seq: *served_seq,
                     popped: *popped,
                     kind: Some(*kind),
+                    batch,
                 },
                 RecordedReadBody::HandOff { served_seq } => ReadIdentity {
                     writer,
@@ -2756,17 +2796,19 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                     served_seq: Some(*served_seq),
                     popped: 0,
                     kind: None,
+                    batch,
                 },
-                // Both annotation kinds left the loop above.
-                RecordedReadBody::Producer { .. } | RecordedReadBody::Truncated { .. } => {
-                    ReadIdentity {
-                        writer,
-                        annotated,
-                        served_seq: None,
-                        popped: 0,
-                        kind: None,
-                    }
-                }
+                // The annotation kinds and batch frames left the loop above.
+                RecordedReadBody::Producer { .. }
+                | RecordedReadBody::Truncated { .. }
+                | RecordedReadBody::BatchFrame { .. } => ReadIdentity {
+                    writer,
+                    annotated,
+                    served_seq: None,
+                    popped: 0,
+                    kind: None,
+                    batch,
+                },
             };
             let per_step = if role == ReadStageRole::Drain {
                 &mut drain

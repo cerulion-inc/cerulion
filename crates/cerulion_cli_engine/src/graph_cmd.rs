@@ -27083,11 +27083,11 @@ nodes:
             )
         );
         assert_eq!(
-            v["trace_format"], 8,
+            v["trace_format"], 9,
             "every bag this binary writes carries read-site roles, folds runs, \
-             records an empty consult a replay also makes AND names the writer of \
-             every read, and read identity is the strongest claim: a reader below 8 \
-             would replay its reads by queue re-creation and call the result clean"
+             records an empty consult a replay also makes AND names the writer and \
+             sequence of every frame each read consumed: a reader below 9 would \
+             skip the per-frame records and feed a batch by its newest frame alone"
         );
     }
 
@@ -27097,12 +27097,13 @@ nodes:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, and the consult record to the 7 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
+    /// per-frame batch identity to the 9 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_eight() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value =
@@ -27111,10 +27112,10 @@ nodes:
         assert_eq!(v["coordination"], "free_run");
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
-        // folding. 8, not 7: read identity rides the consult record and is
-        // tested first of all (`stamp_trace_format`'s hand table pins the
-        // whole matrix).
-        assert_eq!(v["trace_format"], 8);
+        // folding. 8, not 7: read identity rides the consult record. 9, not 8:
+        // every consumed frame of a batch is named (`stamp_trace_format`'s
+        // hand table pins the whole matrix).
+        assert_eq!(v["trace_format"], 9);
     }
 
     /// The ONE resolution point, and the rule it decides: a
