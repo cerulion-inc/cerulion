@@ -257,7 +257,7 @@ impl ReadStageRole {
     }
 
     /// The stable label the run-exit drop report and its log lines carry.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Body => "body",
             Self::Drain => "drain",

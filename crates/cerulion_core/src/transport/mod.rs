@@ -117,7 +117,7 @@ use publisher::{CerulionPublisher, CerulionPublisherConfig};
 use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 
 /// Maximum topic name length (255 - "/event" suffix = 249).
-const MAX_TOPIC_LEN: usize = 249;
+pub(crate) const MAX_TOPIC_LEN: usize = 249;
 
 /// Refuse node/transport startup when this process's iceoryx2 build lacks
 /// Android shared-memory support (stock iceoryx2 has no `shm_open` on
@@ -7332,7 +7332,7 @@ pub(crate) fn classify_node_name_refusal(raw: &str) -> NodeNameRefusal {
 }
 
 /// Validate that the topic name is within iceoryx2's service name limit.
-fn validate_topic_name(topic: &str) -> Result<(), String> {
+pub(crate) fn validate_topic_name(topic: &str) -> Result<(), String> {
     if topic.is_empty() {
         return Err("topic name cannot be empty".to_string());
     }

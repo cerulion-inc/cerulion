@@ -40562,6 +40562,40 @@ fn two_concurrent_fed_replays_sharing_an_iceoryx2_config_do_not_cross_feeds() {
     ri_take();
 }
 
+/// A consumer whose node id is 230 characters long. Every private feed name
+/// carries a fixed-width digest of the node id, so the name stays inside the
+/// transport's topic limit, the fed replay builds its feeds, and every replayed
+/// read equals the live read.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_node_with_a_230_character_id_builds_its_feeds() {
+    let long = format!("slow_{}", "z".repeat(225));
+    assert_eq!(long.len(), 230);
+    let yaml = ri_evict_yaml().replacen("id: slow", &format!("id: {long}"), 1);
+    let make = || {
+        let mut f = ri_evict_factories();
+        let entry = f
+            .shift_remove("slow")
+            .expect("the evict fixture has a slow sink");
+        f.insert(long.clone(), entry);
+        f
+    };
+    let live = ri_record(&yaml, make);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_long_node.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = outcome.expect("the fed replay of a long node id builds its feeds");
+    ri_assert_fed(&outcome);
+    ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    assert!(
+        outcome.passed,
+        "the fed replay passes: {:?}",
+        outcome.violations
+    );
+}
+
 /// Two ranks, the consumers' rank built FIRST: its fed inputs read a topic only
 /// the second rank produces, so no port of the first pass created that topic's
 /// service. The fed build opens no real subscriber on it and still stands up its

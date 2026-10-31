@@ -29,6 +29,15 @@
 //!
 //! The call is made from the drain site that consulted the gate, which may be a
 //! node's own tick on any thread, so a feed is `Send + Sync`.
+//!
+//! # Feed names
+//!
+//! A feed's service name carries the replay's identifier, a fixed-width digest
+//! of the node id, the input index and the stage role (see
+//! [`replay_feed_topic`]). The digest keeps every feed name at most
+//! [`REPLAY_FEED_TOPIC_MAX_LEN`] bytes whatever the node id's length, inside
+//! the transport's topic name limit, and a compile-time assertion holds that
+//! bound to the limit.
 
 use crate::read_outcome::{ReadStageRole, StageKey};
 use crate::transport::TopicServiceConfig;
@@ -36,16 +45,77 @@ use crate::transport::TopicServiceConfig;
 /// The service-name root every private replay feed lives under.
 pub const REPLAY_FEED_TOPIC_ROOT: &str = "/__cerulion/replay_feed";
 
+/// Hex digits of the node digest a feed name carries in place of the node id.
+const NODE_DIGEST_HEX_LEN: usize = 16;
+
+/// Decimal digits of `n`.
+const fn decimal_digits(mut n: u64) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// The longest identifier [`new_replay_id`] mints: `p`, a `u32` process id,
+/// `r`, a `u64` counter.
+const REPLAY_ID_MAX_LEN: usize = 1 + decimal_digits(u32::MAX as u64) + 1 + decimal_digits(u64::MAX);
+
+/// The longest stage role label a feed name carries.
+const ROLE_LABEL_MAX_LEN: usize = {
+    let (body, drain) = (
+        ReadStageRole::Body.label().len(),
+        ReadStageRole::Drain.label().len(),
+    );
+    if body > drain {
+        body
+    } else {
+        drain
+    }
+};
+
+/// The longest name [`replay_feed_topic`] gives a stage of a replay whose
+/// identifier [`new_replay_id`] minted: the root, the replay identifier, the
+/// node digest, a `u16` input index, the role label and four separators.
+pub const REPLAY_FEED_TOPIC_MAX_LEN: usize = REPLAY_FEED_TOPIC_ROOT.len()
+    + 1
+    + REPLAY_ID_MAX_LEN
+    + 1
+    + NODE_DIGEST_HEX_LEN
+    + 1
+    + decimal_digits(u16::MAX as u64)
+    + 1
+    + ROLE_LABEL_MAX_LEN;
+
+const _: () = assert!(REPLAY_FEED_TOPIC_MAX_LEN <= crate::transport::MAX_TOPIC_LEN);
+
 /// The private service a fed read stage subscribes to.
 ///
-/// `/__cerulion/replay_feed/<replay_id>/<node>/<input_idx>/<body|drain>`: one service per
-/// stage, so the body and the drain subscriber of one input, which hold two
-/// queues live, hold two feeds here.
+/// `/__cerulion/replay_feed/<replay_id>/<node digest>/<input_idx>/<body|drain>`:
+/// one service per stage, so the body and the drain subscriber of one input,
+/// which hold two queues live, hold two feeds here. `<node digest>` is the 16
+/// lowercase hex digits of [`crate::wire::fnv1a_hash`] over the node id's
+/// bytes, so its width does not depend on the node id's length and, with a
+/// `replay_id` from [`new_replay_id`], the name is at most
+/// [`REPLAY_FEED_TOPIC_MAX_LEN`] bytes. The name is a function of its inputs
+/// alone (FNV-1a is a fixed algorithm with no per-process seed), so the
+/// replay's feed publisher and the runtime's fed subscriber, which each call
+/// this, name one service.
 #[must_use]
 pub fn replay_feed_topic(replay_id: &str, key: &StageKey) -> String {
+    #[cfg(feature = "oracle-mutants")]
+    if mutants::full_node_feed_names_armed() {
+        return format!(
+            "{REPLAY_FEED_TOPIC_ROOT}/{replay_id}/{}/{}/{}",
+            key.node,
+            key.input_idx,
+            key.role.label()
+        );
+    }
     format!(
-        "{REPLAY_FEED_TOPIC_ROOT}/{replay_id}/{}/{}/{}",
-        key.node,
+        "{REPLAY_FEED_TOPIC_ROOT}/{replay_id}/{:016x}/{}/{}",
+        crate::wire::fnv1a_hash(key.node.as_bytes()),
         key.input_idx,
         key.role.label()
     )
@@ -58,7 +128,12 @@ pub fn replay_feed_topic(replay_id: &str, key: &StageKey) -> String {
 pub fn new_replay_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("p{}r{n}", std::process::id())
+    replay_id_of(std::process::id(), n)
+}
+
+/// The identifier of replay `n` of process `pid`.
+fn replay_id_of(pid: u32, n: u64) -> String {
+    format!("p{pid}r{n}")
 }
 
 /// The service config a fed stage's subscriber creates its feed with.
@@ -203,6 +278,33 @@ pub mod mutants {
     pub(crate) fn writer_runs_on_multi_writer_edges_armed() -> bool {
         WRITER_RUNS_ON_MULTI_WRITER_EDGES.load(Ordering::SeqCst)
     }
+
+    thread_local! {
+        static FULL_NODE_FEED_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A scope that arms the full-node feed names on its own thread until it
+    /// drops. Thread-local, so a test arming it changes no other test's names.
+    #[derive(Debug)]
+    pub struct ThreadMutantGuard(());
+
+    impl Drop for ThreadMutantGuard {
+        fn drop(&mut self) {
+            FULL_NODE_FEED_NAMES.with(|c| c.set(false));
+        }
+    }
+
+    /// Arm the mutant on this thread: [`super::replay_feed_topic`] carries the
+    /// full node id instead of its fixed-width digest.
+    #[must_use]
+    pub fn full_node_feed_names() -> ThreadMutantGuard {
+        FULL_NODE_FEED_NAMES.with(|c| c.set(true));
+        ThreadMutantGuard(())
+    }
+
+    pub(crate) fn full_node_feed_names_armed() -> bool {
+        FULL_NODE_FEED_NAMES.with(std::cell::Cell::get)
+    }
 }
 
 /// How a replay wires a runtime it builds: the identity rule its recording was
@@ -248,15 +350,99 @@ mod tests {
         }
     }
 
+    fn key_of(node: &str, input_idx: u16, role: ReadStageRole) -> StageKey {
+        StageKey {
+            node: node.to_string(),
+            input_idx,
+            role,
+        }
+    }
+
+    /// The node segment is the FNV-1a digest of `sink`, pinned as a literal so
+    /// a seeded or changed hash cannot pass.
     #[test]
     fn a_feed_topic_names_replay_node_input_and_role_so_two_stages_of_one_input_differ() {
         assert_eq!(
             replay_feed_topic("r1", &key(ReadStageRole::Body)),
-            "/__cerulion/replay_feed/r1/sink/2/body"
+            "/__cerulion/replay_feed/r1/4e2e8418e6525c72/2/body"
         );
         assert_eq!(
             replay_feed_topic("r1", &key(ReadStageRole::Drain)),
-            "/__cerulion/replay_feed/r1/sink/2/drain"
+            "/__cerulion/replay_feed/r1/4e2e8418e6525c72/2/drain"
+        );
+    }
+
+    /// A 300 character node id under the longest replay identifier, input
+    /// index and role: the name passes the validation every topic service
+    /// creation applies, at exactly the bound the compile-time assertion holds.
+    #[test]
+    fn a_feed_name_for_a_300_character_node_id_passes_topic_validation() {
+        let node = "n".repeat(300);
+        let longest = replay_feed_topic(
+            &replay_id_of(u32::MAX, u64::MAX),
+            &key_of(&node, u16::MAX, ReadStageRole::Drain),
+        );
+        assert_eq!(longest.len(), REPLAY_FEED_TOPIC_MAX_LEN, "{longest}");
+        assert_eq!(
+            REPLAY_FEED_TOPIC_MAX_LEN, 85,
+            "docs/bag.md states this bound"
+        );
+        assert_eq!(
+            crate::transport::validate_topic_name(&longest),
+            Ok(()),
+            "{longest}"
+        );
+        let minted = replay_feed_topic(&new_replay_id(), &key_of(&node, 0, ReadStageRole::Body));
+        assert_eq!(
+            crate::transport::validate_topic_name(&minted),
+            Ok(()),
+            "{minted}"
+        );
+    }
+
+    /// Two node ids equal for their first 218 characters name two feeds.
+    #[test]
+    fn two_node_ids_that_differ_only_after_character_218_name_two_feeds() {
+        let stem = "s".repeat(218);
+        let (a, b) = (format!("{stem}a"), format!("{stem}b"));
+        for role in [ReadStageRole::Body, ReadStageRole::Drain] {
+            assert_ne!(
+                replay_feed_topic("r1", &key_of(&a, 0, role)),
+                replay_feed_topic("r1", &key_of(&b, 0, role))
+            );
+        }
+    }
+
+    /// The same replay identifier and stage give the same name on every call.
+    #[test]
+    fn a_feed_name_is_a_function_of_its_inputs_alone() {
+        let node = "a/long_node".repeat(40);
+        let stage = key_of(&node, 7, ReadStageRole::Body);
+        assert_eq!(
+            replay_feed_topic("p1r2", &stage),
+            replay_feed_topic("p1r2", &key_of(&node, 7, ReadStageRole::Body))
+        );
+        assert_eq!(
+            replay_feed_topic("p1r2", &stage),
+            format!(
+                "/__cerulion/replay_feed/p1r2/{:016x}/7/body",
+                crate::wire::fnv1a_hash(node.as_bytes())
+            )
+        );
+    }
+
+    /// MUTANT (`oracle-mutants`): a feed name carrying the full node id fails
+    /// the 300 character test.
+    #[cfg(feature = "oracle-mutants")]
+    #[test]
+    fn the_long_node_test_catches_full_node_feed_names() {
+        let _armed = mutants::full_node_feed_names();
+        let caught = std::panic::catch_unwind(
+            a_feed_name_for_a_300_character_node_id_passes_topic_validation,
+        );
+        assert!(
+            caught.is_err(),
+            "the long node test passed under full node names"
         );
     }
 
