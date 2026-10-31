@@ -104,8 +104,8 @@ pub(super) fn decide_netd(r: &NetdReading) -> Outcome {
                      installed with this cerulion"
                 ),
                 None => format!(
-                    "no netd pidfile names a process for that socket: find what holds it with \
-                     `lsof {socket}`"
+                    "no netd pidfile names a running cerulion-netd for that socket: find what \
+                     holds it with `lsof {socket}`"
                 ),
             })
             .reading("socket", Reading::Text(socket.clone()));
@@ -182,10 +182,26 @@ pub(super) fn decide_remoted(installed: Option<&str>, running: Option<usize>) ->
 /// Whether `cmdline` (the NUL-separated `/proc/<pid>/cmdline`) starts with an
 /// `argv[0]` whose file name is `cerulion-remoted`.
 pub(super) fn cmdline_is_remoted(cmdline: &[u8]) -> bool {
+    cmdline_argv0_is(cmdline, "cerulion-remoted")
+}
+
+/// Whether `cmdline` (the NUL-separated `/proc/<pid>/cmdline`) starts with an
+/// `argv[0]` whose file name is `name`.
+pub(super) fn cmdline_argv0_is(cmdline: &[u8], name: &str) -> bool {
     let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
     Path::new(&*String::from_utf8_lossy(argv0))
         .file_name()
-        .is_some_and(|n| n == "cerulion-remoted")
+        .is_some_and(|n| n == name)
+}
+
+/// The pidfile's `pid` when `proc_root/<pid>/cmdline` names `cerulion-netd`
+/// as `argv[0]`, else `None`. A pidfile a crashed netd left behind can name a
+/// pid the kernel has since given to another process, so the `kill` fix is
+/// offered only for a pid read back as netd.
+pub(super) fn verified_netd_pid(proc_root: &Path, pid: Option<u32>) -> Option<u32> {
+    let pid = pid?;
+    let cmdline = std::fs::read(proc_root.join(pid.to_string()).join("cmdline")).ok()?;
+    cmdline_argv0_is(&cmdline, "cerulion-netd").then_some(pid)
 }
 
 /// Processes under `proc_root` whose `argv[0]` is `cerulion-remoted`, or
@@ -213,7 +229,12 @@ fn run_netd(_ctx: &Context) -> Outcome {
     use cerulion_netd::ClientError;
     let socket = cerulion_netd::default_socket_path();
     let shown = socket.display().to_string();
-    let pid = cerulion_hygiene::read_pidfile(&cerulion_hygiene::pidfile_for(&socket));
+    // `/proc` exists only on Linux; elsewhere the pid stays unverified and
+    // the fix names `lsof` instead of `kill`.
+    let pid = verified_netd_pid(
+        Path::new("/proc"),
+        cerulion_hygiene::read_pidfile(&cerulion_hygiene::pidfile_for(&socket)),
+    );
     // A read that timed out is a daemon that did not answer in time, which
     // the client's own error text does not say.
     let describe = |e: &ClientError| match e {
@@ -411,8 +432,8 @@ mod tests {
         assert_eq!(
             foreign.fix.as_deref(),
             Some(
-                "no netd pidfile names a process for that socket: find what holds it with `lsof \
-                 /run/user/1000/cerulion/netd.sock`"
+                "no netd pidfile names a running cerulion-netd for that socket: find what holds \
+                 it with `lsof /run/user/1000/cerulion/netd.sock`"
             )
         );
     }
@@ -458,5 +479,25 @@ mod tests {
         }
         assert_eq!(count_remoted(proc_root.path()), Some(1));
         assert_eq!(count_remoted(&proc_root.path().join("absent")), None);
+    }
+
+    #[test]
+    fn the_kill_fix_names_only_a_pid_read_back_as_netd() {
+        let proc_root = tempfile::tempdir().unwrap();
+        for (pid, cmd) in [
+            ("20", &b"/usr/lib/cerulion/cerulion-netd\0--socket\0x\0"[..]),
+            ("21", &b"/usr/sbin/sshd\0"[..]),
+        ] {
+            let d = proc_root.path().join(pid);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::write(d.join("cmdline"), cmd).unwrap();
+        }
+        let root = proc_root.path();
+        assert_eq!(verified_netd_pid(root, Some(20)), Some(20));
+        // A stale pidfile whose pid now belongs to another process.
+        assert_eq!(verified_netd_pid(root, Some(21)), None);
+        // A pid with no process at all.
+        assert_eq!(verified_netd_pid(root, Some(22)), None);
+        assert_eq!(verified_netd_pid(root, None), None);
     }
 }
