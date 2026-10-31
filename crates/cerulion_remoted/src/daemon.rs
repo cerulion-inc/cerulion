@@ -245,8 +245,11 @@ pub async fn serve_endpoint(
 struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDrop {
-    /// Abort the task and wait for it to end. A blocking step it already
-    /// started (one file apply) runs to completion first.
+    /// Abort the task and wait for the aborted future to end. An apply already
+    /// handed to the blocking pool is not awaited: it runs to completion on its
+    /// own. That apply replaces the trust store by a rename in the same
+    /// directory, so the store file holds the old store or the new one, never
+    /// a torn one.
     async fn stop(mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
@@ -449,6 +452,33 @@ pub async fn handle_accepted_with_wire(
         // accept-classification tests): fall through to the skeleton report.
     }
 
+    // A refused key on the ops ALPN (a cloud row while the allow-from-cloud
+    // switch is OFF): answer in cerud's own framing so an ops client reads the
+    // reason as a handshake `Reject`.
+    if accepted.alpn == cerulion_link::alpn::OPS {
+        if let AcceptDecision::Refuse { reason } = &decision {
+            match tokio::time::timeout(
+                HANDSHAKE_DEADLINE,
+                report_ops_refusal(&accepted.connection, reason),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "cerulion_remoted: ops refusal ended early");
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        remote_id = %accepted.remote_id,
+                        deadline_secs = HANDSHAKE_DEADLINE.as_secs(),
+                        "cerulion_remoted: ops refusal exceeded its deadline; dropping the connection"
+                    );
+                }
+            }
+            return;
+        }
+    }
+
     // Everything else (Refuse / UnknownAlpn, and the no-plane fallbacks): the
     // skeleton control-frame stub. Bound the whole handshake: a peer that completed
     // the QUIC handshake then stalls must not hold this task + connection forever.
@@ -495,6 +525,47 @@ async fn report_decision(
     let _ = send.finish();
     // Hold the connection until the peer finishes (EOF) so the reply is delivered.
     let _ = read_frame(&mut recv, MAX_HELLO_LEN).await;
+    Ok(())
+}
+
+/// The ops-plane refusal: cerud's framing (a `u32` big-endian length, then
+/// JSON). Reads the client's opening frame (bounded by [`MAX_HELLO_LEN`]),
+/// writes one `HandshakeReply::Reject` carrying `reason`, then holds the
+/// connection until the peer closes its stream so the reply is delivered. The
+/// caller bounds the whole exchange with the handshake deadline.
+async fn report_ops_refusal(connection: &Connection, reason: &str) -> Result<(), LinkError> {
+    let stream = |e| LinkError::Stream(Box::new(e));
+    let (mut send, mut recv) = accept_frame_stream(connection).await?;
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| LinkError::Stream(Box::new(e)))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_HELLO_LEN {
+        return Err(LinkError::FrameExceedsMaxLen {
+            len,
+            max: MAX_HELLO_LEN,
+        });
+    }
+    let mut hello = vec![0u8; len];
+    recv.read_exact(&mut hello)
+        .await
+        .map_err(|e| LinkError::Stream(Box::new(e)))?;
+    let reply = cerud::protocol::HandshakeReply::Reject {
+        server_min: cerud::protocol::MIN_PROTOCOL_VERSION,
+        server_max: cerud::protocol::PROTOCOL_VERSION,
+        message: reason.to_string(),
+    };
+    let payload =
+        serde_json::to_vec(&reply).expect("a handshake reply contains only JSON-compatible fields");
+    let payload_len = u32::try_from(payload.len()).expect("a refusal reply is far below 4 GiB");
+    send.write_all(&payload_len.to_be_bytes())
+        .await
+        .map_err(stream)?;
+    send.write_all(&payload).await.map_err(stream)?;
+    let _ = send.finish();
+    let mut sink = [0u8; 256];
+    while let Ok(Some(_)) = recv.read(&mut sink).await {}
     Ok(())
 }
 

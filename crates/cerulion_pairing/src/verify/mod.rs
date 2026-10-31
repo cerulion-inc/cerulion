@@ -466,6 +466,7 @@ pub struct VerifiedPairing {
     scope: Scope,
     principal_kind: PrincipalKind,
     device_key: PublicKey,
+    cert_not_after_ns: u64,
 }
 
 impl VerifiedPairing {
@@ -476,12 +477,14 @@ impl VerifiedPairing {
         scope: Scope,
         principal_kind: PrincipalKind,
         device_key: PublicKey,
+        cert_not_after_ns: u64,
     ) -> Self {
         VerifiedPairing {
             account,
             scope,
             principal_kind,
             device_key,
+            cert_not_after_ns,
         }
     }
 
@@ -500,5 +503,10 @@ impl VerifiedPairing {
     /// The verified device (transport) key.
     pub fn device_key(&self) -> PublicKey {
         self.device_key
+    }
+    /// The verified device certificate's `not_after` (Unix ns). It bounds a
+    /// cloud row's expiry.
+    pub fn cert_not_after_ns(&self) -> u64 {
+        self.cert_not_after_ns
     }
 }

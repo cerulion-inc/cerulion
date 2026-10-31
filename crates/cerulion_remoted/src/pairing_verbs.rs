@@ -61,7 +61,7 @@ use crate::verbs;
 /// Extract the transport-authenticated 32-byte device key from a caller. The
 /// authorizer already gated bootstrap verbs on this, so a failure here is
 /// defense-in-depth (a loud, fail-closed refusal), never a production path.
-fn caller_device_key(caller: &CallerIdentity) -> CerudResult<[u8; 32]> {
+pub(crate) fn caller_device_key(caller: &CallerIdentity) -> CerudResult<[u8; 32]> {
     if !caller.authenticated {
         return Err(CerudError::Verb(
             "pairing verb reached without a transport-authenticated caller (the remote \

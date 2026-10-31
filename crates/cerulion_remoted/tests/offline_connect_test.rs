@@ -82,7 +82,7 @@ async fn established_pairing_connects_under(
         "the established robot is claimed on disk"
     );
     assert!(
-        store.is_allowed(&OWNER, common::T_NOW).is_some(),
+        store.account_access(&OWNER, common::T_NOW).is_some(),
         "the durable access row is the offline authority"
     );
     let index = cerulion_remoted::DeviceAccountIndex::load(&r.index_path, MAC_KEY)

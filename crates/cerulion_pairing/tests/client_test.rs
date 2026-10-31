@@ -544,7 +544,7 @@ fn strong_path_end_to_end_client_to_robot() {
             None,
         )
         .unwrap();
-    assert!(store.is_allowed(&acct(CLIENT_ACCT), T_NOW).is_some());
+    assert!(store.account_access(&acct(CLIENT_ACCT), T_NOW).is_some());
 }
 
 #[test]
@@ -622,7 +622,7 @@ fn code_path_end_to_end_establishes_a_visible_revocable_row() {
         )
         .unwrap();
     let row = store
-        .is_allowed(&acct(CLIENT_ACCT), T_NOW)
+        .account_access(&acct(CLIENT_ACCT), T_NOW)
         .expect("code-paired");
     assert_eq!(row.source, PairingSource::CodePaired);
     assert_eq!(row.scope, Scope::CODE_PAIR_DEFAULT);
@@ -652,5 +652,5 @@ fn unclaimed_claim_reset_lifecycle() {
     // Physical factory reset returns to unclaimed.
     store.factory_reset(CHASSIS).unwrap();
     assert!(!store.is_claimed());
-    assert!(store.is_allowed(&acct(CLIENT_ACCT), T_NOW).is_none());
+    assert!(store.account_access(&acct(CLIENT_ACCT), T_NOW).is_none());
 }
