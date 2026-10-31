@@ -571,6 +571,15 @@ pub fn derive_units(
             if !candidates.contains(next) || !walked.insert(next) {
                 break;
             }
+            // `unit` holds the ticks of every member of `at`'s group. A `next`
+            // in that group (an `isolate: false` join put both there) adds
+            // nothing, so the walk moves on without a verdict.
+            if let (Some(a), Some(b)) = (index(next), index(at)) {
+                if root(&mut parent, a) == root(&mut parent, b) {
+                    at = next;
+                    continue;
+                }
+            }
             let add = match index(next) {
                 Some(i) => {
                     let r = root(&mut parent, i);
@@ -1057,6 +1066,34 @@ mod tests {
             panic!("c must start a unit over budget: {units:?}");
         };
         assert_eq!(v.unit_ns, 3_000_000);
+    }
+
+    #[test]
+    fn a_link_inside_a_unit_an_isolate_false_join_made_adds_no_ticks() {
+        // `s -> b -> y` is a chain; the join `x`, triggered by `s` and `b`,
+        // declares isolate: false, so `s`, `b` and `x` share one unit before
+        // the walk (1.2 ms of ticks). The link `s -> b` lies inside that unit
+        // and adds nothing; `y` brings 0.2 ms, so the unit ticks 1.4 ms, under
+        // a quarter of the 10 ms period, and `y` joins.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[("s", "b"), ("b", "y")],
+            &[("s", "x", join.clone()), ("b", "x", join)],
+            &[("s", 10)],
+        );
+        g.isolate.insert("x".into(), false);
+        let c = costs(
+            &[
+                ("s", 100_000),
+                ("b", 100_000),
+                ("x", 1_000_000),
+                ("y", 200_000),
+            ],
+            &[],
+        );
+        let units = derive_units("g", &s(&["s", "b", "x", "y"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["s", "b", "x", "y"])], "{units:?}");
+        assert_eq!(units[0].boundaries, [("s".to_string(), Boundary::Source)]);
     }
 
     #[test]
