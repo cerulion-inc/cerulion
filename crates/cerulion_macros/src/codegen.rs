@@ -685,16 +685,16 @@ fn gen_wrapper(
             /// own `init` runs. `None` until set and again after `init`
             /// takes them; a node run with no `params:` keeps the defaults
             /// `new()` wrote.
-            __pending_params: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            __pending_params: ::std::option::Option<#__cer_root::graph::params::ParamValues>,
             /// Every `#[param]` field's value just after `init` wrote the
             /// graph's values, before the user's own `init`. A param is
             /// fixed for the run, so a state capture refuses once a field no
             /// longer holds its value here. `None` before `init`.
-            __cer_params_at_init: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            __cer_params_at_init: ::std::option::Option<#__cer_root::graph::params::ParamValues>,
             /// The node's `#[input(accumulate)]` buffers (empty for a node
             /// with none), filled at the step-boundary freeze and served to
             /// the tick.
-            __cer_accumulators: ::cerulion_core::transport::accumulate::AccumulatorSet,
+            __cer_accumulators: #__cer_root::transport::accumulate::AccumulatorSet,
         }
 
         impl #impl_generics #entry_name #ty_generics
@@ -712,7 +712,7 @@ fn gen_wrapper(
                     __pending_params: ::std::option::Option::None,
                     __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
-                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
+                        #__cer_root::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -728,7 +728,7 @@ fn gen_wrapper(
                     __pending_params: ::std::option::Option::None,
                     __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
-                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
+                        #__cer_root::transport::accumulate::AccumulatorSet::new(),
                 }
             }
 
@@ -1209,8 +1209,8 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             // at graph build.
             fn set_params(
                 &mut self,
-                params: &::cerulion_core::graph::params::ParamValues,
-            ) -> ::cerulion_core::error::TransportResult<()> {
+                params: &#__cer_root::graph::params::ParamValues,
+            ) -> #__cer_root::error::TransportResult<()> {
                 self.__pending_params = ::std::option::Option::Some(params.clone());
                 ::std::result::Result::Ok(())
             }
@@ -1231,7 +1231,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 // must see the graph's value, not the default.
                 if let ::std::option::Option::Some(values) = self.__pending_params.take() {
                     self.inner.__cer_apply_params(&values).map_err(|e| {
-                        ::cerulion_core::error::TransportError::NodeError {
+                        #__cer_root::error::TransportError::NodeError {
                             node_id: #diag_label.into(),
                             reason: ::std::format!("param apply failed: {}", e),
                         }
@@ -1909,7 +1909,7 @@ fn gen_cdylib(
                 LAST_ERROR_KIND.with(|cell| cell.set(0));
             }
 
-            fn __cer_set_last_error_kind(e: &::cerulion_core::error::TransportError) {
+            fn __cer_set_last_error_kind(e: &#__cer_root::error::TransportError) {
                 let code = e.node_error_kind().map_or(0, |k| k.code());
                 LAST_ERROR_KIND.with(|cell| cell.set(code));
             }
@@ -1919,9 +1919,9 @@ fn gen_cdylib(
             // in-process macro node reports, so the host's fatal log line and
             // `Error:` verdict read the same for both build forms. Any other
             // error keeps the `<phase> failed: <error>` text.
-            fn __cer_set_node_failure(phase: &str, e: &::cerulion_core::error::TransportError) {
+            fn __cer_set_node_failure(phase: &str, e: &#__cer_root::error::TransportError) {
                 let msg = match e {
-                    ::cerulion_core::error::TransportError::NodeFailed { reason, .. } => {
+                    #__cer_root::error::TransportError::NodeFailed { reason, .. } => {
                         reason.clone()
                     }
                     other => ::std::format!("{} failed: {}", phase, other),
@@ -2084,7 +2084,7 @@ fn gen_cdylib(
                     let ctx = unsafe { *Box::from_raw(ctx_ptr) };
 
                     if let ::std::result::Result::Err(e) =
-                        ::cerulion_core::graph::node::cdylib_platform_check()
+                        #__cer_root::graph::node::cdylib_platform_check()
                     {
                         __cer_set_last_error(::std::format!(
                             "node library {}: {}",
@@ -2143,7 +2143,7 @@ fn gen_cdylib(
                     if let ::std::option::Option::Some(bytes) = params_json {
                         let values = match ::std::str::from_utf8(bytes)
                             .map_err(|e| e.to_string())
-                            .and_then(::cerulion_core::graph::params::params_from_json)
+                            .and_then(#__cer_root::graph::params::params_from_json)
                         {
                             ::std::result::Result::Ok(values) => values,
                             ::std::result::Result::Err(e) => {
@@ -2190,7 +2190,7 @@ fn gen_cdylib(
             }
 
             #[no_mangle]
-            pub extern "C" fn cerulion_node_init(ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext) -> u64 {
+            pub extern "C" fn cerulion_node_init(ctx_ptr: *mut #__cer_root::graph::node::NodeContext) -> u64 {
                 __cer_init_with(ctx_ptr, ::std::option::Option::None)
             }
 
@@ -2207,7 +2207,7 @@ fn gen_cdylib(
             // carries `params:` (never a silently dead key).
             #[no_mangle]
             pub extern "C" fn cerulion_node_init_with_params(
-                ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext,
+                ctx_ptr: *mut #__cer_root::graph::node::NodeContext,
                 params_ptr: *const u8,
                 params_len: usize,
             ) -> u64 {

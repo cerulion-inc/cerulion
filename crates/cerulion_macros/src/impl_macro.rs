@@ -2289,7 +2289,7 @@ fn rewrite_helper_method(
                 #local: &#__cer_root::transport::input_view::InputView<'_, #ty>
             },
             PortKind::Accumulate => parse_quote! {
-                #local: &::cerulion_core::transport::accumulate::Accumulated<'_, #ty>
+                #local: &#__cer_root::transport::accumulate::Accumulated<'_, #ty>
             },
         };
         method.sig.inputs.push(new_arg);
@@ -2795,7 +2795,7 @@ fn rewrite_tick_method(
     };
     method.sig.inputs.push(ctx_arg);
     let acc_arg: FnArg = parse_quote! {
-        __cer_acc: &mut ::cerulion_core::transport::accumulate::AccumulatorSet
+        __cer_acc: &mut #__cer_root::transport::accumulate::AccumulatorSet
     };
     method.sig.inputs.push(acc_arg);
     method.sig.output = parse_quote! {
