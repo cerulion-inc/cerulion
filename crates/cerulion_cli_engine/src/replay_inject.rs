@@ -2209,6 +2209,10 @@ pub struct ReadIdentity {
     pub batch: Vec<(Option<u64>, u32)>,
 }
 
+/// The batch frames staged on one stage and read site since its last read, in
+/// the shape [`ReadIdentity::batch`] takes them.
+type PendingBatch = Vec<(Option<u64>, u32)>;
+
 /// What the planner answered for one topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionPlan {
@@ -2660,7 +2664,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
         // read: the next read of that site carries its own.
         let mut annotation_pending: [[bool; 2]; 2] = [[false, false], [false, false]];
         // Per stage and site, the consumed frames the next read did not name.
-        let mut batch_pending: [[Vec<(Option<u64>, u32)>; 2]; 2] = Default::default();
+        let mut batch_pending: [[PendingBatch; 2]; 2] = Default::default();
         for sited in &edge.reads {
             let step = sited.read.step;
             let role = stage_of_record(sited.role, record_is_batch(&sited.read.body), roles);

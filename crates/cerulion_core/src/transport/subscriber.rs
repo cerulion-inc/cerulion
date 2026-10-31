@@ -1703,6 +1703,8 @@ impl CerulionSubscriber {
             probe: None,
             pending_backpressure_event: None,
             fault_inject_receive_after: std::cell::Cell::new(None),
+            // hot-path-alloc-ok: constructor, once per subscriber. Empty (no
+            // heap reservation) until a read stage is installed.
             batch_frames: std::cell::RefCell::new(Vec::new()),
             max_publishers,
             max_borrowed_samples,
@@ -1746,6 +1748,8 @@ impl CerulionSubscriber {
     /// merge both happen through that side.
     pub(crate) fn set_read_outcome_stage(&mut self, stage: Arc<ReadOutcomeStage>) {
         let depth = self.subscriber.buffer_size();
+        // hot-path-alloc-ok: read-stage install, once per subscriber at graph
+        // build; reserves the queue depth before any drain pushes into it.
         self.batch_frames.get_mut().reserve(depth);
         self.read_stage = Some(stage);
     }
