@@ -11,12 +11,15 @@
 //! fan-out and several writers on one topic then change nothing about what a
 //! replayed read sees.
 //!
-//! This module holds the three halves of that:
+//! This module holds the four parts of that:
 //!
+//! * [`FeedNeed`]: the frame identities the selected reads look up, charged
+//!   against the feed index budget before the bag is walked.
 //! * [`FrameIndex`]: the bag's recorded frames of the consumed topics, keyed by
-//!   `(writer token, wire sequence)`. A multi-writer topic's frames carry the
-//!   recorder's per-frame producer labels; a topic with no label at all was
-//!   written by one writer.
+//!   `(writer token, wire sequence)`, built by [`FrameIndexBuilder`] and, under
+//!   a need, holding only the identities it names. A multi-writer topic's
+//!   frames carry the recorder's per-frame producer labels; a topic with no
+//!   label at all was written by one writer.
 //! * [`plan_feeds`]: for every gated admission that pops, the list of frames it
 //!   consumed, in pop order. A read whose frames cannot be named is REFUSED by
 //!   node, input, writer and sequence ([`FeedRefusal`]); there is no fallback
@@ -26,16 +29,20 @@
 //!
 //! # Which frames a read consumed
 //!
-//! A read record names ONE frame, the one it served. A read that popped `n`
-//! frames on an edge with ONE writer consumed that writer's `n` frames ending
-//! at the served one: the queue drops its oldest frame on overflow, so what one
-//! pop takes is a contiguous run of one writer's sequence. On a topic with
-//! several writers the frames below the served one are not named by anything
-//! the recording holds today, so such a read is refused
-//! ([`FeedRefusalReason::BatchUnattributed`]); the per-frame records that close
-//! that hole arrive as a list of identities per read, which is the shape
-//! [`PlannedRead::frames`] already takes. A `sample(N)` read that dropped the
-//! frames it popped names none of them, and is refused the same way
+//! A read record names ONE frame, the one it served. From `trace_format` 9 a
+//! read that popped more than one frame is preceded by one `BatchFrame` record
+//! per other frame it consumed, in pop order, each naming that frame's
+//! sequence and, on an annotated edge, its writer. Nothing is derived from the
+//! served sequence: on a `drop_oldest` queue a writer can refill and overflow
+//! the queue while the node's callback runs between two receives of one batch,
+//! so a depth-two queue can hand one batch 1, then 19 and 20. One function
+//! yields a read's consumed list (its batch frames, then the served frame);
+//! [`plan_feeds`] looks up exactly that list and [`FeedNeed`] names exactly
+//! that list, under one key rule, so an index built under a need holds every
+//! frame the plan looks up. A multi-frame read recorded without its batch
+//! frames (a bag below format 9) is refused
+//! ([`FeedRefusalReason::BatchUnattributed`]). A `sample(N)` read that dropped
+//! the frames it popped names none of them, and is refused the same way
 //! ([`FeedRefusalReason::DecimatedUnattributed`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -47,7 +54,7 @@ use cerulion_core::read_outcome::{DueShape, StageKey};
 use cerulion_core::replay_feed::{ReadFeed, ReadFeedFault};
 use cerulion_core::transport::publisher::CerulionPublisher;
 
-use crate::replay_inject::{ReadKind, StageAdmission};
+use crate::replay_inject::{ReadIdentity, ReadKind, StageAdmission};
 
 /// The writer token a recorded port id hashes to: the function the recorder
 /// mints producer annotations with, so a frame label and a read annotation
@@ -111,6 +118,38 @@ pub struct FrameIndex {
 /// to which port.
 pub type TopicLabels = Vec<(ProducerAttribution, u128)>;
 
+/// `topic`'s labels in `labels`, empty when the recorder wrote none for it. A
+/// topic with at least one is LABELED.
+fn labels_of<'l>(
+    labels: &'l BTreeMap<String, TopicLabels>,
+    topic: &str,
+) -> &'l [(ProducerAttribution, u128)] {
+    labels.get(topic).map_or(&[], Vec::as_slice)
+}
+
+/// The key a topic's index holds the frame of `writer` at `seq` under:
+/// `(writer, seq)` on a labeled topic, `(0, seq)` on an unlabeled one.
+fn index_key(labeled: bool, writer: u64, seq: u32) -> (u64, u32) {
+    (if labeled { writer } else { 0 }, seq)
+}
+
+/// The `(writer token, sequence)` of every frame the read `id` consumed, in
+/// pop order: its recorded batch frames, each under its own writer (`writer`
+/// where the record names none), then the frame it served, `(writer, served)`.
+///
+/// [`plan_feeds`] looks up exactly these frames and [`FeedNeed::add`] names
+/// exactly these, each through [`index_key`].
+fn consumed_frames(
+    id: &ReadIdentity,
+    writer: u64,
+    served: u32,
+) -> impl Iterator<Item = (u64, u32)> + '_ {
+    id.batch
+        .iter()
+        .map(move |&(frame_writer, seq)| (frame_writer.unwrap_or(writer), seq))
+        .chain(std::iter::once((writer, served)))
+}
+
 /// Bytes one [`FrameIndex`] entry is charged against the feed index budget: the
 /// `((u64, u32), Slot)` pair, its hash table control byte and growth slack.
 pub const FEED_INDEX_ENTRY_BYTES: u64 = 64;
@@ -129,7 +168,10 @@ pub struct FeedNeed {
 
 impl FeedNeed {
     /// Add the identities `stages` look up at steps below `step_end` (`None`
-    /// = every step). A topic is labeled when `labels` holds a label for it.
+    /// = every step): for each read that pops and names its writer and served
+    /// frame, every frame of its consumed list, under the key an index built
+    /// with the same `labels` holds that frame under. A topic is labeled when
+    /// `labels` holds a label for it.
     pub fn add(
         &mut self,
         stages: &[FedStage<'_>],
@@ -137,22 +179,30 @@ impl FeedNeed {
         step_end: Option<u64>,
     ) {
         for stage in stages {
-            let labeled = labels.get(stage.topic).is_some_and(|l| !l.is_empty());
+            let labeled = !labels_of(labels, stage.topic).is_empty();
             for step in &stage.admission.per_step {
                 if step_end.is_some_and(|end| step.step >= end) {
                     continue;
                 }
                 for (due, id) in step.due.iter().zip(&step.identity) {
-                    let DueShape::Pops { pops, .. } = due.shape() else {
+                    if !matches!(due.shape(), DueShape::Pops { .. }) {
                         continue;
-                    };
+                    }
                     let (Some(writer), Some(served)) = (id.writer, id.served_seq) else {
                         continue;
                     };
-                    let writer = if labeled { writer } else { 0 };
                     let set = self.by_topic.entry(stage.topic.to_string()).or_default();
-                    for back in 0..pops {
-                        if set.insert((writer, served.wrapping_sub(back))) {
+                    #[cfg(feature = "oracle-mutants")]
+                    if mutants::need_counted_back() {
+                        for back in 0..due.pop_count() {
+                            if set.insert(index_key(labeled, writer, served.wrapping_sub(back))) {
+                                self.entries += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    for (frame_writer, seq) in consumed_frames(id, writer, served) {
+                        if set.insert(index_key(labeled, frame_writer, seq)) {
                             self.entries += 1;
                         }
                     }
@@ -287,7 +337,7 @@ impl<'a> FrameIndexBuilder<'a> {
         let topics = topics
             .into_iter()
             .map(|topic| {
-                let topic_labels = labels.get(&topic).map(Vec::as_slice).unwrap_or(&[]);
+                let topic_labels = labels_of(labels, &topic);
                 let idx = TopicIndex {
                     labeled: !topic_labels.is_empty(),
                     ..TopicIndex::default()
@@ -647,6 +697,35 @@ pub mod mutants {
     pub(super) fn by_timestamp() -> bool {
         ARMED.load(Ordering::SeqCst) == BY_TIMESTAMP
     }
+
+    thread_local! {
+        static NEED_COUNTED_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A scope that arms the counted-back need on its own thread until it
+    /// drops. Thread-local, so a test arming it changes no other test's need.
+    #[derive(Debug)]
+    pub struct NeedGuard(());
+
+    impl Drop for NeedGuard {
+        fn drop(&mut self) {
+            NEED_COUNTED_BACK.with(|c| c.set(false));
+        }
+    }
+
+    /// Arm the COUNTED-BACK need: [`super::FeedNeed::add`] names, for a read
+    /// that popped `n` frames, the `n` sequences of its writer ending at the
+    /// served one instead of the frames its recording names, while
+    /// [`super::plan_feeds`] still looks up the recorded frames.
+    #[must_use]
+    pub fn need_counted_back_from_served() -> NeedGuard {
+        NEED_COUNTED_BACK.with(|c| c.set(true));
+        NeedGuard(())
+    }
+
+    pub(super) fn need_counted_back() -> bool {
+        NEED_COUNTED_BACK.with(std::cell::Cell::get)
+    }
 }
 
 /// Plan every fed read of a pass.
@@ -666,14 +745,17 @@ pub fn plan_feeds(
     step_end: Option<u64>,
 ) -> Result<FeedPlan, FeedRefusal> {
     let _ = step_targets;
-    // Pass 1: an unlabeled topic must be read under ONE writer.
+    // Pass 1: an unlabeled topic must be read under ONE writer, counting the
+    // writers its reads' batch frames name.
     let mut writers_by_topic: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
     for stage in stages {
         for step in &stage.admission.per_step {
             for id in &step.identity {
-                if let Some(w) = id.writer {
-                    writers_by_topic.entry(stage.topic).or_default().insert(w);
-                }
+                let named = id.batch.iter().filter_map(|(w, _)| *w).chain(id.writer);
+                writers_by_topic
+                    .entry(stage.topic)
+                    .or_default()
+                    .extend(named);
             }
         }
     }
@@ -754,9 +836,10 @@ pub fn plan_feeds(
                         ));
                     }
                 }
-                // Every consumed frame, oldest first: the recorded batch frames,
-                // then the frame the read names. A multi-frame read recorded
-                // without them is refused rather than derived from `served`.
+                // The read's consumed list (`consumed_frames`) is its recorded
+                // batch frames, then the frame it names. A multi-frame read
+                // whose batch frames do not account for every pop is refused
+                // rather than derived from `served`.
                 if pops > 1 && id.batch.len() + 1 != pops as usize {
                     return Err(refuse(
                         step.step,
@@ -786,14 +869,9 @@ pub fn plan_feeds(
                     plan.insert(key, step.step, ordinal, read);
                     continue;
                 }
-                let consumed = id
-                    .batch
-                    .iter()
-                    .map(|(w, seq)| (w.unwrap_or(writer), *seq))
-                    .chain(std::iter::once((writer, served)));
-                for (frame_writer, seq) in consumed {
-                    let lookup_writer = if topic.labeled { frame_writer } else { 0 };
-                    if let Some(first_step) = claimed.insert((lookup_writer, seq), step.step) {
+                for (frame_writer, seq) in consumed_frames(id, writer, served) {
+                    let lookup = index_key(topic.labeled, frame_writer, seq);
+                    if let Some(first_step) = claimed.insert(lookup, step.step) {
                         return Err(refuse(
                             step.step,
                             Some(writer),
@@ -801,7 +879,7 @@ pub fn plan_feeds(
                             FeedRefusalReason::FrameClaimedTwice { first_step },
                         ));
                     }
-                    match topic.by_id.get(&(lookup_writer, seq)) {
+                    match topic.by_id.get(&lookup) {
                         Some(Slot::One(span)) => {
                             read.frames.push(*span);
                             read.ids.push((frame_writer, seq));
@@ -1087,10 +1165,11 @@ mod tests {
     #[test]
     fn an_index_under_a_need_keeps_only_the_named_frames() {
         let frames: Vec<RecordedFrame> = (1..=10).map(|s| frame(s as usize * 10, s)).collect();
-        let adm = admission(&[
+        let mut adm = admission(&[
             (1, 3, Some(7), 2, ReadKind::Served),
             (2, 4, Some(7), 1, ReadKind::Served),
         ]);
+        adm.per_step[0].identity[0].batch = vec![(Some(7), 2)];
         let need = need_of(&adm, None);
         assert_eq!(need.entries(), 3);
         let mut b = FrameIndexBuilder::new(["/t".to_string()], &BTreeMap::new(), Some(&need));
@@ -1140,7 +1219,8 @@ mod tests {
     /// The budget admits a need at or under it and refuses one byte over.
     #[test]
     fn the_feed_index_budget_admits_at_and_under_and_refuses_over() {
-        let adm = admission(&[(1, 3, Some(7), 3, ReadKind::Served)]);
+        let mut adm = admission(&[(1, 3, Some(7), 3, ReadKind::Served)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(7), 1), (Some(7), 2)];
         let need = need_of(&adm, None);
         let bytes = 3 * FEED_INDEX_ENTRY_BYTES;
         assert_eq!(need.index_bytes(), bytes);
@@ -1153,6 +1233,112 @@ mod tests {
                 needed: bytes,
                 entries: 3,
             })
+        );
+    }
+
+    /// The depth-two overflow batch (1, then 19 and 20 after 2 to 18 were
+    /// evicted mid-drain) of an unlabeled topic holding frames 1 to 20: its
+    /// need, and its plan over the index built under that need.
+    fn overflow_batch_through_a_budgeted_index() -> (FeedNeed, Result<FeedPlan, FeedRefusal>) {
+        let mut adm = admission(&[(4, 20, Some(7), 3, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(7), 1), (Some(7), 19)];
+        let need = need_of(&adm, None);
+        let mut b = FrameIndexBuilder::new(["/t".to_string()], &BTreeMap::new(), Some(&need));
+        for s in 1..=20u32 {
+            b.push("/t", frame(s as usize * 10, s));
+        }
+        let idx = b.finish();
+        (need, plan(&adm, &idx))
+    }
+
+    /// Through the budgeted index (need, index under the need, plan), the
+    /// overflowed batch is fed exactly the frames it recorded, and its need
+    /// holds exactly those three.
+    #[test]
+    fn a_budgeted_index_feeds_an_overflowed_batch_exactly_its_recorded_frames() {
+        let (need, planned) = overflow_batch_through_a_budgeted_index();
+        assert_eq!(need.entries(), 3);
+        let p = planned.expect("plans over the index built under the need");
+        let read = p.read(&key(), 4, 0).expect("read planned");
+        assert_eq!(read.frames, vec![span(10), span(190), span(200)]);
+        assert_eq!(read.ids, vec![(7, 1), (7, 19), (7, 20)]);
+    }
+
+    /// MUTANT (`oracle-mutants`): the need counts back from the served frame
+    /// (18, 19, 20) while the plan looks up the recorded frames, so the index
+    /// built under it lacks frame 1 and the budgeted overflow test fails.
+    #[cfg(feature = "oracle-mutants")]
+    #[test]
+    fn the_budgeted_overflow_test_catches_a_need_counted_back_from_the_served_frame() {
+        let _armed = mutants::need_counted_back_from_served();
+        let (need, planned) = overflow_batch_through_a_budgeted_index();
+        assert_eq!(need.entries(), 3, "the mutant names 18, 19 and 20");
+        let refusal = planned.expect_err("frame 1 is outside the mutant's index");
+        assert_eq!(refusal.reason, FeedRefusalReason::FrameMissing);
+        assert_eq!(refusal.sequence, Some(1));
+        let caught = std::panic::catch_unwind(
+            a_budgeted_index_feeds_an_overflowed_batch_exactly_its_recorded_frames,
+        );
+        assert!(
+            caught.is_err(),
+            "the budgeted overflow test passed under the mutant"
+        );
+    }
+
+    /// On a labeled topic each batch frame is needed and fed under its own
+    /// writer: three writers at sequence 5, one batch consuming all three.
+    #[test]
+    fn a_labeled_batch_is_needed_and_fed_under_each_frames_writer() {
+        let ids = [11u128, 22, 33];
+        let labels: TopicLabels = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    ProducerAttribution::FrameLabel {
+                        frame_index: i as u64,
+                    },
+                    *id,
+                )
+            })
+            .collect();
+        let (a, b, c) = (writer_token(11), writer_token(22), writer_token(33));
+        let mut adm = admission(&[(1, 5, Some(c), 3, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(a), 5), (Some(b), 5)];
+        let mut by_topic = BTreeMap::new();
+        by_topic.insert("/t".to_string(), labels);
+        let mut need = FeedNeed::default();
+        need.add(
+            &[FedStage {
+                admission: &adm,
+                input: "inp",
+                topic: "/t",
+                every_read: false,
+            }],
+            &by_topic,
+            None,
+        );
+        assert_eq!(need.entries(), 3);
+        let mut builder = FrameIndexBuilder::new(["/t".to_string()], &by_topic, Some(&need));
+        for f in [frame(1, 5), frame(2, 5), frame(3, 5)] {
+            builder.push("/t", f);
+        }
+        let p = plan(&adm, &builder.finish()).expect("plans");
+        let read = p.read(&key(), 1, 0).expect("read planned");
+        assert_eq!(read.frames, vec![span(1), span(2), span(3)]);
+        assert_eq!(read.ids, vec![(a, 5), (b, 5), (c, 5)]);
+    }
+
+    /// An unlabeled topic whose reads name one writer while a batch frame
+    /// names another is refused: the index keys its frames by sequence alone.
+    #[test]
+    fn an_unlabeled_topic_counts_the_writers_its_batch_frames_name() {
+        let idx = index(vec![frame(10, 1), frame(20, 2)], vec![]);
+        let mut adm = admission(&[(4, 2, Some(7), 2, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = vec![(Some(8), 1)];
+        assert_eq!(
+            plan(&adm, &idx).unwrap_err().reason,
+            FeedRefusalReason::FramesUnattributed { writers: 2 }
         );
     }
 

@@ -2184,12 +2184,11 @@ pub struct StepAdmission {
 /// producer annotation before it named, the sequence it served, how many frames
 /// it popped, and its kind.
 ///
-/// A read record names ONE frame (the one it served), so a read that popped
-/// more than one names the others only by position: on a single-writer edge
-/// they are the writer's frames just below the served one, which is the
-/// derivation `crate::replay_feed` applies. Where that derivation does not hold
-/// (several writers on the edge), the feed refuses the read by name rather
-/// than guess.
+/// A read record names ONE frame (the one it served). From `trace_format` 9 the
+/// `BatchFrame` records before a read that popped more than one name every
+/// other frame it consumed ([`Self::batch`]); `crate::replay_feed` feeds those
+/// and then the served frame, and refuses by name a multi-frame read whose
+/// recording does not name every frame it popped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadIdentity {
     /// The raw producer token of the last annotation of the read's site before
