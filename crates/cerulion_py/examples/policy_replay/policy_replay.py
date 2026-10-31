@@ -104,6 +104,14 @@ class ReplayResult:
     max_abs_error: float
 
 
+def _integer(name, value):
+    """``value`` as an int (``operator.index``); a ``TypeError`` naming ``name`` otherwise."""
+    try:
+        return operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name}={value!r} is not an integer") from None
+
+
 def _difference(replayed, recorded, exact, atol, rtol):
     """Why ``replayed`` does not match ``recorded`` (``None`` when it does), and
     the largest finite element error (0.0 on a shape or dtype mismatch)."""
@@ -159,10 +167,12 @@ def assert_replay_matches(
     only the report line of each named step and counts the rest: while a step
     runs it holds nothing from an earlier step (the ``Step``, its records, or
     the arrays ``policy`` and ``recorded_action`` returned for it). A
-    ``max_report`` that is not an integer raises ``TypeError``, and a negative
-    one ``ValueError``, before any step runs.
+    ``max_report`` or ``min_steps`` that is not an integer raises
+    ``TypeError``, and a negative ``max_report`` ``ValueError``, before any
+    step runs.
     """
-    max_report = operator.index(max_report)
+    max_report = _integer("max_report", max_report)
+    min_steps = _integer("min_steps", min_steps)
     if max_report < 0:
         raise ValueError(f"max_report={max_report} is negative")
     exact = atol == 0.0 and rtol == 0.0

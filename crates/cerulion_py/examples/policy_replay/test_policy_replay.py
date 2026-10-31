@@ -1,7 +1,7 @@
 """Template: replay a recorded bag through a LeRobot policy and assert the actions.
 
 Copy this file and ``policy_replay.py`` into your test directory, then edit the
-constants below to name your topics, cameras and checkpoint. Run it with:
+constants below to name your topics, cameras and task. Run it with:
 
     REPLAY_BAG=session.mcap REPLAY_POLICY=<hub repo or local checkpoint> pytest test_policy_replay.py
 

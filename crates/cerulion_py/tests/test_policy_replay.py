@@ -214,10 +214,12 @@ def fresh_frame_log(count, reads):
 
 
 class FrameWatch:
-    """Wraps a policy (the instance) and the decoder (``decode``). Before each
-    policy call it counts the objects of earlier steps that are still alive:
-    the ``Step``, its observation and action records, and the arrays the
-    policy and the decoder returned for it."""
+    """Wraps a policy (the instance) and the decoder (``decode``). Each policy
+    call registers its ``Step``, the step's observation and action records and
+    the returned array; each decoder call registers its array. Before each
+    policy call, ``alive`` gets the count of registered objects still alive:
+    the earlier steps' objects, as ``assert_replay_matches`` calls the policy
+    before the decoder on every step."""
 
     def __init__(self, policy):
         self.policy = policy
@@ -308,13 +310,36 @@ def test_a_negative_max_report_is_refused_before_the_replay():
     assert calls == []
 
 
-@pytest.mark.parametrize("max_report", [2.5, float("nan"), None])
-def test_a_max_report_that_is_not_an_integer_is_refused_before_the_replay(max_report):
+@pytest.mark.parametrize(
+    "argument, value, message",
+    [
+        ("max_report", 2.5, "max_report=2.5 is not an integer"),
+        ("max_report", float("nan"), "max_report=nan is not an integer"),
+        ("max_report", None, "max_report=None is not an integer"),
+        ("min_steps", 2.5, "min_steps=2.5 is not an integer"),
+        ("min_steps", float("nan"), "min_steps=nan is not an integer"),
+        ("min_steps", None, "min_steps=None is not an integer"),
+    ],
+)
+def test_a_count_argument_that_is_not_an_integer_is_refused_before_the_replay(argument, value, message):
     calls = []
-    with pytest.raises(TypeError, match="cannot be interpreted as an integer"):
-        assert_replay_matches(steps(), calls.append, decode, max_report=max_report)
+    with pytest.raises(TypeError) as failure:
+        assert_replay_matches(steps(), calls.append, decode, **{argument: value})
+    assert str(failure.value) == message
     assert calls == []
-    assert assert_replay_matches(steps(), summed, decode, max_report=np.int64(1)).steps == 2
+
+
+def test_numpy_integers_set_max_report_and_min_steps():
+    with pytest.raises(AssertionError) as failure:
+        assert_replay_matches(steps(), lambda s: np.float32([0.0]), decode, max_report=np.int64(1))
+    assert str(failure.value) == "\n".join(
+        [
+            "2 of 2 replayed actions differ from the recording (byte-exact):",
+            "  step 0 (action sequence 1, timestamp_ns 1001): max abs error 1",
+        ]
+    )
+    with pytest.raises(AssertionError, match=r"^replayed 2 steps, fewer than min_steps=3 "):
+        assert_replay_matches(steps(), summed, decode, min_steps=np.int64(3))
 
 
 def load_template():
