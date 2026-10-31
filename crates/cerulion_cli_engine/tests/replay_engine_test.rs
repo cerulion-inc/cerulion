@@ -19700,8 +19700,9 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
     write_bag_with_recorder_json(&rec, &stamped, production_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 8: the
-    // format that says every gated consult wrote a kind-6 record. The reason is
+    // This bag is recorded BY THIS BINARY, so it stamps 9
+    // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
+    // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
     // in this file that is fed by `production_recorder_json`; the arms that
     // stamp 4, 5 or 6 EXPLICITLY are the ones testing old-format reading.
@@ -21979,12 +21980,12 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 8 on every
-/// bag this binary writes (every gated consult and every read's frames
-/// record), so every "corpus" bag elsewhere in this file is a format-**8** bag, a PRECONDITION that roles are
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 9 on every
+/// bag this binary writes (every gated consult and every frame each read
+/// consumed record), so every "corpus" bag elsewhere in this file is a format-**9** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 8, the identity and
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 9, the identity and
 /// consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
@@ -25348,9 +25349,9 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
     // not: the stamp came up because of the records, not because of the marker.
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
-        "a bag this binary records stamps 8 (roles, folded runs, a record at \
-         every consult and read identity), marker or no marker"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "a bag this binary records stamps the current format (roles, folded runs, \
+         a record at every consult, read identity and batch frames), marker or no marker"
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -25426,8 +25427,8 @@ fn a_resolvable_producer_token_verifies_clean() {
     // not do is push the RECORD-TYPE space, and it does not.
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
-        "a bag this binary records stamps 8, annotation or no annotation"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "a bag this binary records stamps the current format, annotation or no annotation"
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -27052,15 +27053,15 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         &bag_stamped,
         replay_engine::CoordinationMode::Lockstep,
     );
-    // The stamp is 8: every bag this binary writes records every gated
-    // consult and the identity of every read, so the "with a stamp" case is a
-    // format-8 one. What this
+    // The stamp is 9: every bag this binary writes records every gated
+    // consult and every frame each read consumed, so the "with a stamp" case is
+    // a format-9 one. What this
     // precondition is FOR is unchanged: the corpus's stamped case must go down
     // the EXPLICIT-stamp branch (`inferred: false`) rather than the inferred
     // one, and it must be the same clean recording as the unstamped cases.
     assert_eq!(
         recorded_trace_format(&bag_stamped),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "precondition: a bag this binary stamps carries read-site roles, folds \
          runs and records every consult, so this really is the corpus recording \
          WITH an explicit stamp"
@@ -31563,8 +31564,8 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
     );
     assert_eq!(
         recorded_trace_format(&base_bag),
-        8,
-        "PRECONDITION: every bag this binary writes stamps 8"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "PRECONDITION: every bag this binary writes stamps the current format"
     );
     let base = replay(&base_bag, sy_bounded_factories, None, None).expect("the baseline replays");
     assert!(
@@ -31860,7 +31861,7 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
     );
     assert_eq!(
         recorded_trace_format(&unwritten),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: the stamp says roles MAY be believed, the only \
          configuration in which an unnamed role's handling is observable"
     );
@@ -32370,7 +32371,7 @@ fn a_per_set_sync_descent_is_folded_from_its_head_not_declined() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: the roles may be believed, or the arm proves nothing"
     );
     let outcome = replay(&bag, sy_bounded_factories, None, None)
@@ -32732,8 +32733,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
-        "this 'corpus' bag is RECORDED BY THIS BINARY, so it stamps 8. \
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "this 'corpus' bag is RECORDED BY THIS BINARY, so it stamps the current format. \
          It is not an old-format arm: reading a genuinely older bag is pinned \
          by `a_format_5_bag_written_by_the_old_packer_still_replays`, which \
          crafts one through `pack_read_outcome_aux` (high half ZERO) and stamps 5"
@@ -33212,7 +33213,7 @@ fn a_peek_steers_to_the_drain_queue_and_an_unwritten_role_steers_by_kind() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the stamp says roles MAY be believed, the only configuration in which \
          an unnamed role's handling is observable"
     );
@@ -36996,7 +36997,7 @@ fn a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence() {
     write_sy_single_rank_free_run_bag(rec, &bag, |_| {});
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: roles are on the wire and may be believed"
     );
 
@@ -37298,7 +37299,7 @@ fn c6_a_sync_node_with_a_late_context_input_replays_clean_on_carried_heads() {
     write_sy_single_rank_free_run_bag(rec, &bag, |_| {});
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: roles on the wire"
     );
 
@@ -38762,7 +38763,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
     write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the recorder stamps the format whose rule this bag was written under"
     );
 
@@ -38917,7 +38918,7 @@ fn a_per_set_syncs_refill_align_pass_records_nothing_and_replays_byte_exact() {
     write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
     assert_eq!(
         recorded_trace_format(&bag),
-        8,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the recorder stamps the format whose rule this bag was written under"
     );
 
@@ -40209,7 +40210,7 @@ fn ri_assert_evict_premise(live: &RiLive) {
         fast.len(),
         slow.len()
     );
-    // The batch derivation is exercised: some slow read popped two frames.
+    // A multi-frame read is exercised: some slow read popped two frames.
     let popped_two = live.rec.trace.iter().any(|r| {
         r.record_type == RECORD_TYPE_READ_OUTCOME
             && unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_SERVED
@@ -40231,7 +40232,7 @@ fn ri_assert_fed(outcome: &ReplayOutcome) -> (usize, usize) {
             );
             (*reads, *frames)
         }
-        other => panic!("a --verify replay of a format-8 free-run bag is fed: {other:?}"),
+        other => panic!("a --verify replay of a format-9 free-run bag is fed: {other:?}"),
     }
 }
 

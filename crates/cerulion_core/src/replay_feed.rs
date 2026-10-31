@@ -188,7 +188,7 @@ pub enum EdgeIdentity {
     /// the site last annotated, and names the writer of every later read of the
     /// site up to the next annotation. The read log names the writer of every
     /// served frame. What every recording this build makes stages
-    /// (`trace_format` 8).
+    /// (`trace_format` 8 on).
     #[default]
     EveryEdge,
     /// Only edges whose wire sequence names no writer on its own (a

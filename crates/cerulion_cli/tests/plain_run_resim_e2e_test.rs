@@ -3359,7 +3359,8 @@ fn one_rank_capture_resims_and_verifies_under(
         // plan holds no position for is a schedule divergence; below 7 it is a
         // counted number. From 8 every read also names the writer and sequence
         // of each frame it served, so `--verify` feeds each read its recorded
-        // frames; below 8 the replay is labelled best effort. A capture that
+        // frames; below 8 the replay is labelled best effort. From 9 a read
+        // that popped several frames names each of them. A capture that
         // lost or mis-stamped the key would therefore replay this whole fixture
         // under the counted rule and still reach exit 0 with `status:
         // enforced`, which is why the stamp is asserted here rather than

@@ -16376,7 +16376,8 @@ pub fn render_recorder_json(
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
-        // writers by run, which is also every bag this binary writes.
+        // writers by run, and v9 one in which every multi-frame read names each
+        // frame it consumed, both also every bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -16397,7 +16398,8 @@ pub fn render_recorder_json(
             // every bag it writes stamps at least 7.
             crate::replay_engine::recorder_stamps_consult_records(),
             // Whether every edge carries its frames' writers, one annotation per
-            // writer run: it does, so every bag this binary writes stamps 8.
+            // writer run, and every multi-frame read names each frame it
+            // consumed: it does, so every bag this binary writes stamps 9.
             crate::replay_engine::recorder_records_read_identity(),
         ),
         // The coordination contract this run executed under.

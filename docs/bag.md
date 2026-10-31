@@ -51,7 +51,8 @@ product, not a failure), so a completed re-execution always exits **0**.
 
 The line between the two flag classes: a flag that shapes what EXECUTES
 (`--duration`, `--strict-state`, `--allow-param-change`) or PRODUCES (`--record-out`) works in both
-modes; a flag that shapes the VERDICT (`--report`, `--tolerance`) needs `--verify`.
+modes; a flag that shapes the VERDICT (`--report`, `--tolerance`) needs `--verify`, and so
+does `--feed-index-budget`, which bounds the frame index only a verifying run builds.
 
 `--verify` adds the byte-comparison and its stable exit contract: 0 = identical,
 1 = data violation, 2 = bag I/O or not-replay-grade, 3 = node cdylib load error
@@ -259,6 +260,7 @@ cerulion bag play <BAG> [-r|--rate N] [--loop] [--topics TOPIC]...
 cerulion bag play <BAG> --resim all [--verify] [-u|--duration D] [--strict-state]
                                     [--allow-param-change] [--record-out PATH]
                                     [--report PATH] [--tolerance PATH]
+                                    [--feed-index-budget BYTES]
 ```
 
 The two lines are the two modes, and their flags do **not** mix: every illegal
@@ -278,6 +280,7 @@ combination is refused by name with the reason, never silently ignored.
 | `--record-out PATH` | resim | Write the re-executed frames to a new bag at `PATH`: one channel per graph-produced topic holding every frame the re-executed graph published, as the full wire frame stamped with the sequence and timestamp in its own header (a frame shorter than the header is written whole with sequence and timestamp 0, as the recorder does). Each channel's schema hash is the one the re-executed graph publishes: the current workspace's when it resolves, otherwise the input channel's when it was recorded under this build's hash recipe, otherwise the hash in the topic's first frame. Provisioning is copied from the input bag's channel. Its schema name and fixed wire size are copied too when the input channel's hash, under this build's recipe, is the label; otherwise (a schema changed since recording, a legacy recipe, a node added since the recording) the channel takes the current workspace's schema name, else the input's, else `unknown`, and a fixed wire size of 0. A frame whose header names a different schema hash than its channel fails the run, so the output never mislabels a frame; a channel waiting for its first frame to learn its hash, whose first frame has no header, is labelled 0 and holds to it (a headerless frame on a channel already labelled is written under that label). The recorded external inputs a resim injects are not copied, including those re-published on a topic that another rank's graph also writes: they are unchanged and already in the input bag. A custom-type schema catalog in the input bag is carried over, pruned to the schema hashes the output's channels carry (a legacy recipe's hash is not bound in it, so it brings no definition). The output carries no scheduler trace, so it is a recording to read or index, not a bag `--resim` can re-execute. `PATH` must not exist: an existing file (the input bag included) is refused with exit 2 and never overwritten. A run that does not finish removes the partial file. Legal in both resim modes: it shapes what the run produces, not the comparison. With `--report`, the JSON gains a `record_out` field naming the written path (absent without the flag). `--record-out` and `--report` may not name the same file, however each is spelled (`out.mcap` and `./out.mcap`, or a symlink to it). A bag that cannot be finished fails a run that would otherwise exit 0 with exit 5 and removes the file. |
 | `--report PATH` | resim + `--verify` | Persist the machine-readable verdict JSON. Needs `--verify`: its `passed` / `violations` fields ARE the verdict a bare `--resim` declines to make. Beside the verdict it carries the per-rank REPORT-ONLY arrays, none of which move the exit code: `rank_execution` (one entry per pass: steps executed, first/last step, and whether the `--duration` bound is what stopped it; the per-rank breakdown `ticks_replayed` sums away), `injection_anomalies` (a bag-fed topic whose injected stream differed from the recording's: a sequence the plan did not name, a schedule that over-named the stream, or recorded frames a steered schedule left unaccounted for), and `replay_input_shortfalls` (a node whose trace-driven burst asked for the next recorded frame and got nothing, so it fired on its held head). Read all three before attributing a byte mismatch to the candidate: each says the replay's INPUT differed first. |
 | `--tolerance PATH` | resim + `--verify` | Relax the byte-comparison per field. Needs `--verify`: there is no comparison to relax without it. |
+| `--feed-index-budget BYTES` | resim + `--verify` | The bytes the index of recorded frames a fed replay builds may take (default 1073741824, 1 GiB, at 64 bytes per frame). The index holds only the frames the replayed reads consume, up to `--duration` when it is given; a replay that needs more is refused with exit 2 (`read_identity_feed_index_budget`), naming the bytes it needs, the budget and this flag. Needs `--verify`: only a verifying resim feeds reads by recorded identity (see "Read identity" below). |
 
 Why the playback flags are refused under `--resim`: `--rate` has no wall pace to
 multiply (a resim runs on the recording's own gating clock), `--loop` would not
@@ -924,12 +927,12 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 8.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as an 8; a
+`recorder.json` stamps 9.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 9; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Four encodings set the number; the fourth, read identity, has its own
-section below. Every kind-6 record carries a
+in it. Five encodings set the number; the last two, read identity and batch
+frames, have their own section below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
@@ -939,13 +942,14 @@ makes, an empty boundary drain's `none` record included, and reading a `drain`
 role on a `none` record as that empty consult is what `trace_format` 7 means,
 and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
-means.
+means, and a `batch_frame` record for each frame a multi-frame read consumed
+besides the one it served is what `trace_format` 9 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
-decodes as one occurrence each), and since read identity every such bag is
-format 8. A bag
+decodes as one occurrence each), since read identity every such bag is
+format 8, and since batch frames every such bag is format 9. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -970,7 +974,7 @@ defines all three roles, so no bag on disk changes meaning. The field is full:
 a fourth site needs a wider subfield and a format bump. See `docs/read_log_forensics.md` for the role
 table and what each `(kind, role)` pairing means offline.
 
-### Read identity (`trace_format` 8)
+### Read identity (`trace_format` 8) and batch frames (`trace_format` 9)
 
 A format 8 recording names, for every read on every edge, the frame it
 served. The read record carries the frame's wire sequence, and the writer is
@@ -990,6 +994,18 @@ stream (it strips annotations before comparing) but would replay it by
 re-creating each consumer's queue, so the stamp moves and that reader refuses
 the bag.
 
+A format 9 recording also names every OTHER frame a multi-frame read
+consumed. Before a read that popped more than one frame the recorder writes one
+`batch_frame` record (outcome kind 8) per consumed frame the read does not
+name, in pop order, each carrying that frame's wire sequence and, on an
+annotated edge, its own writer annotation. A batch's frames need not be
+consecutive: on a `drop_oldest` queue a writer can refill and overflow the
+queue while the node's callback runs between two receives of one batch, so a
+depth-two queue can hand one batch 1, then 19 and 20 (2 to 18 evicted while the
+callback for 1 ran). A reader below 9 does not know outcome kind 8: it would
+skip those records and feed the read the frames counted back from the served
+one, so the stamp moves and that reader refuses the bag.
+
 On a single-writer edge the read log grows by one record per read site for the
 whole recording, and its stage holds its plain bound plus two records (one
 run-opening annotation per read site); a read of the run equal to the run's
@@ -997,7 +1013,7 @@ first read folds into it. A multi-writer edge's records and its stage's pair
 factor of two are what they were before format 8, so a replay of any bag
 stages the recording's records on it and truncates at the same rim.
 
-`cerulion bag play --resim all --verify` replays a free-run format 8 bag with
+`cerulion bag play --resim all --verify` replays a free-run bag at format 8 or later with
 **private per-input feeds**. Every read stage of the re-executed graph (a
 node's body read, and its trigger drain where it has one) subscribes to its own
 service,
@@ -1010,11 +1026,18 @@ topic limit. When a read is about to pop, the replay publishes
 onto that service exactly the frames the recorded read consumed, found in the
 bag by `(writer, sequence)`: a multi-writer topic's frames carry the
 recorder's per-frame producer labels (`__cerulion/frame_producers`), and a
-topic with no label had one writer. A read that popped `n` frames on a
-single-writer edge consumed that writer's `n` frames ending at the served one,
-because a queue that drops its oldest frame keeps a contiguous run. Live
+topic with no label had one writer. A read that popped several frames is fed
+its `batch_frame` frames and then the frame it served, each by its own writer
+and sequence; nothing is counted back from the served sequence. Live
 evictions, several consumers of one topic and several writers on one topic
 then change nothing about what a replayed read sees.
+
+The replay first collects the `(writer, sequence)` of every frame the replayed
+reads consume (only the steps inside `--duration` when it is given) and indexes
+only those frames of the bag, charged at 64 bytes each against a budget of
+1 GiB, or `--feed-index-budget <BYTES>`. A replay whose reads need more is
+refused before the bag is walked (exit 2, `read_identity_feed_index_budget`),
+naming the bytes the reads need, the budget and the flag.
 
 What cannot be fed is refused by name before the first step (exit 2), with the
 node, the input, the writer and the sequence:
@@ -1024,7 +1047,7 @@ node, the input, the writer and the sequence:
 | `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
 | `read_identity_absent` | A read popped frames and no annotation named their writer, or a read on a multi-writer edge carries no annotation of its own |
 | `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
-| `read_identity_batch_unattributed` | A read popped several frames on a topic with several writers, and the recording names only the newest |
+| `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9 names only the newest |
 | `read_identity_decimated_unattributed` | A `sample(N)` read dropped the frames it popped and names none of them |
 | `read_identity_frames_unattributed` | An unlabelled topic's reads name more than one writer |
 | `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |
@@ -1047,7 +1070,7 @@ fed:
   (`read_identity_decimated_unattributed`): the decimated read names the last
   accepted frame, not the frames it popped and dropped.
 
-- A read that popped several frames on a topic with several writers
+- On a bag recorded below format 9, a read that popped several frames
   (`read_identity_batch_unattributed`): the read names only its newest frame.
 - A bag that starts mid-run (a `bag record --run` attach, a lapped ring, a
   Flashback window): a free-run replay refuses a mid-run bag before any feed is

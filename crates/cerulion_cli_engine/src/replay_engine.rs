@@ -1515,7 +1515,7 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the IDENTITY term and stamps 8, because
+///   this binary writes takes the IDENTITY term and stamps 9, because
 ///   [`recorder_stamps_consult_records`] and
 ///   [`recorder_records_read_identity`] are unconditionally true and this
 ///   function returns before the ladder is consulted. The ladder below (the
@@ -22434,6 +22434,7 @@ fn read_outcome_kind_label(kind: u16, role: ReadSiteRole) -> String {
         // future report — and to keep the vocabulary in one place.
         READ_OUTCOME_TRUNCATED => "truncated",
         READ_OUTCOME_PRODUCER => "producer",
+        cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME => "batch_frame",
         other => return format!("unknown({other})"),
     };
     if role.is_stamped() {
@@ -26670,7 +26671,7 @@ mod recorder_info_version_tests {
     ///
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
-    /// its consults and its reads' frames and therefore stamps 8, so the write
+    /// its consults and every frame its reads consumed and therefore stamps 9, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -26693,10 +26694,11 @@ mod recorder_info_version_tests {
             recorder_records_read_identity(),
         );
         assert_eq!(
-            stamp, 8,
-            "a recorder that records every consult AND the identity of every read \
-             stamps 8: a format-7 reader would replay its reads by queue \
-             re-creation and call the result clean"
+            stamp, 9,
+            "a recorder that records every consult AND every frame each read \
+             consumed stamps 9: a format-7 reader would replay its reads by queue \
+             re-creation and call the result clean, and a format-8 reader would \
+             skip the batch frames"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
