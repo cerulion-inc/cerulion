@@ -963,9 +963,12 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 
 /// The carrier rules of [`validate_network_block`], on an enabled or inert
 /// block alike (a locator or certificate setting that cannot work is wrong
-/// whatever the mode). They are
+/// whatever the mode). Rules 7 to 9, and rule 10 for a `reliability:
+/// best_effort` egress entry, are
 /// [`check_carrier_settings`](crate::transport::carrier::check_carrier_settings),
-/// which `cerulion-netd` applies to its environment too:
+/// which `cerulion-netd` applies to its environment too (with no best-effort
+/// topic, so rules 7 to 9 there); the `default_reliability` refusal and the
+/// WARN of rule 10 are checked here:
 ///
 /// 7. **Known carrier, not datagram only**: every `listen` / `connect` locator
 ///    classifies under
@@ -1682,7 +1685,8 @@ nodes:
     /// best-effort entry on a mixed-rel CONNECT locator counts too; a
     /// `best_effort` default on a mixed-rel locator, with or without a topic
     /// that opts back to `reliable`; a `reliable` default and topic need no
-    /// datagram link.
+    /// datagram link; a `tls/` listener with its certificate and key, and a
+    /// `tls/` connect with its root CA.
     #[test]
     fn test_network_carriers_accepted_shapes() {
         for block in [
@@ -1750,6 +1754,21 @@ nodes:
   tls:
     root_ca: /etc/cerulion/peers.pem
 "#,
+            r#"network:
+  mode: peer
+  listen:
+    - tls/0.0.0.0:7447
+  tls:
+    certificate: /etc/cerulion/robo.pem
+    private_key: /etc/cerulion/robo.key
+"#,
+            r#"network:
+  mode: peer
+  connect:
+    - tls/10.0.0.2:7447
+  tls:
+    root_ca: /etc/cerulion/peers.pem
+"#,
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();
             assert!(
@@ -1767,6 +1786,10 @@ nodes:
             (
                 "network:\n  mode: peer\n  listen:\n    - tls/0.0.0.0:7447\n",
                 &["quic/ or tls/ locator but no network tls.certificate"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - tls/10.0.0.2:7447\n",
+                &["network connect has a quic/ or tls/ locator but no network tls.root_ca"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - ws/0.0.0.0:7447\n",
@@ -1794,15 +1817,15 @@ nodes:
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  tls:\n    root_ca: /c/ca.pem\n",
-                &["tls.root_ca is set but no network connect locator is quic/"][..],
+                &["tls.root_ca is set but no network connect locator is quic/ or tls/"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  tls:\n    certificate: /c/a.pem\n    private_key: /c/a.key\n    root_ca: /c/ca.pem\n",
-                &["tls.root_ca is set but no network connect locator is quic/"][..],
+                &["tls.root_ca is set but no network connect locator is quic/ or tls/"][..],
             ),
             (
                 "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n  tls:\n    root_ca: /c/ca.pem\n    certificate: /c/a.pem\n    private_key: /c/a.key\n",
-                &["no network listen locator is quic/"][..],
+                &["no network listen locator is quic/ or tls/"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",

@@ -260,16 +260,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // CERULION_UNENCRYPTED_QUIC=on, see `quic_first`); discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
-    // A standing gateway serves only under a prior login, and that refusal
-    // comes first. Then a locator or TLS setting that cannot work refuses the
-    // start, naming the variable, before anything binds.
-    let configured_network = net::network_config_from_env_unchecked();
-    if net::standing_gateway_requested(configured_network.as_ref()) {
-        cerulion_netd::serving_login::require_prior_login()?;
-    }
-    if let Some(cfg) = &configured_network {
-        net::check_env_network_config(cfg)?;
-    }
+    // `network_config_from_env` refuses a standing gateway with no prior login
+    // first, then a locator or TLS setting that cannot work, naming the
+    // variable; both before the fold below and before anything binds.
+    let configured_network = net::network_config_from_env()?;
     let (network, peer_fold) = match configured_network {
         Some(cfg) => {
             let (cfg, fold) = discovery_fold::fold_discovered_peers(cfg);

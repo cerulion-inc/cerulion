@@ -557,7 +557,7 @@ network:
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
 | `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external, send_queue}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
-| `tls` | Certificate files for `quic/` locators (see below). |
+| `tls` | Certificate files for `quic/` and `tls/` locators (see below). |
 
 `router` mode is deliberately not exposed: a graph declares a participant,
 not infrastructure. A Strict block's scouting stays OFF (the mesh is exactly
@@ -609,10 +609,10 @@ Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
 lets the peer decide, which is why it does not satisfy a `best_effort` topic
 (the connection may come up with streams only).
 
-`quic/` encrypts the link and lets the CONNECTING side check the listener's
-certificate. The listener does not check who connects (no client certificate
-is requested), so on a robot that listens on `quic/`, who may pull which topic
-is still the pairing grant's decision, as on `tcp/`.
+`quic/` and `tls/` encrypt the link and let the CONNECTING side check the
+listener's certificate. The listener does not check who connects (no client
+certificate is requested), so on a robot that listens on `quic/` or `tls/`,
+who may pull which topic is still the pairing grant's decision, as on `tcp/`.
 
 ```yaml
 network:
@@ -726,9 +726,9 @@ network:
   its subject alternative names. zenoh also trusts the public Web PKI root
   set beside `root_ca`, so a listener holding a publicly issued certificate
   for that name is accepted too.
-- **`cerulion-netd`** reads the same files for its own `quic/` locators from
-  `CERULION_NETD_TLS_ROOT_CA`, `CERULION_NETD_TLS_CERTIFICATE` and
-  `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
+- **`cerulion-netd`** reads the same files for its own `quic/` and `tls/`
+  locators from `CERULION_NETD_TLS_ROOT_CA`, `CERULION_NETD_TLS_CERTIFICATE`
+  and `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
   `CERULION_NETD_LISTEN`. It applies rules 7 to 9 below to those variables
   when it starts, reads each file then, and refuses to start, naming the
   variable, on a setting that cannot work.

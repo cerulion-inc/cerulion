@@ -256,7 +256,7 @@ pub struct NetworkConfig {
     /// `None` (the default) is fine for sessions that never announce
     /// (discovery queries, ingress-only bridges).
     pub robot_identity: Option<String>,
-    /// Certificate files for `quic/` locators, set as zenoh's
+    /// Certificate files for `quic/` and `tls/` locators, set as zenoh's
     /// `transport/link/tls/*` keys by `NetworkManager::build_zenoh_config`.
     /// `None` (the default) sets none of them.
     pub tls: Option<NetworkTls>,
@@ -6119,8 +6119,8 @@ impl NetworkManager {
 /// [`check_tls_files`](super::carrier::check_tls_files) has read each file: a
 /// wrong, unreadable or non-PEM path, or a listener certificate marked
 /// `CA:TRUE`, fails the session open naming the `tls.*` setting and the path,
-/// rather than a QUIC listener that fails inside zenoh or a connect that zenoh
-/// retries in the background.
+/// rather than a `quic/` or `tls/` listener that fails inside zenoh or a
+/// connect that zenoh retries in the background.
 fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()> {
     super::carrier::check_tls_files(tls, &super::carrier::CarrierSettingNames::GRAPH)
         .map_err(|reason| TransportError::SessionCreation { reason })?;

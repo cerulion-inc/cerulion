@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The cross-host carrier a zenoh locator names, the certificate files the
-//! `quic/` carrier reads, and the per-topic egress reliability a gateway puts
-//! with.
+//! `quic/` and `tls/` carriers read, and the per-topic egress reliability a
+//! gateway puts with.
 //!
 //! The carrier is the locator's first segment, so one locator string is the
 //! whole choice:
@@ -25,9 +25,11 @@
 //!
 //! The `udp/...?rel=1` spelling leaves confidentiality and peer authentication
 //! entirely to the network underneath (a WireGuard overlay).
-//! Anywhere else, use `quic/`. A `quic/` connector checks the listener's
-//! certificate; the listener does not ask for one back, so who may pull a topic
-//! stays the demand authorizer's decision.
+//! Anywhere else, use `quic/`, or `tls/` where UDP does not get through. With
+//! the [`NetworkTls`] files, a `quic/` or `tls/` connector checks the
+//! listener's certificate and the listener asks for none back, so who may pull
+//! a topic stays the demand authorizer's decision. A team session
+//! (`team_auth`) checks a certificate at both ends instead.
 
 use std::path::PathBuf;
 
@@ -60,31 +62,32 @@ impl CarrierSettingNames {
     };
 }
 
-/// Certificate files for the `quic/` carrier, mapped onto zenoh's
-/// `transport/link/tls/*` keys (zenoh reads its QUIC certificates from the TLS
-/// section). Every path must be absolute; the files are read when the zenoh
-/// session opens, and a missing or unreadable file is a session-open error that
-/// names the path.
+/// Certificate files for the `quic/` and `tls/` carriers, mapped onto zenoh's
+/// `transport/link/tls/*` keys, which zenoh's QUIC and TLS links both read.
+/// Every path must be absolute; the files are read when the zenoh session
+/// opens, and a missing or unreadable file is a session-open error that names
+/// the path.
 ///
 /// | Field | zenoh key | Needed by |
 /// |---|---|---|
-/// | `root_ca` | `root_ca_certificate` | a `quic/` CONNECT locator: PEM trust anchors added to the ones zenoh always trusts (a self-signed peer certificate is its own anchor when it is not marked `CA:TRUE`) |
-/// | `certificate` | `listen_certificate` | a `quic/` LISTEN locator: the PEM certificate this machine presents |
-/// | `private_key` | `listen_private_key` | a `quic/` LISTEN locator: the PEM private key for `certificate` |
+/// | `root_ca` | `root_ca_certificate` | a `quic/` or `tls/` CONNECT locator: PEM trust anchors added to the ones zenoh always trusts (a self-signed peer certificate is its own anchor when it is not marked `CA:TRUE`) |
+/// | `certificate` | `listen_certificate` | a `quic/` or `tls/` LISTEN locator: the PEM certificate this machine presents |
+/// | `private_key` | `listen_private_key` | a `quic/` or `tls/` LISTEN locator: the PEM private key for `certificate` |
 ///
-/// zenoh's QUIC client trusts the public Web PKI root set as well as
-/// `root_ca` (zenoh-link-commons 1.10.1 `quic/utils.rs`, "mixed user-generated
-/// CA and webPKI CA"), so a listener holding a publicly issued certificate for
-/// the name or IP in the locator is also accepted. The name check
-/// (`verify_name_on_connect`) is always on: with it off, any publicly issued
-/// certificate for any name would pass.
+/// zenoh's QUIC and TLS clients trust the public Web PKI root set as well as
+/// `root_ca` (zenoh-link-commons 1.10.1 `quic/utils.rs` and zenoh-link-tls
+/// 1.10.1 `utils.rs`, "mixed user-generated CA and webPKI CA"), so a listener
+/// holding a publicly issued certificate for the name or IP in the locator is
+/// also accepted. The name check (`verify_name_on_connect`) is always on: with
+/// it off, any publicly issued certificate for any name would pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkTls {
     /// PEM file of trust anchors for the peers this machine connects to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_ca: Option<PathBuf>,
-    /// PEM certificate this machine presents on a `quic/` listen locator.
+    /// PEM certificate this machine presents on a `quic/` or `tls/` listen
+    /// locator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<PathBuf>,
     /// PEM private key for [`Self::certificate`].
@@ -184,8 +187,8 @@ fn refuse_ca_certificate(pem: &[u8]) -> Result<(), String> {
         .is_some_and(|bc| bc.value.ca);
     if is_ca {
         return Err(
-            "is marked CA:TRUE, and a quic/ peer refuses a CA certificate as the \
-             listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
+            "is marked CA:TRUE, and a quic/ or tls/ peer refuses a CA certificate as \
+             the listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
              e.g. add `-addext basicConstraints=critical,CA:FALSE` to `openssl req -x509`"
                 .to_string(),
         );
@@ -385,12 +388,12 @@ pub fn classify_locator(locator: &str) -> Result<Carrier, String> {
 ///
 /// 1. Every locator classifies under [`classify_locator`].
 /// 2. No locator is datagram only ([`Carrier::is_datagram_only`]).
-/// 3. A `tls` block sets at least one file; `root_ca` needs a `quic/` connect
-///    locator, and `certificate` / `private_key` a `quic/` listen locator (zenoh
-///    asks a connecting peer for no certificate). The certificate and key are
-///    set together, and every path is absolute.
-/// 4. A `quic/` listen locator needs `certificate` and `private_key`; a `quic/`
-///    connect locator needs `root_ca`.
+/// 3. A `tls` block sets at least one file; `root_ca` needs a `quic/` or
+///    `tls/` connect locator, and `certificate` / `private_key` a `quic/` or
+///    `tls/` listen locator (zenoh asks a connecting peer for no certificate).
+///    The certificate and key are set together, and every path is absolute.
+/// 4. A `quic/` or `tls/` listen locator needs `certificate` and
+///    `private_key`; a `quic/` or `tls/` connect locator needs `root_ca`.
 /// 5. A best-effort topic needs a locator with `mixed_rel=1`.
 ///
 /// # Errors
@@ -405,8 +408,10 @@ pub fn check_carrier_settings(
     best_effort_topic: Option<&str>,
     names: &CarrierSettingNames,
 ) -> Result<(), String> {
-    let mut quic_listen = false;
-    let mut quic_connect = false;
+    // Set by a `quic/` or `tls/` locator on that side, the locators that read
+    // the `tls` files.
+    let mut cert_listen = false;
+    let mut cert_connect = false;
     let mut datagram_link = false;
     for (list, locators, is_listen) in [
         (names.listen, listen, true),
@@ -426,9 +431,9 @@ pub fn check_carrier_settings(
             }
             if matches!(carrier, Carrier::Quic { .. } | Carrier::Tls) {
                 if is_listen {
-                    quic_listen = true;
+                    cert_listen = true;
                 } else {
-                    quic_connect = true;
+                    cert_connect = true;
                 }
             }
             datagram_link |= carrier.has_datagram_link();
@@ -443,7 +448,7 @@ pub fn check_carrier_settings(
                 names.root_ca, names.certificate, names.private_key
             ));
         }
-        if tls.root_ca.is_some() && !quic_connect {
+        if tls.root_ca.is_some() && !cert_connect {
             return Err(format!(
                 "{} is set but no {} locator is quic/ or tls/, so it would change nothing (a quic/ or tls/ \
                  listener asks a connecting peer for no certificate); remove it or add a \
@@ -451,7 +456,7 @@ pub fn check_carrier_settings(
                 names.root_ca, names.connect
             ));
         }
-        if (tls.certificate.is_some() || tls.private_key.is_some()) && !quic_listen {
+        if (tls.certificate.is_some() || tls.private_key.is_some()) && !cert_listen {
             return Err(format!(
                 "{} / {} are set but no {} locator is quic/ or tls/, so they would change nothing \
                  (only a quic/ or tls/ listener presents them); remove them or add a quic/ or tls/ listen \
@@ -470,13 +475,13 @@ pub fn check_carrier_settings(
         }
         if tls.certificate.is_some() != tls.private_key.is_some() {
             return Err(format!(
-                "one of {} / {} is set without the other; a quic/ listener presents the \
-                 certificate and signs with its key, so set both",
+                "one of {} / {} is set without the other; a quic/ or tls/ listener presents \
+                 the certificate and signs with its key, so set both",
                 names.certificate, names.private_key
             ));
         }
     }
-    if quic_listen && tls.is_none_or(|t| t.certificate.is_none()) {
+    if cert_listen && tls.is_none_or(|t| t.certificate.is_none()) {
         return Err(format!(
             "{} has a quic/ or tls/ locator but no {} / {}; that listener must present a \
              certificate (or use tcp/, or udp/<ip>:<port>?rel=1;mixed_rel=1 on a WireGuard \
@@ -484,7 +489,7 @@ pub fn check_carrier_settings(
             names.listen, names.certificate, names.private_key
         ));
     }
-    if quic_connect && tls.is_none_or(|t| t.root_ca.is_none()) {
+    if cert_connect && tls.is_none_or(|t| t.root_ca.is_none()) {
         return Err(format!(
             "{} has a quic/ or tls/ locator but no {}; set it to the PEM certificate(s) the peer's \
              certificate chains to (a self-signed peer certificate is its own root)",
@@ -694,7 +699,7 @@ mod tests {
                 locs(&["tcp/0.0.0.0:7447"]),
                 locs(&[]),
                 Some(root_ca.clone()),
-                &["ROOT_CA is set but no CONNECT locator is quic/"][..],
+                &["ROOT_CA is set but no CONNECT locator is quic/ or tls/"][..],
             ),
             (
                 locs(&[]),
@@ -703,7 +708,7 @@ mod tests {
                     root_ca: Some("/c/ca.pem".into()),
                     ..listener.clone()
                 }),
-                &["CERT / KEY are set but no LISTEN locator is quic/"][..],
+                &["CERT / KEY are set but no LISTEN locator is quic/ or tls/"][..],
             ),
             (
                 locs(&["quic/0.0.0.0:7447"]),
@@ -748,6 +753,81 @@ mod tests {
         )
         .unwrap();
         check_carrier_settings(&locs(&["tcp/0.0.0.0:7447"]), &[], None, None, &NAMES).unwrap();
+    }
+
+    /// A `tls/` locator reads the `tls` files as a `quic/` one does, on each
+    /// side: a listener needs the certificate and key, a connect needs the
+    /// root CA, and each file is inert without the locator that reads it.
+    /// Every row is checked before the test fails, so a failure lists each
+    /// row that changed.
+    #[test]
+    fn tls_carrier_follows_the_certificate_rules_on_both_sides() {
+        let root_ca = NetworkTls {
+            root_ca: Some("/c/ca.pem".into()),
+            ..NetworkTls::default()
+        };
+        let listener = NetworkTls {
+            certificate: Some("/c/a.pem".into()),
+            private_key: Some("/c/a.key".into()),
+            ..NetworkTls::default()
+        };
+        let every_file = NetworkTls {
+            root_ca: Some("/c/ca.pem".into()),
+            ..listener.clone()
+        };
+        let rows = [
+            (
+                locs(&["tls/0.0.0.0:7447"]),
+                locs(&[]),
+                Some(&listener),
+                None,
+            ),
+            (
+                locs(&["tls/0.0.0.0:7447"]),
+                locs(&[]),
+                None,
+                Some("LISTEN has a quic/ or tls/ locator but no CERT / KEY"),
+            ),
+            (
+                locs(&[]),
+                locs(&["tls/10.0.0.2:7447"]),
+                Some(&root_ca),
+                None,
+            ),
+            (
+                locs(&[]),
+                locs(&["tls/10.0.0.2:7447"]),
+                None,
+                Some("CONNECT has a quic/ or tls/ locator but no ROOT_CA"),
+            ),
+            (
+                locs(&["tls/0.0.0.0:7447"]),
+                locs(&["tcp/10.0.0.2:7447"]),
+                Some(&every_file),
+                Some("ROOT_CA is set but no CONNECT locator is quic/ or tls/"),
+            ),
+            (
+                locs(&["tcp/0.0.0.0:7447"]),
+                locs(&["tls/10.0.0.2:7447"]),
+                Some(&every_file),
+                Some("CERT / KEY are set but no LISTEN locator is quic/ or tls/"),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (listen, connect, tls, want) in rows {
+            let got = check_carrier_settings(&listen, &connect, tls, None, &NAMES);
+            let ok = match (want, &got) {
+                (None, Ok(())) => true,
+                (Some(needle), Err(err)) => err.contains(needle),
+                _ => false,
+            };
+            if !ok {
+                failures.push(format!(
+                    "listen {listen:?} connect {connect:?} tls {tls:?}: want {want:?}, got {got:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

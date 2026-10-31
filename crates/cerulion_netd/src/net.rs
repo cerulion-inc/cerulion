@@ -64,12 +64,13 @@ pub const NETWORK_ENV: &str = "CERULION_NETD_NETWORK";
 /// The kill-switch value (`off`) that disables netd's network plane.
 pub const NETWORK_OFF: &str = "off";
 
-/// Absolute path of the PEM trust anchors a `quic/` [`CONNECT_ENV`] locator's
-/// peer certificate must chain to (zenoh `transport/link/tls/root_ca_certificate`).
+/// Absolute path of the PEM trust anchors a `quic/` or `tls/` [`CONNECT_ENV`]
+/// locator's peer certificate must chain to (zenoh
+/// `transport/link/tls/root_ca_certificate`).
 pub const TLS_ROOT_CA_ENV: &str = "CERULION_NETD_TLS_ROOT_CA";
 
-/// Absolute path of the PEM certificate a `quic/` [`LISTEN_ENV`] locator
-/// presents (zenoh `transport/link/tls/listen_certificate`).
+/// Absolute path of the PEM certificate a `quic/` or `tls/` [`LISTEN_ENV`]
+/// locator presents (zenoh `transport/link/tls/listen_certificate`).
 pub const TLS_CERTIFICATE_ENV: &str = "CERULION_NETD_TLS_CERTIFICATE";
 
 /// Absolute path of the PEM private key for [`TLS_CERTIFICATE_ENV`] (zenoh
@@ -87,9 +88,9 @@ pub const ENV_SETTING_NAMES: cerulion_core::CarrierSettingNames =
         private_key: TLS_PRIVATE_KEY_ENV,
     };
 
-/// Build netd's `quic/` certificate settings from the three env values: `None`
-/// when all are unset or empty, else the set ones. Pure, oracle-tested; the
-/// rules are applied by [`check_env_network_config`].
+/// Build netd's `quic/` and `tls/` certificate settings from the three env
+/// values: `None` when all are unset or empty, else the set ones. Pure,
+/// oracle-tested; the rules are applied by [`check_env_network_config`].
 pub fn tls_from_values(
     root_ca: Option<&str>,
     certificate: Option<&str>,
@@ -110,12 +111,12 @@ pub fn tls_from_values(
 
 /// Apply the graph-load carrier rules to netd's env-derived config, naming the
 /// environment variables: every locator classifies and none is datagram only,
-/// the TLS variables are set exactly when a `quic/` locator reads them
-/// ([`TLS_ROOT_CA_ENV`] for a `quic/` connect, [`TLS_CERTIFICATE_ENV`] and
-/// [`TLS_PRIVATE_KEY_ENV`] together for a `quic/` listen), and each named file
-/// is an absolute path to a readable PEM file, with a listener certificate not
-/// marked `CA:TRUE`. netd egress carries every topic reliable, so no
-/// best-effort rule applies.
+/// the TLS variables are set exactly when a `quic/` or `tls/` locator reads
+/// them ([`TLS_ROOT_CA_ENV`] for a `quic/` or `tls/` connect,
+/// [`TLS_CERTIFICATE_ENV`] and [`TLS_PRIVATE_KEY_ENV`] together for a `quic/`
+/// or `tls/` listen), and each named file is an absolute path to a readable
+/// PEM file, with a listener certificate not marked `CA:TRUE`. netd egress
+/// carries every topic reliable, so no best-effort rule applies.
 ///
 /// # Errors
 ///
@@ -210,32 +211,43 @@ pub fn classify_network_switch(value: Option<&str>) -> NetworkSwitch {
     }
 }
 
-/// Resolve netd's network config from the process environment: `None` when
-/// [`NETWORK_ENV`] is EXACTLY [`NETWORK_OFF`] (LOCAL-ONLY kill switch — a loud info
-/// breadcrumb, then no zenoh ever), else `Some(desk default)` with the
-/// [`CONNECT_ENV`]/[`LISTEN_ENV`] locators folded in and `multicast_scouting` read
-/// from [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]. A non-empty non-`off` value
-/// (a foreseeable "off"-typo like `OFF`/`false`/`0`) keeps networking ON and warns
-/// LOUDLY — never a silent "I thought I disabled it". A configured-but-unused
-/// manager opens no session (the lazy-session invariant), so a never-demanded netd
-/// is byte-identical to a local-only one at runtime.
+/// Resolve netd's network config from the process environment and refuse a
+/// start that cannot work, in this order, before the daemon binds anything:
+///
+/// 1. Read the config: `None` when [`NETWORK_ENV`] is EXACTLY [`NETWORK_OFF`]
+///    (LOCAL-ONLY kill switch: a loud info breadcrumb, then no zenoh ever),
+///    else `Some(desk default)` with the [`CONNECT_ENV`]/[`LISTEN_ENV`]
+///    locators and the TLS variables folded in and `multicast_scouting` read
+///    from [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]. A
+///    non-empty non-`off` value (a foreseeable "off"-typo like
+///    `OFF`/`false`/`0`) keeps networking ON and warns LOUDLY, never a silent
+///    "I thought I disabled it". A configured-but-unused manager opens no
+///    session (the lazy-session invariant), so a never-demanded netd is
+///    byte-identical to a local-only one at runtime.
+/// 2. When [`standing_gateway_requested`] (a [`LISTEN_ENV`] locator: this
+///    machine serves the network), require a prior login with
+///    [`crate::serving_login::require_prior_login`]. That refusal comes
+///    first, before any locator or TLS setting is judged.
+/// 3. Apply [`check_env_network_config`], on a CONNECT-only start too.
 ///
 /// # Errors
 ///
-/// A [`check_env_network_config`] refusal of the locator and TLS variables.
+/// [`crate::serving_login::REFUSAL`] for a LISTEN start with no prior login,
+/// else the first [`check_env_network_config`] refusal, naming the variable.
 pub fn network_config_from_env() -> Result<Option<NetworkConfig>, String> {
     let cfg = network_config_from_env_unchecked();
+    if standing_gateway_requested(cfg.as_ref()) {
+        crate::serving_login::require_prior_login()?;
+    }
     if let Some(cfg) = &cfg {
         check_env_network_config(cfg)?;
     }
     Ok(cfg)
 }
 
-/// [`network_config_from_env`] without [`check_env_network_config`]: the
-/// daemon reads the config with this, applies the serving-login gate, and then
-/// runs the check, so a LISTEN start without a prior login is refused for the
-/// login before any locator or TLS setting is judged.
-pub fn network_config_from_env_unchecked() -> Option<NetworkConfig> {
+/// Step 1 of [`network_config_from_env`]: the environment read, with no login
+/// gate and no [`check_env_network_config`].
+fn network_config_from_env_unchecked() -> Option<NetworkConfig> {
     let raw = std::env::var(NETWORK_ENV).ok();
     match classify_network_switch(raw.as_deref()) {
         NetworkSwitch::Off => {
@@ -441,6 +453,10 @@ mod tests {
         // block whatever the keys are. (This body also touches
         // `CERULION_ROBOT_IDENTITY`, which is not a `CERULION_NETD_*` var at all.)
         let _lock = crate::test_env::env_lock();
+        // A saved login, so a LISTEN row passes the serving-login gate and
+        // reaches the locator and TLS check.
+        let login_home = saved_login_home();
+        let _gh = EnvVarGuard::set(CONFIG_HOME_ENV, login_home.path().to_str().unwrap());
 
         // (a) exactly "off" → LOCAL-ONLY (None).
         {
@@ -569,7 +585,8 @@ mod tests {
                 pem,
                 "",
                 "",
-                "CERULION_NETD_TLS_ROOT_CA is set but no CERULION_NETD_CONNECT locator is quic/",
+                "CERULION_NETD_TLS_ROOT_CA is set but no CERULION_NETD_CONNECT locator is quic/ \
+                 or tls/",
             ),
             (
                 "",
@@ -631,11 +648,189 @@ mod tests {
                 Some(std::path::PathBuf::from(pem))
             );
         }
+        // tls/ locators follow the same certificate rules on each side. The
+        // accepted listener presents an end-entity certificate, which the
+        // CA:TRUE check parses. Every row is checked before the test fails.
+        let team = cerulion_core::transport::test_ca::TestTeam::new("acme", 2);
+        let leaf = team.leaf(
+            cerulion_pairing::team::TeamRole::Robot,
+            &team.machine_key(1),
+        );
+        let leaf_pem = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(cerulion_core::transport::test_ca::TestTeam::pem_base64(
+                    "CERTIFICATE",
+                    &[&leaf],
+                ))
+                .unwrap()
+        };
+        let cert = dir.path().join("robot.pem");
+        std::fs::write(&cert, leaf_pem).unwrap();
+        let cert = cert.to_str().unwrap();
+        let key = dir.path().join("robot.key");
+        std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\n").unwrap();
+        let key = key.to_str().unwrap();
+        let mut failures = Vec::new();
+        for (connect, listen, root_ca, cert, key, want) in [
+            ("", "tls/0.0.0.0:7447", "", cert, key, None),
+            (
+                "",
+                "tls/0.0.0.0:7447",
+                "",
+                "",
+                "",
+                Some(
+                    "CERULION_NETD_LISTEN has a quic/ or tls/ locator but no \
+                     CERULION_NETD_TLS_CERTIFICATE",
+                ),
+            ),
+            ("tls/10.0.0.2:7447", "", pem, "", "", None),
+            (
+                "tls/10.0.0.2:7447",
+                "",
+                "",
+                "",
+                "",
+                Some("CERULION_NETD_CONNECT has a quic/ or tls/ locator but no CERULION_NETD_TLS_ROOT_CA"),
+            ),
+        ] {
+            let _gn = EnvVarGuard::unset(NETWORK_ENV);
+            let _gc = EnvVarGuard::set(CONNECT_ENV, connect);
+            let _gl = EnvVarGuard::set(LISTEN_ENV, listen);
+            let _gr = EnvVarGuard::set(TLS_ROOT_CA_ENV, root_ca);
+            let _gt = EnvVarGuard::set(TLS_CERTIFICATE_ENV, cert);
+            let _gk = EnvVarGuard::set(TLS_PRIVATE_KEY_ENV, key);
+            let got = network_config_from_env();
+            let ok = match (want, &got) {
+                (None, Ok(Some(_))) => true,
+                (Some(needle), Err(err)) => err.contains(needle),
+                _ => false,
+            };
+            if !ok {
+                failures.push(format!(
+                    "connect {connect:?} listen {listen:?} root_ca {root_ca:?} cert {cert:?}: \
+                     want {want:?}, got {got:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
         // The kill switch wins over a setting that would be refused.
         {
             let _gn = EnvVarGuard::set(NETWORK_ENV, NETWORK_OFF);
             let _gl = EnvVarGuard::set(LISTEN_ENV, "udp/0.0.0.0:7684");
             assert!(matches!(network_config_from_env(), Ok(None)));
         }
+    }
+
+    /// The variable `cerulion_discovery::robot_state::config_dir` reads the
+    /// login home from.
+    const CONFIG_HOME_ENV: &str = "CERULION_HOME";
+
+    /// A login home holding a saved, expired login: enough for the
+    /// serving-login gate, which never refreshes it.
+    fn saved_login_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            r#"{"account_id":"saved-account","session_token":"expired-session","refresh_token":"expired-refresh","expires_at_ns":1,"logged_in_ever":true}"#,
+        )
+        .unwrap();
+        home
+    }
+
+    /// The daemon's start-up order, through the function it calls: a LISTEN
+    /// start with no prior login is refused for the login before any locator
+    /// is judged; with a saved login the same locator is refused naming its
+    /// variable; a CONNECT-only start needs no login and its locators are
+    /// still checked; the kill switch wins over the login gate. Every row is
+    /// checked before the test fails.
+    #[test]
+    fn network_config_from_env_refuses_the_login_first_then_each_locator() {
+        let _lock = crate::test_env::env_lock();
+        let saved = saved_login_home();
+        let never = tempfile::tempdir().unwrap();
+        let saved = saved.path().to_str().unwrap();
+        let never = never.path().to_str().unwrap();
+        let refusal = crate::serving_login::REFUSAL;
+        let _gn = EnvVarGuard::unset(NETWORK_ENV);
+        let _gr = EnvVarGuard::unset(TLS_ROOT_CA_ENV);
+        let _gt = EnvVarGuard::unset(TLS_CERTIFICATE_ENV);
+        let _gk = EnvVarGuard::unset(TLS_PRIVATE_KEY_ENV);
+        let mut failures = Vec::new();
+        // (login home, LISTEN, CONNECT, the refusal wanted or None to start)
+        for (home, listen, connect, want) in [
+            (never, "udp/0.0.0.0:7684", "", Some(refusal)),
+            (never, "quic/0.0.0.0:7447", "", Some(refusal)),
+            (never, "tcp/0.0.0.0:7447", "", Some(refusal)),
+            (
+                saved,
+                "udp/0.0.0.0:7684",
+                "",
+                Some("CERULION_NETD_LISTEN: locator 'udp/0.0.0.0:7684' is a datagram-only link"),
+            ),
+            (
+                saved,
+                "quic/0.0.0.0:7447",
+                "",
+                Some(
+                    "CERULION_NETD_LISTEN has a quic/ or tls/ locator but no \
+                     CERULION_NETD_TLS_CERTIFICATE",
+                ),
+            ),
+            (saved, "tcp/0.0.0.0:7447", "", None),
+            (
+                never,
+                "",
+                "udp/10.0.0.2:7684",
+                Some("CERULION_NETD_CONNECT: locator 'udp/10.0.0.2:7684' is a datagram-only link"),
+            ),
+            (
+                never,
+                "",
+                "quic/10.0.0.2:7447",
+                Some("CERULION_NETD_CONNECT has a quic/ or tls/ locator but no CERULION_NETD_TLS_ROOT_CA"),
+            ),
+            (
+                never,
+                "",
+                "tls/10.0.0.2:7447",
+                Some("CERULION_NETD_CONNECT has a quic/ or tls/ locator but no CERULION_NETD_TLS_ROOT_CA"),
+            ),
+            (never, "", "tcp/10.0.0.2:7447", None),
+        ] {
+            let _gh = EnvVarGuard::set(CONFIG_HOME_ENV, home);
+            let _gl = EnvVarGuard::set(LISTEN_ENV, listen);
+            let _gc = EnvVarGuard::set(CONNECT_ENV, connect);
+            let got = network_config_from_env();
+            let ok = match (want, &got) {
+                (None, Ok(Some(_))) => true,
+                (Some(needle), Err(err)) => err.contains(needle),
+                _ => false,
+            };
+            if !ok {
+                let login = if home == saved { "saved" } else { "none" };
+                failures.push(format!(
+                    "login {login} listen {listen:?} connect {connect:?}: want {want:?}, got {got:?}"
+                ));
+            }
+        }
+        // The kill switch wins over the login gate: a LOCAL-ONLY start with a
+        // LISTEN locator left set and no prior login serves nothing, so it is
+        // not refused.
+        {
+            let _gh = EnvVarGuard::set(CONFIG_HOME_ENV, never);
+            let _gn = EnvVarGuard::set(NETWORK_ENV, NETWORK_OFF);
+            let _gl = EnvVarGuard::set(LISTEN_ENV, "tcp/0.0.0.0:7447");
+            let _gc = EnvVarGuard::unset(CONNECT_ENV);
+            let got = network_config_from_env();
+            if !matches!(got, Ok(None)) {
+                failures.push(format!(
+                    "login none, {NETWORK_ENV}={NETWORK_OFF}, listen tcp/0.0.0.0:7447: want \
+                     Ok(None), got {got:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }
