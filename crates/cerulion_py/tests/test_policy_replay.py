@@ -189,18 +189,35 @@ def test_the_report_names_at_most_max_report_steps():
     assert [line.split(" (")[0].strip() for line in lines[1:]] == ["step 0", "step 1", "step 2"]
 
 
-def fresh_frame_log(count):
-    """A new observation record before each of ``count`` actions (all recorded as 1.0).
+class CountedRecord(cerulion.Record):
+    """An action record that appends its sequence to ``reads`` on every read
+    of ``sequence``; ``assert_replay_matches`` reads it to write a report line."""
+
+    def __init__(self, raw, reads):
+        super().__init__(raw)
+        self.reads = reads
+
+    @property
+    def sequence(self):
+        self.reads.append(super().sequence)
+        return super().sequence
+
+
+def fresh_frame_log(count, reads):
+    """A new observation record before each of ``count`` actions, every action
+    recorded as 1.0 in a ``CountedRecord`` that adds to ``reads``.
 
     A generator, so a record is alive only while something still refers to it."""
     for i in range(count):
         yield "/o", synthetic_record(i, [float(i)])
-        yield "/act", synthetic_record(i, [1.0])
+        yield "/act", CountedRecord(synthetic_record(i, [1.0]).raw, reads)
 
 
 class FrameWatch:
-    """A policy wrapper that counts, before each call, the observation records
-    of earlier steps that are still alive."""
+    """Wraps a policy (the instance) and the decoder (``decode``). Before each
+    policy call it counts the objects of earlier steps that are still alive:
+    the ``Step``, its observation and action records, and the arrays the
+    policy and the decoder returned for it."""
 
     def __init__(self, policy):
         self.policy = policy
@@ -210,11 +227,18 @@ class FrameWatch:
     def __call__(self, step):
         gc.collect()
         self.alive.append(sum(ref() is not None for ref in self.earlier))
-        self.earlier.append(weakref.ref(step.observation["/o"]))
-        return self.policy(step)
+        self.earlier += [weakref.ref(step), weakref.ref(step.observation["/o"]), weakref.ref(step.action)]
+        replayed = self.policy(step)
+        self.earlier.append(weakref.ref(replayed))
+        return replayed
+
+    def decode(self, record):
+        recorded = decode(record)
+        self.earlier.append(weakref.ref(recorded))
+        return recorded
 
 
-def test_a_failing_replay_counts_every_mismatch_and_keeps_no_earlier_frames():
+def test_a_failing_replay_counts_every_mismatch_and_keeps_no_earlier_step():
     # Steps cycle through the three kinds of mismatch against a recorded
     # float32 [1.0]: shape (2,), dtype float64, value 2.0.
     kinds = [np.float32([1.0, 1.0]), np.float64([1.0]), np.float32([2.0])]
@@ -228,17 +252,22 @@ def test_a_failing_replay_counts_every_mismatch_and_keeps_no_earlier_frames():
         ]
     )
     for _ in range(2):
-        watch = FrameWatch(lambda step: kinds[step.index % 3])
+        reads = []
+        watch = FrameWatch(lambda step: kinds[step.index % 3].copy())
         with pytest.raises(AssertionError) as failure:
-            assert_replay_matches(RecordedSteps(fresh_frame_log(9), "/o", "/act"), watch, decode, max_report=4)
+            assert_replay_matches(
+                RecordedSteps(fresh_frame_log(9, reads), "/o", "/act"), watch, watch.decode, max_report=4
+            )
         assert str(failure.value) == expected
         assert watch.alive == [0] * 9
+        assert reads == [0, 1, 2, 3]
 
 
 def test_exactly_max_report_mismatches_are_all_named():
+    reads = []
     watch = FrameWatch(lambda step: np.float32([2.0 if step.index in (1, 2, 4) else 1.0]))
     with pytest.raises(AssertionError) as failure:
-        assert_replay_matches(RecordedSteps(fresh_frame_log(5), "/o", "/act"), watch, decode, max_report=3)
+        assert_replay_matches(RecordedSteps(fresh_frame_log(5, reads), "/o", "/act"), watch, watch.decode, max_report=3)
     assert str(failure.value) == "\n".join(
         [
             "3 of 5 replayed actions differ from the recording (byte-exact):",
@@ -248,21 +277,28 @@ def test_exactly_max_report_mismatches_are_all_named():
         ]
     )
     assert watch.alive == [0] * 5
+    assert reads == [1, 2, 4]
 
 
-def test_a_passing_replay_keeps_no_earlier_frames():
+def test_a_passing_replay_keeps_no_earlier_step():
+    reads = []
     watch = FrameWatch(lambda step: np.float32([1.0]))
-    result = assert_replay_matches(RecordedSteps(fresh_frame_log(5), "/o", "/act"), watch, decode, max_report=3)
+    result = assert_replay_matches(
+        RecordedSteps(fresh_frame_log(5, reads), "/o", "/act"), watch, watch.decode, max_report=3
+    )
     assert result == ReplayResult(steps=5, skipped=0, max_abs_error=0.0)
     assert watch.alive == [0] * 5
+    assert reads == []
 
 
 def test_max_report_zero_counts_the_mismatches_and_names_no_step():
+    reads = []
     watch = FrameWatch(lambda step: np.float32([2.0]))
     with pytest.raises(AssertionError) as failure:
-        assert_replay_matches(RecordedSteps(fresh_frame_log(4), "/o", "/act"), watch, decode, max_report=0)
+        assert_replay_matches(RecordedSteps(fresh_frame_log(4, reads), "/o", "/act"), watch, watch.decode, max_report=0)
     assert str(failure.value) == "4 of 4 replayed actions differ from the recording (byte-exact):"
     assert watch.alive == [0] * 4
+    assert reads == []
 
 
 def test_a_negative_max_report_is_refused_before_the_replay():
@@ -270,6 +306,15 @@ def test_a_negative_max_report_is_refused_before_the_replay():
     with pytest.raises(ValueError, match=r"^max_report=-1 is negative$"):
         assert_replay_matches(steps(), calls.append, decode, max_report=-1)
     assert calls == []
+
+
+@pytest.mark.parametrize("max_report", [2.5, float("nan"), None])
+def test_a_max_report_that_is_not_an_integer_is_refused_before_the_replay(max_report):
+    calls = []
+    with pytest.raises(TypeError, match="cannot be interpreted as an integer"):
+        assert_replay_matches(steps(), calls.append, decode, max_report=max_report)
+    assert calls == []
+    assert assert_replay_matches(steps(), summed, decode, max_report=np.int64(1)).steps == 2
 
 
 def load_template():

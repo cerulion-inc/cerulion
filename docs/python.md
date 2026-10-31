@@ -443,19 +443,19 @@ newer observation with that action, and the replayed action can then differ
 from the recorded one (for a policy that keeps state, so can the steps after
 it). Action records logged before every observation topic has a record are
 counted in `skipped`, not replayed. `assert_replay_matches(steps, policy,
-recorded_action, atol=0.0, rtol=0.0)` calls `policy(step)` on every step in
-order and compares the result with `recorded_action(step.action)`. With both
-tolerances zero the arrays must match in dtype, shape and bytes. Otherwise
-each element must equal the recorded one or satisfy `abs(replayed - recorded)
-<= atol + rtol * abs(recorded)`; under a tolerance, a NaN in either array is a
-mismatch and an infinity matches only an equal infinity. A failure counts
-every mismatching step and names the first `max_report` (default 5) by index,
-sequence and timestamp; the check keeps only those report lines, not the
-steps, so a long failing replay does not hold its earlier camera frames. A
-policy that keeps state between calls (an action chunk queue, temporal
-ensembling) reproduces the recording only from the same starting state: start
-the recorder before the policy acts, reset the policy once, and replay every
-step in order.
+recorded_action, atol=0.0, rtol=0.0, max_report=5)` calls `policy(step)` on
+every step in order and compares the result with
+`recorded_action(step.action)`. With both tolerances zero the arrays must
+match in dtype, shape and bytes. Otherwise each element must equal the
+recorded one or satisfy `abs(replayed - recorded) <= atol + rtol *
+abs(recorded)`; under a tolerance, a NaN in either array is a mismatch and an
+infinity matches only an equal infinity. A failure counts every mismatching
+step and names the first `max_report` by index, sequence and timestamp; the
+check keeps only those report lines, not the steps, so a long failing replay
+does not hold its earlier camera frames. A policy that keeps state between
+calls (an action chunk queue, temporal ensembling) reproduces the recording
+only from the same starting state: start the recorder before the policy acts,
+reset the policy once, and replay every step in order.
 
 ```python-source
 from policy_replay import assert_replay_matches, recorded_steps

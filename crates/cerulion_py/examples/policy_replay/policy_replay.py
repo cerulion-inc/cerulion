@@ -17,6 +17,7 @@ Copy this file next to your tests; it needs only ``cerulion`` and NumPy.
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -155,10 +156,13 @@ def assert_replay_matches(
     steps (index, sequence, timestamp, and the shape, dtype or largest error)
     and the mismatch count,
     or when fewer than ``min_steps`` steps were replayed. The check stores
-    only the report line of each named step and counts the rest, so it holds
-    no earlier ``Step`` (or its records) while a later step runs. A negative
-    ``max_report`` raises ``ValueError`` before any step runs.
+    only the report line of each named step and counts the rest: while a step
+    runs it holds nothing from an earlier step (the ``Step``, its records, or
+    the arrays ``policy`` and ``recorded_action`` returned for it). A
+    ``max_report`` that is not an integer raises ``TypeError``, and a negative
+    one ``ValueError``, before any step runs.
     """
+    max_report = operator.index(max_report)
     if max_report < 0:
         raise ValueError(f"max_report={max_report} is negative")
     exact = atol == 0.0 and rtol == 0.0
@@ -167,10 +171,12 @@ def assert_replay_matches(
     count = 0
     worst = 0.0
     for step in steps:
-        replayed = np.asarray(policy(step))
-        recorded = np.asarray(recorded_action(step.action))
+        # The arrays go straight to the comparison: the loop keeps no
+        # reference to them once it returns.
+        why, error = _difference(
+            np.asarray(policy(step)), np.asarray(recorded_action(step.action)), exact, atol, rtol
+        )
         count += 1
-        why, error = _difference(replayed, recorded, exact, atol, rtol)
         worst = max(worst, error)
         if why is None:
             continue
