@@ -46,6 +46,15 @@ report that `ros2` is not on `PATH`. macOS packages carry neither the rmw
 nor the hook because ROS 2 Jazzy has no macOS binaries and the hook
 interposes glibc's allocator.
 
+The package carries the Jazzy rmw only. The rmw library records the distro it
+was built for and refuses a different `ROS_DISTRO`, so a ROS 2 Lyrical host
+uses the separate `cerulion-rmw-lyrical-<version>-<target>.tar.gz`
+release asset, built inside the `ros:lyrical` image
+(`tools/scripts/build_rmw.sh lyrical`) for x86_64 and arm64. It holds
+`librmw_cerulion.so`, `libcerulion_heaphook.so` and the license files; unpack it
+and set `CERULION_LIB_DIR` to the unpacked directory, and `cerulion ros2 run`
+and `cerulion ros2 launch` load that library instead of the one in `/usr/bin`. The Lyrical library is built and tested in CI but has not been run on a robot, and unlike the Debian package it is not installed in a clean container before release.
+
 ## License files
 
 Every release archive and the Debian package built from it carry four license
