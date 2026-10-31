@@ -818,7 +818,7 @@ fn print_read_window(bag: &Path, label: &str, seq: u64) {
         if m.topic != cerulion_bag::SCHEDULER_TRACE_TOPIC {
             continue;
         }
-        for r in m.data.chunks_exact(40) {
+        for r in m.data.as_chunks::<40>().0 {
             let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().expect("8 bytes"));
             let u32_at = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().expect("4 bytes"));
             // (rank, step, type, node_idx, level/meta, slot1, slot2)
@@ -947,7 +947,7 @@ fn first_fires(bag: &Path) -> Vec<FirstFire> {
         if m.topic != cerulion_bag::SCHEDULER_TRACE_TOPIC {
             continue;
         }
-        for r in m.data.chunks_exact(40) {
+        for r in m.data.as_chunks::<40>().0 {
             let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().expect("8 bytes"));
             let u32_at = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().expect("4 bytes"));
             if u32_at(32) == 1 {
