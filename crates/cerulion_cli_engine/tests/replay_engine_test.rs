@@ -40307,6 +40307,88 @@ fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
     );
 }
 
+/// Two fed replays of graphs with identical node names run at the same time on
+/// ONE shared iceoryx2 config. Each private feed service carries
+/// its replay's identifier, so neither replay attaches to the other's feeds and
+/// both are fed and pass.
+#[test]
+#[serial]
+fn two_concurrent_fed_replays_sharing_an_iceoryx2_config_do_not_cross_feeds() {
+    // Two graphs with the same node ids (src, slow, fast) under different
+    // prefixes: their own topics differ, so the only names the two replays could
+    // share are the private feed services, which carry the node id.
+    let dir = tempfile::tempdir().unwrap();
+    let mut bags = Vec::new();
+    for prefix in ["riev", "rievb"] {
+        let yaml = ri_evict_yaml().replacen("prefix: riev", &format!("prefix: {prefix}"), 1);
+        let live = ri_record(&yaml, ri_evict_factories);
+        ri_assert_evict_premise(&live);
+        let bag = dir.path().join(format!("ri_concurrent_{prefix}.mcap"));
+        ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+        bags.push(bag);
+    }
+    let shared = cerulion_core::testing::iceoryx_test_config();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let run = |name: &'static str, bag: &std::path::Path| {
+        let bag = bag.to_path_buf();
+        let shared = shared.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let (config, trace, node_ids, recorded_messages, env_json, recorder) =
+                load_inputs(&bag);
+            let clock = Arc::new(VirtualClock::new());
+            let transport = cerulion_core::transport::TransportManager::init_for_test(
+                cerulion_core::transport::TransportConfig {
+                    node_name: name.into(),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                shared,
+            )
+            .expect("replay transport on the shared config");
+            barrier.wait();
+            replay_engine::run_engine(
+                ReplayInputs {
+                    ros2_entries_skipped: Vec::new(),
+                    config,
+                    trace,
+                    node_ids,
+                    recorded_messages,
+                    env_json,
+                    recorder,
+                    record_health: RecordHealthReport::Absent,
+                    duration_bound_ns: None,
+                    report_path: None,
+                    fire_tap: None,
+                    tolerance: None,
+                    strict_state: false,
+                    allow_param_change: false,
+                    record_out: None,
+                    purpose: replay_engine::ReplayPurpose::Verify,
+                },
+                ReplayNodes::Injected {
+                    transport,
+                    clock,
+                    factories: ri_evict_factories(),
+                },
+            )
+        })
+    };
+    let a = run("cerulion_ri_concurrent_a", &bags[0]);
+    let b = run("cerulion_ri_concurrent_b", &bags[1]);
+    for outcome in [a.join().unwrap(), b.join().unwrap()] {
+        let outcome = outcome.expect("each concurrent fed replay runs");
+        ri_assert_fed(&outcome);
+        assert!(
+            outcome.passed,
+            "a concurrent fed replay is fed only its own frames: {:?}",
+            outcome.violations
+        );
+    }
+    ri_take();
+}
+
 /// Two ranks, the consumers' rank built FIRST: its fed inputs read a topic only
 /// the second rank produces, so no port of the first pass created that topic's
 /// service. The fed build opens no real subscriber on it and still stands up its
