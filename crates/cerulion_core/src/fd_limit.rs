@@ -599,17 +599,16 @@ pub enum PresizeOutcome {
 /// cover it, and never replaces a descriptor that is open), and closes both.
 /// Lowering the soft limit later does not shrink the table. Call it after
 /// [`raise_open_file_limit`] so the target uses the raised limit. The target
-/// is also kept below `getdtablesize()`, above which `fcntl` refuses the
-/// duplicate with `EINVAL` (macOS caps it at `kern.maxfilesperproc`).
+/// is also kept below the highest target `fcntl` accepts, above which it
+/// refuses the duplicate with `EINVAL`: the soft limit on Linux and Android,
+/// `getdtablesize()` elsewhere (macOS caps it at `kern.maxfilesperproc`).
 #[cfg(unix)]
 pub fn presize_descriptor_table() -> PresizeOutcome {
     let soft = match current_open_file_limit() {
         Ok(limit) => limit.soft,
         Err(errno) => return PresizeOutcome::Failed { errno },
     };
-    // SAFETY: `getdtablesize` reads a process limit and touches no memory.
-    let table_max = u64::try_from(unsafe { libc::getdtablesize() }).unwrap_or(0);
-    let Some(target) = presize_target(soft.min(table_max)) else {
+    let Some(target) = presize_target(descriptor_dup_ceiling(soft)) else {
         return PresizeOutcome::NoRoom;
     };
     let Ok(target_fd) = libc::c_int::try_from(target) else {
@@ -659,6 +658,27 @@ pub fn presize_descriptor_table() -> PresizeOutcome {
         ),
     }
     outcome
+}
+
+/// The descriptor count `fcntl(F_DUPFD)` takes a target below in this
+/// process, given its soft `RLIMIT_NOFILE`. The Linux kernel, which Android
+/// runs on, refuses a target at or above the soft limit, so on Linux and
+/// Android this is `soft` (the value glibc's and musl's `getdtablesize`
+/// return; Android's libc has no `getdtablesize`). On the other unix targets
+/// it is `getdtablesize()` lowered to `soft`; macOS caps `getdtablesize()`
+/// at `kern.maxfilesperproc`. A `getdtablesize()` below zero reads as 0.
+#[cfg(unix)]
+fn descriptor_dup_ceiling(soft: u64) -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        soft
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: `getdtablesize` reads a process limit and touches no memory.
+        let table = unsafe { libc::getdtablesize() };
+        u64::try_from(table).map_or(0, |table| table.min(soft))
+    }
 }
 
 #[cfg(test)]
@@ -960,6 +980,36 @@ mod tests {
         );
     }
 
+    /// The duplicate ceiling is the soft limit itself where the kernel is
+    /// Linux, and `getdtablesize()` lowered to the soft limit elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn the_dup_ceiling_is_the_soft_limit_on_linux_and_the_table_size_elsewhere() {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(descriptor_dup_ceiling(0), 0);
+            assert_eq!(descriptor_dup_ceiling(1024), 1024);
+            assert_eq!(descriptor_dup_ceiling(LINUX_RAISE_CAP), LINUX_RAISE_CAP);
+            assert_eq!(descriptor_dup_ceiling(u64::MAX), u64::MAX);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // SAFETY: `getdtablesize` reads a process limit and touches no memory.
+            let table = u64::try_from(unsafe { libc::getdtablesize() }).expect("a table size");
+            assert!(table >= 3, "getdtablesize() {table}");
+            assert_eq!(descriptor_dup_ceiling(0), 0);
+            assert_eq!(descriptor_dup_ceiling(3), 3);
+            assert_eq!(descriptor_dup_ceiling(u64::MAX), table);
+            #[cfg(target_os = "macos")]
+            if let Some(per_proc) = max_files_per_proc() {
+                assert!(
+                    descriptor_dup_ceiling(u64::MAX) <= per_proc,
+                    "ceiling above kern.maxfilesperproc {per_proc}"
+                );
+            }
+        }
+    }
+
     /// The pre-size leaves the table reaching its target and closes the
     /// duplicate it made. On Linux the table size is read back from `FDSize`
     /// in `/proc/self/status`.
@@ -967,10 +1017,8 @@ mod tests {
     #[test]
     fn the_presize_grows_the_table_and_closes_its_duplicate() {
         let soft = current_open_file_limit().expect("RLIMIT_NOFILE").soft;
-        // SAFETY: `getdtablesize` reads a process limit and touches no memory.
-        let table_max = u64::try_from(unsafe { libc::getdtablesize() }).unwrap_or(0);
-        let target =
-            presize_target(soft.min(table_max)).expect("the test process has room above fd 0");
+        let target = presize_target(descriptor_dup_ceiling(soft))
+            .expect("the test process has room above fd 0");
         let outcome = presize_descriptor_table();
         let highest = match outcome {
             PresizeOutcome::Presized { highest } => highest,
