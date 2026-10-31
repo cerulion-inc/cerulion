@@ -31,7 +31,10 @@
 //! tries to connect; on a not-running socket it spawns `cerulion-netd` detached
 //! (into its OWN session via `setsid`, so a `Ctrl-C` on `topic echo` never kills
 //! the shared daemon — the connection close releases the demand instead) and
-//! retries the connect under a bounded budget. The daemon's `flock` singleton
+//! retries the connect under a bounded budget. The daemon inherits none of the
+//! consumer's stdio: stdin is `/dev/null`, and stdout and stderr are appended to
+//! [`spawn_log_for`] beside the socket, which a failed readiness wait names and
+//! quotes. The daemon's `flock` singleton
 //! ([`crate::hygiene`]) makes concurrent spawns safe: N racing consumers all spawn,
 //! exactly one wins the lock and the rest exit `AddrInUse`, and every consumer's
 //! retry-connect finds the winner. A spawn/connect that still fails after the
@@ -40,6 +43,7 @@
 //! network-crossing the shared daemon dissolves).
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -687,7 +691,7 @@ impl NetdClient {
         // Not running: spawn netd detached (best-effort; the flock singleton elects
         // ONE winner among racing consumers — the rest exit AddrInUse and our
         // retry-connect finds the winner).
-        let mut child = spawn_netd_detached(socket)?;
+        let (mut child, spawn_log) = spawn_netd_detached(socket)?;
 
         // TWO notices, each at the level its case earns: this first-use line at
         // `info!`, and ONE stall `warn!` inside the wait loop below. `topic echo` /
@@ -823,9 +827,9 @@ impl NetdClient {
         let liveness = match child_state {
             ChildLiveness::Exited(status, _) => format!(
                 "the spawned daemon EXITED ({status}) before the socket appeared, so the wait was \
-                 cut to the {}ms post-exit grace rather than the full ceiling — check its stderr \
-                 for the startup error (a daemon that merely lost the singleton flock race exits \
-                 harmlessly, but then the winner should have bound this socket)",
+                 cut to the {}ms post-exit grace rather than the full ceiling; see the note on \
+                 its startup output below (a daemon that merely lost the singleton flock race \
+                 exits harmlessly, but then the winner should have bound this socket)",
                 SPAWN_POST_EXIT_GRACE.as_millis()
             ),
             ChildLiveness::Running => format!(
@@ -836,7 +840,7 @@ impl NetdClient {
             ChildLiveness::Unknown => format!(
                 "the spawned daemon's liveness is UNKNOWN — we could not observe it (try_wait \
                  failed: {}), so the full {}s ceiling was used. Check whether a cerulion-netd \
-                 process is running and inspect its stderr",
+                 process is running, and see the note on its startup output below",
                 unknown_cause.as_deref().unwrap_or("cause unrecorded"),
                 SPAWN_READY_TIMEOUT.as_secs()
             ),
@@ -848,10 +852,11 @@ impl NetdClient {
                 io::ErrorKind::TimedOut,
                 format!(
                     "waited {:.1}s for the control socket after spawning cerulion-netd (polled \
-                     every {}ms, ceiling {}s) — {liveness}; last connect error: {last_err}",
+                     every {}ms, ceiling {}s): {liveness}; last connect error: {last_err}. {}",
                     waited.as_secs_f64(),
                     SPAWN_POLL_INTERVAL.as_millis(),
                     SPAWN_READY_TIMEOUT.as_secs(),
+                    spawn_log.describe(),
                 ),
             ),
         })
@@ -2200,18 +2205,346 @@ fn describe_no_netd_binary(current_exe: &Path, tried: &[PathBuf]) -> String {
     msg
 }
 
-/// Spawn `cerulion-netd` DETACHED (its own session via `setsid`), pointed at
-/// `socket`. Best-effort against the singleton race: if another consumer already
-/// won the `flock`, this child exits `AddrInUse` immediately (harmless — the
-/// caller's retry-connect finds the winner). Only a failure to LAUNCH the process
-/// (binary not found) is surfaced.
+/// Where an auto-started `cerulion-netd` writes its stdout and stderr: beside
+/// its control socket, `<name>.sock` → `<name>.log` (the pidfile's sibling). A
+/// socket path that already ends in `.log` gets `.log` appended, so the two
+/// never share a path.
+pub fn spawn_log_for(socket: &Path) -> PathBuf {
+    let log = socket.with_extension("log");
+    if log == socket {
+        let mut name = socket.as_os_str().to_owned();
+        name.push(".log");
+        return PathBuf::from(name);
+    }
+    log
+}
+
+/// The previous generation of [`spawn_log_for`], kept by the one-step rotation
+/// in [`open_spawn_log`]: `<name>.log` → `<name>.log.1`.
+fn previous_spawn_log(log: &Path) -> PathBuf {
+    let mut name = log.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// The size at which a spawn rotates the startup log to its `.1` generation
+/// before appending. It bounds the log across restarts: a cold boot writes a few
+/// KiB at netd's default level, so this keeps hundreds of boots, and with the one
+/// kept generation the pair stays under twice this plus the running daemon's own
+/// output. A daemon that never exits (a standing gateway) is not rotated while it
+/// runs.
+const SPAWN_LOG_ROTATE_AT: u64 = 1024 * 1024;
+
+/// How many trailing lines of the startup log a readiness-wait failure quotes:
+/// a refusal with its cause chain, or a panic message without a backtrace (with
+/// `RUST_BACKTRACE` set, the quoted lines are the backtrace's last frames).
+const SPAWN_LOG_TAIL_LINES: usize = 20;
+
+/// The byte window those lines are taken from, so a daemon that wrote one huge
+/// line cannot turn the error into a dump.
+const SPAWN_LOG_TAIL_BYTES: u64 = 8 * 1024;
+
+/// The startup log one spawn wrote to: its path, a read handle on the file the
+/// daemon was given (so a later rotation by a racing spawn does not change what
+/// is read back), the offset this spawn's output starts at, and the open
+/// failure when the daemon was started with its output discarded instead.
+struct SpawnLog {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    start: u64,
+    open_error: Option<String>,
+}
+
+impl SpawnLog {
+    /// The sentence a readiness-wait failure appends: the log's path and the
+    /// last lines this spawn wrote there, or why there is no log.
+    fn describe(&self) -> String {
+        let file = match (&self.file, &self.open_error) {
+            (Some(file), _) => file,
+            (None, e) => {
+                return format!(
+                    "cerulion-netd's startup output was discarded: its log {} could not be \
+                     opened ({})",
+                    self.path.display(),
+                    e.as_deref().unwrap_or("cause unrecorded")
+                );
+            }
+        };
+        let tail = read_log_tail(file, self.start)
+            .unwrap_or_else(|e| vec![format!("(the log could not be read back: {e})")]);
+        if tail.is_empty() {
+            return format!(
+                "cerulion-netd's startup output goes to {} (it wrote nothing there during \
+                 this start)",
+                self.path.display()
+            );
+        }
+        let mut msg = format!(
+            "cerulion-netd's startup output is in {}; its last lines:",
+            self.path.display()
+        );
+        for line in tail {
+            msg.push_str("\n  | ");
+            msg.push_str(&line);
+        }
+        msg
+    }
+}
+
+/// The last `max` lines of `text`, oldest first, with trailing whitespace
+/// dropped.
+fn tail_lines(text: &str, max: usize) -> Vec<String> {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let skip = lines.len().saturating_sub(max);
+    lines[skip..].iter().map(|l| (*l).to_string()).collect()
+}
+
+/// Read back what was written to `file` from offset `start`: at most the last
+/// [`SPAWN_LOG_TAIL_BYTES`] of it, cut to whole lines. A file shorter than
+/// `start` is read from its beginning.
+fn read_log_tail(file: &std::fs::File, start: u64) -> io::Result<Vec<String>> {
+    use std::os::unix::fs::FileExt as _;
+    let len = file.metadata()?.len();
+    let from = if len < start { 0 } else { start };
+    let window_start = from.max(len.saturating_sub(SPAWN_LOG_TAIL_BYTES));
+    // A window cut inside this spawn's output is read from one byte earlier and
+    // everything up to the first newline is dropped: a partial first line, or
+    // nothing but that newline when the cut fell on a line boundary. A window
+    // with no newline before its last byte holds part of one line longer than
+    // the window, quoted as its truncated tail.
+    let cut = window_start > from;
+    let read_from = if cut { window_start - 1 } else { window_start };
+    let mut bytes = vec![0u8; usize::try_from(len - read_from).unwrap_or(0)];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read_at(&mut bytes[filled..], read_from + filled as u64)? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    bytes.truncate(filled);
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if cut {
+        match text.split_once('\n') {
+            Some((_, rest)) if !rest.trim_end().is_empty() => rest.to_string(),
+            // No newline before the window's end: the window holds part of one
+            // line, quoted as its truncated tail.
+            _ => format!(
+                "(truncated) {}",
+                text.trim_end().chars().skip(1).collect::<String>()
+            ),
+        }
+    } else {
+        text.into_owned()
+    };
+    Ok(tail_lines(&text, SPAWN_LOG_TAIL_LINES))
+}
+
+/// Open `path` read + append, mode `0600` when created, and accept it only as a
+/// regular file owned by this user with exactly one link. `O_NOFOLLOW` refuses a
+/// symlink, and a FIFO at the path opens at once and is then refused as not a
+/// regular file. A read + write open of a FIFO returns at once on Linux and
+/// macOS; `O_NONBLOCK` makes that so where POSIX leaves it undefined, and is
+/// cleared again on the file kept. The mode is set through the open descriptor.
+fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::io::AsRawFd as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !meta.is_file() || meta.uid() != me || meta.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "it is not a regular, singly linked file owned by this user (uid {me}; owner \
+                 uid {}, {} links)",
+                meta.uid(),
+                meta.nlink()
+            ),
+        ));
+    }
+    // SAFETY: F_GETFL/F_SETFL on a descriptor this function owns.
+    unsafe {
+        let fd = file.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags != -1 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Whether `file` is still the file at `path` (same device and inode).
+fn is_still_at(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Rename the full log at `path` (open as `file`) to its `.1` generation. Runs
+/// under an exclusive non-blocking `flock` on the open file, and only while that
+/// file is still the one at `path`, so of several spawns that see the same full
+/// log exactly one renames it. A `.1` that is not a regular file owned by this
+/// user is left alone. Returns whether the rename happened.
+fn rotate_full_log(file: &std::fs::File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: flock on a descriptor the caller owns; released by the LOCK_UN below.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(false);
+    }
+    // The lock is released on every return: the daemon's stdout and stderr share
+    // this open file description, so a lock left held would last its whole life.
+    let result = rotate_locked(file, path);
+    // SAFETY: flock on a descriptor the caller owns.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+    result
+}
+
+/// The body of [`rotate_full_log`], run while its lock is held.
+fn rotate_locked(file: &std::fs::File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !is_still_at(file, path) {
+        return Ok(false);
+    }
+    let previous = previous_spawn_log(path);
+    if let Ok(meta) = std::fs::symlink_metadata(&previous) {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if !meta.is_file() || meta.uid() != me {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not a regular file owned by this user",
+                    previous.display()
+                ),
+            ));
+        }
+    }
+    std::fs::rename(path, &previous)?;
+    Ok(true)
+}
+
+/// Open the startup log at `path` for appending and return it with its length
+/// (the offset this spawn's output starts at).
 ///
-/// Returns the [`Child`] handle so the caller's readiness wait can `try_wait`
-/// it — turning "the daemon I just spawned died" into a fast, ATTRIBUTED failure
-/// instead of a silent wait to the ceiling. The daemon is still detached and NOT
-/// reaped on the healthy path (it outlives this consumer and self-exits on idle); the
-/// handle is dropped when the wait ends.
-fn spawn_netd_detached(socket: &Path) -> Result<Child, ClientError> {
+/// The parent directory goes through the same rule the daemon applies before
+/// it binds its socket there ([`cerulion_hygiene::vet_socket_dir`]): created
+/// `0700` when missing, refused when it is a symlink, a file or another user's,
+/// and stripped of group and other write bits when it is ours. A log at or over
+/// [`SPAWN_LOG_ROTATE_AT`] is renamed to its `.1` generation (see
+/// [`rotate_full_log`]) and a fresh one opened; a rotation that fails is
+/// logged and the full log appended to instead. A file opened while a racing
+/// spawn renamed it is re-opened at the path.
+fn open_spawn_log(path: &Path) -> io::Result<(std::fs::File, u64)> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // One rule, one descriptor: created 0700 when missing, refused when it
+        // is a symlink, a file or another user's, and TIGHTENED when it is ours
+        // but group or others could write into it, all before the log is opened.
+        cerulion_hygiene::vet_socket_dir(parent, cerulion_hygiene::NETD.socket_env())?;
+    }
+    let mut file = open_log_file(path)?;
+    // Two passes: a full log is rotated once, and a file renamed underneath this
+    // open by a racing spawn is swapped for the one now at the path.
+    for _ in 0..2 {
+        let len = file.metadata()?.len();
+        if len >= SPAWN_LOG_ROTATE_AT {
+            match rotate_full_log(&file, path) {
+                Ok(true) => {
+                    file = open_log_file(path)?;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        log = %path.display(),
+                        error = %e,
+                        "cerulion-netd: cannot rotate the startup log; appending to it"
+                    );
+                    break;
+                }
+            }
+        }
+        if is_still_at(&file, path) {
+            break;
+        }
+        file = open_log_file(path)?;
+    }
+    let start = file.metadata()?.len();
+    Ok((file, start))
+}
+
+/// The three stdio streams for a detached daemon: stdin from `/dev/null`, and
+/// stdout and stderr both appended to the startup log, or both to `/dev/null`
+/// when the log cannot be opened. No stream is inherited, so a caller reading
+/// this process's stdout or stderr sees end-of-file when this process exits,
+/// however long the daemon lives.
+fn detached_stdio(log: &Path) -> (Stdio, Stdio, Stdio, SpawnLog) {
+    let opened = open_spawn_log(log).and_then(|(file, start)| {
+        let out = file.try_clone()?;
+        let err = file.try_clone()?;
+        Ok((file, out, err, start))
+    });
+    match opened {
+        Ok((file, out, err, start)) => (
+            Stdio::null(),
+            Stdio::from(out),
+            Stdio::from(err),
+            SpawnLog {
+                path: log.to_path_buf(),
+                file: Some(file),
+                start,
+                open_error: None,
+            },
+        ),
+        Err(e) => {
+            tracing::warn!(
+                log = %log.display(),
+                error = %e,
+                "cerulion-netd: cannot open the startup log; starting the daemon with its \
+                 output discarded"
+            );
+            (
+                Stdio::null(),
+                Stdio::null(),
+                Stdio::null(),
+                SpawnLog {
+                    path: log.to_path_buf(),
+                    file: None,
+                    start: 0,
+                    open_error: Some(e.to_string()),
+                },
+            )
+        }
+    }
+}
+
+/// Spawn `cerulion-netd` DETACHED (its own session via `setsid`, every stdio
+/// stream detached from this process), pointed at `socket`. Best-effort against
+/// the singleton race: if another consumer already won the `flock`, this child
+/// exits `AddrInUse` immediately (harmless: the caller's retry-connect finds the
+/// winner). Only a failure to LAUNCH the process (binary not found) is surfaced.
+///
+/// Returns the [`Child`] handle, which the caller's readiness wait polls with
+/// `try_wait` to report a daemon that died as a fast, ATTRIBUTED failure instead
+/// of a silent wait to the ceiling, and the [`SpawnLog`] that wait's failure
+/// quotes. The daemon is still detached and NOT reaped on the healthy
+/// path (it outlives this consumer and self-exits on idle); the handle is dropped
+/// when the wait ends.
+fn spawn_netd_detached(socket: &Path) -> Result<(Child, SpawnLog), ClientError> {
     let bin = resolve_netd_bin().map_err(|source| ClientError::Spawn {
         bin: PathBuf::from(NETD_BIN_NAME),
         source,
@@ -2220,11 +2553,12 @@ fn spawn_netd_detached(socket: &Path) -> Result<Child, ClientError> {
     // Point the child at the SAME socket the client connects to (belt-and-suspenders
     // for the explicit-socket entry; on the default path both resolve identically).
     cmd.env(SOCKET_ENV, socket);
-    // Detach: no stdin/stdout (a daemon), stderr INHERITED so its startup logs are
-    // visible to a debugging user (a broken pipe on stderr is non-fatal for
-    // tracing). `setsid` puts it in its OWN session so a Ctrl-C on the consumer's
-    // process group never kills the shared daemon.
-    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    // stdin from /dev/null; stdout and stderr appended to the startup log beside
+    // the socket. An inherited stream would keep this process's pipe open for the
+    // daemon's whole life. `setsid` puts it in its OWN session so a Ctrl-C on the
+    // consumer's process group never kills the shared daemon.
+    let (stdin, stdout, stderr, spawn_log) = detached_stdio(&spawn_log_for(socket));
+    cmd.stdin(stdin).stdout(stdout).stderr(stderr);
     // SAFETY: `pre_exec` runs in the forked child before exec; `setsid()` is
     // async-signal-safe and touches only the child's own session.
     unsafe {
@@ -2244,9 +2578,10 @@ fn spawn_netd_detached(socket: &Path) -> Result<Child, ClientError> {
             tracing::debug!(
                 bin = %bin.display(),
                 socket = %socket.display(),
+                log = %spawn_log.path.display(),
                 "cerulion-netd: spawned the shared daemon detached (first-consumer-spawns)"
             );
-            Ok(child)
+            Ok((child, spawn_log))
         }
         Err(source) => Err(ClientError::Spawn { bin, source }),
     }
@@ -3759,6 +4094,393 @@ mod tests {
         assert!(
             e.to_string().contains(NETD_BIN_ENV),
             "names the override env: {e}"
+        );
+    }
+
+    // ---- the startup log (spawn_log_for / open_spawn_log / read_log_tail) ----
+
+    /// Read back from offset `start` through a fresh handle on `path`.
+    fn tail_of(path: &Path, start: u64) -> Vec<String> {
+        read_log_tail(&std::fs::File::open(path).unwrap(), start).unwrap()
+    }
+
+    #[test]
+    fn the_startup_log_sits_beside_the_socket() {
+        assert_eq!(
+            spawn_log_for(Path::new("/run/user/7/cerulion/netd.sock")),
+            PathBuf::from("/run/user/7/cerulion/netd.log")
+        );
+        assert_eq!(
+            spawn_log_for(Path::new("/run/user/7/x.log")),
+            PathBuf::from("/run/user/7/x.log.log"),
+            "a socket named *.log never shares its path with the log"
+        );
+        assert_eq!(
+            previous_spawn_log(Path::new("/run/user/7/cerulion/netd.log")),
+            PathBuf::from("/run/user/7/cerulion/netd.log.1")
+        );
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_last_lines_oldest_first() {
+        assert_eq!(tail_lines("a\nb\nc\nd\n\n", 2), vec!["c", "d"]);
+        assert_eq!(tail_lines("only\n", 5), vec!["only"]);
+        assert!(tail_lines("", 3).is_empty());
+    }
+
+    #[test]
+    fn the_log_is_created_0600_in_a_new_0700_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("rt").join("netd.log");
+        let (_file, start) = open_spawn_log(&log).expect("open");
+        assert_eq!(start, 0);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(mode(log.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn an_existing_wider_log_is_narrowed_to_0600_and_appended() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        std::fs::write(&log, "old run\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (mut file, start) = open_spawn_log(&log).expect("open");
+        assert_eq!(
+            start, 8,
+            "this spawn's output starts after the old run's 8 bytes"
+        );
+        writeln!(file, "new run").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "old run\nnew run\n");
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(read_log_tail(&file, start).unwrap(), vec!["new run"]);
+    }
+
+    #[test]
+    fn a_symlink_at_the_log_path_is_refused_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        let log = tmp.path().join("netd.log");
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        let err = open_spawn_log(&log).expect_err("a symlink is refused");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_symlinked_log_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = open_spawn_log(&link.join("netd.log")).expect_err("refused");
+        assert!(err.to_string().contains("is not a directory"), "{err}");
+        assert!(
+            !real.join("netd.log").exists(),
+            "nothing was written through it"
+        );
+    }
+
+    #[test]
+    fn a_hard_linked_log_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let log = tmp.path().join("netd.log");
+        std::fs::hard_link(&victim, &log).unwrap();
+        let err = open_spawn_log(&log).expect_err("a second link is refused");
+        assert!(err.to_string().contains("2 links"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    }
+
+    #[test]
+    fn a_fifo_at_the_log_path_is_refused_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        let c = std::ffi::CString::new(log.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo on a path inside this test's own temp dir.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_spawn_log(&log).map(|_| ()));
+        });
+        // A blocking open of a FIFO with no reader never returns; the bound is
+        // slack for a loaded runner over an open that returns at once.
+        let res = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening a FIFO must not block");
+        assert!(res.is_err(), "a FIFO is not a log file");
+    }
+
+    /// A directory of the user's that group or others can write into, built the
+    /// same way every time: `mode` is applied after creation so the umask cannot
+    /// narrow it.
+    fn writable_log_dir(root: &Path, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = root.join("shared");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    // HAPPY: a group-writable directory of ours is tightened before the log is
+    // opened, so no other user can rename or unlink the log.
+    #[test]
+    fn a_group_writable_log_directory_is_tightened_before_the_log_is_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = writable_log_dir(tmp.path(), 0o775);
+        let log = dir.join("netd.log");
+        let (_file, start) = open_spawn_log(&log).expect("open");
+        assert_eq!(start, 0);
+        assert_eq!(mode_of(&dir) & 0o022, 0, "group and other write are gone");
+        assert_eq!(mode_of(&dir), 0o755);
+        assert_eq!(mode_of(&log), 0o600);
+    }
+
+    // EDGE: every writable shape is stripped; the sticky and setgid bits and the
+    // owner's own bits are kept, and an already-safe directory is left alone.
+    #[test]
+    fn tightening_the_log_directory_keeps_sticky_setgid_and_owner_bits() {
+        for (before, after) in [
+            (0o777, 0o755),
+            (0o770, 0o750),
+            (0o772, 0o750),
+            (0o2775, 0o2755),
+            (0o755, 0o755),
+            (0o700, 0o700),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = writable_log_dir(tmp.path(), before);
+            open_spawn_log(&dir.join("netd.log")).expect("open");
+            assert_eq!(mode_of(&dir), after, "from {before:o}");
+        }
+    }
+
+    // ADVERSARIAL: the directory is tightened when the log ALREADY exists too
+    // (a rename or unlink of the old log is the attack), and the directory the
+    // log lands in is the one that was judged, never a symlink's target.
+    #[test]
+    fn a_preexisting_log_in_a_writable_directory_is_protected_and_a_symlinked_directory_is_not_followed(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = writable_log_dir(tmp.path(), 0o777);
+        std::fs::write(dir.join("netd.log"), "old run\n").unwrap();
+        let (_file, start) = open_spawn_log(&dir.join("netd.log")).expect("open");
+        assert_eq!(start, 8);
+        assert_eq!(mode_of(&dir) & 0o022, 0);
+
+        let root2 = tmp.path().join("r2");
+        std::fs::create_dir(&root2).unwrap();
+        let real = writable_log_dir(&root2, 0o777);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = open_spawn_log(&link.join("netd.log")).expect_err("a symlinked dir is refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(
+            mode_of(&real),
+            0o777,
+            "the directory behind the link is not chmod-ed through it"
+        );
+        assert!(
+            !real.join("netd.log").exists(),
+            "nothing was created through the link"
+        );
+    }
+
+    // DETERMINISM: two runs over identically built directories end in the same
+    // directory mode, log mode and start offset.
+    #[test]
+    fn the_tightened_result_is_identical_across_two_runs() {
+        let run = || {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = writable_log_dir(tmp.path(), 0o2777);
+            let log = dir.join("netd.log");
+            let (_file, start) = open_spawn_log(&log).expect("open");
+            (mode_of(&dir), mode_of(&log), start)
+        };
+        assert_eq!(run(), run());
+    }
+
+    // ERROR ARMS: a file where the directory should be, and a directory that
+    // cannot be inspected, are both refused as PermissionDenied naming the
+    // directory, and nothing is created.
+    #[test]
+    fn a_planted_file_or_an_uninspectable_directory_is_refused_naming_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let planted = tmp.path().join("planted");
+        std::fs::write(&planted, "").unwrap();
+        let err = open_spawn_log(&planted.join("netd.log")).expect_err("a file is not a dir");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            err.to_string().contains(&planted.display().to_string()),
+            "{err}"
+        );
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let outer = tmp.path().join("closed");
+            std::fs::create_dir(&outer).unwrap();
+            std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let err = open_spawn_log(&outer.join("inner").join("netd.log"))
+                .expect_err("an uninspectable directory");
+            std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        }
+    }
+
+    #[test]
+    fn a_log_at_the_rotation_size_moves_to_its_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        std::fs::write(&log, vec![b'x'; SPAWN_LOG_ROTATE_AT as usize]).unwrap();
+        std::fs::write(previous_spawn_log(&log), "older").unwrap();
+        let (_file, start) = open_spawn_log(&log).expect("open");
+        assert_eq!(start, 0, "the fresh log starts empty");
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        assert_eq!(
+            std::fs::metadata(previous_spawn_log(&log)).unwrap().len(),
+            SPAWN_LOG_ROTATE_AT,
+            "the full log replaced the previous generation"
+        );
+        // One byte under the size is appended to, not rotated.
+        let log2 = tmp.path().join("other.log");
+        std::fs::write(&log2, vec![b'y'; SPAWN_LOG_ROTATE_AT as usize - 1]).unwrap();
+        let (_f2, start2) = open_spawn_log(&log2).expect("open");
+        assert_eq!(start2, SPAWN_LOG_ROTATE_AT - 1);
+        assert!(!previous_spawn_log(&log2).exists());
+    }
+
+    #[test]
+    fn a_failed_rotation_still_opens_the_log_for_appending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        std::fs::write(&log, vec![b'x'; SPAWN_LOG_ROTATE_AT as usize]).unwrap();
+        // A directory at the `.1` path is not ours to replace.
+        std::fs::create_dir(previous_spawn_log(&log)).unwrap();
+        let (_file, start) = open_spawn_log(&log).expect("open despite the failed rotation");
+        assert_eq!(start, SPAWN_LOG_ROTATE_AT, "appended to the full log");
+        assert!(previous_spawn_log(&log).is_dir());
+    }
+
+    #[test]
+    fn a_full_log_locked_by_a_racing_spawn_is_not_renamed_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        std::fs::write(&log, vec![b'x'; SPAWN_LOG_ROTATE_AT as usize]).unwrap();
+        use std::os::unix::io::AsRawFd as _;
+        let racer = open_log_file(&log).unwrap();
+        let ours = open_log_file(&log).unwrap();
+        // A racing spawn mid-rotation holds the lock: this spawn leaves the file
+        // alone even though it is still the one at the path.
+        // SAFETY: flock on a descriptor this test owns.
+        let locked = unsafe { libc::flock(racer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(locked, 0);
+        assert!(
+            !rotate_full_log(&ours, &log).unwrap(),
+            "locked: not renamed"
+        );
+        assert!(log.exists() && !previous_spawn_log(&log).exists());
+        // SAFETY: as above.
+        unsafe {
+            libc::flock(racer.as_raw_fd(), libc::LOCK_UN);
+        }
+        assert!(rotate_full_log(&racer, &log).unwrap(), "the racer rotates");
+        assert!(
+            !rotate_full_log(&ours, &log).unwrap(),
+            "the file is no longer the one at the path"
+        );
+        assert!(previous_spawn_log(&log).exists() && !log.exists());
+    }
+
+    #[test]
+    fn the_tail_is_bounded_in_bytes_and_cut_to_whole_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        // 1000 lines of 16 bytes ("line 0000000000\n"): the 8 KiB window holds 512
+        // of them, of which the last 20 are quoted.
+        let text: String = (0..1000).map(|i| format!("line {i:010}\n")).collect();
+        std::fs::write(&log, &text).unwrap();
+        let expected: Vec<String> = (980..1000).map(|i| format!("line {i:010}")).collect();
+        assert_eq!(tail_of(&log, 0), expected);
+        // A window that starts mid-line drops the partial line: 100 lines of 100
+        // bytes put the 8 KiB window's start 8 bytes into line 18.
+        let text: String = (0..100).map(|i| format!("{i:099}\n")).collect();
+        std::fs::write(&log, &text).unwrap();
+        let tail = tail_of(&log, 0);
+        assert_eq!(tail.len(), 20);
+        assert_eq!(tail[0], format!("{:099}", 80));
+        // One line longer than the window is quoted as its truncated tail.
+        std::fs::write(&log, "z".repeat(20_000)).unwrap();
+        let tail = tail_of(&log, 0);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0], format!("(truncated) {}", "z".repeat(8 * 1024)));
+        // The same with the line's own newline as the window's last byte.
+        std::fs::write(&log, format!("{}\n", "z".repeat(20_000))).unwrap();
+        let tail = tail_of(&log, 0);
+        assert_eq!(
+            tail,
+            vec![format!("(truncated) {}", "z".repeat(8 * 1024 - 1))]
+        );
+        // A file shorter than the recorded offset is read from its start.
+        std::fs::write(&log, "after rotation\n").unwrap();
+        assert_eq!(tail_of(&log, 5000), vec!["after rotation"]);
+    }
+
+    #[test]
+    fn the_failure_sentence_names_the_log_and_quotes_its_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("netd.log");
+        std::fs::write(&log, "earlier run\nError: address in use\n").unwrap();
+        let described = SpawnLog {
+            path: log.clone(),
+            file: Some(std::fs::File::open(&log).unwrap()),
+            start: 12,
+            open_error: None,
+        }
+        .describe();
+        assert_eq!(
+            described,
+            format!(
+                "cerulion-netd's startup output is in {}; its last lines:\n  | Error: address in use",
+                log.display()
+            )
+        );
+        let silent = SpawnLog {
+            path: log.clone(),
+            file: Some(std::fs::File::open(&log).unwrap()),
+            start: std::fs::metadata(&log).unwrap().len(),
+            open_error: None,
+        }
+        .describe();
+        assert!(silent.contains("wrote nothing there"), "{silent}");
+        let unopened = SpawnLog {
+            path: log.clone(),
+            file: None,
+            start: 0,
+            open_error: Some("Permission denied".into()),
+        }
+        .describe();
+        assert_eq!(
+            unopened,
+            format!(
+                "cerulion-netd's startup output was discarded: its log {} could not be \
+                 opened (Permission denied)",
+                log.display()
+            )
         );
     }
 }

@@ -173,7 +173,9 @@ trailing bytes are a loud error (`format_vectors_test.rs`, including
   with notAfter `99991231235959Z`) and team issuing CAs (self-signed, CA with
   path length 0), written by a hand-rolled DER encoder and read back by the strict
   `check_leaf` / `check_team_ca`; the intermediate-signed `TeamTrustBundle`
-  (`cerulion-pairing:team-trust:v1`), `TeamStatusList` and `StatusFreshness`
+  (`cerulion-pairing:team-trust:v1`: the current issuing CA, the next
+  generation's CA published one rotation ahead, retired CAs and robot leaves),
+  `TeamStatusList` and `StatusFreshness`
   (`cerulion-pairing:team-status:v1`, told apart by a kind byte); and the pure
   anti-rollback decisions in `team::rollback`. Pinned by `team_formats_test.rs`
   against x509-parser, rustls-webpki, rcgen-built refusals and hand-built
@@ -575,7 +577,13 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
 - Desk inventory (`~/.cerulion/`): `identity/device.key` (the 32-byte machine
   seed; `desk.key` is a hard link to it or an equal copy, adopted byte for byte when it is the
   only one present, and two different keys are refused), `identity/<team>/high_water`
-  (MAC'd clock, bundle generation and status sequence floors), `device.cert`
+  (MAC'd clock, bundle generation and status sequence floors),
+  `identity/active_team` (the team sessions open with), `identity/<team>/leaf.der`
+  and `identity/<team>/bundle` (the team leaf and the postcard trust bundle,
+  accepted by `IdentityLayout::load_team_credentials` only against a trusted
+  root set; `team_credentials_test.rs`), `dev-issuer/state` (feature
+  `dev-issuer` only: the development issuer's root, intermediate and team CA
+  keys), `device.cert`
   (login-issued), `robots.toml` (name → eid pins), `epochs/<robot>.epoch`,
   `grants/`, `auth.json`, `peers.json` (LAN discovery; see
   `network-daemons.md`).
