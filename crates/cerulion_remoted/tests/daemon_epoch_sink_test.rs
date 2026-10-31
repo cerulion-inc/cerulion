@@ -338,3 +338,242 @@ async fn daemon_serve_endpoint_applies_a_pushed_epoch_through_the_production_wir
     let _ = shutdown_tx.send(());
     let _ = bounded("serve shutdown", serve).await;
 }
+
+/// Whether `ep` is admitted to the robot's wire plane (a catalog answer).
+async fn wire_admitted(ep: &cerulion_link::Endpoint, robot_addr: EndpointAddr) -> bool {
+    let Ok(conn) = bounded("dial", dial(ep, robot_addr, alpn::WIRE)).await else {
+        return false;
+    };
+    let Ok((mut s, mut r)) = open_frame_stream(&conn).await else {
+        return false;
+    };
+    let bytes = serde_json::to_vec(&WireRequest::Catalog).unwrap();
+    if bounded("write", write_frame(&mut s, &bytes)).await.is_err() {
+        return false;
+    }
+    match bounded("read", read_frame(&mut r, DEFAULT_MAX_FRAME_LEN)).await {
+        Ok(raw) => {
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+            v.get("reply").and_then(|x| x.as_str()) == Some("catalog")
+        }
+        Err(_) => false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk_push() {
+    let robot_ep = disabled_endpoint([0x33; 32]).await;
+    let robot_addr = loopback_addr(robot_ep.id(), &robot_ep.bound_sockets());
+    let probe_ep = disabled_endpoint([0x45; 32]).await;
+    let probe_key = *probe_ep.id().as_bytes();
+
+    let root_set = RootSet::new(vec![pk(&sk(1))], 1).unwrap();
+    let mut store = TrustStore::provision(ROBOT, pk(&sk(0x77)), root_set, CHASSIS, 0).unwrap();
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    let verified = store
+        .verify_new_pairing(
+            &presentation_for(probe_key, PROBE),
+            &PublicKey(probe_key),
+            T_NOW,
+        )
+        .unwrap();
+    store
+        .establish_pairing(
+            &verified,
+            cerulion_pairing::verify::PairingSource::StrongChain,
+            Some("desk".into()),
+            T_NOW,
+            None,
+        )
+        .unwrap();
+    let mut index = DeviceAccountIndex::new();
+    index.bind(PublicKey(probe_key), PROBE);
+
+    let manager = test_manager("pull");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("remoted")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join("remoted"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    std::fs::create_dir_all(&config.log_root).unwrap();
+    let pending = dir.path().join("remoted").join("epoch.pending");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serve = tokio::spawn(async move {
+        let _ = serve_endpoint(
+            &config,
+            store,
+            index,
+            Vec::new(),
+            &robot_ep,
+            RemotedClock::fixed(T_NOW),
+            Some(Duration::from_millis(200)),
+            Some(manager),
+            async {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await;
+    });
+
+    assert!(
+        wire_admitted(&probe_ep, robot_addr.clone()).await,
+        "pre-condition: the key is admitted before any epoch"
+    );
+    // That admitted key had not connected before, so the accept asked the
+    // supervisor for an early fetch.
+    assert!(
+        dir.path().join("remoted").join("epoch.request").exists(),
+        "an accept of a key not seen recently requests an early epoch fetch"
+    );
+    // The robot's own sync worker left an epoch revoking PROBE; no desk pushes.
+    // The worker writes it owner-only (0600) through an atomic rename.
+    let staged = dir.path().join("remoted").join(".epoch.pending.tmp");
+    std::fs::write(
+        &staged,
+        hex::encode(
+            EpochSyncWire::new(intermediate_cert(), epoch(3, vec![PROBE]))
+                .to_postcard()
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::rename(&staged, &pending).unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let mut refused = false;
+    while std::time::Instant::now() < until {
+        if !pending.exists() && !wire_admitted(&probe_ep, robot_addr.clone()).await {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        refused,
+        "serve_endpoint polls the fetched epoch and the revoked key is refused"
+    );
+    let _ = shutdown_tx.send(());
+    let _ = bounded("serve shutdown", serve).await;
+}
+
+/// A correctly permissioned, genuinely signed pending epoch in `remoted`.
+fn install_pending(remoted: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let staged = remoted.join(".epoch.pending.tmp");
+    std::fs::write(
+        &staged,
+        hex::encode(
+            EpochSyncWire::new(intermediate_cert(), epoch(4, vec![PROBE]))
+                .to_postcard()
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pending = remoted.join("epoch.pending");
+    std::fs::rename(&staged, &pending).unwrap();
+    pending
+}
+
+fn private_remoted_dir(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let remoted = root.join("remoted");
+    std::fs::create_dir_all(&remoted).unwrap();
+    std::fs::set_permissions(&remoted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    remoted
+}
+
+fn claimed_store() -> (TrustStore, DeviceAccountIndex) {
+    let root_set = RootSet::new(vec![pk(&sk(1))], 1).unwrap();
+    let mut store = TrustStore::provision(ROBOT, pk(&sk(0x77)), root_set, CHASSIS, 0).unwrap();
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    (store, DeviceAccountIndex::new())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_or_cancelled_serve_leaves_no_epoch_poller_running() {
+    // 1. A startup failure (the receipt log cannot open) returns an error, and no
+    //    poller is left behind to claim a later epoch.
+    let dir = tempfile::tempdir().unwrap();
+    let remoted = private_remoted_dir(dir.path());
+    let mut config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    config.receipt_file = remoted.clone(); // a directory: the receipt log refuses it
+    let endpoint = disabled_endpoint([0x34; 32]).await;
+    let (store, index) = claimed_store();
+    let failed = bounded(
+        "failing serve",
+        serve_endpoint(
+            &config,
+            store,
+            index,
+            Vec::new(),
+            &endpoint,
+            RemotedClock::fixed(T_NOW),
+            None,
+            Some(test_manager("pull-fail")),
+            std::future::pending::<()>(),
+        ),
+    )
+    .await;
+    assert!(
+        failed.is_err(),
+        "startup must fail on an unopenable receipt log"
+    );
+    let pending = install_pending(&remoted);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(pending.exists(), "no poller survived the failed startup");
+
+    // 2. A serve future that is cancelled leaves no poller behind either.
+    let dir = tempfile::tempdir().unwrap();
+    let remoted = private_remoted_dir(dir.path());
+    let config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    std::fs::create_dir_all(&config.log_root).unwrap();
+    let endpoint = disabled_endpoint([0x35; 32]).await;
+    let (store, index) = claimed_store();
+    let manager = test_manager("pull-cancel");
+    let serving = tokio::spawn(async move {
+        let _ = serve_endpoint(
+            &config,
+            store,
+            index,
+            Vec::new(),
+            &endpoint,
+            RemotedClock::fixed(T_NOW),
+            None,
+            Some(manager),
+            std::future::pending::<()>(),
+        )
+        .await;
+    });
+    let live = install_pending(&remoted);
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while live.exists() && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !live.exists(),
+        "the poller claims a pending epoch while the serve runs"
+    );
+    assert!(
+        !serving.is_finished(),
+        "the serve is still running before the abort"
+    );
+    serving.abort();
+    let _ = serving.await;
+    let pending = install_pending(&remoted);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(pending.exists(), "no poller survived the cancelled serve");
+}

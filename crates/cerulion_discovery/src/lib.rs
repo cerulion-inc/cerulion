@@ -7,6 +7,8 @@
 //!   the bounded TCP reachability filter ([`ladder::probe_reachable_locators`]), and
 //!   the pure connect-set planner ([`ladder::plan_connect_set`]).
 //! - [`peer_cache`]: the `~/.cerulion/peers.json` format and its reader.
+//! - [`unencrypted_quic`]: the `CERULION_UNENCRYPTED_QUIC=on` opt-in switch and the
+//!   `tcp/` to `udp/...?rel=1` locator rewrites it uses.
 //!
 //! This is an internal building block, published because `cerulion_cli_engine` and
 //! `cerulion_netd` both depend on it. It opens no zenoh session and runs no mDNS
@@ -43,3 +45,5 @@
 
 pub mod ladder;
 pub mod peer_cache;
+pub mod robot_state;
+pub mod unencrypted_quic;

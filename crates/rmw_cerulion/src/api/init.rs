@@ -236,6 +236,15 @@ pub unsafe extern "C" fn rmw_init(
         if !(*context).implementation_identifier.is_null() {
             return RMW_RET_INVALID_ARGUMENT;
         }
+        // Delivery log / replay: a requested record or replay that cannot run
+        // (both variables set, an unwritable log directory, a log of another
+        // process, a log marked not replayable) refuses here, by name, before
+        // the context is touched.
+        if let Err(why) = crate::replay::on_init() {
+            let rcl = ffi::rcutils_set_error_state_best_effort(&why);
+            tracing::error!(rcl_error_channel = %rcl, "{why}");
+            return ffi::RMW_RET_ERROR;
+        }
         match runtime::runtime() {
             Ok(_) => {
                 // One more live context, keyed by the
@@ -366,6 +375,8 @@ pub unsafe extern "C" fn rmw_shutdown(context: *mut ffi::rmw_context_t) -> rmw_r
             tracing::debug!("rmw_shutdown on an already-shut-down context — the rmw.h no-op");
             return RMW_RET_OK;
         }
+        // Delivery log: flush what is recorded. Replay: write the verdict so far.
+        crate::replay::on_shutdown();
         tracing::info!("rmw_cerulion shutdown");
         RMW_RET_OK
     })

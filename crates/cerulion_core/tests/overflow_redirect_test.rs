@@ -260,10 +260,11 @@ fn reader_side_misuse_setter_call_attributes_to_read_only_topic() {
     // Pin that a `&mut self` setter call on a reader-constructed
     // `<Name>Shm` produces an error attributed to `topic: "<read-only>"`
     // rather than `topic: ""`. The reader-side defaults
-    // (`max_capacity: 0, topic: "<read-only>"`) are the
+    // (`max_capacity: 0` and a `None` topic) are the
     // sentinels: max_capacity=0 makes any `required_end > 0`
-    // immediately PayloadTooLarge (no allocation attempt), and topic=
-    // "<read-only>" identifies the misuse source to the operator.
+    // immediately PayloadTooLarge (no allocation attempt), and the error
+    // paths report a `None` topic as "<read-only>" (`READ_ONLY_TOPIC`),
+    // which identifies the misuse source to the operator.
     //
     // This test exercises the path because `Reader<'a> == Writer<'a>`
     // by GAT identity for variable schemas — the value-form Shm returned
@@ -533,4 +534,35 @@ fn allocation_failed_when_spill_fault_armed() {
         !writer.has_overflow(),
         "no spill happened because fault fired BEFORE try_reserve_exact"
     );
+}
+
+#[test]
+fn a_writers_staged_topic_clones_are_released() {
+    // A writer holds the publisher's topic as `Some(Arc)`. Each staged nested
+    // call clones that `Option` into a transient view, and the clone is
+    // released when the call returns, so the topic's strong count is back to
+    // one once the writer drops. This pins the writer side of the `Option`
+    // change; the reader side is pinned in codegen_test.rs.
+    let topic: std::sync::Arc<str> = std::sync::Arc::from("test/staged_topic");
+    let mut buf = aligned_buf(4096);
+    let bytes = aligned_view(&mut buf, 4096);
+    let mut writer = Image::build_writer(
+        bytes,
+        cerulion_core::wire::MaxPayloadCapacity::const_new(4096),
+        std::sync::Arc::clone(&topic),
+    );
+    assert_eq!(std::sync::Arc::strong_count(&topic), 2);
+    writer
+        .with_header(|h| h.set_frame_id("cam0"))
+        .expect("stage frame_id");
+    writer.set_encoding("mono8").expect("encoding set");
+    writer.set_data(&[7u8; 32]).expect("data set");
+    writer.__cer_flush_staged().expect("flush");
+    assert_eq!(
+        std::sync::Arc::strong_count(&topic),
+        2,
+        "the staged view's topic clone must be released when the call returns"
+    );
+    drop(writer);
+    assert_eq!(std::sync::Arc::strong_count(&topic), 1);
 }

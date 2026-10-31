@@ -5525,6 +5525,10 @@ impl CerulionSubscriber {
                             ),
                         });
                     }
+                    // The same schema-dependent refusals the typed receive
+                    // path makes: no room for the fixed section and offset
+                    // table, or a frame that does not start 8-aligned.
+                    super::input_view::validate_reader_prefix::<T>(&self.topic, raw, total_size)?;
                     let payload_ptr = raw.as_ptr();
                     let payload_len = total_size - WireHeader::SIZE;
                     // SAFETY: `raw` is a valid slice into the iceoryx2

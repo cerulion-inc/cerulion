@@ -2185,12 +2185,39 @@ network:
   every `egress` entry that sets no `reliability`. An entry's own
   `reliability` wins in both directions: `{topic: /r/cmd, reliability:
   reliable}` stays reliable under a `best_effort` default.
-- `tls`: absolute PEM paths for `quic/` locators: `certificate` +
-  `private_key` for a `quic/` listener, `root_ca` for a `quic/` connect (the
+- Egress send queue: the gateway hands each egress topic's frames to that
+  topic's own send queue and sender thread, so a congested link holds up the
+  topics it carries and not the gateway's other links (closing LAN access
+  while a put waits on a congested link waits for that put). Topics sent to
+  the same peer share that peer's link. A publishing node writes to shared
+  memory and does not wait on the network. A `reliable` frame waits for
+  zenoh's transmit queue instead of being dropped at the sender, for up to
+  zenoh's `wait_before_close` (5 s by default), after which zenoh drops it and
+  closes its link to that peer. When the topic's send queue is itself full, a
+  `reliable` topic refuses the new frame, counts it, and a warning names the
+  topic; a `best_effort` topic drops its oldest queued frame instead (newest
+  wins), counted too. An entry's `send_queue: N` (a whole number of frames,
+  1 or more) sets the queue's bound, for example `{topic: /r/camera,
+  send_queue: 32}`; without it the bound is the depth of the gateway's tap on
+  the topic. Each queued frame is a heap copy, so a topic's queue can hold
+  up to `send_queue` times its frame size. Every gateway logs, every 10 s, a
+  warning for a topic that refused or failed frames since the last report
+  (an info line for best-effort drops alone), and each topic's totals when it
+  stops. The gateway `cerulion-netd` hosts (a run with no
+  `network:` block) also reports each topic's `forwarded`, `dropped`,
+  `refused`, `failed`, `discarded`, `queued`, `in_flight` and `send_queue` in
+  its `status` reply; a run with a `network:` block uses its own gateway
+  process, which reports through its log. `forwarded` counts puts zenoh
+  accepted; a best-effort frame zenoh discards inside its own transmit queue
+  afterwards, and a reliable frame dropped at `wait_before_close`, are not
+  reported to the gateway.
+- `tls`: absolute PEM paths for `quic/` and `tls/` locators: `certificate` +
+  `private_key` for a listener, `root_ca` for a connect (the
   connect also checks the certificate names the host or IP dialled, and zenoh
   trusts the public Web PKI roots beside `root_ca`). The carrier is the
   locator's first segment:
-  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, or
+  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, `tls/<host>:<port>`
+  (TLS 1.3 over TCP, reading the same `tls` files as `quic/`), or
   `udp/<host>:<port>?rel=1;mixed_rel=1` (QUIC without encryption or peer
   authentication, for a WireGuard overlay only). See `docs/networking.md`
   "Carriers and per-topic reliability".
@@ -2211,8 +2238,8 @@ rejection names the offending topic or setting and the fix:
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
 | Duplicates | The same topic twice in one list. |
-| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`tls/`, `ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
-| Certificate files | A `quic/` listener without `tls.certificate` + `tls.private_key`, a `quic/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` connect, or `certificate`/`private_key` with no `quic/` listen. |
+| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
+| Certificate files | A `quic/` or `tls/` listener without `tls.certificate` + `tls.private_key`, a `quic/` or `tls/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` or `tls/` connect, or `certificate`/`private_key` with no `quic/` or `tls/` listen. |
 | Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
@@ -2971,7 +2998,7 @@ default: loud over silent).
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). **Auto default: ON for live runs** (`--time-source real`/`external`), off for `--time-source virtual`. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this env in both directions. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |
+| `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). **Auto default: ON for live runs** (`--time-source real`/`external`), off for `--time-source virtual`. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this env in both directions. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (a one-rung park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |
 | `CERULION_DOORBELL` | Data-**doorbell** arm of the park: `1` forces it on (a producer's publish rings a shared-memory line that wakes the parked consumer instantly; implies the park), `0` disables it (timer-only park). Exact match; near-misses warn and use the auto default (**ON for live runs**). On Linux a parked consumer hears the ring through the CPU monitor-wait primitive; on macOS 14.4 and later it kernel-blocks on the ring's wake word instead (see `CERULION_DOORBELL_OS_SYNC` below). Where neither exists a ring is still made, but it is observed no sooner than the park's recheck poll already observes the listener, so the doorbell is **forced off** with a warning if you request it. It never implies the park on a target without a CPU monitor-wait primitive. **Native live loop only:** `rmw_cerulion` does NOT read this flag; its publishers always arm the topic doorbell (one atomic increment per publish on Linux; on macOS 14.4 and later two in one cache line, and a kernel wake syscall only while a consumer holds the page's parked claim, a claim a killed consumer leaves set, so a later publish can pay a syscall with nobody there) and its `rmw_wait` park tier is governed by `CERULION_MONITOR_WAIT` alone. |
 | `CERULION_CPU_DMA_LOCK` | CPU C-state cap override (Linux; needs root / `CAP_SYS_NICE` for `/dev/cpu_dma_latency`: a failed acquire warns and the run continues). `1` forces a hard C0 pin, `0` disables the cap (exact match; near-misses warn and use the auto decision). **Auto default:** a graph-derived exit-latency cap computed from the graph's tightest timing, and **skipped entirely while the monitor-wait park is active** (they are alternative shallow-idle mitigations). The `--no-cpu-dma-lock` flag disables the auto cap. No-op off Linux. |
 | `CERULION_CPU_DMA_LOCK_US` | Explicit C-state exit-latency cap in µs (e.g. `=10`), used under the auto mode. A valid non-negative integer wins over the graph-derived cap (but **not** over `CERULION_CPU_DMA_LOCK=1`/`=0`); malformed/negative values warn and fall through to the graph-derived cap. |
@@ -3172,7 +3199,8 @@ PARKS on them with the same CPU monitor-wait the native live loop uses
 (`UMWAIT`/`WFE`; a bounded sleep-recheck where the CPU has no primitive), so
 a publish wakes the waiter hardware-instantly. Whether that tier is ON is a
 platform default set by measurement (see the `CERULION_MONITOR_WAIT` row
-below): aarch64 parks by default, x86 does not: its `ppoll` kernel wait
+below): aarch64 parks the first rung of each call by default, x86 does
+not: its `ppoll` kernel wait
 measured faster at both 2 ms and 10 ms. Where it runs the park is bounded
 and yields the core every recheck slice: 20 µs where `UMWAIT` honors the
 deadline; on the aarch64 `WFE` tier (the park's platform-default home) one
@@ -3194,7 +3222,7 @@ empty wake.
 | Variable | Meaning |
 |---|---|
 | `CERULION_LIVE_SPIN_US` | The SAME knob as in "Live-loop tuning" above, read by `rmw_wait` through the same parse and the same 100 000 µs (100 ms) ceiling. The ONE asymmetry: **unset means the consumer's own default, and the rmw wait's default is PARK-FIRST, no spin** (it has no graph to derive wake-imminence from; the native loop's derived default spins only while a wake is provably imminent). A positive `N` arms the µs busy-probe in front of the FIRST kernel block of each `rmw_wait` call, at most twice per call: once on entry, and at most one recovery spin after a wake whose probe found nothing (consumed on first use, never re-armed); never after an empty timeout. The entry spin is also bounded ACROSS calls: it is armed only by a previous call that RETURNED READY, and a call that delivered nothing disarms it (however its blocks woke), so neither an idle executor nor a notification-without-readiness storm spins more than once per idle period, even at the 100 ms cap (the value that is safe on the native loop's imminence-gated spin). It yields between probes. `0` disables (what unset already means here); malformed warns once and stays park-first. The measured basis for the park-first default: spin off is best-or-equal in every posture (stock 30 µs, C1 cap 19, C0 pin 17; 64 B ping-pong p50), while spin on put roughly half the processes into a per-lifetime ~123 µs same-core scheduling mode in the stock and C0 postures (never under a C1 cap). Ignored entirely under `CERULION_RMW_EVENT_WAIT=off`. |
-| `CERULION_MONITOR_WAIT` | The SAME flag as in "Live-loop tuning" above, resolved by `rmw_wait` through the same classification, applied to a PLATFORM default that is measured, not chosen: **unset ⇒ the platform default: park ON on aarch64 (`WFE`), OFF on x86**; `1` ⇒ force the park on (on x86 the bounded one-rung shape, the experiment hatch); `0` ⇒ off (the wait blocks in `ppoll` on the entities' fds; still event-driven, µs wakes); any other non-empty value warns once and keeps the default. The basis (64 B rmw ping-pong p50): x86-64 2 ms park-on 30.1 vs **off 27.7**, 10 ms park-on 58.8 vs **off 19.8**; aarch64 (Jetson) 2 ms park-on **74.8** vs off 127.1, 10 ms park-on **84.3** vs off 135.7. The park, where it runs, is bounded and yields the core every recheck slice: 20 µs where `UMWAIT` honors the deadline, one generic-timer event-stream period (machine-specific, around 130 µs on an Orin-class board) on the aarch64 `WFE` tier that is the park's default home (a parked thread looks busy to the scheduler, so an unbounded park can starve a thread sharing its core). Elsewhere no ring wakes this wait's park, so the flag changes nothing there. rmw publishers open the topic bell unowned and never unlink it (a ROS topic may carry two publishers, so a dying one must not pull the page from under the survivor; a re-created publisher joins the same page), and a page replaced by an owned creator is re-mapped automatically on the first frame that arrives without a ring. Residual: one 64-byte page per topic can outlive every publisher on the machine until the next creator. Ignored under `CERULION_RMW_EVENT_WAIT=off`. |
+| `CERULION_MONITOR_WAIT` | The SAME flag as in "Live-loop tuning" above, resolved by `rmw_wait` through the same classification, applied to a PLATFORM default that is measured, not chosen: **unset ⇒ the platform default: park ON for the first rung of each call on aarch64 (`WFE`), OFF on x86**; `1` ⇒ force the park on (on x86 the bounded one-rung shape, the experiment hatch); `0` ⇒ off (the wait blocks in `ppoll` on the entities' fds; still event-driven, µs wakes); any other non-empty value warns once and keeps the default. The basis (64 B rmw ping-pong p50): x86-64 2 ms park-on 30.1 vs **off 27.7**, 10 ms park-on 58.8 vs **off 19.8**; aarch64 (Jetson), park held through every block, 2 ms park-on **74.8** vs off 127.1, 10 ms park-on **84.3** vs off 135.7; that shape held one core per idle subscriber, so the aarch64 default parks only the first rung of each call. The park, where it runs, is bounded and yields the core every recheck slice: 20 µs where `UMWAIT` honors the deadline, one generic-timer event-stream period (machine-specific, around 130 µs on an Orin-class board) on the aarch64 `WFE` tier that is the park's default home (a parked thread looks busy to the scheduler, so an unbounded park can starve a thread sharing its core). Elsewhere no ring wakes this wait's park, so the flag changes nothing there. rmw publishers open the topic bell unowned and never unlink it (a ROS topic may carry two publishers, so a dying one must not pull the page from under the survivor; a re-created publisher joins the same page), and a page replaced by an owned creator is re-mapped automatically on the first frame that arrives without a ring. Residual: one 64-byte page per topic can outlive every publisher on the machine until the next creator. Ignored under `CERULION_RMW_EVENT_WAIT=off`. |
 | `CERULION_RMW_EVENT_WAIT` | The one rmw-only knob, the kill-switch. `off` restores the polling wait loop **verbatim**: probe, `sleep(100 µs)`, probe: **no fd block, no park, AND no spin** (`CERULION_LIVE_SPIN_US` is ignored, and the once-only `info!` says so). Everything else (the ready probe, the zero-timeout arm, the 20 ms publisher-event pump cadence) is identical. `on`/unset/empty = event-driven (the default); any other value warns once and stays ON (exact match, no case forgiveness). Independently of this switch, a wait set whose listener drain FAILS mid-call degrades itself to the same sleep pacing for the rest of that call (loud once, counted in `degraded_waits`) and retries the event path on the next call. |
 
 ### ROS 2 rmw slice ceilings
@@ -3423,7 +3451,7 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_CONNECT` / `CERULION_VIZD_CONNECT` | Comma/whitespace-separated zenoh locators to dial (`tcp/192.168.123.99:7683`). Each is where the corresponding verb's `--connect` is threaded when that command STARTS its daemon: `cerulion viz --connect` into the vizd one, a demanding consumer's `--connect` into the netd one. |
 | `CERULION_NETD_LISTEN` / `CERULION_VIZD_LISTEN` | Comma/whitespace-separated zenoh locators to bind (`tcp/0.0.0.0:7447`). The `--listen` counterpart of the row above, threaded the same way. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
-| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. |
+| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
 
 WSD graph and node reads include a `version` field containing the lowercase

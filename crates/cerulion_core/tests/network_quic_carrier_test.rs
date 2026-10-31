@@ -81,6 +81,7 @@ fn pair(port: u16, cert: &Path, key: &Path, anchor: &Path) -> Pair {
         egress_qos: vec![EgressQos {
             topic: "/q/be".to_string(),
             reliability: EgressReliability::BestEffort,
+            send_queue: None,
         }],
         ..NetworkConfig::default()
     });

@@ -163,10 +163,13 @@ fn step_records(step: u64) -> Vec<TraceRingRecord> {
     vec![boundary(step), fire(step, 0), fire(step, 1)]
 }
 
-/// A trace spanning `ANCHOR_STEP` and three steps past it.
+/// A trace spanning `ANCHOR_STEP` and three steps past it, then the next
+/// step's boundary, which proves step `ANCHOR_STEP + 3` complete (the capture's
+/// end cut removes the trailing boundary's step).
 fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
     ((ANCHOR_STEP - 2)..=(ANCHOR_STEP + 3))
         .flat_map(step_records)
+        .chain(std::iter::once(boundary(ANCHOR_STEP + 4)))
         .collect()
 }
 
@@ -175,7 +178,7 @@ fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
 fn expected_kept() -> Vec<TraceRingRecord> {
     trace_across_the_anchor()
         .into_iter()
-        .filter(|r| r.step > ANCHOR_STEP)
+        .filter(|r| r.step > ANCHOR_STEP && r.step <= ANCHOR_STEP + 3)
         .collect()
 }
 
@@ -816,6 +819,9 @@ fn records_committed_during_shutdown_reach_the_final_capture() {
         .flat_map(step_records)
         .collect();
     push_trace(&mut run.trace, &tail);
+    // The next step's boundary, committed during shutdown too: it proves the
+    // tail's last step complete, which the capture's end cut requires.
+    push_trace(&mut run.trace, &[boundary(tail_start + 3)]);
 
     run.capture("with a tail still on the ring");
     let (summary, bags, harness) = run.finish();
@@ -839,7 +845,7 @@ fn records_committed_during_shutdown_reach_the_final_capture() {
     // …and the recorder's own accounting counts them too.
     assert_eq!(
         summary.ring_records,
-        (early.len() + tail.len()) as u64,
+        (early.len() + tail.len() + 1) as u64,
         "the summary counts the tail the final pass collected"
     );
 
@@ -967,6 +973,7 @@ fn a_ring_that_lapped_before_the_recorder_read_it_attaches_at_live_and_says_so()
     let anchor_step = 500;
     let after: Vec<TraceRingRecord> = ((anchor_step - 1)..=(anchor_step + 2))
         .flat_map(step_records)
+        .chain(std::iter::once(boundary(anchor_step + 3)))
         .collect();
     push_trace(&mut run.trace, &after);
     push_state(&mut run.state, &full_anchor(anchor_step));
@@ -1005,7 +1012,7 @@ fn a_ring_that_lapped_before_the_recorder_read_it_attaches_at_live_and_says_so()
     let expected: Vec<TraceRingRecord> = after
         .iter()
         .copied()
-        .filter(|r| r.step > anchor_step)
+        .filter(|r| r.step > anchor_step && r.step <= anchor_step + 2)
         .collect();
     assert!(
         !expected.is_empty(),
@@ -1187,6 +1194,13 @@ fn a_lap_refuses_only_the_capture_that_carries_it_and_a_later_one_is_resimmable(
         "the re-attached drain must read the far side; last saw {:?}",
         run.status.seen
     );
+    // One more boundary proves the last far step complete, so the capture's end
+    // cut leaves at least one far-side step in capture A.
+    let before_proof = run.status.poll().ring_records;
+    push_trace(&mut run.trace, &[boundary(far_step)]);
+    far_step += 1;
+    run.status
+        .await_records(before_proof + 1, "the far side's proving boundary");
     run.publish_frames(4);
     std::thread::sleep(Duration::from_millis(POST_WINDOW_MS * 2));
 

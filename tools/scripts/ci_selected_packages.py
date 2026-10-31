@@ -366,7 +366,7 @@ def read_metadata(source):
 # count, all measured off this workspace independently of this script. The two
 # sizes in a row differ wherever a dev-dependency edge carries the closure, and
 # `cerulion_bag` is the extreme case: 61 packages can observe a change to it,
-# seven of them without dev-dependency edges. That gap is what proves the edges
+# eight of them without dev-dependency edges. That gap is what proves the edges
 # are followed on the real graph rather than only on a fixture.
 #
 # The member count is NOT the length of the root manifest's `members` list: a
@@ -379,14 +379,14 @@ def read_metadata(source):
 LIVE_ORACLE_MEASURED = True
 LIVE_MEMBER_COUNT = 78
 LIVE_ORACLE = {
-    'cerulion_bag': (61, 7),
+    'cerulion_bag': (61, 8),
     'cerulion_cli': (1, 1),
     'cerulion_cli_engine': (61, 5),
     'cerulion_core': (61, 61),
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (61, 47),
+    'native_ros2_messages': (61, 48),
 }
 
 

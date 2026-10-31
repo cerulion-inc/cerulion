@@ -218,6 +218,10 @@ pub use flashback_plane::{FlashbackSettings, FlashbackStats};
 pub use capture::FLASHBACK_ATTACHMENT;
 pub use flashback_plane::FlashbackManifest;
 
+// The rule a capture's trace END is cut by: per rank, records at or after the
+// last step boundary are removed, with every step before it tied to its target.
+pub use trace_window::{end_at_last_complete_step, CompleteSteps};
+
 // Flashback phase 2: the shared anchor retention and its poison-tolerant lock.
 use flashback_plane::{lock_anchors, SharedAnchors, SharedTraceWindow};
 
@@ -9864,6 +9868,10 @@ fn judge_capture_resimmable(
             // as the sweep's report that no rank published nothing.
             rank_space_walked,
             required_nodes: &trimmed.executed_nodes,
+            // The ranks the end cut and the trim left with no step boundary
+            // while another rank kept one. The recorder alone can say so: the
+            // bag carries no record of a rank's removed steps.
+            ranks_without_a_kept_step: &trimmed.ranks_without_a_kept_step,
             anchor_facts,
         },
     )
@@ -16274,14 +16282,26 @@ impl Recorder {
         // published inside its node's tick and the FIRE record is pushed after
         // the tick returns (`Scheduler::fire_node_into`), so every frame a
         // snapshotted FIRE implies was committed before that record was pushed,
-        // hence before this drain, hence is in the window. The RESIDUAL, stated:
-        // a BOUNDARY whose step's first fire had not been pushed at the snapshot
-        // instant (a window of microseconds inside one step, against the whole
-        // drive-loop pass this replaces) still reaches the claim with no fire
-        // and possibly no frame; the recorder keeps every record it holds (a
-        // black box never discards evidence), and that step's tolerance is the
-        // resim's to grant. Pinned by
-        // `the_capture_close_snapshots_the_trace_before_the_taps_are_drained_and_the_frames_read`.
+        // hence before this drain, hence is in the window.
+        //
+        // The snapshot itself can still end INSIDE a step: after a node's tick
+        // published its frame (and its FIRE was pushed) and before the level-end
+        // merge pushed the READ_OUTCOME records behind that frame. The frames
+        // drained below then hold an output whose read the trace does not, and
+        // a gated replay withholds that fire (exit 6). `select_trace` and
+        // `select_trace_untrimmed` therefore cut the snapshot at the last step
+        // each rank finished recording (`trace_window::end_at_last_complete_step`):
+        // a step is kept only when the snapshot also holds that rank's next
+        // boundary, which the scheduler pushes after every record of the step,
+        // and a step tied to the final step's target goes with it. The cut
+        // steps' frames stay in the bag, stamped at that target, above every
+        // kept boundary of their rank on a well-formed trace. A rank the cut
+        // and the trim leave with no boundary makes the capture not resimmable
+        // (`TrimmedTrace::ranks_without_a_kept_step`). Pinned by
+        // `the_capture_close_snapshots_the_trace_before_the_taps_are_drained_and_the_frames_read`
+        // (the order) and
+        // `select_trace_ends_a_capture_cut_between_an_output_and_its_read_at_the_last_complete_step`
+        // (the cut).
         //
         // Inside the measured close window on purpose: one tap drain and one harvest are
         // work the drive loop pays at capture time, and the close budget exists to see it.
@@ -17151,7 +17171,9 @@ impl Recorder {
             // `CaptureHandoff::trace_verdict`. Both are THIS capture's, never
             // the plane's lifetime totals, for the same reason every other
             // number in this manifest is.
-            trace_records_trimmed_away: trimmed.discarded,
+            trace_records_trimmed_away: trimmed.discarded + trimmed.tail_cut,
+            trace_end_cut_steps: trimmed.tail_steps_cut,
+            trace_end_cut_records: trimmed.tail_cut,
             trace_records_truncated: truncated_trace_records,
             // What this recorder's OWN reader did. Lifetime
             // figures, deliberately, unlike every number above: they are facts

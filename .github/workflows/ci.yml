@@ -733,6 +733,12 @@ jobs:
       - name: Android e2e demand probe verdict self-test
         run: ./tools/scripts/test_android_e2e_probe_verdict.sh
 
+      # The emulator e2e reads its millisecond clock from bash 5's
+      # $EPOCHREALTIME, not GNU date. Its self-test needs no device, so it
+      # runs here on every pull request.
+      - name: Android e2e millisecond clock self-test
+        run: bash tools/scripts/android_emulator_e2e.sh self-test
+
       # Offline: the registry, the archives and the tag lookup are PATH shims,
       # so this runs here rather than in the release workflow, where the script
       # itself reads crates.io after an upload.
@@ -839,11 +845,14 @@ jobs:
       # were known to cache: two others were writing into the same store with
       # the combined `actions/cache` action, ungated and unpruned, while a
       # two-file invocation reported clean. Its self-test and the prune
-      # script's self-test run first so a silent checker cannot pass.
+      # script's self-test run first so a silent checker cannot pass. The
+      # target trim's self-test also fails when this runner's filesystem does
+      # not update access times, the signal the trim reads.
       - name: Cache save policy (self-tests, then the workflows)
         run: |
           set -euo pipefail
           bash tools/scripts/ci_cache_prune.sh --self-test
+          bash tools/scripts/ci_cache_trim_target.sh --self-test
           python3 tools/scripts/ci_cache_policy_check.py --self-test
           python3 tools/scripts/ci_cache_policy_check.py .github/workflows
 
@@ -873,7 +882,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-lint-main-
@@ -923,10 +932,10 @@ jobs:
                         -type f -name Cargo.toml -not -path '*/target/*' | sort)
           # A walk that matched nothing would be a silent green. The floor is
           # the exact number of roots in the tree (two under benches/latency,
-          # eight examples, the fuzz crate, the Android sample's runtime
-          # crate), so losing any one of them trips it.
+          # benches/wire-formats, eight examples, the fuzz crate, the Android
+          # sample's runtime crate), so losing any one of them trips it.
           # Raise it in the commit that adds a root.
-          if [ "$checked" -lt 12 ]; then
+          if [ "$checked" -lt 13 ]; then
             echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
             exit 1
           fi
@@ -1125,10 +1134,13 @@ jobs:
       # future pull request. A gate whose own regex is broken must not be
       # discovered by an author who cannot merge.
       #
-      # The values come from the event payload through the ENVIRONMENT, never
-      # interpolated into the shell: a PR title is attacker-controlled text and
-      # `${{ github.event.pull_request.title }}` inside a `run:` block is a
-      # script-injection seam.
+      # The values come from the event payload, never interpolated into the
+      # shell: a PR title is attacker-controlled text and the title expression
+      # inside a `run:` block is a script-injection seam. The title is read out
+      # of the payload file by this step's own `run:` block and handed to the
+      # script with `--title`, not through the step's `env:` block: the run log
+      # prints a step's env values, and that copy would outlive an edit of the
+      # title. The script does not print a title it refuses, for the same reason.
       - name: PR title and branch convention
         # PULL REQUESTS ONLY, deliberately not merge_group: this step reads
         # `github.event.pull_request.title` and `.head.ref`, and a merge_group
@@ -1138,7 +1150,6 @@ jobs:
         # place they exist.
         if: github.event_name == 'pull_request'
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           # The number is minted by THIS repository and never reused; the head
           # ref is fork-controlled text. The grandfather list in the script is
@@ -1152,6 +1163,9 @@ jobs:
           # maintainer push to a bot branch would change it.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
+          # The run shell is `bash -e`, so a payload that cannot be read stops
+          # the step rather than checking an empty title.
+          PR_TITLE=$(jq -e -j '.pull_request.title' "$GITHUB_EVENT_PATH")
           ./tools/scripts/check_pr_title.sh --self-test
           ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER" --author "$PR_AUTHOR"
 
@@ -1172,7 +1186,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -1191,7 +1205,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   cross-aarch64-linux:
     name: Cross-check (aarch64-linux)
     runs-on: ubuntu-latest
@@ -1222,7 +1236,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-cross-aarch64-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-cross-aarch64-
 
@@ -1270,7 +1284,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-cross-aarch64-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -1289,7 +1303,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-cross-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-cross-aarch64-${{ hashFiles('Cargo.lock') }}
   msrv:
     name: MSRV (1.95)
     runs-on: ubuntu-latest
@@ -1327,7 +1341,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-msrv-1.95-main-
@@ -1350,7 +1364,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -1369,7 +1383,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-msrv-1.95-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
 
   android-check:
     name: Android check (arm64-v8a)
@@ -1548,7 +1562,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-crates-${{ runner.os }}-main-
@@ -2168,7 +2182,9 @@ jobs:
       # (Shard 0 is the SOLE saver of `cargo-Linux-`. `lint`, `docs` and
       # `netd-wan` used to share this key and whichever finished first wrote it;
       # they have their own namespaces now and fall through their `restore-keys`
-      # to this one, which is a superset of what they build.)
+      # to this one. The trim before the save keeps only the units shard 0's own
+      # cargo commands read, so a unit only those jobs or shards 1-3 build is
+      # compiled by them on every run.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
@@ -2178,7 +2194,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
@@ -2192,11 +2208,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
+
+      # A save follows only a key miss, which restored an older archive through
+      # `restore-keys` (or nothing). This sets the access time of every restored
+      # fingerprint file to 2000-01-01, so the trim before the save can tell the
+      # units this run's cargo commands read from the ones they did not; see
+      # `tools/scripts/ci_cache_trim_target.sh`. Same gate as the save, less the
+      # prune's output, and on `main` only: a pull-request run builds only its
+      # selected packages, so a trim there would save that narrower graph.
+      - name: Cache cargo, shard 0 saves (age the restored fingerprints)
+        if: >-
+          matrix.shard == 0
+          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && github.ref == 'refs/heads/main'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+        run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
       # cargo doesn't treat them as deps of the test crates). `--workspace`
@@ -2891,6 +2923,19 @@ jobs:
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
 
+      # Deletes from `target/` every unit no cargo command in this job read
+      # (older generations a key roll restored, unused scaffold targets under
+      # `target/tmp`) and `incremental/`, and prints the size before and after.
+      # Deletes nothing when access times do not update or nothing was read.
+      - name: Cache cargo, shard 0 saves (trim units this run did not use)
+        if: >-
+          matrix.shard == 0
+          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && github.ref == 'refs/heads/main'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+        run: bash tools/scripts/ci_cache_trim_target.sh trim target
+
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
       - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
         id: cache-prune
@@ -2900,7 +2945,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green shard 0 stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
@@ -2920,7 +2965,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
@@ -3134,7 +3179,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
@@ -3148,11 +3193,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
+
+      # A save follows only a key miss, which restored an older archive through
+      # `restore-keys` (or nothing). This sets the access time of every restored
+      # fingerprint file to 2000-01-01, so the trim before the save can tell the
+      # units this run's cargo commands read from the ones they did not; see
+      # `tools/scripts/ci_cache_trim_target.sh`. Same gate as the save, less the
+      # prune's output, and on `main` only: a pull-request run builds only its
+      # selected packages, so a trim there would save that narrower graph.
+      - name: Cache cargo, shard 0 saves (age the restored fingerprints)
+        if: >-
+          matrix.shard == 0
+          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && github.ref == 'refs/heads/main'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+        run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
       # cargo doesn't treat them as deps of the test crates). `--workspace`
@@ -3848,6 +3909,19 @@ jobs:
   # rationing a healthy one, which is the rule this file applies everywhere.
   # ==========================================================================
 
+      # Deletes from `target/` every unit no cargo command in this job read
+      # (older generations a key roll restored, unused scaffold targets under
+      # `target/tmp`) and `incremental/`, and prints the size before and after.
+      # Deletes nothing when access times do not update or nothing was read.
+      - name: Cache cargo, shard 0 saves (trim units this run did not use)
+        if: >-
+          matrix.shard == 0
+          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && github.ref == 'refs/heads/main'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+        run: bash tools/scripts/ci_cache_trim_target.sh trim target
+
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
       - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
         id: cache-prune
@@ -3857,7 +3931,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green shard 0 stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
@@ -3877,7 +3951,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   crate-tests:
     name: Crate tests (${{ matrix.os }})
     needs: [lint, changes]
@@ -3962,7 +4036,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-crates-${{ runner.os }}-main-
@@ -4159,7 +4233,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -4178,7 +4252,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   # The Python client (`crates/cerulion_py`) is its own cargo workspace (root
   # `exclude`), so no other job builds it. Both legs build the abi3 wheel,
   # install it into a fresh venv and run the pytest suite from outside the
@@ -4377,7 +4451,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-release-${{ runner.os }}-
 
@@ -4476,7 +4550,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -4495,7 +4569,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
   cli-e2e-latency:
     name: CLI E2E Graph Latency
     # Allowlist (not `!= 'pull_request'`), same as `test-latency` and for the
@@ -4550,7 +4624,7 @@ jobs:
           # test-latency) so it never shares a cache with the debug-profile
           # test-linux/test-macos jobs — a debug restore would force a full
           # release rebuild and risk tripping the 30-min timeout.
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-release-${{ runner.os }}-
 
@@ -4572,7 +4646,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -4595,7 +4669,7 @@ jobs:
           # test-latency) so it never shares a cache with the debug-profile
           # test-linux/test-macos jobs — a debug restore would force a full
           # release rebuild and risk tripping the 30-min timeout.
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
   fuzz:
     name: Fuzz (Linux)
     runs-on: ubuntu-latest
@@ -4631,7 +4705,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/cargo-fuzz
             target
-          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-fuzz-${{ runner.os }}-
 
@@ -4689,7 +4763,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -4709,7 +4783,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/cargo-fuzz
             target
-          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
   miri:
     name: Miri (Linux, scoped to FFI-free tests)
     runs-on: ubuntu-latest
@@ -4748,7 +4822,7 @@ jobs:
             ~/.cargo/git
             ~/.cache/miri
             target
-          key: cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-miri-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-miri-${{ runner.os }}-
 
@@ -4777,7 +4851,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-miri-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -4797,7 +4871,7 @@ jobs:
             ~/.cargo/git
             ~/.cache/miri
             target
-          key: cargo-miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-miri-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
   docs:
     name: Documentation
     runs-on: ubuntu-latest
@@ -4859,7 +4933,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-docs-main-
@@ -4888,7 +4962,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -4907,7 +4981,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-docs-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   netd-wan:
     name: netd WAN (clippy + docs, --features wan)
     runs-on: ubuntu-latest
@@ -4962,7 +5036,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-netd-wan-main-
@@ -5193,7 +5267,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -5212,7 +5286,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [lint, changes]
@@ -5376,7 +5450,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-viz-${{ matrix.lane }}-${{ runner.os }}-main-
@@ -5540,7 +5614,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
       # Saved as the LAST step so a green job stores what it built, and never
       # from a merge-queue build: its branch is deleted after the batch, so
@@ -5559,7 +5633,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-viz-${{ matrix.lane }}-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   machete:
     name: Unused dependencies (cargo-machete, non-blocking)
     runs-on: ubuntu-latest
