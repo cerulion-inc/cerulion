@@ -677,13 +677,15 @@ pub const fn derive_stage_capacity(role: ReadStageRole, sizing: ReadStageSizing)
     // ONE record per consumed frame. An ORDINARY Body can out-run `depth` under
     // a refill, but its node's `burst` term is the same
     // `DATA_PENDING_CARRY_CLAMP`, so `depth + burst >= max_sets` already covers
-    // it. A `Drain` stage stages ONE record per drain whatever the batch
+    // it. A `Drain` stage stages ONE read record per drain whatever the batch
     // popped (`drain_samples`: a `DrainedBatch` with `popped` as a FIELD when
-    // the drain delivered, one `NoFrame` when it delivered nothing), so a queue
-    // provisioned deeper than the declaration by another consumer (the
-    // legacy-`Sync` site's `depth.max(sub_buf)`) yields a bigger `popped`,
-    // never more records. That is pinned by
-    // `a_drain_stage_holds_a_batch_deeper_than_its_declared_depth`.
+    // the drain delivered, one `NoFrame` when it delivered nothing), plus one
+    // `BatchFrame` record per other popped frame only when all of them and the
+    // read fit below the rim. A queue provisioned deeper than the declaration
+    // by another consumer (the legacy-`Sync` site's `depth.max(sub_buf)`)
+    // therefore yields a bigger `popped` and, when its frames do not fit, a
+    // read that names only its newest frame, never a dropped read. That is
+    // pinned by `a_drain_stage_holds_a_batch_deeper_than_its_declared_depth`.
     let consuming = sizing.depth as u64;
     // Run-length encoding folds a maximal run of identical non-consuming
     // records to ONE counted record, which shrinks this arm's COMMON-case
@@ -1215,7 +1217,10 @@ pub enum ReadOutcomeKind {
     /// the read record that follows on the same stage and read site popped it.
     /// `served_seq` is that frame's wire sequence, `popped` is 0. Staged in pop
     /// order, before the read, one per consumed frame, so the read log names
-    /// every frame a read consumed (`trace_format` 9).
+    /// every frame a read consumed (`trace_format` 9). A read's batch frames
+    /// are staged only when all of them and the read fit below the stage's rim
+    /// (`ReadOutcomeStage::has_room`); otherwise none is, and the read names
+    /// only its newest frame.
     BatchFrame = 8,
 }
 
@@ -1577,6 +1582,13 @@ impl ReadOutcomeStage {
     #[inline]
     pub fn capacity(&self) -> u32 {
         self.capacity.load(Ordering::Relaxed)
+    }
+
+    /// Whether `slots` more records fit below this stage's rim in the open
+    /// merge window. A disarmed stage records nothing and answers `false`.
+    pub(crate) fn has_room(&self, slots: usize) -> bool {
+        self.is_armed()
+            && self.lock_inner().records.len().saturating_add(slots) <= self.capacity() as usize
     }
 
     /// Records dropped at capacity over this stage's LIFETIME — an

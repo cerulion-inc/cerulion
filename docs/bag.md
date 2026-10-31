@@ -998,7 +998,11 @@ A format 9 recording also names every OTHER frame a multi-frame read
 consumed. Before a read that popped more than one frame the recorder writes one
 `batch_frame` record (outcome kind 8) per consumed frame the read does not
 name, in pop order, each carrying that frame's wire sequence and, on an
-annotated edge, its own writer annotation. A batch's frames need not be
+annotated edge, its own writer annotation. They are written only when all of
+them and the read fit in the read stage's window; a batch deeper than that (a
+queue another consumer provisioned deeper than this input's declared depth, say)
+keeps its read record, which then names only its newest frame, and a fed replay
+refuses that read by name. A batch's frames need not be
 consecutive: on a `drop_oldest` queue a writer can refill and overflow the
 queue while the node's callback runs between two receives of one batch, so a
 depth-two queue can hand one batch 1, then 19 and 20 (2 to 18 evicted while the

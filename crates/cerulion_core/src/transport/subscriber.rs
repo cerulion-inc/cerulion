@@ -1870,8 +1870,9 @@ impl CerulionSubscriber {
 
     /// Before a read that popped more than one frame, stage one `BatchFrame`
     /// record per popped frame other than the one the read names, in pop
-    /// order, each with its writer annotation when the edge carries writers.
-    /// Clears the drain's frame list either way.
+    /// order, each with its writer annotation when the edge carries writers,
+    /// when all of them and the read fit below the stage's rim. Clears the
+    /// drain's frame list either way.
     fn stage_batch_frames(
         &self,
         stage: &ReadOutcomeStage,
@@ -1891,7 +1892,18 @@ impl CerulionSubscriber {
                 _ => frames.len(),
             };
             let annotate = self.capture_producer_token();
-            for &(seq, token) in &frames[..named] {
+            // A batch frame or a read takes at most two slots with a writer
+            // annotation and one without. The frames are staged only when all
+            // of them and the read fit, so a batch's own frames never push its
+            // read past the rim: a read whose frames do not fit names only its
+            // newest frame, and a fed replay refuses it by name.
+            let slots_each = if annotate { 2 } else { 1 };
+            let staged = if stage.has_room((named + 1) * slots_each) {
+                named
+            } else {
+                0
+            };
+            for &(seq, token) in &frames[..staged] {
                 if annotate {
                     stage.record_with_producer(
                         ReadOutcomeKind::BatchFrame,
@@ -6189,11 +6201,13 @@ mod tests {
     /// deeper can drain more records than the stage holds and lose read-log
     /// records.
     ///
-    /// It cannot: a `Drain` stage's record population is not a function of the
-    /// batch SIZE. `drain_samples` stages ONE `DrainedBatch` per non-empty
-    /// drain — `if capture && count > 0 { .. stage once .. }` — and the number
-    /// of frames popped rides that single record as its `popped` FIELD. A
-    /// deeper queue therefore yields a bigger `popped`, never more records.
+    /// It cannot lose the READ: `drain_samples` stages ONE `DrainedBatch` per
+    /// non-empty drain (`if capture && count > 0 { .. stage once .. }`), and
+    /// the number of frames popped rides that single record as its `popped`
+    /// FIELD. The `BatchFrame` records naming the other popped frames
+    /// (`trace_format` 9) are staged only when all of them and the read fit
+    /// below the rim, so a deeper queue yields a bigger `popped` and, here, a
+    /// read that names only its newest frame, never a dropped record.
     ///
     /// This drives exactly the shape the concern describes: a subscriber
     /// buffer of 16 against a stage sized from a DECLARED depth of 2 (whose
@@ -6294,9 +6308,9 @@ mod tests {
                 role: ReadSiteRole::Drain,
                 run_count: 1,
             }],
-            "ONE record for the whole batch, with the frame count as `popped` — \
-             which is why a queue provisioned deeper than the declaration cannot \
-             overflow a stage sized from that declaration"
+            "ONE record for the whole batch, with the frame count as `popped` and \
+             no batch frames, which do not fit: a queue provisioned deeper than the \
+             declaration cannot overflow a stage sized from that declaration"
         );
         assert_eq!(
             stage.dropped(),
