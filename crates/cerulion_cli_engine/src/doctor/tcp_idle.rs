@@ -8,6 +8,10 @@
 //! warning uses: any nonzero integer is on. The fix is the one that warning
 //! prints. The sysctl matters only to `tcp/` links, the default carrier.
 
+// The decision compiles and is tested on every host; only a Linux build calls
+// it from `run`.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use super::{Check, Context, Outcome, Reading, Status};
 use crate::tcp_idle_warning::{
     idle_reset_enabled, SLOW_START_AFTER_IDLE_SYSCTL, TCP_SLOW_START_AFTER_IDLE_WARNING,
