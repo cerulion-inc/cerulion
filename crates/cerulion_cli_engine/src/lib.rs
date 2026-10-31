@@ -20,6 +20,10 @@ pub mod auth;
 // Account self-service device management (list/revoke) + the robot-ACL
 // revocation engine seam (Studio / web account page; there is no CLI verb).
 pub mod account_cmd;
+pub mod account_identity;
+#[cfg(unix)]
+pub mod account_robot_access;
+pub mod account_robots;
 // `cerulion bag play` / `bag info` / `bag record` — the bag-as-a-data-source
 // verbs. `play` re-publishes recorded frames BYTE-VERBATIM onto local SHM, wall-paced
 // (the robot-substitute source for desk-side work); `record` is the desk-side
@@ -89,12 +93,16 @@ pub mod pair_cmd;
 // /v1/robots`) binds the logged-in account as THIS machine's owner and returns
 // the offline-verifiable owner grant. The install-funnel entry (a robot install,
 // not a desk); dials the account service via reqwest.
+#[cfg(unix)]
+pub mod robot_bootstrap;
 pub mod robot_cmd;
 // The desk-side device↔account binding resolver: reads the cached
 // `SignedDeviceCert` (~/.cerulion/device.cert) and resolves this machine's VERIFIED
 // cloud AccountId (asserting the cert attests THIS machine's device key). The
 // desk half of the binding the robot side enforces via `device_index`.
 pub mod device_binding;
+/// Consistent local certificate chains for automatic owner access.
+pub mod owner_certificate;
 // The peer-cache discovery rung + best-effort persist to
 // `~/.cerulion/peers.json` (warm peers for the next run).
 pub mod peer_cache;
@@ -260,6 +268,9 @@ pub mod schema_store;
 // has it" cannot be expressed in Cargo at all — the probe lives here, and
 // `node build` consults it. Pure decision core + an injected pkg-config probe.
 pub mod system_deps;
+// The `graph run` warning for a tcp/ link on a host that resets idle TCP
+// connections to the initial congestion window.
+pub mod tcp_idle_warning;
 // The shared near-miss key predicate for hand-authored config
 // files whose FOREIGN sibling keys must stay legal (`~/.cerulion/config.toml`,
 // `~/.cerulion/robots.toml`), plus the Levenshtein bound `system_deps`'

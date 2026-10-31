@@ -305,7 +305,8 @@ impl Drop for Producers {
 }
 
 /// Spawn a continuous producer publishing `oracle_frame(seq)` for seq = 0,1,2,…
-/// on `topic` until `stop` is set. Returns the join handle.
+/// on `topic` until `stop` is set. Returns once its publisher exists (see
+/// [`spawn_producer_with`]).
 fn spawn_producer(
     manager: Arc<TransportManager>,
     topic: String,
@@ -323,10 +324,36 @@ fn spawn_producer_tagged(
     tag: Option<u8>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    spawn_producer_with(manager, topic, tag, Duration::ZERO, stop)
+}
+
+/// Spawn a producer that sleeps `start_delay` before it creates its publisher,
+/// and return only once that publisher exists on `manager`'s root.
+///
+/// The robot's demand handler OPENS the demanded topic's data service and never
+/// creates it, so a demand that reaches the robot before this thread has
+/// created the service is refused as an unknown topic. The connect client then
+/// creates no re-inject service for it, and the desk-local tap waits out its
+/// whole readiness budget on a root that lists nothing. Blocking here until the
+/// publisher exists puts that ordering on the producer's own readiness signal.
+/// The wait is bounded by the start delay plus [`STEP_TIMEOUT`]; a producer
+/// that misses it is left detached rather than joined, since joining a thread
+/// stuck in creation would trade this refusal for a hang.
+fn spawn_producer_with(
+    manager: Arc<TransportManager>,
+    topic: String,
+    tag: Option<u8>,
+    start_delay: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let named = topic.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(start_delay);
         let mut publisher = manager
             .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
             .expect("producer");
+        let _ = ready_tx.send(());
         let mut seq = 0u32;
         while !stop.load(Ordering::Relaxed) {
             let frame = match tag {
@@ -337,7 +364,21 @@ fn spawn_producer_tagged(
             seq = seq.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(5));
         }
-    })
+    });
+    match ready_rx.recv_timeout(start_delay + STEP_TIMEOUT) {
+        Ok(()) => handle,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the producer for {named} did not create its publisher within {:?}",
+            start_delay + STEP_TIMEOUT
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            panic!(
+                "the producer for {named} exited before creating its publisher; \
+                 its own panic is printed above"
+            )
+        }
+    }
 }
 
 /// Wait until `topic`'s re-injection service is LISTED on `manager`'s root,
@@ -347,9 +388,13 @@ fn spawn_producer_tagged(
 ///
 /// [`TransportManager::list_topics`] is the readiness read because it opens no
 /// port and registers this node with no service: it enumerates the root's static
-/// service configs. A retry loop around `create_data_only_subscriber` instead
-/// spends the one budget it has on the loopback handshake, and reports an empty
-/// collection where the stream was merely late.
+/// service configs. A service is listed once its static config is unlocked,
+/// before its creator has made the dynamic config, and an open in that window
+/// waits for it only up to iceoryx2's `creation_timeout`; a creator slower than
+/// that fails the attach. The attach is therefore retried until the same
+/// deadline, and the last attach error is returned with the attempt count. The
+/// listing gates the first attach, so a topic nobody created reports readiness,
+/// never an iceoryx2 open error.
 fn attach_tap_when_listed(
     manager: &TransportManager,
     topic: &str,
@@ -371,46 +416,116 @@ fn attach_tap_when_listed(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    manager
-        .create_data_only_subscriber(topic)
-        .map_err(|e| format!("the listed re-inject service for {topic} would not attach: {e}"))
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match manager.create_data_only_subscriber(topic) {
+            Ok(tap) => return Ok(tap),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "the listed re-inject service for {topic} would not attach in \
+                     {attempts} attempt(s) within {ready_budget:?}: {e}"
+                ))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Tap reads grouped into RUNS, a run being every frame read between two empty
+/// reads, and a frame accepted only once its run has closed short of `depth`.
+///
+/// The tap's queue drops its oldest frame only when it is full, and the tap
+/// reads every frame of a full queue before it next reads empty, so a run that
+/// reached `depth` frames is the only place a drop can hide. Until a run closes
+/// its length is unknown, so its frames stay pending; a run that closes at
+/// `depth` or more discards itself and everything accepted before it.
+struct RunGate<T> {
+    depth: usize,
+    run_len: usize,
+    run: Vec<T>,
+    accepted: Vec<T>,
+    restarts: usize,
+}
+
+impl<T> RunGate<T> {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth: depth.max(1),
+            run_len: 0,
+            run: Vec::new(),
+            accepted: Vec::new(),
+            restarts: 0,
+        }
+    }
+
+    /// A non-empty read: `read` frames left the queue, `kept` of them carry a
+    /// wire header. The read count, not `kept`, measures the run.
+    fn on_read(&mut self, read: usize, kept: impl IntoIterator<Item = T>) {
+        self.run_len += read;
+        self.run.extend(kept);
+    }
+
+    /// An empty read closes the current run.
+    fn on_empty(&mut self) {
+        if self.run_len >= self.depth {
+            self.restarts += 1;
+            self.accepted.clear();
+            self.run.clear();
+        } else {
+            self.accepted.append(&mut self.run);
+        }
+        self.run_len = 0;
+    }
 }
 
 /// Attach the desk-local data-only tap on `topic` once its re-injection service
 /// is listed, then collect `n` full frames and their sequences. Blocking, so it
 /// runs under `spawn_blocking`.
+///
+/// The robot forwards frames while the desk is still accepting its streams, so
+/// the connect client's reader finds that backlog buffered on the stream and
+/// re-injects it back to back. A burst that lands while this tap sleeps between
+/// polls can fill its queue, and a full queue drops its oldest frame: a gap
+/// that is this observer's own overflow, not a loss in the re-inject path.
+/// [`RunGate`] accepts only frames from runs that closed short of the queue
+/// depth, so a gap in what it returns is a real loss.
 fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
     let mut tap = match attach_tap_when_listed(manager, topic, TAP_READY_TIMEOUT) {
         Ok(tap) => tap,
         Err(reason) => panic!("{reason}"),
     };
     let budget = tap.max_borrowed_samples().max(1);
+    let depth = tap.buffer_size();
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(budget);
-    let mut collected: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut gate = RunGate::new(depth);
     let deadline = Instant::now() + TAP_COLLECT_TIMEOUT;
-    while collected.len() < n && Instant::now() < deadline {
+    while gate.accepted.len() < n && Instant::now() < deadline {
         batch.clear();
         match tap.drain_owned(budget, &mut batch) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(3)),
-            Ok(_) => {
-                for sample in batch.drain(..) {
-                    let seq = sample.wire_header().map(|h| h.sequence);
-                    let frame = sample.payload().to_vec();
-                    drop(sample);
-                    if let Some(s) = seq {
-                        collected.push((s, frame));
-                    }
-                }
+            Ok(0) => {
+                gate.on_empty();
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            Ok(read) => {
+                let kept = batch.drain(..).filter_map(|sample| {
+                    let seq = sample.wire_header().map(|h| h.sequence)?;
+                    Some((seq, sample.payload().to_vec()))
+                });
+                gate.on_read(read, kept);
             }
             Err(_) => std::thread::sleep(Duration::from_millis(3)),
         }
     }
     assert!(
-        collected.len() >= n,
-        "collected only {} of {n} frames for {topic}",
-        collected.len()
+        gate.accepted.len() >= n,
+        "collected only {} of {n} frames for {topic} within {TAP_COLLECT_TIMEOUT:?} \
+         ({} restart(s) after a run of {} or more frames between empty reads)",
+        gate.accepted.len(),
+        gate.restarts,
+        gate.depth
     );
-    collected
+    gate.accepted
 }
 
 /// The desk `ConnectConfig` dialing a robot at `daemon`, demanding `topics`.
@@ -514,11 +629,11 @@ async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         .expect("desk join")
         .expect("run_connect ok");
     assert!(
-        summary
-            .per_topic
-            .iter()
-            .any(|s| s.topic == topic && s.reinjected >= n as u64),
-        "summary must report the re-injected topic: {:?}",
+        summary.per_topic.iter().any(|s| s.topic == topic
+            && s.reinjected >= n as u64
+            && s.rejected == 0
+            && s.reinject_failed == 0),
+        "summary must report the re-injected topic with nothing refused or failed: {:?}",
         summary.per_topic
     );
     let _ = bounded("robot join", robot).await;
@@ -1047,6 +1162,14 @@ async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32,
         summary.per_topic.len(),
         2,
         "both topics streamed: {:?}",
+        summary.per_topic
+    );
+    assert!(
+        summary
+            .per_topic
+            .iter()
+            .all(|s| s.rejected == 0 && s.reinject_failed == 0),
+        "nothing refused or failed on either topic: {:?}",
         summary.per_topic
     );
     let _ = bounded("robot join", robot).await;
@@ -1935,6 +2058,93 @@ fn a_tap_on_an_unlisted_topic_reports_readiness_not_an_attach_failure() {
         !reason.contains("PublishSubscribeOpenError"),
         "the listing read must gate the attach: an attach-first order reports \
          iceoryx2's open error instead: {reason}"
+    );
+}
+
+/// The overflow path a per-read counter misses: two frames, an empty read, then a
+/// burst that overflowed the queue during the sleep. Frames read from the burst
+/// before its run closes stay pending, so they never complete a collection
+/// across the gap; once the run closes at the queue depth, it and everything
+/// before it are discarded, and the next short run is accepted.
+#[test]
+fn the_run_gate_holds_a_run_until_it_closes_short_of_the_queue_depth() {
+    let mut gate = RunGate::new(16);
+    gate.on_read(2, [11u32, 12]);
+    gate.on_empty();
+    assert_eq!(
+        gate.accepted,
+        vec![11, 12],
+        "a closed short run is accepted"
+    );
+
+    // The queue overflowed while the tap slept: it now holds 25..=40.
+    gate.on_read(2, [25, 26]);
+    gate.on_read(2, [27, 28]);
+    assert_eq!(
+        gate.accepted,
+        vec![11, 12],
+        "an open run is never accepted, so 6 frames cannot be reached across the gap"
+    );
+    for pair in (29..=40).collect::<Vec<u32>>().chunks(2) {
+        gate.on_read(pair.len(), pair.iter().copied());
+    }
+    gate.on_empty();
+    assert!(
+        gate.accepted.is_empty(),
+        "a run that reached the depth discards itself and all before it: {:?}",
+        gate.accepted
+    );
+    assert_eq!(gate.restarts, 1);
+
+    gate.on_read(1, [41]);
+    gate.on_empty();
+    gate.on_read(1, [42]);
+    gate.on_empty();
+    assert_eq!(
+        gate.accepted,
+        vec![41, 42],
+        "live runs after the burst are accepted"
+    );
+}
+
+/// A run one short of the depth cannot have overflowed and is kept whole; a
+/// header-less frame counts toward the run but is not returned.
+#[test]
+fn the_run_gate_keeps_a_run_below_the_depth_and_counts_unkept_reads() {
+    let mut gate = RunGate::new(4);
+    gate.on_read(3, [1u32, 2, 3]);
+    gate.on_empty();
+    assert_eq!(gate.accepted, vec![1, 2, 3]);
+    assert_eq!(gate.restarts, 0);
+
+    gate.on_read(4, [4, 5, 6]);
+    gate.on_empty();
+    assert_eq!(
+        gate.restarts, 1,
+        "four reads reach the depth even with three kept"
+    );
+    assert!(gate.accepted.is_empty());
+}
+
+/// A spawned producer's topic exists on the robot's root by the time the spawn
+/// returns, however late the thread creates its publisher, so a demand sent
+/// after it is not refused as an unknown topic.
+#[test]
+fn a_spawned_producer_exists_before_the_spawn_returns() {
+    let manager = test_manager("lateprod");
+    let topic = format!("/reinj/lateprod/{}", unique_id());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer_with(
+        manager.clone(),
+        topic.clone(),
+        None,
+        Duration::from_millis(500),
+        producers.stop(),
+    ));
+    let listed = manager.list_topics().expect("topic listing");
+    assert!(
+        listed.iter().any(|t| t == &topic),
+        "the producer's service exists once the spawn returns: {listed:?}"
     );
 }
 

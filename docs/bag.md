@@ -40,7 +40,7 @@ else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
 **no output**: its `dds_bridge` node still needs its external DDS inputs. Use
 plain playback to view an attached ROS 2 recording without the robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
-what makes it deterministic (Principle #7). Together those two properties mean
+what makes it deterministic: a replay matches the live run. Together those two properties mean
 `--resim` cannot drive a viewer.
 
 ### `--resim` is NEUTRAL; `--verify` is the verdict
@@ -57,6 +57,46 @@ modes; a flag that shapes the VERDICT (`--report`, `--tolerance`) needs `--verif
 1 = data violation, 2 = bag I/O or not-replay-grade, 3 = node cdylib load error
 or a node that panicked, 4 = tolerance-YAML validation error, 5 = internal, 6 =
 structural trace divergence.
+
+A pass ends the verdict with one line naming the bag, the ticks it re-executed
+and the topics it credited:
+
+```
+replay PASS: <bag> (<N> tick(s) replayed, <P>/<M> topic(s) matched byte-for-byte and were credited)
+```
+
+Data violations (exit 1) print a block instead, also printed beside an exit-3
+node failure or an exit-6 schedule divergence report: a header naming the bag,
+the tally, one line per violation with its topic, its class and what was
+measured, and the count of topics passed at the end:
+
+```
+FRAME-CONTENT DIVERGENCE: <bag>
+  <N> tick(s) replayed; <P>/<M> topic(s) matched and were credited; <V> violation(s):
+  - <topic> [<class>]: <detail>
+  Topics passed: <P>/<M>
+```
+
+The class is one of `missing-topic`, `extra-topic`, `missing-messages`,
+`extra-messages`, `byte-mismatch`, `record-side-tap-loss` and
+`tolerance-exceeded`. A `tolerance-exceeded` detail names the field, the metric
+and the worst frame:
+
+```
+field '<field>' exceeded the <metric> tolerance on '<topic>': worst value <x> vs threshold <t> (worst at frame <k>)
+```
+
+For the set and list metrics the worst value is `1` against a threshold of `0`.
+When the worst frame has no finite value, `worst value <x>` reads
+`numeric overflow computing <metric>` or
+`worst frame structurally incomparable (length mismatch / NaN / ragged bbox / decode failure)`
+instead.
+
+When the verifier left a topic out of the full comparison, the PASS line and
+the block's first tally add
+`; <K> DECLINED (<J> of them matched under the fallback, not credited)` after
+"credited" (the closing `Topics passed` line does not), and a declined topic is
+not counted in `<P>` even when it matched.
 
 One refusal worth knowing by name: a bag (or graph file) whose declared `name:`
 iceoryx2 cannot represent (longer than 128 bytes, or carrying any non-ASCII
@@ -144,6 +184,70 @@ indistinguishable from a cut worker, because only a LATER boundary can prove a
 step completed and the final step has none. The cost is the same under either
 reading, and the note states it: an over-fire in that one
 step, for that one rank, is not caught.
+
+### `--tolerance`: relaxing the comparison per field
+
+`--verify` is byte-exact unless a tolerance document says otherwise. The
+document names topics, and inside each topic the fields to judge by a metric;
+everything it does not cover stays byte-exact.
+
+```yaml
+# tolerance.yaml
+default_metric:          # optional; omitted means bit_exact
+  kind: bit_exact
+topics:
+  /percepmin/detector/detections:
+    fields:
+      boxes:
+        kind: bbox_iou
+        min_iou: 0.5
+      scores:
+        kind: max_abs
+        threshold: 0.05
+      class_ids:
+        kind: set_equal
+```
+
+```
+cerulion bag play "$BAG" --resim all --verify --tolerance tolerance.yaml
+```
+
+| `kind` | Parameter | Passes when |
+|---|---|---|
+| `bit_exact` | none | the bytes are identical (the default) |
+| `max_abs` | `threshold` (`>= 0`) | every element is within `threshold` of its recorded value |
+| `max_rel` | `threshold` (`>= 0`) | every element's absolute difference, divided by the larger of its recorded value's magnitude and `1e-12`, is within `threshold` |
+| `rmse` | `threshold` (`>= 0`) | the root mean square error over the field is within `threshold` |
+| `bbox_iou` | `min_iou` (in `[0, 1]`) | the boxes (a flattened `[x, y, w, h]` `float64[]`) pair one to one with the recorded boxes, in any order, with every pair at or above `min_iou` intersection over union, and no box has zero or negative width or height |
+| `set_equal` | none | the same set of values, in any order |
+| `set_subset` | none | the recorded set is a subset of the replayed set |
+| `ordered_list_equal` | none | the same values in the same positions |
+
+Each field's metric resolves in this order: its own `fields:` entry, then a
+topic-wide `metric:` (a key beside that topic's `fields:`, taking the same
+`kind` and parameter), then the document's `default_metric:`. A topic-wide
+`metric:` therefore covers every field of that topic, and a non-`bit_exact`
+`default_metric` covers every field of every other topic, except a topic whose
+schema the workspace cannot resolve, which stays byte-exact under the default (a
+non-`bit_exact` topic-wide `metric:` on such a topic is an exit-4 error). A
+field that resolves to `bit_exact` stays byte-exact, and so does every topic the
+document does not name while `default_metric` is `bit_exact` (the default), so a
+drifting sibling field is still caught. A NaN or infinity in a field under any
+metric other than `bit_exact` never passes, whatever the threshold. A field past
+its bound is an exit-1 `tolerance-exceeded` violation. A document in which every
+metric resolves to `bit_exact` has no effect, and the run warns that it has
+none.
+
+The document is validated strictly before any node loads, and every failure is
+exit 4: an unreadable file, an unknown or misspelled key at any level, a missing
+or out-of-range parameter, a topic the bag's graph does not carry or a field its
+schema does not have (with a suggestion when one is close), a `fields:` entry on
+a topic whose schema the workspace cannot resolve, and a non-`bit_exact` metric
+on a field that cannot be decoded field by field, whether named directly or
+covered by a topic-wide or default metric (`max_rel` and `rmse` on a 64-bit
+integer field are refused the same way, as they would lose precision).
+[`examples/perception/tolerance.yaml`](../examples/perception/tolerance.yaml) is
+the document behind the perception regression example.
 
 ---
 
@@ -599,6 +703,65 @@ per-topic accounting, rendered from its **per-tap** health record so that:
 The bag carries the full detail (including first/last sequence and the
 reconciliation terms) in its `__cerulion/record_health.json` attachment, which
 the summary always names.
+
+---
+
+## `cerulion bag migrate`
+
+```
+cerulion bag migrate <BAG> [-o PATH] [--dry-run] [--yes]
+```
+
+`bag migrate` writes a corrected copy of a bag the current release cannot
+re-simulate as recorded. It covers two cases:
+
+- **Undefined graph keys.** An older bag may embed the on-disk
+  `graphs/<name>.yaml` rather than the config the run executed, so a setting the
+  graph format no longer defines (for example, a legacy
+  `policy:` block) travels into the bag, and `bag play --resim` refuses it
+  (exit 2). An MCAP attachment is sealed, so there is no way to edit it in
+  place. The copy carries the same graph with those keys removed.
+- **The 32-byte wire header.** A bag recorded by a release with the 32-byte
+  wire header is migrated even when its graph parses, or when it has no graph
+  at all (a `cerulion bag record` bag). Every whole user frame is written with
+  the current 40-byte header (an untagged step tag). Readers already upgrade
+  such frames as they read them, but a frame walk refuses a bag whose upgraded
+  copy would pass 2 GiB; `bag migrate` upgrades one message at a time and
+  writes a current copy of any size.
+
+It lists every key it would remove, with its path and its line in the embedded
+document, and every topic whose frames it upgrades, and asks before writing.
+`--dry-run` shows the list and writes nothing (it wins over `--yes`); `--yes`
+writes without asking and is required when stdin is not a terminal.
+
+| Property | Behaviour |
+|---|---|
+| Input | Read, never modified. The migrated bag is a second file, `<name>.migrated.mcap` beside the original unless `-o` says otherwise. |
+| Output path | A path that already exists, or that is the input, is refused rather than overwritten. |
+| Frames | Every recorded frame (user topics and Cerulion's internal streams alike) is copied with its topic, sequence, timestamps and payload bytes, in file order, except the header upgrade above. |
+| Attachments | The scheduler trace and every other attachment are copied unchanged. `graph.yaml`, when the bag has one, is replaced by the corrected graph, and one new `__cerulion/migration.json` attachment records the date, the source bag's name, size and SHA-256, the keys removed, and the upgraded topics under `wire_header_upgraded_topics`. |
+| The migrated graph | When the bag has one, re-rendered from the parsed config, so YAML comments and key order do not survive (the same normalization `graph run --record` applies). Your own `graphs/<name>.yaml` is not touched. |
+
+It refuses, writing nothing, when:
+
+- the bag's graph already parses and its frames already carry the current
+  header, or it has no embedded graph and its frames carry the current header
+  (nothing to migrate);
+- a 32-byte-header frame cannot be upgraded (shorter than the header, or
+  declaring a size past its end); `cerulion bag info` counts such frames;
+- the bag is not finalized (a torn bag has no attachment index;
+  `cerulion bag info` reports what is readable in it);
+- the graph fails to parse for a reason other than an undefined key, which is
+  YAML damage a rewrite cannot repair;
+- the bag already carries a `__cerulion/migration.json` attachment and still
+  needs migrating; migrate the original recording instead;
+- the bag records a channel this build's bag writer cannot register (it was
+  written by a newer release); migrate with that release;
+- a channel's schema descriptor, hash recipe or encoding is one this build
+  cannot reproduce faithfully.
+
+If the graph has simply moved on, re-recording from the current graph is the
+better answer; migration is for a recording of something you cannot do again.
 
 ---
 

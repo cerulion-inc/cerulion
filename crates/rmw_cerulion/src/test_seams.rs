@@ -754,6 +754,15 @@ pub(crate) fn maybe_clear_release_callback_in_adopt_report_window() {
     }
 }
 
+/// Run `f` (an rmw publish or send) with this thread's delivery-log output
+/// capture armed, as it is for an output under recording or replay, and
+/// return the FNV-1a hash and length of the payload body the output path
+/// captured (`None` when it captured none). Replay compares outputs by this
+/// hash, so two publishes of equal messages must capture equal hashes.
+pub fn capture_output_hash<R>(f: impl FnOnce() -> R) -> (R, Option<(u64, u32)>) {
+    crate::replay::capture_output_for_test(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::EnvVarGuard;

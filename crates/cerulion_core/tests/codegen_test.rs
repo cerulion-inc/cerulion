@@ -2548,3 +2548,73 @@ fn a_fixed_string_array_default_builds_owned_strings() {
         "fixed string array default missing:\n{code}"
     );
 }
+
+/// The body of the generated `pub fn from_bytes(bytes: &'a [u8])`, up to its
+/// closing brace.
+/// The function that builds the reader value: `from_bytes` and its copy
+/// fallback `__cer_from_bytes_copied` both return `Self::__cer_reader_at(..)`.
+fn reader_constructor_body(code: &str) -> &str {
+    let fn_body = |sig: &str| -> &str {
+        let start = code
+            .find(sig)
+            .expect("variable schema emits the reader function");
+        let rest = &code[start..];
+        &rest[..rest.find("\n    }\n").expect("reader function body ends")]
+    };
+    for caller in [
+        "pub fn from_bytes(bytes: &'a [u8]) -> Self {",
+        "fn __cer_from_bytes_copied(bytes: &'a [u8], table_end: usize) -> Self {",
+    ] {
+        assert!(
+            fn_body(caller).contains("Self::__cer_reader_at("),
+            "{caller} must build its reader through __cer_reader_at"
+        );
+    }
+    fn_body("fn __cer_reader_at(")
+}
+
+#[test]
+fn a_variable_reader_holds_no_topic_and_build_reader_is_inline() {
+    // A reader built by `from_bytes` sets `topic: None`: no `Arc` is cloned
+    // when it is built and none is released when it drops, so a receive does
+    // no atomic read-modify-write on a refcount every reader in the process
+    // shares. The writer constructor keeps the publisher's topic.
+    let mut schema = MessageSchema::new("Label");
+    schema.add_field(FieldDef::new("id", FieldType::U32));
+    schema.add_field(FieldDef::new("text", FieldType::String));
+    let code = generate_schema(&schema);
+
+    let body = reader_constructor_body(&code);
+    assert!(
+        body.contains("topic: ::std::option::Option::None,"),
+        "reader constructor must set topic to None:\n{body}"
+    );
+    assert!(
+        !body.contains("Arc"),
+        "reader constructor must not name an Arc (no clone on build):\n{body}"
+    );
+    assert!(code.contains("topic: ::std::option::Option<::std::sync::Arc<str>>,"));
+    assert!(code.contains("topic: ::std::option::Option::Some(topic),"));
+    // Every error path that names the topic falls back to the read-only name
+    // for a reader.
+    assert!(
+        !code.contains("as_ref(&self.topic)") && !code.contains("as_ref(&topic)"),
+        "an error path still reads the topic as a bare Arc"
+    );
+    assert!(
+        code.contains("self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)")
+    );
+
+    // `build_reader` is `#[inline]` for a variable schema and a fixed one, so
+    // a message crate built without LTO inlines it at the receive site.
+    let mut fixed = MessageSchema::new("Point2");
+    fixed.add_field(FieldDef::new("x", FieldType::F64));
+    fixed.add_field(FieldDef::new("y", FieldType::F64));
+    let fixed_code = generate_schema(&fixed);
+    for code in [code.as_str(), fixed_code.as_str()] {
+        assert!(
+            code.contains("    #[inline]\n    fn build_reader(bytes: &[u8]) -> Self::Reader<'_> {"),
+            "build_reader must carry #[inline]"
+        );
+    }
+}

@@ -266,6 +266,26 @@ pub unsafe extern "C" fn rmw_serialized_message_resize(
 pub unsafe extern "C" fn rmw_publish_serialized_message(
     publisher: *const ffi::rmw_publisher_t,
     serialized_message: *const ffi::rmw_serialized_message_t,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_serialized_live(publisher, serialized_message, allocation);
+    }
+    crate::replay::output(
+        (*publisher).data as usize,
+        crate::replay::log::OutputKind::Publish,
+        || publish_serialized_live(publisher, serialized_message, allocation),
+    )
+}
+
+/// The live `rmw_publish_serialized_message`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish_serialized_message`].
+unsafe fn publish_serialized_live(
+    publisher: *const ffi::rmw_publisher_t,
+    serialized_message: *const ffi::rmw_serialized_message_t,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
@@ -371,6 +391,13 @@ pub unsafe extern "C" fn rmw_publish_serialized_message(
         header.timestamp_ns = now;
         header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
         let bytes = &frame[..];
+        if crate::replay::output_capture_armed() {
+            crate::replay::capture_output_body(
+                bytes
+                    .get(cerulion_core::wire::WireHeader::SIZE..)
+                    .unwrap_or(&[]),
+            );
+        }
         match inner.publisher.publish_raw(bytes) {
             Ok(_) => {
                 // Native history: publish_raw retained this
@@ -430,6 +457,9 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         }
         *taken = false;
         let data = &*((*subscription).data as *const crate::runtime::SubscriptionData);
+        // A serialized take bypasses the bridge: a recording marks its log not
+        // replayable.
+        crate::replay::report_serialized_take(&data.topic);
         // Poisoned = wedged: never re-enter torn iceoryx2 state.
         let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
             tracing::error!("entity wedged by an earlier panic; failing call");
@@ -893,11 +923,26 @@ pub unsafe extern "C" fn rmw_count_publishers(
     let Ok(key) = runtime::ros_topic_to_cerulion(topic) else {
         return RMW_RET_INVALID_ARGUMENT;
     };
-    count_in(
-        // The endpoint Vec IS the count — no parallel counter.
-        move |g| g.publishers.get(&key).map(|v| v.len()).unwrap_or(0),
-        count,
-    )
+    if count.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    let (ret, n) = crate::replay::graph(
+        crate::replay::log::GraphQuery::CountPublishers,
+        topic,
+        || {
+            let mut n = 0usize;
+            // The endpoint Vec IS the count: no parallel counter.
+            let ret = count_in(
+                move |g| g.publishers.get(&key).map(|v| v.len()).unwrap_or(0),
+                &mut n,
+            );
+            (ret, n as u64)
+        },
+    );
+    if ret == RMW_RET_OK {
+        *count = n as usize;
+    }
+    ret
 }
 
 /// # Safety
@@ -919,10 +964,25 @@ pub unsafe extern "C" fn rmw_count_subscribers(
     let Ok(key) = runtime::ros_topic_to_cerulion(topic) else {
         return RMW_RET_INVALID_ARGUMENT;
     };
-    count_in(
-        move |g| g.subscriptions.get(&key).map(|v| v.len()).unwrap_or(0),
-        count,
-    )
+    if count.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    let (ret, n) = crate::replay::graph(
+        crate::replay::log::GraphQuery::CountSubscribers,
+        topic,
+        || {
+            let mut n = 0usize;
+            let ret = count_in(
+                move |g| g.subscriptions.get(&key).map(|v| v.len()).unwrap_or(0),
+                &mut n,
+            );
+            (ret, n as u64)
+        },
+    );
+    if ret == RMW_RET_OK {
+        *count = n as usize;
+    }
+    ret
 }
 
 /// # Safety
@@ -1262,6 +1322,100 @@ pub unsafe extern "C" fn rmw_get_subscriptions_info_by_topic(
             ffi::RMW_ENDPOINT_SUBSCRIPTION,
         )
     })
+}
+
+/// The argument checks `rmw/get_service_endpoint_info.h` lists ahead of
+/// any query, in its order, then `RMW_RET_UNSUPPORTED` with `refusal` set
+/// as the rcutils error string. `GraphRegistry::services` and `::clients`
+/// hold one `(type name, count)` pair per service name and no per-endpoint
+/// node name, namespace, gid or QoS, so no `rmw_service_endpoint_info_t`
+/// can be filled from them.
+///
+/// # Safety
+/// `node`, `allocator`, `service_name` and `out` must each be null or
+/// point to a live object of its type.
+#[cfg(cerulion_has_service_endpoint_info)]
+unsafe fn service_endpoint_info_unsupported(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    out: *mut ffi::rmw_service_endpoint_info_array_t,
+    refusal: &'static std::ffi::CStr,
+) -> rmw_ret_t {
+    ffi::ffi_guard(RMW_RET_ERROR, || unsafe {
+        if node.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        // `rcutils_allocator_is_valid`: all four function pointers set.
+        let allocator_valid = !allocator.is_null() && {
+            let a = &*allocator;
+            a.allocate.is_some()
+                && a.deallocate.is_some()
+                && a.reallocate.is_some()
+                && a.zero_allocate.is_some()
+        };
+        if !allocator_valid || ffi::cstr(service_name).is_none() || out.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if (*out).size != 0 || !(*out).info_array.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if !ffi::is_our_identifier((*node).implementation_identifier) {
+            return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+        }
+        let _ = ffi::rcutils_set_error_state_cstr(refusal);
+        ffi::RMW_RET_UNSUPPORTED
+    })
+}
+
+/// Lyrical and later (`rmw/service_endpoint_info_array.h`): compiled out
+/// whole on a build whose headers lack
+/// `rmw_service_endpoint_info_array_t`. Validates its
+/// arguments, then answers `RMW_RET_UNSUPPORTED` with an rcutils error
+/// string naming the call: the runtime graph holds one `(type name,
+/// count)` pair per service and no per-client endpoint record.
+///
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_service_endpoint_info)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_get_clients_info_by_service(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    _no_mangle: bool,
+    clients_info: *mut ffi::rmw_service_endpoint_info_array_t,
+) -> rmw_ret_t {
+    service_endpoint_info_unsupported(
+        node,
+        allocator,
+        service_name,
+        clients_info,
+        c"rmw_get_clients_info_by_service is not supported by rmw_cerulion: it records no per-client endpoint information",
+    )
+}
+
+/// Lyrical and later; the server-side twin of
+/// [`rmw_get_clients_info_by_service`].
+///
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_service_endpoint_info)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_get_servers_info_by_service(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    _no_mangle: bool,
+    servers_info: *mut ffi::rmw_service_endpoint_info_array_t,
+) -> rmw_ret_t {
+    service_endpoint_info_unsupported(
+        node,
+        allocator,
+        service_name,
+        servers_info,
+        c"rmw_get_servers_info_by_service is not supported by rmw_cerulion: it records no per-server endpoint information",
+    )
 }
 
 // =====================================================================

@@ -204,6 +204,20 @@ impl IdentityLayout {
         self.config_dir.join(LEGACY_DESK_KEY_FILENAME)
     }
 
+    /// The file a reader that never writes takes the machine key from: the
+    /// canonical `identity/device.key` when that name exists (any file type,
+    /// so the reader's own checks see it), else the legacy `desk.key`. The
+    /// writer, [`IdentityLayout::load_or_create_machine_key`], keeps the two
+    /// names on one key and refuses a conflict.
+    pub fn machine_key_read_path(&self) -> PathBuf {
+        let canonical = self.device_key_path();
+        if std::fs::symlink_metadata(&canonical).is_ok() {
+            canonical
+        } else {
+            self.legacy_desk_key_path()
+        }
+    }
+
     /// `<config>/identity/<team>`.
     pub fn team_dir(&self, team: &TeamDirName) -> PathBuf {
         self.identity_dir().join(team.as_str())

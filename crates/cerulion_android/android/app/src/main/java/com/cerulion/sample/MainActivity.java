@@ -17,8 +17,10 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 
@@ -104,6 +106,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        CerulionRuntime.loadLibrary("cerulion_sample_runtime");
         int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
         if (init != CerulionRuntime.OK) {
             Log.e(TAG, "init=" + init);
@@ -271,7 +274,8 @@ public final class MainActivity extends Activity {
         } else if (getIntent().hasExtra("lan_access")) {
             Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
         }
-        config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
+        // No node_lib_dir: graph nodes come from the node registry of the
+        // loaded runtime library.
         // Timestamp + random suffix: a restart inside the same millisecond
         // cannot reopen the previous run's bag.
         config.put("record", new JSONObject().put("file",
@@ -281,19 +285,37 @@ public final class MainActivity extends Activity {
                 new JSONArray().put(new JSONObject()
                         .put("topic", "/app/heartbeat")
                         .put("schema", "std_msgs/String")));
-        File graph = new File(getFilesDir(), "graph.yaml");
-        // An absent graph.yaml means a publisher-only run; a path that exists
-        // but is not a regular file is a broken setup, so fail loudly instead
-        // of silently running without the intended graph.
-        if (graph.exists() && !graph.isFile()) {
-            throw new IOException(graph + " exists but is not a regular file");
-        }
-        if (graph.isFile()) {
-            config.put(
-                    "graph_yaml",
-                    new String(Files.readAllBytes(graph.toPath()), StandardCharsets.UTF_8));
-        }
+        config.put("graph_yaml", graphYaml(debuggable));
         return config.toString();
+    }
+
+    // The graph ships in the APK as assets/graph.yaml. A debuggable build
+    // runs files/graph.yaml instead when it exists, so a developer can try a
+    // graph change with run-as without rebuilding the APK.
+    private String graphYaml(boolean debuggable) throws IOException {
+        File override = new File(getFilesDir(), "graph.yaml");
+        if (debuggable) {
+            // A path that exists but is not a regular file is a broken
+            // setup, so fail loudly instead of running the packaged graph.
+            if (override.exists() && !override.isFile()) {
+                throw new IOException(override + " exists but is not a regular file");
+            }
+            if (override.isFile()) {
+                Log.i(TAG, "graph=" + override);
+                return new String(Files.readAllBytes(override.toPath()), StandardCharsets.UTF_8);
+            }
+        } else if (override.exists()) {
+            Log.w(TAG, "ignoring " + override + " in a release build; running the packaged graph");
+        }
+        try (InputStream asset = getAssets().open("graph.yaml")) {
+            ByteArrayOutputStream text = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            for (int read; (read = asset.read(buffer)) != -1; ) {
+                text.write(buffer, 0, read);
+            }
+            Log.i(TAG, "graph=assets/graph.yaml");
+            return new String(text.toByteArray(), StandardCharsets.UTF_8);
+        }
     }
 
     private String recordingFileName() {

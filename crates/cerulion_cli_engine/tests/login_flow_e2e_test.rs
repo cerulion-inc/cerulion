@@ -24,6 +24,7 @@ use cerulion_accountd::{
 use cerulion_cli_engine::account_cmd;
 use cerulion_cli_engine::auth::{self, LoadedAuth, LocalGate};
 use cerulion_cli_engine::login_cmd;
+use cerulion_cli_engine::owner_certificate;
 use serial_test::serial;
 
 // ===========================================================================
@@ -237,6 +238,17 @@ fn device_code_login_writes_auth_json_and_caches_cert() {
     assert!(
         home.path().join("desk.key").exists(),
         "the legacy desk.key names the same key"
+    );
+    let owner = owner_certificate::load().expect("login persists its complete owner chain");
+    assert_eq!(
+        owner.device_cert.cert.account,
+        cerulion_cli_engine::device_binding::resolve_device_binding()
+            .unwrap()
+            .account
+    );
+    assert_eq!(
+        owner.device_cert.cert.issuer_key,
+        owner.intermediate.cert.intermediate_key
     );
 
     // The gate now proceeds (fires-once semantics: the NEXT run reads this).
@@ -863,6 +875,7 @@ fn identity_only_login_drops_a_previous_account_device_cert() {
     // and reports THAT cert's account as this machine's binding.
     let cert_path = home.path().join("device.cert");
     std::fs::write(&cert_path, "cert-issued-to-account-a").unwrap();
+    std::fs::write(home.path().join("device-chain.json"), "old-chain-cache").unwrap();
 
     let mut buf = SharedBuf::new();
     let state = login_cmd::run_login(&mut buf).expect("the identity-only login succeeds");
@@ -873,6 +886,10 @@ fn identity_only_login_drops_a_previous_account_device_cert() {
         "a login that was issued no cert must not leave the previous account's cert \
          authoritative for device binding"
     );
+    assert!(owner_certificate::load()
+        .unwrap_err()
+        .to_string()
+        .contains("current device certificate is unavailable"));
 }
 
 /// A cert is stale only once a NEW account has been resolved. `/v1/me` failing
@@ -1578,10 +1595,12 @@ fn start_certifying_issuer(
                             "account_id":"{account_id}"}}"#
                     ),
                 )
+            } else if request_line.starts_with("GET /v1/me ") {
+                (
+                    200,
+                    serde_json::json!({"account_id":account_id}).to_string(),
+                )
             } else {
-                // Including `/v1/me`: a certifying login must never need it, and
-                // an answer here would let a regression that skipped
-                // registration resolve the same account and pass.
                 (500, r#"{"error":"server_error"}"#.to_string())
             };
             let response = format!(
@@ -1615,6 +1634,8 @@ fn a_certifying_login_that_cannot_publish_its_state_caches_no_cert() {
     let home = tempfile::tempdir().unwrap();
     let own_cert = home.path().join("device.cert");
     std::fs::write(&own_cert, "cert-issued-to-account-a").unwrap();
+    let chain_path = home.path().join("device-chain.json");
+    std::fs::write(&chain_path, "previous-chain").unwrap();
     // A DIRECTORY where auth.json belongs: the atomic rename onto it refuses.
     std::fs::create_dir(home.path().join("auth.json")).unwrap();
     let _svc = EnvGuard::set(
@@ -1647,6 +1668,10 @@ fn a_certifying_login_that_cannot_publish_its_state_caches_no_cert() {
         "the previous account's cert is put back whole: a desk left holding \
          account-b's certificate under account-a's session is bound to an account \
          it is not signed in to"
+    );
+    assert_eq!(
+        std::fs::read_to_string(chain_path).unwrap(),
+        "previous-chain"
     );
 }
 
@@ -2011,6 +2036,10 @@ fn a_cert_target_that_refuses_the_rename_fails_the_login_with_no_cache_left() {
         "the session IS published — it is durable and correct, and re-running the \
          login is what re-certifies the desk: {published}"
     );
+    assert!(
+        !home.path().join("device-chain.json").exists(),
+        "a chain must not publish after a leaf consumer failed"
+    );
     let leftovers: Vec<String> = std::fs::read_dir(home.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -2020,6 +2049,41 @@ fn a_cert_target_that_refuses_the_rename_fails_the_login_with_no_cache_left() {
         leftovers.is_empty(),
         "with no staging files left behind: {leftovers:?}"
     );
+}
+
+#[test]
+#[serial]
+fn an_unpublishable_chain_reports_failure_after_caching_the_current_leaf() {
+    let (port, _served) = start_certifying_issuer("account-b", "cert-issued-to-account-b", 8);
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let chain = home.path().join("device-chain.json");
+    std::fs::create_dir(&chain).unwrap();
+
+    let error = login_cmd::run_login(&mut SharedBuf::new())
+        .expect_err("a chain rename failure must not report a fully usable login")
+        .to_string();
+    assert!(error.contains("device-chain.json"), "{error}");
+    assert_eq!(auth::load().state().unwrap().account_id, "account-b");
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("device.cert")).unwrap(),
+        "cert-issued-to-account-b"
+    );
+    assert!(owner_certificate::load()
+        .unwrap_err()
+        .to_string()
+        .contains("no readable complete device certificate chain"));
+    assert!(std::fs::read_dir(home.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp")
+    }));
 }
 
 /// The crash window the clear cannot close: it is a separate durable step from
@@ -2602,6 +2666,114 @@ fn start_refresh_holding_proxy(
     (port, held_rx, release_tx)
 }
 
+const HOSTED_UUID: &str = "00112233-4455-4677-8899-aabbccddeeff";
+const HOSTED_PAIRING_ID: &str = "Ah8KAGhm_eUlb1fPrQKgIvrp6ORzpuTTpHHx9L2D6Rc";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HostedIssue {
+    Valid,
+    MissingMapping,
+    WrongMapping,
+    WrongRegistration,
+    WrongChallenge,
+    WrongLeaf,
+    WrongKey,
+}
+
+/// A local hosted-shaped issuer signs the key actually sent by the login client.
+/// The pairing id is a shared handwritten protocol oracle, not computed by login.
+fn start_hosted_issuer(issue: HostedIssue) -> (u16, std::thread::JoinHandle<()>) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use cerulion_pairing::format::{
+        AccountId, DeviceCert, IntermediateCert, PrincipalKind, PublicKey, Scope, Validity,
+        FORMAT_VERSION,
+    };
+    use ed25519_dalek::SigningKey;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Read};
+        let deadline = Instant::now() + Duration::from_secs(15);
+        for _ in 0..5 {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    result => {
+                        panic!("hosted fixture did not receive its expected request: {result:?}")
+                    }
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut length = 0;
+            let mut opted_in = false;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" {
+                    break;
+                }
+                let lower = header.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if lower.trim() == "cerulion-pairing-protocol: 1" {
+                    opted_in = true;
+                }
+            }
+            assert!(
+                opted_in,
+                "every account request explicitly opts into pairing"
+            );
+            let mut payload = vec![0; length];
+            reader.read_exact(&mut payload).unwrap();
+            let body = if first.starts_with("POST /v1/auth/device/start ") {
+                serde_json::json!({"device_code":"hosted-code","user_code":"WXYZ-WXYZ","verification_uri":"http://127.0.0.1/device","verification_uri_complete":"http://127.0.0.1/device?user_code=WXYZ-WXYZ","expires_in":600,"interval":0})
+            } else if first.starts_with("POST /v1/auth/device/poll ") {
+                serde_json::json!({"session_token":"hosted-session","refresh_token":"hosted-refresh","expires_in":3600})
+            } else if first.starts_with("POST /v1/devices/challenge ") {
+                let account = if issue == HostedIssue::WrongChallenge { URL_SAFE_NO_PAD.encode([0x88;32]) } else { HOSTED_PAIRING_ID.into() };
+                serde_json::json!({"challenge":"hosted-challenge","account_id":account,"expires_in":300})
+            } else if first.starts_with("POST /v1/devices ") {
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                let mut device: [u8;32] = URL_SAFE_NO_PAD.decode(request["public_key"].as_str().unwrap()).unwrap().try_into().unwrap();
+                if issue == HostedIssue::WrongKey { device = SigningKey::from_bytes(&[0x77;32]).verifying_key().to_bytes(); }
+                let mut account: [u8;32] = URL_SAFE_NO_PAD.decode(HOSTED_PAIRING_ID).unwrap().try_into().unwrap();
+                if issue == HostedIssue::WrongLeaf { account = [0x66;32]; }
+                let issuer = SigningKey::from_bytes(&[0x22;32]);
+                let root = SigningKey::from_bytes(&[0x11;32]);
+                let validity = Validity { not_before_ns: 1, not_after_ns: u64::MAX };
+                let intermediate = IntermediateCert { version:FORMAT_VERSION, intermediate_key:PublicKey(issuer.verifying_key().to_bytes()), validity, issued_at_ns:1, max_scope:Scope::OWNER_FULL }.sign_by_roots(&[&root]);
+                let cert = DeviceCert { version:FORMAT_VERSION, device_key:PublicKey(device), account:AccountId(account), principal_kind:PrincipalKind::Human, scope:Scope::OWNER_FULL, validity, issued_at_ns:1, issuer_key:PublicKey(issuer.verifying_key().to_bytes()) }.sign(&issuer);
+                let registration = if issue == HostedIssue::WrongRegistration { URL_SAFE_NO_PAD.encode([0x55;32]) } else { HOSTED_PAIRING_ID.into() };
+                serde_json::json!({"device_id":"hosted-device","account_id":registration,"device_cert":URL_SAFE_NO_PAD.encode(postcard::to_stdvec(&cert).unwrap()),"intermediate":URL_SAFE_NO_PAD.encode(postcard::to_stdvec(&intermediate).unwrap())})
+            } else {
+                assert!(first.starts_with("GET /v1/me "), "unexpected route {first}");
+                let mut me = serde_json::json!({"account_id":HOSTED_UUID});
+                if issue != HostedIssue::MissingMapping {
+                    me["pairing_account_id"] = serde_json::json!(if issue == HostedIssue::WrongMapping { URL_SAFE_NO_PAD.encode([0x44;32]) } else { HOSTED_PAIRING_ID.into() });
+                }
+                me
+            }.to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    (port, worker)
+}
+
 #[test]
 #[serial]
 fn a_refresh_racing_a_logout_and_a_new_login_leaves_no_live_session_behind() {
@@ -2674,4 +2846,208 @@ fn a_refresh_racing_a_logout_and_a_new_login_leaves_no_live_session_behind() {
         reqwest::StatusCode::UNAUTHORIZED,
         "the session rotated during the sign-out must be revoked"
     );
+}
+
+#[test]
+#[serial]
+fn hosted_certificate_login_retains_uuid_and_loads_its_mapped_owner_chain() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let (port, worker) = start_hosted_issuer(HostedIssue::Valid);
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let state = login_cmd::run_login(&mut SharedBuf::new()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(state.account_id, HOSTED_UUID);
+    assert_eq!(auth::load().state().unwrap().account_id, HOSTED_UUID);
+    let owner = owner_certificate::load().unwrap();
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(owner.device_cert.cert.account.0),
+        HOSTED_PAIRING_ID
+    );
+    let binding = cerulion_cli_engine::device_binding::resolve_device_binding().unwrap();
+    assert_eq!(binding.account_b64(), HOSTED_PAIRING_ID);
+    // A missing consumer after partial publication is repaired against the UUID,
+    // while the chain and device id retain the same independently issued bytes.
+    std::fs::remove_file(home.path().join("device.cert")).unwrap();
+    let cert = URL_SAFE_NO_PAD.encode(postcard::to_stdvec(&owner.device_cert).unwrap());
+    auth::cache_verified_device_cert_at_absent_consumers(&cert, HOSTED_PAIRING_ID);
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("device.cert")).unwrap(),
+        cert
+    );
+    assert_eq!(
+        owner_certificate::load().unwrap().device_cert,
+        owner.device_cert
+    );
+}
+
+#[test]
+#[serial]
+fn inconsistent_hosted_certification_preserves_previous_auth_and_certificate_bytes() {
+    for issue in [
+        HostedIssue::MissingMapping,
+        HostedIssue::WrongMapping,
+        HostedIssue::WrongRegistration,
+        HostedIssue::WrongChallenge,
+        HostedIssue::WrongLeaf,
+        HostedIssue::WrongKey,
+    ] {
+        let (port, worker) = start_hosted_issuer(issue);
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+        let _service = EnvGuard::set(
+            "CERULION_ACCOUNT_SERVICE",
+            &format!("http://127.0.0.1:{port}"),
+        );
+        auth::write_to(
+            &home.path().join("auth.json"),
+            &auth::AuthState {
+                account_id: "previous-auth".into(),
+                session_token: "previous-session".into(),
+                refresh_token: "previous-refresh".into(),
+                expires_at_ns: 0,
+                logged_in_ever: true,
+                role: None,
+            },
+        )
+        .unwrap();
+        let auth_before = std::fs::read(home.path().join("auth.json")).unwrap();
+        // These are preservation canaries, never accepted as certificates.
+        std::fs::write(home.path().join("device.cert"), "previous-leaf-canary").unwrap();
+        std::fs::write(
+            home.path().join("device-chain.json"),
+            "previous-chain-canary",
+        )
+        .unwrap();
+        assert!(
+            login_cmd::run_login(&mut SharedBuf::new()).is_err(),
+            "accepted {issue:?}"
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            std::fs::read(home.path().join("auth.json")).unwrap(),
+            auth_before,
+            "{issue:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("device.cert")).unwrap(),
+            "previous-leaf-canary",
+            "{issue:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("device-chain.json")).unwrap(),
+            "previous-chain-canary",
+            "{issue:?}"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn concurrent_refreshes_spend_the_refresh_token_once_and_both_end_with_the_new_session() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // A refresh endpoint that answers slowly, so the two refreshes overlap, and
+    // counts every exchange it receives.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&exchanges);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert!(first.starts_with("POST /v1/auth/refresh "), "{first}");
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["refresh_token"], "single-use-refresh");
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                let reply = serde_json::json!({
+                    "session_token": "rotated-session",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 3600
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            });
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let auth_path = home.path().join("auth.json");
+    auth::write_to(
+        &auth_path,
+        &auth::AuthState {
+            account_id: "refresh-race-account".into(),
+            session_token: "stale-session".into(),
+            refresh_token: "single-use-refresh".into(),
+            expires_at_ns: 1,
+            logged_in_ever: true,
+            role: None,
+        },
+    )
+    .unwrap();
+
+    // Two independent refreshes at once (each thread opens its own lock file
+    // descriptor, so the kernel flock arbitrates them as it does two processes).
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                login_cmd::refresh_session_if_stale()
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    for result in &results {
+        if let Err(error) = result {
+            panic!("a refresh failed: {error}");
+        }
+    }
+    assert_eq!(
+        exchanges.load(Ordering::SeqCst),
+        1,
+        "the refresh token was spent once"
+    );
+    match auth::load_from(&auth_path) {
+        LoadedAuth::Present(state) => {
+            assert_eq!(state.session_token, "rotated-session");
+            assert_eq!(state.refresh_token, "rotated-refresh");
+            assert!(state.session_is_valid(auth::now_unix_ns()));
+        }
+        other => panic!("expected the refreshed session, got {other:?}"),
+    }
 }

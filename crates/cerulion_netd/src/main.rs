@@ -27,7 +27,9 @@ use cerulion_netd::catalog_events::{AnnounceWatchPlane, GatewayAnnounceWatchPlan
 use cerulion_netd::daemon::{self, NetdConfig};
 use cerulion_netd::discovery_fold;
 use cerulion_netd::egress::{EgressPlane, GatewayEgressPlane};
-use cerulion_netd::mirror::{GatewayMirrorPlane, MirrorPlane};
+#[cfg(not(feature = "wan"))]
+use cerulion_netd::mirror::GatewayMirrorPlane;
+use cerulion_netd::mirror::MirrorPlane;
 use cerulion_netd::net::LISTEN_ENV;
 use cerulion_netd::query::{GatewayQueryPlane, QueryPlane};
 use cerulion_netd::{default_socket_path, net};
@@ -66,6 +68,8 @@ its frames cross the network ONCE and every reader subscribes to the one local
 mirror. It exits by itself when no consumer has demanded a topic for the idle
 grace period. You normally never start it yourself: the first consumer starts it
 in the background on demand.
+Serving through LISTEN or local egress registration requires a prior `cerulion login`.
+Expired saved logins permit offline serving; network-off operation is exempt.
 
 OPTIONS:
     -h, --help       Print this help and exit.
@@ -76,7 +80,8 @@ ENVIRONMENT:
     CERULION_NETD_IDLE_GRACE_MS  Idle grace before self-exit, in ms (default 30000).
     CERULION_NETD_HARD_EXIT_MS   Deadline for graceful shutdown before the daemon
                                  HARD-exits (nonzero) to avoid a zombie, in ms
-                                 (default 5000).
+                                 (default 5000). A robot daemon adds
+                                 CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S to it.
     CERULION_NETD_CONNECT        Zenoh locators to CONNECT to for remote robots
                                  the boot-time mDNS browse and the peer cache
                                  can't reach (comma/space separated).
@@ -94,7 +99,9 @@ ENVIRONMENT:
                                  (so topics registered at runtime, such as ROS 2
                                  publishers on rmw_cerulion, are served with no
                                  graph run) and idle self-exit is DISABLED (the
-                                 daemon runs until SIGINT/SIGTERM).
+                                 daemon runs until SIGINT/SIGTERM). Requires a
+                                 prior `cerulion login`; an expired saved login
+                                 still permits offline LAN serving.
                                  CERULION_NETD_NETWORK=off wins.
     CERULION_NETD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no network ever).
     CERULION_MULTICAST_SCOUTING=on
@@ -103,6 +110,20 @@ ENVIRONMENT:
                                  network where mDNS does not cross. Default off: peers come from
                                  one `_cerulion._tcp` browse at boot plus the peer
                                  cache.
+    CERULION_UNENCRYPTED_QUIC=on Listen on unencrypted QUIC (udp/<host>:<port>?rel=1)
+                                 beside every tcp/ LISTEN locator, advertise it on
+                                 mDNS, and dial it first: a discovered peer that
+                                 advertises it, and a CONNECT locator written as
+                                 udp/<host>:<port>?rel=1, are probed over UDP at boot
+                                 and fall back to tcp/ on the same port with one
+                                 warning when QUIC does not answer. Explicit tcp/
+                                 CONNECT locators are used as written. No encryption
+                                 and no peer authentication, the same as tcp/.
+                                 Only the exact value on turns it on.
+    CERULION_NETD_QUIC_PROBE_TIMEOUT_MS
+                                 How long the boot probe waits for a QUIC answer
+                                 before falling back, in ms (default 1000;
+                                 values above 6000 are treated as 6000).
 ";
 
 /// The iroh WAN-plane env docs — appended to [`USAGE`] ONLY in a `--features wan`
@@ -126,6 +147,12 @@ const WAN_USAGE: &str = "    CERULION_NETD_WAN_ROBOTS     iroh WAN robots: a ';'
                                  Unset = the epochs/ dir next to CERULION_NETD_DESK_KEY
                                  (~/.cerulion/epochs). Absent = no push; dials proceed.
     CERULION_NETD_RELAY_DISABLED Set (non-empty) to disable iroh relays (LAN-only).
+
+A LISTEN-configured serving machine owns its WAN endpoint through remoted.
+Consuming other robots over WAN from a serving machine is not supported in
+this version; use the LAN plane. WAN demands are refused without a fallback.
+Automatic robot state defaults to <CERULION_HOME or ~/.cerulion>/robot-state;
+CERULION_STATE_ROOT preserves an explicit deployment root.
 ";
 
 /// No iroh WAN plane compiled in — no extra env docs.
@@ -212,10 +239,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // afterwards), browse `_cerulion._tcp` once and fold the answers plus the
     // verified `~/.cerulion/peers.json` cache into the connect endpoints, so a
     // desk dials a LAN robot with NO `CERULION_NETD_CONNECT`. Explicit env
-    // locators stay first and verbatim; discovered rows are TCP-probed so a dead
+    // locators stay first and verbatim (except an unanswered udp/...?rel=1 under
+    // CERULION_UNENCRYPTED_QUIC=on, see `quic_first`); discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
-    let (network, peer_fold) = match net::network_config_from_env() {
+    // A standing gateway serves only under a prior login.
+    let configured_network = net::network_config_from_env();
+    if net::standing_gateway_requested(configured_network.as_ref()) {
+        cerulion_netd::serving_login::require_prior_login()?;
+    }
+    let (network, peer_fold) = match configured_network {
         Some(cfg) => {
             let (cfg, fold) = discovery_fold::fold_discovered_peers(cfg);
             (Some(cfg), fold)
@@ -231,6 +264,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // are the machine's network presence and no refcounted demand holds them
     // open. LOCAL-ONLY (`network == None`) wins: nothing to boot.
     let standing_gateway = net::standing_gateway_requested(network.as_ref());
+    let egress_login =
+        cerulion_netd::serving_login::EgressLoginPolicy::for_network(network.is_some());
+    let network_enabled = network.is_some();
     let manager = TransportManager::init(TransportConfig {
         network,
         ..TransportConfig::default()
@@ -250,7 +286,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // query plane's GETs reuse the SAME lazy session (a query-only netd opens ONE
     // session and reuses it across every consumer's catalog/schema query, instead of
     // an N-transient-sessions-per-desk fan-out).
-    let mirror_plane = build_mirror_plane(Arc::clone(&manager), Arc::clone(&demand_authorizer))?;
+    let mirror_plane = build_mirror_plane(
+        Arc::clone(&manager),
+        Arc::clone(&demand_authorizer),
+        standing_gateway,
+        network_enabled,
+    )?;
     // Keep the CONCRETE plane too: the standing-gateway boot below
     // is a `GatewayEgressPlane` method, not part of the `EgressPlane` seam (the
     // spy planes the daemon tests inject have no gateway to boot).
@@ -285,6 +326,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // start-booted gateway (below) holds it open; it exits on
             // SIGINT/SIGTERM only. See `NetdConfig::idle_self_exit`.
             idle_self_exit: !standing_gateway,
+            egress_login,
+            account_identity_watch: cfg!(feature = "wan"),
             ..NetdConfig::default()
         },
     )?;
@@ -333,6 +376,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
     }
+    let mut robot_supervisor = if cfg!(feature = "wan") && standing_gateway {
+        match cerulion_netd::robot_supervisor::RobotSupervisor::start(
+            Arc::clone(&running),
+            Arc::clone(&gateway_egress_plane),
+        ) {
+            Ok(supervisor) => Some(supervisor),
+            Err(error) => {
+                tracing::error!(error = %error, "robot supervisor could not start; LAN remains available");
+                None
+            }
+        }
+    } else {
+        None
+    };
     while running.load(Ordering::SeqCst) && !netd.self_exit_requested() {
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -351,10 +408,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // hard-exits within the deadline so the daemon can NEVER linger as a zombie
     // holding the socket (the production wedge). On the healthy path
     // shutdown() returns well within the deadline, `main` returns, and the process
-    // exits normally before the watchdog fires.
-    spawn_hard_exit_watchdog(resolve_hard_exit_timeout(
-        std::env::var(HARD_EXIT_ENV).ok().as_deref(),
+    // exits normally before the watchdog fires. The deadline includes the robot
+    // supervisor's stop grace, during which its shutdown can wait for a running
+    // revocation fetch.
+    let supervisor_grace = robot_supervisor.as_ref().map_or(
+        Duration::ZERO,
+        cerulion_netd::robot_supervisor::RobotSupervisor::stop_grace,
+    );
+    spawn_hard_exit_watchdog(shutdown_deadline(
+        resolve_hard_exit_timeout(std::env::var(HARD_EXIT_ENV).ok().as_deref()),
+        supervisor_grace,
     ));
+    if let Some(supervisor) = robot_supervisor.as_mut() {
+        supervisor.shutdown();
+    }
     netd.shutdown();
 
     // TEST-ONLY (never set in normal operation): simulate a teardown that WEDGES
@@ -393,6 +460,13 @@ fn lifecycle_status_line(standing_gateway: bool) -> &'static str {
     } else {
         LIFECYCLE_DESK
     }
+}
+
+/// The watchdog deadline for a shutdown: the robot supervisor's stop grace
+/// (zero without a supervisor), during which its stop may wait for a running
+/// revocation fetch, plus the hard-exit deadline for the rest of teardown.
+fn shutdown_deadline(hard_exit: Duration, supervisor_grace: Duration) -> Duration {
+    hard_exit + supervisor_grace
 }
 
 /// Resolve the hard-exit deadline from a [`HARD_EXIT_ENV`] value (already
@@ -563,6 +637,8 @@ fn build_mirror_plane(
     // The WAN plane does not exist in this build; the LAN plane's authorizer is
     // already installed on the shared manager by the caller.
     _demand_authorizer: Arc<dyn DemandAuthorizer>,
+    _serving_gateway: bool,
+    _network_enabled: bool,
 ) -> Result<Arc<dyn MirrorPlane>, Box<dyn std::error::Error>> {
     // Which of the two message CLASSES each var gets — the flat "IGNORED" one for
     // netd's OWN vars, the scoped "netd's WAN dials cannot honor it, but X still does"
@@ -577,41 +653,42 @@ fn build_mirror_plane(
     Ok(Arc::new(GatewayMirrorPlane::new(manager)))
 }
 
-/// Build the daemon's mirror plane. With the `wan` feature: resolve the
-/// WAN robot registry from the environment ([`WanRegistry::from_env`]) and, when it
-/// lists ≥1 robot, compose the DUAL plane (zenoh LAN + iroh WAN) so a demand for a
-/// WAN-registered robot routes over iroh and everything else over zenoh — netd owns
-/// THE one mirror per topic across both. An EMPTY WAN registry stays on the lean
-/// zenoh-only plane (no iroh runtime is spun up), byte-identical to the non-`wan`
-/// build at runtime.
+/// Build one controller for manual and account WAN routes, including a daemon
+/// started before login. Construction opens no outgoing endpoint; network-off
+/// and serving posture are checked before every WAN network operation.
 #[cfg(feature = "wan")]
 fn build_mirror_plane(
     manager: Arc<TransportManager>,
-    // The WAN half of the ONE demand-authorization gate — installed on the
-    // iroh plane so its pre-dial check enforces the SAME authorizer the LAN plane does.
     demand_authorizer: Arc<dyn DemandAuthorizer>,
+    serving_gateway: bool,
+    network_enabled: bool,
 ) -> Result<Arc<dyn MirrorPlane>, Box<dyn std::error::Error>> {
-    use cerulion_netd::{DualMirrorPlane, IrohMirrorPlane, WanRegistry};
+    use cerulion_netd::account_controller::{AccountControllerConfig, AccountWanController};
+    use cerulion_netd::WanRegistry;
 
     let registry = WanRegistry::from_env().map_err(Box::<dyn std::error::Error>::from)?;
-    if registry.robot_count() == 0 {
-        tracing::info!(
-            "cerulion-netd: no WAN robots configured (CERULION_NETD_WAN_ROBOTS unset/empty) — \
-             zenoh LAN plane only"
-        );
-        return Ok(Arc::new(GatewayMirrorPlane::new(manager)));
-    }
-    let registry = Arc::new(registry);
-    // Both planes share the ONE desk transport manager (the single SHM mirror target).
-    let iroh = IrohMirrorPlane::new(manager.clone(), Arc::clone(&registry))
-        .map_err(Box::<dyn std::error::Error>::from)?
-        .with_authorizer(demand_authorizer);
-    let zenoh = GatewayMirrorPlane::new(manager);
-    tracing::info!(
-        wan_robots = registry.robot_count(),
-        "cerulion-netd: dual-plane active (zenoh LAN + iroh WAN) — one mirror per topic across both"
+    let config_home = cerulion_discovery::robot_state::config_dir();
+    let key_file = config_home.as_ref().map(|home| home.join("desk.key"));
+    let epoch_dir = cerulion_wireclient::epoch::resolve_epoch_dir(
+        std::env::var(cerulion_netd::wan::EPOCH_DIR_ENV)
+            .ok()
+            .as_deref(),
+        key_file.as_deref(),
     );
-    Ok(Arc::new(DualMirrorPlane::new(zenoh, iroh, registry)))
+    let controller = AccountWanController::new(
+        manager,
+        registry,
+        demand_authorizer,
+        AccountControllerConfig {
+            config_home,
+            network_enabled,
+            serving_gateway,
+            epoch_dir,
+            trusted_direct: std::collections::HashMap::new(),
+        },
+    )
+    .map_err(Box::<dyn std::error::Error>::from)?;
+    Ok(Arc::new(controller))
 }
 
 /// The daemon's logging default when `RUST_LOG` is unset. An explicit
@@ -711,6 +788,13 @@ mod tests {
         assert!(USAGE.contains(daemon::IDLE_GRACE_ENV));
         // The hard-exit deadline knob is discoverable from --help.
         assert!(USAGE.contains(HARD_EXIT_ENV));
+        assert!(USAGE.contains(cerulion_netd::robot_supervisor::EPOCH_SYNC_STOP_GRACE_ENV));
+        assert!(USAGE.contains(&format!(
+            "{}={}",
+            cerulion_discovery::unencrypted_quic::UNENCRYPTED_QUIC_ENV,
+            cerulion_discovery::unencrypted_quic::UNENCRYPTED_QUIC_ON
+        )));
+        assert!(USAGE.contains(cerulion_netd::quic_probe::QUIC_PROBE_TIMEOUT_ENV));
     }
 
     /// `--help` states the SECOND meaning of `CERULION_NETD_LISTEN`.
@@ -847,6 +931,19 @@ mod tests {
             resolve_hard_exit_timeout(Some("  1200  ")),
             Duration::from_millis(1200)
         );
+    }
+
+    #[test]
+    fn the_shutdown_deadline_outlasts_the_supervisor_stop_grace() {
+        let hard_exit = Duration::from_secs(5);
+        assert_eq!(shutdown_deadline(hard_exit, Duration::ZERO), hard_exit);
+        let grace = Duration::from_secs(35);
+        let deadline = shutdown_deadline(hard_exit, grace);
+        assert!(
+            deadline > grace,
+            "{deadline:?} must outlast the {grace:?} stop grace"
+        );
+        assert_eq!(deadline, grace + hard_exit);
     }
 
     #[test]

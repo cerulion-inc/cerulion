@@ -63,3 +63,16 @@ This file records the licensing history of Cerulion.
   convenience for downstreams reading individual files, not the sole grant.
 - `deny.toml` `[licenses].allow` now includes `AGPL-3.0-only`.
 - `NOTICE` and `AUTHORS` added.
+
+## Ops protocol crate: `cerulion_ops_proto` under MIT OR Apache-2.0
+
+- **Date:** 2026-10-26
+- **Change:** The `cerulion/ops/1` wire types and protocol client, previously
+  in `crates/cerud/src/protocol.rs`, `crates/cerud/src/client.rs` and the
+  `Inventory` struct of `crates/cerud/src/verbs/inventory.rs`, move into the
+  new crate `crates/cerulion_ops_proto`, licensed `MIT OR Apache-2.0`
+  (manifest `license` field, per-file SPDX headers, and `LICENSE-MIT` /
+  `LICENSE-APACHE` in the crate directory). `cerud` stays `AGPL-3.0-only`.
+- The permissive crates excepted from the top-level `LICENSE` are now
+  `cerulion_link`, `cerulion_ops_proto`, `cerulion_pairing` and
+  `cerulion_wire`.

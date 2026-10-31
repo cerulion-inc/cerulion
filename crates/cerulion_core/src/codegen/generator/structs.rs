@@ -438,6 +438,7 @@ pub(super) fn generate_shm_struct(out: &mut String, schema: &MessageSchema) {
     // Inherent methods: from_bytes, from_bytes_mut, snapshot, write_from_snapshot.
     writeln!(out, "impl {shm_name} {{").unwrap();
     generate_shm_from_bytes(out, &shm_name);
+    generate_shm_read_unaligned(out, &shm_name);
     generate_shm_from_bytes_mut(out, &shm_name);
     generate_shm_snapshot_method(out, schema, &shm_name);
     generate_shm_write_from_snapshot_method(out, schema, &shm_name);
@@ -867,6 +868,22 @@ fn generate_shm_from_bytes(out: &mut String, shm_name: &str) {
         "    /// - If `bytes.as_ptr()` is not aligned to `::std::mem::align_of::<Self>()`."
     )
     .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// The payload of a received frame always satisfies both. For bytes at an"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// arbitrary address (an array element, a nested sub-frame, a bag record)"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// use [`read_unaligned`](Self::read_unaligned), which never panics."
+    )
+    .unwrap();
     writeln!(out, "    #[inline]").unwrap();
     writeln!(out, "    pub fn from_bytes(bytes: &[u8]) -> &Self {{").unwrap();
     writeln!(out, "        let size = ::std::mem::size_of::<Self>();").unwrap();
@@ -900,6 +917,77 @@ fn generate_shm_from_bytes(out: &mut String, shm_name: &str) {
     writeln!(
         out,
         "        unsafe {{ &*(bytes.as_ptr() as *const Self) }}"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Emit `pub fn read_unaligned(bytes: &[u8]) -> Option<Self>`.
+///
+/// The copying twin of `from_bytes` for bytes at any address: an element of
+/// an array of nested messages, a sub-frame, a record copied out of a bag.
+/// Every field of a fixed-only `<Name>Shm` accepts any bit pattern (`bool` is
+/// stored as `u8`), so a byte-wise unaligned read is a valid value.
+fn generate_shm_read_unaligned(out: &mut String, shm_name: &str) {
+    writeln!(
+        out,
+        "    /// Copy a `{shm_name}` out of `bytes`, which may sit at any address."
+    )
+    .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// Returns `None` if `bytes.len() < ::std::mem::size_of::<Self>()`; never"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// panics. Use it instead of [`from_bytes`](Self::from_bytes) for bytes that"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// are not the payload of a received frame: an element of an array of"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// nested messages, a nested sub-frame, or a record read out of a bag."
+    )
+    .unwrap();
+    writeln!(out, "    #[inline]").unwrap();
+    writeln!(
+        out,
+        "    pub fn read_unaligned(bytes: &[u8]) -> ::std::option::Option<Self> {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        if bytes.len() < ::std::mem::size_of::<Self>() {{"
+    )
+    .unwrap();
+    writeln!(out, "            return ::std::option::Option::None;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(
+        out,
+        "        // SAFETY: `bytes` covers `size_of::<Self>()` bytes (checked above);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        // `read_unaligned` places no alignment requirement on the source; `Self`"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        // is `#[repr(C)]` over fields that accept every bit pattern (bool stored"
+    )
+    .unwrap();
+    writeln!(out, "        // as u8).").unwrap();
+    writeln!(
+        out,
+        "        ::std::option::Option::Some(unsafe {{ ::std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }})"
     )
     .unwrap();
     writeln!(out, "    }}").unwrap();
@@ -1522,6 +1610,28 @@ fn variable_field_layout(schema: &MessageSchema) -> Vec<(&FieldDef, usize)> {
     out
 }
 
+/// Widest element size, in bytes, of a typed primitive array among the
+/// schema's variable fields: `String` and `Bytes` count as 1, complex fields
+/// (raw-bytes accessors) as 1, any other shape as 8, and 1 when there are no
+/// variable fields.
+fn read_align_widest_array_elem(schema: &MessageSchema) -> usize {
+    variable_field_layout(schema)
+        .into_iter()
+        .map(|(field, _)| {
+            let ft = &field.field_type;
+            if is_complex_variable(ft) {
+                return 1;
+            }
+            match ft {
+                FieldType::String | FieldType::Bytes => 1,
+                FieldType::DynamicArray { element_type } => primitive_size_and_type(element_type).0,
+                _ => 8,
+            }
+        })
+        .max()
+        .unwrap_or(1)
+}
+
 /// Generate `<Name>Shm<'a>` for a variable schema.
 ///
 /// Caller must verify `schema.has_variable_fields() == true`. For fixed
@@ -1598,6 +1708,7 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     )
     .unwrap();
     emit_type_name_lint_allow(out, &shm_name);
+    writeln!(out, "#[repr(C)]").unwrap();
     writeln!(out, "pub struct {shm_name}<'a> {{").unwrap();
     writeln!(
         out,
@@ -1659,16 +1770,6 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     )
     .unwrap();
     writeln!(out, "    len: usize,").unwrap();
-    writeln!(
-        out,
-        "    /// Per-tick writer state (cursor, written bitset, per-field starts)."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    state: ::cerulion_core::shm_runtime::WriterState<{n_var}>,"
-    )
-    .unwrap();
     writeln!(out, "    /// Lazily-allocated heap fallback buffer.").unwrap();
     writeln!(out, "    ///").unwrap();
     writeln!(
@@ -1730,6 +1831,153 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     .unwrap();
     writeln!(
         out,
+        "    /// Reader-side copy `ptr` points into when `from_bytes` was handed a"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// source it cannot read in place (not aligned to `READ_ALIGN`, or shorter"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// than the fixed section plus offset table). `None` for an in-place read"
+    )
+    .unwrap();
+    writeln!(out, "    /// and for every writer.").unwrap();
+    writeln!(
+        out,
+        "    __cer_read_copy: ::std::option::Option<::std::vec::Vec<u64>>,"
+    )
+    .unwrap();
+    writeln!(out, "    /// Topic name as `Arc<str>`. Used to").unwrap();
+    writeln!(
+        out,
+        "    /// attribute `PayloadTooLarge` / `AllocationFailed` errors to"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// the originating topic — codegen doesn't know the topic at"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// expansion time, so the publisher passes it via `build_writer`."
+    )
+    .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// A writer's `Arc<str>` preserves the zero-alloc invariant: each"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// loan is one `Arc::clone` (atomic refcount bump), no allocation."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// Publisher allocates the Arc once at construction. The"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// Arc-not-borrow choice eliminates the raw-pointer reborrow"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// `unsafe` block that the pre-deferral-fix `&'a str` variant"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// required in `loan_proxy`. Only the error path allocates"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// (one `String` from `self.topic.as_deref()` per error)."
+    )
+    .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// `None` on a reader built by `from_bytes`, so building and dropping"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// a reader does no refcount work. A setter called on a reader names"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// [`READ_ONLY_TOPIC`](::cerulion_core::message::READ_ONLY_TOPIC) in its error."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    topic: ::std::option::Option<::std::sync::Arc<str>>,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// Lifetime carrier. Written-side construction goes through"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// `&'a mut [u8]`; read-side through `&'a [u8]`. The struct itself"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// is `!Send + !Sync` because the raw pointer is non-null but not"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// thread-safe — matches the iceoryx2 sample's `!Send` guarantee."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    _phantom: ::std::marker::PhantomData<&'a mut [u8]>,"
+    )
+    .unwrap();
+    // Write-only diagnostic proxy members, one per VARIABLE field,
+    // named exactly after the field. `<Name>Shm<'a>` is a wrapper around the
+    // SHM bytes, not their layout, so adding zero-sized fields changes neither
+    // the SHM layout nor any derive. Plain field resolution finds these
+    // proxies BEFORE the `DerefMut` to `<Name>FixedSection`, so an
+    // un-rewritten variable-field access (`self.<port>.<f>[i]`, `+= …`) lands
+    // on the proxy and produces a codegen-authored diagnostic instead of a
+    // bare `no field <f>` error. See
+    // `generate_variable_field_proxies`.
+    emit_proxy_field_decls(out, schema);
+    // Per complex-nested variable field, the lazily-allocated
+    // staging slot backing the `self.<port>.<f>.<leaf> = …` / `with_<f>`
+    // nested-writer sugar. Private; `None` until first touch.
+    emit_staged_field_decls(out, schema);
+    // `state` (whose `cursor` and `field_starts` are `u32`s) and
+    // `max_capacity` (a `u32`) go last. `#[repr(C)]` keeps the declared
+    // order, so both follow every pointer-sized slot that drop reads back
+    // (`overflow`, `__cer_read_copy`, `topic`, the staging slots).
+    writeln!(
+        out,
+        "    /// Per-tick writer state (cursor, written bitset, per-field starts)."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    state: ::cerulion_core::shm_runtime::WriterState<{n_var}>,"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "    /// Hard ceiling on the payload (max_slice_len minus"
     )
     .unwrap();
@@ -1758,93 +2006,6 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
         "    max_capacity: ::cerulion_core::wire::MaxPayloadCapacity,"
     )
     .unwrap();
-    writeln!(out, "    /// Topic name as `Arc<str>`. Used to").unwrap();
-    writeln!(
-        out,
-        "    /// attribute `PayloadTooLarge` / `AllocationFailed` errors to"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// the originating topic — codegen doesn't know the topic at"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// expansion time, so the publisher passes it via `build_writer`."
-    )
-    .unwrap();
-    writeln!(out, "    ///").unwrap();
-    writeln!(
-        out,
-        "    /// `Arc<str>` preserves the zero-alloc invariant: each"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// loan is one `Arc::clone` (atomic refcount bump), no allocation."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// Publisher allocates the Arc once at construction. The"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// Arc-not-borrow choice eliminates the raw-pointer reborrow"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// `unsafe` block that the pre-deferral-fix `&'a str` variant"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// required in `loan_proxy`. Only the error path allocates"
-    )
-    .unwrap();
-    writeln!(out, "    /// (`self.topic.to_string()` per error).").unwrap();
-    writeln!(out, "    topic: ::std::sync::Arc<str>,").unwrap();
-    writeln!(
-        out,
-        "    /// Lifetime carrier. Written-side construction goes through"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// `&'a mut [u8]`; read-side through `&'a [u8]`. The struct itself"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// is `!Send + !Sync` because the raw pointer is non-null but not"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// thread-safe — matches the iceoryx2 sample's `!Send` guarantee."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    _phantom: ::std::marker::PhantomData<&'a mut [u8]>,"
-    )
-    .unwrap();
-    // Write-only diagnostic proxy members, one per VARIABLE field,
-    // named exactly after the field. `<Name>Shm<'a>` is a plain (NON-repr(C))
-    // wrapper, so adding zero-sized fields changes neither its SHM layout nor
-    // any derive. Plain field resolution finds these proxies BEFORE the
-    // `DerefMut` to `<Name>FixedSection`, so an un-rewritten variable-field
-    // access (`self.<port>.<f>[i]`, `+= …`) lands on the proxy and produces a
-    // codegen-authored diagnostic instead of a bare `no field <f>` error. See
-    // `generate_variable_field_proxies`.
-    emit_proxy_field_decls(out, schema);
-    // Per complex-nested variable field, the lazily-allocated
-    // staging slot backing the `self.<port>.<f>.<leaf> = …` / `with_<f>`
-    // nested-writer sugar. Private; `None` until first touch.
-    emit_staged_field_decls(out, schema);
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 
@@ -1883,10 +2044,36 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
         "    pub const OFFSET_TABLE_BYTES: usize = 8 * Self::VARIABLE_FIELD_COUNT;"
     )
     .unwrap();
+    // READ_ALIGN: the source alignment `from_bytes` reads in place at. The
+    // fixed section is overlaid at `payload[0]` and each typed primitive
+    // array starts at a multiple of its element size counted from
+    // `payload[0]`; the offset table is read byte-wise, and complex fields
+    // are raw bytes a nested reader checks itself.
+    let widest_elem = read_align_widest_array_elem(schema);
+    writeln!(
+        out,
+        "    /// Source alignment [`from_bytes`](Self::from_bytes) reads in place at: the"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// larger of the fixed section's alignment and the widest element of a"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// primitive array in this schema ({widest_elem} bytes)."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    pub const READ_ALIGN: usize = if ::std::mem::align_of::<{fixed_section_name}>() > {widest_elem} {{ ::std::mem::align_of::<{fixed_section_name}>() }} else {{ {widest_elem} }};"
+    )
+    .unwrap();
     writeln!(out).unwrap();
 
     // Constructors.
-    generate_var_shm_from_bytes(out, schema, &shm_name, &fixed_section_name);
+    generate_var_shm_from_bytes(out, schema, &shm_name);
     generate_var_shm_from_bytes_mut(out, schema, &shm_name, &fixed_section_name);
 
     // Internal payload accessors (private helpers).
@@ -2295,22 +2482,27 @@ fn generate_variable_shm_deref_impls(out: &mut String, shm_name: &str, fixed_sec
     writeln!(out, "    fn deref(&self) -> &{fixed_section_name} {{").unwrap();
     writeln!(
         out,
-        "        // SAFETY: `self.ptr` was captured by `from_bytes`/`from_bytes_mut` from a"
+        "        // SAFETY: `self.ptr` points into a borrow living for `'a` or into the"
     )
     .unwrap();
     writeln!(
         out,
-        "        // borrow living for `'a`. Both constructors assert that the pointer is"
+        "        // `__cer_read_copy` this value owns. `from_bytes_mut` asserts, and"
     )
     .unwrap();
     writeln!(
         out,
-        "        // aligned to `align_of::<{fixed_section_name}>()` and that the buffer"
+        "        // `from_bytes` ensures by copying, that the pointer is aligned to at least"
     )
     .unwrap();
     writeln!(
         out,
-        "        // covers at least `OFFSET_TABLE_OFFSET + OFFSET_TABLE_BYTES` bytes (which"
+        "        // `align_of::<{fixed_section_name}>()` and that the block behind it covers"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        // at least `OFFSET_TABLE_OFFSET + OFFSET_TABLE_BYTES` bytes (which"
     )
     .unwrap();
     writeln!(
@@ -2499,6 +2691,7 @@ const SHM_ASSOC_CONSTS: &[&str] = &[
     "VARIABLE_FIELD_COUNT",
     "OFFSET_TABLE_OFFSET",
     "OFFSET_TABLE_BYTES",
+    "READ_ALIGN",
 ];
 
 /// True iff a FIXED-SECTION field with this name would collide with the
@@ -2720,7 +2913,7 @@ fn emit_reserved_collision_compile_error(
     .unwrap();
     writeln!(
         out,
-        "compile_error!(\"In schema `{schema_name}`, field(s) {names_list} collide with reserved accessor names on the generated SHM type. Rename the offending schema field(s). FIXED-SECTION fields cannot use inherent method names (`from_bytes`, `from_bytes_mut`, `payload`, `payload_mut`, `cursor`, `snapshot`, `write_from_snapshot`, `all_variables_written`, `has_overflow`, `overflow_view_bytes`, `take_overflow`, `ensure_capacity_for`, `spill_to_overflow`), private struct fields (`ptr`, `len`, `state`, `overflow`, `max_capacity`, `topic`, `_phantom`, `_marker`), associated constants (`WIRE_FIXED_SIZE`, `VARIABLE_FIELD_COUNT`, `OFFSET_TABLE_OFFSET`, `OFFSET_TABLE_BYTES`), or another field's accessor names (`<v>`, `set_<v>`, `loan_<v>`, `push_<v>`, `fill_from_<v>`, `__cer_assign_<v>`, `__cer_fill_from_<v>`, `with_<v>`, `__cer_nested_<v>`, `__cer_with_nested_<v>`, `<v>_bytes`, `set_<v>_bytes`, `loan_<v>_bytes`, `fill_from_<v>_bytes`). VARIABLE fields collide only when an emitted accessor name matches an inherent method (e.g. a String field named `cursor` or `snapshot`).\");",
+        "compile_error!(\"In schema `{schema_name}`, field(s) {names_list} collide with reserved accessor names on the generated SHM type. Rename the offending schema field(s). FIXED-SECTION fields cannot use inherent method names (`from_bytes`, `from_bytes_mut`, `payload`, `payload_mut`, `cursor`, `snapshot`, `write_from_snapshot`, `all_variables_written`, `has_overflow`, `overflow_view_bytes`, `take_overflow`, `ensure_capacity_for`, `spill_to_overflow`), private struct fields (`ptr`, `len`, `state`, `overflow`, `max_capacity`, `topic`, `_phantom`, `_marker`), associated constants (`WIRE_FIXED_SIZE`, `VARIABLE_FIELD_COUNT`, `OFFSET_TABLE_OFFSET`, `OFFSET_TABLE_BYTES`, `READ_ALIGN`), or another field's accessor names (`<v>`, `set_<v>`, `loan_<v>`, `push_<v>`, `fill_from_<v>`, `__cer_assign_<v>`, `__cer_fill_from_<v>`, `with_<v>`, `__cer_nested_<v>`, `__cer_with_nested_<v>`, `<v>_bytes`, `set_<v>_bytes`, `loan_<v>_bytes`, `fill_from_<v>_bytes`). VARIABLE fields collide only when an emitted accessor name matches an inherent method (e.g. a String field named `cursor` or `snapshot`).\");",
         schema_name = schema.name,
         names_list = names_list,
     )
@@ -2729,12 +2922,7 @@ fn emit_reserved_collision_compile_error(
 }
 
 /// Emit `pub fn from_bytes(bytes: &'a [u8]) -> Self`.
-fn generate_var_shm_from_bytes(
-    out: &mut String,
-    schema: &MessageSchema,
-    shm_name: &str,
-    fixed_section_name: &str,
-) {
+fn generate_var_shm_from_bytes(out: &mut String, schema: &MessageSchema, shm_name: &str) {
     writeln!(
         out,
         "    /// Borrow `bytes` (read-only) and construct a reader-side `{shm_name}`."
@@ -2762,50 +2950,54 @@ fn generate_var_shm_from_bytes(
     )
     .unwrap();
     writeln!(out, "    ///").unwrap();
-    writeln!(out, "    /// # Panics").unwrap();
-    writeln!(out, "    ///").unwrap();
     writeln!(
         out,
-        "    /// - If `bytes.len() < Self::OFFSET_TABLE_OFFSET + Self::OFFSET_TABLE_BYTES`"
+        "    /// Never panics. A source whose address is a multiple of"
     )
     .unwrap();
     writeln!(
         out,
-        "    ///   (i.e. the buffer cannot fit the fixed section + offset table)."
+        "    /// [`READ_ALIGN`](Self::READ_ALIGN) and that holds the"
     )
     .unwrap();
     writeln!(
         out,
-        "    /// - If `bytes.as_ptr()` is not aligned to `::std::mem::align_of::<{fixed_section_name}>()`."
+        "    /// fixed section and offset table is read in place. Any other source (a"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// nested sub-frame from `<field>_bytes()` that its writer placed at an odd"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// offset, bytes copied from a network frame or a bag into an arbitrary"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// buffer, a truncated frame) is read from an 8-aligned copy this value owns;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// bytes missing from a truncated source read as zero."
     )
     .unwrap();
     writeln!(out, "    #[inline]").unwrap();
     writeln!(out, "    pub fn from_bytes(bytes: &'a [u8]) -> Self {{").unwrap();
     writeln!(
         out,
-        "        let align = ::std::mem::align_of::<{fixed_section_name}>();"
+        "        // The fixed section is overlaid at `ptr` and the offset table read"
     )
     .unwrap();
     writeln!(
         out,
-        "        // Require the full prefix (fixed section + offset table)."
+        "        // from `payload[OFFSET_TABLE_OFFSET..table_end]`, so an in-place read"
     )
     .unwrap();
-    writeln!(
-        out,
-        "        // Variable-field readers index `payload[OFFSET_TABLE_OFFSET..table_end]`"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "        // to consult the offset table; an undersized buffer would OOB on the"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "        // first variable read with a confusing slice-index panic."
-    )
-    .unwrap();
+    writeln!(out, "        // needs both bytes and alignment.").unwrap();
     writeln!(
         out,
         "        let table_end = Self::OFFSET_TABLE_OFFSET + Self::OFFSET_TABLE_BYTES;"
@@ -2813,12 +3005,68 @@ fn generate_var_shm_from_bytes(
     .unwrap();
     writeln!(
         out,
-        "        assert!(bytes.len() >= table_end, \"{shm_name}::from_bytes: buffer too small ({{}} < {{}}; need fixed section + offset table)\", bytes.len(), table_end);"
+        "        if bytes.len() >= table_end && bytes.as_ptr().align_offset(Self::READ_ALIGN) == 0 {{"
     )
     .unwrap();
     writeln!(
         out,
-        "        assert!(bytes.as_ptr().align_offset(align) == 0, \"{shm_name}::from_bytes: misaligned source pointer (need align {{}})\", align);"
+        "            Self::__cer_reader_at(bytes.as_ptr() as *mut u8, bytes.len(), ::std::option::Option::None)"
+    )
+    .unwrap();
+    writeln!(out, "        }} else {{").unwrap();
+    writeln!(
+        out,
+        "            Self::__cer_from_bytes_copied(bytes, table_end)"
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    // The copy fallback sits out of line so the in-place path above stays a
+    // single branch into the struct literal.
+    writeln!(
+        out,
+        "    /// `from_bytes` for a source it cannot read in place: reads from an owned"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// 8-aligned copy of `bytes`, zero-padded to `table_end`."
+    )
+    .unwrap();
+    writeln!(out, "    #[cold]").unwrap();
+    writeln!(out, "    #[inline(never)]").unwrap();
+    writeln!(
+        out,
+        "    fn __cer_from_bytes_copied(bytes: &'a [u8], table_end: usize) -> Self {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        let mut copy = ::cerulion_core::shm_runtime::aligned_read_copy(bytes, table_end);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        Self::__cer_reader_at(copy.as_mut_ptr() as *mut u8, bytes.len().max(table_end), ::std::option::Option::Some(copy))"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// The reader-side value over `len` readable bytes at `ptr`, which point"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// into the `'a` source or into `__cer_read_copy`."
+    )
+    .unwrap();
+    writeln!(out, "    #[inline(always)]").unwrap();
+    writeln!(
+        out,
+        "    fn __cer_reader_at(ptr: *mut u8, len: usize, __cer_read_copy: ::std::option::Option<::std::vec::Vec<u64>>) -> Self {{"
     )
     .unwrap();
     // The proxy fields below carry `#[deprecated]`; the
@@ -2829,32 +3077,33 @@ fn generate_var_shm_from_bytes(
     writeln!(out, "        let __cer_shm = Self {{").unwrap();
     writeln!(
         out,
-        "            // SAFETY: read-side construction; the resulting raw pointer is"
+        "            // SAFETY: read-side construction; `ptr` covers `len` readable bytes"
     )
     .unwrap();
     writeln!(
         out,
-        "            // only ever read through `&self` accessors. Mutability is a"
+        "            // (the source, or the copy this value owns) and is only read through"
     )
     .unwrap();
     writeln!(
         out,
-        "            // public-API contract, not a type-system guarantee, because"
+        "            // `&self` accessors. Mutability is a public-API contract, not a"
     )
     .unwrap();
     writeln!(
         out,
-        "            // `Reader<'a> == Writer<'a>` is the same Rust type."
+        "            // type-system guarantee, because `Reader<'a> == Writer<'a>`."
     )
     .unwrap();
-    writeln!(out, "            ptr: bytes.as_ptr() as *mut u8,").unwrap();
-    writeln!(out, "            len: bytes.len(),").unwrap();
+    writeln!(out, "            ptr,").unwrap();
+    writeln!(out, "            len,").unwrap();
+    writeln!(out, "            __cer_read_copy,").unwrap();
     writeln!(out, "            state: ::cerulion_core::shm_runtime::WriterState::new(Self::WIRE_FIXED_SIZE as u32),").unwrap();
-    // Reader-side never writes, so the overflow / max_capacity /
-    // topic fields hold sentinel defaults — the writer-side accessors that
+    // Reader-side never writes, so overflow holds None, max_capacity holds
+    // ZERO and topic holds None; the writer-side accessors that
     // would consume them are gated behind `&mut self` and are unreachable
     // through `from_bytes` (which returns `Self` whose `&mut` method
-    // surface is documented unsound per the panic doc above).
+    // surface is documented unsound per the doc above).
     writeln!(out, "            overflow: ::std::option::Option::None,").unwrap();
     // Setting `max_capacity: u32::MAX, topic: "<read-only>"` for misuse-error
     // attribution would let any reader-side misuse `&mut self` setter fall
@@ -2864,20 +3113,15 @@ fn generate_var_shm_from_bytes(
     // misuse return immediately via `required_end > 0` → PayloadTooLarge
     // with no allocation attempt.
     //
-    // The topic is an `Arc<str>`. Reader-side uses the
-    // cached `read_only_topic()` sentinel — one `Arc::clone` per build_reader
-    // (refcount bump, no allocation), preserving subscriber hot-path
-    // zero-alloc invariants.
+    // The reader's topic is `None`: no `Arc` is cloned on build or released
+    // on drop, so a reader build does no atomic read-modify-write. The
+    // `&mut self` error paths name `READ_ONLY_TOPIC` for a `None` topic.
     writeln!(
         out,
         "            max_capacity: ::cerulion_core::wire::MaxPayloadCapacity::ZERO,"
     )
     .unwrap();
-    writeln!(
-        out,
-        "            topic: ::cerulion_core::message::read_only_topic(),"
-    )
-    .unwrap();
+    writeln!(out, "            topic: ::std::option::Option::None,").unwrap();
     writeln!(out, "            _phantom: ::std::marker::PhantomData,").unwrap();
     // Zero-sized diagnostic proxies (one per variable field). Each is a
     // unit struct, so the field initializer is the type name itself.
@@ -2953,7 +3197,7 @@ fn generate_var_shm_from_bytes_mut(
     writeln!(out, "    ///   `PayloadTooLarge` (no rescue possible).").unwrap();
     writeln!(
         out,
-        "    /// - `topic`: the publisher's topic name, borrowed for the"
+        "    /// - `topic`: the publisher's topic name, stored as `Some(topic)` for the"
     )
     .unwrap();
     writeln!(
@@ -3072,8 +3316,17 @@ fn generate_var_shm_from_bytes_mut(
     writeln!(out, "            len,").unwrap();
     writeln!(out, "            state: ::cerulion_core::shm_runtime::WriterState::new(Self::WIRE_FIXED_SIZE as u32),").unwrap();
     writeln!(out, "            overflow: ::std::option::Option::None,").unwrap();
+    writeln!(
+        out,
+        "            __cer_read_copy: ::std::option::Option::None,"
+    )
+    .unwrap();
     writeln!(out, "            max_capacity,").unwrap();
-    writeln!(out, "            topic,").unwrap();
+    writeln!(
+        out,
+        "            topic: ::std::option::Option::Some(topic),"
+    )
+    .unwrap();
     writeln!(out, "            _phantom: ::std::marker::PhantomData,").unwrap();
     // Zero-sized diagnostic proxies (one per variable field).
     emit_proxy_field_inits(out, schema);
@@ -3300,7 +3553,7 @@ fn generate_var_shm_payload_helpers(out: &mut String) {
     writeln!(out, "            return ::std::result::Result::Err(::cerulion_core::TransportError::AllocationFailed {{").unwrap();
     writeln!(
         out,
-        "                topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&self.topic)),"
+        "                topic: ::std::string::String::from(self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(
@@ -3414,7 +3667,7 @@ fn generate_var_shm_payload_helpers(out: &mut String) {
     writeln!(out, "            return ::std::result::Result::Err(::cerulion_core::TransportError::AllocationFailed {{").unwrap();
     writeln!(
         out,
-        "                topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&self.topic)),"
+        "                topic: ::std::string::String::from(self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(out, "                requested: max_cap,").unwrap();
@@ -3556,7 +3809,7 @@ fn generate_var_shm_payload_helpers(out: &mut String) {
     writeln!(out, "            return ::std::result::Result::Err(::cerulion_core::TransportError::PayloadTooLarge {{").unwrap();
     writeln!(
         out,
-        "                topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&self.topic)),"
+        "                topic: ::std::string::String::from(self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(out, "                requested: required_end,").unwrap();
@@ -5572,7 +5825,7 @@ fn generate_var_shm_staging_resume(
     writeln!(out, "    #[inline]").unwrap();
     writeln!(
         out,
-        "    pub fn __cer_staging_resume(bytes: &'a mut [u8], max_capacity: ::cerulion_core::wire::MaxPayloadCapacity, topic: ::std::sync::Arc<str>, cursor: u32, written: u64, field_starts: &[u32]) -> Self {{"
+        "    pub fn __cer_staging_resume(bytes: &'a mut [u8], max_capacity: ::cerulion_core::wire::MaxPayloadCapacity, topic: ::std::option::Option<::std::sync::Arc<str>>, cursor: u32, written: u64, field_starts: &[u32]) -> Self {{"
     )
     .unwrap();
     writeln!(
@@ -5626,6 +5879,11 @@ fn generate_var_shm_staging_resume(
     writeln!(out, "            len,").unwrap();
     writeln!(out, "            state,").unwrap();
     writeln!(out, "            overflow: ::std::option::Option::None,").unwrap();
+    writeln!(
+        out,
+        "            __cer_read_copy: ::std::option::Option::None,"
+    )
+    .unwrap();
     writeln!(out, "            max_capacity,").unwrap();
     writeln!(out, "            topic,").unwrap();
     writeln!(out, "            _phantom: ::std::marker::PhantomData,").unwrap();
@@ -5913,7 +6171,7 @@ fn emit_with_nested_complex(out: &mut String, field: &FieldDef, var_idx: usize) 
     writeln!(out, "        let max_capacity = self.max_capacity;").unwrap();
     writeln!(
         out,
-        "        let topic = ::std::sync::Arc::clone(&self.topic);"
+        "        let topic = ::std::clone::Clone::clone(&self.topic);"
     )
     .unwrap();
     writeln!(out, "        if self.__cer_staged_{raw}.is_none() {{").unwrap();
@@ -5944,7 +6202,7 @@ fn emit_with_nested_complex(out: &mut String, field: &FieldDef, var_idx: usize) 
     .unwrap();
     writeln!(
         out,
-        "                    topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&topic)),"
+        "                    topic: ::std::string::String::from(topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(
@@ -6248,7 +6506,11 @@ fn emit_flush_staged(out: &mut String, schema: &MessageSchema) {
         )
         .unwrap();
         writeln!(out, "                self.max_capacity,").unwrap();
-        writeln!(out, "                ::std::sync::Arc::clone(&self.topic),").unwrap();
+        writeln!(
+            out,
+            "                ::std::clone::Clone::clone(&self.topic),"
+        )
+        .unwrap();
         writeln!(out, "                staged.cursor,").unwrap();
         writeln!(out, "                staged.written,").unwrap();
         writeln!(out, "                &staged.field_starts,").unwrap();

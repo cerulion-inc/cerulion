@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The `rcp.yaml` manifest: parse, resolve the graph, refuse bad input.
 
-use cerulion_rcpd::manifest::{DeclaredNode, RcpManifest, RobotIdentity};
+use cerulion_rcpd::manifest::{
+    DeclaredNode, EstopClear, IrreversibleTools, Limits, RcpManifest, RobotIdentity, SafetyClass,
+};
 use cerulion_rcpd::RcpdError;
 
 #[test]
@@ -58,13 +60,18 @@ fn tools_state_and_journal_parse_with_defaults() {
 fn a_tool_surface_the_daemon_cannot_serve_is_refused() {
     let cases = [
         (STEP_TOOL.replace("arm.step", "estop"), "built in"),
+        (STEP_TOOL.replace("arm.step", "estop_clear"), "built in"),
         (
             format!("{STEP_TOOL}{}", &STEP_TOOL["\ntools:\n".len()..]),
             "declared twice",
         ),
         (
-            STEP_TOOL.replace("reversible", "irreversible"),
-            "irreversible",
+            format!("{STEP_TOOL}limits:\n  estop_clear: nobody\n"),
+            "nobody",
+        ),
+        (
+            format!("{STEP_TOOL}limits:\n  estop: agent\n"),
+            "unknown field `estop`",
         ),
         (STEP_TOOL.replace("minItems: 6", "pattern: x"), "pattern"),
         (STEP_TOOL.replace("safety_class", "safety"), "safety"),
@@ -171,4 +178,76 @@ fn a_blank_robot_is_refused() {
         let err = cerulion_rcpd::manifest::RcpManifest::parse(yaml).expect_err(yaml);
         assert!(err.contains("robot"), "{err}");
     }
+}
+
+#[test]
+fn limits_default_to_agent_clearing_and_allowed_irreversible_tools() {
+    let defaults = Limits {
+        estop_clear: EstopClear::Agent,
+        irreversible: IrreversibleTools::Allow,
+    };
+    assert_eq!(Limits::default(), defaults);
+    assert_eq!(
+        RcpManifest::parse(STEP_TOOL).expect("parse").limits,
+        defaults
+    );
+    assert_eq!(
+        RcpManifest::parse("limits: {}\n").expect("parse").limits,
+        defaults
+    );
+    let m = RcpManifest::parse("limits:\n  estop_clear: operator\n  irreversible: refuse\n")
+        .expect("parse");
+    assert_eq!(
+        m.limits,
+        Limits {
+            estop_clear: EstopClear::Operator,
+            irreversible: IrreversibleTools::Refuse,
+        }
+    );
+}
+
+const CUT_TOOL: &str = "
+tools:
+  - name: arm.cut
+    description: cut the cable
+    safety_class: irreversible
+    input_schema: { type: object, properties: {} }
+";
+
+#[test]
+fn an_irreversible_tool_loads_by_default() {
+    for extra in ["", "limits:\n  irreversible: allow\n"] {
+        let m = RcpManifest::parse(&format!("{CUT_TOOL}{extra}")).expect(extra);
+        assert_eq!(m.tools[0].safety_class, SafetyClass::Irreversible);
+        assert!(m.tools[0].safety_class.is_mutating());
+    }
+}
+
+#[test]
+fn the_refuse_switch_fails_the_load_naming_the_tool() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("rcp.yaml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{STEP_TOOL}{}limits:\n  irreversible: refuse\n",
+            &CUT_TOOL["\ntools:\n".len()..]
+        ),
+    )
+    .expect("write");
+    let err = RcpManifest::load_full(&manifest).expect_err("refused");
+    let RcpdError::ManifestParse { reason, .. } = &err else {
+        panic!("a parse error: {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "tool \"arm.cut\" is irreversible and `limits.irreversible` is `refuse`"
+    );
+    // The switch refuses only irreversible tools.
+    std::fs::write(
+        &manifest,
+        format!("{STEP_TOOL}limits:\n  irreversible: refuse\n"),
+    )
+    .expect("write");
+    RcpManifest::load_full(&manifest).expect("a reversible tool still loads");
 }

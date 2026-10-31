@@ -367,6 +367,10 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
     let manager = test_manager("evict");
     let topic = format!("/wire/a6/{}", unique_id());
     let stop = Arc::new(AtomicBool::new(false));
+    // The producer signals once its publisher exists, and neither desk demands
+    // before that signal: the plane's tap opens the data service and never
+    // creates it, so a demand that arrives first is refused with DoesNotExist.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let producer = {
         let manager = manager.clone();
         let topic = topic.clone();
@@ -375,6 +379,9 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
             let mut publisher = manager
                 .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
                 .expect("producer");
+            ready_tx
+                .send(())
+                .expect("the test must still be waiting for the producer");
             let mut seq = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let _ = publisher.publish_raw(&make_frame(seq));
@@ -406,6 +413,9 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
     };
 
     // ── both desks connect + stream (healthy pre-revoke) ──
+    ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|err| panic!("the producer must create its publisher: {err}"));
     let mut desk_a = connect_and_demand(&desk_a_ep, robot_addr.clone(), &topic, "desk-A").await;
     let mut desk_b = connect_and_demand(&desk_b_ep, robot_addr.clone(), &topic, "desk-B").await;
 

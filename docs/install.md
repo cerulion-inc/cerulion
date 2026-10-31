@@ -47,6 +47,21 @@ sh install_rust.sh rustc-version.txt
 
 The 1.0.0 release binaries were built with Rust 1.93.0; the workspace's minimum is Rust 1.95, and each release archive names its own compiler in `rustc-version.txt`, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. For another release, read that workflow at its tag.
 
+## What the Debian package requires and ships
+
+The package depends on `libc6 (>= 2.35)`, `libstdc++6` and `libgcc-s1`, so it installs on Ubuntu 22.04 and later, Debian 12 and later, or another distribution with glibc 2.35 or newer; `apt` refuses the install on an older release. ROS 2 is a `Suggests` (`ros-jazzy-ros-base`), not a dependency: the rmw is loaded by a ROS 2 process and links no ROS library of its own. The rmw works where ROS 2 Jazzy works, Ubuntu 24.04 with `ros-jazzy-ros-base` installed. On a host without ROS 2 the CLI installs, and `cerulion ros2 run` and `cerulion ros2 launch` exit with an error saying `ros2` was not found on `PATH`.
+
+The package installs `cerulion`, `cerulion-netd`, `cerulion-connectd` and `cerulion-remoted` into `/usr/bin`, with `librmw_cerulion.so`, `libcerulion_heaphook.so` and the `cerulion-install-rust` helper beside them. The v1.0.0 package predates `cerulion-remoted` and installs the other three programs. Every release archive, and the package built from it, also carries four license files, because the binaries statically link their dependency graph and most of those licenses require their text and copyright notice to travel with a binary:
+
+| File | What it is |
+|---|---|
+| `LICENSE` | The AGPL-3.0-only text the combined work is under. |
+| `NOTICE` | Attribution for the components a reader is most likely to care about, including the vendored ROS 2 message packages. |
+| `LICENSE-BSD-3-CLAUSE` | The BSD text that seven of those message packages require. |
+| `THIRD-PARTY-LICENSES.md` | The generated inventory of every crate linked into the binaries, grouped by license, with each license text reproduced once. |
+
+In the archive the four sit at the top level beside the binaries. The package installs them into `/usr/share/doc/cerulion/`, beside a `copyright` file that names each of them by path. The [APT packaging notes](packaging/apt.md) cover how the package is built and verified.
+
 ## The C toolchain
 
 Building nodes needs a C toolchain, installed before rustup. On Debian and Ubuntu: `sudo apt-get install -y curl git build-essential`. On macOS: `xcode-select --install`. An `apt-get install cerulion` pulls a C toolchain in through the package's Recommends; installing the `.deb` by hand with `dpkg -i` does not.
