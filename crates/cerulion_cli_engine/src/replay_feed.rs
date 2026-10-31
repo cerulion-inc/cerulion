@@ -38,7 +38,7 @@
 //! frames it popped names none of them, and is refused the same way
 //! ([`FeedRefusalReason::DecimatedUnattributed`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -84,8 +84,11 @@ struct TopicIndex {
     /// `true` when the recorder labeled this topic's frames with their writers.
     labeled: bool,
     /// Labeled: keyed by `(writer token, sequence)`. Unlabeled: keyed by
-    /// `(0, sequence)`, the writer being the topic's only one.
+    /// `(0, sequence)`, the writer being the topic's only one. Holds only the
+    /// identities a [`FeedNeed`] names when the index was built under one.
     by_id: HashMap<(u64, u32), Slot>,
+    /// Headered frames on the topic, kept or not.
+    headered: usize,
     /// Labeled frames whose writer the labels do not state (a gap or a
     /// contradiction in the label stream).
     unattributed: usize,
@@ -100,14 +103,271 @@ struct TopicIndex {
 #[derive(Debug, Default)]
 pub struct FrameIndex {
     topics: HashMap<String, TopicIndex>,
+    /// Identity entries held, over every topic.
+    entries: u64,
 }
 
 /// One topic's producer labels, in file order: what each label attributes, and
 /// to which port.
 pub type TopicLabels = Vec<(ProducerAttribution, u128)>;
 
+/// Bytes one [`FrameIndex`] entry is charged against the feed index budget: the
+/// `((u64, u32), Slot)` pair, its hash table control byte and growth slack.
+pub const FEED_INDEX_ENTRY_BYTES: u64 = 64;
+
+/// The feed index budget a fed replay runs under when none is given: 1 GiB.
+pub const DEFAULT_FEED_INDEX_BUDGET: u64 = 1 << 30;
+
+/// The identities a set of fed reads looks up, per topic, in the index's own
+/// key space: `(writer token, sequence)` on a labeled topic, `(0, sequence)` on
+/// an unlabeled one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FeedNeed {
+    by_topic: HashMap<String, HashSet<(u64, u32)>>,
+    entries: u64,
+}
+
+impl FeedNeed {
+    /// Add the identities `stages` look up at steps below `step_end` (`None`
+    /// = every step). A topic is labeled when `labels` holds a label for it.
+    pub fn add(
+        &mut self,
+        stages: &[FedStage<'_>],
+        labels: &BTreeMap<String, TopicLabels>,
+        step_end: Option<u64>,
+    ) {
+        for stage in stages {
+            let labeled = labels.get(stage.topic).is_some_and(|l| !l.is_empty());
+            for step in &stage.admission.per_step {
+                if step_end.is_some_and(|end| step.step >= end) {
+                    continue;
+                }
+                for (due, id) in step.due.iter().zip(&step.identity) {
+                    let DueShape::Pops { pops, .. } = due.shape() else {
+                        continue;
+                    };
+                    let (Some(writer), Some(served)) = (id.writer, id.served_seq) else {
+                        continue;
+                    };
+                    let writer = if labeled { writer } else { 0 };
+                    let set = self.by_topic.entry(stage.topic.to_string()).or_default();
+                    for back in 0..pops {
+                        if set.insert((writer, served.wrapping_sub(back))) {
+                            self.entries += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Distinct identities named.
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        self.entries
+    }
+
+    /// Bytes an index holding every named identity is charged.
+    #[must_use]
+    pub fn index_bytes(&self) -> u64 {
+        self.entries.saturating_mul(FEED_INDEX_ENTRY_BYTES)
+    }
+
+    /// `Err` with the bytes needed when they exceed `budget`.
+    ///
+    /// # Errors
+    ///
+    /// [`FeedIndexOverBudget`] when [`Self::index_bytes`] is above `budget`.
+    pub fn check_budget(&self, budget: u64) -> Result<(), FeedIndexOverBudget> {
+        let needed = self.index_bytes();
+        if needed > budget {
+            return Err(FeedIndexOverBudget {
+                budget,
+                needed,
+                entries: self.entries,
+            });
+        }
+        Ok(())
+    }
+
+    fn wants(&self, topic: &str, key: (u64, u32)) -> bool {
+        self.by_topic.get(topic).is_some_and(|s| s.contains(&key))
+    }
+}
+
+/// A feed index the selected reads need is larger than the budget allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedIndexOverBudget {
+    /// The budget, in bytes.
+    pub budget: u64,
+    /// The bytes the index needs.
+    pub needed: u64,
+    /// The identity entries the index needs.
+    pub entries: u64,
+}
+
+/// Which writer the labels give one ordinal of a topic.
+#[derive(Debug, Default)]
+struct LabelResolver {
+    /// Per ordinal, the `FrameLabel`s naming it as `(label position, port)`.
+    frame_labels: HashMap<usize, Vec<(usize, u128)>>,
+    /// Every `CatchUpPrefix` as `(label position, prefix length, port,
+    /// contested)`.
+    prefixes: Vec<(usize, usize, u128, bool)>,
+}
+
+impl LabelResolver {
+    fn new(labels: &[(ProducerAttribution, u128)]) -> Self {
+        let mut out = Self::default();
+        let mut first_prefix: Option<u128> = None;
+        for (pos, (attribution, id)) in labels.iter().enumerate() {
+            match *attribution {
+                ProducerAttribution::FrameLabel { frame_index } => {
+                    if let Ok(ordinal) = usize::try_from(frame_index) {
+                        out.frame_labels
+                            .entry(ordinal)
+                            .or_default()
+                            .push((pos, *id));
+                    }
+                }
+                ProducerAttribution::CatchUpPrefix { prefix_len } => {
+                    let contested = first_prefix.is_some_and(|p| p != *id);
+                    first_prefix.get_or_insert(*id);
+                    let end = usize::try_from(prefix_len).unwrap_or(usize::MAX);
+                    out.prefixes.push((pos, end, *id, contested));
+                }
+            }
+        }
+        out
+    }
+
+    /// The writer of `ordinal`: `None` = unstated, `Some(None)` = contradicted.
+    /// Folds the labels covering it in label order.
+    fn writer_of(&self, ordinal: usize) -> Option<Option<u128>> {
+        let mut covering: Vec<(usize, u128, bool)> = self
+            .prefixes
+            .iter()
+            .filter(|(_, end, _, _)| ordinal < *end)
+            .map(|&(pos, _, id, contested)| (pos, id, contested))
+            .collect();
+        if let Some(labels) = self.frame_labels.get(&ordinal) {
+            covering.extend(labels.iter().map(|&(pos, id)| (pos, id, false)));
+        }
+        covering.sort_unstable_by_key(|&(pos, _, _)| pos);
+        let mut slot: Option<Option<u128>> = None;
+        for (_, id, contested) in covering {
+            slot = match slot {
+                None if contested => None,
+                None => Some(Some(id)),
+                Some(Some(prev)) if prev == id => Some(Some(id)),
+                Some(_) => Some(None),
+            };
+        }
+        slot
+    }
+}
+
+/// Builds a [`FrameIndex`] from one walk of the bag, frame by frame.
+#[derive(Debug)]
+pub struct FrameIndexBuilder<'a> {
+    topics: HashMap<String, (TopicIndex, LabelResolver, usize)>,
+    need: Option<&'a FeedNeed>,
+    entries: u64,
+}
+
+impl<'a> FrameIndexBuilder<'a> {
+    /// A builder over `topics` under `labels` (per topic). With `need`, only
+    /// the identities it names are kept.
+    #[must_use]
+    pub fn new<I: IntoIterator<Item = String>>(
+        topics: I,
+        labels: &BTreeMap<String, TopicLabels>,
+        need: Option<&'a FeedNeed>,
+    ) -> Self {
+        let topics = topics
+            .into_iter()
+            .map(|topic| {
+                let topic_labels = labels.get(&topic).map(Vec::as_slice).unwrap_or(&[]);
+                let idx = TopicIndex {
+                    labeled: !topic_labels.is_empty(),
+                    ..TopicIndex::default()
+                };
+                (topic, (idx, LabelResolver::new(topic_labels), 0))
+            })
+            .collect();
+        Self {
+            topics,
+            need,
+            entries: 0,
+        }
+    }
+
+    /// Take the next frame of `topic`, in the topic's file order. A topic the
+    /// builder was not given is ignored.
+    pub fn push(&mut self, topic: &str, frame: RecordedFrame) {
+        let Some((idx, resolver, next_ordinal)) = self.topics.get_mut(topic) else {
+            return;
+        };
+        let ordinal = *next_ordinal;
+        *next_ordinal += 1;
+        let Some(seq) = frame.sequence else {
+            return;
+        };
+        idx.headered += 1;
+        let writer = if idx.labeled {
+            match resolver.writer_of(ordinal) {
+                Some(Some(id)) => {
+                    let token = writer_token(id);
+                    idx.writers.insert(token);
+                    token
+                }
+                _ => {
+                    idx.unattributed += 1;
+                    return;
+                }
+            }
+        } else {
+            0
+        };
+        #[cfg(feature = "oracle-mutants")]
+        if let Some(ts) = frame.timestamp_ns {
+            idx.ordered.push((ts, frame.span));
+        }
+        if self.need.is_some_and(|n| !n.wants(topic, (writer, seq))) {
+            return;
+        }
+        match idx.by_id.entry((writer, seq)) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let next = match *e.get() {
+                    Slot::One(_) => Slot::Many(2),
+                    Slot::Many(n) => Slot::Many(n + 1),
+                };
+                e.insert(next);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Slot::One(frame.span));
+                self.entries += 1;
+            }
+        }
+    }
+
+    /// The index.
+    #[must_use]
+    pub fn finish(self) -> FrameIndex {
+        FrameIndex {
+            topics: self
+                .topics
+                .into_iter()
+                .map(|(topic, (idx, _, _))| (topic, idx))
+                .collect(),
+            entries: self.entries,
+        }
+    }
+}
+
 impl FrameIndex {
-    /// Index `frames` (per topic, in file order) under `labels` (per topic).
+    /// Index every frame of `frames` (per topic, in file order) under `labels`
+    /// (per topic).
     ///
     /// A topic with at least one label is LABELED: a `FrameLabel` names one
     /// frame's writer by its ordinal, a `CatchUpPrefix` the writer of a leading
@@ -118,84 +378,19 @@ impl FrameIndex {
         frames: &BTreeMap<String, Vec<RecordedFrame>>,
         labels: &BTreeMap<String, TopicLabels>,
     ) -> Self {
-        let mut topics = HashMap::new();
+        let mut builder = FrameIndexBuilder::new(frames.keys().cloned(), labels, None);
         for (topic, list) in frames {
-            let topic_labels = labels.get(topic).map(Vec::as_slice).unwrap_or(&[]);
-            let mut idx = TopicIndex {
-                labeled: !topic_labels.is_empty(),
-                ..TopicIndex::default()
-            };
-            // Writer per ordinal: `None` = unstated, `Some(None)` = contradicted.
-            let mut writer_of: Vec<Option<Option<u128>>> = vec![None; list.len()];
-            // `contested`: a record that may contradict an attribution but
-            // never originates one (a second catch-up prefix naming another
-            // writer, which the recorder never writes).
-            let mut attribute = |ordinal: usize, id: u128, contested: bool| {
-                if let Some(slot) = writer_of.get_mut(ordinal) {
-                    *slot = match *slot {
-                        None if contested => None,
-                        None => Some(Some(id)),
-                        Some(Some(prev)) if prev == id => Some(Some(id)),
-                        Some(_) => Some(None),
-                    };
-                }
-            };
-            let mut first_prefix: Option<u128> = None;
-            for (attribution, id) in topic_labels {
-                match *attribution {
-                    ProducerAttribution::FrameLabel { frame_index } => {
-                        if let Ok(ordinal) = usize::try_from(frame_index) {
-                            attribute(ordinal, *id, false);
-                        }
-                    }
-                    ProducerAttribution::CatchUpPrefix { prefix_len } => {
-                        let contested = first_prefix.is_some_and(|p| p != *id);
-                        first_prefix.get_or_insert(*id);
-                        let end = usize::try_from(prefix_len)
-                            .unwrap_or(usize::MAX)
-                            .min(list.len());
-                        for ordinal in 0..end {
-                            attribute(ordinal, *id, contested);
-                        }
-                    }
-                }
+            for frame in list {
+                builder.push(topic, *frame);
             }
-            for (ordinal, frame) in list.iter().enumerate() {
-                let Some(seq) = frame.sequence else {
-                    continue;
-                };
-                let writer = if idx.labeled {
-                    match writer_of[ordinal] {
-                        Some(Some(id)) => {
-                            let token = writer_token(id);
-                            idx.writers.insert(token);
-                            token
-                        }
-                        _ => {
-                            idx.unattributed += 1;
-                            continue;
-                        }
-                    }
-                } else {
-                    0
-                };
-                idx.by_id
-                    .entry((writer, seq))
-                    .and_modify(|slot| {
-                        *slot = match *slot {
-                            Slot::One(_) => Slot::Many(2),
-                            Slot::Many(n) => Slot::Many(n + 1),
-                        }
-                    })
-                    .or_insert(Slot::One(frame.span));
-                #[cfg(feature = "oracle-mutants")]
-                if let Some(ts) = frame.timestamp_ns {
-                    idx.ordered.push((ts, frame.span));
-                }
-            }
-            topics.insert(topic.clone(), idx);
         }
-        Self { topics }
+        builder.finish()
+    }
+
+    /// Identity entries held, over every topic.
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        self.entries
     }
 }
 
@@ -457,8 +652,9 @@ pub mod mutants {
 /// Plan every fed read of a pass.
 ///
 /// For each admission that pops, the frames its recorded identity names, looked
-/// up in `index`. `step_targets` maps a step to its recorded boundary target
-/// and is read only by the timestamp mutant.
+/// up in `index`. Steps at or past `step_end` (`None` = no bound) are not
+/// planned. `step_targets` maps a step to its recorded boundary target and is
+/// read only by the timestamp mutant.
 ///
 /// # Errors
 ///
@@ -467,6 +663,7 @@ pub fn plan_feeds(
     stages: &[FedStage<'_>],
     index: &FrameIndex,
     step_targets: &BTreeMap<u64, u64>,
+    step_end: Option<u64>,
 ) -> Result<FeedPlan, FeedRefusal> {
     let _ = step_targets;
     // Pass 1: an unlabeled topic must be read under ONE writer.
@@ -498,16 +695,15 @@ pub fn plan_feeds(
         // consumed it.
         let mut claimed: HashMap<(u64, u32), u64> = HashMap::new();
         for step in &stage.admission.per_step {
+            if step_end.is_some_and(|end| step.step >= end) {
+                continue;
+            }
             for (ordinal, (due, id)) in step.due.iter().zip(&step.identity).enumerate() {
                 let DueShape::Pops { pops, .. } = due.shape() else {
                     continue;
                 };
                 let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
-                let Some(topic) = index
-                    .topics
-                    .get(stage.topic)
-                    .filter(|t| !t.by_id.is_empty() || t.unattributed > 0)
-                else {
+                let Some(topic) = index.topics.get(stage.topic).filter(|t| t.headered > 0) else {
                     return Err(refuse(
                         step.step,
                         id.writer,
@@ -867,7 +1063,113 @@ mod tests {
             }],
             idx,
             &BTreeMap::new(),
+            None,
         )
+    }
+
+    fn need_of(adm: &StageAdmission, step_end: Option<u64>) -> FeedNeed {
+        let mut need = FeedNeed::default();
+        need.add(
+            &[FedStage {
+                admission: adm,
+                input: "inp",
+                topic: "/t",
+                every_read: false,
+            }],
+            &BTreeMap::new(),
+            step_end,
+        );
+        need
+    }
+
+    /// An index built under a need keeps only the identities the reads name,
+    /// and the plan over it is the plan over the whole index.
+    #[test]
+    fn an_index_under_a_need_keeps_only_the_named_frames() {
+        let frames: Vec<RecordedFrame> = (1..=10).map(|s| frame(s as usize * 10, s)).collect();
+        let adm = admission(&[
+            (1, 3, Some(7), 2, ReadKind::Served),
+            (2, 4, Some(7), 1, ReadKind::Served),
+        ]);
+        let need = need_of(&adm, None);
+        assert_eq!(need.entries(), 3);
+        let mut b = FrameIndexBuilder::new(["/t".to_string()], &BTreeMap::new(), Some(&need));
+        for f in &frames {
+            b.push("/t", *f);
+        }
+        let narrow = b.finish();
+        assert_eq!(narrow.entries(), 3);
+        let whole = index(frames, vec![]);
+        assert_eq!(whole.entries(), 10);
+        let a = plan(&adm, &narrow).expect("plans over the narrow index");
+        let b = plan(&adm, &whole).expect("plans over the whole index");
+        assert_eq!(a.read(&key(), 1, 0), b.read(&key(), 1, 0));
+        assert_eq!(a.read(&key(), 2, 0), b.read(&key(), 2, 0));
+    }
+
+    /// A step end leaves the reads at and past it out of the need and the plan.
+    #[test]
+    fn a_step_end_bounds_the_need_and_the_plan() {
+        let adm = admission(&[
+            (1, 1, Some(7), 1, ReadKind::Served),
+            (2, 2, Some(7), 1, ReadKind::Served),
+            (3, 3, Some(7), 1, ReadKind::Served),
+        ]);
+        let need = need_of(&adm, Some(2));
+        assert_eq!(need.entries(), 1);
+        let mut b = FrameIndexBuilder::new(["/t".to_string()], &BTreeMap::new(), Some(&need));
+        for s in 1..=3 {
+            b.push("/t", frame(s as usize, s));
+        }
+        let idx = b.finish();
+        let p = plan_feeds(
+            &[FedStage {
+                admission: &adm,
+                input: "inp",
+                topic: "/t",
+                every_read: false,
+            }],
+            &idx,
+            &BTreeMap::new(),
+            Some(2),
+        )
+        .expect("plans the bounded steps");
+        assert_eq!(p.reads_planned(), 1);
+    }
+
+    /// The budget admits a need at or under it and refuses one byte over.
+    #[test]
+    fn the_feed_index_budget_admits_at_and_under_and_refuses_over() {
+        let adm = admission(&[(1, 3, Some(7), 3, ReadKind::Served)]);
+        let need = need_of(&adm, None);
+        let bytes = 3 * FEED_INDEX_ENTRY_BYTES;
+        assert_eq!(need.index_bytes(), bytes);
+        assert_eq!(need.check_budget(bytes + 1), Ok(()));
+        assert_eq!(need.check_budget(bytes), Ok(()));
+        assert_eq!(
+            need.check_budget(bytes - 1),
+            Err(FeedIndexOverBudget {
+                budget: bytes - 1,
+                needed: bytes,
+                entries: 3,
+            })
+        );
+    }
+
+    /// A catch-up prefix and a frame label that disagree leave the frame
+    /// unattributed, read frame by frame as the whole-list build did.
+    #[test]
+    fn labels_resolve_per_ordinal_in_label_order() {
+        let labels: TopicLabels = vec![
+            (ProducerAttribution::CatchUpPrefix { prefix_len: 2 }, 11),
+            (ProducerAttribution::FrameLabel { frame_index: 1 }, 22),
+            (ProducerAttribution::FrameLabel { frame_index: 2 }, 22),
+        ];
+        let r = LabelResolver::new(&labels);
+        assert_eq!(r.writer_of(0), Some(Some(11)));
+        assert_eq!(r.writer_of(1), Some(None));
+        assert_eq!(r.writer_of(2), Some(Some(22)));
+        assert_eq!(r.writer_of(3), None);
     }
 
     /// A single-writer Latest read that popped 2 after the live queue evicted

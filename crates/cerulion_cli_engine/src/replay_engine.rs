@@ -3667,6 +3667,10 @@ pub struct ReplayInputs {
     /// means a different amount of recording on each. `None` re-executes the
     /// whole recorded trace, which is the answer for every ordinary run.
     pub duration_bound_ns: Option<u64>,
+    /// Bytes a fed replay's frame index may take (`--feed-index-budget`).
+    /// `None` = [`crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET`]. A replay
+    /// whose selected reads need more is refused with exit 2.
+    pub feed_index_budget: Option<u64>,
     /// Write the [`ReplayOutcome`] JSON here (`--report`), if set.
     pub report_path: Option<PathBuf>,
     /// Diagnostic observer over the fire streams: invoked for every
@@ -3791,6 +3795,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         recorder,
         record_health,
         duration_bound_ns,
+        feed_index_budget,
         report_path,
         mut fire_tap,
         tolerance,
@@ -4258,6 +4263,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         roles_stamped,
         kind_width,
         fed.then_some(&recorded_messages),
+        duration_bound_ns.map(|d| (run_epoch_ns, d)),
+        feed_index_budget.unwrap_or(crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET),
     )?;
     let mut fed_totals = (0usize, 0usize);
     // One identifier per replay, named into every private feed service.
@@ -11171,25 +11178,12 @@ fn read_identity_refusal(edge: Option<String>, cause: &str, detail: String) -> R
     }
 }
 
-/// Index the recorded frames of `topics` by identity, for the private feeds.
-fn build_feed_frame_index(
+/// The producer labels of `topics`, per topic, from the bag's sidecar.
+fn feed_topic_labels(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
-) -> Result<crate::replay_feed::FrameIndex, ReplayError> {
-    let mut frames: BTreeMap<String, Vec<crate::replay_feed::RecordedFrame>> =
-        topics.iter().map(|t| (t.clone(), Vec::new())).collect();
-    rm.for_each_frame_span(&mut |topic, span, bytes| {
-        if let Some(list) = frames.get_mut(topic) {
-            let header = WireHeader::read_from_buf(bytes);
-            list.push(crate::replay_feed::RecordedFrame {
-                span,
-                sequence: header.as_ref().map(|h| h.sequence),
-                timestamp_ns: header.as_ref().map(|h| h.timestamp_ns),
-            });
-        }
-    })?;
-    let sidecar = read_producer_sidecar(&rm.reader, topics);
-    let labels: BTreeMap<String, crate::replay_feed::TopicLabels> = sidecar
+) -> BTreeMap<String, crate::replay_feed::TopicLabels> {
+    read_producer_sidecar(&rm.reader, topics)
         .by_topic
         .into_iter()
         .map(|(topic, labels)| {
@@ -11201,8 +11195,100 @@ fn build_feed_frame_index(
                     .collect(),
             )
         })
-        .collect();
-    Ok(crate::replay_feed::FrameIndex::build(&frames, &labels))
+        .collect()
+}
+
+/// Index the recorded frames of `topics` by identity for the private feeds,
+/// keeping only the identities `need` names. Refuses with exit 2 when `need`
+/// is over `budget` bytes, before the bag is walked.
+fn build_feed_frame_index(
+    rm: &RecordedMessages,
+    topics: &BTreeSet<String>,
+    labels: &BTreeMap<String, crate::replay_feed::TopicLabels>,
+    need: &crate::replay_feed::FeedNeed,
+    budget: u64,
+) -> Result<crate::replay_feed::FrameIndex, ReplayError> {
+    if let Err(over) = need.check_budget(budget) {
+        return Err(read_identity_refusal(
+            None,
+            "read_identity_feed_index_budget",
+            format!(
+                "the reads this replay feeds need a feed index of {} bytes ({} frame \
+                 identities at {} bytes each), over the feed index budget of {} bytes; raise \
+                 it with `--feed-index-budget <BYTES>` or bound the replay with `--duration`",
+                over.needed,
+                over.entries,
+                crate::replay_feed::FEED_INDEX_ENTRY_BYTES,
+                over.budget
+            ),
+        ));
+    }
+    let mut builder =
+        crate::replay_feed::FrameIndexBuilder::new(topics.iter().cloned(), labels, Some(need));
+    rm.for_each_frame_span(&mut |topic, span, bytes| {
+        let header = WireHeader::read_from_buf(bytes);
+        builder.push(
+            topic,
+            crate::replay_feed::RecordedFrame {
+                span,
+                sequence: header.as_ref().map(|h| h.sequence),
+                timestamp_ns: header.as_ref().map(|h| h.timestamp_ns),
+            },
+        );
+    })?;
+    let index = builder.finish();
+    tracing::debug!(
+        entries = index.entries(),
+        "replay: feed index built over the selected reads"
+    );
+    Ok(index)
+}
+
+/// The fed stages of one rank's admissions, each with its input's recorded name.
+fn fed_stages_of<'a>(
+    admission: &'a BTreeMap<String, Vec<replay_inject::StageAdmission>>,
+    recorded_inputs: &'a BTreeMap<String, Vec<String>>,
+    every_read_edges: &BTreeSet<(String, String)>,
+) -> Vec<crate::replay_feed::FedStage<'a>> {
+    let mut fed_stages = Vec::new();
+    for (topic, stages) in admission {
+        for stage in stages {
+            let input = recorded_inputs
+                .get(&stage.key.node)
+                .and_then(|names| names.get(usize::from(stage.key.input_idx)))
+                .map_or("<unnamed input>", String::as_str);
+            let every_read =
+                every_read_edges.contains(&(stage.key.node.clone(), input.to_string()));
+            fed_stages.push(crate::replay_feed::FedStage {
+                admission: stage,
+                input,
+                topic,
+                every_read,
+            });
+        }
+    }
+    fed_stages
+}
+
+/// The first step of `rank` a `--duration` bound excludes (`None` = no bound).
+/// The same half-open window the pass loop applies.
+fn fed_step_end(
+    trace: &RecordedTrace,
+    rank: u32,
+    bound: Option<(u64, u64)>,
+) -> Result<Option<u64>, ReplayError> {
+    let Some((epoch, d)) = bound else {
+        return Ok(None);
+    };
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
+    let mut end = 0;
+    while let Some(b) = cursor.next()? {
+        if crate::replay_rank::beyond_duration_bound(b.target_ns.saturating_sub(epoch), d) {
+            return Ok(Some(b.step));
+        }
+        end = b.step.saturating_add(1);
+    }
+    Ok(Some(end))
 }
 
 /// Each step's recorded boundary target on `rank`, for the feed mutant that
@@ -11269,6 +11355,10 @@ fn plan_bag_side_admissions(
     // identity (see `crate::replay_feed`), and anything that cannot be is
     // refused here by name. `false` keeps the queue re-creation path.
     fed: Option<&RecordedMessages>,
+    // `(run epoch, --duration)` in ns: steps past the bound are not fed.
+    duration_bound: Option<(u64, u64)>,
+    // Bytes the feed index may take.
+    feed_index_budget: u64,
 ) -> Result<BTreeMap<u32, RankBagSide>, ReplayError> {
     // A lockstep bag arms no gate at all: one gating clock already orders every
     // publish against every step.
@@ -11303,19 +11393,13 @@ fn plan_bag_side_admissions(
             )),
             (None, None) => return Ok(BTreeMap::new()),
         };
-    // The identity index of every topic a fed rank consumes, built once.
-    let frame_index = match fed {
-        Some(rm) => {
-            let topics: BTreeSet<String> = plans.iter().flat_map(rank_consumed_topics).collect();
-            Some(build_feed_frame_index(rm, &topics)?)
-        }
-        None => None,
-    };
+    // Every rank's admissions, fed after all are planned so the frame index is
+    // built once over the reads they name.
+    let mut planned: Vec<(u32, BTreeMap<String, Vec<replay_inject::StageAdmission>>)> = Vec::new();
     // ONE read of the drain-discipline knob for the whole pre-pass, through the
     // core's own reader, as the graph build takes one per build.
     let force_separate_discipline =
         cerulion_core::graph::runtime::drain_discipline_forces_separate();
-    let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
     for plan in plans {
         // FED: every topic the rank consumes, external and cross-rank included,
         // is read through private feeds and so gated.
@@ -11480,41 +11564,63 @@ fn plan_bag_side_admissions(
                 }
             }
         }
-        let feed = match &frame_index {
-            Some(index) => {
-                let mut fed_stages: Vec<crate::replay_feed::FedStage<'_>> = Vec::new();
-                let every_read_edges = multi_writer_edges(config);
-                for (topic, stages) in &admission {
-                    for stage in stages {
-                        let input = recorded_inputs
-                            .get(&stage.key.node)
-                            .and_then(|names| names.get(usize::from(stage.key.input_idx)))
-                            .map_or("<unnamed input>", String::as_str);
-                        let every_read =
-                            every_read_edges.contains(&(stage.key.node.clone(), input.to_string()));
-                        fed_stages.push(crate::replay_feed::FedStage {
-                            admission: stage,
-                            input,
-                            topic,
-                            every_read,
-                        });
-                    }
-                }
-                let targets = rank_step_targets(trace, plan.rank())?;
-                match crate::replay_feed::plan_feeds(&fed_stages, index, &targets) {
-                    Ok(feed) => Some(Arc::new(feed)),
-                    Err(refusal) => {
-                        return Err(read_identity_refusal(
-                            Some(format!("{}.{}", refusal.node, refusal.input)),
-                            refusal.reason.code(),
-                            refusal.to_string(),
-                        ))
-                    }
-                }
+        planned.push((plan.rank(), admission));
+    }
+    let Some(rm) = fed else {
+        return Ok(planned
+            .into_iter()
+            .map(|(rank, admission)| {
+                (
+                    rank,
+                    RankBagSide {
+                        admission,
+                        feed: None,
+                    },
+                )
+            })
+            .collect());
+    };
+    let every_read_edges = multi_writer_edges(config);
+    let topics: BTreeSet<String> = plans.iter().flat_map(rank_consumed_topics).collect();
+    let labels = feed_topic_labels(rm, &topics);
+    let mut step_ends: BTreeMap<u32, Option<u64>> = BTreeMap::new();
+    let mut need = crate::replay_feed::FeedNeed::default();
+    for (rank, admission) in &planned {
+        let step_end = fed_step_end(trace, *rank, duration_bound)?;
+        step_ends.insert(*rank, step_end);
+        need.add(
+            &fed_stages_of(admission, &recorded_inputs, &every_read_edges),
+            &labels,
+            step_end,
+        );
+    }
+    let index = build_feed_frame_index(rm, &topics, &labels, &need, feed_index_budget)?;
+    let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
+    for (rank, admission) in planned {
+        let targets = rank_step_targets(trace, rank)?;
+        let step_end = step_ends.get(&rank).copied().flatten();
+        let feed = match crate::replay_feed::plan_feeds(
+            &fed_stages_of(&admission, &recorded_inputs, &every_read_edges),
+            &index,
+            &targets,
+            step_end,
+        ) {
+            Ok(feed) => Arc::new(feed),
+            Err(refusal) => {
+                return Err(read_identity_refusal(
+                    Some(format!("{}.{}", refusal.node, refusal.input)),
+                    refusal.reason.code(),
+                    refusal.to_string(),
+                ))
             }
-            None => None,
         };
-        out.insert(plan.rank(), RankBagSide { admission, feed });
+        out.insert(
+            rank,
+            RankBagSide {
+                admission,
+                feed: Some(feed),
+            },
+        );
     }
     Ok(out)
 }

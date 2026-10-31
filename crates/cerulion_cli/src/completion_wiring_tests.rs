@@ -709,6 +709,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // BAG-TIME bounds in seconds, not paths. (They replace
         // `--max-ticks`, which is deleted outright — no alias, no shim.)
         "cerulion bag play::duration",
+        "cerulion bag play::feed_index_budget",
         "cerulion bag play::rate",
         "cerulion bag play::start_offset",
         "cerulion bag record::duration",

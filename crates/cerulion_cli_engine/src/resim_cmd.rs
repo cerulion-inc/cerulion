@@ -121,6 +121,8 @@ pub struct ResimOptions {
     pub allow_param_change: bool,
     /// `--record-out PATH` (legal in both modes).
     pub record_out_path: Option<PathBuf>,
+    /// `--feed-index-budget BYTES` (requires `--verify`).
+    pub feed_index_budget: Option<u64>,
 }
 
 /// Which nodes re-execute.
@@ -185,6 +187,8 @@ pub struct PlayFlags {
     pub allow_param_change: bool,
     /// `--record-out PATH`: resim only, in EITHER mode.
     pub record_out: Option<PathBuf>,
+    /// `--feed-index-budget BYTES`: resim + `--verify` only.
+    pub feed_index_budget: Option<u64>,
 }
 
 /// What a legal `bag play` invocation resolved to.
@@ -277,6 +281,10 @@ const RESIM_ONLY: &[(&str, &str)] = &[
         "plain playback republishes the recorded frames and re-executes nothing, so \
          there is no re-executed output to write",
     ),
+    (
+        "--feed-index-budget",
+        "plain playback feeds no reads, so it builds no feed index to budget",
+    ),
 ];
 
 /// Resolve a `bag play` invocation, refusing every illegal flag combination
@@ -313,6 +321,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         strict_state,
         allow_param_change,
         record_out,
+        feed_index_budget,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
     // before anything else: a bound nobody can act on is a usage error, not a
@@ -322,13 +331,14 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 6] = [
+        let present: [bool; 7] = [
             verify,
             report.is_some(),
             tolerance.is_some(),
             strict_state,
             allow_param_change,
             record_out.is_some(),
+            feed_index_budget.is_some(),
         ];
         if let Some((flag, why)) = RESIM_ONLY
             .iter()
@@ -388,6 +398,15 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         }
     }
 
+    if !verify && feed_index_budget.is_some() {
+        return Err(
+            "`--feed-index-budget` needs `--verify`: only a verifying resim feeds reads by \
+             recorded identity, so a bare `--resim all` builds no feed index to budget. Add \
+             `--verify` or drop the flag."
+                .to_string(),
+        );
+    }
+
     // `--record-out` shapes what the run PRODUCES, so it is legal in both modes.
     // One file cannot be both the verdict and the bag: refuse the collision by
     // name rather than let the second writer clobber the first.
@@ -411,6 +430,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             strict_state,
             allow_param_change,
             record_out_path: record_out,
+            feed_index_budget,
         },
     })
 }
@@ -956,9 +976,11 @@ fn engine_options(o: ResimOptions, verify: bool) -> replay_cmd::ReplayOptions {
         strict_state,
         allow_param_change,
         record_out_path,
+        feed_index_budget,
     } = o;
     replay_cmd::ReplayOptions {
         duration_bound_ns,
+        feed_index_budget,
         report_path,
         tolerance_path,
         strict_state,
@@ -1295,6 +1317,7 @@ mod tests {
                     strict_state: true,
                     allow_param_change: true,
                     record_out_path: None,
+                    feed_index_budget: None,
                 },
             }
         );
@@ -2119,9 +2142,11 @@ mod tests {
                 strict_state: true,
                 allow_param_change: true,
                 record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
+                feed_index_budget: Some(4096),
             },
             true,
         );
+        assert_eq!(got.feed_index_budget, Some(4096));
         assert_eq!(
             got.purpose,
             crate::replay_engine::ReplayPurpose::Verify,

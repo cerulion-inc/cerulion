@@ -2022,6 +2022,7 @@ fn replay_inner_with_transport(
         recorder,
         record_health,
         duration_bound_ns,
+        feed_index_budget: None,
         report_path,
         fire_tap,
         tolerance,
@@ -9778,6 +9779,7 @@ fn replay_probing_reader(
         recorder: None,
         record_health: RecordHealthReport::Absent,
         duration_bound_ns: None,
+        feed_index_budget: None,
         report_path: None,
         fire_tap: None,
         tolerance: None,
@@ -40092,6 +40094,17 @@ fn ri_replay(
     make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
     purpose: replay_engine::ReplayPurpose,
 ) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_bounded(bag, make, purpose, None, None)
+}
+
+/// [`ri_replay`] under a `--duration` bound and a feed index budget.
+fn ri_replay_bounded(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
     ri_take();
     let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(bag);
     let clock = Arc::new(VirtualClock::new());
@@ -40114,7 +40127,8 @@ fn ri_replay(
         env_json,
         recorder,
         record_health: RecordHealthReport::Absent,
-        duration_bound_ns: None,
+        duration_bound_ns,
+        feed_index_budget,
         report_path: None,
         fire_tap: None,
         tolerance: None,
@@ -40339,6 +40353,132 @@ fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
     );
 }
 
+/// The feed index bytes a fed replay of `bag` needs, read off the refusal a
+/// zero budget answers.
+fn ri_feed_index_need(bag: &std::path::Path, duration_bound_ns: Option<u64>) -> u64 {
+    let (outcome, _) = ri_replay_bounded(
+        bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        duration_bound_ns,
+        Some(0),
+    );
+    let msg = outcome
+        .expect_err("a zero feed index budget is refused")
+        .to_string();
+    let rest = msg
+        .split("need a feed index of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the refusal names the bytes needed: {msg}"));
+    rest.split(' ').next().unwrap().parse().unwrap()
+}
+
+fn ri_evict_bag(dir: &std::path::Path) -> std::path::PathBuf {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let bag = dir.join("ri_budget.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    bag
+}
+
+/// A feed index budget well above what the reads need: the replay is fed and
+/// passes.
+#[test]
+#[serial]
+fn a_fed_replay_under_its_feed_index_budget_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    assert!(
+        need > 0 && need.is_multiple_of(cerulion_cli_engine::replay_feed::FEED_INDEX_ENTRY_BYTES),
+        "{need}"
+    );
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(need * 4),
+    );
+    let outcome = outcome.expect("the fed replay runs under its budget");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// A feed index budget exactly equal to what the reads need is enough.
+#[test]
+#[serial]
+fn a_fed_replay_at_exactly_its_feed_index_budget_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(need),
+    );
+    let outcome = outcome.expect("the fed replay runs at exactly its budget");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// A feed index budget one entry below what the reads need refuses the replay
+/// with exit 2, naming the budget, the need and the flag that raises it.
+#[test]
+#[serial]
+fn a_fed_replay_over_its_feed_index_budget_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    let budget = need - cerulion_cli_engine::replay_feed::FEED_INDEX_ENTRY_BYTES;
+    let (outcome, replayed) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(budget),
+    );
+    let err = outcome.expect_err("a replay over its feed index budget is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_feed_index_budget".to_string(),
+        format!("need a feed index of {need} bytes"),
+        format!("feed index budget of {budget} bytes"),
+        "--feed-index-budget".to_string(),
+    ] {
+        assert!(msg.contains(&part), "the refusal names `{part}`: {msg}");
+    }
+    assert!(replayed.is_empty(), "no step ran: {replayed:?}");
+}
+
+/// A `--duration` bound covering part of the bag indexes only the frames the
+/// steps inside it read.
+#[test]
+#[serial]
+fn a_short_duration_indexes_fewer_frames_than_the_whole_bag() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let whole = ri_feed_index_need(&bag, None);
+    let quarter_ns = (RI_STEPS as u64 / 4) * DELTA_MS * 1_000_000;
+    let bounded = ri_feed_index_need(&bag, Some(quarter_ns));
+    assert!(
+        bounded > 0 && bounded * 2 < whole,
+        "a quarter of the bag needs well under half its index ({bounded} vs {whole})"
+    );
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        Some(quarter_ns),
+        Some(bounded),
+    );
+    let outcome = outcome.expect("the bounded fed replay runs under the bounded need");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
 /// Two fed replays of graphs with identical node names run at the same time on
 /// ONE shared iceoryx2 config. Each private feed service carries
 /// its replay's identifier, so neither replay attaches to the other's feeds and
@@ -40391,6 +40531,7 @@ fn two_concurrent_fed_replays_sharing_an_iceoryx2_config_do_not_cross_feeds() {
                     recorder,
                     record_health: RecordHealthReport::Absent,
                     duration_bound_ns: None,
+                    feed_index_budget: None,
                     report_path: None,
                     fire_tap: None,
                     tolerance: None,

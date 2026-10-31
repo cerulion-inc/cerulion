@@ -499,6 +499,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         strict_state,
         allow_param_change,
         record_out,
+        feed_index_budget,
         ..
     } = action
     else {
@@ -518,6 +519,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         strict_state: *strict_state,
         allow_param_change: *allow_param_change,
         record_out: record_out.clone(),
+        feed_index_budget: *feed_index_budget,
     })
 }
 
@@ -551,6 +553,7 @@ fn is_resim_family(action: &BagAction) -> bool {
             strict_state,
             allow_param_change,
             record_out,
+            feed_index_budget,
             ..
         } => {
             // The two BOTH-HALVES flags are deliberately ABSENT
@@ -583,6 +586,7 @@ fn is_resim_family(action: &BagAction) -> bool {
                 || *strict_state
                 || *allow_param_change
                 || record_out.is_some()
+                || feed_index_budget.is_some()
         }
         // `bag migrate` REWRITES a bag rather than executing one — no
         // resim flags exist on it, so it can never be a resim-surface misuse.
@@ -658,6 +662,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             strict_state,
             allow_param_change,
             record_out,
+            feed_index_budget,
         } => {
             // A `--resim` invocation never reaches here — `main`
             // intercepts it for the 0–6 exit contract. What DOES reach here is
@@ -677,6 +682,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     strict_state,
                     allow_param_change,
                     record_out,
+                    feed_index_budget,
                 },
             )
             .map_err(cerulion_cli_engine::error::CliError::Validation)?;
@@ -4940,6 +4946,7 @@ mod resim_flag_mapping_tests {
             // switch, so both arms below cover it.
             allow_param_change: strict_state,
             record_out: Some(PathBuf::from("/tmp/o.mcap")),
+            feed_index_budget: None,
         }
     }
 
@@ -5046,6 +5053,7 @@ mod is_resim_family_tests {
             strict_state: f.strict_state,
             allow_param_change: f.allow_param_change,
             record_out: f.record_out,
+            feed_index_budget: None,
         }
     }
 

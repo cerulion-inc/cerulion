@@ -1319,6 +1319,9 @@ pub struct ReplayOptions {
     /// has no shared axis at all — each rank numbers its own steps — which is
     /// what the bound in TIME buys.
     pub duration_bound_ns: Option<u64>,
+    /// `--feed-index-budget BYTES`: bytes a fed replay's frame index may take.
+    /// `None` = the engine default.
+    pub feed_index_budget: Option<u64>,
     /// Write the [`ReplayOutcome`] JSON to this path (`--report`).
     pub report_path: Option<PathBuf>,
     /// Path to the tolerance YAML (`--tolerance`). Parsed +
@@ -1904,6 +1907,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         recorder,
         record_health,
         duration_bound_ns: opts.duration_bound_ns,
+        feed_index_budget: opts.feed_index_budget,
         report_path: opts.report_path,
         fire_tap: None,
         tolerance,
