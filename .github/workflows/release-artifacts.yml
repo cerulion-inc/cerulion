@@ -84,10 +84,11 @@ jobs:
 
   # The ROS 2 Lyrical rmw, built the same way inside `ros:lyrical` for every
   # release (build_rmw.sh refuses a library whose bindings were not
-  # generated). The `build` job packages it, with the heap hook and the
+  # generated). The `release` job packages it, with the heap hook and the
   # license files, as a separate `cerulion-rmw-lyrical-VERSION-TARGET`
-  # tarball; the archives and the deb carry the Jazzy library only, because
-  # the library bakes in its distro and the CLI looks for one fixed filename.
+  # tarball, so a Lyrical failure blocks only the publish; the archives and
+  # the deb carry the Jazzy library only, because the library bakes in its
+  # distro and the CLI looks for one fixed filename.
   rmw-lyrical:
     name: Build rmw_cerulion for Lyrical ${{ matrix.target }}
     if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
@@ -126,9 +127,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
     # The Linux legs package the rmw library the `rmw` job built; the macOS
     # legs wait on it too (a matrix job has one `needs`), which costs them the
-    # rmw build's wall time and nothing else. The Linux legs also package the
-    # Lyrical library the `rmw-lyrical` job built.
-    needs: [rmw, rmw-lyrical]
+    # rmw build's wall time and nothing else.
+    needs: rmw
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 45
     strategy:
@@ -248,13 +248,6 @@ jobs:
           name: rmw-${{ matrix.target }}
           path: ${{ runner.temp }}/rmw
 
-      - name: Download the Lyrical rmw library for this target
-        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: rmw-lyrical-${{ matrix.target }}
-          path: ${{ runner.temp }}/rmw-lyrical
-
       # The library sits BESIDE the binaries, the layout the CLI resolves
       # without any code change: `cerulion ros2 run` looks for
       # `librmw_cerulion.so` in its own directory and stages a minimal ament
@@ -313,32 +306,6 @@ jobs:
             (cd "$RUNNER_TEMP" && shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256")
           fi
 
-      # The Lyrical rmw is a separate asset: the library bakes in the distro it
-      # was built for and refuses a mismatched ROS_DISTRO, and the CLI looks for
-      # one fixed filename, so it cannot share an archive with the Jazzy one.
-      # The heap hook rides along so CERULION_LIB_DIR can name the unpacked
-      # directory alone.
-      - name: Package Lyrical rmw archive
-        if: runner.os == 'Linux'
-        env:
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          stem="cerulion-rmw-lyrical-${VERSION}-${TARGET}"
-          stage="$RUNNER_TEMP/$stem"
-          mkdir -p "$stage"
-          rmw="$RUNNER_TEMP/rmw-lyrical/librmw_cerulion.so"
-          if [ ! -f "$rmw" ]; then
-            echo "::error::the rmw-lyrical job left no librmw_cerulion.so for $TARGET"
-            exit 1
-          fi
-          cp "$rmw" "$stage/librmw_cerulion.so"
-          cp "target/$TARGET/release/libcerulion_heaphook.so" "$stage/libcerulion_heaphook.so"
-          chmod +x "$stage/librmw_cerulion.so" "$stage/libcerulion_heaphook.so"
-          cp LICENSE docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE THIRD-PARTY-LICENSES.md "$stage/"
-          tar czf "$RUNNER_TEMP/$stem.tar.gz" -C "$RUNNER_TEMP" "$stem"
-          (cd "$RUNNER_TEMP" && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
-
       - name: Check Debian package eligibility
         id: debian
         if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
@@ -378,16 +345,6 @@ jobs:
           path: |
             ${{ runner.temp }}/cerulion-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
             ${{ runner.temp }}/cerulion-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
-          if-no-files-found: error
-
-      - name: Upload Lyrical rmw artifact
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: cerulion-rmw-lyrical-${{ steps.version.outputs.version }}-${{ matrix.target }}
-          path: |
-            ${{ runner.temp }}/cerulion-rmw-lyrical-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
-            ${{ runner.temp }}/cerulion-rmw-lyrical-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
       - name: Upload Debian artifact
@@ -475,13 +432,47 @@ jobs:
       # `rmw-lyrical-*` library artifacts and the `rmw-verify-*` logs are
       # build evidence, not downloads: the Jazzy library ships inside the Linux
       # archives, and the Lyrical library ships in the `cerulion-rmw-lyrical-*`
-      # tarballs the `build` job packs from it.
+      # tarballs this job packs from it.
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: cerulion-*
           path: release-assets
           merge-multiple: true
+
+      - name: Download the Lyrical rmw libraries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: rmw-lyrical-*
+          path: rmw-lyrical
+
+      # The Lyrical rmw is a separate asset: the library bakes in the distro it
+      # was built for and refuses a mismatched ROS_DISTRO, and the CLI looks for
+      # one fixed filename, so it cannot share an archive with the Jazzy one.
+      # The heap hook and the license files are taken from the Linux archive
+      # of the same target, so CERULION_LIB_DIR can name the unpacked
+      # directory alone. Packing happens here, after the build and verify
+      # jobs, so a Lyrical failure blocks only the publish.
+      - name: Package the Lyrical rmw archives
+        run: |
+          set -eu
+          version=${TAG#v}
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            main="release-assets/cerulion-${version}-${target}.tar.gz"
+            lib="rmw-lyrical/rmw-lyrical-${target}/librmw_cerulion.so"
+            [ -f "$main" ] || { echo "::error::no $main to take the heap hook from"; exit 1; }
+            [ -f "$lib" ] || { echo "::error::the rmw-lyrical job left no librmw_cerulion.so for $target"; exit 1; }
+            stem="cerulion-rmw-lyrical-${version}-${target}"
+            src="extract/cerulion-${version}-${target}"
+            mkdir -p "$stem" extract
+            tar xzf "$main" -C extract
+            cp "$lib" "$stem/librmw_cerulion.so"
+            cp "$src/libcerulion_heaphook.so" "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BSD-3-CLAUSE" "$src/THIRD-PARTY-LICENSES.md" "$stem/"
+            chmod +x "$stem/librmw_cerulion.so" "$stem/libcerulion_heaphook.so"
+            tar czf "release-assets/$stem.tar.gz" "$stem"
+            (cd release-assets && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
+            rm -rf "$stem" extract
+          done
 
       - name: Create or update GitHub Release
         env:
