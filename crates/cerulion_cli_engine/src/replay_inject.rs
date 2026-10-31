@@ -384,6 +384,11 @@ pub enum RecordedReadBody {
         /// resolved to nothing does not exist — an unrecognised one resolves to
         /// [`ResolvedProducer::Foreign`], which is an answer.
         token: ResolvedProducer,
+        /// The token as recorded: a 64-bit hash of the writer's port id. Two
+        /// reads name the same writer exactly when their raw tokens are equal,
+        /// which is what a private replay feed matches recorded frames on
+        /// (`crate::replay_feed`), whatever the resolution says.
+        raw: u64,
     },
     /// An OVERFLOW marker: `dropped_records` records are missing here, each
     /// having consumed an unknown number of frames.
@@ -440,12 +445,12 @@ impl RecordedRead {
         Self { step, body }
     }
 
-    /// A producer annotation naming `token`.
+    /// A producer annotation naming `token`, recorded as `raw`.
     #[must_use]
-    pub fn producer(step: u64, token: ResolvedProducer) -> Self {
+    pub fn producer(step: u64, token: ResolvedProducer, raw: u64) -> Self {
         Self {
             step,
-            body: RecordedReadBody::Producer { token },
+            body: RecordedReadBody::Producer { token, raw },
         }
     }
 
@@ -1046,9 +1051,10 @@ impl fmt::Display for StandDownReason {
 /// Which half of a multi-publisher join failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProducerGap {
-    /// The read carried no preceding [`ReadOutcomeKind::Producer`] annotation,
-    /// so the recording never named the frame's publisher — a bag predating the
-    /// annotations, or one whose annotation did not reach the file.
+    /// No [`ReadOutcomeKind::Producer`] annotation precedes the read in its
+    /// site's stream, so the recording never named the frame's publisher, a
+    /// bag predating the annotations, or one whose annotation did not reach the
+    /// file.
     MissingAnnotation,
     /// The annotation's token hashes to two or more distinct publishers.
     AnnotationCollision,
@@ -1387,7 +1393,7 @@ enum EdgeFold {
 ///
 /// The three answers are [`EdgeFold`]'s arms.
 fn fold_edge(edge: &ConsumerEdge, topic: &TopicReplay) -> Result<EdgeFold, StandDownReason> {
-    let mut pending_token: Option<&ResolvedProducer> = None;
+    let mut run_token: Option<&ResolvedProducer> = None;
     let mut cursor = 0usize;
     let mut reads: Vec<PlannedRead> = Vec::new();
     // Set at the hand off skip below. A `Truncated` body returns and a
@@ -1409,25 +1415,28 @@ fn fold_edge(edge: &ConsumerEdge, topic: &TopicReplay) -> Result<EdgeFold, Stand
                 })
             }
             // A producer annotation names the publisher of the frame the NEXT
-            // read serves. It consumes nothing and occupies no position in the
-            // frame stream.
-            RecordedReadBody::Producer { token } => {
-                pending_token = Some(token);
+            // read serves, and of every later read of this site up to the next
+            // annotation (the core stages one per writer run, see
+            // `cerulion_core::read_outcome::writer_run_site`). It consumes
+            // nothing and occupies no position in the frame stream.
+            RecordedReadBody::Producer { token, .. } => {
+                run_token = Some(token);
                 continue;
             }
             // Both remaining bodies CONSUME the pending annotation below.
             RecordedReadBody::Read { .. } | RecordedReadBody::HandOff { .. } => {}
         }
 
-        // Taken unconditionally, including by the hand-off that does not join:
-        // an annotation belongs to exactly the read that follows it, so leaving
-        // it armed would attribute it to a LATER read.
-        let token = pending_token.take();
+        // The open run's writer. A recording that annotated every read (below
+        // trace format 8) names each read's writer right before it, so the
+        // carry changes nothing there; a read the carry misattributes names a
+        // frame whose record-time label differs, which `verify_producer`
+        // refuses as a mismatch.
+        let token = run_token;
 
         // A per-set Sync PROMOTION names a frame an earlier peek on
         // this edge already consumed, so it advances no cursor and joins to no
-        // position. Skipped AFTER the token is taken, for the reason above.
-        // See `RecordedReadBody::HandOff`.
+        // position. See `RecordedReadBody::HandOff`.
         let RecordedReadBody::Read {
             kind,
             served_seq,
@@ -2144,6 +2153,36 @@ pub struct StepAdmission {
     /// DECLARATION (the recorded none, or the served hand off), never an
     /// omission.
     pub due: Vec<DueRead>,
+    /// What each entry of [`Self::due`] recorded about the frame it served,
+    /// position for position: the read's identity for the private replay feed
+    /// (`crate::replay_feed`). Always as long as `due`.
+    pub identity: Vec<ReadIdentity>,
+}
+
+/// What one recorded read says about the frames it consumed: the writer the
+/// producer annotation before it named, the sequence it served, how many frames
+/// it popped, and its kind.
+///
+/// A read record names ONE frame (the one it served), so a read that popped
+/// more than one names the others only by position: on a single-writer edge
+/// they are the writer's frames just below the served one, which is the
+/// derivation `crate::replay_feed` applies. Where that derivation does not hold
+/// (several writers on the edge), the feed refuses the read by name rather
+/// than guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadIdentity {
+    /// The raw producer token of the last annotation of the read's site before
+    /// it (the writer of its run), or `None` when none precedes it.
+    pub writer: Option<u64>,
+    /// An annotation of its own immediately precedes the read: the shape a
+    /// multi-writer edge stages before every read.
+    pub annotated: bool,
+    /// The served frame's wire sequence (`None` = the read served nothing).
+    pub served_seq: Option<u32>,
+    /// Frames the read popped.
+    pub popped: u32,
+    /// The read's kind (`None` on a hand-off entry, which pops nothing).
+    pub kind: Option<ReadKind>,
 }
 
 /// What the planner answered for one topic.
@@ -2582,8 +2621,18 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
         // `BTreeMap` orders the STEPS and a `Vec` keeps the records inside one
         // step exactly as the bag holds them: sorting there would state an order
         // the recording does not.
-        let mut body: BTreeMap<u64, Vec<DueRead>> = BTreeMap::new();
-        let mut drain: BTreeMap<u64, Vec<DueRead>> = BTreeMap::new();
+        let mut body: BTreeMap<u64, Vec<(DueRead, ReadIdentity)>> = BTreeMap::new();
+        let mut drain: BTreeMap<u64, Vec<(DueRead, ReadIdentity)>> = BTreeMap::new();
+        // The raw writer token of the open WRITER RUN, per stage (body, drain)
+        // and per read site (`cerulion_core::read_outcome::writer_run_site`):
+        // the core stages an annotation only when a read's writer differs from
+        // its site's open run, so every later read of the site on the stage was
+        // served by the writer of the last annotation before it. An annotation
+        // and its read are minted by ONE site, so they land on the same stage.
+        let mut run_writer: [[Option<u64>; 2]; 2] = [[None, None], [None, None]];
+        // Per stage and site, whether an annotation was staged since the last
+        // read: the next read of that site carries its own.
+        let mut annotation_pending: [[bool; 2]; 2] = [[false, false], [false, false]];
         for sited in &edge.reads {
             let step = sited.read.step;
             let role = stage_of_record(sited.role, record_is_batch(&sited.read.body), roles);
@@ -2633,8 +2682,17 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                 RecordedReadBody::Truncated { .. } => continue,
                 // An annotation names the publisher of the next read and
                 // occupies no position in the pop stream. A multi-publisher edge
-                // is refused by the core census, which reads the wiring.
-                RecordedReadBody::Producer { .. } => continue,
+                // is refused by the core census, which reads the wiring, unless
+                // the stage is fed by identity.
+                RecordedReadBody::Producer { raw, .. } => {
+                    let (stage, site) = (
+                        usize::from(role == ReadStageRole::Drain),
+                        cerulion_core::read_outcome::writer_run_site(sited.role),
+                    );
+                    run_writer[stage][site] = Some(*raw);
+                    annotation_pending[stage][site] = true;
+                    continue;
+                }
                 // The third meaning: the frame named reached the consumer
                 // without a dequeue, so the gate walks past this entry rather
                 // than withholding at it.
@@ -2674,12 +2732,48 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                     }
                 }
             };
+            let (stage_slot, site) = (
+                usize::from(role == ReadStageRole::Drain),
+                cerulion_core::read_outcome::writer_run_site(sited.role),
+            );
+            let writer = run_writer[stage_slot][site];
+            let annotated = std::mem::take(&mut annotation_pending[stage_slot][site]);
+            let identity = match &sited.read.body {
+                RecordedReadBody::Read {
+                    kind,
+                    served_seq,
+                    popped,
+                } => ReadIdentity {
+                    writer,
+                    annotated,
+                    served_seq: *served_seq,
+                    popped: *popped,
+                    kind: Some(*kind),
+                },
+                RecordedReadBody::HandOff { served_seq } => ReadIdentity {
+                    writer,
+                    annotated,
+                    served_seq: Some(*served_seq),
+                    popped: 0,
+                    kind: None,
+                },
+                // Both annotation kinds left the loop above.
+                RecordedReadBody::Producer { .. } | RecordedReadBody::Truncated { .. } => {
+                    ReadIdentity {
+                        writer,
+                        annotated,
+                        served_seq: None,
+                        popped: 0,
+                        kind: None,
+                    }
+                }
+            };
             let per_step = if role == ReadStageRole::Drain {
                 &mut drain
             } else {
                 &mut body
             };
-            per_step.entry(step).or_default().push(due);
+            per_step.entry(step).or_default().push((due, identity));
         }
         for (exists, role, per_step) in [
             (roles.body, ReadStageRole::Body, body),
@@ -2708,7 +2802,14 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                 mode: edge.mode,
                 per_step: per_step
                     .into_iter()
-                    .map(|(step, due)| StepAdmission { step, due })
+                    .map(|(step, entries)| {
+                        let (due, identity) = entries.into_iter().unzip();
+                        StepAdmission {
+                            step,
+                            due,
+                            identity,
+                        }
+                    })
                     .collect(),
             });
         }
@@ -2907,7 +3008,7 @@ mod tests {
     }
 
     fn producer_note(step: u64, label: &str) -> RecordedRead {
-        RecordedRead::producer(step, ResolvedProducer::Named(label.to_string()))
+        RecordedRead::producer(step, ResolvedProducer::Named(label.to_string()), 0x5eed)
     }
 
     fn truncated(step: u64, dropped: u32) -> RecordedRead {
@@ -3487,7 +3588,7 @@ mod tests {
             // The token hashed to two publishers.
             (
                 vec![
-                    RecordedRead::producer(1, ResolvedProducer::Collision),
+                    RecordedRead::producer(1, ResolvedProducer::Collision, 0x5eed),
                     served(1, 0, 1),
                 ],
                 ProducerGap::AnnotationCollision,
@@ -3495,7 +3596,7 @@ mod tests {
             // No manifest names the token.
             (
                 vec![
-                    RecordedRead::producer(1, ResolvedProducer::Foreign),
+                    RecordedRead::producer(1, ResolvedProducer::Foreign, 0x5eed),
                     served(1, 0, 1),
                 ],
                 ProducerGap::AnnotationForeign,
@@ -3958,11 +4059,13 @@ mod tests {
         );
     }
 
-    /// A producer annotation belongs to exactly the read that FOLLOWS it. A
-    /// stream where an annotation is followed by a non-serving read must not
-    /// leak that token onto the next serving read.
+    /// A producer annotation names the writer of every read of its site up to
+    /// the next annotation (the core stages one per writer run), so a serving
+    /// read after a held one is the held read's writer. The carry is verified
+    /// against the frame's own record-time label: a carried writer the label
+    /// contradicts stands the topic down instead of joining.
     #[test]
-    fn a_producer_annotation_does_not_leak_past_the_read_it_annotates() {
+    fn a_producer_annotation_names_its_run_and_the_label_verifies_the_carry() {
         let mp_frames = vec![
             RecordedFrame {
                 sequence: 0,
@@ -3973,30 +4076,49 @@ mod tests {
                 producer: Some(ResolvedProducer::Named("right/tf".into())),
             },
         ];
-        // The annotation belongs to the HELD read at step 1 (a held frame has a
-        // producer too). The serving read at step 2 has none of its own, so the
-        // join must fail rather than borrow the held read's.
-        let t = topic(
+        let stream = |writer: &str| {
+            vec![
+                producer_note(1, writer),
+                RecordedRead::read(1, ReadKind::Held, Some(0), 0, false),
+                served(2, 0, 1),
+            ]
+        };
+        // The run's writer is the frame's: the read at step 2 joins frame 0.
+        let carried = topic(
+            true,
+            mp_frames.clone(),
+            vec![edge(
+                edge_id("tf_sink", "tf"),
+                ConsumeMode::EachFifo,
+                stream("left/tf"),
+            )],
+        );
+        let steered = expect_steered(plan_no_local(&carried));
+        assert_eq!(shape(&steered), vec![(2, vec![0])]);
+        assert_eq!(
+            steered.per_step[0].frames[0].frame_index, 0,
+            "the read joins frame 0, the one `left/tf` wrote"
+        );
+        // The run names the other writer: the label refuses the carry.
+        let contradicted = topic(
             true,
             mp_frames,
             vec![edge(
                 edge_id("tf_sink", "tf"),
                 ConsumeMode::EachFifo,
-                vec![
-                    producer_note(1, "left/tf"),
-                    RecordedRead::read(1, ReadKind::Held, Some(0), 0, false),
-                    served(2, 0, 1),
-                ],
+                stream("right/tf"),
             )],
         );
-
-        let sd = expect_stand_down(plan_no_local(&t));
+        let sd = expect_stand_down(plan_no_local(&contradicted));
         assert_eq!(
             sd.reason,
             StandDownReason::UnresolvedProducer {
                 edge: edge_id("tf_sink", "tf"),
                 step: 2,
-                detail: ProducerGap::MissingAnnotation,
+                detail: ProducerGap::Mismatch {
+                    annotated: "right/tf".into(),
+                    frame: "left/tf".into(),
+                },
             }
         );
     }
@@ -4732,6 +4854,79 @@ mod tests {
         );
     }
 
+    /// Each admission carries the writer of the last annotation of its site
+    /// before it: an annotation opens a writer run, every later read of the site
+    /// up to the next annotation is that writer's, and a read before any
+    /// annotation carries none.
+    #[test]
+    fn each_admission_carries_the_writer_of_its_run() {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let producer = |step: u64, role: ReadSiteRole, raw: u64| SitedRead {
+            role,
+            read: RecordedRead::producer(step, ResolvedProducer::Foreign, raw),
+        };
+        let topic = one_edge(vec![
+            // Before any annotation: no writer.
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(4), 1),
+            producer(0, ReadSiteRole::Body, 0xA),
+            sited(0, ReadSiteRole::Body, ReadKind::Served, Some(5), 1),
+            // The run continues across reads and steps.
+            sited(1, ReadSiteRole::Body, ReadKind::Served, Some(6), 1),
+            // The drain site's run is its own: its annotation does not move
+            // the body site's writer.
+            producer(1, ReadSiteRole::Drain, 0xC),
+            sited(1, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(1), 1),
+            sited(1, ReadSiteRole::Body, ReadKind::Served, Some(7), 1),
+            // A switch of writer opens a new run.
+            producer(2, ReadSiteRole::Body, 0xB),
+            sited(2, ReadSiteRole::Body, ReadKind::Served, Some(9), 1),
+            sited(2, ReadSiteRole::Body, ReadKind::Served, Some(10), 1),
+            // The drain site's run continues past the body site's switch.
+            sited(2, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(2), 1),
+        ]);
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &stages)
+        else {
+            panic!("the stream plans admissions");
+        };
+        let writers: Vec<(u64, Vec<Option<u64>>)> = plans[0]
+            .per_step
+            .iter()
+            .map(|s| {
+                assert_eq!(s.identity.len(), s.due.len(), "identity is parallel to due");
+                (s.step, s.identity.iter().map(|i| i.writer).collect())
+            })
+            .collect();
+        assert_eq!(
+            writers,
+            vec![
+                (0, vec![None, Some(0xA)]),
+                (1, vec![Some(0xA), Some(0xC), Some(0xA)]),
+                (2, vec![Some(0xB), Some(0xB), Some(0xC)]),
+            ]
+        );
+        let served: Vec<Option<u32>> = plans[0]
+            .per_step
+            .iter()
+            .flat_map(|s| s.identity.iter().map(|i| i.served_seq))
+            .collect();
+        assert_eq!(
+            served,
+            vec![
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(1),
+                Some(7),
+                Some(9),
+                Some(10),
+                Some(2)
+            ]
+        );
+    }
+
     /// A DRAIN-site record folds into the BODY stage when that is the only stage
     /// the input owns, and splits by site when it owns both.
     ///
@@ -4859,7 +5054,7 @@ mod tests {
         // No record plans a read: an annotation-only stream.
         let uncovered = one_edge(vec![SitedRead {
             role: ReadSiteRole::Body,
-            read: RecordedRead::producer(0, ResolvedProducer::Foreign),
+            read: RecordedRead::producer(0, ResolvedProducer::Foreign, 0x5eed),
         }]);
         let AdmissionPlan::Refused(r) = plan_edge_admission(&uncovered, &stages) else {
             panic!("an annotation-only stream covers nothing");

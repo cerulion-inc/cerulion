@@ -34,9 +34,11 @@ workspace = true
 # tests, which is what the dev-dependency self-reference below is for.
 test-seams = []
 # Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
-# show its oracle catches it. Off by default and in every release build; only an
-# explicit `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
-oracle-mutants = []
+# show its oracle catches it, among them the private replay feed's
+# (`replay_feed::mutants`) and the core's (`cerulion_core/oracle-mutants`). Off by
+# default and in every release build; only an explicit
+# `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
+oracle-mutants = ["cerulion_core/oracle-mutants"]
 
 [dependencies]
 cerulion_core = { workspace = true }

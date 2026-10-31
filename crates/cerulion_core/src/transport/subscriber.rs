@@ -1782,6 +1782,16 @@ impl CerulionSubscriber {
         }
     }
 
+    /// Report a read through an unrecorded path to this subscriber's replay
+    /// gate. One `Option` test on a subscriber no replay gates; the gate itself
+    /// mints only when it is armed AND fed.
+    #[inline]
+    fn note_unrecorded_take(&self) {
+        if let Some(plan) = self.replay_plan.as_deref() {
+            plan.note_unrecorded_take();
+        }
+    }
+
     /// Is read-outcome capture LIVE on this subscriber — a stage is
     /// wired AND a recording armed it? Checked BEFORE any capture-only work
     /// (the extra served-seq header parse included), so a non-recording run
@@ -1803,13 +1813,14 @@ impl CerulionSubscriber {
             .is_some_and(|s| s.is_armed() && s.records_every_consult())
     }
 
-    /// Mark this input's topic as `multi_publisher_topics`-listed
-    /// — the ONLY edges whose reads carry a
-    /// [`ReadOutcomeKind::Producer`] annotation. Set by the graph runtime at
-    /// WIRING time (the one site that has the graph config), so the decision
-    /// is a per-subscriber BIT rather than a per-read lookup: a
-    /// single-publisher edge's hot path pays one already-loaded bool and its
-    /// read log is byte-identical to one without the annotation.
+    /// Mark this input's reads as carrying their writer: each read hands its
+    /// producer token to `ReadOutcomeStage::record_with_producer`, which stages
+    /// a [`ReadOutcomeKind::Producer`] annotation when the writer differs from
+    /// the open run's. Set by the graph runtime at WIRING time on every edge
+    /// under the default identity rule (`replay_feed::EdgeIdentity::EveryEdge`),
+    /// and only on multi-writer edges when a replay rebuilds an older
+    /// recording's staging, so the decision is a per-subscriber BIT rather than
+    /// a per-read lookup.
     pub(crate) fn mark_multi_publisher_edge(&mut self) {
         self.multi_publisher_edge = true;
     }
@@ -1817,10 +1828,8 @@ impl CerulionSubscriber {
     /// Should THIS read carry a producer annotation? Both
     /// conjuncts are load-bearing: the armed check keeps a
     /// non-recording run free of any origin read at all, and the
-    /// multi-publisher bit keeps `sample.origin()` — an iceoryx2 call the hot
-    /// path does not otherwise make outside the eviction-probe branch — off
-    /// every single-publisher edge, which is every edge on every shipped
-    /// graph and mp fixture.
+    /// annotation bit keeps `sample.origin()` off an edge whose replay
+    /// rebuilds a recording that did not annotate it.
     #[inline]
     fn capture_producer_token(&self) -> bool {
         self.multi_publisher_edge && self.read_capture_armed()
@@ -2895,6 +2904,9 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one");
         }
+        // A replay that feeds this input privately cannot place frames for a
+        // read the log never recorded: say so on the gate, by stage.
+        self.note_unrecorded_take();
         // Malformed frames this call POPPED. They are queue removals, so each one
         // rode a notify; the listener policy keys on removals, and the exits that
         // return without delivering a frame still have to report them.
@@ -3001,6 +3013,7 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one_owned");
         }
+        self.note_unrecorded_take();
         // Malformed frames this call POPPED. They are queue removals, so each one
         // rode a notify; the listener policy keys on removals, and the exits that
         // return without delivering a frame still have to report them.
@@ -5284,7 +5297,9 @@ impl CerulionSubscriber {
                 // asks the refill hook once MORE than it fires and the empty
                 // answer is what ENDS the burst, while
                 // `Scheduler::tick_replay_burst` fires the recorded count and
-                // asks the hook only BETWEEN fires. So an empty refill answer is
+                // asks the hook BETWEEN fires, plus once after the last fire of a
+                // step whose recording holds the cap's trailing pop. So an empty
+                // refill answer is
                 // the terminal probe of a burst that discovered its own length,
                 // and a plan-driven replay makes no consult for it: a record
                 // there would hold a position the replayed log can never fill.

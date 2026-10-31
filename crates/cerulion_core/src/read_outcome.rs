@@ -191,14 +191,17 @@ pub const READ_OUTCOME_STAGE_MAX: u32 = 4096;
 // leans on evenness for the atomic-pair admission and on the ordering for the
 // clamp to be a clamp at all.
 //
-// WHY THE TOTAL IS EVEN WHEREVER IT HAS TO BE. An ODD rim is
-// reachable only on an UNANNOTATED edge (`pair == 1`), and an unannotated edge
-// never calls `record_with_producer`, so the atomic pair never meets an odd
-// rim. That is a COUPLING, not a coincidence: all three wiring sites compute
-// `annotated` ONCE and drive BOTH the sizing and `mark_multi_publisher_edge`
-// from that same value, so the bit that decides `pair == 2` is the same bit
-// that decides whether pairs are ever staged. Splitting those two reads is the
-// one edit that would make an odd rim reachable by a pair.
+// WHERE AN ODD RIM MEETS A PAIR. On an `Annotated` edge (`pair == 2`) the
+// total is even, so a pair never meets a rim with one free slot. On a
+// `WriterRuns` edge the rim can be odd: the pair there is staged once per
+// writer run, its two records are counted in the run-opening term, and a pair
+// that finds one free slot is refused both-or-neither and counted, the same
+// marked hole as any drop. All three wiring sites read the edge's multi-writer
+// fact once and derive the marking (`EdgeIdentity::annotates`, which drives
+// `mark_multi_publisher_edge`), the sizing (`EdgeIdentity::sizing`) and the
+// per-read rule (`replay_feed::annotates_every_read`) from it, and `sizing` is
+// `Plain` exactly where `annotates` is false, so a `Plain` stage never
+// receives a pair.
 const _: () = assert!(
     READ_OUTCOME_STAGE_MIN <= READ_OUTCOME_STAGE_MAX
         && READ_OUTCOME_STAGE_MIN.is_multiple_of(2)
@@ -351,10 +354,20 @@ pub enum FireBurstBound {
 /// rim EVEN wherever a pair can meet it (see the const assert above).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProducerAnnotation {
-    /// Every read on this edge is admitted as an atomic `(Producer, read)`
-    /// pair — two records, not one.
+    /// A multi-writer edge (a `multi_publisher_topics` topic, or a
+    /// producer-less external one): every read is admitted as an atomic
+    /// `(Producer, read)` pair, so the whole bound doubles.
     Annotated,
-    /// A single-publisher, graph-owned edge: one record per read.
+    /// A single-publisher, graph-owned edge whose reads carry their writer by
+    /// RUN: the annotation is staged only when the writer differs from the one
+    /// the stage last annotated, so one writer costs one annotation per
+    /// recording. The bound takes two records over [`Self::Plain`]: the
+    /// annotation that opens the writer's run at each of the two read sites
+    /// ([`writer_run_site`]). A read costs at most one slot in the plain bound
+    /// (a read equal to the pair's read folds into it, as an equal read folds
+    /// into a bare one), so the annotation is the only record a run adds.
+    WriterRuns,
+    /// An edge whose reads carry no annotation: one record per read.
     Plain,
 }
 
@@ -601,7 +614,11 @@ pub struct ReadStageSizing {
 pub const fn derive_stage_capacity(role: ReadStageRole, sizing: ReadStageSizing) -> u32 {
     let pair: u64 = match sizing.annotated {
         ProducerAnnotation::Annotated => 2,
-        ProducerAnnotation::Plain => 1,
+        ProducerAnnotation::WriterRuns | ProducerAnnotation::Plain => 1,
+    };
+    let run_opening: u64 = match sizing.annotated {
+        ProducerAnnotation::WriterRuns => 2,
+        ProducerAnnotation::Annotated | ProducerAnnotation::Plain => 0,
     };
     // The peek/promote pair mints on the BODY subscriber (per-set `Sync`
     // unifies its trigger drain onto it), so a `Drain` stage cannot hold it.
@@ -713,7 +730,9 @@ pub const fn derive_stage_capacity(role: ReadStageRole, sizing: ReadStageSizing)
     };
     let folded = consuming.saturating_mul(2).saturating_add(1);
     let arm = if unfolded > folded { unfolded } else { folded };
-    let cap = pair.saturating_mul(arm.saturating_add(READ_OUTCOME_STAGE_HEADROOM as u64));
+    let cap = pair
+        .saturating_mul(arm.saturating_add(READ_OUTCOME_STAGE_HEADROOM as u64))
+        .saturating_add(run_opening);
     if cap < READ_OUTCOME_STAGE_MIN as u64 {
         READ_OUTCOME_STAGE_MIN
     } else if cap > READ_OUTCOME_STAGE_MAX as u64 {
@@ -1179,9 +1198,15 @@ pub enum ReadOutcomeKind {
     /// ANNOTATION — the PRODUCER TOKEN. Not a read: it names
     /// WHICH publisher produced the frame the NEXT read record on the same
     /// (node, input) served, as a 64-bit token over iceoryx2's
-    /// `UniquePublisherId` (see `transport::subscriber`'s minting site). Only
-    /// ever emitted on an input whose topic is `multi_publisher_topics`-listed,
-    /// so a single-publisher edge's stream is unchanged by it.
+    /// `UniquePublisherId` (see `transport::subscriber`'s minting site), and
+    /// opens that writer's RUN: every later serving read of the same stage and
+    /// read site ([`writer_run_site`]) with no annotation before it was served
+    /// by the same writer. Under the default
+    /// `replay_feed::EdgeIdentity::EveryEdge` rule (`trace_format` 8) it is
+    /// staged on every edge: before every read of a multi-writer edge, once per
+    /// run on every other (see `ReadOutcomeStage::record_with_producer`).
+    /// Under the rule older recordings staged, before every read of a
+    /// multi-writer edge only.
     /// `served_seq` REPEATS the annotated read's served sequence (a redundant
     /// join key), and the token rides the FULL 64-bit aux word — see
     /// [`StagedReadOutcome::token`].
@@ -1285,8 +1310,9 @@ pub const STAGE_NO_FRAME: u64 = u64::MAX;
 ///   Only a plain `record` may fold into it.
 /// * [`FoldAnchor::PairRead`] — the last push was the READ half of a
 ///   `(Producer, read)` atomic pair. Only
-///   [`ReadOutcomeStage::record_with_producer`] may fold into it, and it must
-///   re-match the ANNOTATION too. Without this state a bare read whose fields
+///   [`ReadOutcomeStage::record_with_producer`] may fold into it: an equal
+///   pair re-matching the ANNOTATION too, or an equal read of the same writer
+///   that continues the run the pair opened. Without this state a bare read whose fields
 ///   happen to match would fold into the pair's read half — the read half
 ///   carries `token: None`, so `records_fold` alone cannot tell the two apart —
 ///   and an offline reader expanding `Producer x 1 + read x N` would hand the
@@ -1324,6 +1350,16 @@ struct StageInner {
     records: Vec<StagedReadOutcome>,
     /// What the last push left foldable — see [`FoldAnchor`].
     fold_anchor: FoldAnchor,
+    /// Per read SITE ([`writer_run_site`]: the node body's reads, and the
+    /// scheduler's drain and peek reads), the producer token of the last
+    /// annotation this stage ADMITTED from that site: the writer of the site's
+    /// open run. A read whose token equals its site's entry is staged bare, and
+    /// the read log attributes it to that annotation. Set only when an
+    /// annotation is admitted, so a pair dropped at the rim leaves the old
+    /// writer in place and the next read of the new writer is annotated again.
+    /// Cleared by `arm`, and by a drain whose consumer refused an annotation,
+    /// so a run never continues past an annotation the read log does not hold.
+    run_writer: [Option<u64>; 2],
     /// The last sequence this input SERVED (`Served` / `DrainedBatch`) — the
     /// "last accepted" a `Decimated` record reports (on a sample-gated input
     /// every served frame passed the gate, so the two are the same value).
@@ -1346,6 +1382,19 @@ struct StageInner {
     /// condition RE-ANNOUNCES itself loudly (the decade discipline).
     /// 0 until the head warn fires.
     next_decade: u64,
+}
+
+/// The writer-run slot of a read site: `0` for the node body's reads, `1` for
+/// the scheduler's (`Drain`, `Peek`, and the never-minted `Unstamped`). A stage
+/// keeps one open run per slot, so a reader that splits a stage's records by
+/// site, as the injection planner splits a unified input's body and drain
+/// reads, still finds each bare read's annotation before it in its own split.
+#[must_use]
+pub const fn writer_run_site(role: ReadSiteRole) -> usize {
+    match role {
+        ReadSiteRole::Body => 0,
+        ReadSiteRole::Drain | ReadSiteRole::Peek | ReadSiteRole::Unstamped => 1,
+    }
 }
 
 /// The served-seq SLOT one staged record carries, plus the `last_served_seq`
@@ -1451,6 +1500,12 @@ pub struct ReadOutcomeStage {
     /// step. Read by the subscriber beside `armed` at each consult site that
     /// found nothing, one `Acquire` load.
     records_every_consult: AtomicBool,
+    /// Does `record_with_producer` stage the annotation before EVERY read,
+    /// rather than only when the writer differs from the one the read's site
+    /// last annotated? `false` at creation, the writer-run rule. The runtime
+    /// sets it at build on a multi-writer edge
+    /// ([`Self::annotating_every_read`], `replay_feed::annotates_every_read`).
+    annotates_every_read: bool,
     /// Staged-record count mirror — lets the merge skip empty stages without
     /// taking the lock (one `Acquire` load per stage per level).
     pending: AtomicU32,
@@ -1476,9 +1531,19 @@ impl ReadOutcomeStage {
             capacity: AtomicU32::new(derive_stage_capacity(role, sizing)),
             armed: AtomicBool::new(false),
             records_every_consult: AtomicBool::new(true),
+            annotates_every_read: false,
             pending: AtomicU32::new(0),
             inner: Mutex::new(StageInner::default()),
         }
+    }
+
+    /// This stage, staging the producer annotation before every read when
+    /// `every_read` is set (see the field `annotates_every_read`). Called once
+    /// at build, before the stage is shared.
+    #[must_use]
+    pub(crate) fn annotating_every_read(mut self, every_read: bool) -> Self {
+        self.annotates_every_read = every_read;
+        self
     }
 
     /// This input's manifest input index.
@@ -1534,6 +1599,9 @@ impl ReadOutcomeStage {
         let mut inner = self.lock_inner();
         let shortfall = (self.capacity() as usize).saturating_sub(inner.records.capacity());
         inner.records.reserve_exact(shortfall);
+        // The read log starts at this arm, so the first annotated read after it
+        // opens a run.
+        inner.run_writer = [None, None];
         drop(inner);
         self.armed.store(true, Ordering::Release);
     }
@@ -1620,6 +1688,23 @@ impl ReadOutcomeStage {
         }
         let mut inner = self.lock_inner();
         let seq_slot = resolve_seq_slot(&mut inner, kind, served_seq);
+        self.stage_bare(inner, kind, seq_slot, popped, role, false);
+    }
+
+    /// Stage one bare read record under the held lock: fold it onto the last
+    /// record or push it, or drop it at the rim. The tail of [`Self::record`],
+    /// and of [`Self::record_with_producer`] for a read that continues the
+    /// open writer run (`continues_run`), which may also fold into the READ
+    /// half of the pair that opened the run: the pair's writer is its writer.
+    fn stage_bare(
+        &self,
+        mut inner: std::sync::MutexGuard<'_, StageInner>,
+        kind: ReadOutcomeKind,
+        seq_slot: u64,
+        popped: u64,
+        role: ReadSiteRole,
+        continues_run: bool,
+    ) {
         let incoming = StagedReadOutcome {
             kind,
             served_seq: seq_slot,
@@ -1647,11 +1732,18 @@ impl ReadOutcomeStage {
         // still costs one slot per read. The stage must therefore stay sized for
         // the worst case, which is what
         // `derive_stage_capacity` does.
-        // Only a BareRead anchor is foldable here: a `PairRead` belongs to an
-        // atomic pair (folding into it would launder the pair's provenance onto
-        // a bare read) and a `Broken` one sits across a DROP (folding across it
-        // would claim an adjacency the stream did not have). See [`FoldAnchor`].
-        if fold_enabled() && inner.fold_anchor == FoldAnchor::BareRead {
+        // A BareRead anchor is foldable. A `PairRead` is foldable only by a read
+        // that continues the pair's writer run (`continues_run`): the read half
+        // then stands for reads of the writer the pair names, and a plain
+        // `record` read folded into it would take on a writer it never had. A
+        // `Broken` anchor sits across a DROP, and folding across it would claim
+        // an adjacency the stream did not have. See [`FoldAnchor`].
+        let foldable = match inner.fold_anchor {
+            FoldAnchor::BareRead => true,
+            FoldAnchor::PairRead => continues_run,
+            FoldAnchor::Broken => false,
+        };
+        if fold_enabled() && foldable {
             if let Some(last) = inner.records.last_mut() {
                 if last.run_count < u32::MAX && records_fold(last, &incoming) {
                     last.run_count += 1;
@@ -1678,11 +1770,23 @@ impl ReadOutcomeStage {
         self.pending.store(len, Ordering::Release);
     }
 
-    /// Stage one read outcome PRECEDED by its
-    /// [`ReadOutcomeKind::Producer`] annotation — the multi-publisher-edge
-    /// form of [`Self::record`]. `token` is the 64-bit producer token (see
-    /// `ReadOutcomeKind::Producer`); every other parameter means exactly what
-    /// it does on `record`.
+    /// Stage one read outcome together with the writer that produced its
+    /// frame, the annotated-edge form of [`Self::record`]. `token` is the
+    /// 64-bit producer token (see `ReadOutcomeKind::Producer`); every other
+    /// parameter means exactly what it does on `record`.
+    ///
+    /// # Writer runs
+    ///
+    /// The read is PRECEDED by a [`ReadOutcomeKind::Producer`] annotation only
+    /// when `token` differs from the writer of its site's open run
+    /// (`run_writer`, the token of the last annotation this stage admitted
+    /// from the same [`writer_run_site`]). A read of the same writer is staged
+    /// bare, exactly as `record` stages it (folding into the read half of the
+    /// pair that opened the run when it equals it), and the read log
+    /// attributes it to the last annotation of its site before it. A
+    /// single-writer edge therefore stages one annotation per read site per
+    /// recording. A stage built [`Self::annotating_every_read`] (a multi-writer
+    /// edge) annotates every read instead.
     ///
     /// # Atomic-pair admission at the rim
     ///
@@ -1712,7 +1816,14 @@ impl ReadOutcomeStage {
         }
         let mut inner = self.lock_inner();
         let seq_slot = resolve_seq_slot(&mut inner, kind, served_seq);
-        // Fold the PAIR. The stage's last two records must be a
+        let site = writer_run_site(role);
+        if !self.annotates_every_read && inner.run_writer[site] == Some(token) {
+            self.stage_bare(inner, kind, seq_slot, popped, role, true);
+            return;
+        }
+        // Fold the PAIR. Reached with an equal pair only on a stage that
+        // annotates every read: under writer runs an equal token took the bare
+        // path above. The stage's last two records must be a
         // `(Producer, read)` pair identical to the incoming one; the count then
         // goes on the READ half and the annotation's is implied. A fold
         // consumes no slots, so the atomic-pair rim check below is never
@@ -1748,6 +1859,7 @@ impl ReadOutcomeStage {
             return;
         }
         inner.fold_anchor = FoldAnchor::PairRead;
+        inner.run_writer[site] = Some(token);
         inner.records.push(annotation);
         inner.records.push(read);
         let len = inner.records.len() as u32;
@@ -1808,17 +1920,27 @@ impl ReadOutcomeStage {
     /// lines, ever) without either distortion.
     /// `f` returns whether the record was HANDED OVER — accepted by at least
     /// one consumer (the trace ring, the in-memory sink) rather than dropped
-    /// on the floor. Only the OVERFLOW MARKER's answer is read; a survivor's
-    /// is ignored, because a survivor carries no debt (it is either bagged or
-    /// it is not, and the run-exit drop report already accounts for the
-    /// unmapped-node class).
+    /// on the floor. Two answers are read: the OVERFLOW MARKER's, which
+    /// retires the window's drop debt, and a producer annotation's, whose
+    /// refusal closes the open writer run. A read's answer is ignored: a read
+    /// carries no debt (it is either bagged or it is not, and the run-exit drop
+    /// report already accounts for the unmapped-node class).
     pub(crate) fn drain_into(&self, mut f: impl FnMut(StagedReadOutcome) -> bool) {
         if self.pending.load(Ordering::Acquire) == 0 {
             return;
         }
         let mut inner = self.lock_inner();
+        let mut annotation_refused = false;
         for rec in inner.records.drain(..) {
-            let _ = f(rec);
+            let is_annotation = rec.kind == ReadOutcomeKind::Producer;
+            if !f(rec) && is_annotation {
+                annotation_refused = true;
+            }
+        }
+        // A refused annotation is not in the read log, so the run it opened
+        // must not continue: the next annotated read stages its writer again.
+        if annotation_refused {
+            inner.run_writer = [None, None];
         }
         // The fold anchor is BROKEN by the drain.
         //
@@ -2267,6 +2389,19 @@ pub enum ReplayReadViolationKind {
         /// the step installed no plan for it).
         planned: u32,
     },
+    /// The stage's private replay feed could not publish the frames of the
+    /// admission at this position of the step's plan
+    /// (`crate::replay_feed::ReadFeed::fill` answered a fault). The feed's own
+    /// report names the frames.
+    FeedFailed {
+        /// The admission's position in the step's installed plan, from 0.
+        ordinal: u32,
+    },
+    /// A read on a FED stage took a frame through a path the read log does not
+    /// record (`CerulionSubscriber::try_receive_one` and its owned twin, the
+    /// rmw `take` path). Such a read has no recorded identity, so its frames
+    /// cannot be fed and the replay cannot reproduce it.
+    UnrecordedTake,
 }
 
 impl ReplayReadViolationKind {
@@ -2278,6 +2413,8 @@ impl ReplayReadViolationKind {
             Self::PoppedShortfall { .. } => "popped_shortfall",
             Self::SequenceMismatch { .. } => "sequence_mismatch",
             Self::UnplannedConsult { .. } => "unplanned_consult",
+            Self::FeedFailed { .. } => "feed_failed",
+            Self::UnrecordedTake => "unrecorded_take",
         }
     }
 }
@@ -2308,7 +2445,9 @@ pub struct ReplayReadViolation {
 /// [`ReplayReadViolationKind::UnplannedConsult`]. The qualifier costs the plan
 /// no position: the one consult the recorder omits is a burst's between-fires
 /// refill when its answer is empty, which is the probe that ended a burst a
-/// plan-driven replay does not re-derive, so neither side holds it.
+/// plan-driven replay does not re-derive, so neither side holds it. A refill
+/// that POPPED after a capped burst's last fire is recorded, and the replay
+/// makes it too (`Scheduler::set_replay_trailing_refills`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ConsultRule {
@@ -2385,6 +2524,12 @@ pub struct ReadPlanStage {
     /// Uncontended, replay only, and mirroring [`ReadOutcomeStage`]'s own
     /// interior mutability for the same reason: `drain_samples` takes `&self`.
     inner: Mutex<PlanInner>,
+    /// The stage's private replay feed, installed once by a replay whose
+    /// recording names the identity of every read
+    /// (`GraphRuntime::install_replay_read_feed`). Empty on every live run and
+    /// on every replay of an older recording, where an admission pops whatever
+    /// the queue holds.
+    feed: std::sync::OnceLock<Arc<dyn crate::replay_feed::ReadFeed>>,
 }
 
 /// One gated stage's mutable half.
@@ -2460,6 +2605,31 @@ impl ReadPlanStage {
             armed: AtomicBool::new(false),
             now_step,
             inner: Mutex::new(PlanInner::default()),
+            feed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install this stage's private replay feed. `false` when one is already
+    /// installed: a second feed would publish a read's frames twice.
+    pub(crate) fn install_feed(&self, feed: Arc<dyn crate::replay_feed::ReadFeed>) -> bool {
+        self.feed.set(feed).is_ok()
+    }
+
+    /// Is a private replay feed installed on this stage?
+    #[must_use]
+    pub fn is_fed(&self) -> bool {
+        self.feed.get().is_some()
+    }
+
+    /// A read on this stage took a frame through a path the read log does not
+    /// record. Mints [`ReplayReadViolationKind::UnrecordedTake`] on an armed,
+    /// FED stage and does nothing anywhere else, so a live run and a replay of
+    /// an older recording are unaffected.
+    #[inline(never)]
+    pub(crate) fn note_unrecorded_take(&self) {
+        if self.is_armed() && self.is_fed() {
+            let step = self.now_step.load(Ordering::Acquire);
+            self.mint(step, ReplayReadViolationKind::UnrecordedTake);
         }
     }
 
@@ -2715,6 +2885,18 @@ impl ReadPlanStage {
                     // drain's own count, so a shortfall is never reported as an
                     // admission.
                     inner.admitted_this_step = inner.admitted_this_step.saturating_add(pops);
+                    // A FED stage's queue holds nothing until the feed places
+                    // this read's frames on it: publish them now, with the plan
+                    // lock released (the feed publishes, and a fault mints
+                    // through the same lock), so the pop the caller makes next
+                    // takes exactly them.
+                    let ordinal = u32::try_from(inner.cursor - 1).unwrap_or(u32::MAX);
+                    drop(inner);
+                    if let Some(feed) = self.feed.get() {
+                        if feed.fill(&self.key, now, ordinal).is_err() {
+                            self.mint(now, ReplayReadViolationKind::FeedFailed { ordinal });
+                        }
+                    }
                     return GateAnswer::Exact(due);
                 }
             }
@@ -3047,12 +3229,14 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             capacity,
             armed,
             records_every_consult,
+            annotates_every_read,
             pending,
             inner
         }),
         abi_pin_struct!(StageInner {
             records,
             fold_anchor,
+            run_writer,
             last_served_seq,
             dropped,
             dropped_reported,
@@ -3089,7 +3273,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             blocker,
             armed,
             now_step,
-            inner
+            inner,
+            feed
         }),
         abi_pin_struct!(PlanInner {
             step,
@@ -3121,7 +3306,9 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             ReplayReadViolationKind::NeverArrived { .. },
             ReplayReadViolationKind::PoppedShortfall { .. },
             ReplayReadViolationKind::SequenceMismatch { .. },
-            ReplayReadViolationKind::UnplannedConsult { .. }
+            ReplayReadViolationKind::UnplannedConsult { .. },
+            ReplayReadViolationKind::FeedFailed { .. },
+            ReplayReadViolationKind::UnrecordedTake
         }),
         abi_pin_enum!(GateBlocker {
             GateBlocker::PerSetSyncEdge,
@@ -3366,9 +3553,11 @@ mod tests {
 
     /// An annotated PAIR folds as a UNIT, with the count on the
     /// READ half — the annotation carries a token in its aux, never a count.
+    /// Driven on a stage that annotates every read (the older recordings'
+    /// rule), the one rule under which two equal pairs are ever staged.
     #[test]
     fn an_annotated_pair_folds_as_a_unit_with_the_count_on_the_read_half() {
-        let stage = rim_stage(0, ReadStageRole::Body);
+        let stage = rim_stage(0, ReadStageRole::Body).annotating_every_read(true);
         stage.arm();
         for _ in 0..4 {
             stage.record_with_producer(
@@ -3450,12 +3639,234 @@ mod tests {
         );
     }
 
+    /// Drain one stage's window into a list.
+    fn drain_all(stage: &ReadOutcomeStage) -> Vec<StagedReadOutcome> {
+        let mut drained = Vec::new(); // hot-path-alloc-ok: test collector.
+        stage.drain_into(|r| {
+            drained.push(r);
+            true
+        });
+        drained
+    }
+
+    /// The (kind, served sequence, token) projection the writer-run arms read.
+    fn kst(drained: &[StagedReadOutcome]) -> Vec<(ReadOutcomeKind, u64, Option<u64>)> {
+        drained
+            .iter()
+            .map(|r| (r.kind, r.served_seq, r.token))
+            .collect()
+    }
+
+    /// WRITER RUNS: one writer's reads stage ONE annotation, before the first
+    /// read, and the run continues across a drain, so a later window's reads
+    /// of the same writer are bare.
+    #[test]
+    fn one_writer_stages_one_annotation_for_its_whole_run() {
+        use ReadOutcomeKind::{Producer, Served};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm();
+        for seq in 1..=3 {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![
+                (Producer, 1, Some(0xA)),
+                (Served, 1, None),
+                (Served, 2, None),
+                (Served, 3, None),
+            ],
+            "the annotation opens the run and the next two reads are bare"
+        );
+        for seq in 4..=5 {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![(Served, 4, None), (Served, 5, None)],
+            "the run spans the drain: no second annotation for the same writer"
+        );
+    }
+
+    /// WRITER RUNS fold: a read that continues the run and equals the pair's
+    /// read folds into that read half, so a run of identical reads costs the
+    /// pair's two slots and no more. A plain `record` read never does (pinned
+    /// by `a_bare_read_never_folds_into_an_annotated_pairs_read_half`).
+    #[test]
+    fn a_read_continuing_the_run_folds_into_the_pairs_read_half() {
+        use ReadOutcomeKind::{Held, Producer};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm();
+        for _ in 0..4 {
+            stage.record_with_producer(Held, Some(7), 0, 0xA, ReadSiteRole::Body);
+        }
+        let drained = drain_all(&stage);
+        assert_eq!(
+            drained
+                .iter()
+                .map(|r| (r.kind, r.run_count, r.token))
+                .collect::<Vec<_>>(),
+            vec![(Producer, 1, Some(0xA)), (Held, 4, None)],
+            "{drained:?}"
+        );
+    }
+
+    /// WRITER RUNS: a switch of writer opens a new run, and a switch back opens
+    /// another, so every annotation names the writer of the reads up to the
+    /// next one. (Driven on the stage directly: the runtime builds a stage
+    /// that can see several writers with `annotating_every_read`.)
+    #[test]
+    fn a_switch_of_writer_opens_a_new_run_each_time() {
+        use ReadOutcomeKind::{Producer, Served};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm();
+        for (seq, token) in [(1, 0xA), (2, 0xA), (1, 0xB), (3, 0xA)] {
+            stage.record_with_producer(Served, Some(seq), 1, token, ReadSiteRole::Body);
+        }
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![
+                (Producer, 1, Some(0xA)),
+                (Served, 1, None),
+                (Served, 2, None),
+                (Producer, 1, Some(0xB)),
+                (Served, 1, None),
+                (Producer, 3, Some(0xA)),
+                (Served, 3, None),
+            ]
+        );
+    }
+
+    /// WRITER RUNS are kept per read SITE: a drain-site read of the writer the
+    /// body site already annotated opens its own run, so a reader that splits
+    /// the stage's records by site finds an annotation in each split.
+    #[test]
+    fn each_read_site_opens_its_own_run() {
+        use ReadOutcomeKind::{DrainedBatch, Producer, Served};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm();
+        stage.record_with_producer(Served, Some(1), 1, 0xA, ReadSiteRole::Body);
+        stage.record_with_producer(DrainedBatch, Some(2), 1, 0xA, ReadSiteRole::Drain);
+        stage.record_with_producer(Served, Some(3), 1, 0xA, ReadSiteRole::Body);
+        stage.record_with_producer(DrainedBatch, Some(4), 1, 0xA, ReadSiteRole::Peek);
+        stage.record_with_producer(DrainedBatch, Some(1), 1, 0xB, ReadSiteRole::Peek);
+        assert_eq!(
+            drain_all(&stage)
+                .iter()
+                .map(|r| (r.kind, r.served_seq, r.role))
+                .collect::<Vec<_>>(),
+            vec![
+                (Producer, 1, ReadSiteRole::Body),
+                (Served, 1, ReadSiteRole::Body),
+                (Producer, 2, ReadSiteRole::Drain),
+                (DrainedBatch, 2, ReadSiteRole::Drain),
+                (Served, 3, ReadSiteRole::Body),
+                (DrainedBatch, 4, ReadSiteRole::Peek),
+                (Producer, 1, ReadSiteRole::Peek),
+                (DrainedBatch, 1, ReadSiteRole::Peek),
+            ],
+            "Drain and Peek share the scheduler's site, Body has its own, and a peek \
+             that opens a run carries the Peek role on its annotation"
+        );
+    }
+
+    /// WRITER RUNS at the rim: a pair refused both-or-neither opens no run, so
+    /// the next read of the new writer is annotated rather than attributed to
+    /// the writer before the hole.
+    #[test]
+    fn a_pair_dropped_at_the_rim_opens_no_run() {
+        use ReadOutcomeKind::{Producer, Served, Truncated};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm_at_recorded_capacity(
+            AdoptedRim::from_recorded(READ_OUTCOME_STAGE_MIN).expect("the floor is in range"),
+        );
+        // A's pair and two bare reads fill the four slots; B's pair finds none
+        // and is refused.
+        for seq in 1..=3 {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        stage.record_with_producer(Served, Some(1), 1, 0xB, ReadSiteRole::Body);
+        let first = drain_all(&stage);
+        assert_eq!(
+            first.last().map(|r| (r.kind, r.popped)),
+            Some((Truncated, 2)),
+            "{first:?}"
+        );
+        stage.record_with_producer(Served, Some(2), 1, 0xB, ReadSiteRole::Body);
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![(Producer, 2, Some(0xB)), (Served, 2, None)],
+            "B's run opens at its first ADMITTED read"
+        );
+    }
+
+    /// WRITER RUNS: an annotation the drain's consumer refused is not in the
+    /// read log, so the run it opened closes and the next read of the same
+    /// writer is annotated again.
+    #[test]
+    fn a_refused_annotation_closes_its_run() {
+        use ReadOutcomeKind::{Producer, Served};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm();
+        stage.record_with_producer(Served, Some(1), 1, 0xA, ReadSiteRole::Body);
+        stage.drain_into(|r| r.kind != Producer);
+        stage.record_with_producer(Served, Some(2), 1, 0xA, ReadSiteRole::Body);
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![(Producer, 2, Some(0xA)), (Served, 2, None)]
+        );
+    }
+
+    /// A stage built to annotate every read (a multi-writer edge) stages the
+    /// pair before every read, whatever the writer.
+    #[test]
+    fn a_stage_annotating_every_read_pairs_each_read() {
+        use ReadOutcomeKind::{Producer, Served};
+        let stage = rim_stage(0, ReadStageRole::Body).annotating_every_read(true);
+        stage.arm();
+        for seq in 1..=2 {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![
+                (Producer, 1, Some(0xA)),
+                (Served, 1, None),
+                (Producer, 2, Some(0xA)),
+                (Served, 2, None),
+            ]
+        );
+    }
+
+    /// The writer-run term of the derivation: a single-writer edge under writer
+    /// runs is sized at the plain bound plus one annotation per read site, and
+    /// a multi-writer edge keeps the pair factor.
+    #[test]
+    fn writer_runs_add_one_annotation_per_read_site_to_the_plain_bound() {
+        let at = |annotated| {
+            derive_stage_capacity(
+                ReadStageRole::Body,
+                shape(
+                    16,
+                    annotated,
+                    SyncTriggerShape::Ordinary,
+                    FireBurstBound::Fires(64),
+                ),
+            )
+        };
+        // depth 16, burst 64: max(16 + 64, 33) + 1 = 81.
+        assert_eq!(at(ProducerAnnotation::Plain), 81);
+        assert_eq!(at(ProducerAnnotation::WriterRuns), 83);
+        assert_eq!(at(ProducerAnnotation::Annotated), 162);
+    }
+
     /// The other direction: a PAIR still folds into
     /// a pair. Without this the rule above is satisfied by never folding pairs at
-    /// all, which would silently delete a shipped saving.
+    /// all, which would silently delete a shipped saving. On a stage that
+    /// annotates every read, the rule under which equal pairs are staged.
     #[test]
     fn an_annotated_pair_still_folds_into_an_identical_pair() {
-        let stage = rim_stage(0, ReadStageRole::Body);
+        let stage = rim_stage(0, ReadStageRole::Body).annotating_every_read(true);
         stage.arm();
         for _ in 0..3 {
             stage.record_with_producer(
@@ -3990,7 +4401,11 @@ mod tests {
     #[test]
     fn an_unbounded_burst_lands_on_the_ceiling_not_on_a_panic() {
         for depth in [0u32, 1, 64, u32::MAX] {
-            for annotated in [ProducerAnnotation::Plain, ProducerAnnotation::Annotated] {
+            for annotated in [
+                ProducerAnnotation::Plain,
+                ProducerAnnotation::WriterRuns,
+                ProducerAnnotation::Annotated,
+            ] {
                 let cap = derive_stage_capacity(
                     ReadStageRole::Body,
                     shape(
@@ -4078,10 +4493,12 @@ mod tests {
         );
     }
 
-    /// Every capacity an ANNOTATED edge derives admits an atomic
-    /// `record_with_producer` pair: it is EVEN and at least 2. An odd capacity
-    /// would make the rim refuse the last pair from a stage with one free slot
-    /// — a truncation the derivation never accounted for.
+    /// Every capacity an `Annotated` (pair per read) edge derives admits an
+    /// atomic `record_with_producer` pair: it is EVEN and at least 2. An odd
+    /// capacity would make the rim refuse the last pair from a stage with one
+    /// free slot, a truncation that derivation does not account for. A
+    /// `WriterRuns` capacity may be odd; its pairs are the run-opening term
+    /// (pinned by `a_writer_runs_stage_refuses_a_pair_at_an_odd_rim_and_counts_it`).
     #[test]
     fn every_stage_capacity_admits_an_atomic_producer_pair() {
         for depth in [0u32, 1, 7, 10, 64, 4095, u32::MAX] {
@@ -4108,6 +4525,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A `WriterRuns` stage at an ODD rim: a run-opening pair that finds one
+    /// free slot is refused both-or-neither and counted as two, and the next
+    /// read of the new writer opens its run when there is room.
+    #[test]
+    fn a_writer_runs_stage_refuses_a_pair_at_an_odd_rim_and_counts_it() {
+        use ReadOutcomeKind::{Producer, Served, Truncated};
+        let cap = derive_stage_capacity(
+            ReadStageRole::Body,
+            shape(
+                10,
+                ProducerAnnotation::WriterRuns,
+                SyncTriggerShape::Ordinary,
+                FireBurstBound::Fires(64),
+            ),
+        );
+        assert!(!cap.is_multiple_of(2), "PREMISE: an odd rim ({cap})");
+        let stage = ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            shape(
+                10,
+                ProducerAnnotation::WriterRuns,
+                SyncTriggerShape::Ordinary,
+                FireBurstBound::Fires(64),
+            ),
+        );
+        stage.arm();
+        // Writer A's pair, then bare reads, leaving one free slot.
+        for seq in 0..(cap - 2) {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        stage.record_with_producer(Served, Some(100), 1, 0xB, ReadSiteRole::Body);
+        let first = drain_all(&stage);
+        assert_eq!(
+            first.len() as u32,
+            cap,
+            "the cap-1 admitted records and the marker"
+        );
+        assert_eq!(
+            first.last().map(|r| (r.kind, r.popped)),
+            Some((Truncated, 2))
+        );
+        stage.record_with_producer(Served, Some(101), 1, 0xB, ReadSiteRole::Body);
+        assert_eq!(
+            kst(&drain_all(&stage)),
+            vec![(Producer, 101, Some(0xB)), (Served, 101, None)]
+        );
     }
 
     /// A depth outside the validated range CLAMPS rather than wrapping — a
@@ -4227,7 +4693,7 @@ mod tests {
     #[test]
     fn the_shipping_shapes_derive_their_worked_table_values() {
         use FireBurstBound::{Fires, Unbounded};
-        use ProducerAnnotation::{Annotated, Plain};
+        use ProducerAnnotation::{Annotated, Plain, WriterRuns};
         use ReadStageRole::{Body, Drain};
         use SyncTriggerShape::{Ordinary, PerSetSyncTrigger};
         // The ROLE is a column, because it is an argument rather than a
@@ -4280,6 +4746,20 @@ mod tests {
                 Body,
                 shape(64, Annotated, Ordinary, Fires(64)),
                 260,
+            ),
+            // The rows a trace format 8 recording stages on a single-writer
+            // edge: the plain bound plus one run-opening annotation per site.
+            (
+                "Period, plain latest-value input, depth 10, single pub, writer runs",
+                Body,
+                shape(10, WriterRuns, Ordinary, Fires(1)),
+                24,
+            ),
+            (
+                "Data-trigger consumer, depth 64, single pub, writer runs",
+                Body,
+                shape(64, WriterRuns, Ordinary, Fires(64)),
+                132,
             ),
             (
                 "Separate trigger DRAIN stage, depth 64, single pub",
@@ -4674,8 +5154,10 @@ mod tests {
         // Body, not Drain: `WIDEST_STAGE` is a per-set `Sync` TRIGGER shape and
         // a `Drain` stage derives 260 from it, never 516 — minting this one
         // `Drain` would have sized the arm at a rim its own doc does not name.
-        // The RECORDS still carry their own call-site roles below.
-        let stage = rim_stage(0, ReadStageRole::Body);
+        // The RECORDS still carry their own call-site roles below. The stage
+        // annotates every read, the worst case the shape is sized for: under
+        // writer runs a promotion of the frame its peek named is staged bare.
+        let stage = rim_stage(0, ReadStageRole::Body).annotating_every_read(true);
         stage.arm();
         for seq in 0..floor_frames as u32 {
             // (1) The R-pop: the frame LEAVES the queue here, so `popped` is 1

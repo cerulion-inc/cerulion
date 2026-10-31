@@ -1403,7 +1403,10 @@ pub fn graph_config(
 pub struct RecordedRun {
     pub fixture: Fixture,
     pub placement: Placement,
-    pub dir: tempfile::TempDir,
+    /// Kept when the test fails with `CERULION_KEEP_TEST_WS=1`
+    /// ([`ScaffoldDir`]): the bag, the read logs, and each replay's stderr,
+    /// `--report` JSON and re-recording.
+    pub dir: ScaffoldDir,
     pub bag: PathBuf,
     pub live: ReadLog,
     /// Where the live run's nodes wrote their records.
@@ -1622,7 +1625,7 @@ fn recording_defect(bag: &Path) -> Option<String> {
 pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> RecordedRun {
     let mut last = String::new();
     for attempt in 0..RECORD_ATTEMPTS {
-        let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+        let dir = ScaffoldDir::new("ri_run");
         let (graph, prefix) = unique_names(fixture.name());
         write_graph(ws, &fixture.graph_config(&graph, &prefix));
         let reads = dir.path().join("live_reads");
@@ -1727,10 +1730,25 @@ const USAGE_ERROR_MARKERS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub enum Replayed {
     /// The replay ran: its exit code and every read its nodes made.
-    Reads { exit: i32, log: ReadLog },
+    Reads {
+        exit: i32,
+        log: ReadLog,
+        artifacts: ReplayArtifacts,
+    },
     /// The replay refused the recording (exit 2), with its stderr: a refusal
     /// by name, which is a verdict about the recording, not a harness failure.
     Refused { stderr: String },
+}
+
+/// The files one replay leaves in its run's directory.
+#[derive(Clone, Debug)]
+pub struct ReplayArtifacts {
+    /// The replay's stderr.
+    pub stderr: PathBuf,
+    /// The `--report` JSON (verify legs).
+    pub report: Option<PathBuf>,
+    /// The `--record-out` re-recording (verify legs).
+    pub record_out: Option<PathBuf>,
 }
 
 /// A judgement of one replay.
@@ -1779,7 +1797,7 @@ pub fn judge_replayed(
         Replayed::Refused { stderr } => Ok(Outcome::Refused {
             stderr: stderr.clone(),
         }),
-        Replayed::Reads { exit, log } => Ok(Outcome::Judged {
+        Replayed::Reads { exit, log, .. } => Ok(Outcome::Judged {
             exit: *exit,
             verdict: judge(fixture, live, log, floors)?,
         }),
@@ -1802,11 +1820,23 @@ pub fn resim(
     let reads = run.dir.path().join(format!("{}_reads_{n}", mode.label()));
     std::fs::create_dir_all(&reads).expect("RI_HARNESS: replay reads dir");
     let home = run.dir.path().join("cerhome");
+    let (report, record_out) = if mode == ReplayMode::ResimVerify {
+        (
+            Some(reads.with_extension("report.json")),
+            Some(reads.with_extension("mcap")),
+        )
+    } else {
+        (None, None)
+    };
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
-    cmd.args(["bag", "play"])
-        .arg(&run.bag)
-        .args(mode.args())
-        .current_dir(&ws.root)
+    cmd.args(["bag", "play"]).arg(&run.bag).args(mode.args());
+    if let Some(path) = &report {
+        cmd.arg("--report").arg(path);
+    }
+    if let Some(path) = &record_out {
+        cmd.arg("--record-out").arg(path);
+    }
+    cmd.current_dir(&ws.root)
         // The replayed nodes load their cdylibs from this target directory.
         .env("CARGO_TARGET_DIR", &ws.target_dir)
         .env("CERULION_NETWORK", "off")
@@ -1853,11 +1883,318 @@ pub fn resim(
         Some(c) if mode.judged_exits().contains(&c) => Replayed::Reads {
             exit: c,
             log: ReadLog::collect(&reads).unwrap_or_else(|e| panic!("RI_HARNESS: {e}")),
+            artifacts: ReplayArtifacts {
+                stderr: stderr_path.clone(),
+                report,
+                record_out,
+            },
         },
         _ => panic!(
             "RI_HARNESS: `bag play` ({}) of {} exited {code:?}, outside its contract\nstderr:\n{stderr}",
             mode.label(),
             run.bag.display()
         ),
+    }
+}
+
+// ===========================================================================
+// Divergence evidence.
+// ===========================================================================
+
+/// How many reads either side of a stream's first difference the evidence
+/// prints.
+pub const EVIDENCE_SPAN: usize = 6;
+
+/// One kind-6 record of a bag's read log, decoded.
+struct EvidenceRecord {
+    step: u64,
+    kind: u16,
+    served: u64,
+    popped: u32,
+    run: u32,
+    role: cerulion_core::read_outcome::ReadSiteRole,
+}
+
+/// A bag's per-rank node tables: `rank -> node ids` from its trace manifests.
+fn bag_node_tables(reader: &cerulion_bag::BagReader) -> BTreeMap<u32, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for rank in 0..64u32 {
+        let Ok(Some(att)) =
+            reader.attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
+        else {
+            continue;
+        };
+        let ids = serde_json::from_slice::<serde_json::Value>(&att.data)
+            .ok()
+            .and_then(|v| {
+                v.get("node_ids").and_then(|ids| {
+                    ids.as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                })
+            })
+            .unwrap_or_default();
+        out.insert(rank, ids);
+    }
+    out
+}
+
+/// The input index of `input` on `node`, from the bag's trace manifests.
+fn bag_input_index(reader: &cerulion_bag::BagReader, node: &str, input: &str) -> Option<u16> {
+    for rank in 0..64u32 {
+        let Ok(Some(att)) =
+            reader.attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
+        else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&att.data) else {
+            continue;
+        };
+        if let Some(list) = v
+            .get("inputs")
+            .and_then(|i| i.get(node))
+            .and_then(|l| l.as_array())
+        {
+            return list
+                .iter()
+                .position(|n| n.as_str() == Some(input))
+                .and_then(|p| u16::try_from(p).ok());
+        }
+    }
+    None
+}
+
+/// The rank a trace record was written by: its `reserved` word without the
+/// discard bit.
+fn record_rank(r: &cerulion_core::trace_ring::TraceRingRecord) -> u32 {
+    r.reserved & !cerulion_core::trace_ring::TRACE_DISCARD_BIT
+}
+
+/// What [`bag_evidence`] found in one bag.
+struct BagEvidence {
+    records: Vec<EvidenceRecord>,
+    fires: BTreeMap<u64, usize>,
+    /// Trace records scanned, and the ranks and node tables seen, so a lookup
+    /// that matched nothing says so instead of printing zeros.
+    scanned: usize,
+    ranks: std::collections::BTreeSet<u32>,
+    tables: BTreeMap<u32, Vec<String>>,
+}
+
+/// `node`'s read-log records on `input` and its fires per step, in file order.
+///
+/// A record's node is its rank's table entry at its `node_idx`; a record whose
+/// rank has no table is matched against every table that holds `node` at that
+/// index (a re-recording may write one table for every rank).
+fn bag_evidence(bag: &Path, node: &str, input: &str) -> Result<BagEvidence, String> {
+    use cerulion_core::trace_ring::{
+        read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
+        unpack_read_outcome_run, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME,
+    };
+    let reader = cerulion_bag::BagReader::open(bag).map_err(|e| format!("open {bag:?}: {e}"))?;
+    let tables = bag_node_tables(&reader);
+    let input_idx = bag_input_index(&reader, node, input);
+    let is_node = |r: &cerulion_core::trace_ring::TraceRingRecord| match tables.get(&record_rank(r))
+    {
+        Some(t) => t.get(r.node_idx as usize).map(String::as_str) == Some(node),
+        None => tables
+            .values()
+            .any(|t| t.get(r.node_idx as usize).map(String::as_str) == Some(node)),
+    };
+    let mut records = Vec::new();
+    let mut fires: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut scanned = 0usize;
+    let mut ranks = std::collections::BTreeSet::new();
+    let iter = reader
+        .trace_records()
+        .map_err(|e| format!("trace of {bag:?}: {e}"))?;
+    for item in iter {
+        let r = item.map_err(|e| format!("trace record of {bag:?}: {e}"))?;
+        scanned += 1;
+        ranks.insert(record_rank(&r));
+        if !is_node(&r) {
+            continue;
+        }
+        if r.record_type == RECORD_TYPE_FIRE {
+            *fires.entry(r.step).or_default() += 1;
+        } else if r.record_type == RECORD_TYPE_READ_OUTCOME {
+            let (idx, kind) = unpack_read_outcome_meta(r.global_level);
+            if input_idx.is_some_and(|i| i != idx) {
+                continue;
+            }
+            let annotation = kind == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+            records.push(EvidenceRecord {
+                step: r.step,
+                kind,
+                served: r.fire_time_ns,
+                popped: if annotation {
+                    0
+                } else {
+                    unpack_read_outcome_popped(r.duration_ns)
+                },
+                run: if annotation {
+                    1
+                } else {
+                    unpack_read_outcome_run(r.duration_ns).max(1)
+                },
+                role: read_site_role(r.global_level),
+            });
+        }
+    }
+    Ok(BagEvidence {
+        records,
+        fires,
+        scanned,
+        ranks,
+        tables,
+    })
+}
+
+/// Print, for every stream of `verdict` that is not equal, what a box log needs
+/// to explain it: the replay's violations and trace divergence (from its
+/// `--report` and stderr), the recorded read-log records around the first
+/// difference, and the live and replayed fire counts per step over the same
+/// window. Every line starts `RI_EVIDENCE`.
+pub fn print_divergence_evidence(run: &RecordedRun, replayed: &Replayed, verdict: &Verdict) {
+    let Replayed::Reads {
+        exit, artifacts, ..
+    } = replayed
+    else {
+        return;
+    };
+    let divergent = verdict.divergent();
+    if divergent.is_empty() && *exit != 6 {
+        return;
+    }
+    eprintln!("RI_EVIDENCE exit={exit}");
+    let stderr = mp_support::read_file(&artifacts.stderr);
+    for line in stderr
+        .lines()
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("violation")
+                || l.contains("diverg")
+                || l.contains("feed")
+                || l.contains("shortfall")
+                || l.contains("never_arrived")
+                || l.contains("error")
+        })
+        .take(60)
+    {
+        eprintln!("RI_EVIDENCE stderr: {line}");
+    }
+    if let Some(report) = &artifacts.report {
+        match std::fs::read(report)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        {
+            Some(serde_json::Value::Object(map)) => {
+                for (key, value) in &map {
+                    let k = key.to_ascii_lowercase();
+                    if k.contains("violation")
+                        || k.contains("diverg")
+                        || k.contains("read_identity")
+                        || k.contains("read_log")
+                        || k == "passed"
+                    {
+                        let text = value.to_string();
+                        let cut: String = text.chars().take(4000).collect();
+                        eprintln!("RI_EVIDENCE report {key}: {cut}");
+                    }
+                }
+            }
+            _ => eprintln!("RI_EVIDENCE report: absent or unreadable at {report:?}"),
+        }
+    }
+    for row in divergent {
+        let first = match &row.verdict {
+            RowVerdict::Diverged { index, .. } => *index,
+            _ => row.compared,
+        };
+        let (records, live_fires) = match bag_evidence(&run.bag, &row.node, &row.input) {
+            Ok(v) => (v.records, v.fires),
+            Err(e) => {
+                eprintln!("RI_EVIDENCE recorded read log unreadable: {e}");
+                continue;
+            }
+        };
+        // Serving occurrences (a folded record counts its run) index the
+        // live reads; the window holds every record between the serving reads
+        // first - SPAN and first + SPAN, annotations and markers included.
+        let lo = first.saturating_sub(EVIDENCE_SPAN);
+        let hi = first + EVIDENCE_SPAN;
+        let mut serving = 0usize;
+        let mut window_steps: Vec<u64> = Vec::new();
+        eprintln!(
+            "RI_EVIDENCE node={} input={} first_diff={first} recorded records (serving index, step, kind, served, popped, role, run):",
+            row.node, row.input
+        );
+        for r in &records {
+            let serves = r.kind != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+                && r.kind != cerulion_core::trace_ring::READ_OUTCOME_TRUNCATED
+                && r.served != cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME
+                && r.popped > 0;
+            let start = serving;
+            if serves {
+                serving += r.run as usize;
+            }
+            if serving >= lo && start <= hi {
+                window_steps.push(r.step);
+                eprintln!(
+                    "RI_EVIDENCE   [{start}] step={} kind={} served={} popped={} role={:?} run={}",
+                    r.step,
+                    r.kind,
+                    if r.served == cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME {
+                        "none".to_string()
+                    } else {
+                        r.served.to_string()
+                    },
+                    r.popped,
+                    r.role,
+                    r.run
+                );
+            }
+            if start > hi {
+                break;
+            }
+        }
+        let (Some(first_step), Some(last_step)) = (
+            window_steps.iter().min().copied(),
+            window_steps.iter().max().copied(),
+        ) else {
+            continue;
+        };
+        let replayed = artifacts
+            .record_out
+            .as_ref()
+            .map(|p| (p, bag_evidence(p, &row.node, &row.input)));
+        let replayed_fires = match &replayed {
+            Some((_, Ok(v))) => {
+                let total: usize = v.fires.values().sum();
+                eprintln!(
+                    "RI_EVIDENCE re-recording: {} trace record(s) scanned, ranks {:?}, node tables {:?}, \
+                     {total} fire(s) of {} matched",
+                    v.scanned, v.ranks, v.tables, row.node
+                );
+                Some(v.fires.clone())
+            }
+            Some((p, Err(e))) => {
+                eprintln!("RI_EVIDENCE re-recording {p:?} unreadable: {e}");
+                None
+            }
+            None => None,
+        };
+        for step in first_step..=last_step {
+            eprintln!(
+                "RI_EVIDENCE   fires step={step} live={} replayed={}",
+                live_fires.get(&step).copied().unwrap_or(0),
+                replayed_fires.as_ref().map_or_else(
+                    || "unrecorded".to_string(),
+                    |f| f.get(&step).copied().unwrap_or(0).to_string()
+                )
+            );
+        }
     }
 }

@@ -111,6 +111,8 @@ cerulion_netd = { workspace = true }
 # this crate's own integration tests via the self-referencing dev-dependency
 # below (mirrors cerulion_bag's pattern); never enabled by production consumers.
 test-helpers = ["cerulion_core/test-helpers", "cerulion_bag/test-helpers"]
+# Builds the capture-side mutants the writer-carry test must catch (trace_window::mutants).
+oracle-mutants = ["cerulion_core/oracle-mutants"]
 
 [dev-dependencies]
 # Self-reference turns on `test-helpers` for tests/*.rs (the fault-injection

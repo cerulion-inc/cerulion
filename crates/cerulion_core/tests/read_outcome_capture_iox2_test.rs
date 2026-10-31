@@ -699,7 +699,7 @@ fn run_recorded_driven(
 
     let kind6 = records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             ReadRec {
@@ -713,6 +713,55 @@ fn run_recorded_driven(
         })
         .collect();
     (kind6, records, input_names)
+}
+
+/// A single-writer edge's records carry ONE producer annotation per read site
+/// that served a frame: each binds to the read right after it (same served
+/// sequence), all name one writer, and the site's later reads are bare.
+fn assert_one_annotation_per_writer_run(edge: &[AnnotRec]) {
+    let mut annotations = [0usize; 2];
+    let mut serving = [0usize; 2];
+    let mut tokens = BTreeSet::new();
+    for (i, r) in edge.iter().enumerate() {
+        let site = cerulion_core::read_outcome::writer_run_site(r.role);
+        if r.kind == READ_OUTCOME_PRODUCER {
+            let read = edge
+                .get(i + 1)
+                .unwrap_or_else(|| panic!("an annotation ends the stream: {edge:?}"));
+            assert!(
+                read.kind != READ_OUTCOME_PRODUCER && read.seq == r.seq,
+                "an annotation binds to the read right after it: {edge:?}"
+            );
+            annotations[site] += 1;
+            tokens.insert(r.aux);
+        } else if r.seq != READ_OUTCOME_NO_FRAME {
+            serving[site] += 1;
+        }
+    }
+    for site in 0..2 {
+        assert_eq!(
+            annotations[site],
+            usize::from(serving[site] > 0),
+            "one writer, one run, one annotation per read site (site {site}: \
+             {} serving reads): {edge:?}",
+            serving[site]
+        );
+    }
+    assert!(
+        serving.iter().sum::<usize>() > 1,
+        "PREMISE: the edge served more than one read, so one annotation is a \
+         run and not a coincidence: {edge:?}"
+    );
+    assert_eq!(tokens.len(), 1, "one writer: {edge:?}");
+}
+
+/// A kind-6 record that is a READ, not a producer annotation: from trace
+/// format 8 every edge carries them, one per writer run, and the annotation
+/// arms read them off the raw records ([`annot_stream`]).
+fn is_read_record(r: &TraceRingRecord) -> bool {
+    r.record_type == RECORD_TYPE_READ_OUTCOME
+        && unpack_read_outcome_meta(r.global_level).1
+            != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
 }
 
 /// Shorthand for the consumer's expected record (node_idx 1, input_idx 0 —
@@ -749,6 +798,24 @@ fn rec(step: u64, kind: u16, seq: u64, popped: u32) -> ReadRec {
 /// row that reads identically. The addressing is now the same triple the replay
 /// engine demuxes on.
 fn role_view(records: &[TraceRingRecord]) -> Vec<(u64, u32, u16, u16, ReadSiteRole)> {
+    records
+        .iter()
+        .filter(|r| is_read_record(r))
+        .map(|r| {
+            let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
+            (
+                r.step,
+                r.node_idx,
+                input_idx,
+                kind,
+                read_site_role(r.global_level),
+            )
+        })
+        .collect()
+}
+
+/// [`role_view`] with the producer annotations kept, for the arms about them.
+fn role_view_all(records: &[TraceRingRecord]) -> Vec<(u64, u32, u16, u16, ReadSiteRole)> {
     records
         .iter()
         .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
@@ -1554,7 +1621,7 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
          annotation adds a record, it does not change what a read pops"
     );
     assert_eq!(
-        role_view(&annot_all),
+        role_view_all(&annot_all),
         vec![
             (0, 0, 0, READ_OUTCOME_PRODUCER, ReadSiteRole::Drain),
             (0, 0, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
@@ -1711,7 +1778,7 @@ fn a_non_improving_peek_is_marked_a_peek_not_the_head() {
          not a silent read"
     );
     assert_eq!(
-        role_view(&all),
+        role_view_all(&all),
         vec![
             (0, 0, 0, READ_OUTCOME_PRODUCER, ReadSiteRole::Drain),
             (0, 0, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
@@ -2283,7 +2350,7 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
         drop(owner);
         records
             .iter()
-            .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+            .filter(|r| is_read_record(r))
             .map(|r| {
                 let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
                 ReadRec {
@@ -2444,7 +2511,7 @@ fn run_exit_drop_report_is_empty_because_a_burst_stages_one_read_not_one_per_fir
         drop(owner);
         let kind6 = records
             .iter()
-            .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+            .filter(|r| is_read_record(r))
             .map(|r| {
                 let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
                 ReadRec {
@@ -2618,11 +2685,7 @@ fn a_full_depth_backlog_burst_stays_inside_capacity_and_marks_nothing() {
     // And the ring carries no other kind-6 shape than reads (the marker is
     // the only annotation this shape could produce).
     assert!(
-        records
-            .iter()
-            .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
-            .count()
-            >= MAX_CONSUMER_DEPTH,
+        records.iter().filter(|r| is_read_record(r)).count() >= MAX_CONSUMER_DEPTH,
         "sanity: the ring really carries the burst's records"
     );
 }
@@ -2735,7 +2798,7 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
 
     let kind6: Vec<ReadRec> = records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             ReadRec {
@@ -2814,7 +2877,7 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
     // all.
     let marker_roles: Vec<ReadSiteRole> = records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .filter(|r| unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_TRUNCATED)
         .map(|r| read_site_role(r.global_level))
         .collect();
@@ -2851,8 +2914,9 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
 #[serial]
 fn a_recorded_rim_is_adopted_and_the_truncation_is_the_recorded_shape() {
     use cerulion_core::read_outcome::{AdoptedRim, StageKey};
-    // Above BOTH rims (the derived one for this edge is 75), so the drop count
-    // is a discriminator rather than a coincidence.
+    // Above BOTH rims (the derived one for this edge is 77, its writer run's
+    // annotations included), so the drop count is a discriminator rather than
+    // a coincidence.
     const STAGED: usize = 100;
     const RECORDED_RIM: u32 = 8;
     let (config, factories) = two_node_graph(
@@ -2976,7 +3040,7 @@ fn run_deep_backlog_burst(tag: &str, burst_ms: u64) -> (Vec<ReadRec>, Vec<TraceR
     drop(owner);
     let kind6 = records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             ReadRec {
@@ -3037,6 +3101,8 @@ struct AnnotRec {
     /// Raw aux: the producer TOKEN on a `Producer` record, the read packing
     /// on every other kind.
     aux: u64,
+    /// The call-site role: a writer run is kept per read site.
+    role: ReadSiteRole,
 }
 
 /// Decode every kind-6 record in ring order, aux word intact.
@@ -3052,6 +3118,7 @@ fn annot_stream(records: &[TraceRingRecord]) -> Vec<AnnotRec> {
                 kind,
                 seq: r.fire_time_ns,
                 aux: r.duration_ns,
+                role: read_site_role(r.global_level),
             }
         })
         .collect()
@@ -3277,7 +3344,7 @@ fn publisher_id_of(publishers: &WiringPublisherTable, node: &str, output: &str) 
 ///
 /// ANTI-TAUTOLOGY, in the same body and the same recording: the consumer's
 /// SECOND edge is a plain input on an ordinary single-writer graph-owned
-/// topic. It reads (records exist) and carries ZERO annotations — so "the
+/// topic. It reads (records exist) and carries ONE annotation, its writer's run, so "the
 /// runtime annotates" cannot pass by annotating everything.
 #[test]
 #[serial]
@@ -3407,6 +3474,18 @@ fn a_narrow_shared_level_is_stamped_but_not_credited() {
             expected.push((slow_token, step / 3 - 1));
         }
     }
+    // A multi-writer edge carries its writer on EVERY read: one annotation per
+    // consumed frame, the run-length rule of a single-writer edge does not apply.
+    let annotations = shared_edge
+        .iter()
+        .filter(|r| r.kind == READ_OUTCOME_PRODUCER)
+        .count();
+    assert_eq!(
+        annotations,
+        expected.len(),
+        "a multi-writer edge annotates every read, not only a switch of writer: \
+         {shared_edge:?}"
+    );
     let observed_pairs: Vec<(u64, u64)> = reads.iter().map(|r| (r.token, r.seq)).collect();
     assert_eq!(
         observed_pairs, expected,
@@ -3417,20 +3496,14 @@ fn a_narrow_shared_level_is_stamped_but_not_credited() {
          {slow_token:#x})"
     );
 
-    // ANTI-TAUTOLOGY: the single-writer sibling edge reads, and is NOT annotated.
+    // The single-writer sibling edge reads, and is annotated too.
     assert!(
         !solo_edge.is_empty(),
         "the control edge must really read (an empty control proves nothing)"
     );
-    assert_eq!(
-        solo_edge
-            .iter()
-            .filter(|r| r.kind == READ_OUTCOME_PRODUCER)
-            .count(),
-        0,
-        "a single-writer graph-owned edge carries NO producer annotation — its \
-         served sequence already names its one publisher: {solo_edge:?}"
-    );
+    // Every edge carries its frames' writer, the single-writer edge included:
+    // one annotation opens the writer's run and its later reads are bare.
+    assert_one_annotation_per_writer_run(&solo_edge);
 }
 
 // ===========================================================================
@@ -3915,7 +3988,8 @@ fn run_wide_shared(
 /// make the kills deterministic.
 ///
 /// ANTI-TAUTOLOGY, same recording: the consumer's `solo` edge on an ordinary
-/// single-writer topic reads (records exist) and carries ZERO annotations.
+/// single-writer topic reads (records exist) and carries ONE annotation, its
+/// writer's run.
 #[test]
 #[serial]
 fn a_wide_level_publishes_a_shared_topic_in_insertion_order() {
@@ -3938,15 +4012,9 @@ fn a_wide_level_publishes_a_shared_topic_in_insertion_order() {
         !solo_edge.is_empty(),
         "the control edge must really read (an empty control proves nothing)"
     );
-    assert_eq!(
-        solo_edge
-            .iter()
-            .filter(|r| r.kind == READ_OUTCOME_PRODUCER)
-            .count(),
-        0,
-        "a single-writer graph-owned edge carries NO producer annotation — its \
-         served sequence already names its one publisher: {solo_edge:?}"
-    );
+    // Every edge carries its frames' writer, the single-writer edge included:
+    // one annotation opens the writer's run and its later reads are bare.
+    assert_one_annotation_per_writer_run(&solo_edge);
 }
 
 /// DETERMINISM on the wide shape: two fresh runtimes (fresh SHM
@@ -4885,22 +4953,14 @@ fn a_decimated_read_that_serves_a_held_frame_is_annotated_with_its_producer() {
         publisher_id_of(&publishers, "slow", "out"),
     );
 
-    // ANTI-TAUTOLOGY: the single-writer sibling edge reads, and is NOT
-    // annotated — so "annotations appear" is the multi-publisher bit's doing,
-    // not a runtime that annotates every read.
+    // The single-writer sibling edge reads, and is annotated too.
     assert!(
         !solo_edge.is_empty(),
         "the control edge must really read (an empty control proves nothing)"
     );
-    assert_eq!(
-        solo_edge
-            .iter()
-            .filter(|r| r.kind == READ_OUTCOME_PRODUCER)
-            .count(),
-        0,
-        "a single-writer graph-owned edge carries NO producer annotation: \
-         {solo_edge:?}"
-    );
+    // Every edge carries its frames' writer, the single-writer edge included:
+    // one annotation opens the writer's run and its later reads are bare.
+    assert_one_annotation_per_writer_run(&solo_edge);
 }
 
 /// P1-5 — THE EXTERNAL ARM: an absolute `source:` with no in-graph producer.
@@ -4921,8 +4981,9 @@ fn a_decimated_read_that_serves_a_held_frame_is_annotated_with_its_producer() {
 /// `foreign(...)`, and the annotation's value there is that the reader can
 /// still tell TWO producers apart).
 ///
-/// ANTI-TAUTOLOGY, same body and same recording: the plain sibling edge on an
-/// ordinary single-writer graph-owned topic reads and is NOT annotated.
+/// Same body and same recording: the plain sibling edge on an ordinary
+/// single-writer graph-owned topic is annotated too, each annotation binding to
+/// the read after it.
 #[test]
 #[serial]
 fn an_external_sourced_edge_carries_producer_tokens_for_its_foreign_writers() {
@@ -5066,6 +5127,18 @@ fn an_external_sourced_edge_carries_producer_tokens_for_its_foreign_writers() {
         expected.push((token_a, i));
         expected.push((token_b, i));
     }
+    // A multi-writer edge carries its writer on EVERY read: one annotation per
+    // consumed frame, the run-length rule of a single-writer edge does not apply.
+    let annotations = ext_edge
+        .iter()
+        .filter(|r| r.kind == READ_OUTCOME_PRODUCER)
+        .count();
+    assert_eq!(
+        annotations,
+        expected.len(),
+        "a multi-writer edge annotates every read, not only a switch of writer: \
+         {ext_edge:?}"
+    );
     let observed_pairs: Vec<(u64, u64)> = reads.iter().map(|r| (r.token, r.seq)).collect();
     assert_eq!(
         observed_pairs, expected,
@@ -5077,15 +5150,9 @@ fn an_external_sourced_edge_carries_producer_tokens_for_its_foreign_writers() {
         !solo_edge.is_empty(),
         "the control edge must really read (an empty control proves nothing)"
     );
-    assert_eq!(
-        solo_edge
-            .iter()
-            .filter(|r| r.kind == READ_OUTCOME_PRODUCER)
-            .count(),
-        0,
-        "a single-writer graph-owned edge carries NO producer annotation: \
-         {solo_edge:?}"
-    );
+    // Every edge carries its frames' writer, the single-writer edge included:
+    // one annotation opens the writer's run and its later reads are bare.
+    assert_one_annotation_per_writer_run(&solo_edge);
 }
 
 /// The P2-8 harness: a recording whose manifest OMITS the consumer node — a
@@ -5192,10 +5259,7 @@ fn run_unmapped_consumer(
     drop(ring_consumer);
     runtime.shutdown();
     drop(owner);
-    let kind6 = records
-        .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
-        .count();
+    let kind6 = records.iter().filter(|r| is_read_record(r)).count();
     (
         refused_in_first,
         refused_over_quiet,
@@ -5597,7 +5661,7 @@ fn run_recorded_planned(
 
     let kind6 = records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             ReadRec {
@@ -5957,9 +6021,9 @@ fn a_never_delivered_input_records_no_frame_at_the_body_site() {
 ///
 /// | consumer | policy | input | declared depth | frozen? | burst | hand oracle |
 /// |---|---|---|---|---|---|---|
-/// | `BurstSink` | `period_ms = 1` | plain `#[input]` | `DEFAULT_CONSUMER_DEPTH` = 10 | YES | `Fires(1)` | `max(10+1, 21) + 1` = **22** |
-/// | `TrigSink` | data-trigger | `#[input(trigger)]` | 10 | no | `Fires(64)` | `max(10+64, 21) + 1` = **75** |
-/// | `DeepTrigSink` | data-trigger | `#[input(trigger, depth = 64)]` | 64 | no | `Fires(64)` | `max(64+64, 129) + 1` = **130** |
+/// | `BurstSink` | `period_ms = 1` | plain `#[input]` | `DEFAULT_CONSUMER_DEPTH` = 10 | YES | `Fires(1)` | `max(10+1, 21) + 1 + 2` = **24** |
+/// | `TrigSink` | data-trigger | `#[input(trigger)]` | 10 | no | `Fires(64)` | `max(10+64, 21) + 1 + 2` = **77** |
+/// | `DeepTrigSink` | data-trigger | `#[input(trigger, depth = 64)]` | 64 | no | `Fires(64)` | `max(64+64, 129) + 1 + 2` = **132** |
 ///
 /// The three numbers being DISTINCT is the load-bearing half: a derivation that
 /// ignored the edge (or that still returned one global constant) would make
@@ -5998,12 +6062,13 @@ fn each_wired_stage_is_sized_at_the_capacity_its_own_edge_derives() {
 
     // The hand oracles of the table above.
     assert_eq!(
-        frozen_period, 22,
+        frozen_period, 24,
         "a step-FROZEN latest-value input on a Period node stages one record per \
-         STEP, so its burst term is 1 and its capacity is 2*depth + 2"
+         STEP, so its burst term is 1 and its capacity is 2*depth + 2, plus one \
+         run-opening annotation per read site (every edge carries its writer)"
     );
     assert_eq!(
-        data_trigger, 75,
+        data_trigger, 77,
         "a data-trigger input is NOT frozen, so its burst term is the within-step \
          clamp. The C3 run-length encoding does NOT retire this: it folds \
          CONSECUTIVE BYTE-IDENTICAL records, and an unfrozen input can observe a \
@@ -6011,7 +6076,7 @@ fn each_wired_stage_is_sized_at_the_capacity_its_own_edge_derives() {
          shrinks this edge's COMMON-case population, never the bound it is sized for"
     );
     assert_eq!(
-        deep_trigger, 130,
+        deep_trigger, 132,
         "the SAME policy at depth 64 — only the declared depth moved"
     );
 
@@ -6054,7 +6119,7 @@ impl Drop for WaveEnvGuard {
 // been wrong at the call site with the whole suite green.
 
 /// A `Period` consumer whose plain input declares depth 1 — the shape whose
-/// FROZEN capacity is 4 and whose UNFROZEN capacity is the ceiling. Depth 1
+/// FROZEN capacity is 6 and whose UNFROZEN capacity is the ceiling. Depth 1
 /// makes the two answers three orders of magnitude apart.
 #[cerulion_node(period_ms = 1)]
 #[derive(Default)]
@@ -6094,7 +6159,7 @@ impl BlockPeriodSink {
 
 /// A data-trigger consumer whose TRIGGER and CONTEXT inputs declare DIFFERENT
 /// depths — the shape that makes the Separate drain's depth read observable
-/// (a drain that read the other input's depth would derive 22, not 130).
+/// (a drain that read the other input's depth would derive 24, not 132).
 #[cerulion_node]
 #[derive(Default)]
 struct MixedDepthTrigSink {
@@ -6359,9 +6424,10 @@ fn a_closure_node_that_cannot_freeze_is_sized_for_one_record_per_fire() {
     );
     assert_eq!(
         macro_twin,
-        vec![(0, ReadStageRole::Body, 4)],
+        vec![(0, ReadStageRole::Body, 6)],
         "a macro Period node CAN freeze, so its plain depth-1 input stages one \
-         record per STEP: max(1 + 1, 3) + 1 = 4"
+         record per STEP: max(1 + 1, 3) + 1 = 4, plus one run-opening annotation \
+         per read site = 6"
     );
 
     // The closure twin: the SAME declared shape — `Period`, one plain input,
@@ -6511,7 +6577,7 @@ fn a_closure_period_burst_stages_no_marker_at_its_derived_capacity() {
     // silently stopped working would be caught rather than absorbed.
     let staged_records: Vec<&_> = ring_records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .filter(|r| {
             let (input_idx, _) = unpack_read_outcome_meta(r.global_level);
             r.node_idx == 1 && input_idx == 0
@@ -6576,7 +6642,7 @@ fn a_closure_period_burst_stages_no_marker_at_its_derived_capacity() {
 /// Two facts nothing else covers. (1) Both Drain wiring sites had ZERO
 /// production coverage — every previous arm reads a single Body stage. (2) The
 /// consumer declares DIFFERENT depths on its trigger and context inputs, so a
-/// drain site that read the wrong input's depth derives 22 instead of 130; a
+/// drain site that read the wrong input's depth derives 24 instead of 132; a
 /// same-depth graph passes either way.
 ///
 /// The registration order is `[Body per input, in `inputs` order] ++ [Separate
@@ -6596,10 +6662,11 @@ fn two_stages_on_one_input_are_sized_independently() {
     );
     assert_eq!(
         unified,
-        vec![(0, ReadStageRole::Body, 130), (1, ReadStageRole::Body, 22),],
+        vec![(0, ReadStageRole::Body, 132), (1, ReadStageRole::Body, 24),],
         "unified: one Body stage per input, in `inputs` order — the depth-64 \
-         TRIGGER at max(64 + 64, 129) + 1 = 130 and the depth-10 FROZEN context \
-         at max(10 + 1, 21) + 1 = 22"
+         TRIGGER at max(64 + 64, 129) + 1 + 2 = 132 and the depth-10 FROZEN \
+         context at max(10 + 1, 21) + 1 + 2 = 24, each with its two run-opening \
+         annotations"
     );
 
     // FORCED SEPARATE: the trigger input grows a second, runtime-owned stage.
@@ -6615,19 +6682,19 @@ fn two_stages_on_one_input_are_sized_independently() {
     assert_eq!(
         separate,
         vec![
-            (0, ReadStageRole::Body, 130),
-            (1, ReadStageRole::Body, 22),
-            (0, ReadStageRole::Drain, 130),
+            (0, ReadStageRole::Body, 132),
+            (1, ReadStageRole::Body, 24),
+            (0, ReadStageRole::Drain, 132),
         ],
         "separate: the trigger input carries TWO stages sharing `input_idx` 0, \
-         and the DRAIN is sized from the TRIGGER's declared depth (64 ⇒ 130), \
-         not from the sibling context input's (10 ⇒ 22)"
+         and the DRAIN is sized from the TRIGGER's declared depth (64 ⇒ 132), \
+         not from the sibling context input's (10 ⇒ 24)"
     );
     // THE ASYMMETRY PIN, stated as its own claim: the drain and the sibling
     // context stage must NOT agree, or a site reading the wrong depth passes.
     assert_ne!(
         separate[2].2, separate[1].2,
-        "a drain site that read the context input's depth would derive 22"
+        "a drain site that read the context input's depth would derive 24"
     );
 }
 
@@ -6657,15 +6724,21 @@ fn a_multi_publisher_edge_derives_the_pair_factor() {
         &["inp"],
         true,
     );
-    // depth 16, Data trigger: max(16 + 64, 33) + 1 = 81, doubled by the pair.
-    assert_eq!(plain, vec![(0, ReadStageRole::Body, 81)]);
+    // depth 16, Data trigger: max(16 + 64, 33) + 1 = 81. The unlisted edge has
+    // one writer, whose run opens with one annotation per read site (+2); the
+    // listed edge can switch writer on every read, so the pair doubles it.
+    assert_eq!(
+        plain,
+        vec![(0, ReadStageRole::Body, 83)],
+        "an unlisted edge carries its writer by run: the plain bound plus two"
+    );
     assert_eq!(
         annotated,
         vec![(0, ReadStageRole::Body, 162)],
         "a `multi_publisher_topics`-listed edge stages a Producer annotation \
          with every read, so the whole bound doubles"
     );
-    assert_eq!(annotated[0].2, 2 * plain[0].2);
+    assert_eq!(annotated[0].2, 2 * (plain[0].2 - 2));
 }
 
 /// The per-set `Sync` SITE factor on the production path.
@@ -6745,12 +6818,13 @@ fn a_per_set_sync_trigger_derives_the_peek_promote_factor() {
          pins it on a bounded (Ordinary) shape, which is where it stays visible"
     );
 
-    // THE CONTROL: the same depth on a DataTrigger consumer derives 130. Both
+    // THE CONTROL: the same depth on a DataTrigger consumer derives 132 (130
+    // plus its writer run's two annotations). Both
     // node kinds satisfy the three CAPABILITY terms of `per_set_capable`, so a
     // predicate that read capability alone would report 258 here too.
     let data_trigger =
         wave_capacities("rocic", Box::new(DeepTrigSinkEntry::new()), &["inp"], false);
-    assert_eq!(data_trigger, vec![(0, ReadStageRole::Body, 130)]);
+    assert_eq!(data_trigger, vec![(0, ReadStageRole::Body, 132)]);
 }
 
 /// `Unbounded` arises from a GRAPH, not only from a hand oracle.
@@ -6758,7 +6832,8 @@ fn a_per_set_sync_trigger_derives_the_peek_promote_factor() {
 /// `block` is the one input class the step freeze excludes by POLICY, so a
 /// `Period` node with a `block` input is the shape that reaches the ceiling —
 /// and its plain sibling on the same node, same producer, same step, is sized
-/// at 22. No overflow stimulus is needed: the two capacities are the claim.
+/// at 24 (22 plus its writer run's two annotations). No overflow stimulus is
+/// needed: the two capacities are the claim.
 #[test]
 #[serial]
 fn a_period_block_input_reaches_the_ceiling_and_its_sibling_does_not() {
@@ -6774,11 +6849,12 @@ fn a_period_block_input_reaches_the_ceiling_and_its_sibling_does_not() {
         caps,
         vec![
             (0, ReadStageRole::Body, READ_OUTCOME_STAGE_MAX),
-            (1, ReadStageRole::Body, 22),
+            (1, ReadStageRole::Body, 24),
         ],
         "the `block` input reads LIVE on every catch-up fire (its drain must \
          stay on the consumer's tick), so an unclamped Period burst lands on \
-         the ceiling; the plain sibling on the SAME node is frozen at 22"
+         the ceiling; the plain sibling on the SAME node is frozen: \
+         max(10 + 1, 21) + 1 = 22, plus one run-opening annotation per read site = 24"
     );
 }
 
@@ -6793,7 +6869,9 @@ fn a_period_block_input_reaches_the_ceiling_and_its_sibling_does_not() {
 fn the_derived_capacities_are_deterministic_across_builds() {
     use cerulion_core::read_outcome::ReadStageRole;
 
-    let oracle = vec![(0, ReadStageRole::Body, 130), (1, ReadStageRole::Body, 22)];
+    // max(64 + 64, 129) + 1 = 130 and max(10 + 1, 21) + 1 = 22, each plus its
+    // writer run's two annotations (one per read site).
+    let oracle = vec![(0, ReadStageRole::Body, 132), (1, ReadStageRole::Body, 24)];
     let first = wave_capacities(
         "rocka",
         Box::new(MixedDepthTrigSinkEntry::new()),
@@ -6839,14 +6917,15 @@ fn a_legacy_sync_drain_is_sized_from_its_own_trigger_edge() {
     assert_eq!(
         stages,
         vec![
-            (0, ReadStageRole::Body, 81),
-            (1, ReadStageRole::Body, 81),
-            (0, ReadStageRole::Drain, 81),
-            (1, ReadStageRole::Drain, 81),
+            (0, ReadStageRole::Body, 83),
+            (1, ReadStageRole::Body, 83),
+            (0, ReadStageRole::Drain, 83),
+            (1, ReadStageRole::Drain, 83),
         ],
         "forced-Separate takes the consumer off per-set, so each trigger has an \
          Ordinary BODY stage and a legacy-Sync DRAIN stage, both sized from \
-         THAT trigger's own depth 16: max(16 + 64, 33) + 1 = 81"
+         THAT trigger's own depth 16: max(16 + 64, 33) + 1 = 81, plus the \
+         single-writer edge's two run-opening annotations = 83"
     );
 }
 

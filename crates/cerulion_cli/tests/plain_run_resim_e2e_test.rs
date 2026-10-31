@@ -3354,16 +3354,20 @@ fn one_rank_capture_resims_and_verifies_under(
              a wrong stamp means the resolver chose the other mode: {recorder}"
         );
         // …and the TRACE FORMAT, which decides the gate's rule. A replay reads
-        // this key once and arms every stage under the rule it implies: at 7
+        // this key once and arms every stage under the rule it implies: from 7
         // the recorder wrote a record at every gated consult, so a consult the
         // plan holds no position for is a schedule divergence; below 7 it is a
-        // counted number. A capture that lost or mis-stamped the key would
-        // therefore replay this whole fixture under the counted rule and still
-        // reach exit 0 with `status: enforced`, which is why the stamp is
-        // asserted here rather than inferred from the verdict.
+        // counted number. From 8 every read also names the writer and sequence
+        // of each frame it served, so `--verify` feeds each read its recorded
+        // frames; below 8 the replay is labelled best effort. A capture that
+        // lost or mis-stamped the key would therefore replay this whole fixture
+        // under the counted rule and still reach exit 0 with `status:
+        // enforced`, which is why the stamp is asserted here rather than
+        // inferred from the verdict. The pin is the engine's own constant, the
+        // newest format this build writes and reads.
         assert_eq!(
             recorder["trace_format"],
-            serde_json::json!(7),
+            serde_json::json!(cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT),
             "the capture must stamp the format this build writes, or the gate below runs \
              under a rule this capture does not describe: {recorder}"
         );
@@ -3482,7 +3486,7 @@ fn one_rank_capture_resims_and_verifies_under(
                 "an armed gate that admitted NOTHING gated nothing: {report}"
             );
             // …and no consult over-ran its plan. The count is serialized only
-            // when nonzero, and on a bag stamped 7 (asserted above) it is
+            // when nonzero, and on a bag stamped 7 or later (asserted above) it is
             // structurally zero: the rule that counts it is the one a format 1
             // to 6 recording selects, and under this capture's rule the same
             // consult would be the exit-6 divergence instead. So the absence is
