@@ -7336,12 +7336,14 @@ impl GraphRuntime {
                     crate::read_outcome::ReadStageRole::Body,
                 );
                 let mut subscriber = if let Some(feed_buffer) = body_feed {
-                    let feed_topic =
-                        crate::replay_feed::replay_feed_topic(&crate::read_outcome::StageKey {
+                    let feed_topic = crate::replay_feed::replay_feed_topic(
+                        &replay_wiring.replay_id,
+                        &crate::read_outcome::StageKey {
                             node: node_def.id.clone(),
                             input_idx: input_idx_u16,
                             role: crate::read_outcome::ReadStageRole::Body,
-                        });
+                        },
+                    );
                     let buffer = input_depth.max(feed_buffer);
                     let feed_config =
                         crate::replay_feed::replay_feed_topic_config(input_topic_config, buffer);
@@ -7823,12 +7825,14 @@ impl GraphRuntime {
                                 .map(|floor| (idx, floor))
                         });
                     let mut trigger_sub = if let Some((idx, floor)) = trigger_feed {
-                        let feed_topic =
-                            crate::replay_feed::replay_feed_topic(&crate::read_outcome::StageKey {
+                        let feed_topic = crate::replay_feed::replay_feed_topic(
+                            &replay_wiring.replay_id,
+                            &crate::read_outcome::StageKey {
                                 node: node_def.id.clone(),
                                 input_idx: idx,
                                 role: crate::read_outcome::ReadStageRole::Drain,
-                            });
+                            },
+                        );
                         let buffer = trigger_buffer.max(floor);
                         let feed_config = crate::replay_feed::replay_feed_topic_config(
                             trigger_topic_config,
@@ -8171,6 +8175,7 @@ impl GraphRuntime {
                             });
                         let mut drain_sub = if let Some((idx, floor)) = drain_feed {
                             let feed_topic = crate::replay_feed::replay_feed_topic(
+                                &replay_wiring.replay_id,
                                 &crate::read_outcome::StageKey {
                                     node: node_def.id.clone(),
                                     input_idx: idx,

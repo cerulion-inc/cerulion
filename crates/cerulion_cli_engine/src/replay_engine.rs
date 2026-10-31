@@ -4253,6 +4253,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         fed.then_some(&recorded_messages),
     )?;
     let mut fed_totals = (0usize, 0usize);
+    // One identifier per replay, named into every private feed service.
+    let replay_id = cerulion_core::replay_feed::new_replay_id();
 
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {
@@ -4265,6 +4267,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             let pass = PassInputs {
                 plan,
                 fed,
+                replay_id: &replay_id,
                 is_last_pass: pass_idx == last_pass,
                 coordination,
                 roles_stamped,
@@ -4311,6 +4314,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             };
             let wiring = cerulion_core::replay_feed::ReplayWiring {
                 identity: edge_identity,
+                replay_id: replay_id.clone(),
                 feeds: if fed {
                     Some(
                         bag_side
@@ -8091,6 +8095,8 @@ struct PassInputs<'a> {
     /// is fed by recorded identity (see `crate::replay_feed`); nothing is
     /// injected and every consumed topic is gated.
     fed: bool,
+    /// This replay's identifier, named into every private feed service.
+    replay_id: &'a str,
     plan: &'a RankPlan,
     /// The LAST pass may evict bag pages behind its cursors; an
     /// earlier one must not, because the next pass re-walks the same map from
@@ -13333,7 +13339,7 @@ fn run_rank_pass(
         };
         let mut ports = std::collections::HashMap::new();
         for key in feed_plan.stages() {
-            let topic = cerulion_core::replay_feed::replay_feed_topic(key);
+            let topic = cerulion_core::replay_feed::replay_feed_topic(pass.replay_id, key);
             let max_frame = feed_plan
                 .topic(key)
                 .map_or(0, |t| pass.recorded_messages.max_frame_len(t));

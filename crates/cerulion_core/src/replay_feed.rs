@@ -38,17 +38,27 @@ pub const REPLAY_FEED_TOPIC_ROOT: &str = "/__cerulion/replay_feed";
 
 /// The private service a fed read stage subscribes to.
 ///
-/// `/__cerulion/replay_feed/<node>/<input_idx>/<body|drain>`: one service per
+/// `/__cerulion/replay_feed/<replay_id>/<node>/<input_idx>/<body|drain>`: one service per
 /// stage, so the body and the drain subscriber of one input, which hold two
 /// queues live, hold two feeds here.
 #[must_use]
-pub fn replay_feed_topic(key: &StageKey) -> String {
+pub fn replay_feed_topic(replay_id: &str, key: &StageKey) -> String {
     format!(
-        "{REPLAY_FEED_TOPIC_ROOT}/{}/{}/{}",
+        "{REPLAY_FEED_TOPIC_ROOT}/{replay_id}/{}/{}/{}",
         key.node,
         key.input_idx,
         key.role.label()
     )
+}
+
+/// A fresh identifier for ONE replay: this process's id plus a per-process
+/// counter, so two concurrent replays (two processes, or two in one process)
+/// name disjoint feed services.
+#[must_use]
+pub fn new_replay_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("p{}r{n}", std::process::id())
 }
 
 /// The service config a fed stage's subscriber creates its feed with.
@@ -202,6 +212,9 @@ pub struct ReplayWiring {
     /// The annotation rule, which must be the recording's so both sides stage
     /// the same records.
     pub identity: EdgeIdentity,
+    /// Unique to ONE replay: every private feed service name carries it, so two replays
+    /// sharing an iceoryx2 config never attach to each other's feeds.
+    pub replay_id: String,
     /// `Some` = every read stage subscribes to its [`replay_feed_topic`]; the
     /// map names the buffer a stage's feed needs (the deepest single recorded
     /// read on it). A stage the map omits takes its input's own depth.
@@ -236,15 +249,28 @@ mod tests {
     }
 
     #[test]
-    fn a_feed_topic_names_node_input_and_role_so_two_stages_of_one_input_differ() {
+    fn a_feed_topic_names_replay_node_input_and_role_so_two_stages_of_one_input_differ() {
         assert_eq!(
-            replay_feed_topic(&key(ReadStageRole::Body)),
-            "/__cerulion/replay_feed/sink/2/body"
+            replay_feed_topic("r1", &key(ReadStageRole::Body)),
+            "/__cerulion/replay_feed/r1/sink/2/body"
         );
         assert_eq!(
-            replay_feed_topic(&key(ReadStageRole::Drain)),
-            "/__cerulion/replay_feed/sink/2/drain"
+            replay_feed_topic("r1", &key(ReadStageRole::Drain)),
+            "/__cerulion/replay_feed/r1/sink/2/drain"
         );
+    }
+
+    /// Two replays of graphs with the same node names: every feed name differs,
+    /// so neither attaches to the other's services.
+    #[test]
+    fn two_replays_of_matching_node_names_never_share_a_feed_service() {
+        for role in [ReadStageRole::Body, ReadStageRole::Drain] {
+            assert_ne!(
+                replay_feed_topic("replay-a", &key(role)),
+                replay_feed_topic("replay-b", &key(role))
+            );
+        }
+        assert_ne!(new_replay_id(), new_replay_id());
     }
 
     #[test]
@@ -298,6 +324,7 @@ mod tests {
         feeds.insert(key(ReadStageRole::Body), 7);
         let fed = ReplayWiring {
             identity: EdgeIdentity::EveryEdge,
+            replay_id: "r1".to_string(),
             feeds: Some(feeds),
         };
         assert_eq!(fed.feed_buffer("sink", 2, ReadStageRole::Body), Some(7));
