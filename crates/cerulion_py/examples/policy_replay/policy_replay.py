@@ -103,6 +103,33 @@ class ReplayResult:
     max_abs_error: float
 
 
+def _difference(replayed, recorded, exact, atol, rtol):
+    """Why ``replayed`` does not match ``recorded`` (``None`` when it does), and
+    the largest finite element error (0.0 on a shape or dtype mismatch)."""
+    if replayed.shape != recorded.shape:
+        return f"shape {replayed.shape} != recorded {recorded.shape}", 0.0
+    if exact and replayed.dtype != recorded.dtype:
+        return f"dtype {replayed.dtype} != recorded {recorded.dtype}", 0.0
+    with np.errstate(invalid="ignore", over="ignore"):
+        error = np.abs(replayed.astype(np.float64) - recorded.astype(np.float64))
+        bound = atol + rtol * np.abs(recorded.astype(np.float64))
+    equal = replayed == recorded
+    if exact:
+        equal |= np.isnan(replayed) & np.isnan(recorded)
+    error = np.where(equal, 0.0, error)
+    largest = float(np.max(error)) if error.size else 0.0
+    finite_error = error[np.isfinite(error)]
+    worst = float(np.max(finite_error)) if finite_error.size else 0.0
+    if exact:
+        ok = replayed.tobytes() == recorded.tobytes()
+    else:
+        finite = np.isfinite(replayed) & np.isfinite(recorded)
+        ok = bool(np.all(equal | (finite & (error <= bound))))
+    if ok:
+        return None, worst
+    return ("bytes differ (max abs error 0)" if largest == 0 else f"max abs error {largest:.6g}"), worst
+
+
 def assert_replay_matches(
     steps: RecordedSteps,
     policy: Callable[[Step], np.ndarray],
@@ -127,50 +154,36 @@ def assert_replay_matches(
     Raises ``AssertionError`` naming the first ``max_report`` mismatching
     steps (index, sequence, timestamp, and the shape, dtype or largest error)
     and the mismatch count,
-    or when fewer than ``min_steps`` steps were replayed.
+    or when fewer than ``min_steps`` steps were replayed. The check stores
+    only the report line of each named step and counts the rest, so it holds
+    no earlier ``Step`` (or its records) while a later step runs. A negative
+    ``max_report`` raises ``ValueError`` before any step runs.
     """
+    if max_report < 0:
+        raise ValueError(f"max_report={max_report} is negative")
     exact = atol == 0.0 and rtol == 0.0
-    mismatches = []
+    report = []
+    mismatched = 0
     count = 0
     worst = 0.0
     for step in steps:
         replayed = np.asarray(policy(step))
         recorded = np.asarray(recorded_action(step.action))
         count += 1
-        if replayed.shape != recorded.shape:
-            mismatches.append((step, f"shape {replayed.shape} != recorded {recorded.shape}"))
+        why, error = _difference(replayed, recorded, exact, atol, rtol)
+        worst = max(worst, error)
+        if why is None:
             continue
-        if exact and replayed.dtype != recorded.dtype:
-            mismatches.append((step, f"dtype {replayed.dtype} != recorded {recorded.dtype}"))
-            continue
-        with np.errstate(invalid="ignore", over="ignore"):
-            error = np.abs(replayed.astype(np.float64) - recorded.astype(np.float64))
-            bound = atol + rtol * np.abs(recorded.astype(np.float64))
-        equal = replayed == recorded
-        if exact:
-            equal |= np.isnan(replayed) & np.isnan(recorded)
-        error = np.where(equal, 0.0, error)
-        largest = float(np.max(error)) if error.size else 0.0
-        finite_error = error[np.isfinite(error)]
-        if finite_error.size:
-            worst = max(worst, float(np.max(finite_error)))
-        if exact:
-            ok = replayed.tobytes() == recorded.tobytes()
-        else:
-            finite = np.isfinite(replayed) & np.isfinite(recorded)
-            ok = bool(np.all(equal | (finite & (error <= bound))))
-        if not ok:
-            why = "bytes differ (max abs error 0)" if largest == 0 else f"max abs error {largest:.6g}"
-            mismatches.append((step, why))
-    if mismatches:
-        rule = "byte-exact" if exact else f"atol={atol:g} rtol={rtol:g}"
-        lines = [f"{len(mismatches)} of {count} replayed actions differ from the recording ({rule}):"]
-        for step, why in mismatches[:max_report]:
-            lines.append(
+        mismatched += 1
+        if len(report) < max_report:
+            report.append(
                 f"  step {step.index} (action sequence {step.action.sequence}, "
                 f"timestamp_ns {step.action.timestamp_ns}): {why}"
             )
-        raise AssertionError("\n".join(lines))
+    if mismatched:
+        rule = "byte-exact" if exact else f"atol={atol:g} rtol={rtol:g}"
+        header = f"{mismatched} of {count} replayed actions differ from the recording ({rule}):"
+        raise AssertionError("\n".join([header, *report]))
     if count < min_steps:
         raise AssertionError(
             f"replayed {count} steps, fewer than min_steps={min_steps} "

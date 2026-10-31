@@ -4,8 +4,10 @@ Records here are built in the test (synthetic frames on made-up topics, or typed
 the fixture's oracle bag.
 """
 
+import gc
 import struct
 import sys
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +16,7 @@ import pytest
 import cerulion
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "policy_replay"))
-from policy_replay import RecordedSteps, assert_replay_matches, recorded_steps  # noqa: E402
+from policy_replay import RecordedSteps, ReplayResult, assert_replay_matches, recorded_steps  # noqa: E402
 
 from test_bag import HASH_A, HASH_B, write_bag  # noqa: E402
 
@@ -185,6 +187,89 @@ def test_the_report_names_at_most_max_report_steps():
     lines = str(failure.value).splitlines()
     assert lines[0].startswith("7 of 7 replayed actions differ")
     assert [line.split(" (")[0].strip() for line in lines[1:]] == ["step 0", "step 1", "step 2"]
+
+
+def fresh_frame_log(count):
+    """A new observation record before each of ``count`` actions (all recorded as 1.0).
+
+    A generator, so a record is alive only while something still refers to it."""
+    for i in range(count):
+        yield "/o", synthetic_record(i, [float(i)])
+        yield "/act", synthetic_record(i, [1.0])
+
+
+class FrameWatch:
+    """A policy wrapper that counts, before each call, the observation records
+    of earlier steps that are still alive."""
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.earlier = []
+        self.alive = []
+
+    def __call__(self, step):
+        gc.collect()
+        self.alive.append(sum(ref() is not None for ref in self.earlier))
+        self.earlier.append(weakref.ref(step.observation["/o"]))
+        return self.policy(step)
+
+
+def test_a_failing_replay_counts_every_mismatch_and_keeps_no_earlier_frames():
+    # Steps cycle through the three kinds of mismatch against a recorded
+    # float32 [1.0]: shape (2,), dtype float64, value 2.0.
+    kinds = [np.float32([1.0, 1.0]), np.float64([1.0]), np.float32([2.0])]
+    expected = "\n".join(
+        [
+            "9 of 9 replayed actions differ from the recording (byte-exact):",
+            "  step 0 (action sequence 0, timestamp_ns 1000): shape (2,) != recorded (1,)",
+            "  step 1 (action sequence 1, timestamp_ns 1001): dtype float64 != recorded float32",
+            "  step 2 (action sequence 2, timestamp_ns 1002): max abs error 1",
+            "  step 3 (action sequence 3, timestamp_ns 1003): shape (2,) != recorded (1,)",
+        ]
+    )
+    for _ in range(2):
+        watch = FrameWatch(lambda step: kinds[step.index % 3])
+        with pytest.raises(AssertionError) as failure:
+            assert_replay_matches(RecordedSteps(fresh_frame_log(9), "/o", "/act"), watch, decode, max_report=4)
+        assert str(failure.value) == expected
+        assert watch.alive == [0] * 9
+
+
+def test_exactly_max_report_mismatches_are_all_named():
+    watch = FrameWatch(lambda step: np.float32([2.0 if step.index in (1, 2, 4) else 1.0]))
+    with pytest.raises(AssertionError) as failure:
+        assert_replay_matches(RecordedSteps(fresh_frame_log(5), "/o", "/act"), watch, decode, max_report=3)
+    assert str(failure.value) == "\n".join(
+        [
+            "3 of 5 replayed actions differ from the recording (byte-exact):",
+            "  step 1 (action sequence 1, timestamp_ns 1001): max abs error 1",
+            "  step 2 (action sequence 2, timestamp_ns 1002): max abs error 1",
+            "  step 4 (action sequence 4, timestamp_ns 1004): max abs error 1",
+        ]
+    )
+    assert watch.alive == [0] * 5
+
+
+def test_a_passing_replay_keeps_no_earlier_frames():
+    watch = FrameWatch(lambda step: np.float32([1.0]))
+    result = assert_replay_matches(RecordedSteps(fresh_frame_log(5), "/o", "/act"), watch, decode, max_report=3)
+    assert result == ReplayResult(steps=5, skipped=0, max_abs_error=0.0)
+    assert watch.alive == [0] * 5
+
+
+def test_max_report_zero_counts_the_mismatches_and_names_no_step():
+    watch = FrameWatch(lambda step: np.float32([2.0]))
+    with pytest.raises(AssertionError) as failure:
+        assert_replay_matches(RecordedSteps(fresh_frame_log(4), "/o", "/act"), watch, decode, max_report=0)
+    assert str(failure.value) == "4 of 4 replayed actions differ from the recording (byte-exact):"
+    assert watch.alive == [0] * 4
+
+
+def test_a_negative_max_report_is_refused_before_the_replay():
+    calls = []
+    with pytest.raises(ValueError, match=r"^max_report=-1 is negative$"):
+        assert_replay_matches(steps(), calls.append, decode, max_report=-1)
+    assert calls == []
 
 
 def load_template():
