@@ -903,11 +903,26 @@ mod unix_client {
         listen: &[String],
     ) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
-        let stderr = match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
+        // The log's directory goes through the one socket-directory rule (a
+        // directory of ours that others could write into is tightened first),
+        // and the log is opened without following a symlink, `0600` when created.
+        let opened = log_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or(Ok(()), |parent| {
+                cerulion_hygiene::vet_socket_dir(parent, cerulion_hygiene::VIZD.socket_env())
+                    .map(drop)
+            })
+            .and_then(|()| {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(log_path)
+            });
+        let stderr = match opened {
             Ok(f) => std::process::Stdio::from(f),
             Err(e) => {
                 tracing::warn!(
@@ -1564,6 +1579,71 @@ mod tests {
             log.display()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The vizd log's directory goes through the one socket-directory rule
+    /// before the log is opened: a directory of ours that group or others could
+    /// write into is tightened (so nobody else can rename or unlink the log),
+    /// the log is created `0600`, a symlink at the log path is not followed, and
+    /// a symlinked directory is refused without being re-moded. Every refusal is
+    /// non-fatal: the daemon still spawns with its stderr discarded.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_vizd_detached_tightens_a_writable_log_directory_and_refuses_planted_paths() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let base = std::env::temp_dir().join(format!("cer_vizc_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let script = base.join("fake-vizd.sh");
+        let mut f = std::fs::File::create(&script).unwrap();
+        writeln!(f, "#!/bin/sh\nexit 0\n").unwrap();
+        drop(f);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Happy + determinism: two identically built writable dirs end identically.
+        let run = |name: &str, before: u32| {
+            let dir = base.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(before)).unwrap();
+            let log = vizd_log_path(&dir.join("vizd.sock"));
+            spawn_vizd_detached(&script, &log, &[], &[]).expect("spawn");
+            (mode(&dir), mode(&log))
+        };
+        assert_eq!(run("a", 0o775), (0o755, 0o600));
+        assert_eq!(run("b", 0o775), run("c", 0o775));
+        // Edge: setgid kept, world write stripped. (A sticky, world-writable
+        // directory of ours is arm 1 of the rule and is accepted as is.)
+        assert_eq!(run("d", 0o2777).0, 0o2755);
+        assert_eq!(run("s", 0o1777).0, 0o1777);
+
+        // Adversarial: a symlink at the log path is not followed.
+        let dir = base.join("e");
+        std::fs::create_dir(&dir).unwrap();
+        let victim = base.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("vizd.log")).unwrap();
+        spawn_vizd_detached(&script, &dir.join("vizd.log"), &[], &[]).expect("still spawns");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+
+        // Error arm: a symlinked directory is refused and its target left alone.
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        spawn_vizd_detached(&script, &link.join("vizd.log"), &[], &[]).expect("still spawns");
+        assert_eq!(mode(&real), 0o777, "not re-moded through the link");
+        assert!(
+            !real.join("vizd.log").exists(),
+            "nothing created through the link"
+        );
+
+        // Make every directory removable again before cleanup.
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

@@ -723,7 +723,7 @@ fn describe_dir_open_failure(error: &io::Error) -> String {
 /// reason. `env` is the caller's socket env var, so every refusal names the
 /// way out.
 #[cfg(unix)]
-fn prepare_socket_dir(parent: &Path, env: &'static str) -> io::Result<()> {
+fn prepare_socket_dir(parent: &Path, env: &'static str) -> io::Result<File> {
     let dir = match open_socket_dir(parent) {
         Ok(dir) => dir,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -749,7 +749,7 @@ fn prepare_socket_dir(parent: &Path, env: &'static str) -> io::Result<()> {
         .metadata()
         .map_err(|e| refuse_dir(parent, env, format!("it could not be inspected: {e}")))?;
     match socket_dir_verdict(meta.mode(), meta.uid(), euid()) {
-        DirVerdict::Accept => Ok(()),
+        DirVerdict::Accept => Ok(dir),
         DirVerdict::Tighten { from, to } => {
             // `fchmod` through the fd we judged, never `chmod` of the path.
             dir.set_permissions(fs::Permissions::from_mode(to)).map_err(|e| {
@@ -767,10 +767,23 @@ fn prepare_socket_dir(parent: &Path, env: &'static str) -> io::Result<()> {
                 to = format_args!("{to:o}"),
                 "tightened the socket directory: other users could write into it and replace the daemon's socket"
             );
-            Ok(())
+            Ok(dir)
         }
         DirVerdict::Refuse(why) => Err(refuse_dir(parent, env, why)),
     }
+}
+
+/// Vet the directory `parent` for a caller that keeps its own files beside a
+/// daemon socket (a startup log): create it `0700` when missing, then apply the
+/// one directory rule of this crate's module docs through a single descriptor.
+/// A directory of the user's that others could write into is tightened with
+/// `fchmod` on that descriptor BEFORE the caller opens anything in it, so no
+/// other user can rename or unlink what the caller then creates. Every refusal
+/// is [`io::ErrorKind::PermissionDenied`] and names `env`, the variable that
+/// moves the socket. The returned handle is the directory that was judged.
+#[cfg(unix)]
+pub fn vet_socket_dir(parent: &Path, env: &'static str) -> io::Result<File> {
+    prepare_socket_dir(parent, env)
 }
 
 /// `flock(LOCK_EX | LOCK_NB)` on `f`; [`io::ErrorKind::WouldBlock`] when held
@@ -1160,6 +1173,45 @@ mod tests {
             socket.exists(),
             "the refusal must not touch the live socket"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The client-side entry point: a directory of ours that others could write
+    /// into is tightened through the returned descriptor, the handle is the
+    /// directory that was judged, and a refusal names the env var.
+    #[test]
+    fn vet_socket_dir_tightens_returns_the_judged_directory_and_names_the_env_var() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir_unique("vet");
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        let handle = vet_socket_dir(&dir, "CERULION_WSD_SOCKET").expect("tightened");
+        let path_meta = fs::metadata(&dir).unwrap();
+        assert_eq!(path_meta.mode() & 0o7777, 0o755);
+        let handle_meta = handle.metadata().unwrap();
+        assert_eq!(
+            (handle_meta.dev(), handle_meta.ino()),
+            (path_meta.dev(), path_meta.ino()),
+            "the handle is the directory that was judged"
+        );
+
+        // A missing directory is created 0700; a second call changes nothing.
+        let fresh = dir.join("new");
+        vet_socket_dir(&fresh, "CERULION_WSD_SOCKET").expect("created");
+        assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o7777, 0o700);
+        vet_socket_dir(&fresh, "CERULION_WSD_SOCKET").expect("idempotent");
+        assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o7777, 0o700);
+
+        // A file where the directory should be is refused, naming the env var.
+        let planted = dir.join("planted");
+        fs::write(&planted, b"").unwrap();
+        let err = vet_socket_dir(&planted, "CERULION_WSD_SOCKET").expect_err("file");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("CERULION_WSD_SOCKET"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 
