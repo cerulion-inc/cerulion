@@ -31,8 +31,8 @@
 //! * a wait with no entities spends its timeout (bounded sleep, no spin);
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
 //!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
-//!   block parks while a bell is mapped, and only `ThroughRung` keeps the
-//!   allowance for the rest of the call), off Linux no ring wakes this park
+//!   block parks while a bell is mapped, and every later block of the call
+//!   takes the fd tier), off Linux no ring wakes this park
 //!   and the same rounds pin the fd tier, and
 //!   `CERULION_MONITOR_WAIT=0` forces the fd tier EVERYWHERE, which is
 //!   why the fd-counter pins below run under it (they pin the SAME tier
@@ -228,6 +228,28 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Unsets `CERULION_MONITOR_WAIT` for the test and restores the caller's
+/// value on drop.
+struct MonitorWaitUnset {
+    prior: Option<std::ffi::OsString>,
+}
+
+impl MonitorWaitUnset {
+    fn new() -> Self {
+        let prior = std::env::var_os("CERULION_MONITOR_WAIT");
+        std::env::remove_var("CERULION_MONITOR_WAIT");
+        Self { prior }
+    }
+}
+
+impl Drop for MonitorWaitUnset {
+    fn drop(&mut self) {
+        if let Some(v) = self.prior.take() {
+            std::env::set_var("CERULION_MONITOR_WAIT", v);
+        }
+    }
+}
+
 /// Counter snapshot off the opaque wait-set data pointer. ONLY sound when
 /// no `rmw_wait` on this wait set is in flight (read-after-join in every
 /// test below).
@@ -253,14 +275,12 @@ unsafe fn blocks_entered(ws: *mut ffi::rmw_wait_set_t) -> u64 {
 ///
 /// The horizon a FORCED park (`CERULION_MONITOR_WAIT=1`) resolves to is a
 /// HAND restatement of the platform table, written from the horizon
-/// definitions rather than read back from the production resolver: aarch64
-/// Linux keeps its own `ThroughRung`, and every other Linux target takes
-/// the bounded one-rung hatch, `FirstRungOnce`.
+/// definitions rather than read back from the production resolver: every
+/// Linux target, aarch64 included, takes the bounded one-rung shape,
+/// `FirstRungOnce`.
 ///
-/// What each horizon PROMISES, and therefore what may be asserted:
+/// What that horizon PROMISES, and therefore what may be asserted:
 ///
-/// * `ThroughRung` keeps a call's park allowance for EVERY block, so an fd
-///   block there means the park tier disengaged: `fd_blocks == 0`.
 /// * `FirstRungOnce` SPENDS the allowance on the call's FIRST block BY
 ///   DESIGN (`guard_wait::block_parks`, pinned by a hand oracle in the lib
 ///   tests), so every LATER block of the same call takes the kernel fd
@@ -281,13 +301,6 @@ unsafe fn assert_park_tier_engaged(ws: *mut ffi::rmw_wait_set_t, calls: u64) {
     let data = &*((*ws).data as *const WaitSetData);
     let park_blocks = data.park_blocks.load(Ordering::Relaxed);
     let fd_blocks = data.fd_blocks.load(Ordering::Relaxed);
-    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        assert_eq!(
-            fd_blocks, 0,
-            "ThroughRung keeps the park allowance for every block of a call, so an \
-             fd block means the park tier disengaged"
-        );
-    }
     assert!(
         park_blocks >= calls,
         "every one of the {calls} calls must park its FIRST block (a mapped bell \
@@ -1765,6 +1778,97 @@ fn an_idle_wait_set_climbs_the_ladder_and_stops_burning_wakeups() {
     }
 }
 
+/// Process CPU (user + system) consumed so far, from `getrusage(RUSAGE_SELF)`.
+fn process_cpu() -> Duration {
+    // SAFETY: `getrusage` writes one `rusage` into the zeroed local.
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut ru), 0);
+        ru
+    };
+    let tv = |t: libc::timeval| {
+        Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+    };
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
+/// An IDLE subscriber at the SHIPPED park default must not hold a core.
+/// The set is the shape `perf_test` and every rclcpp executor build: one
+/// subscription whose topic has a publisher, so the topic doorbell is
+/// mapped and the park tier is armed. One `rmw_wait` call then idles for a
+/// fixed 1 s window with no publish, and the process CPU over that window
+/// is measured with `getrusage`. A park held through every block of the
+/// call measured 1.00 s of CPU per 1 s window on aarch64; the kernel fd
+/// block measured 0.006 s. Bound: under 20 %
+/// of one core, roughly ten times what the kernel-block path measures and
+/// a fifth of the regression's cost.
+#[test]
+#[serial]
+fn an_idle_subscriber_at_the_default_park_does_not_hold_a_core() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    // The platform default, whatever the caller's environment says.
+    let _park = MonitorWaitUnset::new();
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevI{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_i_{suffix}"));
+        let topic = CString::new(format!("/rmw_wev/i/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        // The publisher arms the topic doorbell on Linux, which is what
+        // arms the park allowance for the wait below.
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!publisher.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+
+        const WINDOW: Duration = Duration::from_secs(1);
+        let cpu0 = process_cpu();
+        let start = Instant::now();
+        let (ret, ready) = wait_on_sub((*subscription).data, ws, WINDOW);
+        let wall = start.elapsed();
+        let cpu = process_cpu().saturating_sub(cpu0);
+        assert_eq!(ret, ffi::RMW_RET_TIMEOUT);
+        assert!(!ready);
+        let share = cpu.as_secs_f64() / wall.as_secs_f64();
+        let data = &*((*ws).data as *const WaitSetData);
+        eprintln!(
+            "idle subscriber: cpu={cpu:?} wall={wall:?} share={share:.3} \
+             doorbell_topics={} park_blocks={} park_yields={} fd_blocks={}",
+            data.doorbell_topics(),
+            data.park_blocks.load(Ordering::Relaxed),
+            data.park_yields.load(Ordering::Relaxed),
+            data.fd_blocks.load(Ordering::Relaxed),
+        );
+        // On aarch64 Linux the default parks, so the window must have
+        // entered the park tier: a doorbell that never mapped would pass
+        // the CPU bound without parking at all.
+        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            assert_eq!(
+                data.doorbell_topics(),
+                1,
+                "the topic doorbell must be mapped"
+            );
+            assert!(
+                data.park_blocks.load(Ordering::Relaxed) >= 1,
+                "the call must have parked its first block"
+            );
+        }
+        assert!(
+            share < 0.20,
+            "an idle subscriber used {share:.3} of a core over {wall:?} \
+             ({cpu:?} of CPU); the park must hand an idle wait to the kernel block"
+        );
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
 /// Ladder pin (iii) — a publish AFTER backoff still wakes promptly via the
 /// fd. Each round: the waiter idles long enough to climb to the 20 ms cap
 /// (`block_backoffs` grows), then a publish must return well inside a
@@ -2173,7 +2277,8 @@ fn a_publish_wakes_a_parked_wait_through_the_topic_doorbell() {
     let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
     // Park FORCED on: the x86 default is no park (measured slower), so the
     // Linux arm pins the park tier under the explicit hatch; aarch64 parks
-    // by default and off Linux the force is inert (no ring wakes this park).
+    // one rung by default and off Linux the force is inert (no ring wakes
+    // this park).
     let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
     unsafe {
         let suffix = unique_suffix();
