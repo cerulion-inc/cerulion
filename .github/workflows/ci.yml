@@ -863,6 +863,7 @@ jobs:
       # front is what keeps this job off ENOSPC; the `df` lines make a
       # regression diagnosable from the log.
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -1781,6 +1782,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -2091,6 +2093,7 @@ jobs:
       # in every step's env block in the run logs), so there is no incremental
       # directory to reclaim.
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android \
@@ -3065,6 +3068,7 @@ jobs:
       # An unparseable figure simply skips the reclaim (verified on real BSD `df`:
       # empty and non-numeric both fall through the guard, exit 0).
       - name: Report free disk (reclaim only if tight)
+        if: runner.environment == 'github-hosted'
         run: |
           df -h / || true
           avail=$(df -g / | awk 'NR==2 {print $4}') || true
@@ -4006,7 +4010,7 @@ jobs:
       # headroom on the stock runner (the ENOSPC/SIGBUS class documented at
       # length in that job).
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (runner.os == 'Linux')
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android \
@@ -4053,6 +4057,15 @@ jobs:
       - name: cerulion_pairing tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
         run: cargo test -p cerulion_pairing
+      # Lints and tests cerulion_pairing with the `dev-issuer` feature on, and
+      # checks the release package set (check_no_dev_issuer.sh) for it.
+      - name: cerulion_pairing tests, development issuer
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
+        run: |
+          cargo clippy -p cerulion_pairing --all-targets --features dev-issuer -- -D warnings
+          cargo test -p cerulion_pairing --features dev-issuer
+      - name: release binaries build without the development issuer
+        run: tools/scripts/check_no_dev_issuer.sh
       - name: selection marker, cerulion_pairing
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing') }}
         env:
@@ -4602,7 +4615,7 @@ jobs:
       # preinstalled toolchains (~25 GB) on Linux before building. macOS
       # runners have more disk, so skip it there.
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (runner.os == 'Linux')
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /
@@ -4915,6 +4928,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -5011,6 +5025,7 @@ jobs:
       # Reclaim preinstalled SDK bloat (crib test-linux) so the iroh tree has disk
       # headroom on the stock runner.
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android \
                       /usr/share/dotnet \
@@ -5360,7 +5375,7 @@ jobs:
       # the smaller list alongside the larger profile would inherit the
       # mitigation's name without its substance.
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (runner.os == 'Linux')
         run: |
           sudo rm -rf /usr/local/lib/android \
                       /usr/share/dotnet \
