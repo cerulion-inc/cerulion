@@ -2415,40 +2415,20 @@ fn rotate_locked(file: &std::fs::File, path: &Path) -> io::Result<bool> {
 /// Open the startup log at `path` for appending and return it with its length
 /// (the offset this spawn's output starts at).
 ///
-/// The parent directory is created `0700` when missing, must not be a symlink,
-/// and must pass the same directory rule the daemon applies before it binds its
-/// socket there ([`cerulion_hygiene::socket_dir_verdict`]). A log at or over
+/// The parent directory goes through the same rule the daemon applies before
+/// it binds its socket there ([`cerulion_hygiene::vet_socket_dir`]): created
+/// `0700` when missing, refused when it is a symlink, a file or another user's,
+/// and stripped of group and other write bits when it is ours. A log at or over
 /// [`SPAWN_LOG_ROTATE_AT`] is renamed to its `.1` generation (see
 /// [`rotate_full_log`]) and a fresh one opened; a rotation that fails is
 /// logged and the full log appended to instead. A file opened while a racing
 /// spawn renamed it is re-opened at the path.
 fn open_spawn_log(path: &Path) -> io::Result<(std::fs::File, u64)> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-        let meta = std::fs::symlink_metadata(parent)?;
-        if !meta.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "its directory {} is not a directory (a symlink or file is there)",
-                    parent.display()
-                ),
-            ));
-        }
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        let me = unsafe { libc::geteuid() };
-        if let cerulion_hygiene::DirVerdict::Refuse(reason) =
-            cerulion_hygiene::socket_dir_verdict(meta.mode(), meta.uid(), me)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("its directory {} is refused: {reason}", parent.display()),
-            ));
-        }
+        // One rule, one descriptor: created 0700 when missing, refused when it
+        // is a symlink, a file or another user's, and TIGHTENED when it is ours
+        // but group or others could write into it, all before the log is opened.
+        cerulion_hygiene::vet_socket_dir(parent, cerulion_hygiene::NETD.socket_env())?;
     }
     let mut file = open_log_file(path)?;
     // Two passes: a full log is rotated once, and a file renamed underneath this
@@ -4212,6 +4192,128 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("opening a FIFO must not block");
         assert!(res.is_err(), "a FIFO is not a log file");
+    }
+
+    /// A directory of the user's that group or others can write into, built the
+    /// same way every time: `mode` is applied after creation so the umask cannot
+    /// narrow it.
+    fn writable_log_dir(root: &Path, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = root.join("shared");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    // HAPPY: a group-writable directory of ours is tightened before the log is
+    // opened, so no other user can rename or unlink the log.
+    #[test]
+    fn a_group_writable_log_directory_is_tightened_before_the_log_is_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = writable_log_dir(tmp.path(), 0o775);
+        let log = dir.join("netd.log");
+        let (_file, start) = open_spawn_log(&log).expect("open");
+        assert_eq!(start, 0);
+        assert_eq!(mode_of(&dir) & 0o022, 0, "group and other write are gone");
+        assert_eq!(mode_of(&dir), 0o755);
+        assert_eq!(mode_of(&log), 0o600);
+    }
+
+    // EDGE: every writable shape is stripped; the sticky and setgid bits and the
+    // owner's own bits are kept, and an already-safe directory is left alone.
+    #[test]
+    fn tightening_the_log_directory_keeps_sticky_setgid_and_owner_bits() {
+        for (before, after) in [
+            (0o777, 0o755),
+            (0o770, 0o750),
+            (0o772, 0o750),
+            (0o2775, 0o2755),
+            (0o755, 0o755),
+            (0o700, 0o700),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = writable_log_dir(tmp.path(), before);
+            open_spawn_log(&dir.join("netd.log")).expect("open");
+            assert_eq!(mode_of(&dir), after, "from {before:o}");
+        }
+    }
+
+    // ADVERSARIAL: the directory is tightened when the log ALREADY exists too
+    // (a rename or unlink of the old log is the attack), and the directory the
+    // log lands in is the one that was judged, never a symlink's target.
+    #[test]
+    fn a_preexisting_log_in_a_writable_directory_is_protected_and_a_symlinked_directory_is_not_followed(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = writable_log_dir(tmp.path(), 0o777);
+        std::fs::write(dir.join("netd.log"), "old run\n").unwrap();
+        let (_file, start) = open_spawn_log(&dir.join("netd.log")).expect("open");
+        assert_eq!(start, 8);
+        assert_eq!(mode_of(&dir) & 0o022, 0);
+
+        let root2 = tmp.path().join("r2");
+        std::fs::create_dir(&root2).unwrap();
+        let real = writable_log_dir(&root2, 0o777);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = open_spawn_log(&link.join("netd.log")).expect_err("a symlinked dir is refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(
+            mode_of(&real),
+            0o777,
+            "the directory behind the link is not chmod-ed through it"
+        );
+        assert!(
+            !real.join("netd.log").exists(),
+            "nothing was created through the link"
+        );
+    }
+
+    // DETERMINISM: two runs over identically built directories end in the same
+    // directory mode, log mode and start offset.
+    #[test]
+    fn the_tightened_result_is_identical_across_two_runs() {
+        let run = || {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = writable_log_dir(tmp.path(), 0o2777);
+            let log = dir.join("netd.log");
+            let (_file, start) = open_spawn_log(&log).expect("open");
+            (mode_of(&dir), mode_of(&log), start)
+        };
+        assert_eq!(run(), run());
+    }
+
+    // ERROR ARMS: a file where the directory should be, and a directory that
+    // cannot be inspected, are both refused as PermissionDenied naming the
+    // directory, and nothing is created.
+    #[test]
+    fn a_planted_file_or_an_uninspectable_directory_is_refused_naming_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let planted = tmp.path().join("planted");
+        std::fs::write(&planted, "").unwrap();
+        let err = open_spawn_log(&planted.join("netd.log")).expect_err("a file is not a dir");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            err.to_string().contains(&planted.display().to_string()),
+            "{err}"
+        );
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let outer = tmp.path().join("closed");
+            std::fs::create_dir(&outer).unwrap();
+            std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let err = open_spawn_log(&outer.join("inner").join("netd.log"))
+                .expect_err("an uninspectable directory");
+            std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        }
     }
 
     #[test]
