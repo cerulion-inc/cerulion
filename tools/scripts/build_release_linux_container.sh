@@ -85,6 +85,7 @@ rustc --version
 cd "$repo"
 # The release package list lives in check_no_dev_issuer.sh.
 read -r -a packages <<< "$(bash tools/scripts/check_no_dev_issuer.sh --print-packages)"
+[ "${#packages[@]}" -gt 0 ] || die "check_no_dev_issuer.sh --print-packages printed no package list"
 # shellcheck disable=SC2086 # an empty profile_flag must vanish
 cargo build $profile_flag --locked "${packages[@]}" --target "$target"
 # The heap hook, an LD_PRELOAD malloc interposer the CLI auto-injects into

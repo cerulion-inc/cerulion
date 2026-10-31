@@ -22,7 +22,7 @@ a node that never arms a borrow window. The package is assembled from the
 release archive, so the bytes in the package are the release bytes. The rmw
 library is built inside the `ros:jazzy` image against the real Jazzy headers
 (`tools/scripts/build_rmw.sh jazzy`); the hook is plain Rust over libc and is
-built on the release runner like the binaries. The release workflow installs
+built in the Ubuntu 20.04 release container like the binaries. The release workflow installs
 each package in a clean Jazzy container and runs a talker and a listener
 through it, checks that stock rclpy loads the shipped rmw, then checks that
 the hook is preloaded into a node (the hook's own load breadcrumb and the

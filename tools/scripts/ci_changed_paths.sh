@@ -123,6 +123,7 @@ tools/scripts/build_deb.sh
 tools/scripts/test_build_deb.sh
 tools/scripts/build_release_linux_container.sh
 tools/scripts/check_release_glibc.py
+tools/scripts/check_no_dev_issuer.sh
 tools/scripts/build_apt_repo.sh
 tools/scripts/publish_apt_repo.sh
 tools/scripts/build_keyring_deb.sh
@@ -467,6 +468,7 @@ self_test() {
     local packaging_cases='
 tools/scripts/build_deb.sh|true
 tools/scripts/build_release_linux_container.sh|true
+tools/scripts/check_no_dev_issuer.sh|true
 docs/packaging/apt.md|true
 tools/release/about.toml|true
 .github/workflows/apt-repo.yml|true

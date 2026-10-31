@@ -1242,8 +1242,7 @@ jobs:
             cargo-cross-aarch64-
 
       # ring (through the QUIC link's rustls) compiles C in its build script,
-      # so the check needs the aarch64 C compiler that release-artifacts.yml
-      # installs for the same target.
+      # so the check needs an aarch64 C compiler.
       # The hosted image ships a packages.microsoft.com apt source; apt-get
       # update exits 100 when that source refuses or fails its signature check,
       # even though both packages come from the Ubuntu archives. Deleting its
