@@ -103,6 +103,23 @@ ENVIRONMENT:
                                  prior `cerulion login`; an expired saved login
                                  still permits offline LAN serving.
                                  CERULION_NETD_NETWORK=off wins.
+    CERULION_NETD_TLS_ROOT_CA    Absolute path of the PEM certificate(s) the peer of
+                                 a quic/ or tls/ CONNECT locator must chain to. Such
+                                 a connect locator needs it, and it is refused
+                                 when no connect locator is quic/ or tls/.
+    CERULION_NETD_TLS_CERTIFICATE
+                                 Absolute path of the PEM certificate a quic/ or
+                                 tls/ LISTEN locator presents; it must not be marked
+                                 CA:TRUE.
+    CERULION_NETD_TLS_PRIVATE_KEY
+                                 Absolute path of the PEM private key for
+                                 CERULION_NETD_TLS_CERTIFICATE. A quic/ or tls/
+                                 listen locator needs both, and both are refused
+                                 when no listen locator is quic/ or tls/.
+                                 The daemon refuses to start, naming the variable,
+                                 on a locator or TLS setting that cannot work,
+                                 including a datagram-only locator (plain udp/,
+                                 or rel=0).
     CERULION_NETD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no network ever).
     CERULION_MULTICAST_SCOUTING=on
                                  Turn zenoh multicast scouting (periodic scout
@@ -243,10 +260,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // CERULION_UNENCRYPTED_QUIC=on, see `quic_first`); discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
-    // A standing gateway serves only under a prior login.
-    let configured_network = net::network_config_from_env();
+    // A standing gateway serves only under a prior login, and that refusal
+    // comes first. Then a locator or TLS setting that cannot work refuses the
+    // start, naming the variable, before anything binds.
+    let configured_network = net::network_config_from_env_unchecked();
     if net::standing_gateway_requested(configured_network.as_ref()) {
         cerulion_netd::serving_login::require_prior_login()?;
+    }
+    if let Some(cfg) = &configured_network {
+        net::check_env_network_config(cfg)?;
     }
     let (network, peer_fold) = match configured_network {
         Some(cfg) => {
@@ -890,6 +912,25 @@ mod tests {
         // able to find where revocations are read from).
         assert!(WAN_USAGE.contains(cerulion_netd::wan::EPOCH_DIR_ENV));
         assert!(WAN_USAGE.contains(cerulion_netd::wan::RELAY_DISABLED_ENV));
+    }
+
+    /// `--help` lists each network variable as exactly one row, at the start of
+    /// a line.
+    #[test]
+    fn usage_lists_each_network_variable_once() {
+        for var in [
+            net::CONNECT_ENV,
+            net::LISTEN_ENV,
+            net::TLS_ROOT_CA_ENV,
+            net::TLS_CERTIFICATE_ENV,
+            net::TLS_PRIVATE_KEY_ENV,
+        ] {
+            let rows = USAGE
+                .lines()
+                .filter(|l| l.trim_start().starts_with(var) && l.starts_with("    C"))
+                .count();
+            assert_eq!(rows, 1, "{var} rows in --help:\n{USAGE}");
+        }
     }
 
     #[cfg(not(feature = "wan"))]
