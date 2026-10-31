@@ -81,7 +81,7 @@ const STEP_TIMEOUT: Duration = Duration::from_millis(2);
 /// converts a slow step into a failure.
 const MAX_LIVE_STEPS: usize = 200;
 /// A hand-stamped requirement STRICTLY ABOVE the create-side borrow
-/// floor (3 = `SUBSCRIBER_MAX_BORROWED_HELD`, pub(crate) — literal here), so
+/// floor (3 = `SUBSCRIBER_MAX_BORROWED_HELD`, a hand-written oracle here), so
 /// the created value is attributable ONLY to the union machinery.
 const STAMPED_BORROW: usize = 5;
 const BORROW_FLOOR: usize = 3;
