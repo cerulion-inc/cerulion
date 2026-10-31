@@ -360,11 +360,13 @@ mod tests {
                 robot: "go2".to_string(),
                 topic: "/scan".to_string(),
                 refcount: 1,
+                plane: None,
             }],
             active_connections: 3,
             idle: false,
             connect_endpoints: None,
             lan_access: Some(cerulion_core::LanAccess::Open),
+            egress: None,
         };
         assert_eq!(
             running(SOCK.to_string(), 7, &status),
