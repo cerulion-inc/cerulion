@@ -32,6 +32,12 @@ workspace = true
 # generated path points: a version move is a reviewed event, not a lockfile
 # refresh.
 proc-macro-crate = "=3.5.0"
+# Reads which table of the consuming package's manifest names a crate, so a
+# runtime entry that is only a dev or target-specific dependency does not
+# outrank an umbrella entry in plain [dependencies]. The same version and the
+# same single feature proc-macro-crate already builds it with, so it adds no
+# package to the tree.
+toml_edit = { version = "=0.25.13", default-features = false, features = ["parse"] }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing", "visit", "visit-mut", "extra-traits"] }

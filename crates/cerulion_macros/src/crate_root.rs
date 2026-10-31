@@ -31,16 +31,24 @@
 //! package chose rather than the name on the package. `cer = { package =
 //! "cerulion_core" }` emits `::cer`.
 //!
+//! A package that names both, but names only the umbrella in its plain
+//! `[dependencies]` table, gets `::cerulion::core`. A runtime entry that
+//! sits only in `[dev-dependencies]` or a `[target.'cfg(..)'.dependencies]`
+//! table is not linked into every target the macros expand in, while a plain
+//! `[dependencies]` entry is, so the umbrella is the root that resolves in all
+//! of them.
+//!
 //! # What the resolver cannot see
 //!
-//! It reads a manifest, not a compilation. `[dependencies]`,
+//! It reads a manifest, not a compilation. Apart from the rule above, which
+//! reads only the plain `[dependencies]` table, `[dependencies]`,
 //! `[dev-dependencies]` and every `[target.'cfg(..)'.dependencies]` table are
 //! one flat set to it, whether or not the cfg holds for the target being
-//! compiled. So a package that names the umbrella in `[dependencies]` and the
-//! runtime in `[dev-dependencies]` gets `::cerulion_core` in its library
-//! target too, where that name is not linked, and the missing-dependency
-//! diagnostic does NOT fire, because the runtime was found. The remedy is the
-//! one the compiler's own resolution error already points at: name in
+//! compiled. So a package that names ONLY the runtime, and only in
+//! `[dev-dependencies]`, gets `::cerulion_core` in its library target too,
+//! where that name is not linked, and the missing-dependency diagnostic does
+//! NOT fire, because the runtime was found. The remedy is the one the
+//! compiler's own resolution error already points at: name in
 //! `[dependencies]` whichever crate the code that expands macros is built
 //! against.
 //!
@@ -178,8 +186,23 @@ fn spelling(found: FoundCrate, fallback: &str) -> String {
 ///
 /// Split out from the lookup so it can be tested against every combination
 /// without a manifest on disk. `runtime` and `umbrella` are the outcomes of
-/// asking for `RUNTIME` and `UMBRELLA` in that order.
-fn classify(runtime: Lookup, umbrella: Lookup) -> Root {
+/// asking for `RUNTIME` and `UMBRELLA` in that order. `normal` is the set of
+/// keys in the package's plain `[dependencies]` table, spelled as the
+/// resolver spells them (`-` turned into `_`), or `None` when it was not read.
+fn classify(runtime: Lookup, umbrella: Lookup, normal: Option<&[String]>) -> Root {
+    // Both named, but only the umbrella in plain `[dependencies]`: the runtime
+    // entry is a dev or target-specific one, not linked into every target the
+    // macros expand in, while the umbrella is.
+    if let (
+        Lookup::Found(FoundCrate::Name(runtime_key)),
+        Lookup::Found(FoundCrate::Name(umbrella_key)),
+        Some(normal),
+    ) = (&runtime, &umbrella, normal)
+    {
+        if normal.contains(umbrella_key) && !normal.contains(runtime_key) {
+            return Root::Umbrella(spelling(FoundCrate::Name(umbrella_key.clone()), UMBRELLA));
+        }
+    }
     match runtime {
         Lookup::Found(found) => Root::Runtime(spelling(found, RUNTIME)),
         Lookup::Undecidable => Root::Undecidable,
@@ -237,14 +260,38 @@ fn resolve() -> Root {
 /// Ask the resolver which crates the consuming package names.
 fn resolve_uncached() -> Root {
     let runtime = look_up(RUNTIME);
-    // Only asked when the runtime was not found, so a package that names the
-    // runtime pays one lookup rather than two.
-    let umbrella = if matches!(runtime, Lookup::Absent) {
-        look_up(UMBRELLA)
-    } else {
+    // Asked unless the manifest was unreadable: when both are named, which
+    // table each sits in decides the root.
+    let umbrella = if matches!(runtime, Lookup::Undecidable) {
         Lookup::Absent
+    } else {
+        look_up(UMBRELLA)
     };
-    classify(runtime, umbrella)
+    // Read only when both were found, the one case the table decides.
+    let normal = if matches!((&runtime, &umbrella), (Lookup::Found(_), Lookup::Found(_))) {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(|dir| std::path::PathBuf::from(dir).join("Cargo.toml"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| normal_dependency_keys(&text))
+    } else {
+        None
+    };
+    classify(runtime, umbrella, normal.as_deref())
+}
+
+/// The keys of a manifest's plain `[dependencies]` table, with `-` turned
+/// into `_` as `proc-macro-crate` reports them, or `None` when the text does
+/// not parse. A manifest with no such table has no normal dependencies.
+fn normal_dependency_keys(manifest: &str) -> Option<Vec<String>> {
+    let doc = manifest.parse::<toml_edit::DocumentMut>().ok()?;
+    let keys = match doc
+        .get("dependencies")
+        .and_then(|item| item.as_table_like())
+    {
+        Some(table) => table.iter().map(|(key, _)| key.replace('-', "_")).collect(),
+        None => Vec::new(),
+    };
+    Some(keys)
 }
 
 /// The path every generated runtime item hangs off.
@@ -302,14 +349,14 @@ mod tests {
 
     #[test]
     fn naming_the_runtime_emits_the_runtime_path() {
-        let root = classify(found("cerulion_core"), Lookup::Absent);
+        let root = classify(found("cerulion_core"), Lookup::Absent, None);
         assert_eq!(root, Root::Runtime("cerulion_core".into()));
         assert_eq!(rendered(&root), ":: cerulion_core");
     }
 
     #[test]
     fn naming_only_the_umbrella_emits_the_umbrella_path() {
-        let root = classify(Lookup::Absent, found("cerulion"));
+        let root = classify(Lookup::Absent, found("cerulion"), None);
         assert_eq!(root, Root::Umbrella("cerulion".into()));
         assert_eq!(rendered(&root), ":: cerulion :: core");
     }
@@ -319,15 +366,18 @@ mod tests {
         // The compatibility rule. A package written before this resolver
         // existed names the runtime, and some also name the umbrella; the
         // tokens they get must not move.
-        let root = classify(found("cerulion_core"), found("cerulion"));
+        let root = classify(found("cerulion_core"), found("cerulion"), None);
         assert_eq!(rendered(&root), ":: cerulion_core");
     }
 
     #[test]
     fn a_renamed_dependency_is_carried_through() {
-        assert_eq!(rendered(&classify(found("cer"), Lookup::Absent)), ":: cer");
         assert_eq!(
-            rendered(&classify(Lookup::Absent, found("cer_umbrella"))),
+            rendered(&classify(found("cer"), Lookup::Absent, None)),
+            ":: cer"
+        );
+        assert_eq!(
+            rendered(&classify(Lookup::Absent, found("cer_umbrella"), None)),
             ":: cer_umbrella :: core"
         );
     }
@@ -340,13 +390,13 @@ mod tests {
         // the user's own code.
         for key in ["crate", "self", "123", ""] {
             assert_eq!(
-                rendered(&classify(found(key), Lookup::Absent)),
+                rendered(&classify(found(key), Lookup::Absent, None)),
                 ":: cerulion_core",
                 "a `{key}` rename must not reach Ident::new"
             );
         }
         assert_eq!(
-            rendered(&classify(Lookup::Absent, found("crate"))),
+            rendered(&classify(Lookup::Absent, found("crate"), None)),
             ":: cerulion :: core"
         );
     }
@@ -355,19 +405,90 @@ mod tests {
     fn the_runtime_compiling_itself_is_spelled_by_name_not_by_crate() {
         // `crate` would break the runtime's own doctests, which Cargo reports
         // as `Itself` and which reach the runtime through `--extern`.
-        let root = classify(Lookup::Found(FoundCrate::Itself), Lookup::Absent);
+        let root = classify(Lookup::Found(FoundCrate::Itself), Lookup::Absent, None);
         assert_eq!(rendered(&root), ":: cerulion_core");
     }
 
     #[test]
     fn the_umbrella_compiling_itself_is_spelled_by_name() {
-        let root = classify(Lookup::Absent, Lookup::Found(FoundCrate::Itself));
+        let root = classify(Lookup::Absent, Lookup::Found(FoundCrate::Itself), None);
+        assert_eq!(rendered(&root), ":: cerulion :: core");
+    }
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_umbrella_wins_when_only_it_is_a_normal_dependency() {
+        // `cerulion` in `[dependencies]`, `cerulion_core` only in
+        // `[dev-dependencies]`: the library target links only the umbrella.
+        let normal = keys(&["cerulion", "serde"]);
+        let root = classify(found("cerulion_core"), found("cerulion"), Some(&normal));
+        assert_eq!(root, Root::Umbrella("cerulion".into()));
         assert_eq!(rendered(&root), ":: cerulion :: core");
     }
 
     #[test]
+    fn the_runtime_still_wins_when_both_are_normal_dependencies() {
+        let normal = keys(&["cerulion", "cerulion_core"]);
+        let root = classify(found("cerulion_core"), found("cerulion"), Some(&normal));
+        assert_eq!(rendered(&root), ":: cerulion_core");
+    }
+
+    #[test]
+    fn the_runtime_wins_when_neither_is_a_normal_dependency_or_the_table_is_unread() {
+        let normal = keys(&["serde"]);
+        assert_eq!(
+            rendered(&classify(
+                found("cerulion_core"),
+                found("cerulion"),
+                Some(&normal)
+            )),
+            ":: cerulion_core"
+        );
+        assert_eq!(
+            rendered(&classify(found("cerulion_core"), found("cerulion"), None)),
+            ":: cerulion_core"
+        );
+    }
+
+    #[test]
+    fn a_renamed_umbrella_in_normal_dependencies_is_carried_through() {
+        let normal = keys(&["cer"]);
+        let root = classify(found("cerulion_core"), found("cer"), Some(&normal));
+        assert_eq!(rendered(&root), ":: cer :: core");
+    }
+
+    #[test]
+    fn normal_dependency_keys_reads_only_the_plain_dependencies_table() {
+        let manifest = r#"
+[package]
+name = "robot"
+
+[dependencies]
+cerulion = { workspace = true }
+my-dep = "1"
+
+[dev-dependencies]
+cerulion_core = "1.0.0"
+
+[target.'cfg(unix)'.dependencies]
+cerulion_core = "1.0.0"
+"#;
+        let mut found = normal_dependency_keys(manifest).expect("parses");
+        found.sort();
+        assert_eq!(found, keys(&["cerulion", "my_dep"]));
+        assert_eq!(
+            normal_dependency_keys("[package]\nname = \"x\"\n"),
+            Some(Vec::new())
+        );
+        assert_eq!(normal_dependency_keys("[dependencies"), None);
+    }
+
+    #[test]
     fn naming_neither_falls_back_to_the_runtime_path_and_is_reported() {
-        let root = classify(Lookup::Absent, Lookup::Absent);
+        let root = classify(Lookup::Absent, Lookup::Absent, None);
         assert_eq!(root, Root::Unresolved);
         // The fallback is the pre-resolver spelling, so a package in this
         // state compiles exactly as badly as it did before, with one named
@@ -387,9 +508,9 @@ mod tests {
     #[test]
     fn an_unreadable_manifest_is_not_reported_as_a_missing_dependency() {
         for root in [
-            classify(Lookup::Undecidable, Lookup::Absent),
-            classify(Lookup::Absent, Lookup::Undecidable),
-            classify(Lookup::Undecidable, Lookup::Undecidable),
+            classify(Lookup::Undecidable, Lookup::Absent, None),
+            classify(Lookup::Absent, Lookup::Undecidable, None),
+            classify(Lookup::Undecidable, Lookup::Undecidable, None),
         ] {
             assert_eq!(root, Root::Undecidable);
             assert_eq!(rendered(&root), ":: cerulion_core");

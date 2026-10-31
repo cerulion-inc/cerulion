@@ -437,10 +437,13 @@ pub fn cerulion_node(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => {
             let error_tokens = e.to_compile_error();
             let salvaged = salvage_struct_for_error_path(&input);
-            return TokenStream::from(quote! {
-                #salvaged
-                #error_tokens
-            });
+            return with_root_diagnostic(
+                quote! {
+                    #salvaged
+                    #error_tokens
+                },
+                input.ident.span(),
+            );
         }
     };
 
@@ -454,10 +457,13 @@ pub fn cerulion_node(attr: TokenStream, item: TokenStream) -> TokenStream {
         let error_tokens = combined.to_compile_error();
         // Emit original struct to prevent cascading "cannot find type" errors
         let salvaged = salvage_struct_for_error_path(&input);
-        return TokenStream::from(quote! {
-            #salvaged
-            #error_tokens
-        });
+        return with_root_diagnostic(
+            quote! {
+                #salvaged
+                #error_tokens
+            },
+            input.ident.span(),
+        );
     }
 
     // Emitted BESIDE the expansion, never instead of it. When the root does
