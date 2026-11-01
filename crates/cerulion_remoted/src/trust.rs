@@ -47,8 +47,8 @@ use cerulion_pairing::format::{
 };
 use cerulion_pairing::pake::CpaceConfirmed;
 use cerulion_pairing::verify::{
-    EpochOutcome, OwnerCertificatePresentationWire, OwnerGrantPresentation, PairingPresentation,
-    TrustStore,
+    AccessRow, EpochOutcome, OwnerCertificatePresentationWire, OwnerGrantPresentation,
+    PairingPresentation, TrustStore,
 };
 use cerulion_pairing::PairingError;
 
@@ -75,6 +75,10 @@ pub enum KeyAccess {
     DeviceRevoked,
     /// The key maps to an account currently on the access list; the granted scope.
     Allowed(Scope),
+    /// The key's row is a cloud row and this robot's allow-from-cloud switch is
+    /// OFF ([`TrustStore::cloud_allowed`]). Refused on every plane and for every
+    /// verb, bootstrap verbs included.
+    CloudRefused,
 }
 
 /// A mutation of the shared trust state failed.
@@ -221,6 +225,29 @@ impl SharedTrust {
     /// [`KeyAccess::NotAllowed`] — the accept gate denies it without an explicit
     /// revoke.
     pub fn snapshot_for_key(&self, device_key: &[u8; 32]) -> (bool, KeyAccess) {
+        let (claimed, access, ()) = self.read_key(device_key, |_| ());
+        (claimed, access)
+    }
+
+    /// [`SharedTrust::snapshot_for_key`] plus, when the key is
+    /// [`KeyAccess::Allowed`], a copy of the access row that allows it (its
+    /// account, device, scope and principal kind), all from the same locked read.
+    pub fn snapshot_row_for_key(
+        &self,
+        device_key: &[u8; 32],
+    ) -> (bool, KeyAccess, Option<AccessRow>) {
+        self.read_key(device_key, |row| row.cloned())
+    }
+
+    /// The one locked read behind both snapshots: `(claimed, access)` and
+    /// `on_row` applied to the allowing access row (`None` unless allowed). A
+    /// cloud row on a robot whose allow-from-cloud switch is OFF reads
+    /// [`KeyAccess::CloudRefused`] with no row ([`TrustStore::cloud_allowed`]).
+    fn read_key<T>(
+        &self,
+        device_key: &[u8; 32],
+        on_row: impl FnOnce(Option<&AccessRow>) -> T,
+    ) -> (bool, KeyAccess, T) {
         // Read the trusted time OUTSIDE the store lock (the wall clock is a syscall).
         let now_ns = self.clock.now_ns();
         let key = PublicKey(*device_key);
@@ -230,18 +257,20 @@ impl SharedTrust {
         // account row (the account's other devices stay allowed). Checked FIRST so a
         // revoked device is cut even while its account is fine, and so the
         // mid-session sweep evicts it the moment a synced epoch flips this bit.
-        let access = if guard.store.is_device_revoked(&key) {
-            KeyAccess::DeviceRevoked
+        let (access, row) = if guard.store.is_device_revoked(&key) {
+            (KeyAccess::DeviceRevoked, None)
         } else {
             match guard.index.account_for(&key) {
-                None => KeyAccess::Unpaired,
-                Some(account) => match guard.store.is_allowed(&account, now_ns) {
-                    None => KeyAccess::NotAllowed,
-                    Some(row) => KeyAccess::Allowed(row.scope),
+                None => (KeyAccess::Unpaired, None),
+                Some(account) => match guard.store.is_allowed(&account, &key, now_ns) {
+                    None => (KeyAccess::NotAllowed, None),
+                    Some(row) if !guard.store.cloud_allowed(row) => (KeyAccess::CloudRefused, None),
+                    Some(row) => (KeyAccess::Allowed(row.scope), Some(row)),
                 },
             }
         };
-        (claimed, access)
+        let mapped = on_row(row);
+        (claimed, access, mapped)
     }
 
     /// The robot's own transport key (its iroh `EndpointId`), recorded at
@@ -297,8 +326,9 @@ impl SharedTrust {
         Ok(account)
     }
 
-    /// Admit a certified device of the current owner without rewriting its access
-    /// row. The verified binding is published only after store and index persist.
+    /// Certificate presentation: admit a certified device of the current owner
+    /// with its own access row, never rewriting the owner row. The verified
+    /// binding is published only after store and index persist.
     pub fn verify_owner_certificate_and_establish(
         &self,
         presentation: &OwnerCertificatePresentationWire,
@@ -313,6 +343,48 @@ impl SharedTrust {
             .verify_owner_certificate(presentation, &peer, now_ns)?;
         self.commit(guard, authenticated_peer_key, account)?;
         Ok(account)
+    }
+
+    /// Set the robot's allow-from-cloud switch for the caller `device_key`, which
+    /// must be bound to the OWNER account through a row whose principal is not
+    /// cloud. The new value is written to disk first and published to the live
+    /// store only after the write succeeds; on a write failure the live switch
+    /// keeps its old value.
+    pub fn set_allow_cloud(&self, device_key: &[u8; 32], allow: bool) -> Result<(), TrustError> {
+        let key = PublicKey(*device_key);
+        let now_ns = self.clock.now_ns();
+        let _writer = self.writer_lock();
+        let guard = self.lock();
+        if guard.store.is_device_revoked(&key) {
+            return Err(TrustError::Pairing(PairingError::NotOwner));
+        }
+        let account = guard
+            .index
+            .account_for(&key)
+            .ok_or(TrustError::Pairing(PairingError::NotOwner))?;
+        let row = guard
+            .store
+            .is_allowed(&account, &key, now_ns)
+            .ok_or(TrustError::Pairing(PairingError::NotOwner))?;
+        if row.principal_kind == cerulion_pairing::format::PrincipalKind::Cloud {
+            return Err(TrustError::Pairing(PairingError::NotOwner));
+        }
+        let mut staged = guard.store.clone();
+        staged.set_allow_cloud(&account, allow)?;
+        drop(guard);
+        if !self.mac_key.is_empty() {
+            staged
+                .save(&self.mac_key)
+                .map_err(|e| TrustError::Persist(format!("trust store (allow-from-cloud): {e}")))?;
+        }
+        // The writer lock is still held, so no other mutation ran in between.
+        self.lock().store.set_allow_cloud(&account, allow)?;
+        Ok(())
+    }
+
+    /// The robot's allow-from-cloud switch.
+    pub fn allow_cloud(&self) -> bool {
+        self.lock().store.allow_cloud()
     }
 
     /// Verify a desk-carried, owner-signed [`OwnerGrantPresentation`] OFFLINE against
@@ -625,7 +697,8 @@ mod tests {
         shared
             .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
             .unwrap();
-        let before = postcard::to_stdvec(shared.lock().store.access_rows()).unwrap();
+        let owner_row = postcard::to_stdvec(shared.lock().store.access_rows()).unwrap();
+        assert_eq!(shared.lock().store.access_rows().len(), 1);
         let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
         assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
         assert_eq!(
@@ -638,10 +711,19 @@ mod tests {
             shared.snapshot_for_key(&key).1,
             KeyAccess::Allowed(Scope::OWNER_FULL)
         );
-        assert_eq!(
-            postcard::to_stdvec(shared.lock().store.access_rows()).unwrap(),
-            before
-        );
+        // The owner row is byte-for-byte unchanged and the device row follows it.
+        let check = |shared: &SharedTrust| {
+            let guard = shared.lock();
+            let rows = guard.store.access_rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(postcard::to_stdvec(&rows[..1]).unwrap(), owner_row);
+            assert_eq!(rows[1].account, OWNER);
+            assert_eq!(rows[1].device, Some(PublicKey(key)));
+            assert_eq!(rows[1].scope, Scope::OWNER_FULL);
+            assert_eq!(rows[1].principal_kind, PrincipalKind::Human);
+            assert_eq!(rows[1].source, PairingSource::CertificatePresentation);
+        };
+        check(&shared);
         let loaded = reload(
             &dir.path().join("trust_store"),
             &dir.path().join("device_index.json"),
@@ -650,10 +732,7 @@ mod tests {
             loaded.snapshot_for_key(&key).1,
             KeyAccess::Allowed(Scope::OWNER_FULL)
         );
-        assert_eq!(
-            postcard::to_stdvec(loaded.lock().store.access_rows()).unwrap(),
-            before
-        );
+        check(&loaded);
         assert_eq!(loaded.lock().store.high_water_ns(), T_NOW + 1);
     }
 
@@ -698,6 +777,40 @@ mod tests {
                 KeyAccess::Allowed(Scope::OWNER_FULL)
             );
         }
+    }
+
+    #[test]
+    fn a_failed_switch_write_leaves_the_live_switch_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        // A directory at the saved file's own path makes the rename onto it
+        // fail, whatever temp name the save picks; the real file is set aside
+        // first and restored before the reload.
+        let blocker = dir.path().join("trust_store");
+        let aside = dir.path().join("set_aside");
+        std::fs::rename(&blocker, &aside).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(matches!(
+            shared.set_allow_cloud(&[7; 32], false),
+            Err(TrustError::Persist(_))
+        ));
+        std::fs::remove_dir(&blocker).unwrap();
+        std::fs::rename(&aside, &blocker).unwrap();
+        assert!(shared.allow_cloud(), "the live switch is unchanged");
+        let reload_switch = || {
+            reload(
+                &dir.path().join("trust_store"),
+                &dir.path().join("device_index.json"),
+            )
+            .allow_cloud()
+        };
+        assert!(reload_switch());
+        shared.set_allow_cloud(&[7; 32], false).unwrap();
+        assert!(!shared.allow_cloud());
+        assert!(!reload_switch(), "a successful write persists");
     }
 
     #[test]
@@ -950,7 +1063,10 @@ mod tests {
         // The row is a real strong-chain row on disk.
         let store = TrustStore::load(dir.path().join("trust_store"), MAC).unwrap();
         assert_eq!(
-            store.is_allowed(&account_a, T_NOW).unwrap().source,
+            store
+                .is_allowed(&account_a, &PublicKey(k), T_NOW)
+                .unwrap()
+                .source,
             PairingSource::StrongChain
         );
     }
