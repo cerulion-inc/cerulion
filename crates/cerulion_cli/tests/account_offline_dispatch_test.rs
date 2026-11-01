@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -132,6 +132,120 @@ impl Drop for HttpSentinel {
     }
 }
 
+const EXECUTABLE_PROBE_ATTEMPTS: usize = 500;
+
+fn retry_text_file_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for _ in 1..EXECUTABLE_PROBE_ATTEMPTS {
+        match run() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    run()
+}
+
+#[test]
+fn executable_probe_retries_busy_errors_until_success() {
+    let mut attempts = 0;
+    let result = retry_text_file_busy(|| {
+        attempts += 1;
+        if attempts < 3 {
+            Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+        } else {
+            Ok(())
+        }
+    });
+    result.unwrap();
+    assert_eq!(attempts, 3);
+}
+
+#[test]
+fn executable_probe_returns_busy_error_at_attempt_limit() {
+    let mut attempts = 0;
+    let error = retry_text_file_busy::<()>(|| {
+        attempts += 1;
+        Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+    })
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+    assert_eq!(attempts, EXECUTABLE_PROBE_ATTEMPTS);
+}
+
+#[test]
+fn executable_probe_returns_other_errors_without_retrying() {
+    for errno in [libc::ENOENT, libc::EACCES, libc::ENOEXEC] {
+        let mut attempts = 0;
+        let error = retry_text_file_busy::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(errno))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(errno));
+        assert_eq!(attempts, 1);
+    }
+}
+
+#[test]
+fn executable_probe_stops_on_other_error_after_busy_error() {
+    let mut attempts = 0;
+    let error = retry_text_file_busy::<()>(|| {
+        attempts += 1;
+        Err(std::io::Error::from_raw_os_error(if attempts == 1 {
+            libc::ETXTBSY
+        } else {
+            libc::EACCES
+        }))
+    })
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(attempts, 2);
+}
+
+#[test]
+fn executable_probe_does_not_retry_a_nonzero_exit() {
+    let mut attempts = 0;
+    let status: ExitStatus = retry_text_file_busy(|| {
+        attempts += 1;
+        Command::new("/bin/sh").args(["-c", "exit 78"]).status()
+    })
+    .unwrap();
+    assert_eq!(status.code(), Some(78));
+    assert_eq!(attempts, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn executable_probe_recovers_after_a_real_writer_closes() {
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("probe");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut writer = Some(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap(),
+    );
+    let mut attempts = 0;
+    let status = retry_text_file_busy(|| {
+        attempts += 1;
+        let result = Command::new(&script).status();
+        if writer.is_some() {
+            assert_eq!(
+                result.as_ref().unwrap_err().raw_os_error(),
+                Some(libc::ETXTBSY)
+            );
+            drop(writer.take());
+        }
+        result
+    })
+    .unwrap();
+    assert!(status.success());
+    assert!(attempts >= 2);
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     home: PathBuf,
@@ -199,11 +313,23 @@ impl Fixture {
         let spawn_sentinel = root.path().join("spawn-sentinel");
         std::fs::write(
             &spawn_sentinel,
-            "#!/bin/sh\n: > \"$CERULION_TEST_SPAWN_MARKER\"\nexit 78\n",
+            "#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n: > \"$CERULION_TEST_SPAWN_MARKER\"\nexit 78\n",
         )
         .unwrap();
         std::fs::set_permissions(&spawn_sentinel, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A concurrent fork can retain the script's writer until exec. Probe
+        // without side effects until that inherited descriptor is closed.
+        let probe = retry_text_file_busy(|| {
+            Command::new(&spawn_sentinel)
+                .env("CERULION_TEST_PROBE", "1")
+                .env("CERULION_TEST_SPAWN_MARKER", &spawn_marker)
+                .status()
+        })
+        .unwrap();
+        assert!(probe.success(), "spawn sentinel probe: {probe}");
+        assert!(!spawn_marker.exists(), "probe created the spawn marker");
         let status = Command::new(&spawn_sentinel)
+            .env_remove("CERULION_TEST_PROBE")
             .env("CERULION_TEST_SPAWN_MARKER", &spawn_marker)
             .status()
             .unwrap();
