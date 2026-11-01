@@ -40,11 +40,15 @@ fn client_and_peer() -> (NetdClient, UnixStream) {
 fn receive_install(peer: &UnixStream) -> String {
     let mut line = String::new();
     BufReader::new(peer).read_line(&mut line).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_install(&line);
+    line
+}
+
+fn assert_install(line: &str) {
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
     assert_eq!(value["method"], "account_access");
     assert_eq!(value["id"], 1);
     assert_eq!(value["action"]["operation"], "install");
-    line
 }
 
 /// Reads `peer` to the end and asserts the other end closed without sending more.
@@ -267,23 +271,38 @@ fn oversized_response_poisons_before_parsing_unbounded_input() {
 
 #[test]
 fn delayed_response_cannot_be_reused_for_a_later_request() {
+    for budget_ms in [100, 400, 1_600, 6_400] {
+        if delayed_response_attempt(Duration::from_millis(budget_ms)) {
+            return;
+        }
+    }
+    panic!("the client never wrote a complete request before its deadline");
+}
+
+/// Runs one exchange and reports whether the complete request reached the peer.
+fn delayed_response_attempt(budget: Duration) -> bool {
     let (mut client, mut peer) = client_and_peer();
     let (release, wait) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
-        receive_install(&peer);
+        let mut line = String::new();
+        if BufReader::new(&peer).read_line(&mut line).is_err() || !line.ends_with('\n') {
+            return false;
+        }
+        assert_install(&line);
         wait.recv_timeout(Duration::from_secs(5)).unwrap();
         let _ = peer.write_all(INSTALLED);
         assert_peer_closed(peer);
+        true
     });
     let error = client
-        .account_access_until(install(), Instant::now() + Duration::from_millis(100))
+        .account_access_until(install(), Instant::now() + budget)
         .unwrap_err();
     assert!(
         matches!(error, ClientError::Io(ref error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
     );
     assert_poisoned(&mut client);
-    release.send(()).unwrap();
-    writer.join().unwrap();
+    let _ = release.send(());
+    writer.join().unwrap()
 }
 
 #[test]
