@@ -67,10 +67,13 @@
 //! The node macros expand to absolute paths into the runtime, and they read
 //! the consuming package's `Cargo.toml` to decide how to spell the first
 //! segment: a package that names `cerulion` gets `::cerulion::core`, one that
-//! names `cerulion_core` gets `::cerulion_core`. Either manifest works, and a
-//! package that names both gets the second. What does not work is naming
-//! neither and relying on somebody else's re-export: Cargo does not hand a
-//! package its transitive dependencies, so the name has to be in the
+//! names `cerulion_core` gets `::cerulion_core`. Either manifest works. A
+//! package that names both gets `::cerulion::core` when `cerulion` is a plain
+//! `[dependencies]` entry without `optional = true` and `cerulion_core` is
+//! not, because then only the umbrella is linked into every target; any
+//! other package that names both gets `::cerulion_core`. What does not work
+//! is naming neither and relying on somebody else's re-export: Cargo does not
+//! hand a package its transitive dependencies, so the name has to be in the
 //! manifest. The macros say so by name if it is missing.
 //!
 //! The example above does not exercise that, and cannot. A doctest runs with

@@ -16,6 +16,7 @@ is a contract: changes need explicit maintainer approval.
 | `src/impl_macro.rs` | The tick-body AST rewriter, `#[on_event]` handler discovery, and the determinism deny walk. |
 | `src/registry.rs` | The cross-macro port handoff (struct macro → impl macro). Its module doc is the authority on the mechanism, the source-order rule, and the collision limit. |
 | `src/determinism.rs` | The banned-non-deterministic-symbol table the deny walk matches against, the single source of truth for the determinism lint policy. |
+| `src/crate_root.rs` | The crate root every generated runtime path starts with, resolved once per compilation from the consuming package's `Cargo.toml`, and the missing-dependency diagnostic. Its module doc is the authority on the rule. |
 
 The macro crate is deliberately **schema-blind**. Fixed-vs-variable field resolution
 lives in `cerulion_core`'s schema codegen (`crates/cerulion_core/src/codegen/generator/`),
@@ -29,6 +30,36 @@ A `proc-macro = true` crate may export only its macros: every internal module st
 `mod` (never `pub mod`, a hard compile error), and nothing here is importable by other
 crates. Anything both the macro and another crate must consume (e.g. the determinism
 table) has to be relocated to a shared non-proc-macro crate, not re-exported.
+
+## The crate root (`src/crate_root.rs`)
+
+Every runtime path the macros emit is absolute, and Rust resolves its first
+segment only against a crate the consuming package names itself. So the first
+segment is resolved per package: `::cerulion_core` when the package names the
+runtime, `::cerulion::core` when it names only the umbrella crate, or names
+both with only the umbrella an unconditional dependency (a plain
+`[dependencies]` entry without `optional = true`). The module doc carries the
+full table, the optional-entry rule and what the resolver cannot see.
+
+Rules for an emitter:
+
+- Bind `let __cer_root = crate_root::root();` in the function and write
+  `#__cer_root::graph::...`. A literal `::cerulion_core::...` compiles and
+  passes every test in this repository that names the runtime, and breaks
+  every package that names only the umbrella.
+- Inside `quote_spanned!`, take `crate_root::root_at(span)` at the same span.
+  `quote_spanned!` re-spans only its own tokens; an interpolated `root()`
+  keeps the call-site span, and rustc then reports an unsatisfied
+  `where`-clause predicate at the derive or node attribute instead of at the
+  field. The five state predicates in `state_derive.rs` do this.
+- Every exported macro returns its expansion through `with_root_diagnostic`
+  (or matches on `crate_root::unresolved_diagnostic` at statement level), so a
+  package that names neither crate gets a named error. A source-walk unit test
+  in `crate_root.rs` enforces it.
+
+The macro crate's own unit tests name neither crate, so they always render the
+`::cerulion_core` fallback. The umbrella spelling is compiled only by
+`crates/cerulion/tests/one_dependency_build_test.rs` (see the test map).
 
 ## Attribute grammar contracts
 
@@ -243,13 +274,14 @@ Two regen cautions:
 ## Test map
 
 The macro crate's own suite is token-level only; generated-code behavior is proven in
-`cerulion_core`. Fixture cdylibs must be prebuilt (`cargo build -p <fixture>`); each
-test file's header names its exact prereqs.
+`cerulion_core`, and under the umbrella root in `cerulion`. Fixture cdylibs must be
+prebuilt (`cargo build -p <fixture>`); each test file's header names its exact prereqs.
 
 | Test | Pins | Serial? | Prereq fixtures |
 |---|---|---|---|
 | `cerulion_macros` in-src `#[cfg(test)]` (parse.rs, impl_macro.rs, determinism.rs) | Attribute parsing, emitted rewrite shapes (incl. the hoist-and-`?` nested-chain form), banned-symbol table | no | none |
 | `crates/cerulion_core/tests/macro_test.rs` | Macro lifecycle, `info()`, state | no | none |
+| `crates/cerulion/tests/one_dependency_build_test.rs` | The `::cerulion::core` root: scratch node crates whose only dependency is `cerulion`, built with the `cdylib` feature the scaffold turns on (data-trigger, sync and external nodes; params, accumulate, every state escape); a package naming neither crate gets the named error from all three macros; a field failing a state bound is reported at the field under both roots | no | none (drives `cargo check` on scratch projects; `CERULION_SCRATCH_TARGET_DIR` moves their target dir) |
 | `macro_compile_fail_test.rs` | Diagnostics via trybuild (blocking + ignored groups above) | no | none |
 | `fill_from_rewriter_test.rs` | Rewriter no-false-positives (`fill_from` forms; `=` rewrite preserved) | no | none |
 | `rewriter_var_field_assign_test.rs` | The schema-blind `=` write-shim rewrite, in-process | no | none |

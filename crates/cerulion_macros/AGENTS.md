@@ -1,12 +1,12 @@
 # cerulion_macros - agent notes
 
 Proc-macro crate: `#[cerulion_node]` (struct side: parse, validate, codegen, cdylib FFI)
-and `#[cerulion_node_impl]` (tick-body rewriter). A green `cargo test -p cerulion_macros`
-runs only the in-src unit modules - it does NOT validate generated-code behavior. The
-integration oracle for every codegen/rewriter change is `cargo test -p cerulion_core`.
+and `#[cerulion_node_impl]` (tick-body rewriter). Its tests are token-level, so a
+codegen/rewriter change runs `cargo test -p cerulion_core` AND `cargo test -p cerulion`.
 
 ## Invariants
-
+- Generated runtime paths start at `#__cer_root` (`crate_root::root()`), never at
+  `::cerulion_core`; under `quote_spanned!`, at `crate_root::root_at(span)`.
 - Trigger policy is macro-only; graph YAML carries no policy block. Never add a YAML
   policy path.
 - `sync_window_ms` / `unbounded_sync` fire ONCE PER COMPLETE ALIGNED SET, in set order, each
@@ -31,30 +31,29 @@ integration oracle for every codegen/rewriter change is `cargo test -p cerulion_
   that, or one real diagnostic cascades into pages of "cannot find type" noise.
 
 ## Testing
-
-- `cargo test -p cerulion_macros` - token-level unit modules (parse/rewriter/determinism).
-- Behavior lives in `crates/cerulion_core/tests/`: `macro_test`, `fill_from_rewriter_test`,
+- `cargo test -p cerulion_macros` - in-src unit modules.
+- `cargo test -p cerulion` - the only check of the `::cerulion::core` root.
+- Behavior: `crates/cerulion_core/tests/`: `macro_test`, `fill_from_rewriter_test`,
   `rewriter_var_field_assign_test` (parallel-safe); `macro_cdylib_test`,
   `macro_graph_test`, `abi_version_mismatch_test`, `lazy_loan_iox2_test` need
   `-- --test-threads=1` (they touch the process-global transport singleton).
 - Diagnostics: `cargo test -p cerulion_core --test macro_compile_fail_test` (trybuild).
-  Re-bless after an intentional message change:
+  Re-bless after a deliberate message change:
   `TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test`.
   The rustc-rendered groups (`tests/ui/const_eval/`, `tests/ui/type_error/`) are
   `#[ignore]`d (toolchain-fragile); run them via `-- --ignored`.
 
 ## Gotchas
-
 - `Ident::to_string()` keeps the `r#` prefix: strip it before `format_ident!` (it panics) and
   for external names (`#[param] r#type` is the param `type`). ROS 2 has keyword fields.
 - Two-phase borrows do not apply to closure captures: wrapping a user RHS in a closure
   over the written port breaks same-port read-backs (E0502). Hoist the RHS to a temp
   first - Rust evaluates `rhs` before `place`, so the hoist is semantics-preserving.
-- The struct↔impl port handoff (`Mutex<HashMap>`), the source-order requirement (struct
-  expands before its impl), and the one-node-type-per-struct-name-per-crate collision
-  limit are documented in `src/registry.rs`'s module doc; read it there before touching either macro.
+- The struct↔impl port handoff (`Mutex<HashMap>`), the source-order rule (struct expands
+  before its impl) and the one-node-type-per-struct-name-per-crate collision limit: read
+  `src/registry.rs`'s module doc before touching either macro.
 - Parse integer attrs with `syn::LitInt::base10_parse` - `Literal::to_string()`
   preserves `100_000`/`0xff`/type suffixes, which `str::parse::<u64>()` rejects, and a
   swallowed parse error silently drops the user's policy.
 
-Deep reference: docs/internals/macros.md (attribute grammar, rewriter, FFI symbols, trybuild).
+Deep reference: docs/internals/macros.md (grammar, rewriter, root, FFI, trybuild).

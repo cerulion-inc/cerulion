@@ -2,8 +2,9 @@
 #
 # `cerulion` is the umbrella crate: it brings the runtime, the node macros and
 # the generated ROS 2 message types in together at one version. A project
-# that uses the node macros also names `cerulion_core` directly, because the
-# macros expand to paths rooted at `::cerulion_core`.
+# whose only dependency is this crate builds a node: the macros read the
+# consuming package's manifest, and when it names this crate rather than
+# `cerulion_core` they root every generated path at `::cerulion::core`.
 #
 # It holds no logic of its own. Every item it exposes is a re-export, which is
 # what lets it pin its three dependencies exactly: the four crates are
@@ -17,7 +18,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Zero-copy robotics middleware: re-exports the Cerulion runtime, node macros and ROS 2 message types at one version (node macros also need cerulion_core as a direct dependency)"
+description = "Zero-copy robotics middleware: re-exports the Cerulion runtime, node macros and ROS 2 message types at one version, so one dependency builds a node"
 readme = "README.md"
 keywords = ["robotics", "zero-copy", "ros2", "real-time", "cerulion"]
 categories = ["science::robotics", "concurrency", "network-programming"]
