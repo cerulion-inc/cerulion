@@ -3876,46 +3876,39 @@ mod block_colocation_tests {
         );
     }
 
-    /// For a run in executor units, a chain whose head already shares a group
-    /// with an isolated node is not merged into that group. Here `b` is the
-    /// bridge a `block` group `{a, c}` absorbs ([`bridged_block_graph`]), `c`
-    /// is isolated, and `b -> d` is a linear chain: `d` keeps its own group,
-    /// and the `block` group stays `{a, b, c}`.
+    /// For a run in executor units, a chain is cut at a member whose group
+    /// already holds an isolated node, although the member itself is
+    /// measured. `p` publishes `cmd`, which the isolated `k` consumes as
+    /// `block`, so the `block` seed puts `p` and `k` in one group before the
+    /// chain seeding runs, and `h -> p -> k` is the fixture's one linear
+    /// chain. The chain is cut at `p` and at `k`: `h` keeps its own group and
+    /// the `block` group stays `{p, k}`. A seeding that cut only at the
+    /// isolated node itself would merge `h` into the `block` group.
     #[test]
     fn a_linear_chain_in_a_unit_run_never_joins_a_group_holding_an_isolated_node() {
         let config = config_of(vec![
-            node("a", vec![], vec![out("cmd"), out("feed")]),
-            node("b", vec![inp("t", "a/feed")], vec![out("cmd"), out("next")]),
-            node("c", vec![inp("t", "b/cmd"), inp("gate", "a/cmd")], vec![]),
-            node("d", vec![inp("t", "b/next")], vec![]),
+            node("h", vec![], vec![out("o")]),
+            node("p", vec![inp("t", "h/o")], vec![out("cmd")]),
+            node("k", vec![inp("gate", "p/cmd")], vec![]),
         ]);
         let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
-        infos.insert("a".to_string(), NodeInfo::with_meta(vec![], vec![]));
-        for id in ["b", "d"] {
-            infos.insert(
-                id.to_string(),
-                NodeInfo::with_meta(
-                    vec![meta("t", true, BackpressurePolicy::DropOldest)],
-                    vec![],
-                ),
-            );
-        }
+        infos.insert("h".to_string(), NodeInfo::with_meta(vec![], vec![]));
         infos.insert(
-            "c".to_string(),
+            "p".to_string(),
             NodeInfo::with_meta(
-                vec![
-                    meta("t", true, BackpressurePolicy::DropOldest),
-                    meta("gate", false, BackpressurePolicy::Block),
-                ],
+                vec![meta("t", true, BackpressurePolicy::DropOldest)],
                 vec![],
             ),
         );
+        infos.insert(
+            "k".to_string(),
+            NodeInfo::with_meta(vec![meta("gate", true, BackpressurePolicy::Block)], vec![]),
+        );
         let mut edges = TriggerEdges::new();
-        edges.insert("b", "/p/a/feed");
-        edges.insert("c", "/p/b/cmd");
-        edges.insert("d", "/p/b/next");
+        edges.insert("p", "/p/h/o");
+        edges.insert("k", "/p/p/cmd");
         let costs = PartitionCosts {
-            node_p50_ns: ["a", "b", "d"]
+            node_p50_ns: ["h", "p"]
                 .into_iter()
                 .map(|id| (id.to_string(), 1_000u64))
                 .collect(),
@@ -3927,8 +3920,12 @@ mod block_colocation_tests {
             &GraphTopology::build(&config, &infos).unwrap(),
             &edges,
         );
-        assert_eq!(chains, owned(&[&["b", "d"]]), "the fixture's one chain");
-        let isolated: BTreeSet<String> = ["c".to_string()].into_iter().collect();
+        assert_eq!(
+            chains,
+            owned(&[&["h", "p", "k"]]),
+            "the fixture's one chain"
+        );
+        let isolated: BTreeSet<String> = ["k".to_string()].into_iter().collect();
         let out = auto_partition_with_options(
             &config,
             &infos,
@@ -3943,8 +3940,8 @@ mod block_colocation_tests {
         .expect("derive");
         assert_eq!(
             member_sets(&out),
-            owned(&[&["a", "b", "c"], &["d"]]),
-            "the chain must not join the group that holds the isolated `c`: {:?}",
+            owned(&[&["h"], &["k", "p"]]),
+            "the chain must not join the group that holds the isolated `k`: {:?}",
             out.groups
         );
     }
