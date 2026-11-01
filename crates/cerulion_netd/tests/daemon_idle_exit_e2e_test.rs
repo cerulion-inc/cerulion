@@ -19,23 +19,34 @@
 //!    zenoh/mirror teardown, which unlinks the socket FIRST then hangs) is
 //!    HARD-exited within the bounded deadline, so a real wedge can never leave a
 //!    zombie.
+//! 3. `real_daemon_boot_is_observed_after_its_socket_is_gone` proves that a boot
+//!    signal remains observable on stderr after the short idle grace removes the
+//!    socket.
 //!
 //! SCOPE — the real production wedge is a BLOCKED zenoh session close /
 //! network-thread join, reproducible only against a LIVE robot (the SpyPlane and a
 //! `CERULION_NETD_NETWORK=off` binary have no zenoh threads to wedge). Test 2 uses
 //! the stall seam to exercise the watchdog path deterministically; the exact
-//! zenoh-thread-hang trigger is a residual that needs a live robot. Both tests are hermetic
+//! zenoh-thread-hang trigger is a residual that needs a live robot. All three tests are hermetic
 //! (`CERULION_NETD_NETWORK=off` — no zenoh) and pass the daemon's env DIRECTLY to
 //! the child (no parent-env mutation); a file-local mutex serializes them because
 //! the spawned daemons share the default iceoryx2 namespace.
+//! Boot is observed from the daemon's lifecycle line on stderr, because the socket
+//! exists only for the short idle grace.
 
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Serialize the two real-binary spawns — they share the default iceoryx2
+/// The daemon logs this line once its control socket is bound (see `daemon.rs`
+/// start). It outlives the socket, which idle self-exit unlinks after the grace.
+const BOOT_LINE: &str = "cerulion-netd listening (NDJSON control protocol)";
+
+/// Serialize the real-binary spawns — they share the default iceoryx2
 /// namespace, so running them sequentially avoids any cross-daemon SHM contention.
 fn iox_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -58,12 +69,57 @@ fn unique_socket(tag: &str) -> (PathBuf, PathBuf) {
 struct ChildGuard {
     child: Child,
     dir: PathBuf,
+    booted: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+}
+impl ChildGuard {
+    fn booted_within(&self, timeout: Duration) -> bool {
+        wait_until(|| self.booted.load(Ordering::Acquire), timeout)
+    }
 }
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn spawn_daemon(sock: &Path, dir: PathBuf, extra_env: &[(&str, &str)]) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cerulion-netd"));
+    command
+        .env("CERULION_NETD_SOCK", sock)
+        .env("CERULION_NETD_NETWORK", "off")
+        .env("CERULION_NETD_IDLE_GRACE_MS", "300");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cerulion-netd");
+    let stderr = child.stderr.take().expect("piped daemon stderr");
+    let booted = Arc::new(AtomicBool::new(false));
+    let reader_booted = Arc::clone(&booted);
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("{line}");
+            if line.contains(BOOT_LINE) {
+                reader_booted.store(true, Ordering::Release);
+            }
+        }
+    });
+    ChildGuard {
+        child,
+        dir,
+        booted,
+        reader: Some(reader),
     }
 }
 
@@ -85,20 +141,11 @@ fn real_daemon_idle_self_exit_terminates_and_removes_socket() {
 
     // Spawn the REAL binary: local-only (no zenoh), a short idle grace so it
     // self-exits quickly. Env passed DIRECTLY to the child (no parent-env mutation).
-    let child = Command::new(env!("CARGO_BIN_EXE_cerulion-netd"))
-        .env("CERULION_NETD_SOCK", &sock)
-        .env("CERULION_NETD_NETWORK", "off")
-        .env("CERULION_NETD_IDLE_GRACE_MS", "300")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn cerulion-netd");
-    let mut guard = ChildGuard { child, dir };
+    let mut guard = spawn_daemon(&sock, dir, &[]);
 
     // It boots + binds the socket.
     assert!(
-        wait_until(|| sock.exists(), Duration::from_secs(8)),
+        guard.booted_within(Duration::from_secs(8)),
         "the real daemon booted + bound its control socket"
     );
 
@@ -136,21 +183,17 @@ fn real_daemon_hard_exits_a_wedged_teardown() {
     // the process would hang forever; WITH it, the daemon hard-exits within the
     // deadline. `HARD_EXIT_MS` is well under the assert bound below, so a
     // non-firing watchdog fails this test.
-    let child = Command::new(env!("CARGO_BIN_EXE_cerulion-netd"))
-        .env("CERULION_NETD_SOCK", &sock)
-        .env("CERULION_NETD_NETWORK", "off")
-        .env("CERULION_NETD_IDLE_GRACE_MS", "300")
-        .env("CERULION_NETD_HARD_EXIT_MS", "600")
-        .env("CERULION_NETD_STALL_SHUTDOWN_FOR_TEST", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn cerulion-netd");
-    let mut guard = ChildGuard { child, dir };
+    let mut guard = spawn_daemon(
+        &sock,
+        dir,
+        &[
+            ("CERULION_NETD_HARD_EXIT_MS", "600"),
+            ("CERULION_NETD_STALL_SHUTDOWN_FOR_TEST", "1"),
+        ],
+    );
 
     assert!(
-        wait_until(|| sock.exists(), Duration::from_secs(8)),
+        guard.booted_within(Duration::from_secs(8)),
         "the real daemon booted + bound its control socket"
     );
 
