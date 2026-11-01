@@ -4185,9 +4185,10 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_telemetry (selected: $SELECTED)"
-      # The umbrella crate's test is not a unit test: it writes a bin crate
-      # into a temporary directory OUTSIDE this workspace, whose only
-      # dependency is the umbrella, and asks cargo to check it. That is the
+      # The umbrella crate's test is not a unit test: it writes scratch cargo
+      # projects OUTSIDE this workspace (node crates whose only dependency is
+      # the umbrella, a package naming neither crate, two packages whose type
+      # errors sit on fields) and asks cargo to check them. That is the
       # only way to exercise the claim `cargo add cerulion` makes, because
       # every package inside this workspace also names the runtime crate
       # directly. It runs here rather than in a test shard because it drives

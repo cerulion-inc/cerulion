@@ -81,7 +81,7 @@
 //! `cerulion_core` directly because it has to in order to re-export it, so it
 //! resolves through the runtime like everything else in this workspace. The
 //! umbrella spelling is exercised by `tests/one_dependency_build_test.rs`,
-//! which builds a package outside the workspace that names only this crate.
+//! which checks node crates outside the workspace that name only this crate.
 //!
 //! # Depending on the crates directly
 //!

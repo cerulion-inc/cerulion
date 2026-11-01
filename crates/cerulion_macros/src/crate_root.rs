@@ -31,8 +31,9 @@
 //! package that names it and also names the runtime gets `::cerulion_core`.
 //!
 //! `::cerulion_core` is what every package got before this resolver existed,
-//! and a package whose root is the runtime crate still gets the tokens it got
-//! then, with the spans it got then (see "Spans" below).
+//! and a package whose paths still start `::cerulion_core` gets the tokens it
+//! got then, with the spans it got then (see "Spans" below). A renamed runtime
+//! dependency is the exception: it now gets its own name.
 //!
 //! The umbrella re-exports the runtime whole (`pub use cerulion_core as
 //! core;`), so the two roots address the same items under the same names.
@@ -283,7 +284,7 @@ fn resolve() -> Root {
 fn resolve_uncached() -> Root {
     let runtime = look_up(RUNTIME);
     // Asked unless the manifest was unreadable: when both are named, which
-    // table each sits in decides the root.
+    // table each sits in, and whether it is optional, decides the root.
     let umbrella = if matches!(runtime, Lookup::Undecidable) {
         Lookup::Absent
     } else {
@@ -708,7 +709,7 @@ cerulion_core = "1.0.0"
     /// Every macro this crate exports must route its expansion past the
     /// missing-dependency diagnostic.
     ///
-    /// The fallback in `Root::path` is what makes a macro that skips it
+    /// The fallback in `Root::path_at` is what makes a macro that skips it
     /// silent rather than broken: it would emit the pre-resolver spelling and
     /// the user would get a resolution error against a path they never wrote,
     /// which is the whole condition this module exists to name. A source walk

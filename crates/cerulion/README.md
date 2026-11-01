@@ -49,7 +49,10 @@ impl SensorNode {
 The node macros expand to absolute paths into the runtime, and they read your
 `Cargo.toml` to decide how to spell the first segment: a package that names
 `cerulion` gets `::cerulion::core`, one that names `cerulion_core` gets
-`::cerulion_core`. Either manifest works. What does not work is naming neither
+`::cerulion_core`. Either manifest works. A package that names both gets
+`::cerulion::core` when `cerulion` is a plain `[dependencies]` entry without
+`optional = true` and `cerulion_core` is not, and `::cerulion_core` otherwise.
+What does not work is naming neither
 and relying on a re-export somewhere else, because Cargo does not hand a
 package its transitive dependencies; the macros report that by name.
 

@@ -98,7 +98,7 @@
 //! parameter. Naming the obligation only at its USES (three consts, the probe,
 //! capture, read, restore) is the natural way to write this and it is worse.
 //!
-//! The crate root inside each such predicate comes from
+//! The crate root inside each per-field predicate comes from
 //! `crate_root::root_at(<the type's span>)`, not from `crate_root::root()`.
 //! `quote_spanned!` re-spans only its own tokens, so an interpolated
 //! call-site root would start the trait path with call-site tokens, and rustc

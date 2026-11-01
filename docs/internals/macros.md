@@ -57,8 +57,10 @@ Rules for an emitter:
   package that names neither crate gets a named error. A source-walk unit test
   in `crate_root.rs` enforces it.
 
-The macro crate's own unit tests name neither crate, so they always render the
-`::cerulion_core` fallback. The umbrella spelling is compiled only by
+The macro crate's own manifest names neither crate, so its unit tests that
+render generated code read the `::cerulion_core` fallback; only the
+`crate_root.rs` tests render the umbrella spelling, from a `Root` they build.
+The umbrella spelling is compiled only by
 `crates/cerulion/tests/one_dependency_build_test.rs` (see the test map).
 
 ## Attribute grammar contracts

@@ -136,8 +136,8 @@ pub fn derive_cerulion_state(item: TokenStream) -> TokenStream {
 /// of it when the crate root did not resolve.
 ///
 /// The expansion is returned untouched in the ordinary case, so a package
-/// whose root is the runtime crate gets the tokens, spans included, that it
-/// got before the root was resolvable at all.
+/// whose generated paths start `::cerulion_core` gets the tokens, spans
+/// included, that it got before the root was resolvable at all.
 ///
 /// The diagnostic goes BESIDE the expansion rather than instead of it.
 /// Generated paths fall back to the pre-resolver spelling, so the compiler

@@ -287,15 +287,16 @@ fn main() {
 }
 "#;
 
-/// The span cases' source after its `use` lines: one Cerulion type error per
-/// marked line, each on a field, and nothing else wrong in the source.
+/// The span cases' source after its `use` lines: one marked line per field
+/// whose type fails a Cerulion state bound, and nothing else wrong in the
+/// source. The serde line fails two bounds, and both are reported there.
 ///
 /// A trailing `// E0277 at <text>` names the token the error must point at,
 /// the first `<text>` on that line. Between them the marks cover every
-/// `where`-clause predicate the derive emits on a field (a captured field,
-/// both serde bounds, an unordered container's element type, an enum
-/// variant's field) and the captured-field predicate reached through
-/// `#[cerulion_node]`.
+/// `where`-clause predicate the derive emits on a field that names the crate
+/// root (a captured field, both serde bounds, an unordered container's
+/// element type, an enum variant's field) and the captured-field predicate
+/// reached through `#[cerulion_node]`.
 const FIELD_ERRORS_BODY: &str = r#"
 pub struct CudaContext;
 
@@ -591,13 +592,28 @@ fn a_package_whose_only_dependency_is_the_umbrella_compiles_a_node() {
 fn the_scratch_node_crates_use_the_tables_the_scaffold_writes() {
     let templates = sibling_crate("cerulion_cli_engine").join("src/templates.rs");
     let text = std::fs::read_to_string(&templates).expect("read the node scaffold templates");
-    assert!(
-        text.contains(NODE_CRATE_TABLES),
-        "the node crate manifest `cerulion node create` writes no longer \
-         carries the tables the one-dependency scratch crates are built with, \
-         so those crates stopped building the way a scaffolded node builds. \
-         Update NODE_CRATE_TABLES to match generate_cargo_toml in {}:\n\
-         {NODE_CRATE_TABLES}",
+    // The body of `generate_cargo_toml`, up to the next public function.
+    let start = text
+        .find("pub fn generate_cargo_toml(")
+        .expect("the scaffold still defines generate_cargo_toml");
+    let body = &text[start..];
+    let body = &body[..body[1..].find("\npub fn ").map_or(body.len(), |at| at + 1)];
+    // Everything the template writes from its `[lib]` table up to its
+    // `[dependencies]` table, compared whole: a key or a table added there
+    // fails this as surely as a changed one.
+    let tables = body.find("[lib]").and_then(|from| {
+        body[from..]
+            .find("[dependencies]")
+            .map(|to| &body[from..from + to])
+    });
+    assert_eq!(
+        tables.map(str::trim_end),
+        Some(NODE_CRATE_TABLES.trim_end()),
+        "the tables between `[lib]` and `[dependencies]` in the manifest \
+         `cerulion node create` writes are no longer the ones the \
+         one-dependency scratch crates are built with, so those crates stopped \
+         building the way a scaffolded node builds. Update NODE_CRATE_TABLES \
+         to match generate_cargo_toml in {}",
         templates.display()
     );
 }
