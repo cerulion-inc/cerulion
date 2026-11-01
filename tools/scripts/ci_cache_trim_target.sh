@@ -30,7 +30,16 @@
 # the same way. Under `target/tmp/` a top-level entry with no live unit at all
 # is removed whole, which is also what clears scratch files tests leave there.
 #
+# THE AGED RECORD. `age` ends by writing `<target>/.ci-cache-trim-aged`, which
+# holds this run's identity (`GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT` and
+# `GITHUB_JOB`, or `local` outside Actions). `trim` removes that file every time
+# it runs, so the archive never carries it, and trims only when the identity in
+# it is this run's. A tree that was never aged has fresh access times on every
+# fingerprint, which would otherwise read as all live.
+#
 # WHEN IT DELETES NOTHING. `trim` exits 0 without deleting when
+#   * the aged record is missing or names another run (`age` did not run in
+#     this run);
 #   * the access-time probe fails: a file aged and then read on this filesystem
 #     does not show a new access time (a `noatime` mount);
 #   * the top profile directory `<target>/debug` holds no live unit (`age` did
@@ -47,8 +56,18 @@ set -u
 
 AGED_STAMP=200001010000      # what `age` writes as the access time
 LIVE_AFTER_STAMP=200101010000 # an access time later than this is a read during the run
+AGED_RECORD=.ci-cache-trim-aged # under the target: `age` completed in this run
 
 say() { printf 'ci_cache_trim: %s\n' "$*"; }
+
+# The identity `age` records and `trim` requires: one job attempt of one run.
+run_identity() {
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then
+    printf 'run %s attempt %s job %s\n' "$GITHUB_RUN_ID" "${GITHUB_RUN_ATTEMPT:-}" "${GITHUB_JOB:-}"
+  else
+    printf 'local\n'
+  fi
+}
 
 size_of() {
   if [ -e "$1" ]; then
@@ -76,6 +95,11 @@ cmd_age() {
   done <<EOF
 $(fingerprint_dirs "$target")
 EOF
+  if ! run_identity > "$target/$AGED_RECORD"; then
+    rm -f "$target/$AGED_RECORD"
+    say "age: could not write $target/$AGED_RECORD; trim will delete nothing"
+    return 0
+  fi
   say "age: aged the fingerprint files of $n profile director(y/ies) under $target"
 }
 
@@ -163,6 +187,15 @@ cmd_trim() {
     return 0
   fi
   say "trim: before: target $(size_of "$target"), cargo registry $(size_of "${CARGO_HOME:-$HOME/.cargo}/registry")"
+  local recorded=""
+  if [ -f "$target/$AGED_RECORD" ]; then
+    recorded=$(cat "$target/$AGED_RECORD" 2>/dev/null)
+  fi
+  rm -f "$target/$AGED_RECORD"
+  if [ "$recorded" != "$(run_identity)" ]; then
+    say "trim: SKIPPED: age did not run on $target in this run; deleting nothing"
+    return 0
+  fi
   if ! atime_probe "$target"; then
     say "trim: SKIPPED: an aged file read on this filesystem kept its old access time (noatime?); deleting nothing"
     return 0
@@ -271,6 +304,7 @@ self_test() {
   [ -e "$t/tmp/cli-scaffold-target/debug/deps/libnode-2222222222222222.rlib" ] || fail "case 1: live scaffold unit removed"
   [ ! -e "$t/tmp/gone-scaffold-target" ] || fail "case 1: unread scaffold target kept"
   [ ! -e "$t/tmp/scratch.txt" ] || fail "case 1: tmp scratch file kept"
+  [ ! -e "$t/$AGED_RECORD" ] || fail "case 1: aged record left in the target"
 
   # Case 2: nothing read since `age` (the guard): nothing is deleted.
   rm -rf "$t"; mkunit "$t/debug" foo 0123456789abcdef
@@ -288,17 +322,51 @@ self_test() {
   cmd_trim "$t" > /dev/null
   [ -e "$t/debug/deps/libold-4444444444444444.rlib" ] || fail "case 3: naming guard deleted"
 
+  # An unaged tree: fresh access times everywhere, plus every kind of entry a
+  # trim removes besides stale units.
+  mkunaged() {
+    rm -rf "$t"; mkunit "$t/debug" foo 0123456789abcdef; mkunit "$t/debug" old 4444444444444444
+    printf 'x' > "$t/debug/deps/orphan-1111111111111111"
+    mkdir -p "$t/debug/incremental/foo-abc"
+    mkunit "$t/tmp/gone-scaffold-target/debug" node 3333333333333333
+    printf 'x' > "$t/tmp/scratch.txt"
+    cat "$t/debug/.fingerprint/old-4444444444444444/lib-old" > /dev/null
+  }
+  unaged_kept() { # <case label>
+    [ -e "$t/debug/deps/libold-4444444444444444.rlib" ] || fail "$1: unaged tree trimmed"
+    [ -e "$t/debug/deps/orphan-1111111111111111" ] || fail "$1: orphan artifact removed"
+    [ -d "$t/debug/incremental/foo-abc" ] || fail "$1: incremental removed"
+    [ -e "$t/tmp/gone-scaffold-target/debug/deps/libnode-3333333333333333.rlib" ] || fail "$1: tmp scaffold target removed"
+    [ -e "$t/tmp/scratch.txt" ] || fail "$1: tmp scratch file removed"
+  }
+
   # Case 4: `age` never ran (fresh access times everywhere): nothing is deleted.
-  rm -rf "$t"; mkunit "$t/debug" foo 0123456789abcdef; mkunit "$t/debug" old 4444444444444444
-  cat "$t/debug/.fingerprint/old-4444444444444444/lib-old" > /dev/null
+  mkunaged
   cmd_trim "$t" > /dev/null
-  [ -e "$t/debug/deps/libold-4444444444444444.rlib" ] || fail "case 4: unaged tree trimmed"
+  unaged_kept "case 4"
+
+  # Case 5: the aged record was restored from the run that saved the archive,
+  # and `age` did not run in this one: nothing is deleted, the record goes.
+  mkunaged
+  printf 'run 0 attempt 0 job another\n' > "$t/$AGED_RECORD"
+  cmd_trim "$t" > /dev/null
+  unaged_kept "case 5"
+  [ ! -e "$t/$AGED_RECORD" ] || fail "case 5: stale aged record kept"
+
+  # Case 6: a second trim after one `age` finds no record: nothing is deleted.
+  rm -rf "$t"; mkunit "$t/debug" foo 0123456789abcdef
+  cmd_age "$t" > /dev/null
+  read_unit "$t/debug" foo 0123456789abcdef
+  cmd_trim "$t" > /dev/null
+  mkdir -p "$t/debug/incremental/foo-abc"
+  cmd_trim "$t" > /dev/null
+  [ -d "$t/debug/incremental/foo-abc" ] || fail "case 6: second trim without age deleted"
 
   rm -rf "$base"
   if [ "$fails" -ne 0 ]; then
     return 1
   fi
-  say "self-test: OK (4 cases)"
+  say "self-test: OK (6 cases)"
   return 0
 }
 

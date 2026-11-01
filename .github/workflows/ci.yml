@@ -2928,7 +2928,8 @@ jobs:
       # Deletes from `target/` every unit no cargo command in this job read
       # (older generations a key roll restored, unused scaffold targets under
       # `target/tmp`) and `incremental/`, and prints the size before and after.
-      # Deletes nothing when access times do not update or nothing was read.
+      # Deletes nothing when access times do not update, nothing was read, or
+      # the age step above did not run in this job.
       - name: Cache cargo, shard 0 saves (trim units this run did not use)
         if: >-
           matrix.shard == 0
@@ -3915,7 +3916,8 @@ jobs:
       # Deletes from `target/` every unit no cargo command in this job read
       # (older generations a key roll restored, unused scaffold targets under
       # `target/tmp`) and `incremental/`, and prints the size before and after.
-      # Deletes nothing when access times do not update or nothing was read.
+      # Deletes nothing when access times do not update, nothing was read, or
+      # the age step above did not run in this job.
       - name: Cache cargo, shard 0 saves (trim units this run did not use)
         if: >-
           matrix.shard == 0

@@ -735,7 +735,10 @@ unit hash no cargo command in the job read, plus `incremental/`. Cargo reads the
 every unit in a build graph, fresh or not, so a unit the job used stays. The trim deletes nothing
 when a read leaves an aged access time unchanged, when `target/debug` holds no unit read during
 the run, or (per profile) when no `deps/` entry carries a live unit hash, and it prints the
-target size before and after. It runs on `main` only, under the save's namespace gate. Shard 0's
+target size before and after. `age` also writes `target/.ci-cache-trim-aged` naming the run, job
+and attempt; `trim` removes it every time and deletes nothing unless it names this run, so an
+unaged tree (whose fresh access times would all read as live) and a record restored from an
+older archive both leave the target as it is. It runs on `main` only, under the save's namespace gate. Shard 0's
 archive then holds only the units its own cargo commands read, so a unit that only shards 1 to 3
 or a fall-through job (`lint`, `docs`, `netd-wan`) builds is compiled by that run every time.
 
@@ -791,7 +794,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |
 | `tools/scripts/check_hot_path_allocs.sh --self-test` | the annotation grammar and scope rules | n/a |
-| `tools/scripts/ci_cache_trim_target.sh --self-test` | a synthetic target with a read and an unread generation: the unread units' artifacts, build dirs and fingerprints go, the read ones and unhashed files stay, an unread scaffold target and scratch files under `tmp/` go; nothing is deleted when nothing was read, when `age` never ran, or when no `deps/` entry carries a live hash; fails when the filesystem does not update access times | n/a |
+| `tools/scripts/ci_cache_trim_target.sh --self-test` | a synthetic target with a read and an unread generation: the unread units' artifacts, build dirs and fingerprints go, the read ones and unhashed files stay, an unread scaffold target and scratch files under `tmp/` go; nothing is deleted when nothing was read, when `age` never ran (`incremental/`, an orphan artifact and `tmp/` stay too), when the aged record names another run, on a second trim after one `age`, or when no `deps/` entry carries a live hash; fails when the filesystem does not update access times | n/a |
 | `tools/scripts/check_pr_title.sh --self-test` | the title/branch oracle table | n/a |
 | `tools/scripts/check_agents_md.sh` | context-file budgets, shims, banned tokens | n/a |
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
