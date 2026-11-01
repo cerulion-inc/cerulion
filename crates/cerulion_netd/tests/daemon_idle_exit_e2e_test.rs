@@ -221,3 +221,30 @@ fn real_daemon_hard_exits_a_wedged_teardown() {
         "the socket was unlinked before the wedge — a hard-exited daemon leaves none behind"
     );
 }
+
+#[test]
+fn real_daemon_boot_is_observed_after_its_socket_is_gone() {
+    let _lk = iox_lock();
+    let (dir, sock) = unique_socket("boot_signal");
+    let mut guard = spawn_daemon(&sock, dir, &[]);
+
+    let exited = wait_until(
+        || matches!(guard.child.try_wait(), Ok(Some(_))),
+        Duration::from_secs(10),
+    );
+    assert!(
+        exited,
+        "the idle daemon ACTUALLY terminated after the grace (not a permanent zombie)"
+    );
+    let status = guard.child.try_wait().expect("try_wait").expect("exited");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a clean idle self-exit returns 0 ({status:?})"
+    );
+    assert!(!sock.exists(), "the idle daemon removed its control socket");
+    assert!(
+        guard.booted_within(Duration::from_secs(2)),
+        "the boot signal outlives the short-lived socket"
+    );
+}
