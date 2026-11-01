@@ -27,17 +27,17 @@ workspace = true
 # Reads the CONSUMING package's Cargo.toml at expansion time and reports the
 # name that package gave a dependency, so generated code can point at the
 # crate root the package actually named. Already in this workspace's lockfile
-# at this version through four other proc-macro crates, so it adds no package
-# and no license to the tree. Pinned exactly because it decides where every
-# generated path points: a version move is a reviewed event, not a lockfile
-# refresh.
-proc-macro-crate = "=3.5.0"
-# Reads which table of the consuming package's manifest names a crate, so a
-# runtime entry that is only a dev or target-specific dependency does not
-# outrank an umbrella entry in plain [dependencies]. The same version and the
-# same single feature proc-macro-crate already builds it with, so it adds no
-# package to the tree.
-toml_edit = { version = "=0.25.13", default-features = false, features = ["parse"] }
+# through four other proc-macro crates, so it adds no package and no license
+# to the tree. A caret requirement: a downstream graph holds one 3.x, and an
+# exact pin here would refuse every graph whose other crates need a later
+# one. 3.5.0 is the first release on the toml_edit 0.25 line below.
+proc-macro-crate = "3.5.0"
+# Reads which table of the consuming package's manifest names a crate, and
+# whether the entry is optional, so a runtime entry that is not linked into
+# every target does not outrank an umbrella entry that is. The requirement
+# and the single feature are the ones proc-macro-crate 3.5.0 declares, so
+# the resolver serves both from one toml_edit.
+toml_edit = { version = "0.25.0", default-features = false, features = ["parse"] }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing", "visit", "visit-mut", "extra-traits"] }
