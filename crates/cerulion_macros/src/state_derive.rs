@@ -98,6 +98,13 @@
 //! parameter. Naming the obligation only at its USES (three consts, the probe,
 //! capture, read, restore) is the natural way to write this and it is worse.
 //!
+//! The crate root inside each such predicate comes from
+//! `crate_root::root_at(<the type's span>)`, not from `crate_root::root()`.
+//! `quote_spanned!` re-spans only its own tokens, so an interpolated
+//! call-site root would start the trait path with call-site tokens, and rustc
+//! then reports the unsatisfied bound at the `#[derive(..)]` or
+//! `#[cerulion_node]` attribute instead of at the field.
+//!
 //! **MEASURED against THIS emission** — deleting the
 //! predicate and letting the body's uses speak — on
 //! `tests/ui/type_error/state_derive_uncapturable_field.rs`:
@@ -657,8 +664,9 @@ fn expand_fields(
 
         match c.escape {
             Escape::Captured => {
+                let bound_root = crate_root::root_at(ty.span());
                 predicates.push(quote_spanned! {ty.span()=>
-                    #ty: #__cer_root::state::CerulionState
+                    #ty: #bound_root::state::CerulionState
                 });
                 shape_terms.push(quote! {
                     .field(#fname, <#ty as #__cer_root::state::CerulionState>::STATE_SHAPE)
@@ -688,11 +696,12 @@ fn expand_fields(
                 // INLINE_SAFE.
             }
             Escape::Serde => {
+                let bound_root = crate_root::root_at(ty.span());
                 predicates.push(quote_spanned! {ty.span()=>
-                    #ty: #__cer_root::serde::Serialize
+                    #ty: #bound_root::serde::Serialize
                 });
                 predicates.push(quote_spanned! {ty.span()=>
-                    #ty: #__cer_root::serde::de::DeserializeOwned
+                    #ty: #bound_root::serde::de::DeserializeOwned
                 });
                 let marker = escape_shape(Escape::Serde);
                 shape_terms.push(quote! { .field(#fname, #marker) });
@@ -719,8 +728,9 @@ fn expand_fields(
                     container,
                 } = &plan;
                 for arg in args {
+                    let bound_root = crate_root::root_at(arg.span());
                     predicates.push(quote_spanned! {arg.span()=>
-                        #arg: #__cer_root::state::CerulionState
+                        #arg: #bound_root::state::CerulionState
                     });
                 }
                 let element_shapes = args.iter().map(|a| {
@@ -1169,8 +1179,9 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
             // a single `CerulionState` use anywhere in the emission raises its
             // own obligation and prints the misleading note as a second block
             // (MEASURED: switching all uses is what takes the count to one).
+            let bound_root = crate_root::root_at(ty.span());
             predicates.push(quote_spanned! {ty.span()=>
-                #ty: #__cer_root::state::CerulionVariantMember
+                #ty: #bound_root::state::CerulionVariantMember
             });
             inline_terms.push(
                 quote! { <#ty as #__cer_root::state::CerulionVariantMember>::VARIANT_INLINE_SAFE },

@@ -14,41 +14,59 @@
 //!
 //! | The package names | Generated paths start with |
 //! |---|---|
-//! | `cerulion_core` | `::cerulion_core` |
-//! | `cerulion` (the umbrella crate) | `::cerulion::core` |
+//! | `cerulion_core` and not `cerulion` | `::cerulion_core` |
+//! | `cerulion` (the umbrella crate) and not `cerulion_core` | `::cerulion::core` |
+//! | both, with only `cerulion` an unconditional dependency | `::cerulion::core` |
+//! | both, any other way | `::cerulion_core` |
+//! | neither | `::cerulion_core`, after a named error |
+//!
+//! An unconditional dependency is an entry in the plain `[dependencies]`
+//! table that is not `optional = true`. Cargo links such an entry into every
+//! target of the package. It links a `[dev-dependencies]` entry only into
+//! tests, examples and benches, a `[target.'cfg(..)'.dependencies]` entry
+//! only where its cfg holds, and an optional entry only when a feature turns
+//! it on, which an expansion cannot see. So when both crates are named and
+//! only the umbrella is unconditional, the umbrella is the root that resolves
+//! in every target. An optional umbrella is not unconditional either: a
+//! package that names it and also names the runtime gets `::cerulion_core`.
+//!
+//! `::cerulion_core` is what every package got before this resolver existed,
+//! and a package whose root is the runtime crate still gets the tokens it got
+//! then, with the spans it got then (see "Spans" below).
 //!
 //! The umbrella re-exports the runtime whole (`pub use cerulion_core as
 //! core;`), so the two roots address the same items under the same names.
 //! Nothing here curates a list of what the macros may reach, and a macro that
 //! starts using a new runtime item needs no change on the umbrella side.
 //!
-//! A package that names both gets `::cerulion_core`. That ordering is not a
-//! preference, it is the compatibility rule: every package written before
-//! this resolver existed named `cerulion_core`, and for those the generated
-//! tokens are what they always were.
-//!
 //! A rename is carried through, because the resolver reports the name the
 //! package chose rather than the name on the package. `cer = { package =
 //! "cerulion_core" }` emits `::cer`.
 //!
-//! A package that names both, but names only the umbrella in its plain
-//! `[dependencies]` table, gets `::cerulion::core`. A runtime entry that
-//! sits only in `[dev-dependencies]` or a `[target.'cfg(..)'.dependencies]`
-//! table is not linked into every target the macros expand in, while a plain
-//! `[dependencies]` entry is, so the umbrella is the root that resolves in all
-//! of them.
+//! # Spans
+//!
+//! `root()` spans every token of the root at the macro call site, which is
+//! the span `quote!` gives its own tokens. `root_at(span)` spans them at
+//! `span`, and is what a `quote_spanned!` site interpolates: `quote_spanned!`
+//! re-spans only the tokens it writes itself, never an interpolated stream.
+//! A `where`-clause predicate whose type carries a field's span but whose
+//! trait path starts with call-site tokens is reported at the derive or node
+//! attribute rather than at the field; with the root at the field's span it
+//! is reported at the field. `one_dependency_build_test` in the umbrella
+//! crate pins the field position under both roots.
 //!
 //! # What the resolver cannot see
 //!
-//! It reads a manifest, not a compilation. Apart from the rule above, which
-//! reads only the plain `[dependencies]` table, `[dependencies]`,
+//! It reads a manifest, not a compilation. Apart from the unconditional rule
+//! above, which reads only the plain `[dependencies]` table, `[dependencies]`,
 //! `[dev-dependencies]` and every `[target.'cfg(..)'.dependencies]` table are
 //! one flat set to it, whether or not the cfg holds for the target being
 //! compiled. So a package that names ONLY the runtime, and only in
 //! `[dev-dependencies]`, gets `::cerulion_core` in its library target too,
 //! where that name is not linked, and the missing-dependency diagnostic does
-//! NOT fire, because the runtime was found. The remedy is the one the
-//! compiler's own resolution error already points at: name in
+//! NOT fire, because the runtime was found. The compiler's own error there is
+//! the bare resolution failure ("cannot find `cerulion_core` in the crate
+//! root" on rustc 1.95), which names no manifest. The fix is to name in
 //! `[dependencies]` whichever crate the code that expands macros is built
 //! against.
 //!
@@ -65,7 +83,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use proc_macro_crate::{crate_name, FoundCrate};
-use quote::quote;
+use quote::quote_spanned;
 use std::sync::Mutex;
 use syn::Ident;
 
@@ -92,16 +110,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Which crate the consuming package reaches the runtime through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Root {
-    /// The package names the runtime crate. The identifier is how the package
-    /// spells it, which is the crate's own name unless the dependency was
-    /// renamed.
+    /// The runtime crate, spelled as the package spells it: the crate's own
+    /// name unless the dependency was renamed.
     Runtime(String),
-    /// The package names the umbrella crate and nothing else, so the runtime
-    /// is reached through the umbrella's re-export.
+    /// The umbrella crate's re-export. The package names only the umbrella,
+    /// or names both with only the umbrella an unconditional dependency.
     Umbrella(String),
-    /// The package names neither. The macros cannot be invoked at all without
-    /// one of them in the dependency graph, so this is reachable only by
-    /// depending on the macro crate directly.
+    /// The package names neither. It depends on the macro crate directly, or
+    /// reaches the macros through a third crate's re-export; either way no
+    /// generated path can resolve, and the entry points report it by name.
     Unresolved,
     /// The manifest could not be read, so nothing is known either way.
     ///
@@ -116,27 +133,29 @@ enum Root {
 }
 
 impl Root {
-    /// The path the generated code puts in front of every runtime item.
+    /// The path the generated code puts in front of every runtime item, with
+    /// every one of its tokens at `span`.
     ///
-    /// `Root::Unresolved` falls back to `::cerulion_core`, which is what
-    /// this crate emitted before the root was resolvable at all. The fallback
-    /// is never silent: the macro entry points emit
-    /// `unresolved_diagnostic` alongside the expansion, so the named
-    /// remedy is the first error the compiler prints.
-    fn path(&self) -> TokenStream {
+    /// `Root::Unresolved` and `Root::Undecidable` fall back to
+    /// `::cerulion_core`, which is what this crate emitted before the root
+    /// was resolvable at all. For `Unresolved` the macro entry points emit
+    /// `unresolved_diagnostic` alongside the expansion, so the named remedy
+    /// is the first error the compiler prints; `Undecidable` carries none,
+    /// for the reason on that variant.
+    fn path_at(&self, span: Span) -> TokenStream {
         match self {
             Self::Runtime(name) => {
-                let krate = Ident::new(name, Span::call_site());
-                quote! { ::#krate }
+                let krate = Ident::new(name, span);
+                quote_spanned! {span=> ::#krate }
             }
             Self::Umbrella(name) => {
-                let krate = Ident::new(name, Span::call_site());
-                let module = Ident::new(UMBRELLA_RUNTIME_MODULE, Span::call_site());
-                quote! { ::#krate::#module }
+                let krate = Ident::new(name, span);
+                let module = Ident::new(UMBRELLA_RUNTIME_MODULE, span);
+                quote_spanned! {span=> ::#krate::#module }
             }
             Self::Unresolved | Self::Undecidable => {
-                let krate = Ident::new(RUNTIME, Span::call_site());
-                quote! { ::#krate }
+                let krate = Ident::new(RUNTIME, span);
+                quote_spanned! {span=> ::#krate }
             }
         }
     }
@@ -170,10 +189,12 @@ fn spelling(found: FoundCrate, fallback: &str) -> String {
         FoundCrate::Name(name) => name,
     };
     // The resolver hands back the manifest KEY with `-` turned into `_` and
-    // nothing else, so a rename key that is a Rust keyword, or not an
-    // identifier at all, reaches here. `Ident::new` would panic on it, and a
-    // proc-macro panic carries no span. Fall back to the crate's own name:
-    // the compiler then reports THAT as unresolved, which is true, and
+    // nothing else, so a key that is not an identifier at all (`123`, the
+    // empty string) or that is a keyword (`crate`, `self`) reaches here.
+    // `Ident::new` panics on the first kind, and a proc-macro panic carries no
+    // span; it accepts the second, and `::crate` names no extern crate.
+    // `syn::parse_str::<Ident>` refuses both. The fallback is the crate's own
+    // name: the compiler then reports THAT as unresolved, which is true, and
     // reports it against the user's own code.
     if syn::parse_str::<Ident>(&name).is_ok() {
         name
@@ -186,20 +207,21 @@ fn spelling(found: FoundCrate, fallback: &str) -> String {
 ///
 /// Split out from the lookup so it can be tested against every combination
 /// without a manifest on disk. `runtime` and `umbrella` are the outcomes of
-/// asking for `RUNTIME` and `UMBRELLA` in that order. `normal` is the set of
-/// keys in the package's plain `[dependencies]` table, spelled as the
-/// resolver spells them (`-` turned into `_`), or `None` when it was not read.
-fn classify(runtime: Lookup, umbrella: Lookup, normal: Option<&[String]>) -> Root {
-    // Both named, but only the umbrella in plain `[dependencies]`: the runtime
-    // entry is a dev or target-specific one, not linked into every target the
+/// asking for `RUNTIME` and `UMBRELLA` in that order. `unconditional` is the
+/// set of keys of the package's unconditional dependencies (see
+/// `unconditional_dependency_keys`), spelled as the resolver spells them (`-`
+/// turned into `_`), or `None` when the manifest was not read for them.
+fn classify(runtime: Lookup, umbrella: Lookup, unconditional: Option<&[String]>) -> Root {
+    // Both named, and only the umbrella unconditional: the runtime entry is a
+    // dev, target-specific or optional one, not linked into every target the
     // macros expand in, while the umbrella is.
     if let (
         Lookup::Found(FoundCrate::Name(runtime_key)),
         Lookup::Found(FoundCrate::Name(umbrella_key)),
-        Some(normal),
-    ) = (&runtime, &umbrella, normal)
+        Some(unconditional),
+    ) = (&runtime, &umbrella, unconditional)
     {
-        if normal.contains(umbrella_key) && !normal.contains(runtime_key) {
+        if unconditional.contains(umbrella_key) && !unconditional.contains(runtime_key) {
             return Root::Umbrella(spelling(FoundCrate::Name(umbrella_key.clone()), UMBRELLA));
         }
     }
@@ -230,12 +252,12 @@ fn look_up(name: &str) -> Lookup {
 
 /// Which crates the consuming package names, decided once per compilation.
 ///
-/// Memoised on `CARGO_MANIFEST_DIR` rather than resolved at each of the
-/// nineteen call sites. The point is not the two `fs::metadata` calls
-/// `proc-macro-crate`'s own cache still makes: it is that one expansion must
-/// not be able to mix two answers. Without this, a manifest edited while
-/// rustc is running could put `::cerulion::core` in one generated impl and
-/// `::cerulion_core` in the next.
+/// Memoised on `CARGO_MANIFEST_DIR` rather than resolved at every `root()`,
+/// `root_at()` and `unresolved_diagnostic()` call. The point is not the two
+/// `fs::metadata` calls `proc-macro-crate`'s own cache still makes: it is
+/// that one expansion must not be able to mix two answers. Without this, a
+/// manifest edited while rustc is running could put `::cerulion::core` in
+/// one generated impl and `::cerulion_core` in the next.
 ///
 /// Keyed rather than a bare `OnceLock` because a proc-macro server can serve
 /// more than one package in one process, where the key really does change.
@@ -268,37 +290,63 @@ fn resolve_uncached() -> Root {
         look_up(UMBRELLA)
     };
     // Read only when both were found, the one case the table decides.
-    let normal = if matches!((&runtime, &umbrella), (Lookup::Found(_), Lookup::Found(_))) {
+    let unconditional = if matches!((&runtime, &umbrella), (Lookup::Found(_), Lookup::Found(_))) {
         std::env::var_os("CARGO_MANIFEST_DIR")
             .map(|dir| std::path::PathBuf::from(dir).join("Cargo.toml"))
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| normal_dependency_keys(&text))
+            .and_then(|text| unconditional_dependency_keys(&text))
     } else {
         None
     };
-    classify(runtime, umbrella, normal.as_deref())
+    classify(runtime, umbrella, unconditional.as_deref())
 }
 
-/// The keys of a manifest's plain `[dependencies]` table, with `-` turned
-/// into `_` as `proc-macro-crate` reports them, or `None` when the text does
-/// not parse. A manifest with no such table has no normal dependencies.
-fn normal_dependency_keys(manifest: &str) -> Option<Vec<String>> {
+/// The keys of a manifest's unconditional dependencies: the entries of its
+/// plain `[dependencies]` table whose `optional` is not `true`, with `-`
+/// turned into `_` as `proc-macro-crate` reports them. `None` when the text
+/// does not parse. A manifest with no such table has none.
+///
+/// `optional` is read from the entry itself, inline (`{ optional = true }`)
+/// or as a `[dependencies.<key>]` table. A workspace-inherited entry carries
+/// it there too, because `[workspace.dependencies]` cannot declare it.
+fn unconditional_dependency_keys(manifest: &str) -> Option<Vec<String>> {
     let doc = manifest.parse::<toml_edit::DocumentMut>().ok()?;
     let keys = match doc
         .get("dependencies")
         .and_then(|item| item.as_table_like())
     {
-        Some(table) => table.iter().map(|(key, _)| key.replace('-', "_")).collect(),
+        Some(table) => table
+            .iter()
+            .filter(|(_, entry)| {
+                let optional = entry
+                    .as_table_like()
+                    .and_then(|fields| fields.get("optional"))
+                    .and_then(|value| value.as_bool());
+                optional != Some(true)
+            })
+            .map(|(key, _)| key.replace('-', "_"))
+            .collect(),
         None => Vec::new(),
     };
     Some(keys)
 }
 
-/// The path every generated runtime item hangs off.
+/// The path every generated runtime item hangs off, spanned at the macro call
+/// site.
 ///
 /// Interpolate it: `quote! { #root::graph::node::NodeEntry }`.
 pub(crate) fn root() -> TokenStream {
-    resolve().path()
+    resolve().path_at(Span::call_site())
+}
+
+/// The same path with every token at `span`.
+///
+/// For a `quote_spanned!` site whose diagnostic must point at `span`: a
+/// `where`-clause predicate on a field's type takes the root at that type's
+/// span, so an unsatisfied bound is reported at the field (see "Spans" in
+/// the module doc).
+pub(crate) fn root_at(span: Span) -> TokenStream {
+    resolve().path_at(span)
 }
 
 /// The text a package that names neither crate is shown.
@@ -321,18 +369,28 @@ fn unresolved_message() -> String {
     )
 }
 
+/// The diagnostic `root` calls for at `span`, or `None` when it calls for
+/// none.
+///
+/// Only `Root::Unresolved` is reported. `Root::Undecidable` falls back to the
+/// same path silently, for the reason on that variant. The match names every
+/// variant, so a new one is a decision made here rather than a default.
+fn diagnostic_for(root: &Root, span: Span) -> Option<TokenStream> {
+    match root {
+        Root::Unresolved => Some(syn::Error::new(span, unresolved_message()).to_compile_error()),
+        Root::Runtime(_) | Root::Umbrella(_) | Root::Undecidable => None,
+    }
+}
+
 /// The diagnostic for a package that names neither crate, or `None` when
-/// the root resolved.
+/// the root resolved or could not be decided.
 ///
 /// Emitted beside the expansion rather than instead of it. Without it the
 /// compiler reports `cannot find cerulion_core in the crate root` against a
 /// path the user never wrote, in generated code they cannot see; with it, the
 /// first error names the two manifests that fix it.
 pub(crate) fn unresolved_diagnostic(span: Span) -> Option<TokenStream> {
-    if resolve() != Root::Unresolved {
-        return None;
-    }
-    Some(syn::Error::new(span, unresolved_message()).to_compile_error())
+    diagnostic_for(&resolve(), span)
 }
 
 #[cfg(test)]
@@ -340,7 +398,7 @@ mod tests {
     use super::*;
 
     fn rendered(root: &Root) -> String {
-        root.path().to_string()
+        root.path_at(Span::call_site()).to_string()
     }
 
     fn found(name: &str) -> Lookup {
@@ -363,9 +421,8 @@ mod tests {
 
     #[test]
     fn naming_both_emits_the_runtime_path() {
-        // The compatibility rule. A package written before this resolver
-        // existed names the runtime, and some also name the umbrella; the
-        // tokens they get must not move.
+        // With the tables unread, both named is the runtime spelling, which
+        // is the one every package got before this resolver existed.
         let root = classify(found("cerulion_core"), found("cerulion"), None);
         assert_eq!(rendered(&root), ":: cerulion_core");
     }
@@ -384,10 +441,11 @@ mod tests {
 
     #[test]
     fn a_rename_that_is_not_an_identifier_falls_back_to_the_crate_name() {
-        // `Ident::new` would panic on either of these, and a proc-macro panic
-        // carries no span at all. The fallback path is wrong for that package
-        // but it is a PATH, so the compiler reports the missing name against
-        // the user's own code.
+        // `Ident::new` panics on `123` and on the empty string, and a
+        // proc-macro panic carries no span at all; it accepts `crate` and
+        // `self`, and `::crate` names no extern crate. The fallback path is
+        // wrong for that package but it is a PATH, so the compiler reports
+        // the missing name against the user's own code.
         for key in ["crate", "self", "123", ""] {
             assert_eq!(
                 rendered(&classify(found(key), Lookup::Absent, None)),
@@ -420,30 +478,38 @@ mod tests {
     }
 
     #[test]
-    fn the_umbrella_wins_when_only_it_is_a_normal_dependency() {
+    fn the_umbrella_wins_when_only_it_is_an_unconditional_dependency() {
         // `cerulion` in `[dependencies]`, `cerulion_core` only in
         // `[dev-dependencies]`: the library target links only the umbrella.
-        let normal = keys(&["cerulion", "serde"]);
-        let root = classify(found("cerulion_core"), found("cerulion"), Some(&normal));
+        let unconditional = keys(&["cerulion", "serde"]);
+        let root = classify(
+            found("cerulion_core"),
+            found("cerulion"),
+            Some(&unconditional),
+        );
         assert_eq!(root, Root::Umbrella("cerulion".into()));
         assert_eq!(rendered(&root), ":: cerulion :: core");
     }
 
     #[test]
-    fn the_runtime_still_wins_when_both_are_normal_dependencies() {
-        let normal = keys(&["cerulion", "cerulion_core"]);
-        let root = classify(found("cerulion_core"), found("cerulion"), Some(&normal));
+    fn the_runtime_still_wins_when_both_are_unconditional_dependencies() {
+        let unconditional = keys(&["cerulion", "cerulion_core"]);
+        let root = classify(
+            found("cerulion_core"),
+            found("cerulion"),
+            Some(&unconditional),
+        );
         assert_eq!(rendered(&root), ":: cerulion_core");
     }
 
     #[test]
-    fn the_runtime_wins_when_neither_is_a_normal_dependency_or_the_table_is_unread() {
-        let normal = keys(&["serde"]);
+    fn the_runtime_wins_when_neither_is_unconditional_or_the_table_is_unread() {
+        let unconditional = keys(&["serde"]);
         assert_eq!(
             rendered(&classify(
                 found("cerulion_core"),
                 found("cerulion"),
-                Some(&normal)
+                Some(&unconditional)
             )),
             ":: cerulion_core"
         );
@@ -454,14 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn a_renamed_umbrella_in_normal_dependencies_is_carried_through() {
-        let normal = keys(&["cer"]);
-        let root = classify(found("cerulion_core"), found("cer"), Some(&normal));
+    fn a_renamed_unconditional_umbrella_is_carried_through() {
+        let unconditional = keys(&["cer"]);
+        let root = classify(found("cerulion_core"), found("cer"), Some(&unconditional));
         assert_eq!(rendered(&root), ":: cer :: core");
     }
 
     #[test]
-    fn normal_dependency_keys_reads_only_the_plain_dependencies_table() {
+    fn unconditional_dependency_keys_reads_only_the_plain_dependencies_table() {
         let manifest = r#"
 [package]
 name = "robot"
@@ -476,14 +542,91 @@ cerulion_core = "1.0.0"
 [target.'cfg(unix)'.dependencies]
 cerulion_core = "1.0.0"
 "#;
-        let mut found = normal_dependency_keys(manifest).expect("parses");
+        let mut found = unconditional_dependency_keys(manifest).expect("parses");
         found.sort();
         assert_eq!(found, keys(&["cerulion", "my_dep"]));
         assert_eq!(
-            normal_dependency_keys("[package]\nname = \"x\"\n"),
+            unconditional_dependency_keys("[package]\nname = \"x\"\n"),
             Some(Vec::new())
         );
-        assert_eq!(normal_dependency_keys("[dependencies"), None);
+        assert_eq!(unconditional_dependency_keys("[dependencies"), None);
+    }
+
+    #[test]
+    fn an_optional_entry_is_not_an_unconditional_dependency() {
+        let manifest = r#"
+[package]
+name = "robot"
+
+[dependencies]
+cerulion = "1.0.0"
+cerulion_core = { version = "1.0.0", optional = true }
+plain-table = { version = "1", optional = false }
+serde = "1"
+
+[dependencies.tokio]
+version = "1"
+optional = true
+"#;
+        let mut found = unconditional_dependency_keys(manifest).expect("parses");
+        found.sort();
+        assert_eq!(found, keys(&["cerulion", "plain_table", "serde"]));
+    }
+
+    /// The root a package that names both crates gets from its manifest,
+    /// composed from the same two pure steps `resolve_uncached` runs.
+    fn root_when_both_are_named(manifest: &str) -> Root {
+        classify(
+            found("cerulion_core"),
+            found("cerulion"),
+            unconditional_dependency_keys(manifest).as_deref(),
+        )
+    }
+
+    #[test]
+    fn an_optional_runtime_beside_an_unconditional_umbrella_gets_the_umbrella_path() {
+        // `optional = true` is how a package forwards a `cerulion_core`
+        // feature, because the umbrella forwards none. With that feature off
+        // Cargo passes no `--extern cerulion_core`, while the umbrella is
+        // linked into every target.
+        let root = root_when_both_are_named(
+            r#"
+[dependencies]
+cerulion = "1.0.0"
+cerulion_core = { version = "1.0.0", optional = true }
+
+[features]
+debug-logging = ["cerulion_core/debug-logging"]
+"#,
+        );
+        assert_eq!(root, Root::Umbrella("cerulion".into()));
+        assert_eq!(rendered(&root), ":: cerulion :: core");
+    }
+
+    #[test]
+    fn an_optional_umbrella_is_not_unconditional_and_gets_the_runtime_path() {
+        // Beside an unconditional runtime the runtime wins as it would
+        // anyway. Beside a dev-only runtime neither entry is unconditional,
+        // so the package gets the both-named spelling, `::cerulion_core`,
+        // which is the spelling it got before this resolver existed.
+        for manifest in [
+            r#"
+[dependencies]
+cerulion = { version = "1.0.0", optional = true }
+cerulion_core = "1.0.0"
+"#,
+            r#"
+[dependencies]
+cerulion = { version = "1.0.0", optional = true }
+
+[dev-dependencies]
+cerulion_core = "1.0.0"
+"#,
+        ] {
+            let root = root_when_both_are_named(manifest);
+            assert_eq!(root, Root::Runtime("cerulion_core".into()), "{manifest}");
+            assert_eq!(rendered(&root), ":: cerulion_core");
+        }
     }
 
     #[test]
@@ -494,7 +637,14 @@ cerulion_core = "1.0.0"
         // state compiles exactly as badly as it did before, with one named
         // error added in front.
         assert_eq!(rendered(&root), ":: cerulion_core");
-        assert!(unresolved_diagnostic_applies(&root));
+        let diagnostic = diagnostic_for(&root, Span::call_site())
+            .expect("a package that names neither crate is reported")
+            .to_string();
+        assert!(diagnostic.contains("compile_error"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("must name the runtime"),
+            "the diagnostic must carry the message the user reads: {diagnostic}"
+        );
     }
 
     /// An unreadable manifest is not a missing dependency, and must not be
@@ -515,16 +665,44 @@ cerulion_core = "1.0.0"
             assert_eq!(root, Root::Undecidable);
             assert_eq!(rendered(&root), ":: cerulion_core");
             assert!(
-                !unresolved_diagnostic_applies(&root),
+                diagnostic_for(&root, Span::call_site()).is_none(),
                 "an undecidable manifest must carry no diagnostic"
             );
         }
     }
 
-    /// Whether `unresolved_diagnostic` would emit for this root, without
-    /// needing a real manifest underneath.
-    fn unresolved_diagnostic_applies(root: &Root) -> bool {
-        *root == Root::Unresolved
+    #[test]
+    fn a_resolved_root_carries_no_diagnostic() {
+        for root in [
+            Root::Runtime("cerulion_core".into()),
+            Root::Runtime("cer".into()),
+            Root::Umbrella("cerulion".into()),
+        ] {
+            assert!(
+                diagnostic_for(&root, Span::call_site()).is_none(),
+                "{root:?} resolved, so it must carry no diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn root_at_renders_the_same_path_as_root() {
+        // The span is the only thing `root_at` changes. Spans are not
+        // observable on a proc-macro2 token outside a compiler, so the field
+        // position itself is pinned by `one_dependency_build_test` in the
+        // umbrella crate.
+        for root in [
+            Root::Runtime("cerulion_core".into()),
+            Root::Umbrella("cerulion".into()),
+            Root::Unresolved,
+            Root::Undecidable,
+        ] {
+            assert_eq!(
+                root.path_at(Span::mixed_site()).to_string(),
+                rendered(&root),
+                "{root:?}"
+            );
+        }
     }
 
     /// Every macro this crate exports must route its expansion past the
