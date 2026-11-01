@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 /// start). It outlives the socket, which idle self-exit unlinks after the grace.
 const BOOT_LINE: &str = "cerulion-netd listening (NDJSON control protocol)";
 
-/// Serialize the real-binary spawns — they share the default iceoryx2
+/// Serialize the real-binary spawns: they share the default iceoryx2
 /// namespace, so running them sequentially avoids any cross-daemon SHM contention.
 fn iox_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
