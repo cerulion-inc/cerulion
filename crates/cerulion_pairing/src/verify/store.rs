@@ -1942,22 +1942,48 @@ mod tests {
     #[test]
     fn a_save_over_a_0644_store_leaves_it_0600() {
         use std::os::unix::fs::PermissionsExt as _;
+        const CHILD_DIR: &str = "CERULION_TEST_TRUST_STORE_SAVE_MODE_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = std::path::PathBuf::from(dir);
+            let path = dir.join("trust.store");
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::File::create(dir.join("probe")).unwrap();
+            test_store(&path).save(KEY).unwrap();
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("trust.store");
-        std::fs::write(&path, b"old").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        // Control: a file created without an explicit mode keeps group or other
-        // bits under this umask, so the 0600 below comes from the save.
+        let name = format!(
+            "{}::a_save_over_a_0644_store_leaves_it_0600",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "umask \"$1\"; shift; exec \"$@\"",
+                "save-mode-test",
+                "022",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1"])
+            .env(CHILD_DIR, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The probe confirms the child ran with umask 022.
         let probe = dir.path().join("probe");
-        std::fs::File::create(&probe).unwrap();
+        assert!(probe.exists(), "the child process did not run the save");
         assert_ne!(
             mode_of(&probe) & 0o077,
             0,
-            "the umask clears group and other bits, which would hide a dropped mode"
+            "the child umask did not leave group or other bits"
         );
-        std::fs::remove_file(&probe).unwrap();
-        test_store(&path).save(KEY).unwrap();
-        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&dir.path().join("trust.store")), 0o600);
     }
 
     #[cfg(unix)]
