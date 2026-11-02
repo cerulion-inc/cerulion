@@ -19,9 +19,12 @@
 //!   one topic, read by an accumulating input that stages one read record per
 //!   frame, each with its own producer annotation, so every read names its
 //!   frame's writer and the stream judges equal. (A read that pops several
-//!   frames of several writers is refused by name,
-//!   `read_identity_batch_unattributed`; the engine's
-//!   `a_batch_on_a_multi_writer_edge_is_refused_by_name` pins that.)
+//!   frames of several writers names each frame's writer in its `BatchFrame`
+//!   records and is fed each one, which the engine's
+//!   `a_batch_on_a_multi_writer_edge_is_fed_each_frame_under_its_writer`
+//!   pins; a read whose frames are not named is refused by name,
+//!   `read_identity_batch_unattributed`, which
+//!   `a_batch_whose_frames_are_not_named_is_refused_by_name` pins.)
 //!
 //! Each arm prints one `READ_IDENTITY` line per stream (format in
 //! `read_identity/mod.rs`). A stream that is not equal, or a verify replay

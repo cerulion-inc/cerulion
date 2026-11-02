@@ -1051,7 +1051,7 @@ node, the input, the writer and the sequence:
 | `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
 | `read_identity_absent` | A read popped frames and no annotation named their writer, or a read on a multi-writer edge carries no annotation of its own |
 | `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
-| `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9 names only the newest |
+| `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9, or a batch deeper than its read stage's window, names only the newest |
 | `read_identity_decimated_unattributed` | A `sample(N)` read dropped the frames it popped and names none of them |
 | `read_identity_frames_unattributed` | An unlabelled topic's reads name more than one writer |
 | `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |
@@ -1074,7 +1074,8 @@ fed:
   (`read_identity_decimated_unattributed`): the decimated read names the last
   accepted frame, not the frames it popped and dropped.
 
-- On a bag recorded below format 9, a read that popped several frames
+- On a bag recorded below format 9, a read that popped several frames, and on
+  any bag a batch deeper than its read stage's window
   (`read_identity_batch_unattributed`): the read names only its newest frame.
 - A bag that starts mid-run (a `bag record --run` attach, a lapped ring, a
   Flashback window): a free-run replay refuses a mid-run bag before any feed is

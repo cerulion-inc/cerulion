@@ -38559,13 +38559,24 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
     rebind_annotations(&mut rec.trace);
     // Step 4 then pops BOTH queued frames and serves the newer, which is what a
     // drain-to-latest read does with a one-frame backlog. Its served sequence is
-    // unchanged: the newer of the two IS the frame it already served.
+    // unchanged: the newer of the two IS the frame it already served. From
+    // `trace_format` 9 the recorder names the older frame, seq 2, in a
+    // `BatchFrame` record just before the read.
     let caught_up = rec
         .trace
-        .iter_mut()
-        .find(|r| is_read_record(r) && r.step == HELD_STEP + 1)
+        .iter()
+        .position(|r| is_read_record(r) && r.step == HELD_STEP + 1)
         .expect("the step-4 kind-6 record exists");
-    caught_up.duration_ns = 2;
+    rec.trace[caught_up].duration_ns = 2;
+    let mut older = rec.trace[caught_up];
+    older.global_level = pack_read_outcome_meta(
+        0,
+        cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+        ReadSiteRole::Body,
+    );
+    older.fire_time_ns = HELD_STEP - 1;
+    older.duration_ns = 0;
+    rec.trace.insert(caught_up, older);
     assert_eq!(
         kind6_records(&rec),
         vec![
@@ -38573,6 +38584,14 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
             served(1),
             served(2),
             (3, 1, 0, READ_OUTCOME_HELD, 1, 0),
+            (
+                4,
+                1,
+                0,
+                cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+                2,
+                0
+            ),
             (4, 1, 0, READ_OUTCOME_SERVED, 3, 2),
             served(5),
         ],
@@ -40477,7 +40496,24 @@ fn a_short_duration_indexes_fewer_frames_than_the_whole_bag() {
     );
     let outcome = outcome.expect("the bounded fed replay runs under the bounded need");
     ri_assert_fed(&outcome);
-    assert!(outcome.passed, "{:?}", outcome.violations);
+    // The bound re-executes the first quarter of the steps, so the source's
+    // topic is short by the rest and that is the outcome's one violation; the
+    // reads inside the bound are fed and the read log stays clean.
+    match outcome.violations.as_slice() {
+        [v] if v.topic == "/riev/src/out" => match v.class {
+            ViolationClass::MissingMessages { recorded, replayed } => {
+                assert_eq!((recorded, replayed), (RI_STEPS, RI_STEPS / 4), "{v:?}");
+            }
+            ref other => panic!("expected MissingMessages, got {other:?}"),
+        },
+        other => panic!("one truncation violation on the source's topic: {other:?}"),
+    }
+    assert!(
+        outcome.trace_divergence.is_none() && outcome.read_log_divergence.is_none(),
+        "{:?} {:?}",
+        outcome.trace_divergence,
+        outcome.read_log_divergence
+    );
 }
 
 /// Two fed replays of graphs with identical node names run at the same time on
@@ -40699,27 +40735,28 @@ fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
     let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
     let slow_idx = live.rec.node_ids.iter().position(|n| n == "slow").unwrap() as u32;
     // The slow consumer's run-opening annotation, whose read POPPED a frame,
-    // and the sequence of the read it names.
+    // and the served sequence of that read. From `trace_format` 9 the
+    // annotation can precede the `BatchFrame` records of a read that popped
+    // several frames, which sit between it and the read.
     let trace = &live.rec.trace;
     let is_slow_read =
         |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == slow_idx;
-    let pos = (0..trace.len())
+    let (pos, named) = (0..trace.len())
         .filter(|&i| {
             is_slow_read(&trace[i])
                 && unpack_read_outcome_meta(trace[i].global_level).1
                     == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
         })
-        .find(|&i| {
-            trace[i + 1..]
+        .find_map(|i| {
+            let read = trace[i + 1..]
                 .iter()
-                .find(|r| is_slow_read(r))
-                .is_some_and(|r| {
-                    unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_SERVED
-                        && unpack_read_outcome_popped(r.duration_ns) > 0
-                })
+                .filter(|r| is_slow_read(r))
+                .find(|r| !is_batch_frame_record(r))?;
+            (unpack_read_outcome_meta(read.global_level).1 == READ_OUTCOME_SERVED
+                && unpack_read_outcome_popped(read.duration_ns) > 0)
+                .then_some((i, read.fire_time_ns))
         })
         .expect("the slow consumer's run opens with an annotation");
-    let named = live.rec.trace[pos].fire_time_ns;
     live.rec.trace.remove(pos);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("ri_dropped_identity.mcap");
@@ -40832,12 +40869,10 @@ fn ri_multi_writer_batch_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
     ])
 }
 
-/// A read that popped several frames on a topic with several writers names
-/// only its newest frame's writer, each read carrying its own annotation
-/// notwithstanding: the fed replay refuses it by name rather than feed a guess.
-#[test]
-#[serial]
-fn a_batch_on_a_multi_writer_edge_is_refused_by_name() {
+/// The multi-writer batch recording: some sink read popped more than one
+/// frame, and the read log names the frames it did not serve in `BatchFrame`
+/// records.
+fn ri_multi_writer_batch_live() -> RiLive {
     let live = ri_record(
         ri_multi_writer_batch_yaml(),
         ri_multi_writer_batch_factories,
@@ -40848,15 +40883,100 @@ fn a_batch_on_a_multi_writer_edge_is_refused_by_name() {
             && r.fire_time_ns != READ_OUTCOME_NO_FRAME
     });
     assert!(popped_two, "PREMISE: a read popped more than one frame");
+    assert!(
+        live.rec.trace.iter().any(is_batch_frame_record),
+        "PREMISE: the read log names a batch's other frames"
+    );
+    live
+}
+
+/// A `BatchFrame` record: one frame a read consumed and did not serve.
+fn is_batch_frame_record(r: &TraceRingRecord) -> bool {
+    r.record_type == RECORD_TYPE_READ_OUTCOME
+        && unpack_read_outcome_meta(r.global_level).1
+            == cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME
+}
+
+/// A read that popped several frames on a topic with several writers names
+/// each frame it did not serve in a `BatchFrame` record under that frame's
+/// own writer annotation, so the fed replay feeds every frame of the batch
+/// by `(writer, sequence)` and each replayed read equals the live read.
+#[test]
+#[serial]
+fn a_batch_on_a_multi_writer_edge_is_fed_each_frame_under_its_writer() {
+    let live = ri_multi_writer_batch_live();
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("ri_multi_writer_batch.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_multi_writer_batch_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("a batch on several writers is fed");
+    let (reads, frames) = ri_assert_fed(&outcome);
+    assert!(
+        frames > reads,
+        "the batches' other frames are fed: {reads} reads, {frames} frames"
+    );
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE multi_writer_batch: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// Remove every `BatchFrame` record and the producer annotation staged with it
+/// (the record just before it, on the same node and input); returns the
+/// `(batch frames, annotations)` removed.
+fn strip_batch_frames(trace: &mut Vec<TraceRingRecord>) -> (usize, usize) {
+    let mut keep = vec![true; trace.len()];
+    let (mut frames, mut annotations) = (0, 0);
+    for i in 0..trace.len() {
+        if !is_batch_frame_record(&trace[i]) {
+            continue;
+        }
+        keep[i] = false;
+        frames += 1;
+        let input = unpack_read_outcome_meta(trace[i].global_level).0;
+        if let Some(prev) = i.checked_sub(1) {
+            let p = &trace[prev];
+            if p.record_type == RECORD_TYPE_READ_OUTCOME
+                && p.node_idx == trace[i].node_idx
+                && unpack_read_outcome_meta(p.global_level)
+                    == (input, cerulion_core::trace_ring::READ_OUTCOME_PRODUCER)
+            {
+                keep[prev] = false;
+                annotations += 1;
+            }
+        }
+    }
+    let mut kept = keep.into_iter();
+    trace.retain(|_| kept.next().unwrap_or(true));
+    (frames, annotations)
+}
+
+/// The same recording with its `BatchFrame` records and their annotations
+/// removed, which is the read log of a recorder below `trace_format` 9 and of
+/// a batch deeper than its read stage's window: a read that popped several
+/// frames names only its newest. The fed replay refuses it by name rather than
+/// feed frames counted back from the served one.
+#[test]
+#[serial]
+fn a_batch_whose_frames_are_not_named_is_refused_by_name() {
+    let mut live = ri_multi_writer_batch_live();
+    let (frames, annotations) = strip_batch_frames(&mut live.rec.trace);
+    assert_eq!(
+        frames, annotations,
+        "PREMISE: an edge that annotates every read stages each batch frame with its annotation"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_multi_writer_batch_unnamed.mcap");
     ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
     let (outcome, _) = ri_replay(
         &bag,
         ri_multi_writer_batch_factories,
         replay_engine::ReplayPurpose::Verify,
     );
-    let err = outcome.expect_err("a batch on several writers is refused");
+    let err = outcome.expect_err("a batch whose frames are not named is refused");
     let msg = err.to_string();
     assert_eq!(err.exit_code(), 2, "{msg}");
     assert!(
