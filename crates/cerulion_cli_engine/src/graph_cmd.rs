@@ -25322,7 +25322,7 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let ready = tmp.path().join("never.ready");
         let running = AtomicBool::new(true);
-        let mut guard = spawn_fake("sleep 30");
+        let mut guard = spawn_fake("exec sleep 30");
         let err = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_millis(200))
             .expect_err("a never-ready child must time out");
         assert!(
@@ -25359,7 +25359,7 @@ nodes:
         let running = AtomicBool::new(true);
         // The fake child writes the sentinel itself then sleeps (still alive
         // when ready is observed — the production shape).
-        let mut guard = spawn_fake(&format!("touch {} && sleep 30", ready.display()));
+        let mut guard = spawn_fake(&format!("touch {} && exec sleep 30", ready.display()));
         let outcome = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_secs(10))
             .expect("sentinel must yield Ready");
         assert_eq!(outcome, BagdReadyWait::Ready);
@@ -25372,7 +25372,7 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let ready = tmp.path().join("never.ready");
         let running = AtomicBool::new(false); // Ctrl-C already observed
-        let mut guard = spawn_fake("sleep 30");
+        let mut guard = spawn_fake("exec sleep 30");
         let outcome = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_secs(10))
             .expect("Ctrl-C is NOT an error");
         assert_eq!(outcome, BagdReadyWait::CtrlC, "user abort → CtrlC, not Err");
@@ -25389,7 +25389,7 @@ nodes:
             other => panic!("a fast-exiting child must report Exited, got {other:?}"),
         }
         // TimedOut arm (child still running at the deadline).
-        let mut slow = spawn_fake("sleep 30");
+        let mut slow = spawn_fake("exec sleep 30");
         match wait_for_child_bounded(&mut slow, Duration::from_millis(150)) {
             ChildExitWait::TimedOut => {}
             other => panic!("a still-running child must report TimedOut, got {other:?}"),
@@ -27417,7 +27417,7 @@ nodes:
         );
 
         // TimedOut → the finalize-deadline message (kills + reaps the child).
-        let mut slow_guard = spawn_fake("sleep 30");
+        let mut slow_guard = spawn_fake("exec sleep 30");
         let err = report_bagd_outcome("g", &out, ChildExitWait::TimedOut, &mut slow_guard)
             .expect_err("a finalize timeout must be an error");
         let msg = err.to_string();
