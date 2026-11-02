@@ -11200,25 +11200,29 @@ fn feed_topic_labels(
 
 /// Index the recorded frames of `topics` by identity for the private feeds,
 /// keeping only the identities `need` names. Refuses with exit 2 when `need`
-/// is over `budget` bytes, before the bag is walked.
+/// and the producer `labels` of `topics` are over `budget` bytes, before the
+/// bag's frames are walked.
 fn build_feed_frame_index(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
     labels: &BTreeMap<String, crate::replay_feed::TopicLabels>,
-    need: &crate::replay_feed::FeedNeed,
+    need: crate::replay_feed::FeedNeed,
     budget: u64,
 ) -> Result<crate::replay_feed::FrameIndex, ReplayError> {
-    if let Err(over) = need.check_budget(budget) {
+    if let Err(over) = need.check_budget(budget, labels) {
         return Err(read_identity_refusal(
             None,
             "read_identity_feed_index_budget",
             format!(
                 "the reads this replay feeds need a feed index of {} bytes ({} frame \
-                 identities at {} bytes each), over the feed index budget of {} bytes; raise \
-                 it with `--feed-index-budget <BYTES>` or bound the replay with `--duration`",
+                 identities at {} bytes each and {} producer labels of the topics they read at \
+                 {} bytes each), over the feed index budget of {} bytes; raise it with \
+                 `--feed-index-budget <BYTES>` or bound the replay with `--duration`",
                 over.needed,
                 over.entries,
                 crate::replay_feed::FEED_INDEX_ENTRY_BYTES,
+                over.labels,
+                crate::replay_feed::FEED_LABEL_BYTES,
                 over.budget
             ),
         ));
@@ -11239,6 +11243,7 @@ fn build_feed_frame_index(
     let index = builder.finish();
     tracing::debug!(
         entries = index.entries(),
+        size_bytes = index.held_bytes(),
         "replay: feed index built over the selected reads"
     );
     Ok(index)
@@ -11594,7 +11599,7 @@ fn plan_bag_side_admissions(
             step_end,
         );
     }
-    let index = build_feed_frame_index(rm, &topics, &labels, &need, feed_index_budget)?;
+    let index = build_feed_frame_index(rm, &topics, &labels, need, feed_index_budget)?;
     let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
     for (rank, admission) in planned {
         let targets = rank_step_targets(trace, rank)?;

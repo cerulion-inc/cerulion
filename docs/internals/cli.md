@@ -37,8 +37,9 @@ bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
 (`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic labelled
 with the schema the re-executed graph publishes, a partial file removed on any run that does not finish, and the
 engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
-REQUIRE `--verify`, and so does `--feed-index-budget`, which bounds the frame index a
-fed replay builds (`replay_feed::FeedNeed`; default 1 GiB). Every misuse exits 2, never 1:
+REQUIRE `--verify`, and so does `--feed-index-budget`, the bytes a fed replay's frame
+index and the producer labels it reads are charged (`replay_feed::FeedNeed::check_budget`;
+default 1 GiB). Every misuse exits 2, never 1:
 under `--verify` 1 means "your code diverged", so a malformed invocation reported as 1
 would make CI announce a regression that does not exist.
 
