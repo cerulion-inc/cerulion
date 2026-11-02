@@ -97,6 +97,16 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   created, a native publisher's declared history does not reach native subscribers either.
   Data-only taps (`bag record`, the viz daemon) do not read the attribute and take the
   service history either way.
+- A data publisher whose own history request is above 0 is created with the iceoryx2 port
+  name `cerulion.retains` (`transport::RETAINING_PUBLISHER_NAME`, set in `finish_publisher`,
+  the one place every data publisher is built); a publisher that asks for none keeps the
+  default empty name. The name lives in the service's dynamic config, so
+  `TransportManager::topic_publisher_retain_marks` reads one flag per live publisher from
+  any process, and the publisher's drop (or iceoryx2's dead-node cleanup, for a crashed
+  process) removes it. It exists because the service history cannot say which publisher
+  retains: every publisher's ring is sized from the service. `rmw_cerulion` resolves a
+  BEST_AVAILABLE subscription from these flags. A publisher from a build without the
+  name reads as one that retains nothing.
 - Writer cursor contract (for anyone writing an independent frame reader): the
   variable-payload write cursor starts at `wire_fixed_size + 8·N` and only advances
   forward; a re-written variable field is appended at the tail, leaving interior dead

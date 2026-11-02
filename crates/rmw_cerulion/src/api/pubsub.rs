@@ -153,6 +153,56 @@ pub(crate) fn ros_topic_history_depth(slice_len: MaxSliceLen) -> usize {
     }
 }
 
+/// `RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE` where this build's rmw headers
+/// declare it (Iron and later), `None` where they do not (Foxy, Galactic,
+/// Humble), so the resolvers below compile to the same code on every distro
+/// and rcl there can never pass the value.
+#[cfg(cerulion_has_durability_best_available)]
+pub(crate) const DURABILITY_BEST_AVAILABLE: Option<u32> =
+    Some(ffi::RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE);
+/// `None`: this distro's rmw headers have no BEST_AVAILABLE durability.
+#[cfg(not(cerulion_has_durability_best_available))]
+pub(crate) const DURABILITY_BEST_AVAILABLE: Option<u32> = None;
+
+/// Whether `durability` is BEST_AVAILABLE on this build's distro.
+pub(crate) fn is_best_available_durability(durability: u32) -> bool {
+    Some(durability) == DURABILITY_BEST_AVAILABLE
+}
+
+/// The durability an rmw PUBLISHER is created with: BEST_AVAILABLE becomes
+/// TRANSIENT_LOCAL, as `rmw_dds_common` resolves it for a publisher, so the
+/// publisher retains its depth and carries the retaining mark. Every other
+/// value is returned unchanged.
+pub(crate) fn resolve_publisher_durability(requested: u32) -> u32 {
+    if is_best_available_durability(requested) {
+        ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
+    } else {
+        requested
+    }
+}
+
+/// The durability an rmw SUBSCRIPTION is created with, from what it asked
+/// for and one flag per publisher live on the topic when it is created
+/// (`true` when that publisher carries
+/// [`cerulion_core::transport::RETAINING_PUBLISHER_NAME`], in any process).
+///
+/// BEST_AVAILABLE becomes TRANSIENT_LOCAL when every flag is set, an empty
+/// slice included, and VOLATILE otherwise; the mark stands for "offers
+/// TRANSIENT_LOCAL". `rmw_dds_common` counts the same way but resolves an
+/// empty list VOLATILE (Jazzy, Rolling), because a later VOLATILE DDS writer
+/// would not match a TRANSIENT_LOCAL reader; this transport matches every
+/// publisher with every subscription. Every other value is returned
+/// unchanged, whatever the flags say.
+pub(crate) fn resolve_subscription_durability(requested: u32, publishers_retain: &[bool]) -> u32 {
+    if !is_best_available_durability(requested) {
+        requested
+    } else if publishers_retain.iter().all(|&retains| retains) {
+        ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
+    } else {
+        ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE
+    }
+}
+
 /// The slice bytes the subscriber floor may account for, summed over the
 /// floor's slots: [`ros_topic_create_subscribers`] divides it by the topic's
 /// slice ceiling. 1 GiB gives 8 slots at the 128 MiB tier (`sensor_msgs/Image`,
@@ -552,7 +602,9 @@ pub unsafe extern "C" fn rmw_create_publisher(
             }
         };
         // Transient-local durability maps to Cerulion history (late-joiner
-        // replay); the requested depth is clamped to [1, limit], where the limit
+        // replay), and so does BEST_AVAILABLE, which a publisher resolves to
+        // TRANSIENT_LOCAL (`resolve_publisher_durability`); the requested depth
+        // is clamped to [1, limit], where the limit
         // is the type's `ros_topic_history_depth` (16, or 12 above the 16 MiB
         // slice tier). Floor 1 so a TRANSIENT_LOCAL request always retains at
         // least one frame; the cap is the history every rmw endpoint creates
@@ -560,12 +612,12 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // warns when history exceeds 75% of the subscriber buffer; the create
         // floor provisions a buffer that holds the limit, and the ceiling raise
         // below sets this publisher's open requirement to match.
-        // VOLATILE (and any non-TRANSIENT_LOCAL durability) retains nothing
-        // (history = 0).
+        // VOLATILE (and any durability that does not resolve to
+        // TRANSIENT_LOCAL) asks for no history of its own (history = 0).
         //
         // `depth_governs_retention` rides the SAME branch on purpose (the
-        // retention-depth reporting rule): only a TRANSIENT_LOCAL
-        // ask participates in the retention at all. Every other durability
+        // retention-depth reporting rule): only an ask that resolves to
+        // TRANSIENT_LOCAL participates in the retention at all. Every other durability
         // retains 0 BECAUSE OF THE POLICY the caller chose — that is what
         // VOLATILE MEANS, not a divergence from the ask — so its create must
         // not warn. Deriving the flag here rather than re-testing the
@@ -576,8 +628,9 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // (`ros_topic_history_depth`), the clamp below and the create floor.
         let slice_len = slice_len_for(&bridge);
         let history_limit = ros_topic_history_depth(slice_len);
+        let durability = resolve_publisher_durability((*qos).durability);
         let (history, depth_governs_retention) =
-            if (*qos).durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
+            if durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
                 ((*qos).depth.clamp(1, history_limit), true)
             } else {
                 (0, false)
@@ -2442,9 +2495,28 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // The retained frames this subscription takes when it connects: a
         // VOLATILE subscription takes none, a TRANSIENT_LOCAL one up to its
         // depth (DDS durability). The core clamps the request to the service
-        // history and this port's buffer.
-        let history_request = if (*qos).durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
-        {
+        // history and this port's buffer. BEST_AVAILABLE is resolved here,
+        // once, from the retain mark of every publisher live on the topic in
+        // any process (`resolve_subscription_durability`); a later publisher
+        // does not change it. A publisher list the probe cannot read counts
+        // as one publisher without the mark.
+        let marks = if is_best_available_durability((*qos).durability) {
+            rt.transport
+                .topic_publisher_retain_marks(&topic)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        topic = %topic,
+                        error = %error,
+                        "BEST_AVAILABLE subscription: the topic's publishers could not be \
+                         read, so it resolves VOLATILE and takes no retained messages"
+                    );
+                    vec![false]
+                })
+        } else {
+            Vec::new()
+        };
+        let durability = resolve_subscription_durability((*qos).durability, &marks);
+        let history_request = if durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
             (*qos).depth.clamp(1, history_limit)
         } else {
             0
@@ -5044,5 +5116,102 @@ mod slice_ceiling_tests {
             SMALL_TIER
         );
         assert_eq!(slice_len_with_overrides(&colons, &narrowed).get(), 1024);
+    }
+}
+
+/// The durability resolvers against hand-written verdicts: BEST_AVAILABLE by
+/// the every-publisher-retains rule (an empty list resolves TRANSIENT_LOCAL,
+/// unlike current `rmw_dds_common`), every other value passed through.
+#[cfg(test)]
+mod durability_resolution_tests {
+    use super::*;
+
+    const TL: u32 = ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+    const VOLATILE: u32 = ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE;
+    const SYSTEM_DEFAULT: u32 = ffi::RMW_QOS_POLICY_DURABILITY_SYSTEM_DEFAULT;
+    const UNKNOWN: u32 = ffi::RMW_QOS_POLICY_DURABILITY_UNKNOWN;
+
+    #[cfg(cerulion_has_durability_best_available)]
+    const BA: u32 = ffi::RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE;
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn best_available_is_the_iron_header_value() {
+        assert_eq!(DURABILITY_BEST_AVAILABLE, Some(4));
+        assert!(is_best_available_durability(4));
+        for other in [0, 1, 2, 3, 5, u32::MAX] {
+            assert!(!is_best_available_durability(other), "{other}");
+        }
+    }
+
+    #[cfg(not(cerulion_has_durability_best_available))]
+    #[test]
+    fn without_the_iron_headers_no_value_is_best_available() {
+        assert_eq!(DURABILITY_BEST_AVAILABLE, None);
+        for value in 0..=8 {
+            assert!(!is_best_available_durability(value), "{value}");
+            assert_eq!(resolve_subscription_durability(value, &[]), value);
+            assert_eq!(resolve_publisher_durability(value), value);
+        }
+    }
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn a_best_available_subscription_is_transient_local_only_when_every_publisher_retains() {
+        let all_retain = [true; 64];
+        let mut last_does_not = [true; 65];
+        last_does_not[64] = false;
+        let cases: [(&[bool], u32); 9] = [
+            (&[], TL),
+            (&[true], TL),
+            (&[true, true, true], TL),
+            (&all_retain, TL),
+            (&[false], VOLATILE),
+            (&[false, false], VOLATILE),
+            (&[true, false], VOLATILE),
+            (&[false, true], VOLATILE),
+            (&last_does_not, VOLATILE),
+        ];
+        for (marks, want) in cases {
+            assert_eq!(
+                resolve_subscription_durability(BA, marks),
+                want,
+                "{} publishers, {} retaining",
+                marks.len(),
+                marks.iter().filter(|&&m| m).count()
+            );
+        }
+    }
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn a_best_available_publisher_is_transient_local() {
+        assert_eq!(resolve_publisher_durability(BA), TL);
+    }
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn the_resolution_is_the_same_on_every_call() {
+        for marks in [&[][..], &[true, true], &[true, false]] {
+            let first = resolve_subscription_durability(BA, marks);
+            for _ in 0..3 {
+                assert_eq!(resolve_subscription_durability(BA, marks), first);
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_durability_is_returned_unchanged_whatever_the_publishers() {
+        let mark_sets: [&[bool]; 4] = [&[], &[true], &[false], &[true, false]];
+        for requested in [TL, VOLATILE, SYSTEM_DEFAULT, UNKNOWN, 99, u32::MAX] {
+            for marks in mark_sets {
+                assert_eq!(
+                    resolve_subscription_durability(requested, marks),
+                    requested,
+                    "{requested} with {marks:?}"
+                );
+            }
+            assert_eq!(resolve_publisher_durability(requested), requested);
+        }
     }
 }

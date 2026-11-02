@@ -1311,6 +1311,26 @@ pub const INTROSPECTION_SUBSCRIBER_HEADROOM: usize = 5;
 /// graph (fan-out is node-count bounded).
 pub const MAX_REASONABLE_PORTS: usize = 4096;
 
+/// The iceoryx2 port name of every data publisher that asks for history of
+/// its own (`history_size > 0`): an `rmw_cerulion` TRANSIENT_LOCAL or
+/// BEST_AVAILABLE publisher, or a native publisher that declares history. A
+/// publisher that asks for none carries the default empty name.
+///
+/// The name lives in the service's dynamic config, which every process that
+/// opens the service reads, and leaves it with the publisher (its drop
+/// deregisters the port; iceoryx2's dead-node cleanup removes a crashed
+/// process's ports). [`TransportManager::topic_publisher_retain_marks`] reads
+/// it back, and an `rmw_cerulion` subscription that asks for BEST_AVAILABLE
+/// durability takes the retained messages only when every live publisher on
+/// the topic carries it. A publisher created by a build without this mark
+/// reads as one that retains nothing.
+pub const RETAINING_PUBLISHER_NAME: &str = "cerulion.retains";
+
+/// Whether an iceoryx2 publisher port name is [`RETAINING_PUBLISHER_NAME`].
+pub(crate) fn publisher_name_retains(name: &str) -> bool {
+    name == RETAINING_PUBLISHER_NAME
+}
+
 /// How a topic's publisher side is provisioned, derived
 /// from the graph topology. The `Multi` variant is the opt-in —
 /// call sites extend a `match`, not a second signature churn.
@@ -3335,6 +3355,15 @@ impl TransportManager {
         let mut publisher_builder = data_service
             .publisher_builder()
             .initial_max_slice_len(max_slice_len.get() as usize);
+        // A publisher that asks for history of its own states it in its port
+        // name, which other processes read from the service's dynamic config
+        // (`topic_publisher_retain_marks`). The service history alone cannot
+        // say it: every publisher's retained ring is sized from the service.
+        if history_size > 0 {
+            let name = PortName::new(RETAINING_PUBLISHER_NAME)
+                .map_err(|e| map_err(format!("retaining publisher port name: {e:?}")))?;
+            publisher_builder = publisher_builder.name(&name);
+        }
         if let Some(max_loaned) = topic_config.publisher_max_loaned_samples {
             // Raise the simultaneous-loan budget above the iceoryx2
             // default (2) — the rmw borrow window holds ~4 outstanding loans per
@@ -6119,6 +6148,49 @@ impl TransportManager {
         classify_producer_probe(probe)
     }
 
+    /// One entry per publisher attached to `topic`'s data service right now,
+    /// in every process: `true` when that publisher carries
+    /// [`RETAINING_PUBLISHER_NAME`] (it asked for history of its own).
+    ///
+    /// An empty list when the service does not exist, and when it exists with
+    /// no publisher.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::TopicPublishers`], naming the cause, when the topic
+    /// is not a valid service name, the service cannot be opened for a reason
+    /// other than not existing, or it states another wire header version.
+    pub fn topic_publisher_retain_marks(&self, topic: &str) -> TransportResult<Vec<bool>> {
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let map_err = |reason: String| TransportError::TopicPublishers {
+            topic: topic.to_string(),
+            reason,
+        };
+        let name: ServiceName = format!("{}/data", topic)
+            .as_str()
+            .try_into()
+            .map_err(|e| map_err(format!("{e}")))?;
+        match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service) => {
+                wire_header_attribute::check_opened(topic, service.attributes())
+                    .map_err(map_err)?;
+                let mut marks = Vec::new();
+                service.dynamic_config().list_publishers(|details| {
+                    marks.push(publisher_name_retains(details.publisher_name.as_str()));
+                    CallbackProgression::Continue
+                });
+                Ok(marks)
+            }
+            Err(PublishSubscribeOpenError::DoesNotExist) => Ok(Vec::new()),
+            Err(e) => Err(map_err(format!("{e}"))),
+        }
+    }
+
     /// Owned handle to the transport clock (the service layer
     /// stamps frames with it so replay runs under `VirtualClock` produce
     /// bit-identical timestamps).
@@ -7645,6 +7717,26 @@ mod node_name_refusal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the exact reserved name marks a retaining publisher, and it is a
+    /// valid iceoryx2 port name.
+    #[test]
+    fn only_the_reserved_port_name_marks_a_retaining_publisher() {
+        assert_eq!(RETAINING_PUBLISHER_NAME, "cerulion.retains");
+        assert!(publisher_name_retains("cerulion.retains"));
+        for other in [
+            "",
+            "cerulion.retain",
+            "cerulion.retains ",
+            " cerulion.retains",
+            "CERULION.RETAINS",
+            "cerulion.retains.x",
+            "retains",
+        ] {
+            assert!(!publisher_name_retains(other), "{other:?}");
+        }
+        assert!(PortName::new(RETAINING_PUBLISHER_NAME).is_ok());
+    }
 
     /// The startup sweep's FAILED-removal arm is the only surface of a fault
     /// with an operator remedy, so it is a `warn!` naming `cerulion clean`;

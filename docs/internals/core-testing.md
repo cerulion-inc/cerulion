@@ -168,7 +168,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `zero_alloc_test.rs` | Zero heap allocations on the receive path (unprobed, probed drop_oldest, sample-gated). | `#[serial]` | none |
 | `zero_copy_ci_test.rs` | Structural zero-copy verification (payload sizes, round-trip). | `#[serial]` | none |
 | `zero_copy_hot_path_test.rs` | Constant init cost + zero-alloc on the publisher (`loan_proxy`) side. | `#[serial]` | none |
-| `history_test.rs` | iceoryx2-native late-joiner history delivery. | tt1 | none |
+| `history_test.rs` | iceoryx2-native late-joiner history delivery; a publisher that asks for history carries the `cerulion.retains` port name, one that asks for none does not, and a dropped one leaves `topic_publisher_retain_marks`. | tt1 | none |
 | `pump_history_runtime_test.rs` | The runtime drives `pump_history` each live-loop iteration. | `#[serial]` | none |
 | `pump_history_e2e_test.rs` | Quiescent publisher delivers retained history to a late joiner, in-process AND cdylib nodes. | `#[serial]` | cdylib fixture (header names it) |
 | `pump_history_quiescent_test.rs` | Quiescent-state history behavior over an isolated per-test transport. | parallel | none |
