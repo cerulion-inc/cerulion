@@ -41,9 +41,8 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   takes an O(1) snapshot) and is EVENT-driven, never timed: the worker blocks on a kernel
   watch of the iceoryx2 service directory (`service_dir_watch`, inotify/kqueue) and walks
   only on a change, so an idle machine runs ZERO walks. An inline walk starves the drain;
-  a cadence burns a core. Degradations are loud (`warn!`; `wake_source()` reads the engine,
-  the recorder does not store it); a dead worker is caught by its HEARTBEAT
-  (`ScanSilenceLatch`), never by silence, normal here.
+  a cadence burns a core. Degradations are loud (`warn!`; the recorder does not store the
+  engine); a dead worker is caught by its HEARTBEAT (`ScanSilenceLatch`), not by silence.
 - Live discovery defaults ON only for `--topics-json` and `--run`; OFF for
   `--topic`/`--all`/`--regex` and `BagdConfig::new`. `graph run --record` builds bagd's argv
   itself: retune with `CERULION_RECORD_DISCOVERY=off` / `CERULION_RECORD_DISCOVERY_SETTLE_MS`.

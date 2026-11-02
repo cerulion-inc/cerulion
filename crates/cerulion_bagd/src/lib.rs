@@ -12937,7 +12937,8 @@ impl Recorder {
         let scan = discovery_scan::TopicScan {
             result: mgr.list_topics().map_err(|e| e.to_string()),
         };
-        self.apply_discovery(mgr, scan);
+        // Arm time has no retry clock to restart.
+        let _planned = self.apply_discovery(mgr, scan);
     }
 
     /// Tap what the recording is not yet covering — "data is truth"
@@ -12945,9 +12946,9 @@ impl Recorder {
     ///
     /// Takes an ALREADY-COMPLETED enumeration so the caller decides where the
     /// directory walk happens (the drive loop's comes off a worker
-    /// thread, arm time's is inline). Everything below this line is byte-for-byte
-    /// what discovery first shipped: this function judges a scan, it never performs
-    /// one.
+    /// thread, arm time's is inline). It judges a scan and never performs one:
+    /// the enumeration bookkeeping is here, the decision is `plan_and_attach`,
+    /// which the refused-attach retry shares.
     ///
     /// Best-effort by construction: enumeration walks the SHM service directory,
     /// which can fail. A failure must never abort a running recording — but it
@@ -12956,16 +12957,20 @@ impl Recorder {
     /// coverage manifest, which escalates the terminal line) and reported
     /// through the shared flood latch so a repeating failure re-announces
     /// instead of going quiet after the first line.
-    fn apply_discovery(&mut self, mgr: &TransportManager, scan: discovery_scan::TopicScan) {
+    ///
+    /// Returns whether the scan was PLANNED: `false` when discovery is off or
+    /// the enumeration failed, so the caller can tell a scan that re-tried the
+    /// refused attaches from one that did not.
+    fn apply_discovery(&mut self, mgr: &TransportManager, scan: discovery_scan::TopicScan) -> bool {
         if !self.cfg.discover_live {
-            return;
+            return false;
         }
         let live = match scan.result {
             Ok(live) => live,
             Err(e) => {
                 self.enumeration_failures += 1;
                 self.report_enumeration_failure(&e);
-                return;
+                return false;
             }
         };
         if let Some(suppressed) = self.enumeration_latch.on_success() {
@@ -12976,7 +12981,56 @@ impl Recorder {
             );
         }
         self.enumeration_ok = true;
+        self.plan_and_attach(mgr, &live);
+        true
+    }
 
+    /// Re-try every topic whose verdict can still change (an attach the
+    /// transport REFUSED), against the topics alone, with no directory walk.
+    ///
+    /// The verdict is retryable because it is transient: a subscriber slot
+    /// freed by a departing `topic echo` makes a refused attach succeed. Nothing
+    /// about that changes a FILE in the service directory, so nothing prompts a
+    /// walk, and an enumeration driven by directory changes would leave the
+    /// topic unrecorded beside a free slot until some unrelated change did. The drive loop calls this on the
+    /// enumeration cadence while no scan arrives; it costs one attach attempt
+    /// per refused topic and nothing at all when there is none.
+    ///
+    /// The decision is the same `plan_and_attach` a scan takes, so a retry
+    /// after the bag exists settles the topic exactly as a scan would. A
+    /// SETTLED topic (in `discovery_known`, which is where a verdict reached
+    /// after the bag exists goes) keeps its reason but is not retried again.
+    ///
+    /// Returns how many topics it re-planned.
+    fn retry_refused_attaches(&mut self, mgr: &TransportManager) -> usize {
+        if !self.cfg.discover_live {
+            return 0;
+        }
+        let retryable: Vec<String> = self
+            .discovery_ledger
+            .iter()
+            .filter(|(topic, reason)| {
+                !reason.is_terminal() && !self.discovery_known.contains(*topic)
+            })
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        if retryable.is_empty() {
+            return 0;
+        }
+        self.plan_and_attach(mgr, &retryable);
+        retryable.len()
+    }
+
+    /// Plan `live` against what the recorder already covers, attach what the
+    /// plan admits, and record a verdict for the rest.
+    ///
+    /// `live` is a full enumeration when a scan calls this and the retryable
+    /// topics alone when `retry_refused_attaches` does. The prune below keeps a
+    /// verdict only for a topic in `live` or a terminal one. A retry's `live`
+    /// holds every unsettled non-terminal verdict, and settled ones (kept out
+    /// of it) only exist once the bag does, when the first plan has already
+    /// settled or pruned every non-terminal verdict, so a retry prunes nothing.
+    fn plan_and_attach(&mut self, mgr: &TransportManager, live: &[String]) {
         let bag_created = self.bag_exists();
         let discovered_taps = self
             .taps
@@ -12984,7 +13038,7 @@ impl Recorder {
             .filter(|t| matches!(t.source, TapSource::Discovered))
             .count();
         let decision = discovery::plan_discovery(
-            &live,
+            live,
             &self.discovery_known,
             &self.mirrors,
             &self.discovery_excludes,
@@ -19193,6 +19247,11 @@ fn drive_loop(
     // sweeps immediately — a mid-run attach's rings are already there and
     // waiting a full interval for them would only delay the first anchor.
     let mut last_state_scan: Option<Instant> = None;
+    // When a planned scan last re-planned the refused attaches, or the retry
+    // last ran.
+    // The retry runs at most once per enumeration cadence; a planned scan
+    // re-plans them itself and restarts this clock.
+    let mut last_attach_retry: Option<Instant> = None;
     // BACKLOG-AWARE PACING: how long to sleep at the
     // TOP of the NEXT pass, decided from THIS pass's progress. `None` on the
     // first pass so a startup backlog drains immediately.
@@ -19345,7 +19404,16 @@ fn drive_loop(
         // directory changed. It hands back at most ONE scan per enumeration, so
         // the loop can never be handed the same snapshot twice.
         if let Some(scan) = scanner.next_scan(mgr) {
-            rec.apply_discovery(mgr, scan);
+            // A PLANNED scan re-tried the refused attaches itself.
+            if rec.apply_discovery(mgr, scan) {
+                last_attach_retry = Some(Instant::now());
+            }
+        } else if last_attach_retry.is_none_or(|t| t.elapsed() >= DISCOVERY_RESCAN_INTERVAL) {
+            // A refused attach is retried on the enumeration cadence even when
+            // no scan comes: what frees it (a subscriber leaving) changes no
+            // file in the service directory, so nothing prompts a walk.
+            last_attach_retry = Some(Instant::now());
+            let _replanned = rec.retry_refused_attaches(mgr);
         }
         // The settle decision, AFTER this pass's scan is applied: a scan that
         // just added a tap has restarted the quiet window, so the bag is never
@@ -23347,6 +23415,161 @@ mod tap_listener_drain_tests {
             !rec.taps[0].held.is_empty(),
             "the data-only tap must record frames via drain_owned polling (no listener)"
         );
+    }
+}
+
+#[cfg(test)]
+mod refused_attach_retry_tests {
+    //! A discovered topic whose attach the transport REFUSED is retried by
+    //! `Recorder::retry_refused_attaches`, with no scan, and attached once the
+    //! refusal clears.
+    //!
+    //! Driven on the `Recorder` directly so the retry is the ONLY thing that
+    //! can attach: through `run_bagd` any walk of the shared service directory
+    //! would re-plan the topic too, and a passing arm could not say which did.
+    use super::*;
+    use cerulion_core::clock::VirtualClock;
+    use cerulion_core::testing::iceoryx_test_config;
+    use cerulion_core::transport::TransportConfig;
+    use serial_test::serial;
+
+    fn isolated_manager() -> Arc<TransportManager> {
+        TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "bagd_retry".into(),
+                clock: Arc::new(VirtualClock::new()),
+                subscriber_buffer_size: 64,
+                network: None,
+            },
+            iceoryx_test_config(),
+        )
+        .expect("isolated transport manager")
+    }
+
+    /// A publisher whose service has exactly ONE subscriber slot.
+    fn one_slot_publisher(mgr: &TransportManager, topic: &str) -> CerulionPublisher {
+        let mut tc = mgr.default_topic_config();
+        tc.max_subscribers = Some(1);
+        mgr.create_publisher_with_topic_config(topic, MaxSliceLen::const_new(64), 0, tc)
+            .expect("one-slot publisher")
+    }
+
+    fn tapped(rec: &Recorder, topic: &str) -> bool {
+        rec.taps.iter().any(|t| t.topic == topic)
+    }
+
+    fn armed_recorder(mgr: &Arc<TransportManager>, declared: &str, tag: &str) -> Recorder {
+        let out =
+            std::env::temp_dir().join(format!("bagd_retry_{tag}_{}.mcap", std::process::id()));
+        let mut cfg = BagdConfig::new(out, vec![TapSpec::attach(declared)]);
+        cfg.discover_live = true;
+        cfg.status_period = None;
+        Recorder::setup(mgr, cfg, &AtomicBool::new(false)).expect("Recorder::setup")
+    }
+
+    /// Before the bag exists: refused while the slot is held, attached on the
+    /// first retry after it frees, and the earlier verdict cleared.
+    #[test]
+    #[serial]
+    fn a_refused_attach_is_attached_by_the_retry_once_its_slot_frees() {
+        let mgr = isolated_manager();
+        let declared = "/retry/declared";
+        let crowded = "/retry/crowded";
+        let _declared_pub = mgr
+            .create_publisher(declared, MaxSliceLen::const_new(64), 0)
+            .expect("declared publisher");
+        let _crowded_pub = one_slot_publisher(&mgr, crowded);
+        let holder = mgr
+            .create_data_only_subscriber(crowded)
+            .expect("the test takes the only slot");
+
+        let mut rec = armed_recorder(&mgr, declared, "attach");
+        // NONZERO CONTROL: the arm-time scan found the topic and was refused.
+        assert!(
+            matches!(
+                rec.discovery_ledger.get(crowded),
+                Some(UntappedReason::AttachFailed { .. })
+            ),
+            "the arm-time scan must record the refusal: {:?}",
+            rec.discovery_ledger
+        );
+        assert!(!tapped(&rec, crowded));
+
+        // Still held: the retry re-plans the one refused topic and is refused.
+        assert_eq!(rec.retry_refused_attaches(&mgr), 1);
+        assert!(!tapped(&rec, crowded), "the slot is still held");
+        assert!(matches!(
+            rec.discovery_ledger.get(crowded),
+            Some(UntappedReason::AttachFailed { .. })
+        ));
+
+        // Freed: the next retry attaches it, with no scan in between.
+        drop(holder);
+        assert_eq!(rec.retry_refused_attaches(&mgr), 1);
+        assert!(
+            tapped(&rec, crowded),
+            "the retry must attach a refused topic once its slot frees"
+        );
+        assert!(
+            !rec.discovery_ledger.contains_key(crowded),
+            "a retry that succeeds must clear the earlier verdict"
+        );
+        assert!(
+            rec.discovery_last_add.is_some(),
+            "a retry that attaches restarts the settle window, as a scan's find does"
+        );
+        // Nothing is refused any more, so the retry has nothing to do.
+        assert_eq!(rec.retry_refused_attaches(&mgr), 0);
+    }
+
+    /// After the bag exists: the retry SETTLES the refused topic (a tap opened
+    /// now would have no channel), keeps its reason, and never retries it again.
+    #[test]
+    #[serial]
+    fn after_the_bag_exists_the_retry_settles_a_refused_attach_once() {
+        let mgr = isolated_manager();
+        let declared = "/retry/declared_b";
+        let crowded = "/retry/crowded_b";
+        let _declared_pub = mgr
+            .create_publisher(declared, MaxSliceLen::const_new(64), 0)
+            .expect("declared publisher");
+        let _crowded_pub = one_slot_publisher(&mgr, crowded);
+        let holder = mgr
+            .create_data_only_subscriber(crowded)
+            .expect("the test takes the only slot");
+
+        let mut rec = armed_recorder(&mgr, declared, "settle");
+        rec.ensure_writer(true).expect("force-create the bag");
+        assert!(rec.bag_exists());
+
+        drop(holder);
+        assert_eq!(
+            rec.retry_refused_attaches(&mgr),
+            1,
+            "the first retry after creation must still look at the refused topic"
+        );
+        assert!(
+            !tapped(&rec, crowded),
+            "a topic attached after the bag exists would have no channel"
+        );
+        assert!(
+            matches!(
+                rec.discovery_ledger.get(crowded),
+                Some(UntappedReason::AttachFailed { .. })
+            ),
+            "the true reason must survive the settle, not become appeared-after-creation"
+        );
+        assert!(rec.discovery_known.contains(crowded));
+        assert_eq!(
+            rec.retry_refused_attaches(&mgr),
+            0,
+            "a settled topic is never retried again"
+        );
+        if let Ok(summary) = rec.finalize() {
+            for path in summary.bag_paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 

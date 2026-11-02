@@ -316,12 +316,20 @@ mod imp {
     /// chmod is the edge that matters. `IN_CREATE` / `IN_MOVED_TO` catch the
     /// file appearing, and the two removal events keep a torn-down topic from
     /// leaving the watch believing nothing has changed since.
+    ///
+    /// `IN_MOVE_SELF` is the WATCHED directory itself being renamed. The watch
+    /// follows the inode, so without it a service directory moved aside and
+    /// replaced would leave the watch on the old one with nothing to prompt the
+    /// identity re-check; with it the move is a change, and the re-check
+    /// re-targets to the replacement. (Removal needs no bit: inotify queues
+    /// `IN_IGNORED` whatever the mask.)
     const MASK: u32 = libc::IN_CREATE
         | libc::IN_MOVED_TO
         | libc::IN_MOVED_FROM
         | libc::IN_DELETE
         | libc::IN_ATTRIB
-        | libc::IN_CLOSE_WRITE;
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_MOVE_SELF;
 
     pub struct DirWatch {
         fd: libc::c_int,
@@ -871,6 +879,53 @@ mod tests {
             watch.wait(Duration::from_secs(5)),
             WatchWake::Changed,
             "the re-promoted watch must see files in the recreated directory"
+        );
+    }
+
+    /// A service directory MOVED ASIDE and replaced is followed to the
+    /// replacement.
+    ///
+    /// A kernel watch is bound to an inode, so the move leaves it on the old
+    /// directory. Unless the move itself is reported, nothing prompts the
+    /// identity re-check, and every service created in the replacement is
+    /// missed while the watch reads healthy.
+    #[test]
+    fn a_service_directory_moved_aside_and_replaced_is_followed_to_the_replacement() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let services = root.path().join("services");
+        std::fs::create_dir(&services).expect("create services dir");
+
+        let mut watch = match ServiceDirWatch::arm(root.path(), "services") {
+            Ok(w) => w,
+            Err(WatchError::Unsupported) => return,
+            Err(e) => panic!("arming on a real directory must succeed: {e}"),
+        };
+        let first = dir_identity(&services);
+        assert!(first.is_some());
+
+        std::fs::rename(&services, root.path().join("services.old")).expect("move it aside");
+        std::fs::create_dir(&services).expect("create the replacement");
+        let second = dir_identity(&services);
+        assert_ne!(
+            first, second,
+            "the replacement must be a different directory"
+        );
+        assert_eq!(
+            watch.wait(Duration::from_secs(5)),
+            WatchWake::Changed,
+            "moving the watched directory aside is a change worth enumerating"
+        );
+        assert_eq!(
+            watch.watched_id, second,
+            "the watch must be on the replacement, not on the directory that was moved aside"
+        );
+        // Drain anything the swap queued, then prove the new watch is live.
+        while watch.wait(Duration::from_millis(120)) == WatchWake::Changed {}
+        std::fs::write(services.join("f.service"), b"x").expect("write");
+        assert_eq!(
+            watch.wait(Duration::from_secs(5)),
+            WatchWake::Changed,
+            "a file in the replacement must wake the watch"
         );
     }
 

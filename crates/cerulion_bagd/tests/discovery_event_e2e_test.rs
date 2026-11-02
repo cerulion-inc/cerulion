@@ -687,6 +687,7 @@ fn the_settle_hold_is_decided_after_the_passes_scan_is_applied() {
     };
     let read_pending = at("scanner.walk_pending()");
     let take_scan = at("scanner.next_scan(");
+    let retry = at("rec.retry_refused_attaches(");
     let decide = at("discovery_hold_active(");
     let create = at("ensure_writer(");
     assert!(
@@ -698,6 +699,11 @@ fn the_settle_hold_is_decided_after_the_passes_scan_is_applied() {
         take_scan < decide,
         "the settle hold must be decided AFTER this pass's scan is applied, or a find in that \
          scan is created into a bag whose quiet window it should have restarted"
+    );
+    assert!(
+        retry < decide,
+        "a refused attach that succeeds on retry restarts the quiet window too, so the retry \
+         must also run before the hold is decided"
     );
     assert!(
         decide < create,
@@ -838,6 +844,90 @@ fn the_watch_is_armed_before_the_workers_baseline_walk() {
          enumerated for the life of the recording while every observable reads healthy. Body:\n\
          {body}"
     );
+}
+
+// ===========================================================================
+// End to end: a refused attach is retried with no directory change.
+// ===========================================================================
+
+/// A discovered topic whose attach was REFUSED is retried and recorded once a
+/// subscriber slot frees, although no file in the service directory changes.
+///
+/// A refused attach is transient: here the topic provisions ONE subscriber
+/// slot and the test holds it, so the recorder's tap is refused, and dropping
+/// the holder frees the slot. Freeing a slot writes the service's dynamic
+/// state, never the service directory, so an enumeration driven by directory
+/// changes alone would never look at the topic again and would leave it
+/// unrecorded beside a free slot.
+///
+/// Bag creation is held off for the whole arm by a declared tap that never
+/// publishes (its schema is never learned, so nothing creates the bag before
+/// the schema wait), which keeps the retry inside the window where a new tap
+/// still gets a channel.
+///
+/// An end-to-end smoke test, not the pin: a walk of the shared service
+/// directory caused by anything else on the machine would re-plan the topic
+/// too, so this arm can pass without the retry on a busy machine. The pin is
+/// `refused_attach_retry_tests` in `lib.rs`, which drives the retry alone.
+#[test]
+#[serial_test::serial]
+fn a_refused_attach_is_retried_once_its_slot_frees_without_a_directory_change() {
+    let mgr = make_manager(16);
+    let declared = unique_topic("retry-declared");
+    let crowded = unique_topic("retry-crowded");
+    let out = unique_out("retry");
+    let ready = unique_out("retry_ready");
+    let _declared_pub = publisher_with_provisioning(&mgr, &declared, 8, 16, 4096);
+    let mut crowded_pub = publisher_with_subscriber_slots(&mgr, &crowded, 1, 4096);
+    let slot_holder = mgr
+        .create_data_only_subscriber(&crowded)
+        .expect("the test takes the topic's only subscriber slot");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut cfg = BagdConfig::new(out.clone(), vec![TapSpec::attach(&declared)]);
+    cfg.flush_interval = Duration::from_millis(20);
+    cfg.ready_file = Some(ready.clone());
+    cfg.status_period = None;
+    // Longer than `DEADLINE`, so a late attach reads as a missing retry and
+    // never as a bag that was created first.
+    cfg.schema_wait = Duration::from_secs(30);
+    cfg.discover_live = true;
+    let mgr_for_bagd = mgr.clone();
+    let flag = shutdown.clone();
+    let handle = std::thread::spawn(move || run_bagd(mgr_for_bagd, cfg, flag));
+    assert!(wait_for_file(&ready, Duration::from_secs(10)), "bagd ready");
+
+    // Not a rendezvous: this spends the worker's first walk and the tail
+    // behind it, so that on a quiet machine the attach below can only come
+    // from the retry.
+    std::thread::sleep(EVENT_CONFIRM_DELAY * (CONFIRM_WALKS + 1) + Duration::from_millis(200));
+    assert_eq!(
+        mgr.topic_subscriber_count(&crowded),
+        1,
+        "the topic has one slot and the test holds it"
+    );
+
+    drop(slot_holder);
+    await_condition("the recorder to retry the refused attach", || {
+        mgr.topic_subscriber_count(&crowded) >= 1
+    });
+
+    let frame = build_frame(HASH, 0, 1_000, b"retried");
+    crowded_pub.publish_raw(&frame).expect("publish");
+    std::thread::sleep(Duration::from_millis(300));
+    shutdown.store(true, Ordering::Relaxed);
+    let summary = handle.join().expect("bagd thread").expect("clean finalize");
+
+    let coverage = &summary.record_coverage;
+    let entry = coverage.tapped.get(&crowded).unwrap_or_else(|| {
+        panic!("a refused attach whose slot freed must end up recorded: {coverage:?}")
+    });
+    assert_eq!(entry.source, TapSource::Discovered);
+    assert!(
+        !coverage.untapped.contains_key(&crowded),
+        "a retry that succeeds must clear the earlier verdict: {coverage:?}"
+    );
+    cleanup(&out);
 }
 
 // ===========================================================================
