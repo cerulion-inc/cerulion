@@ -58,9 +58,12 @@ const fn decimal_digits(mut n: u64) -> usize {
     digits
 }
 
-/// The longest identifier [`new_replay_id`] mints: `p`, a `u32` process id,
-/// `r`, a `u64` counter.
-const REPLAY_ID_MAX_LEN: usize = 1 + decimal_digits(u32::MAX as u64) + 1 + decimal_digits(u64::MAX);
+/// Hex digits of the 128-bit unique system id a replay identifier carries.
+const REPLAY_ID_HEX_LEN: usize = 32;
+
+/// The length of every identifier [`new_replay_id`] mints: `u` and the
+/// [`REPLAY_ID_HEX_LEN`] hex digits of its unique system id.
+const REPLAY_ID_MAX_LEN: usize = 1 + REPLAY_ID_HEX_LEN;
 
 /// The longest stage role label a feed name carries.
 const ROLE_LABEL_MAX_LEN: usize = {
@@ -121,19 +124,36 @@ pub fn replay_feed_topic(replay_id: &str, key: &StageKey) -> String {
     )
 }
 
-/// A fresh identifier for ONE replay: this process's id plus a per-process
-/// counter, so two concurrent replays (two processes, or two in one process)
-/// name disjoint feed services.
-#[must_use]
-pub fn new_replay_id() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    replay_id_of(std::process::id(), n)
+/// A fresh identifier for ONE replay: `u` and the 32 lowercase hex digits of
+/// a fresh iceoryx2 `UniqueSystemId`. That id packs the process id, the
+/// creation time to the nanosecond and a per-process counter, so two replays
+/// in one process carry two counter values, and two processes that share an
+/// iceoryx2 root, in separate PID namespaces included, carry the same
+/// identifier only when they hold one process id and mint at the same
+/// nanosecond as the same counter value.
+///
+/// # Errors
+///
+/// [`ReplayIdUnavailable`] when the clock the id reads cannot be read.
+pub fn new_replay_id() -> Result<String, ReplayIdUnavailable> {
+    let id = iceoryx2_bb_posix::unique_system_id::UniqueSystemId::new().map_err(|e| {
+        ReplayIdUnavailable {
+            detail: format!("{e:?}"),
+        }
+    })?;
+    Ok(replay_id_of(id.value()))
 }
 
-/// The identifier of replay `n` of process `pid`.
-fn replay_id_of(pid: u32, n: u64) -> String {
-    format!("p{pid}r{n}")
+/// The identifier of the replay whose unique system id is `value`.
+fn replay_id_of(value: u128) -> String {
+    format!("u{value:0width$x}", width = REPLAY_ID_HEX_LEN)
+}
+
+/// A replay identifier could not be minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayIdUnavailable {
+    /// What failed, as iceoryx2 reports it.
+    pub detail: String,
 }
 
 /// The service config a fed stage's subscriber creates its feed with.
@@ -354,8 +374,9 @@ pub struct ReplayWiring {
     /// The annotation rule, which must be the recording's so both sides stage
     /// the same records.
     pub identity: EdgeIdentity,
-    /// Unique to ONE replay: every private feed service name carries it, so two replays
-    /// sharing an iceoryx2 config never attach to each other's feeds.
+    /// The replay's identifier ([`new_replay_id`]): every private feed
+    /// service name carries it, so two replays sharing an iceoryx2 config
+    /// attach to each other's feeds only when their identifiers are equal.
     pub replay_id: String,
     /// `Some` = every read stage subscribes to its [`replay_feed_topic`]; the
     /// map names the buffer a stage's feed needs (the deepest single recorded
@@ -419,12 +440,12 @@ mod tests {
     fn a_feed_name_for_a_300_character_node_id_passes_topic_validation() {
         let node = "n".repeat(300);
         let longest = replay_feed_topic(
-            &replay_id_of(u32::MAX, u64::MAX),
+            &replay_id_of(u128::MAX),
             &key_of(&node, u16::MAX, ReadStageRole::Drain),
         );
         assert_eq!(longest.len(), REPLAY_FEED_TOPIC_MAX_LEN, "{longest}");
         assert_eq!(
-            REPLAY_FEED_TOPIC_MAX_LEN, 85,
+            REPLAY_FEED_TOPIC_MAX_LEN, 86,
             "docs/bag.md states this bound"
         );
         assert_eq!(
@@ -432,7 +453,10 @@ mod tests {
             Ok(()),
             "{longest}"
         );
-        let minted = replay_feed_topic(&new_replay_id(), &key_of(&node, 0, ReadStageRole::Body));
+        let minted = replay_feed_topic(
+            &new_replay_id().expect("the clock reads"),
+            &key_of(&node, 0, ReadStageRole::Body),
+        );
         assert_eq!(
             crate::transport::validate_topic_name(&minted),
             Ok(()),
@@ -496,7 +520,33 @@ mod tests {
                 replay_feed_topic("replay-b", &key(role))
             );
         }
-        assert_ne!(new_replay_id(), new_replay_id());
+        assert_ne!(
+            new_replay_id().expect("the clock reads"),
+            new_replay_id().expect("the clock reads")
+        );
+    }
+
+    /// A replay identifier is `u` and all 128 bits of its unique system id in
+    /// hex, so two ids that differ in any one field, the creation time of two
+    /// processes holding one process id in two PID namespaces included, name
+    /// two replays.
+    ///
+    /// Hand oracle: `100 | 7 << 64` and the same value plus `1 << 32` render as
+    /// the two 32 digit strings below, differing in one digit.
+    #[test]
+    fn a_replay_id_carries_every_bit_of_its_unique_system_id() {
+        let at = |nanoseconds: u128| 100 | (nanoseconds << 32) | (7 << 64);
+        assert_eq!(replay_id_of(at(0)), "u00000000000000070000000000000064");
+        assert_eq!(replay_id_of(at(1)), "u00000000000000070000000100000064");
+        assert_eq!(replay_id_of(u128::MAX).len(), REPLAY_ID_MAX_LEN);
+        let minted = new_replay_id().expect("the clock reads");
+        assert_eq!(minted.len(), REPLAY_ID_MAX_LEN, "{minted}");
+        assert!(
+            minted[1..]
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{minted}"
+        );
     }
 
     #[test]

@@ -1022,11 +1022,14 @@ stages the recording's records on it and truncates at the same rim.
 node's body read, and its trigger drain where it has one) subscribes to its own
 service,
 `/__cerulion/replay_feed/<replay id>/<node digest>/<input index>/<body|drain>`,
-and nothing else publishes there. The replay id is unique to one replay, so two
-replays sharing an iceoryx2 config never share a feed. The node digest is 16
-lowercase hex digits of the FNV-1a hash of the node id, so a feed name is at
-most 85 characters whatever the node id's length, inside the 249 character
-topic limit. When a read is about to pop, the replay publishes
+and nothing else publishes there. The replay id is `u` and the 32 hex digits of
+an iceoryx2 unique system id, which packs the process id, the creation time to
+the nanosecond and a per-process counter, so two replays sharing an iceoryx2
+config, in separate PID namespaces included, share a feed only when both mint
+their id under one process id at the same nanosecond with the same counter. The
+node digest is 16 lowercase hex digits of the FNV-1a hash of the node id, so a
+feed name is at most 86 characters whatever the node id's length, inside the
+249 character topic limit. When a read is about to pop, the replay publishes
 onto that service exactly the frames the recorded read consumed, found in the
 bag by `(writer, sequence)`: a multi-writer topic's frames carry the
 recorder's per-frame producer labels (`__cerulion/frame_producers`), and a

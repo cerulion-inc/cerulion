@@ -4268,7 +4268,13 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     )?;
     let mut fed_totals = (0usize, 0usize);
     // One identifier per replay, named into every private feed service.
-    let replay_id = cerulion_core::replay_feed::new_replay_id();
+    let replay_id =
+        cerulion_core::replay_feed::new_replay_id().map_err(|e| ReplayError::Internal {
+            reason: format!(
+                "the replay's private feed identifier could not be minted: {}",
+                e.detail
+            ),
+        })?;
 
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {
