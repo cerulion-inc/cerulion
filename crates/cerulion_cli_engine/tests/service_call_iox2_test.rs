@@ -194,6 +194,40 @@ fn an_empty_request_reaches_a_server_with_a_nested_array_response() {
 }
 
 #[test]
+fn a_cleared_running_flag_sends_no_request_to_a_ready_server() {
+    let dir = store();
+    let ready = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = serve(
+        "/service_call_test/stopped/list_controllers",
+        "controller_manager_msgs/ListControllers",
+        r#"{"controller": []}"#,
+        dir.path().to_path_buf(),
+        ready.clone(),
+        stop.clone(),
+    );
+    wait_ready(&ready);
+    let running = AtomicBool::new(false);
+    let req = CallRequest {
+        service: "/service_call_test/stopped/list_controllers",
+        type_name: "controller_manager_msgs/ListControllers",
+        request: "{}",
+        timeout: Duration::from_secs(10),
+    };
+    let err = service_call(&req, Some(dir.path()), &running).unwrap_err();
+    // Long enough for a request that did go out to be taken.
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::SeqCst);
+    let seen = server.join().unwrap();
+    assert_eq!(err.exit_code(), EXIT_UNAVAILABLE, "{err}");
+    assert!(
+        err.to_string().contains("before its request was sent"),
+        "{err}"
+    );
+    assert!(seen.is_empty(), "the server took {seen:?}");
+}
+
+#[test]
 fn a_call_with_no_server_is_unavailable_after_the_timeout() {
     let dir = store();
     let running = AtomicBool::new(true);

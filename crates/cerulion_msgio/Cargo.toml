@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Messages as JSON or YAML text on local shared memory: encode and publish, call a service, snapshot a camera frame, decode one message"
+readme = "README.md"
+keywords = ["robotics", "ros2", "json", "yaml", "cerulion"]
+categories = ["science::robotics", "encoding"]
+# A crates.io download carries the sources, the README, the license text and
+# this manifest.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 
 [lints]
 workspace = true

@@ -37,7 +37,7 @@ const ISSUED: u64 = 500_000_000_000;
 const EXPIRY: u64 = 2_000_000_000_000; // > T_NOW (1e12), < grant_validity (1e14)
 const CHASSIS: &[u8] = b"daemon-gate-chassis-secret-not-serial-derived";
 const OWNER: AccountId = AccountId([10; 32]);
-const SUBJECT: AccountId = AccountId([0x5C; 32]); // != OWNER ([10;32]) — not a self-grant
+const SUBJECT: AccountId = AccountId([0x5C; 32]); // != OWNER ([10;32]), not a self-grant
 const ROBOT: RobotId = RobotId([0x0B; 32]);
 
 fn unique_id() -> String {

@@ -2859,11 +2859,12 @@ jobs:
         run: |
           echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
-      # `cerulion_msgio` — messages as text on local shared memory (publish,
-      # service call, snapshot, decode), extracted from `cerulion_cli_engine` so
-      # `cerulion-remoted` serves the same operations as ops verbs. Named here for
-      # the same reason as `cerulion_discovery` above: an extraction un-runs its
-      # tests unless the new package has its own step.
+      # `cerulion_msgio`: messages as text on local shared memory (publish,
+      # service call, snapshot, decode), used by `cerulion_cli_engine` and by
+      # `cerulion-remoted`, which serves the same operations as ops verbs. The
+      # schema store moved here from `cerulion_cli_engine`. Named here for the
+      # same reason as `cerulion_discovery` above: these jobs run only the
+      # packages they name.
       - name: cerulion_msgio tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
         run: cargo test -p cerulion_msgio
@@ -3723,11 +3724,12 @@ jobs:
         run: |
           echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
-      # `cerulion_msgio` — messages as text on local shared memory (publish,
-      # service call, snapshot, decode), extracted from `cerulion_cli_engine` so
-      # `cerulion-remoted` serves the same operations as ops verbs. Named here for
-      # the same reason as `cerulion_discovery` above: an extraction un-runs its
-      # tests unless the new package has its own step.
+      # `cerulion_msgio`: messages as text on local shared memory (publish,
+      # service call, snapshot, decode), used by `cerulion_cli_engine` and by
+      # `cerulion-remoted`, which serves the same operations as ops verbs. The
+      # schema store moved here from `cerulion_cli_engine`. Named here for the
+      # same reason as `cerulion_discovery` above: these jobs run only the
+      # packages they name.
       - name: cerulion_msgio tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
         run: cargo test -p cerulion_msgio

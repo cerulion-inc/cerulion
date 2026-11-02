@@ -179,7 +179,9 @@ in the directory `CERULION_REMOTED_SCHEMAS_DIR` names. Publishing and calling
 a service need an access row with the teleoperate capability; a snapshot
 needs observe. The output and exit codes are the local ones; a snapshot's
 JPEG is written on this machine. A robot that cannot be reached exits 3, and
-one that refuses the call exits 1 with its reason.
+one that refuses the call exits 1 with its reason. Ctrl+C ends the command on
+this machine only: a publish already running on the robot sends its remaining
+frames, and engaging the robot's e-stop stops it.
 
 ### Message YAML
 

@@ -269,6 +269,38 @@ fn service_call_with_no_server_is_unavailable() {
 }
 
 #[test]
+fn an_estop_engaged_during_the_server_wait_stops_the_call_as_unavailable() {
+    store();
+    let l = lease();
+    let engager = {
+        let l = l.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            l.lock().unwrap().engage_estop("test");
+        })
+    };
+    let started = std::time::Instant::now();
+    let err = ServiceCallVerb::new(l)
+        .execute(
+            &json!({"service": "/act_verbs_test/call/estop", "type": "demo_srvs/srv/Ping",
+                         "timeout_s": 10}),
+        )
+        .unwrap_err();
+    engager.join().unwrap();
+    match err {
+        CerudError::Verb(m) => assert!(
+            m.starts_with("unavailable: ") && m.contains("e-stop engaged"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the wait ended at the e-stop"
+    );
+}
+
+#[test]
 fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable() {
     store();
     let l = lease();

@@ -14,7 +14,10 @@
 use cerulion_core::codegen::{
     DefaultLiteral, FieldType, FrameWalker, MessageSchema, ScalarLiteral,
 };
-use cerulion_core::dynamic::{message_to_yaml, yaml_to_message, DynamicError, MAX_YAML_DEPTH};
+use cerulion_core::dynamic::{
+    find_anchor_or_alias, message_to_yaml, yaml_to_message, DynamicError, MAX_YAML_DEPTH,
+    MAX_YAML_INPUT_BYTES,
+};
 use cerulion_core::wire::{StepTag, WireHeader};
 use serde_yaml::{Mapping, Number, Value};
 
@@ -27,6 +30,12 @@ pub const EXIT_USAGE: u8 = 2;
 /// Exit code for nothing answering in time: no service server, no response,
 /// no frame.
 pub const EXIT_UNAVAILABLE: u8 = 3;
+
+/// The most values [`message_frame`] inserts for the fields a text leaves
+/// out (262,144). Each inserted value is held in the value tree, in its
+/// re-serialized text and in the tree the codec parses from that text, so
+/// the count bounds what a short text (an array of `{}` elements) costs.
+pub const MAX_FILLED_VALUES: usize = 1 << 18;
 
 /// A failure of `topic pub`, `service call` or `topic snapshot`, carrying
 /// its exit code class.
@@ -156,9 +165,11 @@ pub fn qualified_type_name(input: &str, kind: InterfaceKind) -> Result<String, V
 /// the header and sequence 0. Omitted fields take their declared default or
 /// zero value (see the module docs).
 ///
-/// Errors: text that is not one JSON or YAML document is a
+/// Errors: text that is not one JSON or YAML document, is longer than
+/// [`MAX_YAML_INPUT_BYTES`] or holds an anchor or alias is a
 /// [`VerbError::Usage`]; a value that does not fit its field, an unknown
-/// field name, a wrong array length and every other codec refusal is a
+/// field name, a wrong array length, omitted fields that expand past
+/// [`MAX_FILLED_VALUES`] and every other codec refusal is a
 /// [`VerbError::Encode`] naming the field path.
 pub fn message_frame(
     walker: &FrameWalker,
@@ -170,15 +181,36 @@ pub fn message_frame(
         .schema_for_name(schema)
         .ok_or_else(|| VerbError::Usage(format!("unknown message type '{schema}'")))?;
     let mut value = parse_message_text(text)?;
-    fill_omitted_fields(walker, target, &mut value, 0);
+    let mut budget = MAX_FILLED_VALUES;
+    fill_omitted_fields(walker, target, &mut value, 0, &mut budget)?;
     let filled = serde_yaml::to_string(&value)
         .map_err(|e| VerbError::Encode(format!("could not re-serialize the message: {e}")))?;
     yaml_to_message(walker, schema, filled.as_bytes(), timestamp_ns).map_err(codec_error)
 }
 
 /// One JSON or YAML document as a value tree; empty text or `null` is the
-/// empty mapping.
+/// empty mapping. The text is checked as the codec checks its own input
+/// before it is parsed: its length against [`MAX_YAML_INPUT_BYTES`], and for
+/// an anchor or alias, which the parser would expand at every reference.
 fn parse_message_text(text: &str) -> Result<Value, VerbError> {
+    parse_message_text_capped(text, MAX_YAML_INPUT_BYTES)
+}
+
+/// [`parse_message_text`] with the input cap as a parameter, so tests can
+/// reach it with small inputs.
+fn parse_message_text_capped(text: &str, max_bytes: usize) -> Result<Value, VerbError> {
+    if text.len() > max_bytes {
+        return Err(codec_error(DynamicError::YamlInputTooLarge {
+            len: text.len(),
+            max_bytes,
+        }));
+    }
+    if let Some((line, column)) = find_anchor_or_alias(text) {
+        return Err(codec_error(DynamicError::YamlAnchorOrAlias {
+            line,
+            column,
+        }));
+    }
     let value: Value = serde_yaml::from_str(text).map_err(|e| {
         VerbError::Usage(format!("the message is not one JSON or YAML document: {e}"))
     })?;
@@ -201,37 +233,52 @@ fn codec_error(e: DynamicError) -> VerbError {
     }
 }
 
+/// Take `n` values from `budget`; a [`VerbError::Encode`] when fewer are
+/// left.
+fn charge(budget: &mut usize, n: usize) -> Result<(), VerbError> {
+    *budget = budget.checked_sub(n).ok_or_else(|| {
+        VerbError::Encode(format!(
+            "the fields the message leaves out expand to more than {MAX_FILLED_VALUES} values; \
+             write more of the message out"
+        ))
+    })?;
+    Ok(())
+}
+
 /// Insert every field of `schema` that the mapping `value` leaves out, with
 /// its default, and recurse into the nested messages it does give. A value
 /// that is not a mapping is left as it is, for the codec to refuse with its
 /// field path. Past [`MAX_YAML_DEPTH`] nothing is filled, so a schema that
-/// refers to itself stops here and the codec reports the depth.
+/// refers to itself stops here and the codec reports the depth. Every
+/// inserted value is charged to `budget`.
 fn fill_omitted_fields(
     walker: &FrameWalker,
     schema: &MessageSchema,
     value: &mut Value,
     depth: usize,
-) {
+    budget: &mut usize,
+) -> Result<(), VerbError> {
     if depth > MAX_YAML_DEPTH {
-        return;
+        return Ok(());
     }
     let Value::Mapping(map) = value else {
-        return;
+        return Ok(());
     };
     let parent = schema.package.as_deref();
     for field in &schema.fields {
         let key = Value::String(field.name.clone());
         match map.get_mut(&key) {
-            Some(given) => fill_given(walker, &field.field_type, given, parent, depth),
+            Some(given) => fill_given(walker, &field.field_type, given, parent, depth, budget)?,
             None => {
                 let default = match &field.default_literal {
-                    Some(literal) => literal_value(literal),
-                    None => zero_value(walker, &field.field_type, parent, depth),
+                    Some(literal) => literal_value(literal, budget)?,
+                    None => zero_value(walker, &field.field_type, parent, depth, budget)?,
                 };
                 map.insert(key, default);
             }
         }
     }
+    Ok(())
 }
 
 /// Recurse into a given value of type `ft` that holds messages: a nested
@@ -242,7 +289,8 @@ fn fill_given(
     value: &mut Value,
     parent: Option<&str>,
     depth: usize,
-) {
+    budget: &mut usize,
+) -> Result<(), VerbError> {
     match ft {
         FieldType::Nested {
             schema_name,
@@ -250,24 +298,34 @@ fn fill_given(
             ..
         } => {
             if let Some((_, nested)) = walker.nested_target(schema_name, package, parent) {
-                fill_omitted_fields(walker, nested, value, depth + 1);
+                fill_omitted_fields(walker, nested, value, depth + 1, budget)?;
             }
         }
         FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
             if let Value::Sequence(items) = value {
                 for item in items {
-                    fill_given(walker, element_type, item, parent, depth + 1);
+                    fill_given(walker, element_type, item, parent, depth + 1, budget)?;
                 }
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// The zero value of a field of type `ft`: `false`, `0`, `0.0`, `""`, `[]`,
-/// a fixed array of zero elements, or a nested message of defaults.
-fn zero_value(walker: &FrameWalker, ft: &FieldType, parent: Option<&str>, depth: usize) -> Value {
-    match ft {
+/// a fixed array of zero elements, or a nested message of defaults. Every
+/// value it builds is charged to `budget`, a fixed array's copies of its
+/// element before they are made.
+fn zero_value(
+    walker: &FrameWalker,
+    ft: &FieldType,
+    parent: Option<&str>,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Value, VerbError> {
+    charge(budget, 1)?;
+    Ok(match ft {
         FieldType::Bool => Value::Bool(false),
         FieldType::I8
         | FieldType::U8
@@ -284,23 +342,32 @@ fn zero_value(walker: &FrameWalker, ft: &FieldType, parent: Option<&str>, depth:
             element_type,
             length,
         } => {
-            let element = zero_value(walker, element_type, parent, depth + 1);
+            let before = *budget;
+            let element = zero_value(walker, element_type, parent, depth + 1, budget)?;
+            let per_element = before - *budget;
+            charge(budget, per_element.saturating_mul(length.saturating_sub(1)))?;
             Value::Sequence(vec![element; *length])
         }
         FieldType::Nested { .. } => {
             let mut message = Value::Mapping(Mapping::new());
-            fill_given(walker, ft, &mut message, parent, depth);
+            fill_given(walker, ft, &mut message, parent, depth, budget)?;
             message
         }
-    }
+    })
 }
 
-/// A `.msg` default as a YAML value.
-fn literal_value(literal: &DefaultLiteral) -> Value {
-    match literal {
-        DefaultLiteral::Scalar(s) => scalar_value(s),
-        DefaultLiteral::Array(items) => Value::Sequence(items.iter().map(scalar_value).collect()),
-    }
+/// A `.msg` default as a YAML value, its values charged to `budget`.
+fn literal_value(literal: &DefaultLiteral, budget: &mut usize) -> Result<Value, VerbError> {
+    Ok(match literal {
+        DefaultLiteral::Scalar(s) => {
+            charge(budget, 1)?;
+            scalar_value(s)
+        }
+        DefaultLiteral::Array(items) => {
+            charge(budget, items.len().saturating_add(1))?;
+            Value::Sequence(items.iter().map(scalar_value).collect())
+        }
+    })
 }
 
 fn scalar_value(s: &ScalarLiteral) -> Value {
@@ -562,6 +629,59 @@ mod tests {
             back,
             r#"{"points":[{"x":3.0,"y":1.0},{"x":0.0,"y":1.0}],"ends":[{"x":0.0,"y":1.0},{"x":0.0,"y":1.0}],"name":"p"}"#
         );
+    }
+
+    #[test]
+    fn an_anchor_or_alias_and_text_past_the_input_cap_are_usage_errors() {
+        let w = walker(&[]);
+        let err = message_frame(
+            &w,
+            "geometry_msgs/Twist",
+            "linear: &v {x: 1.0}\nangular: *v\n",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, VerbError::Usage(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("anchor or alias at line 1"),
+            "{err}"
+        );
+        let err = parse_message_text_capped("data: \"abcd\"", 11).unwrap_err();
+        assert!(matches!(err, VerbError::Usage(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("12 bytes, over the 11-byte"),
+            "{err}"
+        );
+        parse_message_text_capped("data: \"abc\"", 11).expect("at the cap");
+    }
+
+    #[test]
+    fn omitted_fields_that_expand_past_the_budget_are_an_encode_error() {
+        let w = walker(&[
+            ("demo_msgs", "Point2", "float64 x\nfloat64 y\n"),
+            ("demo_msgs", "Path2", "Point2[] points\n"),
+            (
+                "demo_msgs",
+                "Wide",
+                &format!("float64[{MAX_FILLED_VALUES}] v\n"),
+            ),
+            (
+                "demo_msgs",
+                "Fits",
+                &format!("float64[{}] v\n", MAX_FILLED_VALUES - 1),
+            ),
+        ]);
+        // Each `{}` element takes two inserted values (x and y).
+        let elements = MAX_FILLED_VALUES / 2 + 1;
+        let text = format!("{{\"points\": [{}{{}}]}}", "{},".repeat(elements - 1));
+        let err = message_frame(&w, "demo_msgs/Path2", &text, 0).unwrap_err();
+        assert!(matches!(err, VerbError::Encode(_)), "{err:?}");
+        assert!(err.to_string().contains("expand to more than"), "{err}");
+        // An omitted `float64[N]` takes N + 1 values: the sequence and its
+        // elements.
+        let err = message_frame(&w, "demo_msgs/Wide", "{}", 0).unwrap_err();
+        assert!(err.to_string().contains("expand to more than"), "{err}");
+        message_frame(&w, "demo_msgs/Fits", "{}", 0).expect("exactly the budget");
     }
 
     #[test]

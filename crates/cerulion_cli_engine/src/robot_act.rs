@@ -127,7 +127,7 @@ pub fn robot_pub(
     req: &crate::topic_cmd::publish::PubRequest<'_>,
 ) -> Result<String, VerbError> {
     let period = crate::topic_cmd::publish::publish_period(req.times, req.rate_hz)?;
-    let frames_wait = period.saturating_mul(u32::try_from(req.times).unwrap_or(u32::MAX));
+    let frames_wait = cerulion_msgio::publish::frames_span(period, req.times);
     let args = serde_json::json!({
         "topic": req.topic,
         "type": req.type_name,

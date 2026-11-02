@@ -65,8 +65,8 @@ impl PubReport {
 }
 
 /// The interval between frames for `times` frames at `rate_hz`; zero for a
-/// single frame. A rate that is not a finite positive number is a usage
-/// error.
+/// single frame. A rate that is not a finite positive number, or whose
+/// interval rounds to zero nanoseconds, is a usage error.
 pub fn publish_period(times: u64, rate_hz: Option<f64>) -> Result<Duration, VerbError> {
     let rate = rate_hz.unwrap_or(DEFAULT_REPEAT_RATE_HZ);
     if !(rate.is_finite() && rate > 0.0) {
@@ -81,7 +81,15 @@ pub fn publish_period(times: u64, rate_hz: Option<f64>) -> Result<Duration, Verb
         return Ok(Duration::ZERO);
     }
     Duration::try_from_secs_f64(1.0 / rate)
-        .map_err(|_| VerbError::Usage(format!("--rate {rate} gives no usable interval")))
+        .ok()
+        .filter(|period| !period.is_zero())
+        .ok_or_else(|| VerbError::Usage(format!("--rate {rate} gives no usable interval")))
+}
+
+/// How long `times` frames take at `period`, counted as `times` whole
+/// periods; [`Duration::MAX`] when that does not fit a `Duration`.
+pub fn frames_span(period: Duration, times: u64) -> Duration {
+    Duration::try_from_secs_f64(period.as_secs_f64() * times as f64).unwrap_or(Duration::MAX)
 }
 
 /// Publish `req.message`, encoded as the type `name` (`pkg/Type`, a name
@@ -211,6 +219,27 @@ mod tests {
             publish_period(0, None).unwrap_err().exit_code(),
             crate::text::EXIT_USAGE
         );
+    }
+
+    #[test]
+    fn a_rate_whose_interval_rounds_to_zero_is_a_usage_error() {
+        let err = publish_period(2, Some(1e10)).unwrap_err();
+        assert_eq!(err.exit_code(), crate::text::EXIT_USAGE);
+        assert_eq!(
+            publish_period(2, Some(1e9)).unwrap(),
+            Duration::from_nanos(1)
+        );
+    }
+
+    #[test]
+    fn the_frames_span_counts_every_frame_and_saturates() {
+        assert_eq!(
+            frames_span(Duration::from_millis(250), 3),
+            Duration::from_millis(750)
+        );
+        assert_eq!(frames_span(Duration::ZERO, 1), Duration::ZERO);
+        assert!(frames_span(Duration::from_nanos(1), u64::MAX) > Duration::from_secs(1 << 33));
+        assert_eq!(frames_span(Duration::MAX, 2), Duration::MAX);
     }
 
     #[test]

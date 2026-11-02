@@ -218,7 +218,8 @@ pub fn resolve_store_service_types(
 /// not fit its field, or a response that does not decode, is
 /// [`VerbError::Encode`]; no server within the timeout, or no response
 /// within what is left of it, is [`VerbError::Unavailable`]. An interrupted
-/// call returns [`VerbError::Unavailable`] too.
+/// call returns [`VerbError::Unavailable`] too; a `running` cleared before
+/// the request goes out sends no request, even to a server that is ready.
 pub fn service_call(
     req: &CallRequest<'_>,
     types: &ServiceTypes,
@@ -245,6 +246,12 @@ pub fn service_call(
             req.service,
             format_secs(req.timeout),
             request_topic(req.service)
+        )));
+    }
+    if !running.load(Ordering::Relaxed) {
+        return Err(VerbError::Unavailable(format!(
+            "the call to '{}' was stopped before its request was sent",
+            req.service
         )));
     }
 

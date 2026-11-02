@@ -19,8 +19,10 @@
 //!
 //! `topic-publish` and `service-call` check only the e-stop, not the control
 //! lease: each is refused while the e-stop latch (`cerud::lease::ControlLease`)
-//! is engaged, and a publish stops at its next check when the latch
-//! engages. A topic under
+//! is engaged, and a running publish or call stops at the next check (every
+//! 10 ms) after the latch engages. A publish still running
+//! [`PUBLISH_DEADLINE`] after it started is stopped too. A `message` or
+//! `request` longer than [`MAX_MESSAGE_TEXT_BYTES`] is refused. A topic under
 //! the reserved `/__cerulion` namespace is refused.
 //!
 //! A failure is `CerudError::Verb` with a message that starts with the
@@ -87,6 +89,19 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 /// frames), inside the ops session's 120 s deadline.
 const MAX_PUBLISH_SPAN: Duration = Duration::from_secs(90);
 
+/// When the watcher stops a `topic-publish` that is still running: the 90 s
+/// span the request was checked against plus room for the encode and the
+/// linger, inside the ops session's 120 s deadline. A frame
+/// that takes longer to send than its period delays every later one, so the
+/// span check alone does not bound the run.
+pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(100);
+
+/// The longest `message` or `request` text the verbs read (1 MiB). The
+/// encode holds the parsed text, the tree with omitted fields filled in and
+/// that tree's re-serialized text at once, so the cap bounds that memory
+/// below what the 16 MiB ops frame would allow.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 1 << 20;
+
 fn schemas_dir() -> Option<PathBuf> {
     std::env::var_os(SCHEMAS_DIR_ENV)
         .filter(|v| !v.is_empty())
@@ -109,16 +124,25 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> CerudResult<&'a str> {
 }
 
 /// A message argument: a JSON object (used as JSON text) or a string of
-/// JSON or YAML; absent is `{}`.
+/// JSON or YAML, at most [`MAX_MESSAGE_TEXT_BYTES`] long; absent is `{}`.
 fn text_arg(args: &Value, key: &str) -> CerudResult<String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok("{}".to_string()),
-        Some(Value::String(s)) => Ok(s.clone()),
-        Some(v @ Value::Object(_)) => Ok(v.to_string()),
-        Some(_) => Err(usage(format!(
-            "`{key}` must be a JSON object or a JSON/YAML string"
-        ))),
+    let text = match args.get(key) {
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(v @ Value::Object(_)) => v.to_string(),
+        Some(_) => {
+            return Err(usage(format!(
+                "`{key}` must be a JSON object or a JSON/YAML string"
+            )))
+        }
+    };
+    if text.len() > MAX_MESSAGE_TEXT_BYTES {
+        return Err(usage(format!(
+            "`{key}` is {} bytes of text; the act verbs read at most {MAX_MESSAGE_TEXT_BYTES}",
+            text.len()
+        )));
     }
+    Ok(text)
 }
 
 fn seconds_arg(args: &Value, key: &str, default: Duration) -> CerudResult<Duration> {
@@ -161,6 +185,55 @@ impl Drop for SetOnDrop<'_> {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Why [`watched`] cleared the running flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The e-stop latch engaged.
+    Estop,
+    /// The deadline passed.
+    Deadline,
+}
+
+/// Run `op` with a running flag that a watcher thread clears when the
+/// e-stop on `lease` engages or, given one, `deadline` passes, checked every
+/// [`ESTOP_POLL`]. The watcher ends with `op`. Returns what `op` returned and
+/// why the flag was cleared, if it was.
+fn watched<R>(
+    lease: &Arc<Mutex<ControlLease>>,
+    verb: &'static str,
+    deadline: Option<Instant>,
+    op: impl FnOnce(&AtomicBool) -> R,
+) -> (R, Option<Stop>) {
+    let running = Arc::new(AtomicBool::new(true));
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (running, done, lease) = (running.clone(), done.clone(), lease.clone());
+        std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let stop = if refuse_under_estop(&lease, verb).is_err() {
+                    Some(Stop::Estop)
+                } else if deadline.is_some_and(|at| Instant::now() >= at) {
+                    Some(Stop::Deadline)
+                } else {
+                    None
+                };
+                if stop.is_some() {
+                    running.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return stop;
+                }
+                std::thread::sleep(ESTOP_POLL); // ALLOW: e-stop watch for one act verb, ends with it
+            }
+            None
+        })
+    };
+    let out = {
+        let _stop = SetOnDrop(&done);
+        op(&running)
+    };
+    let stop = watcher.join().unwrap_or(Some(Stop::Estop));
+    (out, stop)
 }
 
 /// Refuse when the robot's e-stop is engaged.
@@ -246,7 +319,7 @@ impl VerbHandler for TopicPublishVerb {
             publish::DEFAULT_WAIT_SUBSCRIBERS,
         )?;
         let period = publish::publish_period(times, rate_hz).map_err(verb_error)?;
-        let frames_span = period.saturating_mul(u32::try_from(times).unwrap_or(u32::MAX));
+        let frames_span = publish::frames_span(period, times);
         if wait.saturating_add(frames_span) > MAX_PUBLISH_SPAN {
             return Err(usage(format!(
                 "the subscriber wait plus {times} frames at that rate take longer than {} s",
@@ -271,33 +344,27 @@ impl VerbHandler for TopicPublishVerb {
             rate_hz,
             wait_subscribers: wait,
         };
-        // The publish loop polls this flag in the subscriber wait, between
-        // frames and in the linger; a watcher thread clears it when the e-stop
-        // engages, and stops when `_stop` drops.
-        let running = Arc::new(AtomicBool::new(true));
-        let done = Arc::new(AtomicBool::new(false));
-        let watcher = {
-            let (running, done, lease) = (running.clone(), done.clone(), self.lease.clone());
-            std::thread::spawn(move || {
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    if refuse_under_estop(&lease, TOPIC_PUBLISH).is_err() {
-                        running.store(false, std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    }
-                    std::thread::sleep(ESTOP_POLL); // ALLOW: e-stop watch for one publish, ends with it
-                }
-            })
-        };
-        let report = {
-            let _stop = SetOnDrop(&done);
-            publish::publish_message(&req, &walker, &name, &running, |_| ())
-        };
-        let _ = watcher.join();
-        if !running.load(std::sync::atomic::Ordering::Relaxed) {
-            let sent = report.as_ref().map_or(0, |r| r.frames);
-            return Err(verb_error(VerbError::Unavailable(format!(
-                "the robot's e-stop engaged after {sent} of {times} frames"
-            ))));
+        // The publish loop polls the running flag in the subscriber wait,
+        // between frames and in the linger.
+        let deadline = Instant::now() + PUBLISH_DEADLINE;
+        let (report, stop) = watched(&self.lease, TOPIC_PUBLISH, Some(deadline), |running| {
+            publish::publish_message(&req, &walker, &name, running, |_| ())
+        });
+        let sent = report.as_ref().map_or(0, |r| r.frames);
+        match stop {
+            Some(Stop::Estop) => {
+                return Err(verb_error(VerbError::Unavailable(format!(
+                    "the robot's e-stop engaged after {sent} of {times} frames"
+                ))))
+            }
+            Some(Stop::Deadline) => {
+                return Err(verb_error(VerbError::Internal(format!(
+                    "the publish was still running {} s after it started and was stopped after \
+                     {sent} of {times} frames",
+                    PUBLISH_DEADLINE.as_secs()
+                ))))
+            }
+            None => {}
         }
         let report = report.map_err(verb_error)?;
         Ok(json!({
@@ -311,7 +378,8 @@ impl VerbHandler for TopicPublishVerb {
 }
 
 /// `service-call`: call a service on this robot once. Refused while the
-/// e-stop is engaged.
+/// e-stop is engaged; an e-stop engaged during the server or response wait
+/// ends the call as unavailable.
 pub struct ServiceCallVerb {
     lease: Arc<Mutex<ControlLease>>,
 }
@@ -347,7 +415,17 @@ impl VerbHandler for ServiceCallVerb {
             request: &request,
             timeout,
         };
-        let text = service::service_call(&req, &types, &running()).map_err(verb_error)?;
+        let (call, stop) = watched(&self.lease, SERVICE_CALL, None, |running| {
+            service::service_call(&req, &types, running)
+        });
+        let text = match (call, stop) {
+            (Err(_), Some(Stop::Estop)) => {
+                return Err(verb_error(VerbError::Unavailable(format!(
+                    "the robot's e-stop engaged, so {SERVICE_CALL} stopped without a response"
+                ))))
+            }
+            (call, _) => call.map_err(verb_error)?,
+        };
         let response: Value = serde_json::from_str(&text)
             .map_err(|e| verb_error(VerbError::Encode(format!("the response is not JSON: {e}"))))?;
         bounded(json!({ "response": response, "response_text": text }))
@@ -541,6 +619,25 @@ mod tests {
                 &publish,
                 json!({"topic": "/x", "type": "std_msgs/String", "message": 5}),
             ),
+            (
+                &publish,
+                json!({"topic": "/x", "type": "std_msgs/String", "times": 2, "rate_hz": 1e10}),
+            ),
+            (
+                &publish,
+                json!({"topic": "/x", "type": "std_msgs/String", "times": u64::MAX,
+                       "rate_hz": 1e9}),
+            ),
+            (
+                &publish,
+                json!({"topic": "/x", "type": "std_msgs/String",
+                       "message": "x".repeat(MAX_MESSAGE_TEXT_BYTES + 1)}),
+            ),
+            (
+                &call,
+                json!({"service": "/s", "type": "std_srvs/srv/Trigger",
+                       "request": "x".repeat(MAX_MESSAGE_TEXT_BYTES + 1)}),
+            ),
             (&publish, json!({"topic": "/x", "type": "nope_msgs/Nope"})),
             (&call, json!({"service": "/s"})),
             (
@@ -557,6 +654,30 @@ mod tests {
             let err = verb.execute(&args).unwrap_err();
             assert_eq!(class_of(err), "usage", "{} {args}", verb.name());
         }
+    }
+
+    #[test]
+    fn the_watcher_clears_the_flag_at_the_deadline_and_at_an_estop() {
+        let hold = |running: &AtomicBool| {
+            let start = Instant::now();
+            while running.load(std::sync::atomic::Ordering::Relaxed)
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            start.elapsed()
+        };
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let (held, stop) = watched(&lease(), TOPIC_PUBLISH, Some(deadline), hold);
+        assert_eq!(stop, Some(Stop::Deadline));
+        assert!(held < Duration::from_secs(4), "held {held:?}");
+        let engaged = lease();
+        engaged.lock().unwrap().engage_estop("test");
+        let (held, stop) = watched(&engaged, TOPIC_PUBLISH, None, hold);
+        assert_eq!(stop, Some(Stop::Estop));
+        assert!(held < Duration::from_secs(4), "held {held:?}");
+        let (_, stop) = watched(&lease(), TOPIC_PUBLISH, None, |_| ());
+        assert_eq!(stop, None);
     }
 
     #[test]
