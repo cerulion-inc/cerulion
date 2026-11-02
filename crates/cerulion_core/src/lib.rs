@@ -806,7 +806,8 @@ pub mod wire;
 ///
 /// - v30: a batched read names every frame it consumed. `CerulionSubscriber`
 ///   gains `batch_frames`, the `(sequence, producer token)` of each frame the
-///   current drain popped while the read log is armed, and `ReadOutcomeKind`
+///   current drain popped while the read log is armed, up to its read stage's
+///   capacity, and `ReadOutcomeKind`
 ///   gains `BatchFrame = 8`, which the subscriber stages once per popped frame
 ///   the read does not name, before the read (`trace_format` 9). The drain
 ///   paths run inside a node library, so a library built against an earlier

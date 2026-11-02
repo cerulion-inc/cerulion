@@ -285,6 +285,79 @@ fn producer_token(id: UniquePublisherId) -> u64 {
     crate::wire::fnv1a_hash(&id.value().to_le_bytes())
 }
 
+/// The `(sequence, producer token)` of each frame one drain popped, in pop
+/// order, held to a length fixed when the read stage is installed.
+///
+/// The bound is the stage's capacity at install: a multi-frame read stages its
+/// other frames only when they and the read fit below the rim, so a batch
+/// longer than the capacity names only its newest frame whatever the list
+/// holds. A push at the bound keeps nothing and sets `overflowed`, and a read
+/// whose drain overflowed stages no `BatchFrame` record (see
+/// [`batch_frames_staged`]), so the list never reallocates on the receive path.
+#[derive(Debug, Default)]
+struct BatchFrameList {
+    /// The kept entries, oldest first.
+    frames: Vec<(u32, u64)>,
+    /// The most entries [`Self::push`] keeps.
+    bound: usize,
+    /// A push since the last [`Self::clear`] found the list at its bound.
+    overflowed: bool,
+}
+
+impl BatchFrameList {
+    /// Keep at most `bound` entries, reserving room for all of them.
+    fn set_bound(&mut self, bound: usize) {
+        // hot-path-alloc-ok: read-stage install, once per subscriber at graph
+        // build, before any drain pushes into the list.
+        self.frames.reserve(bound.saturating_sub(self.frames.len()));
+        self.bound = bound;
+    }
+
+    /// Keep `(seq, token)` when the list is below its bound, and mark it
+    /// overflowed otherwise.
+    #[inline]
+    fn push(&mut self, seq: u32, token: u64) {
+        if self.frames.len() < self.bound {
+            self.frames.push((seq, token));
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    /// Empty the list and clear its overflow mark, keeping the reservation.
+    #[inline]
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.overflowed = false;
+    }
+}
+
+/// How many of the `named` frames a multi-frame read popped other than the one
+/// it names its stage gets as `BatchFrame` records, before the read itself,
+/// with `room` slots left below the rim.
+///
+/// All `named` when the drain's frame list kept every frame (`overflowed`
+/// false) and the frames and the read fit in `room` at two slots each on an
+/// edge whose records may carry a writer annotation (`annotate`) and one
+/// otherwise; none in every other case. A batch's frames therefore never push
+/// its own read past the rim, and a read whose frames are not all kept names
+/// only its newest frame, which a fed replay refuses by name.
+fn batch_frames_staged(named: usize, overflowed: bool, annotate: bool, room: usize) -> usize {
+    #[cfg(feature = "oracle-mutants")]
+    let overflowed = overflowed && !crate::replay_feed::mutants::batch_overflow_ignored_armed();
+    if overflowed {
+        return 0;
+    }
+    #[cfg(feature = "oracle-mutants")]
+    let annotate = annotate && !crate::replay_feed::mutants::batch_frames_at_one_slot_armed();
+    let slots_each = if annotate { 2 } else { 1 };
+    if named.saturating_add(1).saturating_mul(slots_each) <= room {
+        named
+    } else {
+        0
+    }
+}
+
 /// Forward/backward decision threshold for same-publisher sequence gaps: a
 /// wrapping gap of at most half the `u32` range reads as forward motion
 /// (eviction candidate); anything larger means the drain's oldest sequence
@@ -1261,10 +1334,11 @@ pub struct CerulionSubscriber {
     /// second.
     fault_inject_receive_after: std::cell::Cell<Option<u32>>,
     /// `(sequence, producer token)` of each frame the current drain popped,
-    /// in pop order, while the read log is armed. The staging wrappers write
-    /// one `BatchFrame` record per entry before a multi-frame read, then clear
-    /// it. Reserved to the queue depth when the stage is installed.
-    batch_frames: std::cell::RefCell<Vec<(u32, u64)>>,
+    /// in pop order, while the read log is armed, up to the bound the
+    /// `BatchFrameList` takes when the stage is installed. The staging
+    /// wrappers write one `BatchFrame` record per entry before a multi-frame
+    /// read, then clear it.
+    batch_frames: std::cell::RefCell<BatchFrameList>,
     /// The topic's EFFECTIVE iceoryx2
     /// `subscriber_max_borrowed_samples` — the borrow budget this
     /// subscriber's takes are really bounded by, read from the data
@@ -1703,9 +1777,9 @@ impl CerulionSubscriber {
             probe: None,
             pending_backpressure_event: None,
             fault_inject_receive_after: std::cell::Cell::new(None),
-            // hot-path-alloc-ok: constructor, once per subscriber. Empty (no
-            // heap reservation) until a read stage is installed.
-            batch_frames: std::cell::RefCell::new(Vec::new()),
+            // Empty (no heap reservation, bound 0) until a read stage is
+            // installed.
+            batch_frames: std::cell::RefCell::new(BatchFrameList::default()),
             max_publishers,
             max_borrowed_samples,
             // hot-path-alloc-ok: constructor — once per subscriber. Empty (no
@@ -1747,10 +1821,9 @@ impl CerulionSubscriber {
     /// runtime retains a clone: arming (recording only) and the level-end
     /// merge both happen through that side.
     pub(crate) fn set_read_outcome_stage(&mut self, stage: Arc<ReadOutcomeStage>) {
-        let depth = self.subscriber.buffer_size();
-        // hot-path-alloc-ok: read-stage install, once per subscriber at graph
-        // build; reserves the queue depth before any drain pushes into it.
-        self.batch_frames.get_mut().reserve(depth);
+        self.batch_frames
+            .get_mut()
+            .set_bound(stage.capacity() as usize);
         self.read_stage = Some(stage);
     }
 
@@ -1871,8 +1944,8 @@ impl CerulionSubscriber {
     /// Before a read that popped more than one frame, stage one `BatchFrame`
     /// record per popped frame other than the one the read names, in pop
     /// order, each with its writer annotation when the edge carries writers,
-    /// when all of them and the read fit below the stage's rim. Clears the
-    /// drain's frame list either way.
+    /// as many as [`batch_frames_staged`] answers. Clears the drain's frame
+    /// list either way.
     fn stage_batch_frames(
         &self,
         stage: &ReadOutcomeStage,
@@ -1881,28 +1954,19 @@ impl CerulionSubscriber {
         popped: u64,
         role: ReadSiteRole,
     ) {
-        let mut frames = self.batch_frames.borrow_mut();
+        let mut list = self.batch_frames.borrow_mut();
         let consumes = matches!(
             kind,
             ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch
         );
         if consumes && popped > 1 {
+            let frames = &list.frames;
             let named = match frames.last() {
                 Some(&(seq, _)) if Some(seq) == served_seq => frames.len() - 1,
                 _ => frames.len(),
             };
             let annotate = self.capture_producer_token();
-            // A batch frame or a read takes at most two slots with a writer
-            // annotation and one without. The frames are staged only when all
-            // of them and the read fit, so a batch's own frames never push its
-            // read past the rim: a read whose frames do not fit names only its
-            // newest frame, and a fed replay refuses it by name.
-            let slots_each = if annotate { 2 } else { 1 };
-            let staged = if stage.has_room((named + 1) * slots_each) {
-                named
-            } else {
-                0
-            };
+            let staged = batch_frames_staged(named, list.overflowed, annotate, stage.room());
             for &(seq, token) in &frames[..staged] {
                 if annotate {
                     stage.record_with_producer(
@@ -1917,7 +1981,7 @@ impl CerulionSubscriber {
                 }
             }
         }
-        frames.clear();
+        list.clear();
     }
 
     /// Stage one read outcome PRECEDED by its producer
@@ -3273,7 +3337,7 @@ impl CerulionSubscriber {
                                 } else {
                                     0
                                 };
-                                self.batch_frames.borrow_mut().push((seq, token));
+                                self.batch_frames.borrow_mut().push(seq, token);
                             }
                             newest_seq = Some(seq);
                             if capture && annotate {
@@ -3958,7 +4022,7 @@ impl CerulionSubscriber {
                         } else {
                             0
                         };
-                        batch_frames.borrow_mut().push((seq, token));
+                        batch_frames.borrow_mut().push(seq, token);
                     }
                 }
                 latest = Some(sample);
@@ -6547,6 +6611,544 @@ mod tests {
                 (ReadOutcomeKind::DrainedBatch, 20, 3),
             ]
         );
+    }
+
+    /// The capacity of the drain's frame list, the reservation the bound
+    /// below is checked against.
+    fn frame_list_capacity(sub: &CerulionSubscriber) -> usize {
+        sub.batch_frames.borrow().frames.capacity()
+    }
+
+    /// A hand-built wire frame: 40-byte header and 8 payload bytes carrying
+    /// `seq`, the sequence the read log parses back.
+    fn batch_frame_bytes(seq: u32) -> Vec<u8> {
+        let mut header = crate::wire::WireHeader::new(0xC1290, seq, 1_000 + u64::from(seq));
+        let total = crate::wire::WireHeader::SIZE + 8;
+        header.total_size = total as u32;
+        let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+        header.write_to_buf(&mut buf);
+        buf
+    }
+
+    /// A drain stage declared at depth `depth`, one fire per step, with the
+    /// given annotation rule.
+    fn shallow_drain_sizing(
+        depth: u32,
+        annotated: crate::read_outcome::ProducerAnnotation,
+    ) -> crate::read_outcome::ReadStageSizing {
+        crate::read_outcome::ReadStageSizing {
+            depth,
+            annotated,
+            sync_shape: crate::read_outcome::SyncTriggerShape::Ordinary,
+            burst: crate::graph::runtime::read_stage_burst_bound(
+                crate::read_outcome::ReadStageRole::Drain,
+                "inp",
+                &[],
+                false,
+                crate::read_outcome::FireBurstBound::Fires(1),
+            ),
+        }
+    }
+
+    /// A drain whose callback refills its queue pops more frames than the
+    /// frame list was reserved for, and the list does not grow.
+    ///
+    /// Hand oracle: a stage declared at depth 2 with one fire derives a
+    /// capacity of 6 (`max(2 + 1, 2 * 2 + 1) + 1`), the bound the list takes at
+    /// install. A depth-two queue holds 1 and 2, and the callback for frame `s`
+    /// publishes `s + 2` up to 12, so one `try_receive` delivers 1 to 12. The
+    /// list's capacity is the same after the drain as before it, and the read
+    /// names only its newest frame: `[DrainedBatch 12 popped 12]`, nothing
+    /// dropped.
+    #[test]
+    fn a_refilled_drain_past_its_frame_list_bound_does_not_grow_the_list() {
+        use crate::read_outcome::{
+            ProducerAnnotation, ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, StagedReadOutcome,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "frame_list_bound".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 2,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "frame_list_bound";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let sizing = shallow_drain_sizing(2, ProducerAnnotation::Plain);
+        assert_eq!(
+            crate::read_outcome::derive_stage_capacity(ReadStageRole::Drain, sizing),
+            6,
+            "PREMISE: the stage's derived capacity"
+        );
+        let stage = Arc::new(ReadOutcomeStage::new(0, ReadStageRole::Drain, sizing));
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        let reserved = frame_list_capacity(&sub);
+        publisher
+            .publish_raw(&batch_frame_bytes(1))
+            .expect("publish");
+        publisher
+            .publish_raw(&batch_frame_bytes(2))
+            .expect("publish");
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        sub.try_receive(|msg| {
+            let seq = msg.header().sequence;
+            seen.push(seq);
+            if seq + 2 <= 12 {
+                publisher
+                    .publish_raw(&batch_frame_bytes(seq + 2))
+                    .expect("publish");
+            }
+        })
+        .expect("drain");
+        assert_eq!(
+            seen,
+            (1..=12).collect::<Vec<u32>>(),
+            "PREMISE: one drain delivered 1 to 12"
+        );
+        assert_eq!(
+            frame_list_capacity(&sub),
+            reserved,
+            "the frame list grew inside the drain"
+        );
+        let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            staged.push(r);
+            true
+        });
+        assert_eq!(
+            staged,
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![StagedReadOutcome {
+                kind: ReadOutcomeKind::DrainedBatch,
+                served_seq: 12,
+                popped: 12,
+                token: None,
+                role: ReadSiteRole::Body,
+                run_count: 1,
+            }]
+        );
+        assert_eq!(stage.dropped(), 0);
+    }
+
+    /// The latest-wins drain on a two-writer topic pops both writers' queues,
+    /// more frames than the frame list was reserved for, and the list does not
+    /// grow.
+    ///
+    /// Hand oracle: a body stage declared at depth 1 with one fire derives the
+    /// floor capacity 4, the list's bound. The subscriber's queue is 8 per
+    /// writer, and two writers fill theirs, so one `try_view_raw` pops 16
+    /// frames. The list's capacity is unchanged and the read names only the
+    /// frame it served: `[Served <served> popped 16]`.
+    #[test]
+    fn a_two_writer_latest_drain_past_its_frame_list_bound_does_not_grow_the_list() {
+        use crate::read_outcome::{
+            ProducerAnnotation, ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, ReadStageSizing,
+            StagedReadOutcome, SyncTriggerShape,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "latest_list_bound".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "latest_list_bound";
+        let mut a = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher a");
+        let mut b = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher b");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let sizing = ReadStageSizing {
+            depth: 1,
+            annotated: ProducerAnnotation::Plain,
+            sync_shape: SyncTriggerShape::Ordinary,
+            burst: crate::graph::runtime::read_stage_burst_bound(
+                ReadStageRole::Body,
+                "inp",
+                &[],
+                false,
+                crate::read_outcome::FireBurstBound::Fires(1),
+            ),
+        };
+        assert_eq!(
+            crate::read_outcome::derive_stage_capacity(ReadStageRole::Body, sizing),
+            4,
+            "PREMISE: the stage's derived capacity"
+        );
+        let stage = Arc::new(ReadOutcomeStage::new(0, ReadStageRole::Body, sizing));
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        let reserved = frame_list_capacity(&sub);
+        for seq in 0..8u32 {
+            a.publish_raw(&batch_frame_bytes(seq)).expect("publish a");
+            b.publish_raw(&batch_frame_bytes(100 + seq))
+                .expect("publish b");
+        }
+        let served = sub
+            .try_view_raw(|bytes| {
+                crate::wire::WireHeader::read_from_buf(bytes)
+                    .expect("header")
+                    .sequence
+            })
+            .expect("view")
+            .expect("a frame was served");
+        assert_eq!(
+            frame_list_capacity(&sub),
+            reserved,
+            "the frame list grew inside the drain"
+        );
+        let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            staged.push(r);
+            true
+        });
+        assert_eq!(
+            staged,
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![StagedReadOutcome {
+                kind: ReadOutcomeKind::Served,
+                served_seq: u64::from(served),
+                popped: 16,
+                token: None,
+                role: ReadSiteRole::Body,
+                run_count: 1,
+            }],
+            "PREMISE and oracle: one read popped both writers' 16 frames"
+        );
+    }
+
+    /// A drain that overflowed its frame list stages no `BatchFrame` record
+    /// even where the stage's rim, widened since install, has room for the
+    /// frames the list kept.
+    ///
+    /// Hand oracle: the list's bound is the capacity at install, 6 (declared
+    /// depth 2, one fire). The stage then adopts a recorded rim of 64. A
+    /// refilled drain delivers 1 to 10, the list keeps 1 to 6, and the read
+    /// names only its newest frame: `[DrainedBatch 10 popped 10]`. Staging the
+    /// six kept frames would name a batch without 7, 8 and 9.
+    #[test]
+    fn an_overflowed_frame_list_stages_no_batch_frame_under_a_wider_adopted_rim() {
+        use crate::read_outcome::{
+            AdoptedRim, ProducerAnnotation, ReadOutcomeKind, ReadOutcomeStage, ReadStageRole,
+            StagedReadOutcome,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "frame_list_overflow".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 2,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "frame_list_overflow";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let stage = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Drain,
+            shallow_drain_sizing(2, ProducerAnnotation::Plain),
+        ));
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        stage.arm_at_recorded_capacity(AdoptedRim::from_recorded(64).expect("rim"));
+        assert_eq!(stage.capacity(), 64, "PREMISE: the adopted rim");
+        publisher
+            .publish_raw(&batch_frame_bytes(1))
+            .expect("publish");
+        publisher
+            .publish_raw(&batch_frame_bytes(2))
+            .expect("publish");
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        sub.try_receive(|msg| {
+            let seq = msg.header().sequence;
+            seen.push(seq);
+            if seq + 2 <= 10 {
+                publisher
+                    .publish_raw(&batch_frame_bytes(seq + 2))
+                    .expect("publish");
+            }
+        })
+        .expect("drain");
+        assert_eq!(seen, (1..=10).collect::<Vec<u32>>(), "PREMISE");
+        let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            staged.push(r);
+            true
+        });
+        assert_eq!(
+            staged,
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![StagedReadOutcome {
+                kind: ReadOutcomeKind::DrainedBatch,
+                served_seq: 10,
+                popped: 10,
+                token: None,
+                role: ReadSiteRole::Body,
+                run_count: 1,
+            }]
+        );
+    }
+
+    /// On an edge that annotates every read, a batch frame costs two slots,
+    /// and a batch whose frames fit at one slot each but not at two keeps its
+    /// read pair whole and stages no frame.
+    ///
+    /// Hand oracle: an annotated drain stage declared at depth 2 with one fire
+    /// derives 12 (`2 * (max(2 + 1, 2 * 2 + 1) + 1)`). One drain pops 0 to 7
+    /// from a queue provisioned at 16: seven frames and the read take 16 slots
+    /// at two each, over 12, so the stage holds only the read's pair,
+    /// `[Producer 7, DrainedBatch 7 popped 8]`, with nothing dropped. At one
+    /// slot each the seven frames would pass the fit check, fill the rim with
+    /// six pairs and drop the seventh and the read's own pair.
+    #[test]
+    fn an_annotated_batch_whose_frames_fit_only_at_one_slot_keeps_its_read_pair() {
+        use crate::read_outcome::{
+            ProducerAnnotation, ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, StagedReadOutcome,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "annotated_fit".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "annotated_fit";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let sizing = shallow_drain_sizing(2, ProducerAnnotation::Annotated);
+        assert_eq!(
+            crate::read_outcome::derive_stage_capacity(ReadStageRole::Drain, sizing),
+            12,
+            "PREMISE: the stage's derived capacity"
+        );
+        let stage = Arc::new(
+            ReadOutcomeStage::new(0, ReadStageRole::Drain, sizing).annotating_every_read(true),
+        );
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        sub.mark_multi_publisher_edge();
+        for seq in 0..8u32 {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+        }
+        let mut delivered = 0usize;
+        sub.try_receive_for_drain(|_msg| delivered += 1)
+            .expect("the drain succeeds");
+        assert_eq!(delivered, 8, "PREMISE: one drain popped 0 to 7");
+        let token = crate::wire::fnv1a_hash(&publisher.publisher_id().to_le_bytes());
+        let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            staged.push(r);
+            true
+        });
+        assert_eq!(
+            staged,
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![
+                StagedReadOutcome {
+                    kind: ReadOutcomeKind::Producer,
+                    served_seq: 7,
+                    popped: 0,
+                    token: Some(token),
+                    role: ReadSiteRole::Drain,
+                    run_count: 1,
+                },
+                StagedReadOutcome {
+                    kind: ReadOutcomeKind::DrainedBatch,
+                    served_seq: 7,
+                    popped: 8,
+                    token: None,
+                    role: ReadSiteRole::Drain,
+                    run_count: 1,
+                },
+            ]
+        );
+        assert_eq!(stage.dropped(), 0, "the read's pair was not refused");
+    }
+
+    /// One drain over two writers names each batch frame under the writer that
+    /// published it, so the writer changes inside the batch.
+    ///
+    /// Hand oracle: writer A publishes 10 and 11, writer B 20 and 21, on an
+    /// edge that annotates every read. For the pop order the drain hands the
+    /// callback, the stage holds a `(Producer token, BatchFrame seq)` pair per
+    /// frame but the last, each under the token of that frame's own writer,
+    /// then `(Producer token, DrainedBatch seq popped 4)` for the last.
+    #[test]
+    fn a_two_writer_batch_names_each_frame_under_its_own_writer() {
+        use crate::read_outcome::{
+            ProducerAnnotation, ReadOutcomeKind, ReadOutcomeStage, ReadStageRole, StagedReadOutcome,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "two_writer_batch".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "two_writer_batch";
+        let mut a = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher a");
+        let mut b = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher b");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let stage = Arc::new(
+            ReadOutcomeStage::new(
+                0,
+                ReadStageRole::Drain,
+                shallow_drain_sizing(8, ProducerAnnotation::Annotated),
+            )
+            .annotating_every_read(true),
+        );
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        sub.mark_multi_publisher_edge();
+        a.publish_raw(&batch_frame_bytes(10)).expect("publish a");
+        a.publish_raw(&batch_frame_bytes(11)).expect("publish a");
+        b.publish_raw(&batch_frame_bytes(20)).expect("publish b");
+        b.publish_raw(&batch_frame_bytes(21)).expect("publish b");
+        let token_of = |id: u128| crate::wire::fnv1a_hash(&id.to_le_bytes());
+        let (token_a, token_b) = (token_of(a.publisher_id()), token_of(b.publisher_id()));
+        let mut popped = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        sub.try_receive_for_drain(|msg| {
+            popped.push((token_of(msg.origin()), msg.header().sequence))
+        })
+        .expect("the drain succeeds");
+        let mut sorted = popped.clone();
+        sorted.sort_unstable();
+        let mut expected_set = vec![(token_a, 10), (token_a, 11), (token_b, 20), (token_b, 21)];
+        expected_set.sort_unstable();
+        assert_eq!(sorted, expected_set, "PREMISE: one drain popped all four");
+        assert!(
+            popped.windows(2).any(|w| w[0].0 != w[1].0),
+            "PREMISE: the writer changes inside the batch"
+        );
+        let mut expected = Vec::new(); // hot-path-alloc-ok: test-only hand oracle.
+        for (i, &(token, seq)) in popped.iter().enumerate() {
+            let last = i + 1 == popped.len();
+            expected.push(StagedReadOutcome {
+                kind: ReadOutcomeKind::Producer,
+                served_seq: u64::from(seq),
+                popped: 0,
+                token: Some(token),
+                role: ReadSiteRole::Drain,
+                run_count: 1,
+            });
+            expected.push(StagedReadOutcome {
+                kind: if last {
+                    ReadOutcomeKind::DrainedBatch
+                } else {
+                    ReadOutcomeKind::BatchFrame
+                },
+                served_seq: u64::from(seq),
+                popped: if last { 4 } else { 0 },
+                token: None,
+                role: ReadSiteRole::Drain,
+                run_count: 1,
+            });
+        }
+        let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            staged.push(r);
+            true
+        });
+        assert_eq!(staged, expected);
+        assert_eq!(stage.dropped(), 0);
+    }
+
+    /// The fit rule over hand-picked inputs: a batch of `named` other frames
+    /// and its read take `named + 1` records, two slots each on an annotated
+    /// edge, and the frames are staged only when the list kept every one and
+    /// all of them fit.
+    #[test]
+    fn batch_frames_staged_answers_all_or_none() {
+        // Plain edge: 7 frames and the read take 8 slots.
+        assert_eq!(batch_frames_staged(7, false, false, 8), 7);
+        assert_eq!(batch_frames_staged(7, false, false, 7), 0);
+        // Annotated edge: 7 frames and the read take 16 slots.
+        assert_eq!(batch_frames_staged(7, false, true, 16), 7);
+        assert_eq!(batch_frames_staged(7, false, true, 15), 0);
+        assert_eq!(batch_frames_staged(7, false, true, 12), 0);
+        // An overflowed list stages nothing, whatever the room.
+        assert_eq!(batch_frames_staged(3, true, false, 4096), 0);
+        assert_eq!(batch_frames_staged(3, true, true, 4096), 0);
+        // A disarmed stage has no room.
+        assert_eq!(batch_frames_staged(1, false, false, 0), 0);
+    }
+
+    /// MUTANT (`oracle-mutants`): one slot per frame on an annotated edge fails
+    /// the annotated fit test and the fit rule test.
+    #[cfg(feature = "oracle-mutants")]
+    #[test]
+    fn the_annotated_fit_test_catches_one_slot_per_frame() {
+        let _armed = crate::replay_feed::mutants::batch_frames_at_one_slot();
+        let caught = std::panic::catch_unwind(
+            an_annotated_batch_whose_frames_fit_only_at_one_slot_keeps_its_read_pair,
+        );
+        assert!(
+            caught.is_err(),
+            "the annotated fit test passed under the mutant"
+        );
+        let caught = std::panic::catch_unwind(batch_frames_staged_answers_all_or_none);
+        assert!(caught.is_err(), "the fit rule test passed under the mutant");
+    }
+
+    /// MUTANT (`oracle-mutants`): staging the frames an overflowed list kept
+    /// fails the adopted rim test and the fit rule test.
+    #[cfg(feature = "oracle-mutants")]
+    #[test]
+    fn the_adopted_rim_test_catches_an_ignored_overflow() {
+        let _armed = crate::replay_feed::mutants::batch_overflow_ignored();
+        let caught = std::panic::catch_unwind(
+            an_overflowed_frame_list_stages_no_batch_frame_under_a_wider_adopted_rim,
+        );
+        assert!(
+            caught.is_err(),
+            "the adopted rim test passed under the mutant"
+        );
+        let caught = std::panic::catch_unwind(batch_frames_staged_answers_all_or_none);
+        assert!(caught.is_err(), "the fit rule test passed under the mutant");
     }
 
     /// An EMPTY drain through `drain_samples` stages ONE `NoFrame` record,

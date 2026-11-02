@@ -305,6 +305,46 @@ pub mod mutants {
     pub(crate) fn full_node_feed_names_armed() -> bool {
         FULL_NODE_FEED_NAMES.with(std::cell::Cell::get)
     }
+
+    thread_local! {
+        static BATCH_FRAMES_AT_ONE_SLOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static BATCH_OVERFLOW_IGNORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A scope that arms one batch frame mutant on its own thread until it
+    /// drops.
+    #[derive(Debug)]
+    pub struct BatchMutantGuard(&'static std::thread::LocalKey<std::cell::Cell<bool>>);
+
+    impl Drop for BatchMutantGuard {
+        fn drop(&mut self) {
+            self.0.with(|c| c.set(false));
+        }
+    }
+
+    /// Arm the mutant on this thread: the batch frame fit rule charges one
+    /// slot per frame on an annotated edge too.
+    #[must_use]
+    pub fn batch_frames_at_one_slot() -> BatchMutantGuard {
+        BATCH_FRAMES_AT_ONE_SLOT.with(|c| c.set(true));
+        BatchMutantGuard(&BATCH_FRAMES_AT_ONE_SLOT)
+    }
+
+    pub(crate) fn batch_frames_at_one_slot_armed() -> bool {
+        BATCH_FRAMES_AT_ONE_SLOT.with(std::cell::Cell::get)
+    }
+
+    /// Arm the mutant on this thread: a read whose drain overflowed its frame
+    /// list stages the frames the list kept.
+    #[must_use]
+    pub fn batch_overflow_ignored() -> BatchMutantGuard {
+        BATCH_OVERFLOW_IGNORED.with(|c| c.set(true));
+        BatchMutantGuard(&BATCH_OVERFLOW_IGNORED)
+    }
+
+    pub(crate) fn batch_overflow_ignored_armed() -> bool {
+        BATCH_OVERFLOW_IGNORED.with(std::cell::Cell::get)
+    }
 }
 
 /// How a replay wires a runtime it builds: the identity rule its recording was

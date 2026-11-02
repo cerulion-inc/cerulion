@@ -1218,9 +1218,10 @@ pub enum ReadOutcomeKind {
     /// `served_seq` is that frame's wire sequence, `popped` is 0. Staged in pop
     /// order, before the read, one per consumed frame, so the read log names
     /// every frame a read consumed (`trace_format` 9). A read's batch frames
-    /// are staged only when all of them and the read fit below the stage's rim
-    /// (`ReadOutcomeStage::has_room`); otherwise none is, and the read names
-    /// only its newest frame.
+    /// are staged only when the subscriber's frame list kept every one of them
+    /// and they and the read fit below the stage's rim
+    /// (`ReadOutcomeStage::room`); otherwise none is, and the read names only
+    /// its newest frame.
     BatchFrame = 8,
 }
 
@@ -1584,11 +1585,13 @@ impl ReadOutcomeStage {
         self.capacity.load(Ordering::Relaxed)
     }
 
-    /// Whether `slots` more records fit below this stage's rim in the open
-    /// merge window. A disarmed stage records nothing and answers `false`.
-    pub(crate) fn has_room(&self, slots: usize) -> bool {
-        self.is_armed()
-            && self.lock_inner().records.len().saturating_add(slots) <= self.capacity() as usize
+    /// The records that still fit below this stage's rim in the open merge
+    /// window. A disarmed stage records nothing and answers 0.
+    pub(crate) fn room(&self) -> usize {
+        if !self.is_armed() {
+            return 0;
+        }
+        (self.capacity() as usize).saturating_sub(self.lock_inner().records.len())
     }
 
     /// Records dropped at capacity over this stage's LIFETIME — an
