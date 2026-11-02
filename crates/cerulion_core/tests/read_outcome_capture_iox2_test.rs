@@ -96,9 +96,10 @@ use cerulion_core::prelude::*;
 use cerulion_core::read_outcome::ReadSiteRole;
 use cerulion_core::trace_ring::{
     default_capacity_records, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
-    TraceRingConsumer, TraceRingOwner, TraceRingRecord, READ_OUTCOME_DECIMATED,
-    READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME,
-    READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED, RECORD_TYPE_READ_OUTCOME,
+    TraceRingConsumer, TraceRingOwner, TraceRingRecord, READ_OUTCOME_BATCH_FRAME,
+    READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
+    READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED,
+    RECORD_TYPE_READ_OUTCOME,
 };
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
@@ -1049,7 +1050,9 @@ fn never_delivered_input_records_no_frame_every_fire() {
 /// so `fire_count` is 2 and the fire loop consults no refill hook at all
 /// (unlike arm (a), whose one-frozen-slot drain can only ever signal one).
 /// The body therefore pops BOTH heads and step k yields
-/// [Served(2k, 1), Served(2k+1, 1), DrainedBatch(2k+1, 2)]. Before SERVE-MANY the
+/// [Served(2k, 1), Served(2k+1, 1), BatchFrame(2k, 0), DrainedBatch(2k+1, 2)]:
+/// from `trace_format` 9 the drain names the older frame it popped, 2k, in a
+/// `BatchFrame` record just before its batch. Before SERVE-MANY the
 /// scheduler consumed one signal per step and CARRIED the rest, so the body
 /// recorded a single Served(k, 1) and the consumer fell progressively further
 /// behind its own drain. The two Served records land BEFORE the DrainedBatch
@@ -1072,13 +1075,14 @@ fn separate_discipline_records_both_the_batch_drain_and_the_body_read() {
     for k in 0..STEPS {
         expected.push(rec(k, READ_OUTCOME_SERVED, 2 * k, 1));
         expected.push(rec(k, READ_OUTCOME_SERVED, 2 * k + 1, 1));
+        expected.push(rec(k, READ_OUTCOME_BATCH_FRAME, 2 * k, 0));
         expected.push(rec(k, READ_OUTCOME_DRAINED_BATCH, 2 * k + 1, 2));
     }
     assert_eq!(
         kind6, expected,
         "the Separate path records BOTH reads: one FIFO body pop per FIRE \
          (2k then 2k+1, popped 1) and ONE drain-everything signal batch \
-         (newest 2k+1, popped 2)"
+         (newest 2k+1, popped 2) after the batch frame naming its older frame 2k"
     );
 }
 
@@ -1129,6 +1133,7 @@ fn the_separate_discipline_stamps_drain_on_the_drain_and_body_on_the_body() {
     for k in 0..STEPS {
         shape.push(rec(k, READ_OUTCOME_SERVED, 2 * k, 1));
         shape.push(rec(k, READ_OUTCOME_SERVED, 2 * k + 1, 1));
+        shape.push(rec(k, READ_OUTCOME_BATCH_FRAME, 2 * k, 0));
         shape.push(rec(k, READ_OUTCOME_DRAINED_BATCH, 2 * k + 1, 2));
     }
     assert_eq!(
@@ -1143,7 +1148,9 @@ fn the_separate_discipline_stamps_drain_on_the_drain_and_body_on_the_body() {
         // The node body's own FIFO pops, inside its tick.
         expected.push((k, 1u32, 0u16, READ_OUTCOME_SERVED, ReadSiteRole::Body));
         expected.push((k, 1u32, 0u16, READ_OUTCOME_SERVED, ReadSiteRole::Body));
-        // The scheduler's trigger drain, on the runtime-owned subscriber.
+        // The scheduler's trigger drain, on the runtime-owned subscriber: its
+        // batch frame carries the role of the drain it precedes.
+        expected.push((k, 1u32, 0u16, READ_OUTCOME_BATCH_FRAME, ReadSiteRole::Drain));
         expected.push((
             k,
             1u32,
