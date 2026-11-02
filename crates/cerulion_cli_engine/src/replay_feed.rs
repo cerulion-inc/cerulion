@@ -146,7 +146,7 @@ fn consumed_frames(
 ) -> impl Iterator<Item = (u64, u32)> + '_ {
     id.batch
         .iter()
-        .map(move |&(frame_writer, seq)| (frame_writer.unwrap_or(writer), seq))
+        .map(move |f| (f.writer.unwrap_or(writer), f.sequence))
         .chain(std::iter::once((writer, served)))
 }
 
@@ -465,6 +465,16 @@ pub enum FeedRefusalReason {
         /// Frames the read popped.
         popped: u32,
     },
+    /// A read popped `popped` frames and the recording names `named` frames
+    /// it consumed, more than it popped: a batch frame record before it
+    /// belongs to no frame of this read.
+    BatchMiscounted {
+        /// Frames the read popped.
+        popped: u32,
+        /// Frames the recording names for it: its batch frames and the frame
+        /// it served.
+        named: usize,
+    },
     /// A `sample(N)` read dropped the frames it popped and names none of them.
     DecimatedUnattributed {
         /// Frames the read popped.
@@ -498,6 +508,7 @@ impl FeedRefusalReason {
             Self::FrameMissing => "read_identity_frame_missing",
             Self::WritersIndistinguishable { .. } => "read_identity_writers_indistinguishable",
             Self::BatchUnattributed { .. } => "read_identity_batch_unattributed",
+            Self::BatchMiscounted { .. } => "read_identity_batch_miscounted",
             Self::DecimatedUnattributed { .. } => "read_identity_decimated_unattributed",
             Self::FramesUnattributed { .. } => "read_identity_frames_unattributed",
             Self::TopicUnrecorded => "read_identity_topic_unrecorded",
@@ -517,7 +528,9 @@ pub struct FeedRefusal {
     pub topic: String,
     /// The recorded step of the read.
     pub step: u64,
-    /// The writer token the read named, when it named one.
+    /// The writer token of the frame that could not be fed, when the
+    /// recording names one: the read's own writer, or the writer of the
+    /// frame of a batch the lookup failed on.
     pub writer: Option<u64>,
     /// The sequence that could not be fed (the served one, or the frame of a
     /// batch the lookup failed on).
@@ -558,6 +571,11 @@ impl fmt::Display for FeedRefusal {
                 f,
                 "the read popped {popped} frames and the recording does not name each of \
                  them (recorded below trace format 9, or a frame record was lost)"
+            ),
+            FeedRefusalReason::BatchMiscounted { popped, named } => write!(
+                f,
+                "the read popped {popped} frame(s) and the recording names {named} frames it \
+                 consumed, so a batch frame record before it names no frame of this read"
             ),
             FeedRefusalReason::DecimatedUnattributed { popped } => write!(
                 f,
@@ -726,6 +744,33 @@ pub mod mutants {
     pub(super) fn need_counted_back() -> bool {
         NEED_COUNTED_BACK.with(std::cell::Cell::get)
     }
+
+    thread_local! {
+        static BATCH_FRAME_KEEPS_ANNOTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A scope that arms the kept annotation on its own thread until it drops.
+    #[derive(Debug)]
+    pub struct AnnotationGuard(());
+
+    impl Drop for AnnotationGuard {
+        fn drop(&mut self) {
+            BATCH_FRAME_KEEPS_ANNOTATION.with(|c| c.set(false));
+        }
+    }
+
+    /// Arm the KEPT ANNOTATION: the admission planner leaves the annotation
+    /// before a `BatchFrame` record pending, so the read after it counts as
+    /// annotated with no annotation of its own.
+    #[must_use]
+    pub fn batch_frame_keeps_annotation() -> AnnotationGuard {
+        BATCH_FRAME_KEEPS_ANNOTATION.with(|c| c.set(true));
+        AnnotationGuard(())
+    }
+
+    pub(crate) fn batch_frame_keeps_annotation_armed() -> bool {
+        BATCH_FRAME_KEEPS_ANNOTATION.with(std::cell::Cell::get)
+    }
 }
 
 /// Plan every fed read of a pass.
@@ -751,7 +796,7 @@ pub fn plan_feeds(
     for stage in stages {
         for step in &stage.admission.per_step {
             for id in &step.identity {
-                let named = id.batch.iter().filter_map(|(w, _)| *w).chain(id.writer);
+                let named = id.batch.iter().filter_map(|f| f.writer).chain(id.writer);
                 writers_by_topic
                     .entry(stage.topic)
                     .or_default()
@@ -781,6 +826,22 @@ pub fn plan_feeds(
                 continue;
             }
             for (ordinal, (due, id)) in step.due.iter().zip(&step.identity).enumerate() {
+                // The recorder writes batch frames before a read that popped
+                // several, one per frame it consumed besides the one it
+                // served, so a read naming more frames than it popped carries a
+                // record of no frame it consumed.
+                let named = id.batch.len() + usize::from(id.served_seq.is_some());
+                if !id.batch.is_empty() && named > due.pop_count() as usize {
+                    return Err(refuse(
+                        step.step,
+                        id.writer,
+                        id.served_seq,
+                        FeedRefusalReason::BatchMiscounted {
+                            popped: due.pop_count(),
+                            named,
+                        },
+                    ));
+                }
                 let DueShape::Pops { pops, .. } = due.shape() else {
                     continue;
                 };
@@ -806,6 +867,16 @@ pub fn plan_feeds(
                         step.step,
                         None,
                         id.served_seq,
+                        FeedRefusalReason::IdentityAbsent,
+                    ));
+                }
+                // The same rule per batch frame: on a multi-writer edge each
+                // carries an annotation of its own.
+                if let Some(lost) = id.batch.iter().find(|f| stage.every_read && !f.annotated) {
+                    return Err(refuse(
+                        step.step,
+                        None,
+                        Some(lost.sequence),
                         FeedRefusalReason::IdentityAbsent,
                     ));
                 }
@@ -869,12 +940,14 @@ pub fn plan_feeds(
                     plan.insert(key, step.step, ordinal, read);
                     continue;
                 }
+                // Each refusal names the frame whose lookup failed: its own
+                // writer and sequence.
                 for (frame_writer, seq) in consumed_frames(id, writer, served) {
                     let lookup = index_key(topic.labeled, frame_writer, seq);
                     if let Some(first_step) = claimed.insert(lookup, step.step) {
                         return Err(refuse(
                             step.step,
-                            Some(writer),
+                            Some(frame_writer),
                             Some(seq),
                             FeedRefusalReason::FrameClaimedTwice { first_step },
                         ));
@@ -887,7 +960,7 @@ pub fn plan_feeds(
                         Some(Slot::Many(frames)) => {
                             return Err(refuse(
                                 step.step,
-                                Some(writer),
+                                Some(frame_writer),
                                 Some(seq),
                                 FeedRefusalReason::WritersIndistinguishable { frames: *frames },
                             ));
@@ -895,7 +968,7 @@ pub fn plan_feeds(
                         None => {
                             return Err(refuse(
                                 step.step,
-                                Some(writer),
+                                Some(frame_writer),
                                 Some(seq),
                                 FeedRefusalReason::FrameMissing,
                             ));
@@ -1061,8 +1134,20 @@ impl ReadFeed for BagReadFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay_inject::{ReadIdentity, StepAdmission};
+    use crate::replay_inject::{ConsumedFrame, ReadIdentity, StepAdmission};
     use cerulion_core::read_outcome::{DueRead, ReadStageRole};
+
+    /// Batch frames as a multi-writer recorder stages them: each `(writer,
+    /// sequence)` after an annotation of its own.
+    fn frames_of(list: &[(Option<u64>, u32)]) -> Vec<ConsumedFrame> {
+        list.iter()
+            .map(|&(writer, sequence)| ConsumedFrame {
+                writer,
+                sequence,
+                annotated: true,
+            })
+            .collect()
+    }
 
     fn span(offset: usize) -> FrameSpan {
         FrameSpan { offset, len: 1 }
@@ -1169,7 +1254,7 @@ mod tests {
             (1, 3, Some(7), 2, ReadKind::Served),
             (2, 4, Some(7), 1, ReadKind::Served),
         ]);
-        adm.per_step[0].identity[0].batch = vec![(Some(7), 2)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 2)]);
         let need = need_of(&adm, None);
         assert_eq!(need.entries(), 3);
         let mut b = FrameIndexBuilder::new(["/t".to_string()], &BTreeMap::new(), Some(&need));
@@ -1220,7 +1305,7 @@ mod tests {
     #[test]
     fn the_feed_index_budget_admits_at_and_under_and_refuses_over() {
         let mut adm = admission(&[(1, 3, Some(7), 3, ReadKind::Served)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(7), 1), (Some(7), 2)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 1), (Some(7), 2)]);
         let need = need_of(&adm, None);
         let bytes = 3 * FEED_INDEX_ENTRY_BYTES;
         assert_eq!(need.index_bytes(), bytes);
@@ -1241,7 +1326,7 @@ mod tests {
     /// need, and its plan over the index built under that need.
     fn overflow_batch_through_a_budgeted_index() -> (FeedNeed, Result<FeedPlan, FeedRefusal>) {
         let mut adm = admission(&[(4, 20, Some(7), 3, ReadKind::DrainedBatch)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(7), 1), (Some(7), 19)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 1), (Some(7), 19)]);
         let need = need_of(&adm, None);
         let mut b = FrameIndexBuilder::new(["/t".to_string()], &BTreeMap::new(), Some(&need));
         for s in 1..=20u32 {
@@ -1304,7 +1389,7 @@ mod tests {
             .collect();
         let (a, b, c) = (writer_token(11), writer_token(22), writer_token(33));
         let mut adm = admission(&[(1, 5, Some(c), 3, ReadKind::DrainedBatch)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(a), 5), (Some(b), 5)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(a), 5), (Some(b), 5)]);
         let mut by_topic = BTreeMap::new();
         by_topic.insert("/t".to_string(), labels);
         let mut need = FeedNeed::default();
@@ -1335,7 +1420,7 @@ mod tests {
     fn an_unlabeled_topic_counts_the_writers_its_batch_frames_name() {
         let idx = index(vec![frame(10, 1), frame(20, 2)], vec![]);
         let mut adm = admission(&[(4, 2, Some(7), 2, ReadKind::DrainedBatch)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(8), 1)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(8), 1)]);
         assert_eq!(
             plan(&adm, &idx).unwrap_err().reason,
             FeedRefusalReason::FramesUnattributed { writers: 2 }
@@ -1364,7 +1449,7 @@ mod tests {
     fn a_batch_on_one_writer_is_fed_the_run_ending_at_the_served_frame() {
         let idx = index(vec![frame(10, 1), frame(20, 2), frame(30, 3)], vec![]);
         let mut adm = admission(&[(4, 3, Some(7), 2, ReadKind::Served)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(7), 2)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 2)]);
         let p = plan(&adm, &idx).expect("plans");
         let read = p.read(&key(), 4, 0).expect("read planned");
         assert_eq!(read.frames, vec![span(20), span(30)]);
@@ -1382,7 +1467,7 @@ mod tests {
         let frames = (1..=20u32).map(|s| frame(s as usize * 10, s)).collect();
         let idx = index(frames, vec![]);
         let mut adm = admission(&[(4, 20, Some(7), 3, ReadKind::DrainedBatch)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(7), 1), (Some(7), 19)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 1), (Some(7), 19)]);
         let p = plan(&adm, &idx).expect("plans");
         let read = p.read(&key(), 4, 0).expect("read planned");
         assert_eq!(read.frames, vec![span(10), span(190), span(200)]);
@@ -1440,7 +1525,7 @@ mod tests {
     fn a_missing_frame_is_refused_naming_its_sequence() {
         let idx = index(vec![frame(1, 5), frame(2, 7)], vec![]);
         let mut adm = admission(&[(3, 7, Some(9), 2, ReadKind::Served)]);
-        adm.per_step[0].identity[0].batch = vec![(Some(9), 6)];
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(9), 6)]);
         let r = plan(&adm, &idx).unwrap_err();
         assert_eq!(r.reason, FeedRefusalReason::FrameMissing);
         assert_eq!(r.sequence, Some(6));
@@ -1598,5 +1683,137 @@ mod tests {
         let p = plan(&adm, &idx).expect("plans");
         assert!(p.read(&key(), 1, 0).is_none());
         assert_eq!(p.read(&key(), 1, 1).unwrap().frames, vec![span(1)]);
+    }
+
+    /// Two writers on a labeled topic: A (port 11) at sequences 30 and 31, B
+    /// (port 22) at 12 and 13, labeled one frame each in that order.
+    fn two_writer_index(b_frames: &[(usize, u32)]) -> (FrameIndex, u64, u64) {
+        let mut frames = vec![frame(1, 30), frame(2, 31)];
+        let mut labels: TopicLabels = vec![
+            (ProducerAttribution::FrameLabel { frame_index: 0 }, 11),
+            (ProducerAttribution::FrameLabel { frame_index: 1 }, 11),
+        ];
+        for (i, &(offset, seq)) in b_frames.iter().enumerate() {
+            frames.push(frame(offset, seq));
+            labels.push((
+                ProducerAttribution::FrameLabel {
+                    frame_index: 2 + i as u64,
+                },
+                22,
+            ));
+        }
+        (index(frames, labels), writer_token(11), writer_token(22))
+    }
+
+    /// A batch frame of writer B that the bag lost, on a read that served A's
+    /// frame, is refused naming B and the lost sequence: the writer and the
+    /// sequence of one frame, which the sentence says the bag lacks.
+    #[test]
+    fn a_missing_batch_frame_is_refused_under_its_own_writer() {
+        let (idx, a, b) = two_writer_index(&[(3, 13)]);
+        let mut adm = admission(&[(7, 30, Some(a), 2, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(b), 12)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(r.reason, FeedRefusalReason::FrameMissing);
+        assert_eq!((r.step, r.writer, r.sequence), (7, Some(b), Some(12)));
+        assert!(
+            r.to_string()
+                .contains(&format!("writer {b:016x}, sequence 12:")),
+            "{r}"
+        );
+    }
+
+    /// A batch frame of writer B that an earlier read of the stage already
+    /// consumed is refused naming B, the writer the claim is about.
+    #[test]
+    fn a_batch_frame_claimed_twice_is_refused_under_its_own_writer() {
+        let (idx, a, b) = two_writer_index(&[(3, 12)]);
+        let mut adm = admission(&[
+            (1, 12, Some(b), 1, ReadKind::Served),
+            (2, 30, Some(a), 2, ReadKind::DrainedBatch),
+        ]);
+        adm.per_step[1].identity[0].batch = frames_of(&[(Some(b), 12)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::FrameClaimedTwice { first_step: 1 }
+        );
+        assert_eq!((r.step, r.writer, r.sequence), (2, Some(b), Some(12)));
+    }
+
+    /// A batch frame whose writer and sequence two recorded frames share is
+    /// refused naming that writer, not the served frame's.
+    #[test]
+    fn an_indistinguishable_batch_frame_is_refused_under_its_own_writer() {
+        let (idx, a, b) = two_writer_index(&[(3, 12), (4, 12)]);
+        let mut adm = admission(&[(5, 30, Some(a), 2, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(b), 12)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::WritersIndistinguishable { frames: 2 }
+        );
+        assert_eq!((r.step, r.writer, r.sequence), (5, Some(b), Some(12)));
+    }
+
+    /// A read that popped one frame and carries a batch frame names more
+    /// frames than it popped, and is refused by name rather than planned with
+    /// two frames for one pop.
+    #[test]
+    fn a_single_pop_read_carrying_a_batch_frame_is_refused() {
+        let idx = index(vec![frame(1, 4), frame(2, 5)], vec![]);
+        let mut adm = admission(&[(3, 5, Some(7), 1, ReadKind::Served)]);
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 4)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(r.reason.code(), "read_identity_batch_miscounted");
+        assert_eq!((r.step, r.sequence), (3, Some(5)));
+        assert!(
+            r.to_string()
+                .contains("the read popped 1 frame(s) and the recording names 2"),
+            "{r}"
+        );
+    }
+
+    /// A read that popped two frames and carries two batch frames names three,
+    /// and is refused by name.
+    #[test]
+    fn a_batch_naming_more_frames_than_it_popped_is_refused() {
+        let idx = index(vec![frame(1, 3), frame(2, 4), frame(3, 5)], vec![]);
+        let mut adm = admission(&[(3, 5, Some(7), 2, ReadKind::DrainedBatch)]);
+        adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 3), (Some(7), 4)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(r.reason.code(), "read_identity_batch_miscounted");
+        assert!(
+            r.to_string()
+                .contains("the read popped 2 frame(s) and the recording names 3"),
+            "{r}"
+        );
+    }
+
+    /// A read that popped nothing and carries a batch frame is refused by name:
+    /// batch frames are recorded before a read that popped several.
+    #[test]
+    fn a_read_that_popped_nothing_carrying_a_batch_frame_is_refused() {
+        let idx = index(vec![frame(1, 4), frame(2, 5)], vec![]);
+        let mut adm = admission(&[(1, 5, Some(7), 1, ReadKind::Served)]);
+        adm.per_step[0].due.insert(0, DueRead::nothing());
+        adm.per_step[0].identity.insert(
+            0,
+            ReadIdentity {
+                writer: Some(7),
+                annotated: false,
+                served_seq: None,
+                popped: 0,
+                kind: Some(ReadKind::NoFrame),
+                batch: frames_of(&[(Some(7), 4)]),
+            },
+        );
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(r.reason.code(), "read_identity_batch_miscounted");
+        assert!(
+            r.to_string()
+                .contains("the read popped 0 frame(s) and the recording names 1"),
+            "{r}"
+        );
     }
 }

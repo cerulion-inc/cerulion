@@ -1049,9 +1049,10 @@ node, the input, the writer and the sequence:
 | Cause (`--report` code) | Meaning |
 |---|---|
 | `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
-| `read_identity_absent` | A read popped frames and no annotation named their writer, or a read on a multi-writer edge carries no annotation of its own |
+| `read_identity_absent` | A read popped frames and no annotation named their writer, or a read or a `batch_frame` record on a multi-writer edge carries no annotation of its own |
 | `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
 | `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9, or a batch deeper than its read stage's window, names only the newest |
+| `read_identity_batch_miscounted` | The recording names more frames for a read than it popped: a `batch_frame` record before it belongs to no frame it consumed |
 | `read_identity_decimated_unattributed` | A `sample(N)` read dropped the frames it popped and names none of them |
 | `read_identity_frames_unattributed` | An unlabelled topic's reads name more than one writer |
 | `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |

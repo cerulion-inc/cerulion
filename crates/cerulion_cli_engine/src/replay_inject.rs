@@ -2203,15 +2203,29 @@ pub struct ReadIdentity {
     pub popped: u32,
     /// The read's kind (`None` on a hand-off entry, which pops nothing).
     pub kind: Option<ReadKind>,
-    /// The `(writer, sequence)` of every frame the read consumed other than the
-    /// one it names, in pop order, from the `BatchFrame` records before it
-    /// (`trace_format` 9). Empty on an older recording.
-    pub batch: Vec<(Option<u64>, u32)>,
+    /// Every frame the read consumed other than the one it names, in pop
+    /// order, from the `BatchFrame` records before it (`trace_format` 9).
+    /// Empty on an older recording.
+    pub batch: Vec<ConsumedFrame>,
+}
+
+/// One frame a read consumed other than the one it names, from a `BatchFrame`
+/// record before the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumedFrame {
+    /// The raw producer token of the last annotation of the record's site
+    /// before it (the writer of its run), or `None` when none precedes it.
+    pub writer: Option<u64>,
+    /// The frame's wire sequence.
+    pub sequence: u32,
+    /// An annotation of its own immediately precedes the record: the shape a
+    /// multi-writer edge stages before every record.
+    pub annotated: bool,
 }
 
 /// The batch frames staged on one stage and read site since its last read, in
 /// the shape [`ReadIdentity::batch`] takes them.
-type PendingBatch = Vec<(Option<u64>, u32)>;
+type PendingBatch = Vec<ConsumedFrame>;
 
 /// What the planner answered for one topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2730,8 +2744,19 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                         usize::from(role == ReadStageRole::Drain),
                         cerulion_core::read_outcome::writer_run_site(sited.role),
                     );
-                    annotation_pending[stage][site] = false;
-                    batch_pending[stage][site].push((run_writer[stage][site], *served_seq));
+                    // An annotation pending here is this record's own, so the
+                    // read that follows counts as annotated only when another
+                    // annotation precedes it.
+                    let annotated = std::mem::take(&mut annotation_pending[stage][site]);
+                    #[cfg(feature = "oracle-mutants")]
+                    if crate::replay_feed::mutants::batch_frame_keeps_annotation_armed() {
+                        annotation_pending[stage][site] = annotated;
+                    }
+                    batch_pending[stage][site].push(ConsumedFrame {
+                        writer: run_writer[stage][site],
+                        sequence: *served_seq,
+                        annotated,
+                    });
                     continue;
                 }
                 // The third meaning: the frame named reached the consumer
@@ -4969,6 +4994,266 @@ mod tests {
                 Some(10),
                 Some(2)
             ]
+        );
+    }
+
+    /// On a multi-writer edge every record carries its own annotation, so a
+    /// batch frame without one lost it: the fed plan refuses the read naming
+    /// that frame's sequence rather than look the frame up under the writer of
+    /// the annotation before it.
+    ///
+    /// Hand oracle: `Producer A, BatchFrame 1, BatchFrame 2, Producer B,
+    /// DrainedBatch 3 popped 3`. The read and its first batch frame carry their
+    /// own annotations, frame 2 does not, so the plan over a two-writer
+    /// labeled index refuses with `read_identity_absent` at frame 2, writer
+    /// none.
+    #[test]
+    fn a_multi_writer_batch_frame_without_its_own_annotation_is_refused() {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let (a_port, b_port) = (11u128, 22u128);
+        let (a, b) = (
+            crate::replay_feed::writer_token(a_port),
+            crate::replay_feed::writer_token(b_port),
+        );
+        let on_body = |read: RecordedRead| SitedRead {
+            role: ReadSiteRole::Body,
+            read,
+        };
+        let mut topic = one_edge(vec![
+            on_body(RecordedRead::producer(0, ResolvedProducer::Foreign, a)),
+            on_body(RecordedRead::batch_frame(0, 1)),
+            on_body(RecordedRead::batch_frame(0, 2)),
+            on_body(RecordedRead::producer(0, ResolvedProducer::Foreign, b)),
+            sited(0, ReadSiteRole::Body, ReadKind::DrainedBatch, Some(3), 3),
+        ]);
+        topic.multi_publisher = true;
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &stages)
+        else {
+            panic!("the stream plans admissions");
+        };
+        let frames = |seqs: &[u32]| -> Vec<crate::replay_feed::RecordedFrame> {
+            seqs.iter()
+                .enumerate()
+                .map(|(i, &s)| crate::replay_feed::RecordedFrame {
+                    span: cerulion_bag::FrameSpan {
+                        offset: i * 10,
+                        len: 1,
+                    },
+                    sequence: Some(s),
+                    timestamp_ns: Some(i as u64),
+                })
+                .collect()
+        };
+        let labels: crate::replay_feed::TopicLabels = [a_port, a_port, b_port]
+            .iter()
+            .enumerate()
+            .map(|(i, port)| {
+                (
+                    cerulion_bag::ProducerAttribution::FrameLabel {
+                        frame_index: i as u64,
+                    },
+                    *port,
+                )
+            })
+            .collect();
+        let index = crate::replay_feed::FrameIndex::build(
+            &BTreeMap::from([("/t".to_string(), frames(&[1, 2, 3]))]),
+            &BTreeMap::from([("/t".to_string(), labels)]),
+        );
+        let refusal = crate::replay_feed::plan_feeds(
+            &[crate::replay_feed::FedStage {
+                admission: &plans[0],
+                input: "inp",
+                topic: "/t",
+                every_read: true,
+            }],
+            &index,
+            &BTreeMap::new(),
+            None,
+        )
+        .expect_err("frame 2 carries no annotation of its own");
+        assert_eq!(refusal.reason.code(), "read_identity_absent");
+        assert_eq!(
+            (refusal.step, refusal.writer, refusal.sequence),
+            (0, None, Some(2))
+        );
+    }
+
+    /// The identities the planner gives the reads of one body stage, over a
+    /// hand-built record stream at step 0.
+    fn identities_of(reads: Vec<SitedRead>) -> Vec<ReadIdentity> {
+        let stages = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission(&one_edge(reads), &stages)
+        else {
+            panic!("the stream plans admissions");
+        };
+        plans[0]
+            .per_step
+            .iter()
+            .flat_map(|s| s.identity.iter().cloned())
+            .collect()
+    }
+
+    fn on_site(role: ReadSiteRole, read: RecordedRead) -> SitedRead {
+        SitedRead { role, read }
+    }
+
+    fn annotation_read(raw: u64) -> RecordedRead {
+        RecordedRead::producer(0, ResolvedProducer::Foreign, raw)
+    }
+
+    fn served_read(seq: u32, popped: u32) -> RecordedRead {
+        RecordedRead::read(0, ReadKind::Served, Some(seq), popped, false)
+    }
+
+    /// Each batch frame reaches the next read of its stage and site, under the
+    /// writer of its site's run, marked with whether an annotation of its own
+    /// preceded it; the read is annotated only when one precedes the read
+    /// after its batch frames.
+    ///
+    /// Hand oracle, one stream per row:
+    /// `P(A) BF 1 P(B) R 2/2` gives writer B, annotated, batch `[A 1 own]`;
+    /// `P(A) BF 1 R 2/2` gives writer A, NOT annotated, batch `[A 1 own]`;
+    /// `P(A) BF 1 T(0) P(A) R 2/2` carries the frame past the empty marker;
+    /// `BF 1 R none/0 R 3/1` hands the frame to the read that popped nothing
+    /// and none to the next; a drain-site frame reaches the drain-site read,
+    /// never the body-site read between them.
+    #[test]
+    fn batch_frames_reach_the_next_read_of_their_stage_and_site() {
+        let body = ReadSiteRole::Body;
+        let frame = |writer: Option<u64>, sequence: u32, annotated: bool| ConsumedFrame {
+            writer,
+            sequence,
+            annotated,
+        };
+        let id = |writer: Option<u64>,
+                  annotated: bool,
+                  served_seq: Option<u32>,
+                  popped: u32,
+                  kind: ReadKind,
+                  batch: Vec<ConsumedFrame>| ReadIdentity {
+            writer,
+            annotated,
+            served_seq,
+            popped,
+            kind: Some(kind),
+            batch,
+        };
+        assert_eq!(
+            identities_of(vec![
+                on_site(body, annotation_read(0xA)),
+                on_site(body, RecordedRead::batch_frame(0, 1)),
+                on_site(body, annotation_read(0xB)),
+                on_site(body, served_read(2, 2)),
+            ]),
+            vec![id(
+                Some(0xB),
+                true,
+                Some(2),
+                2,
+                ReadKind::Served,
+                vec![frame(Some(0xA), 1, true)]
+            )]
+        );
+        assert_eq!(
+            identities_of(vec![
+                on_site(body, annotation_read(0xA)),
+                on_site(body, RecordedRead::batch_frame(0, 1)),
+                on_site(body, served_read(2, 2)),
+            ]),
+            vec![id(
+                Some(0xA),
+                false,
+                Some(2),
+                2,
+                ReadKind::Served,
+                vec![frame(Some(0xA), 1, true)]
+            )]
+        );
+        assert_eq!(
+            identities_of(vec![
+                on_site(body, annotation_read(0xA)),
+                on_site(body, RecordedRead::batch_frame(0, 1)),
+                on_site(body, RecordedRead::truncated(0, 0)),
+                on_site(body, annotation_read(0xA)),
+                on_site(body, served_read(2, 2)),
+            ]),
+            vec![id(
+                Some(0xA),
+                true,
+                Some(2),
+                2,
+                ReadKind::Served,
+                vec![frame(Some(0xA), 1, true)]
+            )]
+        );
+        assert_eq!(
+            identities_of(vec![
+                on_site(body, RecordedRead::batch_frame(0, 1)),
+                on_site(
+                    body,
+                    RecordedRead::read(0, ReadKind::NoFrame, None, 0, false)
+                ),
+                on_site(body, served_read(3, 1)),
+            ]),
+            vec![
+                id(
+                    None,
+                    false,
+                    None,
+                    0,
+                    ReadKind::NoFrame,
+                    vec![frame(None, 1, false)]
+                ),
+                id(None, false, Some(3), 1, ReadKind::Served, Vec::new()),
+            ]
+        );
+        assert_eq!(
+            identities_of(vec![
+                on_site(ReadSiteRole::Drain, RecordedRead::batch_frame(0, 1)),
+                on_site(body, served_read(2, 1)),
+                on_site(
+                    ReadSiteRole::Drain,
+                    RecordedRead::read(0, ReadKind::DrainedBatch, Some(3), 2, false)
+                ),
+            ]),
+            vec![
+                id(None, false, Some(2), 1, ReadKind::Served, Vec::new()),
+                id(
+                    None,
+                    false,
+                    Some(3),
+                    2,
+                    ReadKind::DrainedBatch,
+                    vec![frame(None, 1, false)]
+                ),
+            ]
+        );
+    }
+
+    /// MUTANT (`oracle-mutants`): a batch frame that leaves the annotation
+    /// before it pending fails the planner test and the multi-writer refusal
+    /// test.
+    #[cfg(feature = "oracle-mutants")]
+    #[test]
+    fn the_batch_frame_tests_catch_an_annotation_left_pending() {
+        let _armed = crate::replay_feed::mutants::batch_frame_keeps_annotation();
+        let caught =
+            std::panic::catch_unwind(batch_frames_reach_the_next_read_of_their_stage_and_site);
+        assert!(caught.is_err(), "the planner test passed under the mutant");
+        let caught = std::panic::catch_unwind(
+            a_multi_writer_batch_frame_without_its_own_annotation_is_refused,
+        );
+        assert!(
+            caught.is_err(),
+            "the multi-writer refusal test passed under the mutant"
         );
     }
 
