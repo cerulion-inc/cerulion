@@ -1584,7 +1584,7 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 6] = [
+        let cases: [(&str, PlayFlags); 7] = [
             (
                 "--record-out",
                 PlayFlags {
@@ -1627,6 +1627,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "--feed-index-budget",
+                PlayFlags {
+                    feed_index_budget: Some(1),
+                    ..Default::default()
+                },
+            ),
         ];
         for (flag, flags) in cases {
             let err = resolve_play_mode(flags).unwrap_err();
@@ -1664,6 +1671,40 @@ mod tests {
                 "must say WHY a neutral resim has no verdict to shape: {err}"
             );
         }
+    }
+
+    /// `--feed-index-budget` under a resim without `--verify` is refused by
+    /// name, naming `--verify` as the remedy: a neutral resim builds no feed
+    /// index. CONTROL: with `--verify` the same budget resolves and reaches
+    /// the engine's options.
+    #[test]
+    fn the_feed_index_budget_needs_verify_not_merely_resim() {
+        let err = resolve_play_mode(PlayFlags {
+            feed_index_budget: Some(4096),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(err.contains("`--feed-index-budget`"), "{err}");
+        assert!(err.contains("`--verify`"), "must name the remedy: {err}");
+        assert!(
+            err.contains("builds no feed index"),
+            "must say why a neutral resim has nothing to budget: {err}"
+        );
+        let mode = resolve_play_mode(PlayFlags {
+            feed_index_budget: Some(4096),
+            verify: true,
+            ..resim("all")
+        })
+        .expect("a verifying resim takes the budget");
+        let PlayMode::Resim {
+            verify: true,
+            options,
+            ..
+        } = mode
+        else {
+            panic!("a verifying resim: {mode:?}");
+        };
+        assert_eq!(options.feed_index_budget, Some(4096));
     }
 
     #[test]

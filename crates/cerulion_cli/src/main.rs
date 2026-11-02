@@ -4946,7 +4946,8 @@ mod resim_flag_mapping_tests {
             // switch, so both arms below cover it.
             allow_param_change: strict_state,
             record_out: Some(PathBuf::from("/tmp/o.mcap")),
-            feed_index_budget: None,
+            // Rides the `verify` switch, so the arm without it maps none.
+            feed_index_budget: verify.then_some(4096),
         }
     }
 
@@ -4980,6 +4981,11 @@ mod resim_flag_mapping_tests {
             f.allow_param_change,
             "`--allow-param-change` must survive the variant -> PlayFlags mapping"
         );
+        assert_eq!(
+            f.feed_index_budget,
+            Some(4096),
+            "`--feed-index-budget` must survive the variant -> PlayFlags mapping"
+        );
     }
 
     #[test]
@@ -4993,6 +4999,7 @@ mod resim_flag_mapping_tests {
         assert!(!f.repeat);
         assert!(f.rate.is_none());
         assert!(f.topics.is_empty());
+        assert!(f.feed_index_budget.is_none());
         // The two bag-time bounds are `Option`s for the same
         // reason `--rate` is — the refusal seam has to tell "asked for nothing"
         // from "asked for the default".
@@ -5036,6 +5043,7 @@ mod is_resim_family_tests {
         strict_state: bool,
         allow_param_change: bool,
         record_out: Option<PathBuf>,
+        feed_index_budget: Option<u64>,
     }
 
     fn play(f: Flags) -> BagAction {
@@ -5053,7 +5061,7 @@ mod is_resim_family_tests {
             strict_state: f.strict_state,
             allow_param_change: f.allow_param_change,
             record_out: f.record_out,
-            feed_index_budget: None,
+            feed_index_budget: f.feed_index_budget,
         }
     }
 
@@ -5163,6 +5171,13 @@ mod is_resim_family_tests {
                 "--record-out",
                 play(Flags {
                     record_out: Some(PathBuf::from("/tmp/o.mcap")),
+                    ..Flags::default()
+                }),
+            ),
+            (
+                "--feed-index-budget",
+                play(Flags {
+                    feed_index_budget: Some(4096),
                     ..Flags::default()
                 }),
             ),
