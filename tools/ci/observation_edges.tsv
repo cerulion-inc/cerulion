@@ -34,7 +34,7 @@ cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_tes
 cerulion_cli	cerulion_hygiene	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_telemetry	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_viz	crate-path	crates/cerulion_cli/tests/config_home_test.rs
-cerulion_cli	rmw_cerulion	dlopen	crates/cerulion_cli/tests/ros2_graph_e2e_test.rs
+cerulion_cli	rmw_cerulion	dlopen	crates/cerulion_cli/tests/doctor_cli_test.rs
 cerulion_cli_engine	all	whole-tree	crates/cerulion_cli_engine/tests/block_colocation_adoption_test.rs
 cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/shm_state.rs
 cerulion_cli_engine	cerulion_core	crate-path	crates/cerulion_cli_engine/src/replay_engine.rs
@@ -42,7 +42,7 @@ cerulion_cli_engine	cerulion_heaphook	dlopen	crates/cerulion_cli_engine/src/ros2
 cerulion_cli_engine	cerulion_wsd	crate-path	crates/cerulion_cli_engine/tests/workspace_lock_verb_adoption_test.rs
 cerulion_cli_engine	go2_tf_source	crate-path	crates/cerulion_cli_engine/tests/dependency_door_test.rs
 cerulion_cli_engine	native_ros2_messages	crate-path	crates/cerulion_cli_engine/src/workspace.rs
-cerulion_cli_engine	rmw_cerulion	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs
+cerulion_cli_engine	rmw_cerulion	dlopen	crates/cerulion_cli_engine/src/doctor/ros.rs
 cerulion_core	all	whole-tree	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_core	cerulion_bag	crate-path	crates/cerulion_core/tests/state_record_framing_scan_test.rs
 cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs
