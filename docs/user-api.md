@@ -2541,8 +2541,8 @@ edge, the topic has one in-graph producer and one consumer, the producer feeds n
 consumer fires on that frame alone (a data trigger with one trigger edge). The fused-chain census and
 the partitioner start from these same link rules; the census then adds its own fusion rules. A link joins the two units only when the graph's profile
 (`graphs/<NAME>.costs.yaml`, written by `cerulion graph profile`) shows it is safe: the unit's summed
-p50 tick, the new node included, stays under a quarter of the period the unit is fed at, and under a
-quarter of the new node's `tick_within_ms`. **Without a profile nothing merges**: every data-triggered
+p50 tick, the new node included, stays under a quarter of the shortest period the merged unit is fed at,
+and under a quarter of the new node's `tick_within_ms`. **Without a profile nothing merges**: every data-triggered
 node is a unit of its own, so a slow node never holds another node from the first run.
 
 Each unit `cerulion graph plan <NAME>` prints names why its first node starts it:

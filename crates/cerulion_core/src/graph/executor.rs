@@ -25,10 +25,10 @@
 //! A link merges only when the graph's profile ([`PartitionCosts`], the cost
 //! snapshot `graph profile` writes) shows the merge is safe: the unit's summed
 //! p50 tick, the new node included, stays under [`BUDGET_DIVISOR`]⁻¹ of the
-//! period the unit is fed at, and under the same share of the node's own
-//! `tick_within_ms`. Without a profile, or without a profiled tick for every node
-//! involved, nothing merges: every data-triggered node is a unit of its own, so a
-//! slow node never holds a fast one from the first run.
+//! shortest period the merged unit is fed at, and under the same share of the
+//! node's own `tick_within_ms`. Without a profile, or without a profiled tick
+//! for every node involved, nothing merges: every data-triggered node is a unit
+//! of its own, so a slow node never holds a fast one from the first run.
 //!
 //! Each node that starts a unit carries the reason ([`Boundary`]): a source, an
 //! edge that is no link (latest-value, fan-out, join, a period or sync
@@ -336,22 +336,38 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
-/// The period a unit headed by `head` is fed at: the head's own period, else
-/// the fastest profiled rate of its trigger edges.
-fn head_period_ns(head: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>) -> Option<u64> {
-    if let Some(p) = graph.period_ns.get(head) {
+/// The period `node` is fed at: its own period, else the fastest profiled
+/// rate of its trigger edges.
+fn feed_period_ns(node: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>) -> Option<u64> {
+    if let Some(p) = graph.period_ns.get(node) {
         return Some(*p);
     }
     let costs = costs?;
     graph
         .trigger_edges
         .iter()
-        .filter(|(_, c)| c == head)
+        .filter(|(_, c)| c == node)
         .filter_map(|(p, c)| costs.edge_rate_mhz.get(&(p.clone(), c.clone())))
         .copied()
         .filter(|r| *r > 0)
         .max()
         .map(|mhz| 1_000_000_000_000 / mhz)
+}
+
+/// The shorter of two feed periods; unknown when either is.
+fn faster(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    Some(a?.min(b?))
+}
+
+/// Record that the group rooted at `r` is also fed at `period_ns`, and return
+/// the period the group is fed at now.
+fn feed(fed: &mut IndexMap<usize, Option<u64>>, r: usize, period_ns: Option<u64>) -> Option<u64> {
+    let now = match fed.get(&r) {
+        Some(&known) => faster(known, period_ns),
+        None => period_ns,
+    };
+    fed.insert(r, now);
+    now
 }
 
 /// A unit being grown along one chain.
@@ -545,25 +561,35 @@ pub fn derive_units(
             deadline_ns,
         }
     };
+    // A member that is no candidate and links to one heads a chain.
+    let heads = |n: &str| {
+        !candidates.contains(n) && link_out.get(n).is_some_and(|f| candidates.contains(*f))
+    };
+    // The period each group is fed at, keyed by its root: the shortest feed
+    // period of its members that start a unit or head a chain, and of every
+    // link a walk has crossed into it; unknown when any of them is. A group
+    // absent from the map is fed only through the link a walk reaches it by.
+    let mut fed: IndexMap<usize, Option<u64>> = IndexMap::new();
+    for (i, member) in members.iter().enumerate() {
+        let n = member.as_str();
+        if starts.contains_key(n) || heads(n) {
+            let r = root(&mut parent, i);
+            feed(&mut fed, r, feed_period_ns(n, graph, costs));
+        }
+    }
     let mut walked: IndexSet<&str> = IndexSet::new();
     // Walk each chain of candidate links from the node that heads it, growing
     // one unit at a time.
     for node in members {
         let head = node.as_str();
-        if candidates.contains(head) {
-            continue;
-        }
-        let Some(&first) = link_out.get(head) else {
-            continue;
-        };
-        if !candidates.contains(first) {
+        if !heads(head) {
             continue;
         }
         let head_root = index(head).map(|i| root(&mut parent, i));
         let totals = head_root.map(|r| unit_totals(r, &mut parent));
         let mut unit = Growing {
             sum_ns: totals.as_ref().and_then(|t| t.sum_ns),
-            period_ns: head_period_ns(head, graph, costs),
+            period_ns: head_root.and_then(|r| fed.get(&r).copied().flatten()),
             deadline_ns: totals.as_ref().and_then(|t| t.deadline_ns),
         };
         let mut at = head;
@@ -580,23 +606,38 @@ pub fn derive_units(
                     continue;
                 }
             }
-            let add = match index(next) {
-                Some(i) => {
-                    let r = root(&mut parent, i);
-                    unit_totals(r, &mut parent)
-                }
+            let next_root = index(next).map(|i| root(&mut parent, i));
+            let add = match next_root {
+                Some(r) => unit_totals(r, &mut parent),
                 None => Growing {
                     sum_ns: None,
                     period_ns: None,
                     deadline_ns: None,
                 },
             };
-            match merge_verdict(next, at, &unit, &add, profile) {
+            // Merged, the unit is also fed wherever `next`'s group is fed (by
+            // a member that starts a unit or heads a chain, or across a link a
+            // walk crossed into it), so the verdict reads the shorter period.
+            let judged = Growing {
+                period_ns: match next_root.and_then(|r| fed.get(&r)) {
+                    Some(&known) => faster(unit.period_ns, known),
+                    None => unit.period_ns,
+                },
+                ..unit
+            };
+            match merge_verdict(next, at, &judged, &add, profile) {
                 Ok(sum) => {
                     if let (Some(a), Some(b)) = (index(next), index(at)) {
+                        let old = [root(&mut parent, a), root(&mut parent, b)];
                         union(&mut parent, a, b);
+                        for r in old {
+                            fed.shift_remove(&r);
+                        }
+                        let r = root(&mut parent, a);
+                        fed.insert(r, judged.period_ns);
                     }
                     unit.sum_ns = sum;
+                    unit.period_ns = judged.period_ns;
                     unit.deadline_ns = match (unit.deadline_ns, add.deadline_ns) {
                         (Some(a), Some(b)) => Some(a.min(b)),
                         (a, b) => a.or(b),
@@ -604,15 +645,19 @@ pub fn derive_units(
                 }
                 Err(boundary) => {
                     starts.insert(next, boundary);
+                    let link = costs
+                        .and_then(|c| c.edge_rate_mhz.get(&(at.to_string(), next.to_string())))
+                        .copied()
+                        .filter(|r| *r > 0)
+                        .map(|mhz| 1_000_000_000_000 / mhz)
+                        .or(unit.period_ns);
                     unit = Growing {
                         deadline_ns: add.deadline_ns,
                         sum_ns: add.sum_ns,
-                        period_ns: costs
-                            .and_then(|c| c.edge_rate_mhz.get(&(at.to_string(), next.to_string())))
-                            .copied()
-                            .filter(|r| *r > 0)
-                            .map(|mhz| 1_000_000_000_000 / mhz)
-                            .or(unit.period_ns),
+                        period_ns: match next_root {
+                            Some(r) => feed(&mut fed, r, link),
+                            None => link,
+                        },
                     };
                 }
             }
@@ -1094,6 +1139,128 @@ mod tests {
         let units = derive_units("g", &s(&["s", "b", "x", "y"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["s", "b", "x", "y"])], "{units:?}");
         assert_eq!(units[0].boundaries, [("s".to_string(), Boundary::Source)]);
+    }
+
+    fn over_period(node: &str, unit_ns: u64, period_ns: u64) -> Boundary {
+        Boundary::OverBudget(BudgetVerdict {
+            node: node.to_string(),
+            unit_ns,
+            budget_ns: period_ns / BUDGET_DIVISOR,
+            against: BudgetAgainst::Period { period_ns },
+            profile: "costs.yaml".to_string(),
+        })
+    }
+
+    #[test]
+    fn a_node_refused_over_budget_does_not_rejoin_through_a_later_member_of_that_unit() {
+        // `s -> b -> y` is a chain at 100 Hz; the join `x`, triggered by `s`
+        // and `y`, declares isolate: false, so `s`, `x` and `y` share one unit
+        // (1.6 ms) before the walk. `b` brings 1 ms: 2.6 ms reaches a quarter
+        // of the 10 ms period, so `b` starts a unit. The profile measured
+        // `s -> b` at 90 Hz (an 11.1 ms period). The link `b -> y` would put
+        // the same 2.6 ms back into the unit `s` feeds every 10 ms, so `y`
+        // stays with `s` and says why.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[("s", "b"), ("b", "y")],
+            &[("s", "x", join.clone()), ("y", "x", join.clone())],
+            &[("s", 10)],
+        );
+        g.isolate.insert("x".into(), false);
+        let c = costs(
+            &[
+                ("s", 1_000_000),
+                ("b", 1_000_000),
+                ("x", 300_000),
+                ("y", 300_000),
+            ],
+            &[("s", "b", 90_000)],
+        );
+        let units = derive_units("g", &s(&["s", "b", "x", "y"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["s", "x", "y"]), s(&["b"])], "{units:?}");
+        assert_eq!(
+            units[0].boundaries,
+            [
+                ("s".to_string(), Boundary::Source),
+                ("y".to_string(), over_period("y", 2_600_000, 10_000_000)),
+            ]
+        );
+        assert_eq!(
+            units[1].boundaries,
+            [("b".to_string(), over_period("b", 2_600_000, 10_000_000))]
+        );
+
+        // One hop later: `s -> b -> c -> y` with `x` joining `b` and `y`.
+        // `b` (with `x` and `y`) joins `s` at 1.6 ms; `c` brings 1 ms and
+        // starts a unit; `y` would put `c` back into the 10 ms unit.
+        let mut g = graph(
+            &[("s", "b"), ("b", "c"), ("c", "y")],
+            &[("b", "x", join.clone()), ("y", "x", join)],
+            &[("s", 10)],
+        );
+        g.isolate.insert("x".into(), false);
+        let c = costs(
+            &[
+                ("s", 500_000),
+                ("b", 500_000),
+                ("c", 1_000_000),
+                ("x", 300_000),
+                ("y", 300_000),
+            ],
+            &[("b", "c", 90_000)],
+        );
+        let units = derive_units("g", &s(&["s", "b", "c", "x", "y"]), &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["s", "b", "x", "y"]), s(&["c"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "c"),
+            Some(&over_period("c", 2_600_000, 10_000_000))
+        );
+        assert_eq!(
+            start_of(&units, "y"),
+            Some(&over_period("y", 2_600_000, 10_000_000))
+        );
+    }
+
+    #[test]
+    fn a_merge_into_a_unit_another_node_feeds_is_judged_at_the_faster_period() {
+        // `h2` (50 Hz) links to `y`; the join `x`, triggered by `y` and the
+        // 100 Hz source `h1`, declares isolate: false, so `y`, `h1` and `x`
+        // share one unit (2.1 ms) fed every 10 ms. With `h2` the unit would
+        // tick 4.1 ms: under a quarter of `h2`'s 20 ms period, over a quarter
+        // of `h1`'s 10 ms one.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[("h2", "y")],
+            &[("h1", "x", join.clone()), ("y", "x", join)],
+            &[("h1", 10), ("h2", 20)],
+        );
+        g.isolate.insert("x".into(), false);
+        let c = costs(
+            &[
+                ("h2", 2_000_000),
+                ("y", 300_000),
+                ("h1", 1_500_000),
+                ("x", 300_000),
+            ],
+            &[],
+        );
+        let units = derive_units("g", &s(&["h2", "y", "h1", "x"]), &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["h2"]), s(&["y", "h1", "x"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            units[1].boundaries,
+            [
+                ("y".to_string(), over_period("y", 4_100_000, 10_000_000)),
+                ("h1".to_string(), Boundary::Source),
+            ]
+        );
     }
 
     #[test]
