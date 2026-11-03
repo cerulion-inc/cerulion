@@ -1100,24 +1100,21 @@ with rmw-specific additions:
   clamped to `[1, limit]`. BEST_AVAILABLE is resolved once, at create, by the pure
   `resolve_publisher_durability` and `resolve_subscription_durability` in
   `src/api/pubsub.rs`: a publisher takes TRANSIENT_LOCAL; a subscription takes
-  TRANSIENT_LOCAL when every publisher live on the topic carries the retaining mark, or
-  when there is none, and VOLATILE otherwise. That is the `rmw_dds_common` count, except
-  for the empty list, which current `rmw_dds_common` (Jazzy, Rolling) resolves VOLATILE
-  because a later VOLATILE DDS writer would not match a TRANSIENT_LOCAL reader; this
-  transport has no such matching, so the two differ only for a publisher that attaches
-  while the subscription is created. The flags come from
-  `TransportManager::topic_publisher_retain_marks`, one per publisher in the service's
-  iceoryx2 dynamic config, so publishers in other processes count; `cerulion_core` names
-  every data publisher whose own history request is above 0 `cerulion.retains`
-  (`RETAINING_PUBLISHER_NAME`), so a native publisher that declares history counts as
-  retaining, and a publisher that asks for none does not: a DDS bridge or network
-  ingress publisher, or a destroyed VOLATILE publisher whose destroy leaked a borrowed
-  slot (its port stays registered until its process exits). A probe that cannot read the
-  service resolves VOLATILE and warns with the reason. A publisher that opens after the
-  subscription does not change its resolution. A publisher from a build without the mark
-  counts as one that retains nothing. Endpoint info reports the REQUESTED durability,
-  BEST_AVAILABLE included. The Foxy, Galactic and Humble headers declare no
-  BEST_AVAILABLE; the constant sits behind
+  TRANSIENT_LOCAL when at least one publisher is live on the topic and every one carries
+  the retaining mark, and VOLATILE otherwise, including when there is none. This matches
+  `rmw_dds_common` on Jazzy and later; Iron resolves the zero-publisher case to
+  TRANSIENT_LOCAL. The flags come from `TransportManager::topic_publisher_retain_marks`,
+  one per publisher in the service's iceoryx2 dynamic config, so publishers in other
+  processes count; `cerulion_core` names every data publisher whose own history request
+  is above 0 `cerulion.retains` (`RETAINING_PUBLISHER_NAME`), so a native publisher that
+  declares history counts as retaining, and a publisher that asks for none does not: a
+  DDS bridge or network ingress publisher, or a destroyed VOLATILE publisher whose
+  destroy leaked a borrowed slot (its port stays registered until its process exits). A
+  probe that cannot read the service resolves VOLATILE and warns with the reason. A
+  publisher that opens after the subscription does not change its resolution. A
+  publisher from a build without the mark counts as one that retains nothing. Endpoint
+  info reports the REQUESTED durability, BEST_AVAILABLE included. The Foxy, Galactic and
+  Humble headers declare no BEST_AVAILABLE; the constant sits behind
   `cfg(cerulion_has_durability_best_available)`, and the resolvers return every value
   unchanged there.
 - **Endpoint info by topic.** `rmw_get_{publishers,subscriptions}_info_by_topic` serves

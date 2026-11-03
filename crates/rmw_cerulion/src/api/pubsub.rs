@@ -186,17 +186,15 @@ pub(crate) fn resolve_publisher_durability(requested: u32) -> u32 {
 /// (`true` when that publisher carries
 /// [`cerulion_core::transport::RETAINING_PUBLISHER_NAME`], in any process).
 ///
-/// BEST_AVAILABLE becomes TRANSIENT_LOCAL when every flag is set, an empty
-/// slice included, and VOLATILE otherwise; the mark stands for "offers
-/// TRANSIENT_LOCAL". `rmw_dds_common` counts the same way but resolves an
-/// empty list VOLATILE (Jazzy, Rolling), because a later VOLATILE DDS writer
-/// would not match a TRANSIENT_LOCAL reader; this transport matches every
-/// publisher with every subscription. Every other value is returned
-/// unchanged, whatever the flags say.
+/// BEST_AVAILABLE becomes TRANSIENT_LOCAL when there is at least one flag and
+/// every flag is set, and VOLATILE otherwise, an empty slice included; the
+/// mark stands for "offers TRANSIENT_LOCAL". This matches `rmw_dds_common` on
+/// Jazzy and later; Iron resolves the zero-publisher case to TRANSIENT_LOCAL.
+/// Every other value is returned unchanged, whatever the flags say.
 pub(crate) fn resolve_subscription_durability(requested: u32, publishers_retain: &[bool]) -> u32 {
     if !is_best_available_durability(requested) {
         requested
-    } else if publishers_retain.iter().all(|&retains| retains) {
+    } else if !publishers_retain.is_empty() && publishers_retain.iter().all(|&retains| retains) {
         ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
     } else {
         ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE
@@ -5120,8 +5118,8 @@ mod slice_ceiling_tests {
 }
 
 /// The durability resolvers against hand-written verdicts: BEST_AVAILABLE by
-/// the every-publisher-retains rule (an empty list resolves TRANSIENT_LOCAL,
-/// unlike current `rmw_dds_common`), every other value passed through.
+/// the `rmw_dds_common` rule of Jazzy and later (no publisher resolves
+/// VOLATILE), every other value passed through.
 #[cfg(test)]
 mod durability_resolution_tests {
     use super::*;
@@ -5162,7 +5160,9 @@ mod durability_resolution_tests {
         let mut last_does_not = [true; 65];
         last_does_not[64] = false;
         let cases: [(&[bool], u32); 9] = [
-            (&[], TL),
+            // No publisher: VOLATILE; the one-retaining-publisher row below is
+            // its nonzero control.
+            (&[], VOLATILE),
             (&[true], TL),
             (&[true, true, true], TL),
             (&all_retain, TL),
