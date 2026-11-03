@@ -23,6 +23,9 @@ CHANGELOG = ROOT / "CHANGELOG.md"
 ROOT_MANIFEST = ROOT / "Cargo.toml"
 WORKSPACE_RS = ROOT / "crates" / "cerulion_cli_engine" / "src" / "workspace.rs"
 
+# A number of bytes or bits attached to the key: 32-byte, 16 byte, 64 bytes, 256-bit.
+KEY_LENGTH_CLAIM = re.compile(r"\b\d+[- ](?:byte|bit)s?\b", re.IGNORECASE)
+
 
 def squash(text):
     """Collapse every run of whitespace so a line wrap never decides a result."""
@@ -151,10 +154,16 @@ class MacKeyChangelogEntry(unittest.TestCase):
         self.assertIn("refuses to start", entry)
 
     def test_no_entry_claims_a_key_length(self):
-        # `store_mac_key` returns a `Vec<u8>` and the MAC takes any length.
+        # `store_mac_key` returns a `Vec<u8>` and the MAC takes any length, so
+        # no number of bytes or bits may be attached to the key, whatever it is.
         for bullet in self.about_key:
-            self.assertNotIn("32-byte", bullet)
-            self.assertNotIn("32 byte", bullet)
+            self.assertIsNone(KEY_LENGTH_CLAIM.search(bullet), bullet)
+
+    def test_the_length_pattern_catches_each_spelling_of_a_claim(self):
+        for claim in ("32-byte key", "a 16 byte key", "64 bytes", "256-bit key"):
+            self.assertIsNotNone(KEY_LENGTH_CLAIM.search(claim), claim)
+        for fine in ("the key file", "a key of any length", "trust_store.mac_key"):
+            self.assertIsNone(KEY_LENGTH_CLAIM.search(fine), fine)
 
 
 if __name__ == "__main__":
