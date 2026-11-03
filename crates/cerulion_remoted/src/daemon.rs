@@ -572,7 +572,7 @@ pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, Remot
         Ok(bytes) if bytes.is_empty() && expected => Err(RemotedError::MacKey(format!(
             "empty trust-store MAC key file {}: a trust store or device index exists and \
              must be verified with it. An empty key file is only a fresh install's \
-             placeholder; restore this device's 32-byte MAC key into it (mode 0600)",
+             placeholder; restore this device's own MAC key into it (mode 0600)",
             path.display()
         ))),
         Ok(bytes) => Ok(bytes),
