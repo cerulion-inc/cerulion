@@ -703,7 +703,53 @@ async fn an_empty_mac_key_for_existing_trust_state_is_a_mac_key_error() {
             assert!(
                 message.contains("empty trust-store MAC key"),
                 "message: {message}"
-            )
+            );
+            assert!(
+                message.contains("no key file to name"),
+                "a provider without a file says so: {message}"
+            );
+        }
+        other => panic!("expected a MAC key error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_empty_mac_key_file_for_existing_trust_state_names_the_file() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let key_file = root.path().join("remoted").join("device_key");
+    let mac_file = root.path().join("remoted").join("trust_store.mac_key");
+    std::fs::write(&key_file, [ROBOT_SEED; 32]).unwrap();
+    std::fs::write(&mac_file, b"").unwrap();
+    let before = state_files(root.path());
+    let error = RemotePlane::new(
+        root.path(),
+        ROBOT,
+        root.path().join("s"),
+        RelayConfig::Disabled,
+    )
+    .bind_bounded(&KeyFiles {
+        key_file,
+        store_mac_key_file: mac_file.clone(),
+    })
+    .await
+    .err()
+    .expect("an empty key file cannot verify the existing store");
+    assert_eq!(
+        state_files(root.path()),
+        before,
+        "a refused bind changes no state file"
+    );
+    match error {
+        RemotedError::MacKey(message) => {
+            assert!(
+                message.contains("empty trust-store MAC key"),
+                "message: {message}"
+            );
+            assert!(
+                message.contains(&mac_file.display().to_string()),
+                "the message names the key file: {message}"
+            );
         }
         other => panic!("expected a MAC key error, got {other:?}"),
     }
