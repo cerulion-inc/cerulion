@@ -736,6 +736,60 @@ An Android app links its nodes this way into one native library, its app runtime
 
 ## Node author API (the macros)
 
+### What a node crate depends on
+
+A node needs the runtime and the message types, and there are two manifests
+that provide them.
+
+One dependency, which is what `cargo add cerulion` writes:
+
+```toml
+[dependencies]
+cerulion = "1.0.0"
+```
+
+`cerulion` is an umbrella crate that re-exports the other three at a single
+version. A node written against it imports `cerulion::prelude::*` and takes
+its port types from `cerulion::msgs`.
+
+Or the crates themselves, which is what `cerulion workspace create` scaffolds
+and what every example in this document uses:
+
+```toml
+[dependencies]
+cerulion_core = "1.0.0"
+native_ros2_messages = "1.0.0"
+```
+
+Either works. The macros read the package's own `Cargo.toml` at expansion
+time to decide how to spell the paths they emit, because Rust resolves the
+first segment of an absolute path only against a crate the package names in
+its own manifest:
+
+| The package names | Generated paths start with |
+|---|---|
+| `cerulion_core` and not `cerulion` | `::cerulion_core` |
+| `cerulion` and not `cerulion_core` | `::cerulion::core` |
+| both, with `cerulion` a plain `[dependencies]` entry without `optional = true`, and `cerulion_core` not one | `::cerulion::core` |
+| both, any other way | `::cerulion_core` |
+
+The third row is the layout where only the umbrella is linked into every
+target: `cerulion_core` sits in `[dev-dependencies]`, in a
+`[target.'cfg(..)'.dependencies]` table, or behind `optional = true`. A
+package whose generated paths start with `::cerulion_core` gets the same
+generated code it got before the macros read the manifest, so a type error on
+a node's field is still reported at that field.
+
+A package that names neither is refused: Cargo does not hand a package its
+transitive dependencies, so a re-export in some crate further down cannot
+stand in. The macros report that by name, with both manifests spelled out,
+rather than leaving a resolution error against a path nobody wrote.
+
+`cerulion_macros` is never a direct dependency. The macros arrive with the
+prelude.
+
+### The shape of a node
+
 A node lives in `nodes/<type>/src/lib.rs` and looks like this:
 
 ```rust
