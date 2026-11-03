@@ -133,7 +133,10 @@ pub mod discovery;
 // crate, exposed so its behaviour can be pinned from an integration test rather
 // than only inferred from the recorder's output.
 pub mod discovery_scan;
+// The kernel watch the enumeration blocks on, so a settled machine
+// pays no directory walks at all. `pub` on the same terms as its siblings.
 pub mod schema_resolve;
+pub mod service_dir_watch;
 // The node-state anchor ledger + the coverage attachment it
 // becomes. `pub` on the same terms as its siblings.
 pub mod state_coverage;
@@ -412,25 +415,25 @@ const _: () = assert!(
 );
 const _: () = assert!(DEFAULT_SCHEMA_DEMAND_MS < DEFAULT_SCHEMA_WAIT_MS);
 
-/// Consecutive rescans that must find NOTHING NEW before bag creation
-/// is released early.
+/// How many enumeration cadences of QUIET the settle window is worth.
 ///
-/// The settle window is "quiet for N scans, capped at
-/// [`DEFAULT_DISCOVERY_SETTLE_MS`]", not a flat sleep: a plain graph — whose
-/// live set is complete at arm time and never changes — is released after
-/// `DISCOVERY_SETTLE_QUIET_SCANS * DISCOVERY_RESCAN_INTERVAL` (500 ms at the
-/// shipped constants) rather than paying the whole cap, while a robot whose
-/// bridge is still opening routes keeps the window open until it stops finding
-/// them or the cap expires.
+/// The one input [`DISCOVERY_SETTLE_MIN`] - the window itself - is derived
+/// from, kept as a separate number because it is where the JUDGEMENT lives:
+/// TWO rather than one, because a single cadence of quiet is satisfied by the
+/// gap between two routes opening back to back, which is exactly the shape the
+/// window must not cut short.
 ///
-/// TWO rather than one: a single quiet scan is satisfied by the gap between two
-/// routes opening back to back, which is exactly the shape this must not cut
-/// short.
+/// It is no longer a count of scans anything compares against. Enumeration is
+/// driven by filesystem events now, so a settled machine produces no scans to
+/// count; the window is measured as a WALL instead (see
+/// [`discovery::discovery_hold_open`], which is the rule, and
+/// `Recorder::discovery_hold_active`, which applies it) and this constant sizes
+/// it.
 pub const DISCOVERY_SETTLE_QUIET_SCANS: u32 = 2;
 
 /// How often the drive loop LOOKS at the run it is bound to.
 ///
-/// Deliberately the discovery rescan's cadence, and deliberately NOT the wall
+/// Deliberately the discovery cadence quantum, and deliberately NOT the wall
 /// the verdict is measured against: the watcher's subscriber accumulates
 /// records whether or not anyone is looking, so this sets how promptly a
 /// finished run is NOTICED, never whether its last word was heard. That is the
@@ -443,34 +446,38 @@ pub const DISCOVERY_SETTLE_QUIET_SCANS: u32 = 2;
 /// is real work for an answer that changes at most every 150 ms.
 const RUN_OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Discovery re-check: the ABSOLUTE minimum the settle hold lasts, below which the
-/// quiet rule cannot release bag creation.
+/// The QUIET WINDOW: how long the live topic set must go unchanged before bag
+/// creation is released.
 ///
-/// # Why counting scans was not enough
+/// The settle hold is "nothing new discovered for this long, capped at
+/// [`DEFAULT_DISCOVERY_SETTLE_MS`]", measured from the later of the drive
+/// loop's start and the last discovered tap. A plain graph - whose live set is
+/// complete before the recorder armed - therefore pays exactly this window
+/// rather than the whole cap, while a robot whose bridge is still opening
+/// routes keeps the window open until it stops finding them.
 ///
-/// The quiet rule alone does not deliver the window its own arithmetic implies.
-/// `Recorder::setup` discounts the ARM-TIME scan (a scan taken before the graph
-/// is released to step 0 says nothing about whether the run's producers have
-/// appeared) — but drive-loop pass 1 rescans IMMEDIATELY, microseconds later and
-/// still strictly before the parent has seen the ready file and written GO, and
-/// that scan DID count. So only one informative scan separated arm from release
-/// and the real floor was ONE rescan interval (~250 ms), while the constant's
-/// own doc and the project docs both said 500 ms.
+/// # Why a wall rather than a count
 ///
-/// That is a correctness bug, not a doc nit: on the flagship `ros2 attach` path
-/// the window closed ~250 ms after GO, and DDS SPDP/SEDP discovery does not
-/// deliver the bridge's first `create_ingress_publisher` that fast — so every
-/// route would land `appeared_after_bag_creation` and blocker 1's observable
-/// outcome would be unchanged, with only the manifest accurate about it.
+/// It states the guarantee in the unit the guarantee is about (wall time before
+/// the channel set closes) and is directly measurable by a test, instead of
+/// being an emergent property of which enumerations happen to be counted. A
+/// count also depends on which enumerations are counted: one taken
+/// microseconds after the arm-time scan would count, and leave fewer
+/// informative scans between arm and release than the count promises.
 ///
-/// An absolute floor is used rather than more scan bookkeeping because it states
-/// the guarantee in the unit the guarantee is about (wall time before the
-/// channel set closes) and is directly measurable by a test, instead of being an
-/// emergent property of which scans happen to be counted.
+/// It is also what lets discovery be EVENT-DRIVEN at all. A watch on the
+/// iceoryx2 service directory is silent on a settled machine, so a rule phrased
+/// as "N consecutive enumerations found nothing" could never be satisfied there
+/// and every plain recording would pay the full cap.
 ///
-/// Derived from the cadence and the quiet threshold so the three constants
-/// cannot drift apart; CLAMPED to `discovery_settle` at the use site, so
-/// `--discovery-settle-ms 0` still disables the hold entirely.
+/// That matters on the flagship robot path: if the window closes too early,
+/// DDS discovery has not yet delivered the bridge's first runtime route, every
+/// route lands `appeared_after_bag_creation`, and the recording is empty of the
+/// data it was started for.
+///
+/// Derived from the enumeration cadence and the quiet threshold so the
+/// constants cannot drift apart; CLAMPED to `discovery_settle` at the use site,
+/// so `--discovery-settle-ms 0` still disables the hold entirely.
 pub const DISCOVERY_SETTLE_MIN: Duration = Duration::from_millis(
     discovery::DISCOVERY_RESCAN_INTERVAL_MS * DISCOVERY_SETTLE_QUIET_SCANS as u64,
 );
@@ -4686,8 +4693,9 @@ pub struct TappedTopic {
     ///    nonzero first sequence is just where the tap came in.
     /// 2. `source == Declared` — that guarantee covers the DECLARED set only. An
     ///    arm-time DISCOVERED topic is a co-tenant that may have been streaming
-    ///    for hours, and a rescan-discovered one attached up to one
-    ///    [`DISCOVERY_RESCAN_INTERVAL`] after its producer registered.
+    ///    for hours, and a later-discovered one attached some way after its
+    ///    producer registered - promptly, since a service file appearing wakes
+    ///    the enumeration, but never at the producer's first frame.
     /// 3. `!attached_late` — a tap that attached after recording started covers
     ///    its topic only from that instant, by construction.
     /// 4. The sequence belongs to ONE commit counter: the topic is not declared
@@ -10545,7 +10553,7 @@ struct Recorder {
     /// ascending — the durable half is `StateCoverage::ranks_discovered`.
     state_ring_ranks: BTreeSet<u32>,
     /// Rank holes already REPORTED, so a hole that persists across
-    /// every 250 ms rescan is announced once rather than four times a second.
+    /// every state-ring sweep is announced once rather than on every sweep.
     state_rank_gaps_reported: BTreeSet<u32>,
     /// Ranks the DISCOVERY SWEEP walked to, as opposed to ranks this
     /// recorder holds a ring for. Only these witness density — see
@@ -10678,9 +10686,16 @@ struct Recorder {
     /// descriptor says whether the bag can be REPLAYED from (which a name alone
     /// does not establish). `replay_grade` is classified from THIS.
     schema_descriptors: BTreeMap<String, schema_resolve::ChannelDescriptor>,
-    /// Consecutive rescans that added NO new tap. Bag creation is
-    /// released once this reaches [`DISCOVERY_SETTLE_QUIET_SCANS`].
-    discovery_quiet_scans: u32,
+    /// When discovery last ADDED a tap, on the recorder's own monotonic
+    /// clock. Bag creation is held until this has been quiet for
+    /// [`DISCOVERY_SETTLE_MIN`] (see [`Recorder::discovery_hold_active`]).
+    ///
+    /// A wall mark rather than a count of quiet scans, because enumeration is
+    /// now driven by filesystem events: a settled machine produces no scans at
+    /// all, so a rule phrased as "N consecutive scans found nothing" would never
+    /// be satisfied and every plain recording would pay the whole settle cap.
+    /// The wall is also the unit the guarantee was always about.
+    discovery_last_add: Option<Instant>,
     /// The drive loop's own origin — the instant
     /// [`Recorder::discovery_hold_active`]'s `elapsed` is measured from. Stashed
     /// here by [`drive_loop`] so bag creation can date itself against the SAME
@@ -11965,7 +11980,7 @@ impl Recorder {
             schema_resolver: None,
             schema_sources: BTreeMap::new(),
             schema_descriptors: BTreeMap::new(),
-            discovery_quiet_scans: 0,
+            discovery_last_add: None,
             drive_start: None,
             run_watcher,
             run_watch_failed,
@@ -12024,7 +12039,7 @@ impl Recorder {
         // The ARM-TIME scan. On the `graph run --record` path this typically
         // finds nothing new — the recorder is armed BEFORE the graph is released
         // to step 0, so a runtime-registered producer does not exist yet. That is
-        // precisely why the rescan in `drive_loop` is the load-bearing half.
+        // precisely why the later enumerations are the load-bearing half.
         rec.rescan_discovery(mgr);
         // Every node the opened rings DECLARE, into the anchor
         // retention. Recorded at OPEN rather than when an anchor lands, because
@@ -12041,13 +12056,13 @@ impl Recorder {
         rec.discover_state_rings();
         // From here every find is a LATE attach.
         rec.discovery_armed = true;
-        // The ARM-TIME scan must not count toward the settle window's quiet
-        // threshold. bagd is armed BEFORE the graph is released to step 0, so a
-        // quiet arm scan says nothing about whether the run's producers have
-        // appeared — counting it let two quiet scans (the arm one plus drive
-        // pass 1) release bag creation on the very first pass, which is the
-        // inertness this window exists to fix.
-        rec.discovery_quiet_scans = 0;
+        // The ARM-TIME scan must not close the settle window. bagd is armed
+        // BEFORE the graph is released to step 0, so what it found says nothing
+        // about whether the run's producers have appeared - and the window
+        // exists precisely to wait for producers that do not exist yet. Clearing
+        // the mark means the window is measured from the DRIVE LOOP's start,
+        // never from an arm-time find.
+        rec.discovery_last_add = None;
         // Start the RESOLVE-OR-DEMAND resolver at ARM TIME, on
         // its own thread. It is seeded with the tap set as it stands now and fed
         // every later discovery through `note_topic` — the rescan-found set is
@@ -12097,7 +12112,8 @@ impl Recorder {
     ///
     /// ONCE, and at ARM time, for a measured reason: the gather LISTENS for
     /// `mirror_registry::MIRROR_GATHER_WINDOW` (600 ms), which is longer than
-    /// the 250 ms rescan cadence, so per-scan gathering would dominate the loop.
+    /// the enumeration cadence quantum, so per-scan gathering would dominate
+    /// the loop.
     /// Arm time is also the one moment it is free: bagd is armed BEFORE the
     /// graph is released to step 0, so no tapped topic is streaming yet and the
     /// 600 ms costs no frames. RESIDUAL: a mirror that netd creates AFTER this
@@ -12290,7 +12306,7 @@ impl Recorder {
     /// ENDED, latch that verdict — which makes the very same pass a shutdown
     /// pass (see the drive loop).
     ///
-    /// Throttled to [`RUN_OBSERVE_INTERVAL`], the discovery rescan's cadence: a
+    /// Throttled to [`RUN_OBSERVE_INTERVAL`], the discovery cadence quantum: a
     /// live run republishes every 150 ms, so looking four times a second cannot
     /// miss a record (the subscriber's queue is 256 deep and holds whatever
     /// accumulated), while an unthrottled look would drain and read a
@@ -12445,7 +12461,7 @@ impl Recorder {
     /// walk therefore stops a small tolerance past the last rank that answered
     /// (`scan_state_ring_ranks`) rather than sweeping the rank space. The inline
     /// topic walk is the standing lesson that unbounded per-pass work on this loop costs
-    /// FRAMES. It also runs at the topic-rescan cadence, not every pass.
+    /// FRAMES. It also runs at the enumeration cadence, not every pass.
     ///
     /// The departure-ring sentinel rank is unreachable here twice over: the
     /// sweep's ceiling is far below it, and `state_ring_tag` refuses it outright.
@@ -12903,12 +12919,13 @@ impl Recorder {
     ///
     /// **Scoped to ARM TIME.** `list_topics()` walks the iceoryx2
     /// service directory and its cost scales with the machine's live service
-    /// count — MEASURED at 117.5 ms on the Go2's Jetson at 86 topics — so on the
-    /// DRIVE LOOP it stopped the drain for roughly a third of every 250 ms
-    /// rescan period and fast topics overflowed their queues (23 % frame loss).
+    /// count - MEASURED at 117.5 ms on a robot's compute module at 86 topics -
+    /// so on the DRIVE LOOP it stopped the drain for roughly a third of every
+    /// 250 ms period and fast topics overflowed their queues (23 % frame loss).
     /// The drive loop now consumes [`discovery_scan::DiscoveryScanner`]'s
-    /// snapshots instead; see [`Self::apply_discovery`], which is the half that
-    /// DECIDES and is shared by both callers.
+    /// snapshots instead, produced on a worker thread when the service
+    /// directory actually CHANGES; see [`Self::apply_discovery`], which is the
+    /// half that DECIDES and is shared by both callers.
     ///
     /// Arm time keeps the inline call for two reasons: the recorder is armed
     /// BEFORE the graph is released to step 0, so the walk costs no frames, and
@@ -12920,7 +12937,8 @@ impl Recorder {
         let scan = discovery_scan::TopicScan {
             result: mgr.list_topics().map_err(|e| e.to_string()),
         };
-        self.apply_discovery(mgr, scan);
+        // Arm time has no retry clock to restart.
+        let _planned = self.apply_discovery(mgr, scan);
     }
 
     /// Tap what the recording is not yet covering — "data is truth"
@@ -12928,9 +12946,9 @@ impl Recorder {
     ///
     /// Takes an ALREADY-COMPLETED enumeration so the caller decides where the
     /// directory walk happens (the drive loop's comes off a worker
-    /// thread, arm time's is inline). Everything below this line is byte-for-byte
-    /// what discovery first shipped: this function judges a scan, it never performs
-    /// one.
+    /// thread, arm time's is inline). It judges a scan and never performs one:
+    /// the enumeration bookkeeping is here, the decision is `plan_and_attach`,
+    /// which the refused-attach retry shares.
     ///
     /// Best-effort by construction: enumeration walks the SHM service directory,
     /// which can fail. A failure must never abort a running recording — but it
@@ -12939,16 +12957,20 @@ impl Recorder {
     /// coverage manifest, which escalates the terminal line) and reported
     /// through the shared flood latch so a repeating failure re-announces
     /// instead of going quiet after the first line.
-    fn apply_discovery(&mut self, mgr: &TransportManager, scan: discovery_scan::TopicScan) {
+    ///
+    /// Returns whether the scan was PLANNED: `false` when discovery is off or
+    /// the enumeration failed, so the caller can tell a scan that re-tried the
+    /// refused attaches from one that did not.
+    fn apply_discovery(&mut self, mgr: &TransportManager, scan: discovery_scan::TopicScan) -> bool {
         if !self.cfg.discover_live {
-            return;
+            return false;
         }
         let live = match scan.result {
             Ok(live) => live,
             Err(e) => {
                 self.enumeration_failures += 1;
                 self.report_enumeration_failure(&e);
-                return;
+                return false;
             }
         };
         if let Some(suppressed) = self.enumeration_latch.on_success() {
@@ -12959,7 +12981,56 @@ impl Recorder {
             );
         }
         self.enumeration_ok = true;
+        self.plan_and_attach(mgr, &live);
+        true
+    }
 
+    /// Re-try every topic whose verdict can still change (an attach the
+    /// transport REFUSED), against the topics alone, with no directory walk.
+    ///
+    /// The verdict is retryable because it is transient: a subscriber slot
+    /// freed by a departing `topic echo` makes a refused attach succeed. Nothing
+    /// about that changes a FILE in the service directory, so nothing prompts a
+    /// walk, and an enumeration driven by directory changes would leave the
+    /// topic unrecorded beside a free slot until some unrelated change did. The drive loop calls this on the
+    /// enumeration cadence while no scan arrives; it costs one attach attempt
+    /// per refused topic and nothing at all when there is none.
+    ///
+    /// The decision is the same `plan_and_attach` a scan takes, so a retry
+    /// after the bag exists settles the topic exactly as a scan would. A
+    /// SETTLED topic (in `discovery_known`, which is where a verdict reached
+    /// after the bag exists goes) keeps its reason but is not retried again.
+    ///
+    /// Returns how many topics it re-planned.
+    fn retry_refused_attaches(&mut self, mgr: &TransportManager) -> usize {
+        if !self.cfg.discover_live {
+            return 0;
+        }
+        let retryable: Vec<String> = self
+            .discovery_ledger
+            .iter()
+            .filter(|(topic, reason)| {
+                !reason.is_terminal() && !self.discovery_known.contains(*topic)
+            })
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        if retryable.is_empty() {
+            return 0;
+        }
+        self.plan_and_attach(mgr, &retryable);
+        retryable.len()
+    }
+
+    /// Plan `live` against what the recorder already covers, attach what the
+    /// plan admits, and record a verdict for the rest.
+    ///
+    /// `live` is a full enumeration when a scan calls this and the retryable
+    /// topics alone when `retry_refused_attaches` does. The prune below keeps a
+    /// verdict only for a topic in `live` or a terminal one. A retry's `live`
+    /// holds every unsettled non-terminal verdict, and settled ones (kept out
+    /// of it) only exist once the bag does, when the first plan has already
+    /// settled or pruned every non-terminal verdict, so a retry prunes nothing.
+    fn plan_and_attach(&mut self, mgr: &TransportManager, live: &[String]) {
         let bag_created = self.bag_exists();
         let discovered_taps = self
             .taps
@@ -12967,7 +13038,7 @@ impl Recorder {
             .filter(|t| matches!(t.source, TapSource::Discovered))
             .count();
         let decision = discovery::plan_discovery(
-            &live,
+            live,
             &self.discovery_known,
             &self.mirrors,
             &self.discovery_excludes,
@@ -13086,10 +13157,13 @@ impl Recorder {
         // topic that keeps failing to attach is re-planned on every scan, and
         // treating that as activity would hold the window open to its cap on
         // every run for a producer that is never going to be recorded.
+        //
+        // A scan that added nothing records NOTHING here, deliberately. The
+        // window closes by the wall going quiet, not by scans accumulating -
+        // which is what lets an event-driven enumeration, silent on a settled
+        // machine, release the hold at all.
         if added > 0 {
-            self.discovery_quiet_scans = 0;
-        } else {
-            self.discovery_quiet_scans = self.discovery_quiet_scans.saturating_add(1);
+            self.discovery_last_add = Some(Instant::now());
         }
     }
 
@@ -13326,24 +13400,36 @@ impl Recorder {
     /// Whether bag creation is still being held open for the live topic
     /// set to SETTLE.
     ///
-    /// True while discovery is enabled, the cap has not expired, and fewer than
-    /// [`DISCOVERY_SETTLE_QUIET_SCANS`] consecutive scans have come back with
-    /// nothing new. `elapsed` is measured from the drive loop's start.
-    fn discovery_hold_active(&self, elapsed: Duration) -> bool {
-        if !self.cfg.discover_live || elapsed >= self.cfg.discovery_settle {
-            return false;
-        }
-        // The ABSOLUTE floor comes first: until it elapses the hold stands
-        // whatever the scan counter says (see `DISCOVERY_SETTLE_MIN` for why the
-        // counter alone delivered half the documented window). Clamped to the
-        // cap so `--discovery-settle-ms 0` — and any cap below the floor — still
-        // means what it says.
-        let floor = if DISCOVERY_SETTLE_MIN < self.cfg.discovery_settle {
-            DISCOVERY_SETTLE_MIN
-        } else {
-            self.cfg.discovery_settle
-        };
-        elapsed < floor || self.discovery_quiet_scans < DISCOVERY_SETTLE_QUIET_SCANS
+    /// ONE rule, in the unit the guarantee is about: the channel set stays open
+    /// until [`DISCOVERY_SETTLE_MIN`] has passed with NOTHING NEW DISCOVERED,
+    /// measured from the later of the drive loop's start and the last discovered
+    /// tap - capped by [`BagdConfig::discovery_settle`], which
+    /// `--discovery-settle-ms 0` sets to zero to disable the hold entirely.
+    ///
+    /// So a plain graph, whose live set is complete before the recorder armed,
+    /// pays exactly the floor; a robot whose bridge is still opening routes
+    /// keeps the window open until it stops finding them or the cap expires.
+    ///
+    /// `walk_pending` says the enumerator still OWES a walk (its baseline, the
+    /// answer to a change it has seen, or the walks a broken watch handed to
+    /// the timed engine), which also holds: quiet time is the ABSENCE of evidence, and
+    /// an event is evidence. Releasing on the boundary while that answer is in
+    /// flight would freeze the channel set against a topic set already known to
+    /// have moved, omitting exactly the producer the event was about.
+    ///
+    /// `elapsed` is measured from the drive loop's start.
+    fn discovery_hold_active(&self, elapsed: Duration, walk_pending: bool) -> bool {
+        // Clamped to the cap so `--discovery-settle-ms 0` - and any cap below
+        // the window - still means what it says.
+        let quiet = DISCOVERY_SETTLE_MIN.min(self.cfg.discovery_settle);
+        discovery::discovery_hold_open(
+            self.cfg.discover_live,
+            elapsed,
+            self.cfg.discovery_settle,
+            quiet,
+            self.discovery_last_add.map(|at| at.elapsed()),
+            walk_pending,
+        )
     }
 
     /// Every DECLARED tap's schema is known (attach-mode taps have seen a
@@ -13548,12 +13634,11 @@ impl Recorder {
                 //
                 //     The settle RELEASE is NOT the `--discovery-settle-ms`
                 //     cap. That flag is a CEILING: `discovery_hold_active`
-                //     releases as soon as `DISCOVERY_SETTLE_QUIET_SCANS`
-                //     rescans in a row add nothing, past a
-                //     `DISCOVERY_SETTLE_MIN` floor — so a settled machine
-                //     releases at the floor whatever the cap says, and only a
-                //     machine that KEEPS producing new topics (each such scan
-                //     resets the quiet counter) rides the cap. And the release
+                //     releases as soon as `DISCOVERY_SETTLE_MIN` has passed
+                //     with nothing new discovered - so a settled machine
+                //     releases at that window whatever the cap says, and only a
+                //     machine that KEEPS producing new topics (each new tap
+                //     restarts the window) rides the cap. And the release
                 //     is ZERO whenever discovery is off, which
                 //     `resolve_discovery` makes the default for an EXPLICIT
                 //     `--topic` selection (though `--topics-json` is equally
@@ -19149,21 +19234,24 @@ fn drive_loop(
     let mut last_status = Instant::now();
     // The absorbance verdict's own throttle mark.
     let mut last_absorbance = Instant::now();
-    // The discovery rescan cadence. Its own clock, independent of the
-    // flush/status ones — discovery is an OBSERVATION of the machine, not part
-    // of the write path.
-    //
-    // That clock now lives on a WORKER THREAD. The loop consumes
-    // whatever the worker has published (O(1)) instead of walking the iceoryx2
-    // service directory itself, which cost 117.5 ms per call at the Go2's 86
-    // topics and overflowed the fast topics' queues while it ran. The cadence,
-    // the one-apply-per-enumeration rule and every decision the scan feeds are
-    // unchanged — see `discovery_scan`.
+    // Live-topic discovery. An OBSERVATION of the machine, not part
+    // of the write path, and it has no clock at all: a worker thread blocks on
+    // a kernel watch of the iceoryx2 service directory and enumerates when
+    // something actually changes. The loop consumes whatever that worker has
+    // published (O(1)) and never walks the directory itself - a walk costs
+    // 117.5 ms at 86 live topics and overflowed the fast topics' queues while it
+    // ran. The one-apply-per-enumeration rule and every decision a scan feeds
+    // are unchanged; see `discovery_scan`.
     let mut scanner = discovery_scan::DiscoveryScanner::start(mgr, rec.cfg.discover_live);
     // The state-ring sweep's own cadence clock. `None` so pass 1
     // sweeps immediately — a mid-run attach's rings are already there and
     // waiting a full interval for them would only delay the first anchor.
     let mut last_state_scan: Option<Instant> = None;
+    // When a planned scan last re-planned the refused attaches, or the retry
+    // last ran.
+    // The retry runs at most once per enumeration cadence; a planned scan
+    // re-plans them itself and restarts this clock.
+    let mut last_attach_retry: Option<Instant> = None;
     // BACKLOG-AWARE PACING: how long to sleep at the
     // TOP of the NEXT pass, decided from THIS pass's progress. `None` on the
     // first pass so a startup backlog drains immediately.
@@ -19262,8 +19350,16 @@ fn drive_loop(
         // is created on pass 1 and discovery can only ever report.
         //
         // Shutdown always wins: a SIGINT must never wait out a discovery window.
-        let discovery_hold = !shutting && rec.discovery_hold_active(start.elapsed());
-        // The SECOND, independent hold. The settle above asks "has the
+        //
+        // A walk the enumerator still owes also holds: that is positive
+        // evidence the live topic set is moving, and releasing on the quiet
+        // boundary while the answer is in flight omits the very producer the
+        // event was about. The flag is read HERE, before `next_scan` below: a
+        // `false` is ordered after the scan the worker published before
+        // clearing it, so that scan is taken and applied this pass. The hold
+        // itself is decided after the apply.
+        let walk_pending = scanner.walk_pending();
+        // The SECOND, independent hold. The settle hold asks "has the
         // live topic set stopped changing?" — which a multi-second gap in a
         // bursty route build answers WRONGLY, freezing a 4-topic bag while 98
         // routes were still on their way. This asks "is a process on this
@@ -19304,19 +19400,32 @@ fn drive_loop(
         // grace still gets a channel in the bag.
         //
         // `next_scan` is a mutex take on the shipping path — the walk
-        // itself happened on the worker thread. It hands back at most ONE scan
-        // per enumeration, so `discovery_quiet_scans` counts exactly what it
-        // counted when the loop enumerated inline.
+        // itself happened on the worker thread, and only because the service
+        // directory changed. It hands back at most ONE scan per enumeration, so
+        // the loop can never be handed the same snapshot twice.
         if let Some(scan) = scanner.next_scan(mgr) {
-            rec.apply_discovery(mgr, scan);
+            // A PLANNED scan re-tried the refused attaches itself.
+            if rec.apply_discovery(mgr, scan) {
+                last_attach_retry = Some(Instant::now());
+            }
+        } else if last_attach_retry.is_none_or(|t| t.elapsed() >= DISCOVERY_RESCAN_INTERVAL) {
+            // A refused attach is retried on the enumeration cadence even when
+            // no scan comes: what frees it (a subscriber leaving) changes no
+            // file in the service directory, so nothing prompts a walk.
+            last_attach_retry = Some(Instant::now());
+            let _replanned = rec.retry_refused_attaches(mgr);
         }
+        // The settle decision, AFTER this pass's scan is applied: a scan that
+        // just added a tap has restarted the quiet window, so the bag is never
+        // created in the same pass as a find that should have held it open.
+        let discovery_hold = !shutting && rec.discovery_hold_active(start.elapsed(), walk_pending);
 
-        // Sweep for per-rank node-state rings on the SAME cadence,
-        // and — unlike the topic scan — INLINE. It is a bounded run of
+        // Sweep for per-rank node-state rings on the enumeration
+        // cadence, and - unlike the topic scan - INLINE. It is a bounded run of
         // `shm_open`s (the ranks that answered, plus a small tolerance), not a
-        // service-directory walk, so it does not carry the cost that
-        // moved the topic scan onto a worker thread. Its own clock, because
-        // discovery of the checkpoint plane is independent of the topic plane's.
+        // service-directory walk, so it does not carry the cost that moved the
+        // topic scan onto a worker thread. Its own clock, because discovery of
+        // the checkpoint plane is independent of the topic plane's.
         if last_state_scan.is_none_or(|t| t.elapsed() >= DISCOVERY_RESCAN_INTERVAL) {
             last_state_scan = Some(Instant::now());
             rec.discover_state_rings();
@@ -19571,7 +19680,7 @@ impl Recorder {
             schema_resolver: None,
             schema_sources: BTreeMap::new(),
             schema_descriptors: BTreeMap::new(),
-            discovery_quiet_scans: 0,
+            discovery_last_add: None,
             drive_start: None,
             // A rings-only test recorder is bound to no run by construction.
             run_watcher: None,
@@ -23306,6 +23415,161 @@ mod tap_listener_drain_tests {
             !rec.taps[0].held.is_empty(),
             "the data-only tap must record frames via drain_owned polling (no listener)"
         );
+    }
+}
+
+#[cfg(test)]
+mod refused_attach_retry_tests {
+    //! A discovered topic whose attach the transport REFUSED is retried by
+    //! `Recorder::retry_refused_attaches`, with no scan, and attached once the
+    //! refusal clears.
+    //!
+    //! Driven on the `Recorder` directly so the retry is the ONLY thing that
+    //! can attach: through `run_bagd` any walk of the shared service directory
+    //! would re-plan the topic too, and a passing arm could not say which did.
+    use super::*;
+    use cerulion_core::clock::VirtualClock;
+    use cerulion_core::testing::iceoryx_test_config;
+    use cerulion_core::transport::TransportConfig;
+    use serial_test::serial;
+
+    fn isolated_manager() -> Arc<TransportManager> {
+        TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "bagd_retry".into(),
+                clock: Arc::new(VirtualClock::new()),
+                subscriber_buffer_size: 64,
+                network: None,
+            },
+            iceoryx_test_config(),
+        )
+        .expect("isolated transport manager")
+    }
+
+    /// A publisher whose service has exactly ONE subscriber slot.
+    fn one_slot_publisher(mgr: &TransportManager, topic: &str) -> CerulionPublisher {
+        let mut tc = mgr.default_topic_config();
+        tc.max_subscribers = Some(1);
+        mgr.create_publisher_with_topic_config(topic, MaxSliceLen::const_new(64), 0, tc)
+            .expect("one-slot publisher")
+    }
+
+    fn tapped(rec: &Recorder, topic: &str) -> bool {
+        rec.taps.iter().any(|t| t.topic == topic)
+    }
+
+    fn armed_recorder(mgr: &Arc<TransportManager>, declared: &str, tag: &str) -> Recorder {
+        let out =
+            std::env::temp_dir().join(format!("bagd_retry_{tag}_{}.mcap", std::process::id()));
+        let mut cfg = BagdConfig::new(out, vec![TapSpec::attach(declared)]);
+        cfg.discover_live = true;
+        cfg.status_period = None;
+        Recorder::setup(mgr, cfg, &AtomicBool::new(false)).expect("Recorder::setup")
+    }
+
+    /// Before the bag exists: refused while the slot is held, attached on the
+    /// first retry after it frees, and the earlier verdict cleared.
+    #[test]
+    #[serial]
+    fn a_refused_attach_is_attached_by_the_retry_once_its_slot_frees() {
+        let mgr = isolated_manager();
+        let declared = "/retry/declared";
+        let crowded = "/retry/crowded";
+        let _declared_pub = mgr
+            .create_publisher(declared, MaxSliceLen::const_new(64), 0)
+            .expect("declared publisher");
+        let _crowded_pub = one_slot_publisher(&mgr, crowded);
+        let holder = mgr
+            .create_data_only_subscriber(crowded)
+            .expect("the test takes the only slot");
+
+        let mut rec = armed_recorder(&mgr, declared, "attach");
+        // NONZERO CONTROL: the arm-time scan found the topic and was refused.
+        assert!(
+            matches!(
+                rec.discovery_ledger.get(crowded),
+                Some(UntappedReason::AttachFailed { .. })
+            ),
+            "the arm-time scan must record the refusal: {:?}",
+            rec.discovery_ledger
+        );
+        assert!(!tapped(&rec, crowded));
+
+        // Still held: the retry re-plans the one refused topic and is refused.
+        assert_eq!(rec.retry_refused_attaches(&mgr), 1);
+        assert!(!tapped(&rec, crowded), "the slot is still held");
+        assert!(matches!(
+            rec.discovery_ledger.get(crowded),
+            Some(UntappedReason::AttachFailed { .. })
+        ));
+
+        // Freed: the next retry attaches it, with no scan in between.
+        drop(holder);
+        assert_eq!(rec.retry_refused_attaches(&mgr), 1);
+        assert!(
+            tapped(&rec, crowded),
+            "the retry must attach a refused topic once its slot frees"
+        );
+        assert!(
+            !rec.discovery_ledger.contains_key(crowded),
+            "a retry that succeeds must clear the earlier verdict"
+        );
+        assert!(
+            rec.discovery_last_add.is_some(),
+            "a retry that attaches restarts the settle window, as a scan's find does"
+        );
+        // Nothing is refused any more, so the retry has nothing to do.
+        assert_eq!(rec.retry_refused_attaches(&mgr), 0);
+    }
+
+    /// After the bag exists: the retry SETTLES the refused topic (a tap opened
+    /// now would have no channel), keeps its reason, and never retries it again.
+    #[test]
+    #[serial]
+    fn after_the_bag_exists_the_retry_settles_a_refused_attach_once() {
+        let mgr = isolated_manager();
+        let declared = "/retry/declared_b";
+        let crowded = "/retry/crowded_b";
+        let _declared_pub = mgr
+            .create_publisher(declared, MaxSliceLen::const_new(64), 0)
+            .expect("declared publisher");
+        let _crowded_pub = one_slot_publisher(&mgr, crowded);
+        let holder = mgr
+            .create_data_only_subscriber(crowded)
+            .expect("the test takes the only slot");
+
+        let mut rec = armed_recorder(&mgr, declared, "settle");
+        rec.ensure_writer(true).expect("force-create the bag");
+        assert!(rec.bag_exists());
+
+        drop(holder);
+        assert_eq!(
+            rec.retry_refused_attaches(&mgr),
+            1,
+            "the first retry after creation must still look at the refused topic"
+        );
+        assert!(
+            !tapped(&rec, crowded),
+            "a topic attached after the bag exists would have no channel"
+        );
+        assert!(
+            matches!(
+                rec.discovery_ledger.get(crowded),
+                Some(UntappedReason::AttachFailed { .. })
+            ),
+            "the true reason must survive the settle, not become appeared-after-creation"
+        );
+        assert!(rec.discovery_known.contains(crowded));
+        assert_eq!(
+            rec.retry_refused_attaches(&mgr),
+            0,
+            "a settled topic is never retried again"
+        );
+        if let Ok(summary) = rec.finalize() {
+            for path in summary.bag_paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
