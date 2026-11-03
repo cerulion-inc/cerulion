@@ -3944,6 +3944,34 @@ mod block_colocation_tests {
             "the chain must not join the group that holds the isolated `k`: {:?}",
             out.groups
         );
+
+        // The cut binds the chain seeding only. With a profiled rate on
+        // `h -> p` (a profile rates every edge no isolated node touches), the
+        // cost rules fuse `h` into the `block` group.
+        let rated = PartitionCosts {
+            edge_rate_mhz: [(("h".to_string(), "p".to_string()), 100_000u64)]
+                .into_iter()
+                .collect(),
+            ..costs
+        };
+        let out = auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &rated,
+            &isolated,
+            1_000_000,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive");
+        assert_eq!(
+            member_sets(&out),
+            owned(&[&["h", "k", "p"]]),
+            "a rated edge into the `block` group is a cost-rule candidate: {:?}",
+            out.groups
+        );
     }
 
     /// The budget gate guards CANDIDATE fusions, and a seed is not a candidate

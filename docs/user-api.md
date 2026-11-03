@@ -2561,8 +2561,10 @@ stay in one unit, a node declaring `isolate: true` included. Units are decided w
 `graph run` derives process groups from the graph's profile for a free run on the real clock, the
 cost-aware partitioner keeps every linear chain within the per-group compute budget in one process
 group, so a chain's units share one process; a chain over the budget is cut where the cost model
-cuts it, and a node the profile isolated keeps its own process group, so a chain through it is cut
-there. `graph partition` and the lockstep execution mode partition by the cost rules alone.
+cuts it, and a chain is cut at a node the profile isolated. That node keeps a process group of its
+own unless a `block` edge puts it in one group with that edge's producers and consumers; a chain is
+then cut at every node of that group, and only the cost rules can add another node to it.
+`graph partition` and the lockstep execution mode partition by the cost rules alone.
 
 **Overrides: `isolate:`.** `isolate: true` gives a node a unit of its own. `isolate: false` keeps it
 in the unit of every node of its process that triggers it, whatever the rules above say: a fan-in node
