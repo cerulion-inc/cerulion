@@ -170,14 +170,14 @@ libc = "0.2"
 # engine and two copies of one root is the mistake — so the writer
 # delegates to this crate instead. Already in the workspace tree via
 # cerulion_cli_engine and cerulion_discovery.
-dirs = "6"
+dirs = "7"
 
 # Graph loading
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 # Dynamic library loading for cdylib nodes
-libloading = "0.8"
+libloading = "0.9"
 
 # Proc macros for node type definition
 cerulion_macros = { workspace = true }
@@ -216,13 +216,13 @@ x509-parser = "0.18"
 cerulion_pairing = { workspace = true }
 # PEM text for the in-memory certificates and key a team session hands zenoh
 # (`*_base64` keys); 0.22 is the line zenoh-link-commons 1.10 resolves.
-base64 = "0.22"
+base64 = "0.23"
 # Clears the in-memory PKCS#8 key of a team session on drop.
 zeroize = "1"
 # Sign and derive the keys of test team certificates in `transport::test_ca`
 # (`test-helpers` only); the same lines cerulion_pairing resolves.
 ed25519-dalek = { version = "2", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 # Stable get_or_try_init (std::sync::OnceLock version is nightly-only)
 once_cell = "1"
@@ -324,7 +324,7 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # of waiting tests — tests whose correctness depends on ordering
 # (e.g., tick-panic-then-shutdown) must still be combined into a
 # single `#[test]` body.
-serial_test = "3"
+serial_test = "4"
 
 # The permissive standalone wire decoder. `cerulion-wire` hand-mirrors
 # `cerulion_core/src/wire.rs`; `tests/wire_lockstep_test.rs` builds frames with
