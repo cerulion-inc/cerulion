@@ -263,13 +263,17 @@ Whatever the source of `cerulion_android`, crates.io included, an app
 copies two things into its own build from the Cerulion release or commit it
 depends on:
 
-1. The iceoryx2 `[patch.crates-io]` block. Copy the complete block from the
-   root `Cargo.toml` of that release or commit (a node workspace made by
-   `cerulion workspace create` carries the same block) into this file, below
-   the entries above. A patch applies only in the workspace that declares it,
-   and a published crate carries none, so a crates.io dependency does not
-   bring it along. Without it the library links upstream iceoryx2, which has
-   no Android shared-memory support.
+1. The iceoryx2 `[patch.crates-io]` entries. Add the `iceoryx2*` entries from
+   the `[patch.crates-io]` table in the root `Cargo.toml` of that release or
+   commit under the `[patch.crates-io]` header this file already has; a second
+   header makes the file fail to parse. Leave out the table's other entries,
+   such as `re_grpc_server`, which an app does not need. (The
+   `[patch.crates-io]` table that `cerulion workspace create` writes into a
+   node workspace's `Cargo.toml` holds only these `iceoryx2*` entries, so you
+   can copy them from there.) A patch applies only in the workspace that
+   declares it, and a published crate carries none, so a crates.io dependency
+   does not bring it along. Without them the library links upstream iceoryx2,
+   which has no Android shared-memory support.
 2. The Java facade, `com.cerulion.android.CerulionRuntime`. It is Java
    source in the `java/` directory of `cerulion_android`, and the app compiles
    it into its own classes. Use the copy from the same release or commit as
