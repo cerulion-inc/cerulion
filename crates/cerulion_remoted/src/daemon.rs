@@ -562,11 +562,19 @@ pub(crate) fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
 ///   [`RemotedError::MacKey`]: a broken secure-storage secret is never silently
 ///   swallowed, even when no artifact currently requires it.
 ///
-/// A present but EMPTY file loads as an empty key; when `expected`,
-/// [`crate::RemotePlane::bind`] then refuses it with [`RemotedError::MacKey`] (an
-/// empty key verifies nothing and cannot persist a mutation).
+/// A present but EMPTY file loads as an empty key when not `expected` (a fresh
+/// install's placeholder). When `expected` it is refused here with
+/// [`RemotedError::MacKey`] naming the file: an empty key verifies nothing and
+/// cannot persist a mutation. [`crate::RemotePlane::bind`] repeats the refusal
+/// for a [`crate::KeyProvider`] that has no file to name.
 pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
     match std::fs::read(path) {
+        Ok(bytes) if bytes.is_empty() && expected => Err(RemotedError::MacKey(format!(
+            "empty trust-store MAC key file {}: a trust store or device index exists and \
+             must be verified with it. An empty key file is only a fresh install's \
+             placeholder; restore this device's 32-byte MAC key into it (mode 0600)",
+            path.display()
+        ))),
         Ok(bytes) => Ok(bytes),
         // Genuinely-fresh robot: nothing on disk needs this key and it is simply
         // absent. Defer to the absent store's own `Store` provisioning gap.
@@ -668,6 +676,22 @@ mod tests {
         let key = load_mac_key(&missing, /*expected=*/ false)
             .expect("an unrequired absent MAC key is benign, not an error");
         assert!(key.is_empty(), "the placeholder must be empty, got {key:?}");
+    }
+
+    #[test]
+    fn empty_mac_key_file_is_refused_by_name_only_when_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust_store.mac_key");
+        std::fs::write(&path, b"").unwrap();
+        let err = load_mac_key(&path, /*expected=*/ true).unwrap_err();
+        assert!(matches!(err, RemotedError::MacKey(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "the error names the key file: {err}"
+        );
+        // A fresh install's empty placeholder stays benign.
+        let key = load_mac_key(&path, /*expected=*/ false).unwrap();
+        assert!(key.is_empty());
     }
 
     #[test]

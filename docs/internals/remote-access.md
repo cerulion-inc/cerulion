@@ -612,6 +612,17 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
   `beacon_facts_test.rs`).
 
+  An empty trust-store MAC key file is refused while a trust store or device
+  index exists (`RemotePlane::bind`), and the error names the file. A
+  `KeyProvider` with no file gets the same refusal without a path. Recovery:
+  put this device's 32-byte key back into `<state_root>/remoted/trust_store.mac_key`
+  with mode 0600. If the key is lost, move `<state_root>/remoted/` away (keep
+  `<state_root>/robot-registration.json`) and let the registration bootstrap
+  provision the robot again. That discards the trust store, so desks pair
+  again. Under netd's robot supervisor, a bootstrap that gave up needs a
+  `cerulion-netd` restart. A library host restores or streams its keys again
+  through its own `KeyProvider`.
+
 ## 11. Test map
 
 Every crate in this family is PARALLEL-safe, with no test requiring serial

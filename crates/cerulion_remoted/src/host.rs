@@ -75,7 +75,8 @@ pub trait KeyProvider: Send + Sync {
     ///
     /// `required` is `true` when a trust store or a side map already exists under
     /// the state root, so the key is needed to verify them; an empty key is then
-    /// refused with [`RemotedError::MacKey`]. When it is `false` and the provider
+    /// refused with [`RemotedError::MacKey`]; [`KeyFiles`] refuses an empty file
+    /// itself and names its path. When it is `false` and the provider
     /// has no key, it may return an empty key: it verifies nothing, and the
     /// absent trust store reports its own provisioning gap.
     fn store_mac_key(&self, required: bool) -> Result<Vec<u8>, RemotedError>;
@@ -229,9 +230,10 @@ impl RemotePlane {
         // served under one.
         if mac_required && mac_key.is_empty() {
             return Err(RemotedError::MacKey(
-                "the key provider returned an empty trust-store MAC key, but a trust store \
-                 or device index exists and must be verified with it. An empty key is only \
-                 a fresh install's placeholder; provide this device's MAC key"
+                "the key provider returned an empty trust-store MAC key (this provider has \
+                 no key file to name), but a trust store or device index exists and must \
+                 be verified with it. An empty key is only a fresh install's placeholder; \
+                 provide this device's MAC key"
                     .into(),
             ));
         }
