@@ -18,6 +18,7 @@ use std::time::Duration;
 use cerulion_cli_engine::message_text::{body_to_json, message_frame, EXIT_UNAVAILABLE};
 use cerulion_cli_engine::service_cmd::{resolve_service_types, service_call, CallRequest};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
+use serial_test::serial;
 
 const STORE: &[(&str, &str)] = &[
     (
@@ -119,6 +120,7 @@ fn wait_ready(ready: &AtomicBool) {
 }
 
 #[test]
+#[serial]
 fn a_call_reaches_a_core_service_server_and_prints_its_response() {
     let dir = store();
     let ready = Arc::new(AtomicBool::new(false));
@@ -157,6 +159,7 @@ fn a_call_reaches_a_core_service_server_and_prints_its_response() {
 }
 
 #[test]
+#[serial]
 fn an_empty_request_reaches_a_server_with_a_nested_array_response() {
     let dir = store();
     let ready = Arc::new(AtomicBool::new(false));
@@ -194,6 +197,7 @@ fn an_empty_request_reaches_a_server_with_a_nested_array_response() {
 }
 
 #[test]
+#[serial]
 fn a_cleared_running_flag_sends_no_request_to_a_ready_server() {
     let dir = store();
     let ready = Arc::new(AtomicBool::new(false));
@@ -228,6 +232,7 @@ fn a_cleared_running_flag_sends_no_request_to_a_ready_server() {
 }
 
 #[test]
+#[serial]
 fn a_call_with_no_server_is_unavailable_after_the_timeout() {
     let dir = store();
     let running = AtomicBool::new(true);

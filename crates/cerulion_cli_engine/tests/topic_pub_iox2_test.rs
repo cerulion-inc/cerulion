@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use cerulion_cli_engine::topic_cmd::publish::{topic_pub, PubRequest};
 use cerulion_cli_engine::topic_cmd::TopicScope;
+use serial_test::serial;
 
 #[test]
+#[serial]
 fn published_frames_reach_a_local_subscriber_with_the_given_values() {
     let topic = "/c1_test/pub/cmd_vel";
     let transport = cerulion_core::TransportManager::get_or_init().expect("transport");
@@ -69,6 +71,7 @@ fn published_frames_reach_a_local_subscriber_with_the_given_values() {
 }
 
 #[test]
+#[serial]
 fn a_bad_value_publishes_nothing_and_is_an_encode_error() {
     let running = AtomicBool::new(true);
     let req = PubRequest {
@@ -91,6 +94,7 @@ fn a_bad_value_publishes_nothing_and_is_an_encode_error() {
 }
 
 #[test]
+#[serial]
 fn a_snapshot_of_a_topic_that_never_appears_is_unavailable_after_the_timeout() {
     use cerulion_cli_engine::topic_cmd::snapshot::{topic_snapshot, SnapshotRequest};
     let running = AtomicBool::new(true);

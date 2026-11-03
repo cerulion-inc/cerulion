@@ -135,6 +135,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 ed25519-dalek = "2"
 # Isolated temp dirs/files for the device-index persistence round-trip tests.
 tempfile = "3"
+# `#[serial]` makes `tests/act_verbs_test.rs` take one lock around the process-global iceoryx2 manager.
+serial_test = "3"
 # The wire-plane tests drive REAL iceoryx2 over PER-TEST SHM
 # roots (`TransportManager::init_for_test` + `testing::iceoryx_test_config`),
 # which live behind cerulion_core's `test-helpers` feature — so the dev-dep

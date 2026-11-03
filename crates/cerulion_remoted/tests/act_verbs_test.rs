@@ -18,6 +18,7 @@ use cerulion_remoted::act_verbs::{
     ServiceCallVerb, TopicEchoOnceVerb, TopicPublishVerb, TopicSnapshotVerb, SCHEMAS_DIR_ENV,
 };
 use serde_json::json;
+use serial_test::serial;
 
 /// One store for the whole binary: the verbs read the directory from the
 /// environment, which every test here sets to this same path.
@@ -76,6 +77,7 @@ fn publish_until(
 }
 
 #[test]
+#[serial]
 fn topic_publish_reaches_a_live_subscriber() {
     store();
     let topic = "/c1_act/publish/twist";
@@ -112,6 +114,7 @@ fn topic_publish_reaches_a_live_subscriber() {
 }
 
 #[test]
+#[serial]
 fn topic_echo_once_decodes_a_live_publishers_frame() {
     store();
     let stop = Arc::new(AtomicBool::new(false));
@@ -133,6 +136,7 @@ fn topic_echo_once_decodes_a_live_publishers_frame() {
 }
 
 #[test]
+#[serial]
 fn topic_snapshot_returns_a_jpeg_of_a_live_camera_frame() {
     store();
     let stop = Arc::new(AtomicBool::new(false));
@@ -175,6 +179,7 @@ fn topic_snapshot_returns_a_jpeg_of_a_live_camera_frame() {
 }
 
 #[test]
+#[serial]
 fn topic_snapshot_of_a_missing_topic_is_unavailable() {
     store();
     let err = TopicSnapshotVerb
@@ -187,6 +192,7 @@ fn topic_snapshot_of_a_missing_topic_is_unavailable() {
 }
 
 #[test]
+#[serial]
 fn service_call_gets_the_answer_of_a_core_service_server() {
     let dir = store().to_path_buf();
     let stop = Arc::new(AtomicBool::new(false));
@@ -254,6 +260,7 @@ fn service_call_gets_the_answer_of_a_core_service_server() {
 }
 
 #[test]
+#[serial]
 fn service_call_with_no_server_is_unavailable() {
     store();
     let err = ServiceCallVerb::new(lease())
@@ -269,6 +276,7 @@ fn service_call_with_no_server_is_unavailable() {
 }
 
 #[test]
+#[serial]
 fn an_estop_engaged_during_the_server_wait_stops_the_call_as_unavailable() {
     store();
     let l = lease();
@@ -301,6 +309,7 @@ fn an_estop_engaged_during_the_server_wait_stops_the_call_as_unavailable() {
 }
 
 #[test]
+#[serial]
 fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable() {
     store();
     let l = lease();

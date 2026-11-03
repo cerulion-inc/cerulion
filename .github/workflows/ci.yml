@@ -3975,12 +3975,15 @@ jobs:
   # crypto/iroh/web dependency trees to them buys a cancellation, not coverage.
   #
   # PARALLEL (no `--test-threads=1`) for every package, and that is a READ of
-  # the tests rather than an assumption: nothing here calls
-  # `TransportManager::get_or_init()`. `cerulion_remoted` is the only package
-  # that builds real iceoryx2 transports at all, and its five transport files
-  # mint ISOLATED per-test SHM roots via `TransportManager::init_for_test`
-  # (their own headers say "parallel-safe without `#[serial]`"), which is the
-  # same property that lets the `cerulion_connectd` step above run parallel.
+  # the tests rather than an assumption. `cerulion_remoted` is the only package
+  # that builds real iceoryx2 transports at all. One of its files,
+  # `tests/act_verbs_test.rs`, calls `TransportManager::get_or_init()`, the
+  # process-global manager on the default namespace; every test in it carries
+  # `#[serial]`, which takes one lock shared by the whole test binary, so no
+  # two of them run at once. Its other transport files mint ISOLATED per-test
+  # SHM roots via `TransportManager::init_for_test` (their own headers say
+  # "parallel-safe without `#[serial]`"), which is the same property that lets
+  # the `cerulion_connectd` step above run parallel.
   # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
   # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
