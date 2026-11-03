@@ -129,10 +129,12 @@ the annotations and the batch frames are written either way.)
 From `trace_format` 9 on, a read that popped more than one frame is preceded,
 on its own stage and read site, by one `batch_frame` record per frame it
 consumed besides the one it served, in pop order, each with that frame's
-sequence and (on an annotated edge) a `producer` annotation of its own, when
-all of them and the read fit in the stage's window (otherwise none is written,
-and the read names only its newest frame). With
-them the log names every frame each read consumed, which need not be a
+sequence, when all of them and the read fit in the stage's window (otherwise
+none is written, and the read names only its newest frame). On a multi-writer
+edge each batch frame carries a `producer` annotation of its own; on any other
+edge it is attributed to the writer of its run, as a read is, with an
+annotation only where the writer changes. With
+them the log names every frame such a read consumed, which need not be a
 contiguous run: a writer can refill and overflow a `drop_oldest` queue while
 the node's callback runs between two receives of one batch.
 

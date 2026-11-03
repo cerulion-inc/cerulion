@@ -997,8 +997,10 @@ the bag.
 A format 9 recording also names every OTHER frame a multi-frame read
 consumed. Before a read that popped more than one frame the recorder writes one
 `batch_frame` record (outcome kind 8) per consumed frame the read does not
-name, in pop order, each carrying that frame's wire sequence and, on an
-annotated edge, its own writer annotation. They are written only when all of
+name, in pop order, each carrying that frame's wire sequence. On a multi-writer
+edge each batch frame carries its own writer annotation; on any other edge it
+is attributed to the writer of its run, as a read is, with an annotation only
+where the writer changes. They are written only when all of
 them and the read fit in the read stage's window; a batch deeper than that (a
 queue another consumer provisioned deeper than this input's declared depth, say)
 keeps its read record, which then names only its newest frame, and a fed replay
@@ -1006,9 +1008,10 @@ refuses that read by name. A batch's frames need not be
 consecutive: on a `drop_oldest` queue a writer can refill and overflow the
 queue while the node's callback runs between two receives of one batch, so a
 depth-two queue can hand one batch 1, then 19 and 20 (2 to 18 evicted while the
-callback for 1 ran). A reader below 9 does not know outcome kind 8: it would
-skip those records and feed the read the frames counted back from the served
-one, so the stamp moves and that reader refuses the bag.
+callback for 1 ran). A reader below 9 does not know outcome kind 8, so the
+stamp moves and that reader refuses the bag. A replay of a bag below format 9
+stages no `batch_frame` record either, as its recorder staged none, so the two
+read logs hold the same positions.
 
 On a single-writer edge the read log grows by one record per read site for the
 whole recording, and its stage holds its plain bound plus two records (one
