@@ -1152,6 +1152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion"
+version = "1.0.0"
+dependencies = [
+ "cerulion_core",
+ "cerulion_macros",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "cerulion-ros2-client"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1539,9 +1548,11 @@ dependencies = [
 name = "cerulion_macros"
 version = "1.0.0"
 dependencies = [
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+ "toml_edit",
 ]
 
 [[package]]
@@ -8057,11 +8068,14 @@ version = "1.0.0"
 dependencies = [
  "bindgen 0.70.1",
  "cc",
+ "cerulion_bag",
  "cerulion_core",
  "iceoryx2",
  "libc",
  "native_ros2_messages",
  "rmw_cerulion",
+ "serde",
+ "serde_json",
  "serial_test",
  "tracing",
  "tracing-subscriber",

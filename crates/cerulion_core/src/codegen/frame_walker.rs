@@ -107,7 +107,11 @@
 //!   wherever the writer's cursor happened to be (the generated writers
 //!   align-up only for primitive arrays), so an element blob can begin at an
 //!   odd offset. Decoding is unaligned-safe (`from_le_bytes` over slices),
-//!   but a consumer can never cast the blob to a typed slice.
+//!   but a consumer can never cast the blob to a typed slice. The generated
+//!   readers take such bytes as they are: `<Name>Shm::from_bytes` reads a
+//!   sub-frame at any address (from an aligned copy when it is not aligned
+//!   to that reader's `READ_ALIGN`), and a fixed-only `<Name>Shm::read_unaligned` copies one
+//!   element of a fixed-element array out of the blob.
 //! - **Element-schema skew is not hash-covered.** The wire `schema_hash`
 //!   folds a *fixed*-resolved nested target's hash into the parent but NOT a
 //!   variable one (it is self-describing on the wire), so a producer/consumer

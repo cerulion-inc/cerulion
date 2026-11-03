@@ -124,7 +124,9 @@ rollback) is `crates/cerulion_pairing/tests/chain_verify_test.rs`.
   (`lib.rs`), encoded in every grant and enforced at verify time
   (`chain_verify_test.rs`).
 - **Revocation is not expiry.** The robot-local durable access list is truth;
-  established pairings never rot offline; short-lived certs gate NEW pairings
+  an established pairing lapses offline only at a finite expiry its row carries
+  (an owner-signed grant's `not_after`; for a cloud device, no later than its
+  certificate's `not_after`); short-lived certs otherwise gate NEW pairings
   only. Revocation propagates via the monotonic signed epoch (§9).
 - **The trust store is tamper-evident and anti-rollback** (`verify/store.rs`):
   HMAC-SHA256 over a versioned envelope, constant-time verify on load, atomic
@@ -132,9 +134,25 @@ rollback) is `crates/cerulion_pairing/tests/chain_verify_test.rs`.
   the crate holds no key-management policy). `high_water_ns` is the max
   validated time ever observed; a verification whose `now_ns` is behind it is
   refused, so a clock rollback cannot resurrect an expired cert, and the floor
-  survives factory reset. Pinned by `store_test.rs`. A store whose
-  `STORE_FORMAT_VERSION` does not match is REFUSED, never migrated (the
-  documented bump policy in `store.rs`).
+  survives factory reset. Pinned by `store_test.rs`. Format v4 keys access rows
+  by `(account, device)` and carries the allow-from-cloud switch; a v3 store is
+  MIGRATED on load (MAC verified first, every row kept as an account-wide row in
+  order, the switch on, one warning) and saved as v4 on the next write. Any other
+  version is REFUSED (the bump policy in `store.rs`).
+- **Access rows are per device.** A row belongs to `(account, device)`; a new
+  device of an account adds its own row and never rewrites another device's
+  row, the owner row included. `device: None` is an account-wide row (the owner
+  row a claim writes, and every migrated row); a device with no row of its own
+  falls back to it, and a revoked or expired device row never does
+  (`TrustStore::is_allowed`). An owner revoke covers every row of the account.
+- **The cloud principal.** `PrincipalKind::Cloud` (signed discriminant 3, postcard
+  variant index 2) marks a device certificate the hosted service holds for an
+  account. A decoder built before it refuses the certificate. The robot's
+  allow-from-cloud switch (in the trust store, ON by default, set by the owner
+  from a non-cloud device with the `cloud-access` ops verb) gates every cloud row
+  through one predicate, `TrustStore::cloud_allowed`, surfaced as
+  `KeyAccess::CloudRefused` and refused at accept on every ALPN and for every
+  verb, the bootstrap and e-stop verbs included.
 - **CPace fallback ceremony** (`pake.rs`): the CFRG balanced PAKE, run INSIDE an
   already-authenticated channel with both transport identities transcript-bound;
   bounded attempts (config range 1..=5, default 3), code burn, TTL (default
@@ -173,7 +191,9 @@ trailing bytes are a loud error (`format_vectors_test.rs`, including
   with notAfter `99991231235959Z`) and team issuing CAs (self-signed, CA with
   path length 0), written by a hand-rolled DER encoder and read back by the strict
   `check_leaf` / `check_team_ca`; the intermediate-signed `TeamTrustBundle`
-  (`cerulion-pairing:team-trust:v1`), `TeamStatusList` and `StatusFreshness`
+  (`cerulion-pairing:team-trust:v1`: the current issuing CA, the next
+  generation's CA published one rotation ahead, retired CAs and robot leaves),
+  `TeamStatusList` and `StatusFreshness`
   (`cerulion-pairing:team-status:v1`, told apart by a kind byte); and the pure
   anti-rollback decisions in `team::rollback`. Pinned by `team_formats_test.rs`
   against x509-parser, rustls-webpki, rcgen-built refusals and hand-built
@@ -460,13 +480,17 @@ and presents the owner's certificate chain ONCE, and only on a classified
 unpaired refusal: never after expiry, revocation or a denied permission, and
 never as a silent fallback to a code. On the robot side the `pair` verb admits a
 chain whose account equals the owner account with no robot-scoped grant; every
-other account still needs the full grant presentation.
+other account still needs the full grant presentation. This is **certificate
+presentation**: no code and no user step, and the presenting device gets its own
+row `(owner, device)` with the owner row's scope and the certificate's principal.
+The hosted service's device is admitted exactly this way, as a cloud row.
 
 **Code pairing cannot name an account.** Possession of a code and of the device
 keys proves neither, so `code-pair-finish` binds the guest to the self-account
-derived from the authenticated transport key and refuses any other value; a
-cloud account requires the full roots-verified chain whose device key equals the
-transport peer key. The owner row is never preserved for a guest, because that
+derived from the authenticated transport key and refuses any other value; an
+account certificate requires the full roots-verified chain whose device key equals
+the transport peer key, presented through `pair` (certificate presentation, above).
+The owner row is never preserved for a guest, because that
 would hand the guest the owner's authority outright
 (`crates/cerulion_remoted/tests/code_pair_account_test.rs`).
 
@@ -585,14 +609,23 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
 - Desk inventory (`~/.cerulion/`): `identity/device.key` (the 32-byte machine
   seed; `desk.key` is a hard link to it or an equal copy, adopted byte for byte when it is the
   only one present, and two different keys are refused), `identity/<team>/high_water`
-  (MAC'd clock, bundle generation and status sequence floors), `device.cert`
+  (MAC'd clock, bundle generation and status sequence floors),
+  `identity/active_team` (the team sessions open with), `identity/<team>/leaf.der`
+  and `identity/<team>/bundle` (the team leaf and the postcard trust bundle,
+  accepted by `IdentityLayout::load_team_credentials` only against a trusted
+  root set; `team_credentials_test.rs`), `dev-issuer/state` (feature
+  `dev-issuer` only: the development issuer's root, intermediate and team CA
+  keys), `device.cert`
   (login-issued), `robots.toml` (name → eid pins), `epochs/<robot>.epoch`,
   `grants/`, `auth.json`, `peers.json` (LAN discovery; see
   `network-daemons.md`).
 - Robot inventory (state root, `remoted/` subdir; `remoted::config`):
   `device_key`, `trust_store` + `trust_store.mac_key` (the daemon loads the
-  trust-store MAC key from this file, so robot setup must provision and protect
-  it; there is no secure-storage backend and no enforcing test),
+  trust-store MAC key from this file, so robot setup must provision it, mode
+  0600; there is no secure-storage backend. On load the daemon clears the group
+  and other permission bits of the device key, the MAC key, the trust store and
+  the device index, without following a symbolic link at the path, and saves
+  create the trust store and the device index 0600),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
   root), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
