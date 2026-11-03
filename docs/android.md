@@ -933,7 +933,8 @@ device.
 
 A start reads them before it builds anything else. When a key or the trust
 store is missing, or a file does not verify (a fresh install, a trust store
-bound to another device key),
+bound to another device key, an empty `trust_store.mac_key` beside a trust
+store; the error names the file and the fix is to stream the real key again),
 the start fails: `status` reports `state` `failed` with `last_error.code` 17
 (`REMOTE_NOT_PROVISIONED`), nothing runs and nothing is served. Any other
 plane failure is code 18 (`REMOTE`): an app library that links no host, an

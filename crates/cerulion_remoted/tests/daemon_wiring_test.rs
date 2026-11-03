@@ -168,7 +168,11 @@ async fn present_store_with_an_empty_mac_key_file_is_a_provisioning_class_error(
         RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, /*disabled=*/ false);
     let err = run(cfg, async {}).await.unwrap_err();
     assert!(
-        matches!(&err, RemotedError::MacKey(m) if m.contains("empty trust-store MAC key")),
-        "expected an empty-key MacKey error, got {err:?}"
+        matches!(
+            &err,
+            RemotedError::MacKey(m) if m.contains("empty trust-store MAC key")
+                && m.contains(&remoted.join("trust_store.mac_key").display().to_string())
+        ),
+        "expected an empty-key MacKey error naming the key file, got {err:?}"
     );
 }
