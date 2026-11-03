@@ -144,9 +144,9 @@ impl PeriodLearner {
         }
     }
 
-    /// The predicted message arrived before its window opened. The next window opens earlier by a widening that
-    /// doubles per such arrival, from [`MIN_WINDOW_NS`] up to what keeps the window within [`MAX_PARK_NS`].
-    /// No effect unless the topic is regular.
+    /// The predicted message was seen late: before its window opened, or before the park's first check. The next
+    /// window opens earlier by a widening that doubles per such arrival, from [`MIN_WINDOW_NS`] up to what keeps the
+    /// window within [`MAX_PARK_NS`]. No effect unless the topic is regular.
     pub fn arrived_before_window(&mut self) {
         if !self.regular {
             return;
@@ -180,10 +180,12 @@ impl PeriodLearner {
 /// How a predicted block ended, applied to the predicted topic's learner by the next [`TopicLearners::note`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowEnd {
-    /// A wake cut the kernel sleep before the window opened.
-    BeforeOpen,
-    /// The park ran and a wake (not the window's end) returned it.
-    Parked,
+    /// The predicted message was seen before the park could catch its ring: a wake cut the kernel
+    /// lead, or the predicted bell had already rung when the park made its first check. The arrival
+    /// is noted late, so the next window widens on its early side.
+    BeforePark,
+    /// The park armed on the predicted bell saw that bell ring, so the noted arrival is the ring time.
+    Caught,
 }
 
 /// One learner per topic of a wait set, matched by position to the wait set's mapped bells.
@@ -249,11 +251,29 @@ impl TopicLearners {
             *last = seq;
             learner.observe(now_ns);
             match pending {
-                Some((b, WindowEnd::BeforeOpen)) if b == bell => learner.arrived_before_window(),
-                Some((b, WindowEnd::Parked)) if b == bell => learner.caught_in_window(),
+                Some((b, WindowEnd::BeforePark)) if b == bell => learner.arrived_before_window(),
+                Some((b, WindowEnd::Caught)) if b == bell => learner.caught_in_window(),
                 _ => {}
             }
         }
+    }
+
+    /// Record each mapped bell's seq (`seqs`, in bell order) as seen without observing an arrival, and drop the
+    /// pending predicted block's end. For seqs read before a readiness probe that serves every message behind them.
+    pub fn sync(&mut self, seqs: impl IntoIterator<Item = u64>) {
+        self.pending = None;
+        for (bell, seq) in seqs.into_iter().enumerate() {
+            let Some(&idx) = self.map.get(bell) else {
+                break;
+            };
+            self.learners[idx].1 = seq;
+        }
+    }
+
+    /// Each mapped bell's seq at the last [`Self::note`] or [`Self::sync`] (the seed for a topic not yet noted), in
+    /// bell order. A bell whose seq differs from this has rung since the learners last looked.
+    pub fn noted_seqs(&self) -> impl Iterator<Item = u64> + '_ {
+        self.map.iter().map(|&idx| self.learners[idx].1)
     }
 
     /// The window that opens first among the mapped bells' predictions that close after `now_ns`, with its bell index.
@@ -616,9 +636,69 @@ mod tests {
     }
 
     #[test]
+    fn the_noted_seqs_are_the_last_note_per_bell_in_bell_order() {
+        let mut set = TopicLearners::default();
+        set.remap(1, &[("/a", 5), ("/b", 9)]);
+        assert_eq!(
+            set.noted_seqs().collect::<Vec<_>>(),
+            [5, 9],
+            "a topic not yet noted reports its seed"
+        );
+        set.note(1_000_000, [7, 9]);
+        assert_eq!(set.noted_seqs().collect::<Vec<_>>(), [7, 9]);
+        set.note(2_000_000, [7, 9]);
+        assert_eq!(
+            set.noted_seqs().collect::<Vec<_>>(),
+            [7, 9],
+            "a note with no ring keeps the seqs"
+        );
+        set.remap(2, &[("/b", 40), ("/a", 8)]);
+        assert_eq!(
+            set.noted_seqs().collect::<Vec<_>>(),
+            [9, 7],
+            "a remap reorders by bell and does not re-seed a known topic"
+        );
+    }
+
+    #[test]
+    fn a_sync_marks_rings_seen_without_an_arrival_and_drops_the_pending_end() {
+        // Seqs 1 to 11 noted at 0 to 10 ms: a regular 1 ms topic per bell, last seq 11.
+        let mut set = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        let before = set.learners[1].2;
+        set.end_window(Some((1, WindowEnd::BeforePark)));
+        set.sync([12, 12]);
+        assert_eq!(set.noted_seqs().collect::<Vec<_>>(), [12, 12]);
+        assert_eq!(set.learners[1].2, before, "a sync observes no arrival");
+        set.note(11_000_000, [12, 13]);
+        assert_eq!(
+            set.learners[1].2.early_ns, 0,
+            "the sync dropped the pending end"
+        );
+        assert_eq!(
+            set.learners[1].2.predict().map(|p| p.next_ns),
+            Some(12_000_000),
+            "the ring to 13 at 11 ms is the arrival observed"
+        );
+        let at_11 = set.learners[1].2;
+        set.sync([12, 13]);
+        set.note(11_400_000, [12, 13]);
+        assert_eq!(
+            set.learners[1].2, at_11,
+            "a note at the synced seqs sees no ring"
+        );
+        let mut unsynced = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        unsynced.end_window(Some((1, WindowEnd::BeforePark)));
+        unsynced.note(11_000_000, [12, 12]);
+        assert_eq!(
+            unsynced.learners[1].2.early_ns, MIN_WINDOW_NS,
+            "without the sync the pending end widens the window"
+        );
+    }
+
+    #[test]
     fn the_pending_window_end_reaches_only_its_own_bell_and_only_once() {
         let mut set = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
-        set.end_window(Some((1, WindowEnd::BeforeOpen)));
+        set.end_window(Some((1, WindowEnd::BeforePark)));
         set.note(11_000_000, [12, 12]);
         assert_eq!(
             set.learners[0].2.early_ns, 0,
@@ -630,13 +710,13 @@ mod tests {
             set.learners[1].2.early_ns, MIN_WINDOW_NS,
             "a pending end applies once"
         );
-        set.end_window(Some((1, WindowEnd::BeforeOpen)));
+        set.end_window(Some((1, WindowEnd::BeforePark)));
         set.note(12_500_000, [14, 13]);
         assert_eq!(
             set.learners[1].2.early_ns, MIN_WINDOW_NS,
             "the predicted bell did not move: no widening"
         );
-        set.end_window(Some((1, WindowEnd::Parked)));
+        set.end_window(Some((1, WindowEnd::Caught)));
         set.note(13_000_000, [14, 14]);
         assert_eq!(set.learners[1].2.early_ns, 0, "a catch drops the widening");
     }

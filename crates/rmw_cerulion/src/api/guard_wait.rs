@@ -315,6 +315,28 @@ enum BlockWake {
     Timeout,
 }
 
+/// How one park ended ([`WaitSetData::park_until`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkEnd {
+    wake: BlockWake,
+    /// The park returned at its first check: a bell had already moved from the park's
+    /// reference seq, so no wait ran.
+    #[cfg_attr(not(any(test, feature = "period-park")), allow(dead_code))]
+    at_entry: bool,
+}
+
+/// The seqs a park measures a ring against ([`WaitSetData::park_until`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkRef {
+    /// Each bell's seq read when the park starts (the stock park).
+    Entry,
+    /// Each bell's seq at the period learners' last note or sync (feature `period-park`). A
+    /// ring that landed after that read, during the kernel lead included, ends the park at
+    /// its first check, before a monitor wait is armed on a line that has already moved.
+    #[cfg(feature = "period-park")]
+    Noted,
+}
+
 /// What this loop iteration knows about why it is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -432,14 +454,17 @@ pub fn block_parks(horizon: ParkHorizon, allowance: bool) -> (bool, bool) {
     }
 }
 
-/// PURE: how a block spends a predicted window `(opens at, length)`. `Some((lead, park))`
-/// means a kernel fd block of `lead`, then a doorbell park of `park`; `None` means the
-/// stock block. A window already closed, or opening at or beyond `budget`, gives `None`.
+/// PURE: how a block spends a predicted window `(opens at, length)`. `Some((lead, park_end))`
+/// means a kernel fd block of `lead`, then a doorbell park that ends at the instant
+/// `park_end`: the window's close, or the block's end (`now + budget`) if that is sooner.
+/// The end is an instant, so a lead that wakes late shortens the park and never moves its
+/// end. `None` means the stock block. A window already closed, or opening at or beyond
+/// `budget`, gives `None`.
 pub fn predicted_block(
     now: Instant,
     window: Option<(Instant, Duration)>,
     budget: Duration,
-) -> Option<(Duration, Duration)> {
+) -> Option<(Duration, Instant)> {
     let (open, len) = window?;
     let close = open.checked_add(len)?;
     if close <= now {
@@ -449,10 +474,35 @@ pub fn predicted_block(
     if lead >= budget {
         return None;
     }
-    let park = close
-        .saturating_duration_since(now.max(open))
-        .min(budget - lead);
-    Some((lead, park))
+    let park_end = now.checked_add(budget).map_or(close, |end| close.min(end));
+    Some((lead, park_end))
+}
+
+/// PURE (feature `period-park`): what a predicted block reports to its topic's learner.
+/// `lead` is how the kernel lead ended and `park` how the park after it ended (`None`: no
+/// park ran, an fd cut the lead). Only a ring of the predicted bell that the armed park saw
+/// is a catch at ring time. An fd that cut the lead, or a predicted bell that had already
+/// rung at the park's first check, is a late sighting of the message. Any other end (an fd,
+/// another bell, the park's end) tells the learner nothing about the predicted message.
+#[cfg(any(test, feature = "period-park"))]
+fn window_end(
+    lead: BlockWake,
+    park: Option<ParkEnd>,
+    bell: usize,
+) -> Option<super::period_learner::WindowEnd> {
+    use super::period_learner::WindowEnd;
+    match park {
+        None => (lead == BlockWake::Fd).then_some(WindowEnd::BeforePark),
+        Some(ParkEnd {
+            wake: BlockWake::Bell(b),
+            at_entry,
+        }) if b == bell => Some(if at_entry {
+            WindowEnd::BeforePark
+        } else {
+            WindowEnd::Caught
+        }),
+        Some(_) => None,
+    }
 }
 
 /// Most subscription topics one call predicts over (feature `period-park`): each wake
@@ -746,6 +796,11 @@ pub struct WaitSetData {
     /// Predicted parks that returned on the predicted topic's own bell.
     #[cfg(feature = "period-park")]
     pub predicted_bell_wakes: AtomicU64,
+    /// Predicted bell wakes found at the park's first check: the predicted bell had rung
+    /// after the learners' last note or sync, during the kernel lead or before the park
+    /// started.
+    #[cfg(feature = "period-park")]
+    pub predicted_rings_before_park: AtomicU64,
 }
 
 /// Arrival learners for the wait set's topics, timed in ns since `epoch` (the first arrival noted).
@@ -788,6 +843,17 @@ impl WaitSetData {
         st.learners.remap(bells.generation, &seqs);
     }
 
+    /// Mark every mapped bell's current seq as seen, with no arrival observed. The call's
+    /// entry pass runs this before its full readiness probe, and the probe serves every
+    /// message committed before this read (a publisher commits, then rings), so the next
+    /// predicted park ([`ParkRef::Noted`]) reacts only to rings after it.
+    fn sync_noted_bells(&self) {
+        let bells = self.park_bells.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.period.lock().unwrap_or_else(|e| e.into_inner());
+        Self::map_learners_locked(&bells, &mut st);
+        st.learners.sync(bells.bells.iter().map(|(_, b)| b.seq()));
+    }
+
     /// Record an arrival at `at` for every mapped bell whose seq moved since the last note,
     /// and apply the last predicted block's end to its bell's learner.
     fn note_rung_bells(&self, at: Instant) {
@@ -813,40 +879,47 @@ impl WaitSetData {
         Some((open, Duration::from_nanos(p.close_ns() - p.open_ns()), bell))
     }
 
-    /// This block's predicted plan as (kernel lead, park, bell index), or `None` for the stock block.
-    fn predicted_plan(&self, budget: Duration) -> Option<(Duration, Duration, usize)> {
+    /// This block's predicted plan as (kernel lead, park end, bell index), or `None` for the
+    /// stock block. The park end is an instant ([`predicted_block`]).
+    fn predicted_plan(&self, budget: Duration) -> Option<(Duration, Instant, usize)> {
         let now = Instant::now();
         let (open, len, bell) = self.next_window(now)?;
-        let (lead, park) = predicted_block(now, Some((open, len)), budget)?;
-        Some((lead, park, bell))
+        let (lead, park_end) = predicted_block(now, Some((open, len)), budget)?;
+        Some((lead, park_end, bell))
     }
 
-    /// Run a predicted plan: a kernel fd block of `lead`, then, if it timed out, a park of
-    /// `park` armed on bell `bell`. How it ended is kept for the next [`Self::note_rung_bells`].
-    fn predicted_wait(&self, (lead, park, bell): (Duration, Duration, usize)) -> BlockWake {
-        use super::period_learner::WindowEnd;
+    /// Run a predicted plan: a kernel fd block of `lead`, then, if it timed out, a park armed
+    /// on bell `bell` until the instant `park_end`, measuring a ring against the learners'
+    /// last note or sync ([`ParkRef::Noted`]). A lead that wakes late leaves the park less time, never
+    /// a later end. How it ended ([`window_end`]) is kept for the next
+    /// [`Self::note_rung_bells`].
+    fn predicted_wait(&self, (lead, park_end, bell): (Duration, Instant, usize)) -> BlockWake {
         let lead_wake = if lead.is_zero() {
             BlockWake::Timeout
         } else {
             self.fd_block(lead)
         };
-        let (outcome, end) = if lead_wake == BlockWake::Timeout {
+        let park = if lead_wake == BlockWake::Timeout {
             self.predicted_parks.fetch_add(1, Ordering::Relaxed);
-            let woke = self.park_block(park, bell);
-            if woke == BlockWake::Bell(bell) {
+            let end = self.park_until(park_end, bell, ParkRef::Noted);
+            if end.wake == BlockWake::Bell(bell) {
                 self.predicted_bell_wakes.fetch_add(1, Ordering::Relaxed);
+                if end.at_entry {
+                    self.predicted_rings_before_park
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
-            (woke, WindowEnd::Parked)
+            Some(end)
         } else {
-            (lead_wake, WindowEnd::BeforeOpen)
+            None
         };
-        let ended = (outcome != BlockWake::Timeout).then_some((bell, end));
+        let ended = window_end(lead_wake, park, bell).map(|end| (bell, end));
         self.period
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .learners
             .end_window(ended);
-        outcome
+        park.map_or(lead_wake, |end| end.wake)
     }
 }
 
@@ -867,8 +940,10 @@ struct ParkBells {
     missing: Vec<String>,
     /// Calls since the last retry of `missing`.
     calls_since_retry: u32,
-    /// Each bell's seq as snapshotted at the LAST park entry (parallel to
-    /// `bells`) — what "stayed silent" is measured against.
+    /// Each bell's reference seq for the LAST park (parallel to `bells`): read
+    /// at the park's entry, or for a predicted park the seq at the period
+    /// learners' last note or sync ([`ParkRef`]). What "stayed silent" is
+    /// measured against.
     last_snap: Vec<u64>,
     /// The last park returned via the FD path with every bell silent —
     /// a frame may have arrived without its bell ringing; reconcile.
@@ -1065,10 +1140,20 @@ impl WaitSetData {
     /// doorbell ring wakes hardware-instantly on the primary and within
     /// one slice on the rest; listener/guard fds wake within one slice.
     fn park_block(&self, budget: Duration, primary: usize) -> BlockWake {
-        self.park_blocks.fetch_add(1, Ordering::Relaxed);
         let Some(deadline) = Instant::now().checked_add(budget) else {
+            self.park_blocks.fetch_add(1, Ordering::Relaxed);
             return BlockWake::Timeout;
         };
+        self.park_until(deadline, primary, ParkRef::Entry).wake
+    }
+
+    /// The park of [`Self::park_block`], ending at the instant `deadline` and
+    /// measuring a ring against `reference`. Each pass checks the bells first,
+    /// then the fds, then the deadline, so a bell that already differs from the
+    /// reference returns at the first check ([`ParkEnd::at_entry`]) even when
+    /// the deadline has passed.
+    fn park_until(&self, deadline: Instant, primary: usize, reference: ParkRef) -> ParkEnd {
+        self.park_blocks.fetch_add(1, Ordering::Relaxed);
         let mut bells = self.park_bells.lock().unwrap_or_else(|e| e.into_inner());
         let primary = if primary < bells.bells.len() {
             primary
@@ -1077,9 +1162,27 @@ impl WaitSetData {
         };
         // hot-path-alloc-ok: one small Vec per park entry (the idle path,
         // never the frame path).
-        let snap: Vec<u64> = bells.bells.iter().map(|(_, b)| b.seq()).collect();
+        let snap: Vec<u64> = match reference {
+            ParkRef::Entry => bells.bells.iter().map(|(_, b)| b.seq()).collect(),
+            #[cfg(feature = "period-park")]
+            ParkRef::Noted => {
+                let st = self.period.lock().unwrap_or_else(|e| e.into_inner());
+                let noted: Vec<u64> = if st.learners.is_mapped(bells.generation) {
+                    st.learners.noted_seqs().collect()
+                } else {
+                    Vec::new()
+                };
+                if noted.len() == bells.bells.len() {
+                    noted
+                } else {
+                    // Learners not matched to this bell set: the entry seqs.
+                    bells.bells.iter().map(|(_, b)| b.seq()).collect()
+                }
+            }
+        };
         bells.last_snap.clone_from(&snap);
         bells.fd_wake_suspect = false;
+        let mut first_check = true;
         loop {
             if let Some(idx) = bells
                 .bells
@@ -1088,8 +1191,12 @@ impl WaitSetData {
                 .position(|((_, b), s)| b.seq() != *s)
             {
                 self.park_wakes_doorbell.fetch_add(1, Ordering::Relaxed);
-                return BlockWake::Bell(idx);
+                return ParkEnd {
+                    wake: BlockWake::Bell(idx),
+                    at_entry: first_check,
+                };
             }
+            first_check = false;
             if self
                 .fd_set
                 .lock()
@@ -1102,12 +1209,18 @@ impl WaitSetData {
                 // (see `reconcile_stale_bells`, run by the caller).
                 bells.fd_wake_suspect = true;
                 self.fd_wakes.fetch_add(1, Ordering::Relaxed);
-                return BlockWake::Fd;
+                return ParkEnd {
+                    wake: BlockWake::Fd,
+                    at_entry: false,
+                };
             }
             let now = Instant::now();
             if now >= deadline {
                 self.timeout_wakes.fetch_add(1, Ordering::Relaxed);
-                return BlockWake::Timeout;
+                return ParkEnd {
+                    wake: BlockWake::Timeout,
+                    at_entry: false,
+                };
             }
             let slice_deadline = deadline.min(now + PARK_RECHECK);
             let performed = match bells.bells.get(primary) {
@@ -2475,6 +2588,12 @@ unsafe fn rmw_wait_live(
                     fired_buf.clear();
                     match phase {
                         Phase::Entry => {
+                            // Period-learned park: the full probe below serves every
+                            // message whose ring came before this read.
+                            #[cfg(feature = "period-park")]
+                            if parked && predict {
+                                ws.sync_noted_bells();
+                            }
                             let mut fd_set = ws.fd_set.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = fd_set.check();
                             fired_buf.extend_from_slice(fd_set.fired());
@@ -2993,13 +3112,8 @@ mod tests {
         );
     }
 
-    /// STRUCTURAL (the park is stubbed off Linux, so the desk cannot run
-    /// it): the park loop's timed-out slice must reach `yield_now` — the
-    /// OS-cooperative property the same-core Linux arm measures. Walked
-    /// over a comment-stripped view of this file's `park_block`, so a
-    /// yield mentioned only in prose cannot satisfy it.
     #[test]
-    fn a_predicted_window_maps_to_a_kernel_lead_then_a_bounded_park() {
+    fn a_predicted_window_maps_to_a_kernel_lead_then_a_park_to_an_absolute_end() {
         let now = Instant::now();
         let us = Duration::from_micros;
         let budget = us(1_000);
@@ -3026,18 +3140,69 @@ mod tests {
         );
         assert_eq!(
             predicted_block(now, Some((past, us(150))), budget),
-            Some((us(0), us(50))),
-            "open: park the rest"
+            Some((us(0), now + us(50))),
+            "open: park to the close"
         );
         assert_eq!(
             predicted_block(now, Some((now + us(300), us(40))), budget),
-            Some((us(300), us(40))),
-            "future: sleep, then park"
+            Some((us(300), now + us(340))),
+            "future: sleep, then park to the close"
         );
         assert_eq!(
             predicted_block(now, Some((now + us(900), us(400))), budget),
-            Some((us(900), us(100))),
-            "park clamped by the budget"
+            Some((us(900), now + us(1_000))),
+            "the park ends at the block's end when that comes first"
+        );
+        assert_eq!(
+            predicted_block(now, Some((now + us(999), us(40))), budget),
+            Some((us(999), now + us(1_000))),
+            "an open just inside the budget keeps a park to the block's end"
+        );
+    }
+
+    #[test]
+    fn only_the_predicted_bells_own_ring_seen_by_the_armed_park_is_a_catch() {
+        use super::super::period_learner::WindowEnd;
+        let park = |wake, at_entry| Some(ParkEnd { wake, at_entry });
+        assert_eq!(
+            window_end(BlockWake::Fd, None, 1),
+            Some(WindowEnd::BeforePark),
+            "an fd cut the kernel lead"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, park(BlockWake::Bell(1), false), 1),
+            Some(WindowEnd::Caught),
+            "the armed park saw the predicted bell ring"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, park(BlockWake::Bell(1), true), 1),
+            Some(WindowEnd::BeforePark),
+            "the predicted bell had rung before the park's first check"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, park(BlockWake::Fd, false), 1),
+            None,
+            "an fd end is never a catch"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, park(BlockWake::Bell(0), false), 1),
+            None,
+            "another bell's ring is not the predicted message"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, park(BlockWake::Bell(0), true), 1),
+            None,
+            "nor is another bell that rang before the park"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, park(BlockWake::Timeout, false), 1),
+            None,
+            "a park that ran to its end saw nothing"
+        );
+        assert_eq!(
+            window_end(BlockWake::Timeout, None, 1),
+            None,
+            "no park and no lead wake"
         );
     }
 
@@ -3115,6 +3280,302 @@ mod tests {
         );
     }
 
+    /// A wait set with one mapped bell whose learner noted a ring at `base + k ms` for k in
+    /// 0..=10: a regular 1 ms topic whose next window on bell 0 is (base + 11 ms - 20 us,
+    /// 40 us). Returns the wait set, the producer side of the bell, `base` and the bell's
+    /// seq at the last note.
+    #[cfg(feature = "period-park")]
+    fn regular_one_ms_topic(
+        tag: &str,
+    ) -> (WaitSetData, cerulion_core::doorbell::Doorbell, Instant, u64) {
+        let topic = format!("/rmw_pp/{}/{tag}", std::process::id());
+        let page = cerulion_core::doorbell::Doorbell::open_owned(doorbell_ns(), &topic)
+            .expect("beat page");
+        let ws = WaitSetData::default();
+        ws.refresh_park_bells(std::slice::from_ref(&topic));
+        assert_eq!(ws.doorbell_topics(), 1);
+        ws.map_learners();
+        let base = Instant::now();
+        for k in 0..=10u64 {
+            page.ring();
+            ws.note_rung_bells(base + Duration::from_millis(k));
+        }
+        let noted = page.seq();
+        (ws, page, base, noted)
+    }
+
+    /// A readable fd in the wait set's fd snapshot, as a landed listener notify leaves it.
+    #[cfg(feature = "period-park")]
+    fn readable_fd(ws: &WaitSetData) -> std::os::unix::net::UnixStream {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        let (rx, mut tx) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        tx.write_all(&[1]).expect("one byte");
+        ws.fd_set.lock().expect("fd set").watch(rx.as_raw_fd());
+        // The byte stays readable while `rx` lives; the writer can go.
+        rx
+    }
+
+    /// The predicted bell rings after the learners' last note and before the park, as a ring
+    /// during the kernel lead does. The park measures against the noted seq, so its first
+    /// check returns on the bell. Measured against its own entry seqs, it would arm the
+    /// monitor wait on a line that had already moved and sleep to its end, 2 s here.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn a_ring_during_the_lead_ends_the_predicted_park_at_its_first_check() {
+        let (ws, page, _, noted) = regular_one_ms_topic("lead_ring");
+        page.ring();
+        let end = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Bell(0)
+        );
+        assert!(Instant::now() < end, "returned before the park's end");
+        assert_eq!(
+            ws.park_yields.load(Ordering::Relaxed),
+            0,
+            "no park slice ran"
+        );
+        assert_eq!(ws.predicted_parks.load(Ordering::Relaxed), 1);
+        assert_eq!(ws.predicted_bell_wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 1);
+        let pb = ws.park_bells.lock().expect("bells");
+        assert_eq!(pb.last_snap, [noted], "the reference is the learners' note");
+        assert!(!pb.fd_wake_suspect);
+    }
+
+    /// A ring the call's entry pass synced (its message is served by the full probe) is not
+    /// a ring for the next predicted park, which then runs to its end; the sync feeds the
+    /// learner no arrival. Negative: a ring after the sync still ends the park at its first
+    /// check.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn a_ring_synced_by_the_entry_pass_does_not_end_the_next_predicted_park() {
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        let (ws, page, base, noted) = regular_one_ms_topic("entry_sync");
+        page.ring();
+        ws.sync_noted_bells();
+        let end = Instant::now() + ms(3);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Timeout
+        );
+        assert!(Instant::now() >= end, "the park ran to its end");
+        assert_eq!(
+            ws.park_bells.lock().expect("bells").last_snap,
+            [noted + 1],
+            "the reference is the synced seq"
+        );
+        assert_eq!(
+            ws.next_window(base + ms(10)),
+            Some((base + ms(11) - us(20), us(40), 0)),
+            "the window of the last noted arrival at 10 ms"
+        );
+        page.ring();
+        let end = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Bell(0)
+        );
+        assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 1);
+    }
+
+    /// The same ring with the listener notify already readable. The bell check comes before
+    /// the fd check and sees the ring, so the park returns on the bell and leaves the
+    /// stale-bell reconcile idle. Returned as an fd wake, the reconcile would find a pending
+    /// sample with the bell at the park's entry seq and re-open a live bell.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn a_ring_before_the_park_with_its_notify_readable_returns_on_the_bell_not_the_fd() {
+        let (ws, page, _, noted) = regular_one_ms_topic("ring_and_notify");
+        let _notify = readable_fd(&ws);
+        page.ring();
+        let end = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Bell(0)
+        );
+        let pb = ws.park_bells.lock().expect("bells");
+        assert!(
+            !pb.fd_wake_suspect,
+            "a bell wake does not ask for the reconcile"
+        );
+        assert_eq!(pb.last_snap, [noted]);
+        assert!(
+            !bell_is_stale(true, noted + 1, pb.last_snap[0]),
+            "against the noted reference the rung bell is live"
+        );
+    }
+
+    /// Negative for the two tests above: with no ring since the learners' note, the
+    /// predicted park runs to its end, and a readable fd ends it as an fd wake that does arm
+    /// the stale-bell reconcile.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn with_no_ring_since_the_note_the_predicted_park_waits_for_an_fd_or_its_end() {
+        let (ws, _page, _, noted) = regular_one_ms_topic("no_ring");
+        let end = Instant::now() + Duration::from_millis(3);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Timeout
+        );
+        assert!(Instant::now() >= end, "a timeout never precedes the end");
+        assert!(
+            ws.park_yields.load(Ordering::Relaxed) > 0,
+            "the park ran slices"
+        );
+        let _notify = readable_fd(&ws);
+        let end = Instant::now() + Duration::from_secs(2);
+        assert_eq!(ws.predicted_wait((Duration::ZERO, end, 0)), BlockWake::Fd);
+        assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 0);
+        assert_eq!(ws.predicted_bell_wakes.load(Ordering::Relaxed), 0);
+        let pb = ws.park_bells.lock().expect("bells");
+        assert!(
+            pb.fd_wake_suspect,
+            "a silent bell with an fd wake is suspect"
+        );
+        assert_eq!(pb.last_snap, [noted]);
+    }
+
+    /// The park ends at the plan's instant. A kernel lead that ends 4 ms after the park's
+    /// end leaves the park its first check and no slice; a park whose length was measured
+    /// from its own entry would run that length after the late lead.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn a_late_lead_leaves_the_predicted_park_its_first_check_and_no_later_end() {
+        let (ws, page, _, _) = regular_one_ms_topic("late_lead");
+        let start = Instant::now();
+        let plan = (
+            Duration::from_millis(5),
+            start + Duration::from_millis(1),
+            0,
+        );
+        assert_eq!(ws.predicted_wait(plan), BlockWake::Timeout);
+        assert_eq!(
+            ws.predicted_parks.load(Ordering::Relaxed),
+            1,
+            "the park was entered"
+        );
+        assert_eq!(
+            ws.park_yields.load(Ordering::Relaxed),
+            0,
+            "and ran no slice past its end"
+        );
+        page.ring();
+        let start = Instant::now();
+        let plan = (
+            Duration::from_millis(2),
+            start + Duration::from_millis(1),
+            0,
+        );
+        assert_eq!(
+            ws.predicted_wait(plan),
+            BlockWake::Bell(0),
+            "a ring in a late lead is still served at the first check"
+        );
+        assert_eq!(ws.park_yields.load(Ordering::Relaxed), 0);
+        assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 1);
+    }
+
+    /// What a predicted park tells the learner. Arrivals are noted on the hand clock
+    /// base + k ms (1 ms period, 20 us half-width), so every window below is worked out by
+    /// hand: a ring found at the park's first check widens the next window's early side by
+    /// 20 us, an fd end leaves the widening, and a ring the armed park sees drops it.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn a_ring_before_the_park_widens_the_next_window_and_only_a_ring_in_the_park_drops_it() {
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        let far = || Instant::now() + Duration::from_secs(2);
+        let (ws, page, base, _) = regular_one_ms_topic("feedback");
+        assert_eq!(
+            ws.next_window(base + ms(10)),
+            Some((base + ms(11) - us(20), us(40), 0))
+        );
+        page.ring();
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, far(), 0)),
+            BlockWake::Bell(0)
+        );
+        ws.note_rung_bells(base + ms(11));
+        assert_eq!(
+            ws.next_window(base + ms(11)),
+            Some((base + ms(12) - us(40), us(60), 0)),
+            "a ring before the park widens the early side by 20 us"
+        );
+        let notify = readable_fd(&ws);
+        assert_eq!(ws.predicted_wait((Duration::ZERO, far(), 0)), BlockWake::Fd);
+        page.ring();
+        ws.note_rung_bells(base + ms(12));
+        assert_eq!(
+            ws.next_window(base + ms(12)),
+            Some((base + ms(13) - us(40), us(60), 0)),
+            "an fd end is not a catch: the widening stays"
+        );
+        ws.fd_set.lock().expect("fd set").clear();
+        drop(notify);
+        let slices_before = ws.park_yields.load(Ordering::Relaxed);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Ring once the park has run a slice, so the ring lands inside the park.
+                let give_up = Instant::now() + Duration::from_secs(2);
+                while ws.park_yields.load(Ordering::Relaxed) == slices_before
+                    && Instant::now() < give_up
+                {
+                    std::thread::yield_now();
+                }
+                page.ring();
+            });
+            assert_eq!(
+                ws.predicted_wait((Duration::ZERO, far(), 0)),
+                BlockWake::Bell(0)
+            );
+        });
+        assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 1);
+        ws.note_rung_bells(base + ms(13));
+        assert_eq!(
+            ws.next_window(base + ms(13)),
+            Some((base + ms(14) - us(20), us(40), 0)),
+            "a ring the armed park saw drops the widening"
+        );
+    }
+
+    /// STRUCTURAL: the entry pass syncs the learners' seqs before its fd check and its full
+    /// probe. A sync after the probe would mark a ring as seen whose message no probe looked
+    /// for, and the next predicted park would wait past it. Walked over a comment-stripped
+    /// view of `rmw_wait_live`.
+    #[test]
+    fn the_entry_pass_syncs_the_learners_before_its_full_probe() {
+        let src = include_str!("guard_wait.rs");
+        let start = src
+            .find("unsafe fn rmw_wait_live(")
+            .expect("rmw_wait_live present");
+        let end = src[start..]
+            .find("fn rmw_publisher_event_init(")
+            .map(|e| start + e)
+            .expect("rmw_publisher_event_init follows rmw_wait_live");
+        let body = code_only(&src[start..end]);
+        let arm = &body[body.find("Phase::Entry => {").expect("the entry arm")..];
+        let sync = arm
+            .find("ws.sync_noted_bells()")
+            .expect("the entry arm syncs");
+        let check = arm
+            .find("fd_set.check()")
+            .expect("the entry arm checks the fds");
+        let probe = arm.find("probe_ready_into(").expect("the probe follows");
+        assert!(
+            sync < check && check < probe,
+            "sync, then the fd check, then the probe"
+        );
+    }
+
+    /// STRUCTURAL (off Linux the wait never takes the park tier, so the desk
+    /// cannot measure it): the park loop's timed-out slice must reach
+    /// `yield_now`, the OS-cooperative property the same-core Linux arm
+    /// measures. Walked over a comment-stripped view of this file's
+    /// `park_block` and `park_until`, so a yield mentioned only in prose
+    /// cannot satisfy it.
     #[test]
     fn the_park_slice_yields_the_core() {
         let src = include_str!("guard_wait.rs");
