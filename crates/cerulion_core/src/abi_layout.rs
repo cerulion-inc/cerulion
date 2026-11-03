@@ -652,20 +652,24 @@ static EXPECTED: &[Expected] = &[
         // the same change, and one version describes one shipped layout.
         // v29 adds `annotates_every_read: bool`, which takes offset rank 7
         // (last); every other field keeps its rank (MEASURED via
-        // `dump_measured_table`).
+        // `dump_measured_table`). v30 adds `records_batch_frames: AtomicBool`,
+        // which takes offset rank 6: `role` moves from rank 6 to 7 and
+        // `annotates_every_read` from 7 to 8, and every other field keeps its
+        // rank (MEASURED via `dump_measured_table`).
         fields: &[
             "input_idx",
             "role",
             "capacity",
             "armed",
             "records_every_consult",
+            "records_batch_frames",
             "annotates_every_read",
             "pending",
             "inner",
         ],
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[3, 6, 1, 4, 5, 7, 2, 0],
+            ranks: &[3, 7, 1, 4, 5, 6, 8, 2, 0],
         },
     },
     Expected {

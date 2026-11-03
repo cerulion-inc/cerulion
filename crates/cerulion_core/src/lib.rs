@@ -804,12 +804,17 @@ pub mod wire;
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
-/// - v30: a batched read names every frame it consumed. `CerulionSubscriber`
+/// - v30: a batched read names every frame it consumed when they and the read
+///   fit in its read stage's window. `CerulionSubscriber`
 ///   gains `batch_frames`, the `(sequence, producer token)` of each frame the
 ///   current drain popped while the read log is armed, up to its read stage's
 ///   capacity, and `ReadOutcomeKind`
 ///   gains `BatchFrame = 8`, which the subscriber stages once per popped frame
-///   the read does not name, before the read (`trace_format` 9). The drain
+///   the read does not name, before the read (`trace_format` 9).
+///   `ReadOutcomeStage` gains `records_batch_frames: AtomicBool`, the batch
+///   frame rule a replay adopts from the bag's trace format beside
+///   `records_every_consult`, so a replay of a bag below format 9 stages no
+///   `BatchFrame` record. The drain
 ///   paths run inside a node library, so a library built against an earlier
 ///   core reads the subscriber at stale offsets and stages no `BatchFrame`
 ///   records.

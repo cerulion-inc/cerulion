@@ -1943,9 +1943,12 @@ impl CerulionSubscriber {
 
     /// Before a read that popped more than one frame, stage one `BatchFrame`
     /// record per popped frame other than the one the read names, in pop
-    /// order, each with its writer annotation when the edge carries writers,
-    /// as many as [`batch_frames_staged`] answers. Clears the drain's frame
-    /// list either way.
+    /// order, each through `ReadOutcomeStage::record_with_producer` with its
+    /// writer's token when the edge carries writers, as many as
+    /// [`batch_frames_staged`] answers, and none on a stage whose batch frame
+    /// rule is off (`ReadOutcomeStage::records_batch_frames`: a replay of a bag
+    /// declared below trace format 9). Clears the drain's frame list either
+    /// way.
     fn stage_batch_frames(
         &self,
         stage: &ReadOutcomeStage,
@@ -1959,7 +1962,7 @@ impl CerulionSubscriber {
             kind,
             ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch
         );
-        if consumes && popped > 1 {
+        if consumes && popped > 1 && stage.records_batch_frames() {
             let frames = &list.frames;
             let named = match frames.last() {
                 Some(&(seq, _)) if Some(seq) == served_seq => frames.len() - 1,

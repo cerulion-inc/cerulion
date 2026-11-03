@@ -16435,6 +16435,23 @@ impl GraphRuntime {
         }
     }
 
+    /// Adopt the RECORDING's batch frame rule on every wired stage: does a
+    /// read that popped more than one frame stage its other frames as
+    /// `BatchFrame` records? A recorder at trace format 9 does, and a replay
+    /// of such a bag keeps the stages' creation value; a bag declared below
+    /// format 9 holds none, and a staging that wrote them would hand the
+    /// redundant read log verifier replayed positions with no recorded
+    /// partner and fill rim slots the recording left free. Called once per
+    /// replay, before the first step, beside
+    /// [`Self::set_read_log_records_every_consult`]; a recording run never
+    /// calls it.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn set_read_log_records_batch_frames(&self, every: bool) {
+        for (_node, stage) in &self.read_outcome_stages {
+            stage.adopt_batch_frame_records(every);
+        }
+    }
+
     /// Every read-outcome stage this runtime owns, by key.
     ///
     /// The ONE source of truth about which stages exist. The replay's

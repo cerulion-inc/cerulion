@@ -16376,8 +16376,9 @@ pub fn render_recorder_json(
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
-        // writers by run, and v9 one in which every multi-frame read names each
-        // frame it consumed, both also every bag this binary writes.
+        // writers by run, and v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, both also
+        // every bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -16398,8 +16399,9 @@ pub fn render_recorder_json(
             // every bag it writes stamps at least 7.
             crate::replay_engine::recorder_stamps_consult_records(),
             // Whether every edge carries its frames' writers, one annotation per
-            // writer run, and every multi-frame read names each frame it
-            // consumed: it does, so every bag this binary writes stamps 9.
+            // writer run, and every multi-frame read whose batch fits its read
+            // stage's window names each frame it consumed: it does, so every bag
+            // this binary writes stamps 9.
             crate::replay_engine::recorder_records_read_identity(),
         ),
         // The coordination contract this run executed under.
@@ -27088,8 +27090,9 @@ nodes:
             v["trace_format"], 9,
             "every bag this binary writes carries read-site roles, folds runs, \
              records an empty consult a replay also makes AND names the writer and \
-             sequence of every frame each read consumed: a reader below 9 would \
-             skip the per-frame records and feed a batch by its newest frame alone"
+             sequence of every frame each read consumed when its batch fits the \
+             read stage's window: a reader below 9 does not know the per-frame \
+             record, so the stamp makes it refuse the bag"
         );
     }
 

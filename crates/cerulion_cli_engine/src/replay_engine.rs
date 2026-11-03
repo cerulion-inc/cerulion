@@ -1551,8 +1551,10 @@ pub fn stamp_trace_format(
         // 7 reader reads such a stream correctly (it strips annotations before
         // its compare) but would replay it by queue re-creation and call the
         // result clean, so the stamp moves and that reader refuses instead.
-        // From 9 a multi-frame read also names every frame it consumed
-        // (`BatchFrame` records), which a format 8 reader would skip.
+        // From 9 a multi-frame read whose batch fits its read stage's window
+        // also names every frame it consumed (`BatchFrame` records), a record
+        // kind a format 8 reader does not know, so the stamp moves and that
+        // reader refuses the bag.
         return 9;
     }
     if records_consults {
@@ -1761,6 +1763,35 @@ pub fn replay_stages_every_consult(
     })
 }
 
+/// The lowest `trace_format` whose recorder stages, before a read that popped
+/// more than one frame, one `BatchFrame` record per other frame the read
+/// consumed (when they and the read fit in the read stage's window).
+pub const BATCH_FRAME_MIN_TRACE_FORMAT: u32 = 9;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(BATCH_FRAME_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does the REPLAY stage `BatchFrame` records before a multi-frame read, the
+/// shape the recording's own staging took?
+///
+/// A declared `trace_format` below [`BATCH_FRAME_MIN_TRACE_FORMAT`] names a
+/// recorder that wrote none, so the replay writes none either and the
+/// redundant verifier compares the two logs position for position, and each
+/// stage truncates at the rim position the recording's did. An ABSENT
+/// attachment makes no claim, so the caller answers `stream_records_batch_frames`
+/// from the bag's own kind-6 records (`trace_holds_batch_frame_record`, crate
+/// private), as [`replay_stages_every_consult`] does for the consult rule. The
+/// answer reaches the runtime through
+/// `GraphRuntime::set_read_log_records_batch_frames`.
+pub fn replay_stages_batch_frames(
+    recorder: Option<&RecorderInfo>,
+    stream_records_batch_frames: bool,
+) -> bool {
+    recorder.map_or(stream_records_batch_frames, |r| {
+        r.trace_format >= BATCH_FRAME_MIN_TRACE_FORMAT
+    })
+}
+
 /// The highest scheduler-trace format version this binary can replay.
 /// Bumped to 2 by the discard-marker feature (a FIRE record's `reserved` may
 /// carry `cerulion_core::trace_ring::TRACE_DISCARD_BIT`); bumped to 3 by
@@ -1798,9 +1829,12 @@ pub fn replay_stages_every_consult(
 /// replay on the queue re-creation path, best effort.
 ///
 /// Bumped to 9 by per-frame batch identity: a read that pops more than one
-/// frame is preceded by one `BatchFrame` record per frame it did not name, so a
-/// fed replay feeds every consumed frame by its own identity. A format 8 bag
-/// stays readable; a fed replay of it refuses a multi-frame read by name.
+/// frame is preceded by one `BatchFrame` record per frame it did not name, when
+/// they and the read fit in its read stage's window, so a fed replay feeds every
+/// consumed frame of such a read by its own identity. A format 8 bag stays
+/// readable; a fed replay of it refuses a multi-frame read by name, and a
+/// replay of it stages no `BatchFrame` record
+/// ([`BATCH_FRAME_MIN_TRACE_FORMAT`]).
 ///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
@@ -1808,7 +1842,8 @@ pub fn replay_stages_every_consult(
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
 /// them to zero for the bags this binary writes (every one of them stamps 9,
 /// because every one records every consult and every frame each read
-/// consumed), but the two remain separate functions serving separate
+/// consumed when its batch fits the read stage's window), but the two remain
+/// separate functions serving separate
 /// questions, and the READ gate still admits 1 to 8
 /// while the WRITE stamp never emits them.
 pub const SUPPORTED_TRACE_FORMAT: u32 = 9;
@@ -3888,6 +3923,16 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             None => trace_holds_empty_drain_record(&trace, kind_width)?,
         },
     );
+    // The staging shape of a multi-frame read, the same decode question: a bag
+    // declared below trace format 9 wrote no `BatchFrame` record, and a bag
+    // with no attachment answers from its own record stream.
+    let stages_batch_frames = replay_stages_batch_frames(
+        recorder.as_ref(),
+        match recorder.as_ref() {
+            Some(_) => false,
+            None => trace_holds_batch_frame_record(&trace, kind_width)?,
+        },
+    );
 
     // 0. Does this recording begin mid-run, and if so what
     //    must happen before the first step? `None` — a recording that begins at
@@ -4293,6 +4338,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 roles_stamped,
                 consults_recorded,
                 stages_every_consult,
+                stages_batch_frames,
                 kind_width,
                 catchup_onset,
                 trace: &trace,
@@ -8150,6 +8196,10 @@ struct PassInputs<'a> {
     /// bag with no recorder attachment, which is charged nothing either way and
     /// stages whatever its own record stream shows its recorder wrote.
     stages_every_consult: bool,
+    /// Does the replay's staging write `BatchFrame` records before a
+    /// multi-frame read, the shape this bag's recorder wrote
+    /// (`replay_stages_batch_frames`)?
+    stages_batch_frames: bool,
     /// How wide this bag's kind-6 kind field is.
     ///
     /// A SECOND term beside `roles_stamped` rather than a re-derivation of it,
@@ -11763,7 +11813,19 @@ fn decode_enforcement_read(
         ),
         None if kind == ReadOutcomeKind::BatchFrame => match served_seq {
             Some(seq) => replay_inject::RecordedRead::batch_frame(r.step, seq),
-            None => return Ok(None),
+            // The subscriber stages a batch frame only with its frame's wire
+            // sequence, so the sentinel here is a record no recorder writes.
+            None => {
+                return Err(ReplayError::RecordingInconsistent {
+                    detail: format!(
+                        "a recorded batch frame at step {} on '{}.{}' carries the no-frame \
+                         sentinel ({READ_OUTCOME_NO_FRAME}) where the wire sequence of the \
+                         frame it names belongs. No recorder can write that record, so this \
+                         bag's read log is corrupt. Re-record the bag.",
+                        r.step, r.node_id, r.input
+                    ),
+                })
+            }
         },
         None => replay_inject::RecordedRead::truncated(r.step, r.popped),
     };
@@ -13666,6 +13728,7 @@ fn run_rank_pass(
         pass.roles_stamped,
         pass.consults_recorded,
         pass.stages_every_consult,
+        pass.stages_batch_frames,
     )?;
     if pass.fed {
         read_log.feed_by_identity();
@@ -22536,16 +22599,41 @@ fn trace_holds_empty_drain_record(
     trace: &RecordedTrace,
     width: KindFieldWidth,
 ) -> Result<bool, ReplayError> {
+    trace_holds_read_outcome(trace, width, |kind, role, popped| {
+        kind == READ_OUTCOME_NONE && role == ReadSiteRole::Drain && popped == 0
+    })
+}
+
+/// Does the bag's scheduler trace hold a `BatchFrame` record (outcome kind 8),
+/// the record only a format 9 recorder writes?
+///
+/// The answer for a bag with NO `recorder.json` (see
+/// [`replay_stages_batch_frames`]), from the same walk as
+/// [`trace_holds_empty_drain_record`].
+fn trace_holds_batch_frame_record(
+    trace: &RecordedTrace,
+    width: KindFieldWidth,
+) -> Result<bool, ReplayError> {
+    trace_holds_read_outcome(trace, width, |kind, _, _| {
+        kind == cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME
+    })
+}
+
+/// Does any kind-6 record of the bag's scheduler trace satisfy `matches`,
+/// asked of its `(kind, role, popped)` decoded at `width`? One early-exiting
+/// streaming pass in the shape of [`trace_has_read_outcomes`], advise-behind.
+fn trace_holds_read_outcome(
+    trace: &RecordedTrace,
+    width: KindFieldWidth,
+    matches: impl Fn(u16, ReadSiteRole, u32) -> bool,
+) -> Result<bool, ReplayError> {
     let mut iter = trace.reader.trace_records().map_err(trace_rewalk_error)?;
     let mut advise = cerulion_bag::AdviseCursor::new();
     while let Some(item) = iter.next() {
         let rec = item.map_err(trace_rewalk_error)?;
         if rec.record_type == RECORD_TYPE_READ_OUTCOME {
             let (_, kind, role) = decode_read_outcome_meta(rec.global_level, width);
-            if kind == READ_OUTCOME_NONE
-                && role == ReadSiteRole::Drain
-                && unpack_read_outcome_popped(rec.duration_ns) == 0
-            {
+            if matches(kind, role, unpack_read_outcome_popped(rec.duration_ns)) {
                 return Ok(true);
             }
         }
@@ -23313,6 +23401,10 @@ impl<'a> ReadLogVerifier<'a> {
         // stages beside the sink install: the two logs the compare below pairs
         // position for position must be staged under one rule.
         stages_every_consult: bool,
+        // Whether the replay's staging writes `BatchFrame` records before a
+        // multi-frame read, threaded from `PassInputs::stages_batch_frames` the
+        // same way.
+        stages_batch_frames: bool,
     ) -> Result<Self, ReplayError> {
         // Ragged-tail scoping, derived even for the inert/disabled states so the
         // field's meaning does not depend on which state we land in (it is
@@ -23612,6 +23704,10 @@ impl<'a> ReadLogVerifier<'a> {
         // the rims: a bag declared below trace format 7 wrote nothing there,
         // so the replay writes nothing there either.
         runtime.set_read_log_records_every_consult(stages_every_consult);
+        // The staging shape of a multi-frame read, adopted the same way: a bag
+        // declared below trace format 9 wrote no `BatchFrame` record, so the
+        // replay writes none either.
+        runtime.set_read_log_records_batch_frames(stages_batch_frames);
         let replayed_inputs = runtime.read_log_input_names().clone();
         // Resolved ONCE: the manifest tables do not
         // change for the life of the verifier, and the answer is consulted once
@@ -26676,13 +26772,15 @@ mod recorder_info_version_tests {
         assert_eq!(ROLE_STAMPED_MIN_TRACE_FORMAT, 5);
         assert_eq!(EVERY_CONSULT_MIN_TRACE_FORMAT, 7);
         assert_eq!(READ_IDENTITY_MIN_TRACE_FORMAT, 8);
+        assert_eq!(BATCH_FRAME_MIN_TRACE_FORMAT, 9);
     }
 
     /// The decoupling pin.
     ///
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
-    /// its consults and every frame its reads consumed and therefore stamps 9, so the write
+    /// its consults and the frames of every batch that fits its read stage's
+    /// window, and therefore stamps 9, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -26706,10 +26804,10 @@ mod recorder_info_version_tests {
         );
         assert_eq!(
             stamp, 9,
-            "a recorder that records every consult AND every frame each read \
-             consumed stamps 9: a format-7 reader would replay its reads by queue \
-             re-creation and call the result clean, and a format-8 reader would \
-             skip the batch frames"
+            "a recorder that records every consult AND the frames of every batch \
+             that fits its read stage stamps 9: a format-7 reader would replay its \
+             reads by queue re-creation and call the result clean, and a format-8 \
+             reader does not know the batch frame record"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
@@ -27133,6 +27231,31 @@ mod recorder_info_version_tests {
              staging shape, so a byte-identical replay of such a bag stages nothing \
              the recording does not hold"
         );
+    }
+
+    /// The batch frame rule, the consult rule's decode question one format
+    /// later: a declared format below 9 stages no `BatchFrame` record whatever
+    /// the stream term says (the `true` passed on every declared leg pins that
+    /// it is not read), and the attachment-less bag answers from its stream.
+    #[test]
+    fn a_replay_stages_batch_frames_only_for_a_format_nine_bag() {
+        fn info(trace_format: u32) -> RecorderInfo {
+            serde_json::from_str(&format!(
+                r#"{{"arch":"x86_64","os":"linux","cerulion_version":"0.0.1",
+                     "recorded_at_ns":7,"trace_format":{trace_format}}}"#
+            ))
+            .expect("valid recorder.json")
+        }
+        for silenced in 1u32..=8 {
+            assert!(
+                !replay_stages_batch_frames(Some(&info(silenced)), true),
+                "a format-{silenced} recorder wrote no batch frame, so its replay \
+                 stages none"
+            );
+        }
+        assert!(replay_stages_batch_frames(Some(&info(9)), false));
+        assert!(replay_stages_batch_frames(None, true));
+        assert!(!replay_stages_batch_frames(None, false));
     }
 
     /// The kind-field width and the role trust are
@@ -31263,6 +31386,66 @@ mod read_log_enforcement_fold_tests {
                     );
                 }
                 other => panic!("{label}: a pass that gated makes the run enforced: {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod enforcement_decode_tests {
+    use super::*;
+
+    /// One recorded `BatchFrame` record on `sink.inp` at step 4 whose
+    /// served-sequence slot holds `served_seq` verbatim.
+    fn batch_frame(served_seq: u64) -> CollectedRead {
+        CollectedRead {
+            step: 4,
+            node_id: Arc::from("sink"),
+            input: "inp".to_string(),
+            kind: cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+            served_seq,
+            popped: 0,
+            aux: 0,
+            role: ReadSiteRole::Drain,
+        }
+    }
+
+    /// A `BatchFrame` record whose served-sequence slot holds the no-frame
+    /// sentinel is refused as a corrupt read log naming its edge, its step and
+    /// the sentinel, on a gated edge and off one, where a skip would let the
+    /// read after it be fed one frame short or refused under a cause that
+    /// names no malformed record. The same record carrying a sequence decodes
+    /// to a batch frame, which is the control.
+    #[test]
+    fn a_batch_frame_without_a_sequence_is_refused_as_inconsistent() {
+        let tokens = BTreeMap::new();
+        for gated in [true, false] {
+            match decode_enforcement_read(&batch_frame(READ_OUTCOME_NO_FRAME), gated, true, &tokens)
+            {
+                Err(ReplayError::RecordingInconsistent { detail }) => {
+                    for part in [
+                        "step 4",
+                        "'sink.inp'",
+                        &format!("sentinel ({READ_OUTCOME_NO_FRAME})"),
+                    ] {
+                        assert!(
+                            detail.contains(part),
+                            "gated={gated}: names {part}: {detail}"
+                        );
+                    }
+                }
+                Err(other) => panic!("gated={gated}: refused under another cause: {other}"),
+                Ok(decoded) => panic!(
+                    "gated={gated}: a sentinel batch frame decoded: {:?}",
+                    decoded.map(|d| d.kind)
+                ),
+            }
+            match decode_enforcement_read(&batch_frame(7), gated, true, &tokens) {
+                Ok(Some(decoded)) => {
+                    assert_eq!(decoded.kind, ReadOutcomeKind::BatchFrame, "gated={gated}");
+                }
+                Ok(None) => panic!("gated={gated}: a batch frame with a sequence was skipped"),
+                Err(e) => panic!("gated={gated}: a batch frame with a sequence was refused: {e}"),
             }
         }
     }

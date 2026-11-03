@@ -2186,7 +2186,8 @@ pub struct StepAdmission {
 ///
 /// A read record names ONE frame (the one it served). From `trace_format` 9 the
 /// `BatchFrame` records before a read that popped more than one name every
-/// other frame it consumed ([`Self::batch`]); `crate::replay_feed` feeds those
+/// other frame it consumed when its batch fits the read stage's window
+/// ([`Self::batch`]); `crate::replay_feed` feeds those
 /// and then the served frame, and refuses by name a multi-frame read whose
 /// recording does not name every frame it popped.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -30,8 +30,9 @@
 //! # Which frames a read consumed
 //!
 //! A read record names ONE frame, the one it served. From `trace_format` 9 a
-//! read that popped more than one frame is preceded by one `BatchFrame` record
-//! per other frame it consumed, in pop order, each naming that frame's
+//! read that popped more than one frame is preceded, when they and the read fit
+//! in its read stage's window, by one `BatchFrame` record per other frame it
+//! consumed, in pop order, each naming that frame's
 //! sequence and, on an annotated edge, its writer. Nothing is derived from the
 //! served sequence: on a `drop_oldest` queue a writer can refill and overflow
 //! the queue while the node's callback runs between two receives of one batch,
@@ -40,7 +41,8 @@
 //! [`plan_feeds`] looks up exactly that list and [`FeedNeed`] names exactly
 //! that list, under one key rule, so an index built under a need holds every
 //! frame the plan looks up. A multi-frame read recorded without its batch
-//! frames (a bag below format 9) is refused
+//! frames (a bag below format 9, or a batch deeper than its read stage's
+//! window) is refused
 //! ([`FeedRefusalReason::BatchUnattributed`]). A `sample(N)` read that dropped
 //! the frames it popped names none of them, and is refused the same way
 //! ([`FeedRefusalReason::DecimatedUnattributed`]).
@@ -677,7 +679,8 @@ impl fmt::Display for FeedRefusal {
             FeedRefusalReason::BatchUnattributed { popped } => write!(
                 f,
                 "the read popped {popped} frames and the recording does not name each of \
-                 them (recorded below trace format 9, or a frame record was lost)"
+                 them (recorded below trace format 9, or the batch did not fit its read \
+                 stage's window, so the recorder named only its newest frame)"
             ),
             FeedRefusalReason::BatchMiscounted { popped, named } => write!(
                 f,

@@ -21981,8 +21981,8 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
 /// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 9 on every
-/// bag this binary writes (every gated consult and every frame each read
-/// consumed record), so every "corpus" bag elsewhere in this file is a format-**9** bag, a PRECONDITION that roles are
+/// bag this binary writes (every gated consult, and every frame of each batch
+/// that fits its read stage's window, record), so every "corpus" bag elsewhere in this file is a format-**9** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
 /// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 9, the identity and
@@ -27054,8 +27054,8 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         replay_engine::CoordinationMode::Lockstep,
     );
     // The stamp is 9: every bag this binary writes records every gated
-    // consult and every frame each read consumed, so the "with a stamp" case is
-    // a format-9 one. What this
+    // consult and every frame of each batch that fits its read stage's window,
+    // so the "with a stamp" case is a format-9 one. What this
     // precondition is FOR is unchanged: the corpus's stamped case must go down
     // the EXPLICIT-stamp branch (`inferred: false`) rather than the inferred
     // one, and it must be the same clean recording as the unstamped cases.
@@ -40983,6 +40983,76 @@ fn a_batch_whose_frames_are_not_named_is_refused_by_name() {
         msg.contains("read_identity_batch_unattributed") && msg.contains("node 'sink'"),
         "{msg}"
     );
+}
+
+/// A bag recorded below `trace_format` 9 holds no `BatchFrame` records, and a
+/// `--verify` replay of it stages none either, so the two read logs hold the
+/// same positions and the replay passes: the multi-writer batch recording with
+/// its batch frames and their annotations removed, stamped as a format 8
+/// lockstep bag and as a format 7 free-run bag, both replayed on the queue
+/// re-creation path. The control is the same recording unstripped at format 9
+/// lockstep, whose recorded batch frames the replay stages too.
+#[test]
+#[serial]
+fn a_batch_recorded_below_format_nine_replays_clean_under_verify() {
+    let live = ri_multi_writer_batch_live();
+    let lockstep = replay_engine::CoordinationMode::Lockstep;
+    let fixtures = [
+        (
+            "format9_lockstep_control",
+            false,
+            production_recorder_json(lockstep),
+        ),
+        (
+            "format8_lockstep",
+            true,
+            recorder_json_at_trace_format(lockstep, 8),
+        ),
+        ("format7_free_run", true, ri_recorder_json_at(7)),
+    ];
+    for (name, strip, recorder_json) in fixtures {
+        let mut rec = live.rec.clone();
+        if strip {
+            let (frames, annotations) = strip_batch_frames(&mut rec.trace);
+            assert!(
+                frames > 0 && frames == annotations,
+                "PREMISE {name}: batch frames removed with their annotations: \
+                 {frames} frames, {annotations} annotations"
+            );
+        } else {
+            assert!(
+                rec.trace.iter().any(is_batch_frame_record),
+                "PREMISE {name}: the control keeps its batch frames"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ri_batch_{name}.mcap"));
+        ri_bag(&rec, &bag, recorder_json);
+        let (outcome, _) = ri_replay(
+            &bag,
+            ri_multi_writer_batch_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{name}: the bag replays: {e}"));
+        assert!(
+            matches!(
+                outcome.read_identity,
+                replay_engine::ReadIdentityReport::BestEffort { .. }
+            ),
+            "{name}: replayed on the queue re-creation path: {:?}",
+            outcome.read_identity
+        );
+        println!(
+            "RI_BELOW_NINE {name}: passed={} violations={:?} read_log={:?}",
+            outcome.passed, outcome.violations, outcome.read_log_divergence
+        );
+        assert!(
+            outcome.passed && outcome.read_log_divergence.is_none(),
+            "{name}: the replay stages the batch frames its recording staged: {:?} {:?}",
+            outcome.violations,
+            outcome.read_log_divergence
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

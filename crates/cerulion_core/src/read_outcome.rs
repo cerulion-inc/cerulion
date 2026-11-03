@@ -1513,6 +1513,15 @@ pub struct ReadOutcomeStage {
     /// step. Read by the subscriber beside `armed` at each consult site that
     /// found nothing, one `Acquire` load.
     records_every_consult: AtomicBool,
+    /// Does a read that popped more than one frame stage its other frames as
+    /// `BatchFrame` records before it? `true` at creation, the shape every
+    /// trace format 9 recorder writes. A REPLAY adopts the recording's own
+    /// rule through [`Self::adopt_batch_frame_records`]: a bag declared below
+    /// format 9 holds no `BatchFrame` record, and a replay that staged them
+    /// would hand the redundant read log verifier replayed positions with no
+    /// recorded partner and fill rim slots the recording left free. Read by
+    /// the subscriber before each multi-frame read, one `Acquire` load.
+    records_batch_frames: AtomicBool,
     /// Does `record_with_producer` stage the annotation before EVERY read,
     /// rather than only when the writer differs from the one the read's site
     /// last annotated? `false` at creation, the writer-run rule. The runtime
@@ -1544,6 +1553,7 @@ impl ReadOutcomeStage {
             capacity: AtomicU32::new(derive_stage_capacity(role, sizing)),
             armed: AtomicBool::new(false),
             records_every_consult: AtomicBool::new(true),
+            records_batch_frames: AtomicBool::new(true),
             annotates_every_read: false,
             pending: AtomicU32::new(0),
             inner: Mutex::new(StageInner::default()),
@@ -1686,6 +1696,28 @@ impl ReadOutcomeStage {
     #[inline]
     pub fn records_every_consult(&self) -> bool {
         self.records_every_consult.load(Ordering::Acquire)
+    }
+
+    /// Adopt the RECORDING's batch frame rule: does a read that popped more
+    /// than one frame stage its other frames as `BatchFrame` records? Called
+    /// once per stage, before step 0, from
+    /// `GraphRuntime::set_read_log_records_batch_frames` with the answer the
+    /// bag's `trace_format` gives; a recording run never calls it and keeps
+    /// the creation value `true`.
+    pub(crate) fn adopt_batch_frame_records(&self, every: bool) {
+        self.records_batch_frames.store(every, Ordering::Release);
+    }
+
+    /// Whether a read that popped more than one frame stages its other frames
+    /// as `BatchFrame` records on this stage.
+    ///
+    /// `true` at creation, the shape every trace format 9 recorder writes. A
+    /// replay adopts the recording's own answer before step 0, through
+    /// `GraphRuntime::set_read_log_records_batch_frames` over every wired
+    /// stage; a recording run never moves it.
+    #[inline]
+    pub fn records_batch_frames(&self) -> bool {
+        self.records_batch_frames.load(Ordering::Acquire)
     }
 
     /// Stage one read outcome. `served_seq` is the served frame's wire
@@ -3251,6 +3283,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             capacity,
             armed,
             records_every_consult,
+            records_batch_frames,
             annotates_every_read,
             pending,
             inner
