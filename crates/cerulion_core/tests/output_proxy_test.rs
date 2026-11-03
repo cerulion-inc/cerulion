@@ -729,6 +729,7 @@ impl NodeEntry for DiscardingProducer {
 fn output_discard_count_is_observable_through_node_handle_e2e() {
     let discards_attempted = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -945,6 +946,7 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
 
     let node_local_count = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

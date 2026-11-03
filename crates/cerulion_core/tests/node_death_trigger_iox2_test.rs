@@ -63,6 +63,7 @@ fn unique_prefix(tag: &str) -> String {
 fn build_panicking_runtime(prefix: &str, panic_from: u64) -> (GraphRuntime, Arc<AtomicU64>) {
     let ticks = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -498,6 +499,7 @@ fn a_node_that_dies_on_its_last_input_is_still_captured() {
     let consumer_fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -669,6 +671,7 @@ fn a_cdylib_style_panic_class_error_mints_exactly_one_death() {
     let fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -776,6 +779,7 @@ fn a_fatal_error_stop_mints_exactly_one_death_naming_the_fatal_cause() {
     let prefix = unique_prefix("nd_fatal");
     let fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

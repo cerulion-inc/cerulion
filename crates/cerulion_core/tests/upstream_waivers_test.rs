@@ -204,6 +204,10 @@ const WAIVED_2034: &[(&str, &str)] = &[
         "crates/cerulion_cli_engine/tests/graph_profile_iox2_test.rs",
         "two_runs_agree_on_artifact_shape",
     ),
+    (
+        "crates/cerulion_cli_engine/tests/sim_time_graph_run_test.rs",
+        "a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time",
+    ),
 ];
 
 /// THE DECLARED INPUT, and it is the MECHANISM rather than a list of helper names.

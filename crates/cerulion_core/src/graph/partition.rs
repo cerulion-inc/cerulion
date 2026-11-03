@@ -2791,6 +2791,7 @@ fn subgraph_local_levels(
         .cloned()
         .collect();
     let sub_config = GraphConfig {
+        sim_time: false,
         // When the parent graph carries a `level_assignments`
         // override, the sub-config gets the COMPRESSED local band
         // ([`compress_group_level_assignments`]) — modelling EXACTLY what the
@@ -3235,6 +3236,7 @@ mod block_colocation_tests {
     /// single-producer arms already use.
     fn multi_publisher_listed_config_of(nodes: Vec<NodeDef>, topics: &[&str]) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             multi_publisher_topics: topics.iter().map(|t| t.to_string()).collect(),
             ..config_of(nodes)
         }
@@ -3254,6 +3256,7 @@ mod block_colocation_tests {
 
     fn config_of(nodes: Vec<NodeDef>) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,

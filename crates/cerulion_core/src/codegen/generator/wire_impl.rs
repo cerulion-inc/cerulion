@@ -1227,6 +1227,7 @@ pub const IN_REPO_PACKAGES: &[&str] = &[
     "object_recognition_msgs",
     "octomap_msgs",
     "radar_msgs",
+    "rosgraph_msgs",
     "sensor_msgs",
     "shape_msgs",
     "statistics_msgs",

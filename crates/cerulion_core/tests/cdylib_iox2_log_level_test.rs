@@ -147,6 +147,7 @@ fn build_probe_graph() -> TransportResult<GraphRuntime> {
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
     factories.insert("probe0".to_string(), Box::new(DylibNodeEntry::load(&path)?));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -377,6 +378,7 @@ fn subprocess_child_raw_ffi_level_probe() {
         Box::new(DylibNodeEntry::load(&path).expect("load raw-FFI fixture")),
     );
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

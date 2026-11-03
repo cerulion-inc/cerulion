@@ -705,6 +705,9 @@ pub fn validate_graph_with(
     // (`cerulion graph validate` / `graph run`) inherit the checks.
     validate_network_block(config)?;
 
+    // `sim_time: true`: one clock source per graph (`sim_time.rs`).
+    super::sim_time::validate_sim_time(config)?;
+
     Ok(())
 }
 

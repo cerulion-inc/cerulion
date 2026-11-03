@@ -164,6 +164,7 @@ fn graph_runtime_run_until_shutdown_exits_when_signal_fires() {
     // step that set it).
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

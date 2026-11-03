@@ -173,6 +173,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
     .with_unified_drain(false);
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         process_groups: Default::default(),
         process_group_order: Default::default(),

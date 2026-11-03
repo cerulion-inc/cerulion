@@ -103,6 +103,7 @@ impl SamplingConsumer {
 /// `regimes` (shared back to the caller).
 fn sample_graph(regimes: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

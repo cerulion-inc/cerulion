@@ -286,6 +286,7 @@ impl CrashConsumer {
 /// attach). 5 ms sweep cadence so one `step_ms(5)` runs one sweep.
 fn build_watcher(obs: Arc<CrashObs>) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -182,6 +182,7 @@ fn input(name: &str, source: &str) -> InputDef {
 /// producer/b.
 fn build_three_axis_graph() -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

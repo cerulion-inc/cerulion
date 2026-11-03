@@ -6,7 +6,7 @@
 //!
 //! A behavioral test can only show one bag did not respawn; this walk makes
 //! the property structural — no replay-path module references the spawner
-//! (`Ros2Children` / `spawn_argv` / `stage_ros2_child_env`) or builds a
+//! (`Ros2Children` / `spawn_plan` / `stage_ros2_child_env`) or builds a
 //! `ros2` command at all — over a COMMENT-STRIPPED view, so prose naming the
 //! forbidden tokens (this file's own reason-comments included) never
 //! false-positives, and a call commented out never satisfies anything.
@@ -73,7 +73,7 @@ fn the_replay_path_never_references_the_ros2_spawner() {
     // Token spellings assembled at runtime so THIS file's own code section
     // cannot satisfy or trip the walk it performs.
     let spawner = format!("Ros2{}", "Children");
-    let spawn_argv = format!("spawn{}", "_argv");
+    let spawn_plan = format!("spawn{}", "_plan");
     let stage_env = format!("stage_ros2{}", "_child_env");
     let ros2_command = format!("Command::new({:?})", "ros2");
     let mut walked = 0usize;
@@ -84,7 +84,7 @@ fn the_replay_path_never_references_the_ros2_spawner() {
         let code = code_only(&src);
         for (token, why) in [
             (spawner.as_str(), "the supervised-children spawner"),
-            (spawn_argv.as_str(), "the entry argv builder"),
+            (spawn_plan.as_str(), "the entry spawn plan builder"),
             (stage_env.as_str(), "the ros2 child env staging"),
             (ros2_command.as_str(), "a literal ros2 process launch"),
         ] {

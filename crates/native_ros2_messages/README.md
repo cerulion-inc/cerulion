@@ -3,7 +3,7 @@
 ROS 2 message types for
 [Cerulion](https://github.com/cerulion-inc/cerulion) zero-copy messaging.
 
-The crate vendors 22 message packages (254 messages) as `.msg` files under
+The crate vendors 23 message packages (255 messages) as `.msg` files under
 `msg/` and generates the Rust types at build time with `cerulion_core`'s
 codegen: `std_msgs`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `tf2_msgs`,
 `vision_msgs`, `control_msgs`, `moveit_msgs`, `visualization_msgs` and more.

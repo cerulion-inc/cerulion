@@ -4,7 +4,7 @@ Workspace schemas (schemas/*.yaml): 0
 
 Schemas from the .msg store (schemas/<pkg>/msg): 0 in 0 packages
 
-Built-in ROS 2 messages: 254 in 22 packages
+Built-in ROS 2 messages: 255 in 23 packages
   action_msgs (3):
     GoalInfo, GoalStatus, GoalStatusArray
   autoware_perception_msgs (6):
@@ -64,6 +64,8 @@ Built-in ROS 2 messages: 254 in 22 packages
     Octomap, OctomapWithPose
   radar_msgs (4):
     RadarReturn, RadarScan, RadarTrack, RadarTracks
+  rosgraph_msgs (1):
+    Clock
   sensor_msgs (27):
     BatteryState, CameraInfo, ChannelFloat32, CompressedImage, FluidPressure
     Illuminance, Image, Imu, JointState, Joy, JoyFeedback, JoyFeedbackArray

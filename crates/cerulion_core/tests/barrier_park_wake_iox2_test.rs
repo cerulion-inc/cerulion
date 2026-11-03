@@ -243,6 +243,7 @@ fn in_def(name: &str, source: &str) -> InputDef {
 
 fn graph_config(name: &str, prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -604,6 +604,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
     .with_label("fbws_cdylib_sink");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fbws_cdylib".to_string(),
         prefix: "fbwsCdylib".to_string(),
@@ -1071,6 +1072,7 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
     );
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_burst_ctx_cdylib".to_string(),
         prefix: "fbwsCtxDl".to_string(),
@@ -1256,6 +1258,7 @@ fn record_node() -> NodeDef {
 /// -> `record` (pairs).
 fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_burst_frozen_context".to_string(),
         prefix: prefix.to_string(),
@@ -1311,6 +1314,7 @@ fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRunt
 /// phase has already frozen the value the consumer must read.
 fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_burst_same_level_context".to_string(),
         prefix: prefix.to_string(),
@@ -1453,6 +1457,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
     .with_label("fbws_collapse_record");
 
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_burst_collapsed_tick".to_string(),
         prefix: prefix.to_string(),
@@ -1527,6 +1532,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
 /// `ping` (`period_ms = 1`, in-graph) -> `sink` (data-trigger recorder).
 fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_burst_within_step".to_string(),
         prefix: prefix.to_string(),
@@ -1578,6 +1584,7 @@ fn external_source_graph(
     seen: Arc<Mutex<Vec<u64>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         name: None,
         identity: "fifo_burst_within_step_live".to_string(),
         prefix: prefix.to_string(),

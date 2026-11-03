@@ -134,6 +134,7 @@ fn cyclone_peer_cloud_reaches_cerulion_subscriber_byte_exact() {
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
+        sim_time: false,
         name: None,
         identity: "dds_bridge_cyclone_e2e".to_string(),
         prefix: "cyc".to_string(),

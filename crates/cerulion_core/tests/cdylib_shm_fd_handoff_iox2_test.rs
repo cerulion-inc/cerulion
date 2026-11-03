@@ -122,6 +122,7 @@ fn run_and_shut_down_cdylib_graph(prefix: &str) -> Arc<cerulion_core::TransportM
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
+        sim_time: false,
         name: None,
         identity: format!("fdh_{prefix}"),
         prefix: prefix.to_string(),

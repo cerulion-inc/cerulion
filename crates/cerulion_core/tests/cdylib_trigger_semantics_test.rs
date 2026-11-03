@@ -85,6 +85,7 @@ fn build_single(
     buffer: usize,
 ) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -223,6 +224,7 @@ fn data_trigger_cdylib_fires_once_per_frame_zero_on_silence() {
 
 fn build_sync(prefix: &str, topic_cam: &str, topic_imu: &str) -> GraphRuntime {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -380,6 +382,7 @@ fn raw_ffi_cdylib_no_policy_emits_default_policy_warn() {
     // (cerulion_core), so `#[traced_test]` captures it (the cdylib's own
     // tracing is irrelevant here).
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -429,6 +432,7 @@ fn run_live_refuses_loaded_host_driven_cdylib() {
     // (kind 3); `run_live`'s entry collect reads it and REFUSES the launch —
     // a provably-inert external node can never fire on the live path.
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

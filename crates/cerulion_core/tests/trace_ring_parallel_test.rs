@@ -153,6 +153,7 @@ fn run_level_with_ring(
     let producer = ring_owner.producer().expect("mint producer");
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -501,6 +502,7 @@ fn runtime_passthrough_reports_exact_unmapped_skip_count() {
     let producer = ring_owner.producer().expect("mint producer");
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -624,6 +626,7 @@ fn multi_level_dag_pushes_one_boundary_per_step_not_per_level() {
     let _ = &mut src;
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

@@ -225,6 +225,7 @@ struct QosRun {
 
 fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -474,6 +475,7 @@ impl FloodDepthProducer {
 
 fn run_sample(steps: usize) -> (u64, u64) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

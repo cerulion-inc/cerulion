@@ -590,14 +590,15 @@ pub enum GatingClock {
     /// resim-grade, which is what a Flashback capture of such a rank needs.
     RecordedWall,
     /// The scheduler does NOT advance the gating clock; every boundary is a
-    /// CLOCK READING (`live_gating_quantum = None`, `ClockInner::Real`). Covers
-    /// both `RealClock` (`--single-process`, `ros2 attach`, `node run`, and
-    /// every rank of a `--no-rings` FREE-RUN deployment) and
-    /// `ExternalClock`, which is read-only in the same sense — the scheduler
-    /// never advances it either.
+    /// CLOCK READING (`live_gating_quantum = None`, `ClockInner::Real`): the
+    /// `RealClock` of `--single-process`, `ros2 attach`, `node run`, and
+    /// every rank of a `--no-rings` FREE-RUN deployment.
     Wall,
-    /// The run never enters the live loop at all: a polled `step()` monolith
-    /// under `--time-source virtual`.
+    /// The run never enters the live loop at all: a polled `step()` monolith.
+    /// Both `--time-source virtual` (one 1 ms step per poll) and sim time
+    /// (`--time-source external`, or `sim_time: true` in the graph YAML: one
+    /// step per `/clock` sample on a controlled `VirtualClock`) are this
+    /// shape.
     Polled,
 }
 
@@ -660,21 +661,22 @@ impl GatingClock {
     ///   `wall`. A WORKER-side create failure needs no correction, because the
     ///   worker keys its clock on the stamped intent and wall-follows either
     ///   way;
-    /// * a `--time-source virtual` monolith runs the polled loop and never
-    ///   reaches `live_step` ⇒ [`Polled`](Self::Polled);
+    /// * a polled monolith (`polled_time_source`: `--time-source virtual`, or
+    ///   sim time) runs the polled loop and never reaches `live_step` ⇒
+    ///   [`Polled`](Self::Polled);
     /// * a RECORDING monolith is configured `gating_follows_wall` on a
     ///   controlled clock ⇒ [`RecordedWall`](Self::RecordedWall);
     /// * everything else is the read-only arm ⇒ [`Wall`](Self::Wall).
     ///
-    /// `--record` is refused under virtual and external clocks, so the
+    /// `--record` is refused under virtual and sim time, so the
     /// `RecordedWall` arm cannot be reached with a non-real clock and the order
-    /// of the last two tests is not load-bearing — it is written virtual-first
+    /// of the last two tests is not load-bearing; it is written polled-first
     /// anyway, so a future relaxation of that refusal does not silently relabel
     /// a polled run.
     #[must_use]
     pub fn classify(
         supervisor: bool,
-        virtual_time_source: bool,
+        polled_time_source: bool,
         records: bool,
         traced: bool,
         execution_mode: crate::multiprocess::ExecutionMode,
@@ -685,7 +687,7 @@ impl GatingClock {
                 crate::multiprocess::ExecutionMode::FreeRun if traced => GatingClock::RecordedWall,
                 crate::multiprocess::ExecutionMode::FreeRun => GatingClock::Wall,
             }
-        } else if virtual_time_source {
+        } else if polled_time_source {
             GatingClock::Polled
         } else if records {
             GatingClock::RecordedWall

@@ -75,15 +75,15 @@ fn builtin_resolver_layouts_match_generated_constants() {
 
 /// The registry entry count equals the canonical vendored-schema count.
 ///
-/// 254 is pinned as the single source of truth by
+/// 255 is pinned as the single source of truth by
 /// `native_ros2_messages/tests/layout_equivalence_test.rs`
-/// (`build_resolver`'s `assert_eq!(schemas.len(), 254, ...)`). It is
+/// (`build_resolver`'s `assert_eq!(schemas.len(), 255, ...)`). It is
 /// mirrored here rather than imported (that assert lives in a different
 /// crate's test binary, unreachable from here); vendoring a new `.msg`
 /// must move BOTH asserts together.
 #[test]
 fn builtin_msgs_count_matches_canonical_anchor() {
-    const CANONICAL_BUILTIN_COUNT: usize = 254;
+    const CANONICAL_BUILTIN_COUNT: usize = 255;
     assert_eq!(
         BUILTIN_MSGS.len(),
         CANONICAL_BUILTIN_COUNT,
@@ -320,7 +320,7 @@ fn workspace_schema_without_collision_has_no_shadow() {
 }
 
 /// List (a): a missing workspace schemas dir yields the built-in
-/// groups only — totals and package count equal the registry (the 254
+/// groups only: totals and package count equal the registry (the 255
 /// anchor is pinned by `builtin_msgs_count_matches_canonical_anchor`),
 /// no shadow markers, and two renders are byte-identical (Principle #7).
 #[test]
@@ -433,7 +433,7 @@ fn list_marks_shadowed_builtin_inline() {
 
 /// List (d): exact-substring rendering pins with HAND-WRITTEN oracle
 /// strings (never derived from the renderer): the built-in section
-/// header (counts move with the vendored set, in lockstep with the 254
+/// header (counts move with the vendored set, in lockstep with the 255
 /// anchor), a known package header, and its full type line —
 /// builtin_interfaces vendors exactly Duration.msg + Time.msg, sorted
 /// ascending by the registry.
@@ -445,7 +445,7 @@ fn list_rendering_pins_known_package_header_and_type_lines() {
 
     assert!(rendered.contains("Workspace schemas (schemas/*.yaml): 0"));
     assert!(
-        rendered.contains("Built-in ROS 2 messages: 254 in 22 packages"),
+        rendered.contains("Built-in ROS 2 messages: 255 in 23 packages"),
         "section header (counts track the vendored set):\n{rendered}"
     );
     assert!(

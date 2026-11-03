@@ -202,6 +202,7 @@ fn build_blocking_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Atom
     let last = Arc::new(AtomicU64::new(MISSING));
     let fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

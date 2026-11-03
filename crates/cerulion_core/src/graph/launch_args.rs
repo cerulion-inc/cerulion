@@ -806,10 +806,12 @@ fn refuse_only_other_keys(value: &Value, section: &str, label: &str) -> Result<(
     }
 }
 
-/// The first keys serde lists when it refuses an unknown top-level graph
-/// key, in `GraphConfig` declaration order. `args` is accepted here, before
-/// serde sees the document, so the list it prints is completed with it.
-const TOP_LEVEL_EXPECTED: &str = "expected one of `name`, `prefix`, `nodes`";
+/// The first two keys serde lists when it refuses an unknown top-level graph
+/// key, in `GraphConfig` declaration order. Only these two are matched, so a
+/// new top-level section declared after them does not break the match. `args`
+/// is accepted here, before serde sees the document, so the list it prints is
+/// completed with it.
+const TOP_LEVEL_EXPECTED: &str = "expected one of `name`, `prefix`, ";
 
 fn parse_failure(e: serde_yaml::Error) -> TransportError {
     let mut reason = e.to_string();
@@ -1525,7 +1527,8 @@ mod tests {
                 .expect_err("an unknown top-level key is refused")
                 .to_string();
             assert!(
-                msg.contains("expected one of `args`, `name`, `prefix`, `nodes`"),
+                msg.contains("expected one of `args`, `name`, `prefix`, ")
+                    && msg.contains("`nodes`"),
                 "{msg}"
             );
         }

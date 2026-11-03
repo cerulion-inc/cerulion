@@ -219,7 +219,7 @@ fn schema_info_builtin_qualified_resolves_from_binary() {
 }
 
 /// `schema list` subprocess: the built-in section header (counts move
-/// with the vendored set, in lockstep with the engine-test 254 anchor)
+/// with the vendored set, in lockstep with the engine-test 255 anchor)
 /// and a known package header render from the real binary.
 #[test]
 fn schema_list_renders_builtin_groups_from_binary() {
@@ -231,7 +231,7 @@ fn schema_list_renders_builtin_groups_from_binary() {
 
     let stdout = stdout_of(&out);
     assert!(
-        stdout.contains("Built-in ROS 2 messages: 254 in 22 packages"),
+        stdout.contains("Built-in ROS 2 messages: 255 in 23 packages"),
         "stdout: {stdout}"
     );
     assert!(

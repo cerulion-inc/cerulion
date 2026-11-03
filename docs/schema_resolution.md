@@ -75,7 +75,7 @@ resolution **chain**:
    materializes into this store, so acquisition is a one-time cost: acquire
    once, commit the store, resolve forever (and deterministically: a build or
    replay never depends on a live robot).
-2. **Built-in ROS 2 corpus**: the ~254 types compiled into
+2. **Built-in ROS 2 corpus**: the ~255 types compiled into
    `native_ros2_messages`.
 
 A type the chain already resolves is never handed to the acquisition ladder.

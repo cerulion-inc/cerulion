@@ -67,6 +67,7 @@ impl Depth32Consumer {
 
 fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -407,6 +408,7 @@ fn default_opener_attaches_to_low_depth_topic() {
     // would lock default openers (`cerulion topic echo` requires the global
     // 16) out of the topic.
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -602,6 +604,7 @@ fn history_above_input_depth_warns_at_build() {
     // unconditionally → 2; `<` loosened to `<=` (false positive at
     // exactly-fits, where the queue holds ALL replayed frames) → 2.
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -896,6 +899,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
     // fails; `consumers.len() → 1` provisions 5 — require-6 fails;
     // double-counting consumers provisions 8 — reject-7 fails.)
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1083,6 +1087,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
     // attaches / require ONE MORE (= 2) rejected. The require-one-more arm is
     // what pins the listener budget is EXACT, not merely "enough".
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

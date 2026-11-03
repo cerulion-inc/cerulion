@@ -253,6 +253,7 @@ fn chain_graph(
     samples: Arc<Mutex<Vec<(f64, f64, f64)>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

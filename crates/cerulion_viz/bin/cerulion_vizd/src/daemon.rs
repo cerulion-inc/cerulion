@@ -1115,7 +1115,7 @@ struct SeedState {
     /// re-opens the cost [`absorb`](Self::absorb)'s idempotence short-circuit was
     /// written to prevent: `bag play` re-offers the SAME set every 2 s, so a doc
     /// the walker cannot use looped absorb(added=1) → full rebuild (a re-parse of
-    /// the whole ~254-message built-in corpus) + a `pending_worker_swap` → refuse
+    /// the whole ~255-message built-in corpus) + a `pending_worker_swap` → refuse
     /// → roll back, for the entire playback.
     ///
     /// Remembering the refused TEXT closes that without weakening recovery: the
@@ -9026,7 +9026,7 @@ mod absorb_tests {
     /// The seed's idempotence policy, against a hand oracle.
     ///
     /// It is load-bearing rather than an optimisation: every accepted doc costs a
-    /// FULL walker rebuild (a re-parse of all ~254 built-ins), and the bag
+    /// FULL walker rebuild (a re-parse of all ~255 built-ins), and the bag
     /// player re-offers its definitions on a timer for the whole playback. Without
     /// this, a 10-minute playback would pay ~300 rebuilds and grow the doc list
     /// unboundedly with duplicates.

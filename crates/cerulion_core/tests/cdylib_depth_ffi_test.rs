@@ -254,6 +254,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
     // the ceiling was max(16, 10) = 16 and the require-32 probe below
     // fails — the regression guard.
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

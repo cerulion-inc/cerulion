@@ -16,7 +16,7 @@ Full text: <https://www.apache.org/licenses/LICENSE-2.0>
 
 | Package | Upstream | Revision | Declared as |
 | --- | --- | --- | --- |
-| `action_msgs`, `builtin_interfaces`, `statistics_msgs` | [ros2/rcl_interfaces](https://github.com/ros2/rcl_interfaces) | `jazzy` | Apache License 2.0 |
+| `action_msgs`, `builtin_interfaces`, `rosgraph_msgs`, `statistics_msgs` | [ros2/rcl_interfaces](https://github.com/ros2/rcl_interfaces) | `jazzy` | Apache License 2.0 |
 | `diagnostic_msgs`, `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `shape_msgs`, `std_msgs`, `trajectory_msgs`, `visualization_msgs` | [ros2/common_interfaces](https://github.com/ros2/common_interfaces) | `jazzy` | Apache License 2.0 |
 | `vision_msgs` | [ros-perception/vision_msgs](https://github.com/ros-perception/vision_msgs) | `jazzy` | Apache License 2.0 |
 | `radar_msgs` | [ros2-gbp/radar_msgs-release](https://github.com/ros2-gbp/radar_msgs-release) | `release/jazzy/radar_msgs/0.2.2-4` | Apache-2.0 |
