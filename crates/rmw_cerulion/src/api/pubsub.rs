@@ -153,6 +153,27 @@ pub(crate) fn ros_topic_history_depth(slice_len: MaxSliceLen) -> usize {
     }
 }
 
+/// How many retained messages a TRANSIENT_LOCAL endpoint asks for: a
+/// publisher's history, or what a subscription takes when it connects.
+/// KEEP_ALL does not bound history by depth, so it asks for the topic's
+/// `limit`; every other history policy (KEEP_LAST, SYSTEM_DEFAULT, UNKNOWN)
+/// asks for its depth clamped to `[1, limit]`. The core caps a subscription's
+/// request to the service history and its port buffer.
+pub(crate) fn transient_local_history(history_policy: u32, depth: usize, limit: usize) -> usize {
+    if history_policy == ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL {
+        limit
+    } else {
+        depth.clamp(1, limit)
+    }
+}
+
+/// Whether a TRANSIENT_LOCAL endpoint's depth sets the history it asks for and
+/// reports, so a history that differs from the depth is a clamp worth
+/// reporting: false for KEEP_ALL, whose depth is not its ask.
+pub(crate) fn depth_sets_history(history_policy: u32) -> bool {
+    history_policy != ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL
+}
+
 /// `RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE` where this build's rmw headers
 /// declare it (Iron and later), `None` where they do not (Foxy, Galactic,
 /// Humble), so the resolvers below compile to the same code on every distro
@@ -602,7 +623,8 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // Transient-local durability maps to Cerulion history (late-joiner
         // replay), and so does BEST_AVAILABLE, which a publisher resolves to
         // TRANSIENT_LOCAL (`resolve_publisher_durability`); the requested depth
-        // is clamped to [1, limit], where the limit
+        // is clamped to [1, limit] (KEEP_ALL asks for the limit itself, see
+        // `transient_local_history`), where the limit
         // is the type's `ros_topic_history_depth` (16, or 12 above the 16 MiB
         // slice tier). Floor 1 so a TRANSIENT_LOCAL request always retains at
         // least one frame; the cap is the history every rmw endpoint creates
@@ -629,7 +651,10 @@ pub unsafe extern "C" fn rmw_create_publisher(
         let durability = resolve_publisher_durability((*qos).durability);
         let (history, depth_governs_retention) =
             if durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
-                ((*qos).depth.clamp(1, history_limit), true)
+                (
+                    transient_local_history((*qos).history, (*qos).depth, history_limit),
+                    depth_sets_history((*qos).history),
+                )
             } else {
                 (0, false)
             };
@@ -749,11 +774,13 @@ pub unsafe extern "C" fn rmw_create_publisher(
         };
 
         // The depth this endpoint reports is its clamped ask: TRANSIENT_LOCAL
-        // depth-N reports N clamped to the type's limit, VOLATILE reports 0.
+        // depth-N reports N clamped to the type's limit (KEEP_ALL reports the
+        // limit), VOLATILE reports 0.
         // Every rmw endpoint creates the service at that limit
         // (`create_history_floor`), so the retained ring is that deep whatever
         // this publisher asked; what a late joiner takes from it is its own
-        // history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth), set in
+        // history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth or, when
+        // KEEP_ALL, the limit), set in
         // `rmw_create_subscription`. The open requirement is at-least, so an
         // opened service always holds at least `history` frames.
         let provisioned_depth = history;
@@ -2492,7 +2519,8 @@ pub unsafe extern "C" fn rmw_create_subscription(
         topic_config.create_history_floor = Some(history_limit);
         // The retained frames this subscription takes when it connects: a
         // VOLATILE subscription takes none, a TRANSIENT_LOCAL one up to its
-        // depth (DDS durability). The core clamps the request to the service
+        // depth, or up to the topic's limit when it keeps all history (DDS
+        // durability; `transient_local_history`). The core clamps the request to the service
         // history and this port's buffer. BEST_AVAILABLE is resolved here,
         // once, from the retain mark of every publisher live on the topic in
         // any process (`resolve_subscription_durability`); a later publisher
@@ -2515,7 +2543,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
         };
         let durability = resolve_subscription_durability((*qos).durability, &marks);
         let history_request = if durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
-            (*qos).depth.clamp(1, history_limit)
+            transient_local_history((*qos).history, (*qos).depth, history_limit)
         } else {
             0
         };
@@ -5212,6 +5240,54 @@ mod durability_resolution_tests {
                 );
             }
             assert_eq!(resolve_publisher_durability(requested), requested);
+        }
+    }
+}
+
+/// The TRANSIENT_LOCAL history request against hand-written values: KEEP_ALL
+/// asks for the topic's limit, every other policy for its clamped depth.
+#[cfg(test)]
+mod transient_local_history_tests {
+    use super::*;
+
+    const KEEP_LAST: u32 = ffi::RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    const KEEP_ALL: u32 = ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+    const SYSTEM_DEFAULT: u32 = ffi::RMW_QOS_POLICY_HISTORY_SYSTEM_DEFAULT;
+    const UNKNOWN: u32 = ffi::RMW_QOS_POLICY_HISTORY_UNKNOWN;
+
+    #[test]
+    fn keep_all_asks_for_the_limit_and_every_other_policy_for_its_clamped_depth() {
+        // (policy, depth, limit, history asked for)
+        let cases = [
+            (KEEP_LAST, 0, 16, 1),
+            (KEEP_LAST, 1, 16, 1),
+            (KEEP_LAST, 5, 16, 5),
+            (KEEP_LAST, 16, 16, 16),
+            (KEEP_LAST, 17, 16, 16),
+            (KEEP_LAST, 1000, 16, 16),
+            (KEEP_LAST, 1000, 12, 12),
+            (KEEP_ALL, 0, 16, 16),
+            (KEEP_ALL, 7, 16, 16),
+            (KEEP_ALL, 1000, 16, 16),
+            (KEEP_ALL, 0, 12, 12),
+            (SYSTEM_DEFAULT, 0, 16, 1),
+            (SYSTEM_DEFAULT, 5, 16, 5),
+            (UNKNOWN, 5, 16, 5),
+        ];
+        for (policy, depth, limit, want) in cases {
+            assert_eq!(
+                transient_local_history(policy, depth, limit),
+                want,
+                "policy {policy}, depth {depth}, limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_keep_all_depth_does_not_set_the_history() {
+        assert!(!depth_sets_history(KEEP_ALL));
+        for policy in [KEEP_LAST, SYSTEM_DEFAULT, UNKNOWN, 99] {
+            assert!(depth_sets_history(policy), "{policy}");
         }
     }
 }

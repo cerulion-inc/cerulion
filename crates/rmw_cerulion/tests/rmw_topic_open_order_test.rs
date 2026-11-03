@@ -11,12 +11,12 @@
 //! The late-joiner arms pin what a late subscription takes from the retained
 //! messages, by its durability: VOLATILE none, TRANSIENT_LOCAL up to its depth
 //! and the topic's history limit (16, or 12 for a type above the 16 MiB slice
-//! tier), and BEST_AVAILABLE as TRANSIENT_LOCAL only when every publisher on
-//! the topic retains, in this process or another. The cross-process arms
-//! re-execute this binary as the publishing child
-//! (`subprocess_child_publishes_then_waits`, `#[ignore]`d and inert without
-//! its environment). The BEST_AVAILABLE arms build only where the rmw headers
-//! declare that durability (Iron and later).
+//! tier; KEEP_ALL takes up to the limit whatever its depth), and BEST_AVAILABLE
+//! as TRANSIENT_LOCAL only when the topic has publishers and every one
+//! retains, in this process or another. The cross-process arms re-execute this binary as the
+//! publishing child (`subprocess_child_publishes_then_waits`, `#[ignore]`d and
+//! inert without its environment). The BEST_AVAILABLE arms build only where the
+//! rmw headers declare that durability (Iron and later).
 //!
 //! Shares the iceoryx2 SHM singleton, so run serial:
 //!
@@ -125,6 +125,12 @@ fn qos(durability: u32, depth: usize) -> ffi::rmw_qos_profile_t {
 
 fn transient_local(depth: usize) -> ffi::rmw_qos_profile_t {
     qos(ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, depth)
+}
+
+/// `profile` with KEEP_ALL history: the depth no longer bounds what it keeps.
+fn keep_all(mut profile: ffi::rmw_qos_profile_t) -> ffi::rmw_qos_profile_t {
+    profile.history = ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+    profile
 }
 
 fn volatile(depth: usize) -> ffi::rmw_qos_profile_t {
@@ -706,13 +712,12 @@ fn a_large_variable_type_topic_opened_by_a_subscription_retains_twelve_messages(
 }
 
 // =====================================================================
-// BEST_AVAILABLE durability (Iron and later headers only).
+// Late-joiner arms that count retained and live messages apart.
 // =====================================================================
 
 /// The `x` the publisher of a late-joiner arm sends AFTER the late
 /// subscription took what was retained: it can only arrive live, so it is
 /// the nonzero control beside every list of retained messages.
-#[cfg(cerulion_has_durability_best_available)]
 const LIVE_X: f64 = 1000.0;
 
 #[cfg(cerulion_has_durability_best_available)]
@@ -721,7 +726,6 @@ fn best_available(depth: usize) -> ffi::rmw_qos_profile_t {
 }
 
 /// `start, .., end - 1` as message `x` values.
-#[cfg(cerulion_has_durability_best_available)]
 fn xs(range: std::ops::Range<usize>) -> Vec<f64> {
     range.map(|i| i as f64).collect()
 }
@@ -735,7 +739,6 @@ fn sorted(mut values: Vec<f64>) -> Vec<f64> {
 }
 
 /// What a late subscription took in a late-joiner arm.
-#[cfg(cerulion_has_durability_best_available)]
 #[derive(Debug, PartialEq)]
 struct LateTake {
     /// The `x` values taken before the live message was sent, in take order.
@@ -750,7 +753,6 @@ struct LateTake {
 /// FIRST publisher sends one live message (`x` = [`LIVE_X`]), and the
 /// subscription takes again. Also returns the depth endpoint info reports for
 /// each publisher.
-#[cfg(cerulion_has_durability_best_available)]
 unsafe fn late_subscription_takes(
     tag: &str,
     publishers: &[ffi::rmw_qos_profile_t],
@@ -807,6 +809,88 @@ unsafe fn late_subscription_takes(
     assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     (LateTake { retained, live }, depths)
 }
+
+#[test]
+#[serial]
+fn a_late_keep_all_transient_local_subscription_takes_up_to_the_topics_limit() {
+    unsafe {
+        let (taken, _) = late_subscription_takes(
+            "keep_all_sub",
+            &[transient_local(DEEP)],
+            20,
+            keep_all(transient_local(0)),
+        );
+        assert_eq!(
+            taken,
+            LateTake {
+                retained: xs(4..20),
+                live: vec![LIVE_X],
+            },
+            "KEEP_ALL ignores the depth (0 here), so a late TRANSIENT_LOCAL KEEP_ALL \
+             subscription takes as many of the 20 retained messages as the topic's limit \
+             of 16 holds, then the live one"
+        );
+        let (control, _) = late_subscription_takes(
+            "keep_last_sub",
+            &[transient_local(DEEP)],
+            20,
+            transient_local(3),
+        );
+        assert_eq!(
+            control,
+            LateTake {
+                retained: xs(17..20),
+                live: vec![LIVE_X],
+            },
+            "control: a KEEP_LAST depth-3 subscription on the same topic shape takes its 3"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_keep_all_transient_local_publisher_reports_the_topics_limit() {
+    unsafe {
+        let want = LateTake {
+            retained: xs(4..20),
+            live: vec![LIVE_X],
+        };
+        let (taken, depths) = late_subscription_takes(
+            "keep_all_pub",
+            &[keep_all(transient_local(0))],
+            20,
+            transient_local(DEEP),
+        );
+        assert_eq!(
+            depths,
+            vec![16],
+            "a TRANSIENT_LOCAL KEEP_ALL publisher asks for and reports the topic's \
+             limit of 16, whatever its depth (0 here)"
+        );
+        assert_eq!(
+            taken, want,
+            "its backlog reaches a late TRANSIENT_LOCAL depth-16 subscription (every \
+             publisher's ring is sized from the topic, so this half does not depend on \
+             the publisher's depth)"
+        );
+        let (control, control_depths) = late_subscription_takes(
+            "keep_last_pub",
+            &[transient_local(5)],
+            20,
+            transient_local(DEEP),
+        );
+        assert_eq!(
+            control_depths,
+            vec![5],
+            "control: a KEEP_LAST depth-5 TRANSIENT_LOCAL publisher reports 5"
+        );
+        assert_eq!(control, want);
+    }
+}
+
+// =====================================================================
+// BEST_AVAILABLE durability (Iron and later headers only).
+// =====================================================================
 
 #[cfg(cerulion_has_durability_best_available)]
 #[test]
