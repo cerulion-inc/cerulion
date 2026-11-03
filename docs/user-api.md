@@ -2542,7 +2542,9 @@ consumer fires on that frame alone (a data trigger with one trigger edge). The f
 the partitioner start from these same link rules; the census then adds its own fusion rules. A link joins the two units only when the graph's profile
 (`graphs/<NAME>.costs.yaml`, written by `cerulion graph profile`) shows it is safe: the unit's summed
 p50 tick, the new node included, stays under a quarter of the shortest period the merged unit is fed at,
-and under a quarter of the new node's `tick_within_ms`. **Without a profile nothing merges**: every data-triggered
+and under a quarter of the tightest `tick_within_ms` of its members. A unit is fed at each member's own
+period, at the profiled rate of each trigger edge into a member, and at the profiled fire rate of each member
+that no graph node triggers (an external source). **Without a profile nothing merges**: every data-triggered
 node is a unit of its own, so a slow node never holds another node from the first run.
 
 Each unit `cerulion graph plan <NAME>` prints names why its first node starts it:
@@ -2554,7 +2556,8 @@ Each unit `cerulion graph plan <NAME>` prints names why its first node starts it
 | `isolate: true` | declares it |
 | after an isolated node | is fed by a node that declares `isolate: true` |
 | no profile | no profile shows that joining its producer's unit is safe |
-| tick budget | the profile shows the merged unit would tick for a quarter of its period or more, or of the node's `tick_within_ms` |
+| unknown feed | the profile holds no rate for how often a node of the merged unit (the reason names it) is fed, so the unit's period is unknown |
+| tick budget | the profile shows the merged unit would tick for a quarter of its period or more, or of a member's `tick_within_ms` |
 
 Latest-value inputs never join units. Every producer and consumer of a topic with a `block` consumer
 stay in one unit, a node declaring `isolate: true` included. Units are decided when the graph loads and never move during a run. When
