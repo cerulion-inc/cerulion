@@ -404,6 +404,11 @@ The JSON object carries `report_version` (1; it changes only when a field is rem
 | `disk.recordings` | The filesystem under the first of `./recordings` (where `graph run --record` writes) and `<workspace>/recordings` (where flashback captures go) that exists, else the current directory (where `bag record` writes and `graph run --record` would create `recordings/`); `CERULION_FLASHBACK_DIR` is not read | For a recordings directory, fails when it is read-only, not writable or full; for the current directory, warns instead. Warns when it is tmpfs |
 | `account.login` | The local sign-in state, with no network | Fails when this machine never signed in, signed out, the sign-in file cannot be read or parsed, or no config directory resolves |
 | `cpu.governor` | Linux: each CPU's frequency governor, floor and maximum | Never: it is `info` only, and Cerulion changes no governor |
+| `clock.sync` | Linux and macOS: the kernel's clock discipline state (`ntp_adjtime`, a read that changes nothing), with its error bound and last offset | Warns when the kernel marks the clock unsynchronised |
+| `net.mtu` | Linux: the MTU of each IP interface (Ethernet, PPP, raw-IP LTE and 5G modems, IP tunnels, WireGuard, TUN) that is up and not a loopback | Warns when an interface is below 1228 bytes: a QUIC datagram carries at least 1200 bytes plus the UDP and IPv4 headers |
+| `gpu.cuda` | Linux: the NVIDIA driver version, `/dev/nvidia<N>` devices, Jetson release, CUDA toolkit version and whether the loader cache names `libcuda.so.1`, from files only | Warns when this host has an NVIDIA device node or is a Jetson and `/etc/ld.so.cache` does not name `libcuda.so.1`; otherwise `info` |
+| `ros.distro` | `ROS_DISTRO`, `ROS_VERSION` and `AMENT_PREFIX_PATH` | Never: `info` when a ROS 2 distribution is sourced, `skip` when none is (a ROS 1 shell, `ROS_VERSION=1`, counts as none) |
+| `ros.rmw` | Whether `librmw_cerulion.so` is where `cerulion ros2 run` looks (`CERULION_LIB_DIR`, else beside `cerulion`), and `RMW_IMPLEMENTATION` | Fails when a ROS 2 environment is sourced and the library is missing or its directory cannot be resolved (the fix is the one `ros2 run` prints); warns or informs otherwise. Not applicable on macOS |
 
 ### Other
 
