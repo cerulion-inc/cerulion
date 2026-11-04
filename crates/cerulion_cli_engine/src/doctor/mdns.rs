@@ -55,19 +55,21 @@ pub(super) fn decide(robots: &[String], window_elapsed_cleanly: bool) -> Outcome
     }
 }
 
-/// The names of the robots that answered, sorted and without repeats, as
-/// they print. A name is LAN-supplied text, so each goes through
+/// The names of the robots that answered, without repeats, sorted as they
+/// print. A name is LAN-supplied text, so each goes through
 /// [`crate::topic_cmd::sanitize_display`]: a peer cannot put terminal escapes
 /// into the summary. Repeats go before that, on the names as sent, so two
 /// names that differ only in a control character still count as two.
 pub(super) fn answered_robots(names: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut robots: Vec<String> = names.into_iter().collect();
-    robots.sort();
-    robots.dedup();
-    robots
+    let mut sent: Vec<String> = names.into_iter().collect();
+    sent.sort();
+    sent.dedup();
+    let mut robots: Vec<String> = sent
         .iter()
         .map(|name| crate::topic_cmd::sanitize_display(name))
-        .collect()
+        .collect();
+    robots.sort();
+    robots
 }
 
 fn run(_ctx: &Context) -> Outcome {
@@ -118,6 +120,12 @@ mod tests {
         let o = decide(&robots, true);
         assert_eq!(o.readings.get("robots"), Some(&Reading::Int(2)));
         assert!(o.summary.contains("2 answered"), "{:?}", o.summary);
+    }
+
+    #[test]
+    fn the_names_sort_as_they_print() {
+        let robots = answered_robots(["lab".to_string(), "\u{1}go2".to_string()]);
+        assert_eq!(robots, ["lab", "\u{FFFD}go2"]);
     }
 
     #[test]
