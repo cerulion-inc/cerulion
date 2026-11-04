@@ -10,6 +10,8 @@ use cerulion_core::wire::MaxSliceLen;
 
 use crate::bridge::AnyBridge;
 use crate::ffi::{self, rmw_ret_t, RMW_RET_ERROR, RMW_RET_INVALID_ARGUMENT, RMW_RET_OK};
+use crate::replay::log::{EntityKind, GraphQuery, OutputKind, TakeKind, TakeRec};
+use crate::replay::{TakeAction, TakeMeta};
 use crate::runtime::{self, ClientData, GraphRegistry, ServiceData};
 use crate::type_bridge::BridgedMessage;
 use crate::type_bridge_cpp::CppBridgedMessage;
@@ -149,6 +151,14 @@ pub unsafe extern "C" fn rmw_create_service(
                 &data_ref.service_name,
                 &data_ref.type_name,
             );
+            drop(graph);
+            // Delivery log / replay: the stable name (`srv:<name>#n`).
+            crate::replay::on_entity(
+                EntityKind::Service,
+                (*ptr).data as usize,
+                &data_ref.service_name,
+                &(*((*node).data as *const runtime::NodeData)).name,
+            );
         }
         runtime::notify_graph_change();
         ptr
@@ -169,6 +179,7 @@ pub unsafe extern "C" fn rmw_destroy_service(
         if !ffi::is_our_identifier((*service).implementation_identifier) {
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
+        crate::replay::on_entity_destroyed((*service).data as usize);
         // Borrow-first, free-last.
         {
             let data = &*((*service).data as *const ServiceData);
@@ -189,6 +200,103 @@ pub unsafe extern "C" fn rmw_destroy_service(
 /// rmw ABI contract.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_take_request(
+    service: *const ffi::rmw_service_t,
+    request_header: *mut ffi::rmw_service_info_t,
+    ros_request: *mut c_void,
+    taken: *mut bool,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live take.
+    if !crate::replay::active() {
+        return take_request_live(service, request_header, ros_request, taken);
+    }
+    ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
+        if service.is_null() || request_header.is_null() || ros_request.is_null() || taken.is_null()
+        {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if !ffi::is_our_identifier((*service).implementation_identifier) {
+            return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+        }
+        let key = (*service).data as usize;
+        match crate::replay::take_action(key, TakeKind::Request) {
+            TakeAction::Live => take_request_live(service, request_header, ros_request, taken),
+            TakeAction::Record(r) => r.take(
+                key,
+                TakeKind::Request,
+                || take_request_live(service, request_header, ros_request, taken),
+                |_| service_take_meta(*taken, request_header),
+            ),
+            TakeAction::Serve(rec) => {
+                let data = &*((*service).data as *const ServiceData);
+                serve_recorded(
+                    &data.request_bridge,
+                    &data.service_name,
+                    rec,
+                    request_header,
+                    ros_request,
+                    taken,
+                )
+            }
+            TakeAction::Refuse => RMW_RET_ERROR,
+        }
+    })
+}
+
+/// What a live request or response take reported, for the delivery log.
+unsafe fn service_take_meta(taken: bool, header: *const ffi::rmw_service_info_t) -> TakeMeta {
+    if !taken {
+        return TakeMeta {
+            taken,
+            received_ts: 0,
+            request: None,
+        };
+    }
+    let h = &*header;
+    // int8_t[16] before Iron, uint8_t[16] from Iron on (a no-op cast there).
+    #[allow(clippy::unnecessary_cast)]
+    let guid: [u8; 16] = h.request_id.writer_guid.map(|b| b as u8);
+    TakeMeta {
+        taken,
+        received_ts: h.received_timestamp,
+        request: Some((h.request_id.sequence_number, guid, h.source_timestamp)),
+    }
+}
+
+/// Replay: deliver a recorded request or response into the caller's message,
+/// decoded by the entity's own bridge, with the request id the live take
+/// reported.
+unsafe fn serve_recorded(
+    bridge: &AnyBridge,
+    service_name: &str,
+    rec: Option<TakeRec>,
+    header: *mut ffi::rmw_service_info_t,
+    ros_message: *mut c_void,
+    taken: *mut bool,
+) -> rmw_ret_t {
+    *taken = false;
+    let Some(rec) = rec else {
+        return RMW_RET_OK;
+    };
+    if rec.taken {
+        if !bridge.unflatten(&rec.body, ros_message) {
+            crate::replay::served_decode_failed(service_name);
+            return RMW_RET_ERROR;
+        }
+        *taken = true;
+        let hdr = &mut *header;
+        hdr.request_id.sequence_number = rec.seq;
+        hdr.request_id.writer_guid = rec.guid.map(|b| b as _);
+        hdr.source_timestamp = rec.source_ts;
+        hdr.received_timestamp = rec.received_ts;
+    }
+    rec.ret
+}
+
+/// The live `rmw_take_request`.
+///
+/// # Safety
+/// Same contract as [`rmw_take_request`].
+unsafe fn take_request_live(
     service: *const ffi::rmw_service_t,
     request_header: *mut ffi::rmw_service_info_t,
     ros_request: *mut c_void,
@@ -240,6 +348,7 @@ pub unsafe extern "C" fn rmw_take_request(
                 return;
             }
             if bridge.unflatten(payload, ros_request) {
+                crate::replay::capture_take_body(payload, envelope.sequence, 0);
                 got = Some(envelope);
                 crate::decode_failure_latch::report_decode_success(
                     &data.decode_failures,
@@ -293,6 +402,24 @@ pub unsafe extern "C" fn rmw_send_response(
     request_header: *mut ffi::rmw_request_id_t,
     ros_response: *mut c_void,
 ) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live send.
+    if !crate::replay::active() || service.is_null() {
+        return send_response_live(service, request_header, ros_response);
+    }
+    crate::replay::output((*service).data as usize, OutputKind::Response, || {
+        send_response_live(service, request_header, ros_response)
+    })
+}
+
+/// The live `rmw_send_response`.
+///
+/// # Safety
+/// Same contract as [`rmw_send_response`].
+unsafe fn send_response_live(
+    service: *const ffi::rmw_service_t,
+    request_header: *mut ffi::rmw_request_id_t,
+    ros_response: *mut c_void,
+) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
         if service.is_null() || request_header.is_null() || ros_response.is_null() {
             return RMW_RET_INVALID_ARGUMENT;
@@ -322,6 +449,7 @@ pub unsafe extern "C" fn rmw_send_response(
             tracing::error!("entity wedged by an earlier panic; failing call");
             return RMW_RET_ERROR;
         };
+        crate::replay::capture_output_body(&payload);
         match server.send_response(&envelope, &payload) {
             Ok(()) => RMW_RET_OK,
             Err(e) => {
@@ -452,6 +580,14 @@ pub unsafe extern "C" fn rmw_create_client(
                 &data_ref.service_name,
                 &data_ref.type_name,
             );
+            drop(graph);
+            // Delivery log / replay: the stable name (`cli:<name>#n`).
+            crate::replay::on_entity(
+                EntityKind::Client,
+                (*ptr).data as usize,
+                &data_ref.service_name,
+                &(*((*node).data as *const runtime::NodeData)).name,
+            );
         }
         runtime::notify_graph_change();
         ptr
@@ -472,6 +608,7 @@ pub unsafe extern "C" fn rmw_destroy_client(
         if !ffi::is_our_identifier((*client).implementation_identifier) {
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
+        crate::replay::on_entity_destroyed((*client).data as usize);
         // Borrow-first, free-last.
         {
             let data = &*((*client).data as *const ClientData);
@@ -492,6 +629,24 @@ pub unsafe extern "C" fn rmw_destroy_client(
 /// rmw ABI contract.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_send_request(
+    client: *const ffi::rmw_client_t,
+    ros_request: *const c_void,
+    sequence_id: *mut i64,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live send.
+    if !crate::replay::active() || client.is_null() {
+        return send_request_live(client, ros_request, sequence_id);
+    }
+    crate::replay::output((*client).data as usize, OutputKind::Request, || {
+        send_request_live(client, ros_request, sequence_id)
+    })
+}
+
+/// The live `rmw_send_request`.
+///
+/// # Safety
+/// Same contract as [`rmw_send_request`].
+unsafe fn send_request_live(
     client: *const ffi::rmw_client_t,
     ros_request: *const c_void,
     sequence_id: *mut i64,
@@ -517,6 +672,7 @@ pub unsafe extern "C" fn rmw_send_request(
             tracing::error!("entity wedged by an earlier panic; failing call");
             return RMW_RET_ERROR;
         };
+        crate::replay::capture_output_body(&payload);
         match client_guard.send_request(&payload) {
             Ok(seq) => {
                 *sequence_id = seq;
@@ -534,6 +690,53 @@ pub unsafe extern "C" fn rmw_send_request(
 /// rmw ABI contract.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_take_response(
+    client: *const ffi::rmw_client_t,
+    request_header: *mut ffi::rmw_service_info_t,
+    ros_response: *mut c_void,
+    taken: *mut bool,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live take.
+    if !crate::replay::active() {
+        return take_response_live(client, request_header, ros_response, taken);
+    }
+    ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
+        if client.is_null() || request_header.is_null() || ros_response.is_null() || taken.is_null()
+        {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if !ffi::is_our_identifier((*client).implementation_identifier) {
+            return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+        }
+        let key = (*client).data as usize;
+        match crate::replay::take_action(key, TakeKind::Response) {
+            TakeAction::Live => take_response_live(client, request_header, ros_response, taken),
+            TakeAction::Record(r) => r.take(
+                key,
+                TakeKind::Response,
+                || take_response_live(client, request_header, ros_response, taken),
+                |_| service_take_meta(*taken, request_header),
+            ),
+            TakeAction::Serve(rec) => {
+                let data = &*((*client).data as *const ClientData);
+                serve_recorded(
+                    &data.response_bridge,
+                    &data.service_name,
+                    rec,
+                    request_header,
+                    ros_response,
+                    taken,
+                )
+            }
+            TakeAction::Refuse => RMW_RET_ERROR,
+        }
+    })
+}
+
+/// The live `rmw_take_response`.
+///
+/// # Safety
+/// Same contract as [`rmw_take_response`].
+unsafe fn take_response_live(
     client: *const ffi::rmw_client_t,
     request_header: *mut ffi::rmw_service_info_t,
     ros_response: *mut c_void,
@@ -574,6 +777,7 @@ pub unsafe extern "C" fn rmw_take_response(
                 return;
             }
             if bridge.unflatten(payload, ros_response) {
+                crate::replay::capture_take_body(payload, seq, 0);
                 got_seq = Some(seq);
                 crate::decode_failure_latch::report_decode_success(
                     &data.decode_failures,
@@ -643,8 +847,14 @@ pub unsafe extern "C" fn rmw_service_server_is_available(
             tracing::error!("entity wedged by an earlier panic; failing call");
             return RMW_RET_ERROR;
         };
-        *is_available = client_guard.server_available();
-        RMW_RET_OK
+        let live = client_guard.server_available();
+        drop(client_guard);
+        let (ret, answer) =
+            crate::replay::graph(GraphQuery::ServerIsAvailable, &data.service_name, || {
+                (RMW_RET_OK, live as u64)
+            });
+        *is_available = answer != 0;
+        ret
     })
 }
 

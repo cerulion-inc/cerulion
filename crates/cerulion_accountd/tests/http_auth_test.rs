@@ -2,12 +2,15 @@
 //! HTTP-surface coverage for the root fixes, over a REAL axum server:
 //! - **E** negative-auth on the authed surface (absent / garbage / expired token).
 //! - **F** refresh rotation is single-use; revoke-then-refresh is rejected.
+//! - **R** the refresh reuse window: the replaced token is replayed once, inside
+//!   the window, to the SAME pair; never twice, never after it, never when off.
 //! - **B** two concurrent device polls of one authorized code mint EXACTLY one
 //!   session (the atomic redeem).
 //! - **A** cross-account device registration is a 409; a same-account re-register
 //!   mints the cert from the STORED principal.
 //! - **G** magic-link completion is single-use end to end.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -58,6 +61,14 @@ fn test_config() -> ServiceConfig {
     }
 }
 
+/// [`test_config`] with the refresh reuse window off: strict single-use rotation.
+fn no_reuse_config() -> ServiceConfig {
+    ServiceConfig {
+        refresh_reuse_window_ns: 0,
+        ..test_config()
+    }
+}
+
 /// Install the `ring` rustls crypto provider ONCE. Needed only when
 /// reqwest is built with `rustls-no-provider` via cross-crate feature unification with
 /// iroh-pulling crates; a no-op otherwise.
@@ -69,16 +80,18 @@ fn ensure_crypto_provider() {
 }
 
 async fn spawn_with(config: ServiceConfig) -> (String, Arc<AppState>, Arc<CapturingEmailSender>) {
+    spawn_with_clock(config, Clock::System).await
+}
+
+async fn spawn_with_clock(
+    config: ServiceConfig,
+    clock: Clock,
+) -> (String, Arc<AppState>, Arc<CapturingEmailSender>) {
     ensure_crypto_provider();
     let email = Arc::new(CapturingEmailSender::new());
     let state = Arc::new(
-        AppState::dev(
-            config,
-            Clock::System,
-            email.clone(),
-            Arc::new(UnconfiguredResolver),
-        )
-        .expect("dev app state"),
+        AppState::dev(config, clock, email.clone(), Arc::new(UnconfiguredResolver))
+            .expect("dev app state"),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("http://{}", listener.local_addr().unwrap());
@@ -273,7 +286,8 @@ async fn me_with_expired_session_is_401() {
 
 #[tokio::test]
 async fn old_refresh_token_is_dead_after_rotation() {
-    let (addr, _s, email) = spawn().await;
+    // With the reuse window off, rotation is strictly single-use.
+    let (addr, _s, email) = spawn_with(no_reuse_config()).await;
     let http = reqwest::Client::new();
     let (_session, refresh1) = login(&http, &addr, &email, "rotate@example.com").await;
 
@@ -337,8 +351,9 @@ async fn revoke_then_refresh_is_rejected() {
 async fn concurrent_refreshes_with_one_token_yield_exactly_one_winner() {
     // Two concurrent refreshes carrying the SAME refresh token must NOT
     // both succeed (the second would silently invalidate the first). The rotate CAS
-    // (WHERE refresh_token_hash = old) makes it single-use → exactly one 200.
-    let (addr, _s, email) = spawn().await;
+    // (WHERE refresh_token_hash = old) makes it single-use → exactly one 200
+    // when the reuse window is off.
+    let (addr, _s, email) = spawn_with(no_reuse_config()).await;
     let http = reqwest::Client::new();
     let (_session, refresh) = login(&http, &addr, &email, "concurrent-refresh@example.com").await;
 
@@ -366,6 +381,230 @@ async fn concurrent_refreshes_with_one_token_yield_exactly_one_winner() {
         1,
         "the losing refresh must be Unauthorized"
     );
+}
+
+// ============================================================================
+// R: the refresh reuse window
+// ============================================================================
+
+/// A fixed epoch for the shared test clock (2023-11-14T22:13:20Z).
+const T0: u64 = 1_700_000_000 * SEC;
+const SEC: u64 = 1_000_000_000;
+
+async fn spawn_at(
+    config: ServiceConfig,
+) -> (
+    String,
+    Arc<AtomicU64>,
+    Arc<AppState>,
+    Arc<CapturingEmailSender>,
+) {
+    let now = Arc::new(AtomicU64::new(T0));
+    let (addr, state, email) = spawn_with_clock(config, Clock::Shared(now.clone())).await;
+    (addr, now, state, email)
+}
+
+async fn post_refresh(http: &reqwest::Client, addr: &str, token: &str) -> reqwest::Response {
+    http.post(format!("{addr}/v1/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": token }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A 200 refresh's `(session_token, refresh_token, expires_in)`.
+async fn pair_of(resp: reqwest::Response) -> (String, String, u64) {
+    assert_eq!(resp.status(), 200, "expected a 200 refresh");
+    let v: Value = resp.json().await.unwrap();
+    (
+        v["session_token"].as_str().unwrap().to_string(),
+        v["refresh_token"].as_str().unwrap().to_string(),
+        v["expires_in"].as_u64().unwrap(),
+    )
+}
+
+async fn me_status(http: &reqwest::Client, addr: &str, session: &str) -> u16 {
+    http.get(format!("{addr}/v1/me"))
+        .bearer_auth(session)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn a_replay_inside_the_window_returns_the_same_pair() {
+    let (addr, now, state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    let (_s1, refresh1) = login(&http, &addr, &email, "reuse-same@example.com").await;
+
+    // Rotate well after the login, so the window is measured from the ROTATION.
+    now.store(T0 + 120 * SEC, Ordering::SeqCst);
+    let (s2, r2, exp2) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+    assert_eq!(exp2, state.config.session_ttl_ns / SEC);
+
+    // The reply was "lost"; the client retries 30 s later with the old token.
+    now.store(T0 + 150 * SEC, Ordering::SeqCst);
+    let (s2b, r2b, exp2b) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+    assert_eq!((s2b.as_str(), r2b.as_str()), (s2.as_str(), r2.as_str()));
+    assert_eq!(
+        exp2b,
+        state.config.session_ttl_ns / SEC - 30,
+        "remaining lifetime"
+    );
+
+    // One family: the replayed pair is the live one and rotates normally.
+    assert_eq!(me_status(&http, &addr, &s2).await, 200);
+    let (s3, _r3, _) = pair_of(post_refresh(&http, &addr, &r2).await).await;
+    assert_eq!(me_status(&http, &addr, &s3).await, 200);
+    assert_eq!(
+        me_status(&http, &addr, &s2).await,
+        401,
+        "s2 was rotated away"
+    );
+    // Only the latest replaced token is replayable: refresh1 is dead now.
+    assert_eq!(post_refresh(&http, &addr, &refresh1).await.status(), 401);
+}
+
+#[tokio::test]
+async fn a_replay_at_or_after_the_window_is_rejected() {
+    let (addr, now, state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    let (_s1, refresh1) = login(&http, &addr, &email, "reuse-late@example.com").await;
+    let (s2, r2, _) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+
+    now.store(T0 + state.config.refresh_reuse_window_ns, Ordering::SeqCst);
+    let late = post_refresh(&http, &addr, &refresh1).await;
+    assert_eq!(late.status(), 401);
+    let body: Value = late.json().await.unwrap();
+    assert!(
+        body.to_string().contains("unknown refresh token"),
+        "rejected exactly as before the window existed: {body}"
+    );
+    // The rejection leaves the live pair alone.
+    assert_eq!(me_status(&http, &addr, &s2).await, 200);
+    assert_eq!(post_refresh(&http, &addr, &r2).await.status(), 200);
+}
+
+#[tokio::test]
+async fn a_second_replay_inside_the_window_is_rejected() {
+    let (addr, now, _state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    let (_s1, refresh1) = login(&http, &addr, &email, "reuse-twice@example.com").await;
+    let (s2, r2, _) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+
+    now.store(T0 + 10 * SEC, Ordering::SeqCst);
+    let (s2b, r2b, _) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+    assert_eq!((s2b, r2b), (s2.clone(), r2.clone()));
+    now.store(T0 + 20 * SEC, Ordering::SeqCst);
+    assert_eq!(post_refresh(&http, &addr, &refresh1).await.status(), 401);
+    assert_eq!(me_status(&http, &addr, &s2).await, 200);
+    assert_eq!(post_refresh(&http, &addr, &r2).await.status(), 200);
+}
+
+#[tokio::test]
+async fn a_token_older_than_the_latest_rotation_is_rejected_inside_the_window() {
+    let (addr, now, _state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    let (_s, token_a) = login(&http, &addr, &email, "reuse-abc@example.com").await;
+    // A -> B at T0, B -> C at T0 + 5 s; A is never replayed before.
+    let (_sb, token_b, _) = pair_of(post_refresh(&http, &addr, &token_a).await).await;
+    now.store(T0 + 5 * SEC, Ordering::SeqCst);
+    let (s_c, token_c, _) = pair_of(post_refresh(&http, &addr, &token_b).await).await;
+    // T0 + 10 s: inside both windows, A is still refused (only B is replayable).
+    now.store(T0 + 10 * SEC, Ordering::SeqCst);
+    assert_eq!(post_refresh(&http, &addr, &token_a).await.status(), 401);
+    // The refusal leaves C live, and B's own replay still returns C.
+    assert_eq!(me_status(&http, &addr, &s_c).await, 200);
+    let (s_c2, token_c2, _) = pair_of(post_refresh(&http, &addr, &token_b).await).await;
+    assert_eq!((s_c2, token_c2), (s_c, token_c));
+}
+
+#[tokio::test]
+async fn a_zero_window_disables_the_replay() {
+    let (addr, _now, _state, email) = spawn_at(no_reuse_config()).await;
+    let http = reqwest::Client::new();
+    let (_s1, refresh1) = login(&http, &addr, &email, "reuse-off@example.com").await;
+    let (_s2, r2, _) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+    // Same instant as the rotation: a zero window is still closed.
+    assert_eq!(post_refresh(&http, &addr, &refresh1).await.status(), 401);
+    assert_eq!(post_refresh(&http, &addr, &r2).await.status(), 200);
+}
+
+#[tokio::test]
+async fn a_revoke_inside_the_window_blocks_the_replay() {
+    let (addr, _now, _state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    let (_s1, refresh1) = login(&http, &addr, &email, "reuse-revoked@example.com").await;
+    let (s2, _r2, _) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+    let rev = http
+        .post(format!("{addr}/v1/auth/revoke"))
+        .json(&serde_json::json!({ "token": s2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rev.status(), 204);
+    assert_eq!(post_refresh(&http, &addr, &refresh1).await.status(), 401);
+}
+
+#[tokio::test]
+async fn a_revoke_with_the_replaced_token_closes_the_replay_and_keeps_the_session() {
+    let (addr, _now, _state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    let (_s1, refresh1) = login(&http, &addr, &email, "reuse-signout@example.com").await;
+    let (s2, r2, _) = pair_of(post_refresh(&http, &addr, &refresh1).await).await;
+    let rev = http
+        .post(format!("{addr}/v1/auth/revoke"))
+        .json(&serde_json::json!({ "token": refresh1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rev.status(), 204);
+    assert_eq!(post_refresh(&http, &addr, &refresh1).await.status(), 401);
+    // The session another holder may use stays live.
+    assert_eq!(me_status(&http, &addr, &s2).await, 200);
+    assert_eq!(post_refresh(&http, &addr, &r2).await.status(), 200);
+}
+
+/// Two threads refresh with ONE current token at once. Exactly one rotates; the
+/// other either loses the CAS or finds the token already replaced, and in both
+/// cases gets the SAME pair through the window: one session family, never two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_refreshes_inside_the_window_share_one_pair() {
+    let (addr, _now, state, email) = spawn_at(test_config()).await;
+    let http = reqwest::Client::new();
+    for i in 0..20 {
+        let (_s, refresh) = login(&http, &addr, &email, &format!("race-{i}@example.com")).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let task = |tok: String| {
+            let (http, addr, barrier) = (http.clone(), addr.clone(), barrier.clone());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                post_refresh(&http, &addr, &tok).await
+            })
+        };
+        let (a, b) = (task(refresh.clone()), task(refresh.clone()));
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        let (pa, pb) = (pair_of(a).await, pair_of(b).await);
+        assert_eq!(
+            (pa.0.as_str(), pa.1.as_str()),
+            (pb.0.as_str(), pb.1.as_str()),
+            "round {i}"
+        );
+        // The one replay is spent; the shared pair is the session's live pair.
+        assert_eq!(post_refresh(&http, &addr, &refresh).await.status(), 401);
+        assert_eq!(me_status(&http, &addr, &pa.0).await, 200);
+        let prev = state
+            .db
+            .previous_rotation(&cerulion_accountd::hash_token(&refresh))
+            .unwrap()
+            .expect("one rotation recorded");
+        assert_eq!(
+            prev.refresh_token_hash,
+            cerulion_accountd::hash_token(&pa.1)
+        );
+    }
 }
 
 // ============================================================================

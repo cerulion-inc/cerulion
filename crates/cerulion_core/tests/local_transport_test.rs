@@ -293,8 +293,14 @@ fn run_gateway_delivery() -> (Vec<Vec<u8>>, u64) {
         }
     }
     // The gateway's own forwarded counter is an observation independent of
-    // local delivery: it increments only in `forward_frame`'s success arm on
-    // the network egress path, so delivery alone cannot fake it.
+    // local delivery: the topic's egress sender increments it only when the
+    // zenoh put returns `Ok`, so delivery alone cannot fake it. The sender
+    // counts after the put returns, and an in-process reader can see the
+    // frame inside that put, so wait (bounded) for the count to settle.
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    while gateway.forwarded_count(&topic) < PLAN.len() as u64 && Instant::now() < settle_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
     let forwarded = gateway.forwarded_count(&topic);
     (frames, forwarded)
 }

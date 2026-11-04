@@ -86,7 +86,7 @@ rm -rf "$REC_DIR"
 #    wall-faithful, byte-exact-replayable recording path).
 # ---------------------------------------------------------------------------
 say "record perception_min for ${RECORD_SECS}s"
-"$CLI" graph run perception_min --release --single-process --record &
+"$CLI" graph run perception_min --release --single-process --network off --record &
 REC_PID=$!
 sleep "$RECORD_SECS"
 kill -INT "$REC_PID" 2>/dev/null || true
