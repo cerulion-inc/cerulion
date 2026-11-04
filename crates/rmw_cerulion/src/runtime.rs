@@ -171,8 +171,9 @@ impl GraphRegistry {
 pub struct Runtime {
     pub transport: Arc<TransportManager>,
     pub graph: RwLock<GraphRegistry>,
-    /// Monotonic counter for deterministic per-process entity ids (gids,
-    /// client instance numbers). Never wall-clock, never random.
+    /// Monotonic per-process entity counter: bytes 8 to 15 of subscription
+    /// and client gids ([`crate::gid::mint_gid`]). Never wall-clock, never
+    /// random.
     pub entity_counter: AtomicU64,
     /// Every live node's graph guard condition state. Registry
     /// mutations trigger ALL of them so executors blocked in `rmw_wait`

@@ -406,9 +406,15 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
             RMW_RET_OK
         );
         assert_eq!(n, 2);
-        assert_eq!((msgs[0].x, msgs[1].x), (4.0, 5.0));
-        assert!(gids_equal(&infos[0].publisher_gid, &pub_gid));
-        assert!(gids_equal(&infos[1].publisher_gid, &second_gid));
+        // Matched by value: the order of two publishers' messages in one
+        // sequence take is not part of the contract.
+        let mut xs = [msgs[0].x, msgs[1].x];
+        xs.sort_by(f64::total_cmp);
+        assert_eq!(xs, [4.0, 5.0]);
+        for (msg, info) in msgs.iter().zip(infos.iter()) {
+            let expected = if msg.x == 4.0 { &pub_gid } else { &second_gid };
+            assert!(gids_equal(&info.publisher_gid, expected), "x={}", msg.x);
+        }
 
         // rmw_take_serialized_message_with_info.
         publish(publisher, 6.0);

@@ -118,9 +118,9 @@
 //!   request channel. Schema-hash gating degrades this loudly (foreign
 //!   frames warn + skip) but treat `svc/` as RESERVED for services.
 //! - `ServiceServer` keeps one lazily-created reply publisher per client
-//!   GUID forever (deterministic, but unbounded under client churn with
-//!   ever-fresh `instance` values). Restarting clients reuse their
-//!   derived GUID and cost nothing new.
+//!   GUID until that client's reply subscriber is gone (see "Topology"). A
+//!   client in a crashed process holds its entries until iceoryx2 removes
+//!   the dead process's ports.
 //! - The 16-byte GUID matches `RMW_GID_STORAGE_SIZE` on ROS 2 Iron and
 //!   later (Humble used 24 — not a target).
 
@@ -580,8 +580,9 @@ impl ServiceServer {
     /// [`try_take_one_request`](Self::try_take_one_request) verbatim).
     ///
     /// The reply publisher for the client is created lazily on first
-    /// response to that client — creation order is driven by request
-    /// data, never timing, so it is replay-stable.
+    /// response to that client, so creation follows request data. A response
+    /// that reaches no subscriber drops the client's publisher and sequence
+    /// entry, and the next response to that GUID creates the publisher again.
     pub fn send_response(
         &mut self,
         envelope: &ServiceEnvelope,
@@ -713,8 +714,7 @@ impl ServiceServer {
                         // would otherwise pass in SILENCE — the backward
                         // jump satisfies neither `> prev + 1` nor any other
                         // arm, so nothing at all would be reported.
-                        let prev = match last_seen.insert(envelope.client_guid, envelope.sequence)
-                        {
+                        let prev = match last_seen.insert(envelope.client_guid, envelope.sequence) {
                             Some(prev) => prev,
                             None => {
                                 new_client = true;
@@ -776,6 +776,7 @@ impl ServiceServer {
                 .filter(|guid| !self.last_seen_seq.contains_key(*guid)),
         );
         let mut unprobed = 0usize;
+        let mut first_unprobed = None;
         for guid in guids {
             let topic = reply_topic(&self.service, &guid);
             match self.transport.topic_subscriber_count_checked(&topic) {
@@ -788,15 +789,20 @@ impl ServiceServer {
                     self.forget_client(&guid);
                 }
                 Some(_) => {}
-                None => unprobed += 1,
+                None => {
+                    unprobed += 1;
+                    first_unprobed.get_or_insert(topic);
+                }
             }
         }
         if unprobed > 0 {
             tracing::warn!(
                 service = %self.service,
                 clients = unprobed,
-                "could not read whether these service clients are still present; \
-                 their reply publishers are kept"
+                first_topic = first_unprobed.as_deref().unwrap_or(""),
+                "could not open the reply topics of these service clients to read \
+                 whether they are still present; their reply publishers are kept \
+                 (the open error is logged at debug level)"
             );
         }
     }
@@ -854,9 +860,9 @@ impl ServiceServer {
 impl TransportManager {
     /// Create the client side of a service.
     ///
-    /// `client_guid` should come from [`derive_client_guid`] (or the rmw
-    /// layer's gid) — it must be unique among live clients of this
-    /// service and replay-stable. `request_schema_hash` /
+    /// `client_guid` should come from [`derive_client_guid`] (replay-stable)
+    /// or the rmw layer's gid (host-unique, different per run); it must be
+    /// unique among live clients of this service. `request_schema_hash` /
     /// `response_schema_hash` identify the service's request/response
     /// types on the wire (e.g. FNV-1a of
     /// `"moveit_msgs/srv/GetPlanningScene_Request"`).

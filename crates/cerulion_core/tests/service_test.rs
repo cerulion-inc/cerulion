@@ -580,7 +580,9 @@ fn departed_clients_leave_no_reply_publisher_or_sequence_entry_behind() {
         let mut envelopes = Vec::new();
         drain_requests(server, |e, _| envelopes.push(e)).expect("take");
         assert_eq!(envelopes.len(), 1, "one request");
-        server.send_response(&envelopes[0], b"pong").expect("respond");
+        server
+            .send_response(&envelopes[0], b"pong")
+            .expect("respond");
         let mut got = Vec::new();
         drain_responses(client, |_, p| got.push(p.to_vec())).expect("take response");
         assert_eq!(got, vec![b"pong".to_vec()], "the client got its response");
@@ -614,7 +616,11 @@ fn departed_clients_leave_no_reply_publisher_or_sequence_entry_behind() {
     let mut envelopes = Vec::new();
     drain_requests(&mut server, |e, _| envelopes.push(e)).expect("take");
     assert_eq!(envelopes.len(), 1);
-    assert_eq!(server.tracked_client_count(), 3, "the early client is tracked");
+    assert_eq!(
+        server.tracked_client_count(),
+        3,
+        "the early client is tracked"
+    );
     drop(early);
     server
         .send_response(&envelopes[0], b"pong")
