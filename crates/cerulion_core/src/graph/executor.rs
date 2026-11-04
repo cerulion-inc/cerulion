@@ -45,9 +45,9 @@
 //! Each node that starts a unit carries the reason ([`Boundary`]): a source, an
 //! edge that is no link (latest-value, fan-out, join, a period or sync
 //! consumer...), `isolate: true`, an isolated producer, an unprofiled merge, a
-//! merge into a unit fed at a rate the profile does not hold, or a merge over
-//! budget. A node in one unit with a node that triggers it starts no unit and
-//! carries no reason.
+//! merge into a unit fed at a rate the profile does not hold, a merge over
+//! budget, or a cycle of links that no chain head reaches. A node in one unit
+//! with a node that triggers it starts no unit and carries no reason.
 //!
 //! # Overrides
 //!
