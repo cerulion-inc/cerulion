@@ -23,7 +23,9 @@ mod jni;
 pub use config::LanAccessConfig;
 /// Stable error-code constants.
 pub use error::{codes, EmbedError};
-pub use runtime::{EmbeddedRuntime, RecorderSummary, RuntimeState, Status};
+pub use runtime::{
+    EmbeddedRuntime, NodeFailure, NodeFailures, RecorderSummary, RuntimeState, Status,
+};
 
 /// Link graph node types into the app library.
 ///

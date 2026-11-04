@@ -474,9 +474,9 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `11 BUSY`, `12 PANIC`, and `13 SPAWN`.
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
-`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
-`last_error`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
-`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`,
+`last_error`, and `node_failures`. State is `idle`, `starting`, `running`,
+`stopping`, `finished`, `stopped`, or `failed`; `last_error` is null or an object with a stable code and
 message. `finished` means a graph ended on its own after a node requested
 shutdown. Call `stop` to finalize its recording, then start again. Before
 initialization, the state is `uninitialized`. With recording disabled, a
@@ -494,9 +494,19 @@ snapshot can look like this:
   "record_path": null,
   "published": {"/app/heartbeat": 2},
   "recorder": null,
-  "last_error": null
+  "last_error": null,
+  "node_failures": []
 }
 ```
+
+`node_failures` lists each graph node whose tick panicked, in graph order,
+as an object with the node's graph `node_id` and its first panic `message`.
+The runtime contains the panic: that node does not run again, the rest of
+the graph keeps running, and `state` stays `running`. A node is listed once.
+The list stays readable after `stop`. The next `start` whose config parses
+and passes its path checks clears it, also when that start then fails, for
+example on a node type that is not linked. A node that returns an error
+from its tick is not listed.
 
 The `recorder` summary is available after stop and includes message, channel,
 byte, per-topic, and output-path totals. App files are private to the app:

@@ -83,8 +83,8 @@ pub use partition::{
 };
 pub use runtime::{
     build_trigger_edges, compute_gateway_plan, validate_network_ingress, BuildPurpose,
-    CreditBinding, CreditRole, CrossProcessWiring, GraphRuntime, BARRIER_BOUNDARY_TIMEOUT,
-    EXTERNAL_TOPIC_SILENCE_GRACE_MS,
+    CreditBinding, CreditRole, CrossProcessWiring, GraphRuntime, NodeTickPanicRecords,
+    BARRIER_BOUNDARY_TIMEOUT, EXTERNAL_TOPIC_SILENCE_GRACE_MS,
 };
 pub use sibling_topics::{SiblingConsumedTopics, SiblingProducedTopics};
 pub use topology::{
