@@ -848,10 +848,10 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             };
             let consume_tok: TokenStream = match i.consume {
                 Some(crate::parse::ParsedConsume::Latest) => {
-                    quote! { ::cerulion_core::graph::node::InputConsume::Latest }
+                    quote! { #__cer_root::graph::node::InputConsume::Latest }
                 }
                 Some(crate::parse::ParsedConsume::Fifo) | None => {
-                    quote! { ::cerulion_core::graph::node::InputConsume::Fifo }
+                    quote! { #__cer_root::graph::node::InputConsume::Fifo }
                 }
             };
             quote! {
