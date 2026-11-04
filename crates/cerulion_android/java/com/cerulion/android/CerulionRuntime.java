@@ -82,7 +82,7 @@ public final class CerulionRuntime {
     }
 
     /**
-     * Take the oldest message of a {@code subscribe} topic without waiting
+     * Take the next message of a {@code subscribe} topic without waiting
      * and append it to {@code out} as JSON object text, for example
      * {@code {"data":"hello"}}. Returns {@link #OK} after appending, or
      * {@link #EMPTY} when the queue holds no message; any other value is a
@@ -91,9 +91,12 @@ public final class CerulionRuntime {
      * did not decode; it was still taken, so the next poll reads the one
      * after it. The queue holds {@code depth} messages from each publisher
      * of the topic; when a publisher's part is full, its oldest message is
-     * dropped, and {@link #status()} counts it under {@code subscribed}. A
-     * frame a node sends from {@code init} is in the queue only when its
-     * output declares {@code history_size}. A run whose graph is
+     * dropped, and {@link #status()} counts it under {@code subscribed}.
+     * Messages from one publisher come out oldest first; messages from
+     * different publishers keep no order between them. A frame a node sends
+     * from {@code init} is in the queue only when its output declares
+     * {@code history_size} and the node forwards the history pump (see
+     * docs/android.md). A run whose graph is
      * {@code finished} can still be polled until {@link #stop()}.
      */
     public static int poll(String topic, StringBuilder out) {

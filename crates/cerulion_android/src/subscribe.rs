@@ -3,7 +3,9 @@
 //!
 //! The subscription queue is the transport's own subscriber queue, `depth`
 //! messages deep per publisher of the topic (one publisher for a graph
-//! output): a publisher whose part is full drops its oldest message. `poll`
+//! output): a publisher whose part is full drops its oldest message.
+//! Messages from one publisher come out oldest first; messages from
+//! different publishers keep no order between them. `poll`
 //! takes one message off it and decodes it into JSON text; that text is an
 //! app-side copy, not the zero-copy node path.
 use cerulion_core::dynamic::WireLayout;
@@ -50,7 +52,7 @@ impl Subscription {
         }
     }
 
-    /// Take the oldest queued message and decode it into JSON text, or
+    /// Take the next queued message and decode it into JSON text, or
     /// return `None` when the queue is empty. Returns the subscription's
     /// counts after this poll with the result.
     pub(crate) fn poll(&mut self) -> (SubscriptionCounts, Result<Option<&str>, EmbedError>) {

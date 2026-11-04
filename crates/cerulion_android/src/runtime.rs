@@ -731,7 +731,7 @@ impl EmbeddedRuntime {
         Ok(sequence)
     }
 
-    /// Take the oldest message of the subscription on `topic` and return it
+    /// Take the next message of the subscription on `topic` and return it
     /// as JSON object text, or `None` when its queue is empty. A message that
     /// does not decode is still taken: the error is DECODE and the next poll
     /// reads the message after it. A graph that finished keeps the run's
