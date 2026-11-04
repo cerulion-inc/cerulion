@@ -3224,20 +3224,18 @@ fn latest_relay_round_trip(
     let f = replay(&free, make, None, None).expect("free-run replay runs");
     assert_clean_verdict(&f, &format!("{node_type} (free run)"));
     // A clean verdict also follows from the verifier standing aside, so the
-    // arm requires that it judged: no whole-rank decline (subject `rank N`),
-    // no node whose metadata could not be read (no `code`), and no stand-down
-    // of the latest decider (its label in the detail). The sampled relay is
-    // exempt from the last, because a decimated read stands the decider down
-    // by rule (`StandDownReason::DecimatedRead`).
+    // arm refuses every stand-down note: a whole-rank decline, a node whose
+    // metadata could not be read, a whole-node read-log stand-down and a
+    // stand-down of any decider. The one stand-down a healthy relay here
+    // carries is the sampled relay's `decimated_read`, which a decimated read
+    // causes by rule.
     let sampled = node_type == "sampled_latest_relay_node";
     let stood_aside: Vec<_> = f
         .rederivation_notes
         .iter()
         .filter(|n| {
             n.kind == replay_engine::RederivationNoteKind::StandDown
-                && (n.subject.starts_with("rank ")
-                    || n.code.is_none()
-                    || (!sampled && n.detail.contains("consume = latest fire count")))
+                && !(sampled && n.code.as_deref() == Some("decimated_read"))
         })
         .collect();
     assert!(

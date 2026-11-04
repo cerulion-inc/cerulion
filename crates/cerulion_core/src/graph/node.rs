@@ -7464,13 +7464,13 @@ mod tests {
     }
 
     #[test]
-    fn info_json_map_shaped_consume_with_another_key_refuses_the_load() {
+    fn info_json_map_shaped_consume_with_an_extra_key_or_unknown_mode_refuses_the_load() {
         for consume in [r#"{"latest":null,"depth":1}"#, r#"{"lifo":null}"#] {
             let json = format!(
                 r#"{{"inputs":[{{"name":"cam","trigger":true,"consume":{consume}}}],"outputs":[]}}"#
             );
             let err = DylibNodeEntry::parse_info_json(&json)
-                .expect_err("a consume value carrying another key is not a consume mode");
+                .expect_err("a map with an extra key or an unknown mode is not a consume mode");
             assert!(err.contains("invalid JSON"), "{consume}: {err}");
         }
     }

@@ -960,15 +960,16 @@ pub struct TopicServiceConfig {
     /// global value) always succeed on graph-created services.
     pub subscriber_max_buffer_size: usize,
     /// The iceoryx2 `subscriber_max_borrowed_samples` for this topic.
-    /// `None` = use the iceoryx2 default (2). `Some(3)` is set ONLY on
-    /// topics that feed a non-trigger latest-value input of a macro node
-    /// (a snapshot consumer): such a consumer HOLDS the last-delivered
+    /// `None` = use the iceoryx2 default (2). `Some(3)` is set on topics
+    /// that feed a non-trigger latest-value input of a macro node (a
+    /// snapshot consumer): such a consumer HOLDS the last-delivered
     /// sample across steps, so the drain peak is held(1) +
     /// latest(1) + receive-transient(1) = 3 borrowed per connection. A
     /// burst (≥2 queued) would exceed the default 2 → `ExceedsMaxBorrows`.
     /// The source topic of a `consume = latest` trigger input gets `Some(3)`
     /// too: its subscriber holds a frame no tick has read through the next
-    /// drain. Every other trigger topic keeps the default 2.
+    /// drain. A topic none of whose consumers holds a frame keeps the
+    /// default 2, and a recorded topic takes the recorder's own raise.
     pub subscriber_max_borrowed_samples: Option<usize>,
     /// A CREATE-leg-only borrow floor — the `subscriber_max_borrowed_samples`
     /// a service THIS opener creates is raised to, WITHOUT arming any open-time
