@@ -88,16 +88,26 @@ status-before-load=call CerulionRuntime.loadLibrary(<your runtime library>) firs
 load-again=no-exception
 load-other=CerulionRuntime is bound to libcerulion_sample_runtime.so
 status-before-init=uninitialized
+codes=14,15,16
 init-bad=3
 init-ok=0
 linked-nodes=[\"printer\",\"relay\",\"timer\"]
 publish-before-start=4
+poll-before-start=4
 start-invalid=0 state=failed error=3
 start-ok=0 state=running
 publish=0
 publish-unknown=8
+poll=0 {\"data\":\"hello\"}
+poll-empty=15
+poll-unknown=8
+poll-null-out=3
+poll-null-topic=3
+poll-overflow=0 {\"data\":\"b\"}, 0 {\"data\":\"\u{e7}\"}, 15
+subscribed={\"/jni/heartbeat\":{\"polled\":3,\"dropped\":1,\"undecodable\":0}}
 stop=0 state=stopped
 start-graph=0 state=running nodes=3
+poll-graph=0 {\"data\":2}
 stop-graph=0 state=stopped";
     assert_eq!(String::from_utf8_lossy(&java.stdout).trim(), expected);
 }

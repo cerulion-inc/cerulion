@@ -295,16 +295,16 @@ impl Host {
         codes::OK
     }
 
-    /// Take the runtime lock for an app publish. The lifecycle check and the
-    /// runtime try_lock run under the lifecycle guard so a stop cannot be
-    /// accepted in between; then the guard drops before the publish itself.
+    /// Take the runtime lock for an app publish or poll. The lifecycle check
+    /// and the runtime try_lock run under the lifecycle guard so a stop cannot
+    /// be accepted in between; then the guard drops before the call itself.
     /// The lifecycle lock is taken with a wait (its holders only decide a
     /// transition or read the status); the runtime lock with try_lock, so a
-    /// Java stop() is never made to wait out a publish. Once the caller
-    /// holds the returned runtime lock, a stop accepted afterwards just waits
-    /// on that lock in its worker: the publish is ordered before the stop and
-    /// teardown cannot interleave.
-    fn publish_runtime(&self) -> Result<MutexGuard<'_, EmbeddedRuntime>, i32> {
+    /// Java stop() is never made to wait out a publish or a poll. Once the
+    /// caller holds the returned runtime lock, a stop accepted afterwards just
+    /// waits on that lock in its worker: the call is ordered before the stop
+    /// and teardown cannot interleave.
+    fn app_runtime(&self) -> Result<MutexGuard<'_, EmbeddedRuntime>, i32> {
         let lifecycle = lock_lifecycle(&self.lifecycle);
         if !matches!(*lifecycle, Lifecycle::Idle) {
             return Err(codes::BUSY);
@@ -328,7 +328,7 @@ impl Host {
         topic: &str,
         prepare: impl FnOnce(usize) -> Result<String, i32>,
     ) -> i32 {
-        let mut runtime = match self.publish_runtime() {
+        let mut runtime = match self.app_runtime() {
             Ok(runtime) => runtime,
             Err(code) => return code,
         };
@@ -344,6 +344,23 @@ impl Host {
             .publish(topic, &json)
             .map(|_| codes::OK)
             .unwrap_or_else(|error| error.code())
+    }
+
+    /// Poll the subscription on `topic` and hand its message to `deliver`
+    /// while the runtime lock is held, so the message stays valid for the
+    /// call; `deliver`'s code is returned. An empty queue returns EMPTY
+    /// without calling it, and so do BUSY, BAD_STATE and the unknown-topic
+    /// code.
+    fn poll_with(&self, topic: &str, deliver: impl FnOnce(&str) -> i32) -> i32 {
+        let mut runtime = match self.app_runtime() {
+            Ok(runtime) => runtime,
+            Err(code) => return code,
+        };
+        match runtime.poll(topic) {
+            Ok(Some(json)) => deliver(json),
+            Ok(None) => codes::EMPTY,
+            Err(error) => error.code(),
+        }
     }
 }
 
@@ -448,6 +465,19 @@ pub(crate) fn publish_prepared(
     guarded_code(
         || match HOST.get() {
             Some(host) => host.publish_prepared(topic, prepare),
+            None => codes::NOT_INITIALIZED,
+        },
+        panic_code,
+    )
+}
+
+/// Poll the subscription on `topic`, handing its message to `deliver` (see
+/// `Host::poll_with`). The JNI layer uses it to append the message to the
+/// caller's buffer.
+pub(crate) fn poll_with(topic: &str, deliver: impl FnOnce(&str) -> i32) -> i32 {
+    guarded_code(
+        || match HOST.get() {
+            Some(host) => host.poll_with(topic, deliver),
             None => codes::NOT_INITIALIZED,
         },
         panic_code,
@@ -722,6 +752,83 @@ mod tests {
             codes::UNKNOWN_TOPIC,
             "unknown topic"
         );
+    }
+
+    /// A poll through the JNI entry point's path, returning the code and
+    /// the message it delivered.
+    fn poll_on(host: &Host, topic: &str) -> (i32, Option<String>) {
+        let mut delivered = None;
+        let code = host.poll_with(topic, |json| {
+            delivered = Some(json.to_string());
+            codes::OK
+        });
+        (code, delivered)
+    }
+
+    #[test]
+    fn poll_refuses_without_waiting_and_without_delivering() {
+        if HOST.get().is_none() {
+            assert_eq!(
+                poll_with("/topic", |_| unreachable!("no host")),
+                codes::NOT_INITIALIZED
+            );
+        }
+        let host = test_host();
+        assert_eq!(poll_on(&host, "/topic"), (codes::BAD_STATE, None));
+        {
+            let _runtime = host.runtime.lock().expect("runtime lock");
+            assert_eq!(poll_on(&host, "/topic"), (codes::BUSY, None));
+        }
+        lock_status(&host.status).state = RuntimeState::Running;
+        for lifecycle in [
+            Lifecycle::Starting {
+                stop_requested: false,
+            },
+            Lifecycle::Stopping,
+        ] {
+            *lock_lifecycle(&host.lifecycle) = lifecycle;
+            assert_eq!(poll_on(&host, "/topic"), (codes::BUSY, None));
+        }
+        *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
+        // A running state with no run behind it has no subscription to
+        // read: still BAD_STATE. UNKNOWN_TOPIC on a real run is pinned by
+        // `embedded_subscribe_poll_test`.
+        host.runtime
+            .lock()
+            .expect("runtime lock")
+            .mark_running_for_test();
+        assert_eq!(poll_on(&host, "/missing"), (codes::BAD_STATE, None));
+        assert!(host.lifecycle.try_lock().is_ok());
+    }
+
+    #[test]
+    fn poll_delivers_each_message_under_the_runtime_lock_then_reports_empty() {
+        let host = static_test_host();
+        let config = r#"{"publish":[{"topic":"/host_test/poll","schema":"std_msgs/String"}],"subscribe":[{"topic":"/host_test/poll","schema":"std_msgs/String"}]}"#;
+        assert_eq!(host.start(config), codes::OK);
+        wait_for_observed(host, RuntimeState::Running);
+        assert_eq!(poll_on(host, "/host_test/poll"), (codes::EMPTY, None));
+        for data in ["one", "two"] {
+            let json = format!(r#"{{"data":"{data}"}}"#);
+            assert_eq!(publish_on(host, "/host_test/poll", &json), codes::OK);
+        }
+        let code = host.poll_with("/host_test/poll", |json| {
+            assert!(
+                matches!(host.runtime.try_lock(), Err(TryLockError::WouldBlock)),
+                "the message is delivered while the runtime is locked"
+            );
+            assert_eq!(json, r#"{"data":"one"}"#);
+            codes::OK
+        });
+        assert_eq!(code, codes::OK);
+        // The deliver step's own failure code is returned as is.
+        assert_eq!(
+            host.poll_with("/host_test/poll", |_| codes::PANIC),
+            codes::PANIC
+        );
+        assert_eq!(poll_on(host, "/host_test/poll"), (codes::EMPTY, None));
+        assert_eq!(host.stop(), codes::OK);
+        wait_for_observed(host, RuntimeState::Stopped);
     }
 
     #[test]
