@@ -37,7 +37,8 @@
 //! A member the profile rates no edge into is fed through each trigger edge
 //! from outside its group: from another node of the process at the period
 //! that node's group is fed at before any merge (the node and the nodes
-//! `isolate: false` joined to it), from another process at an unknown rate.
+//! `isolate: false` and couplings joined to it), from another process at an
+//! unknown rate.
 //! Every member's feeds are gathered before the first merge, so a merge is
 //! judged against every feed of the merged unit whichever chain is walked
 //! first.
@@ -46,7 +47,8 @@
 //! edge that is no link (latest-value, fan-out, join, a period or sync
 //! consumer...), `isolate: true`, an isolated producer, an unprofiled merge, a
 //! merge into a unit fed at a rate the profile does not hold, or a merge over
-//! budget.
+//! budget. A node in one unit with a node that triggers it starts no unit and
+//! carries no reason.
 //!
 //! # Overrides
 //!
@@ -58,9 +60,11 @@
 //! producer's declaration wins.
 //!
 //! A [`Coupling`] (every producer and consumer of a topic with a `block`
-//! consumer) merges its nodes into one unit after every other rule: the
+//! consumer) merges its nodes into one unit whatever the other rules say: the
 //! producer's deferral reads an outstanding count kept by the consumers' drains
-//! inside one level loop.
+//! inside one level loop. The coupling joins them before any link is judged,
+//! as an `isolate: false` join does, so a link's tick budget sums the ticks of
+//! every node a coupling puts in the unit and reads their feeds and deadlines.
 //!
 //! # Fixed at load
 //!
@@ -608,8 +612,29 @@ pub fn derive_units(
         candidates.insert(n);
     }
 
+    // A coupling joins its nodes before any link is judged, as an
+    // `isolate: false` join does: the feeds, ticks and deadlines below are
+    // gathered per group, so a verdict counts every node a coupling puts in
+    // the unit.
+    let mut block_topics: IndexMap<usize, Vec<String>> = IndexMap::new();
+    for coupling in &graph.couplings {
+        let local: Vec<usize> = coupling.nodes.iter().filter_map(|n| index(n)).collect();
+        if local.len() < 2 {
+            continue;
+        }
+        for pair in local.windows(2) {
+            union(&mut parent, pair[0], pair[1]);
+        }
+        let r = root(&mut parent, local[0]);
+        block_topics
+            .entry(r)
+            .or_default()
+            .push(coupling.topic.clone());
+    }
+
     // The summed p50 tick and tightest `tick_within` of the unit rooted at
-    // `r` so far (a node and every node `isolate: false` joined to it).
+    // `r` so far (a node and every node `isolate: false` or a coupling joined
+    // to it).
     let unit_totals = |r: usize, parent: &mut Vec<usize>| {
         let mut sum_ns = costs.map(|_| 0u64);
         let mut deadline: Option<Deadline<'_>> = None;
@@ -709,8 +734,8 @@ pub fn derive_units(
                 break;
             }
             // `unit` holds the ticks of every member of `at`'s group. A `next`
-            // in that group (an `isolate: false` join put both there) adds
-            // nothing, so the walk moves on without a verdict.
+            // in that group (an `isolate: false` join or a coupling put both
+            // there) adds nothing, so the walk moves on without a verdict.
             if let (Some(a), Some(b)) = (index(next), index(at)) {
                 if root(&mut parent, a) == root(&mut parent, b) {
                     at = next;
@@ -775,34 +800,27 @@ pub fn derive_units(
         }
     }
 
-    let mut block_topics: IndexMap<usize, Vec<String>> = IndexMap::new();
-    for coupling in &graph.couplings {
-        let local: Vec<usize> = coupling.nodes.iter().filter_map(|n| index(n)).collect();
-        if local.len() < 2 {
-            continue;
-        }
-        for pair in local.windows(2) {
-            union(&mut parent, pair[0], pair[1]);
-        }
-        let r = root(&mut parent, local[0]);
-        block_topics
-            .entry(r)
-            .or_default()
-            .push(coupling.topic.clone());
-    }
     let mut topics_by_root: IndexMap<usize, Vec<String>> = IndexMap::new();
     for (r, topics) in block_topics {
         let fr = root(&mut parent, r);
         topics_by_root.entry(fr).or_default().extend(topics);
     }
-    // A `block` flow keeps its nodes together over `isolate: true`; such a
-    // node does not start a unit, and the unit lists the block topic instead.
+    // A node in one unit with a node of this host that triggers it starts no
+    // unit, so it carries no reason. A `block` flow keeps its nodes together
+    // over `isolate: true`; such a node does not start a unit either, and the
+    // unit lists the block topic instead.
     for (i, member) in members.iter().enumerate() {
+        let n = member.as_str();
         let r = root(&mut parent, i);
-        if topics_by_root.contains_key(&r)
-            && starts.get(member.as_str()) == Some(&Boundary::Isolated)
-        {
-            starts.shift_remove(member.as_str());
+        let with_producer = producers.get(n).is_some_and(|own| {
+            own.iter()
+                .filter_map(|p| index(p))
+                .any(|j| root(&mut parent, j) == r)
+        });
+        let kept_over_isolate =
+            topics_by_root.contains_key(&r) && starts.get(n) == Some(&Boundary::Isolated);
+        if with_producer || kept_over_isolate {
+            starts.shift_remove(n);
         }
     }
 
@@ -1670,6 +1688,94 @@ mod tests {
                 ("b".to_string(), over_period("b", 310_000, 1_000_000)),
             ]
         );
+    }
+
+    /// `h` (1 kHz) links to `a`, and `b` reads `a`'s topic as `block`, so `a`
+    /// and `b` share one unit (the link `a -> b` lies inside it).
+    fn block_partner() -> UnitGraph {
+        let mut g = graph(&[("h", "a"), ("a", "b")], &[], &[("h", 1)]);
+        g.couplings.push(Coupling {
+            topic: "/t/a/out".into(),
+            nodes: s(&["a", "b"]),
+        });
+        g
+    }
+
+    #[test]
+    fn a_block_partner_counts_in_the_budget_of_a_link_into_its_unit() {
+        // Joining `h` brings both `a` and `b`: 50.02 ms reaches a quarter of
+        // 1 ms.
+        let c = costs(&[("h", 10_000), ("a", 10_000), ("b", 50_000_000)], &[]);
+        let units = derive_units("g", &s(&["h", "a", "b"]), &block_partner(), profile(&c));
+        assert_eq!(nodes(&units), [s(&["h"]), s(&["a", "b"])], "{units:?}");
+        assert_eq!(units[0].boundaries, [("h".to_string(), Boundary::Source)]);
+        assert_eq!(
+            units[1].boundaries,
+            [("a".to_string(), over_period("a", 50_020_000, 1_000_000))]
+        );
+        assert_eq!(units[1].block_topics, s(&["/t/a/out"]));
+    }
+
+    #[test]
+    fn without_a_profile_a_block_partner_names_no_reason() {
+        // `b` shares `a`'s unit, so only `a` says why it starts one.
+        let units = derive_units("g", &s(&["h", "a", "b"]), &block_partner(), None);
+        assert_eq!(nodes(&units), [s(&["h"]), s(&["a", "b"])], "{units:?}");
+        assert_eq!(
+            units[1].boundaries,
+            [(
+                "a".to_string(),
+                Boundary::Unprofiled {
+                    producer: "h".into()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_fan_out_consumer_a_block_coupling_keeps_with_its_producer_names_no_reason() {
+        // `slow` reads `pace`'s fan-out topic and a `block` coupling keeps
+        // the two together: `slow` starts no unit. `fast` does.
+        let mut g = graph(
+            &[],
+            &[
+                ("pace", "fast", ChainBar::FanOut { consumers: 2 }),
+                ("pace", "slow", ChainBar::FanOut { consumers: 2 }),
+            ],
+            &[("pace", 1)],
+        );
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["pace", "slow"]),
+        });
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["pace", "slow"]), s(&["fast"])]);
+        assert_eq!(
+            units[0].boundaries,
+            [("pace".to_string(), Boundary::Source)]
+        );
+        assert_eq!(
+            start_of(&units, "fast"),
+            Some(&Boundary::NotALink {
+                producer: "pace".into(),
+                bar: ChainBar::FanOut { consumers: 2 }
+            })
+        );
+    }
+
+    #[test]
+    fn a_consumer_a_block_coupling_keeps_with_its_isolated_producer_names_no_reason() {
+        // `a` declares isolate: true and a `block` coupling keeps it with its
+        // consumer `b`: neither starts a unit.
+        let mut g = graph(&[("a", "b")], &[], &[("a", 10)]);
+        g.isolate.insert("a".into(), true);
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["a", "b"]),
+        });
+        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["a", "b"])]);
+        assert!(units[0].boundaries.is_empty(), "{units:?}");
     }
 
     #[test]

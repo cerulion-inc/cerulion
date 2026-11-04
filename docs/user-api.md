@@ -2644,7 +2644,9 @@ Each unit `cerulion graph plan <NAME>` prints names why its first node starts it
 | tick budget | the profile shows the merged unit would tick for a quarter of its period or more, or of a member's `tick_within_ms` |
 
 Latest-value inputs never join units. Every producer and consumer of a topic with a `block` consumer
-stay in one unit, a node declaring `isolate: true` included. Units are decided when the graph loads and never move during a run. When
+stay in one unit, a node declaring `isolate: true` included, and a link into that unit is judged with all of them: the tick budget
+sums their ticks and reads their feeds and `tick_within_ms`. A node in one unit with a node that triggers it starts no
+unit and prints no reason. Units are decided when the graph loads and never move during a run. When
 `graph run` derives process groups from the graph's profile for a free run on the real clock, the
 cost-aware partitioner keeps every linear chain within the per-group compute budget in one process
 group, so a chain's units share one process; a chain over the budget is cut where the cost model
