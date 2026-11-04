@@ -1590,6 +1590,89 @@ mod tests {
     }
 
     #[test]
+    fn a_feed_carried_through_two_groups_reaches_a_group_listed_before_them() {
+        // `f` (1 kHz) links to `g` and `g` to `m`, unrated; the join `x`,
+        // triggered by `y` and `m`, declares isolate: false, so `y`, `x` and
+        // `m` share one unit, fed through `m` from `f`'s group. `hA` (10 Hz)
+        // links to `y`: with `hA` the unit ticks 1.6 ms, over a quarter of
+        // 1 ms. The members list `f` after the group `f`'s feed reaches.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[("hA", "y"), ("f", "g"), ("g", "m")],
+            &[("y", "x", join.clone()), ("m", "x", join)],
+            &[("hA", 100), ("f", 1)],
+        );
+        g.isolate.insert("x".into(), false);
+        let c = costs(
+            &[
+                ("hA", 1_000_000),
+                ("y", 200_000),
+                ("x", 200_000),
+                ("m", 200_000),
+                ("g", 10_000),
+                ("f", 10_000),
+            ],
+            &[],
+        );
+        let units = derive_units("g", &s(&["hA", "y", "x", "m", "g", "f"]), &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["hA"]), s(&["y", "x", "m"]), s(&["g", "f"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            units[1].boundaries,
+            [
+                ("y".to_string(), over_period("y", 1_600_000, 1_000_000)),
+                ("m".to_string(), over_period("m", 620_000, 1_000_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_walk_reads_the_feed_a_merge_gave_the_merged_group() {
+        // The join `j`, triggered by `a`, `b` and by `o` of another process at
+        // 1 kHz, declares isolate: false, so `a`, `b` and `j` share one unit
+        // fed every 1 ms. `h1` (10 Hz) links to `a` and joins at 0.11 ms; the
+        // merged unit keeps `h1`'s place and is fed every 1 ms. `h2` (10 Hz)
+        // links to `b`: 0.31 ms reaches a quarter of 1 ms.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 3 };
+        let mut g = graph(
+            &[("h1", "a"), ("h2", "b")],
+            &[
+                ("a", "j", join.clone()),
+                ("b", "j", join.clone()),
+                ("o", "j", join),
+            ],
+            &[("h1", 100), ("h2", 100)],
+        );
+        g.isolate.insert("j".into(), false);
+        let c = costs(
+            &[
+                ("h1", 50_000),
+                ("h2", 200_000),
+                ("a", 20_000),
+                ("b", 20_000),
+                ("j", 20_000),
+            ],
+            &[("o", "j", 1_000_000)],
+        );
+        let units = derive_units("g", &s(&["h1", "h2", "a", "b", "j"]), &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["h1", "a", "b", "j"]), s(&["h2"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            units[0].boundaries,
+            [
+                ("h1".to_string(), Boundary::Source),
+                ("b".to_string(), over_period("b", 310_000, 1_000_000)),
+            ]
+        );
+    }
+
+    #[test]
     fn a_block_flow_keeps_an_isolated_node_and_says_so() {
         let mut g = graph(&[("a", "b")], &[], &[("a", 10)]);
         g.isolate.insert("b".into(), true);
