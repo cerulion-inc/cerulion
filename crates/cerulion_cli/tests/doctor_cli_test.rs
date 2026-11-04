@@ -87,7 +87,7 @@ fn json_of(out: &Output) -> serde_json::Value {
 }
 
 /// The catalogue as the verb lists it, in order.
-const CHECK_IDS: [&str; 17] = [
+const CHECK_IDS: [&str; 18] = [
     "limits.open-files",
     "shm.dev-shm",
     "shm.stale-nodes",
@@ -105,6 +105,7 @@ const CHECK_IDS: [&str; 17] = [
     "daemon.remoted",
     "net.mdns",
     "net.udp",
+    "net.tcp-slow-start",
 ];
 
 #[test]

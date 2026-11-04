@@ -415,6 +415,7 @@ The JSON object carries `report_version` (1; it changes only when a field is rem
 | `daemon.remoted` | `cerulion-remoted` beside `cerulion`, and on Linux whether one runs | Never: `info` only |
 | `net.mdns` (network) | An mDNS browse of `_cerulion._tcp` for one second, the browse `topic list` makes | Warns when the browse cannot start or its responder stops mid-window; `info` with the machines that answered otherwise. A network that drops multicast, or a host whose mDNS socket could not bind, also shows no machine |
 | `net.udp` (network) | One 1200-byte QUIC datagram with a reserved version to each `quic/` and `udp/...?rel=1` connect locator of the workspace's graphs and each `--udp-target`, at the same time; a QUIC endpoint answers it with Version Negotiation, with no handshake and no certificate | Warns for an endpoint whose first resolved address, the one a dial connects to, does not answer within one second, refuses (nothing listens), cannot be sent to, cannot be resolved, or is unfinished within the check's fixed three seconds; `skip` when no endpoint is named, so it never probes a host you did not name |
+| `net.tcp-slow-start` | Linux: `net.ipv4.tcp_slow_start_after_idle`, read the way the `graph run` warning reads it | Warns when it is nonzero (the Linux default): an idle `tcp/` link's congestion window decays toward its initial size. The fix is the one `graph run` prints |
 
 ### Other
 
