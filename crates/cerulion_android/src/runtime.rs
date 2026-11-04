@@ -579,6 +579,7 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
+        let log_level = config.log_level;
         {
             let mut status = lock_status(&self.status);
             status.state = RuntimeState::Starting;
@@ -605,6 +606,12 @@ impl EmbeddedRuntime {
                 return Err(error);
             }
         };
+        // Set just before the build, so the build's lines use it. A start
+        // refused before this point never touches the process-wide level; a
+        // later failure (another runtime owns the gateway, a recording file
+        // exists) drops `level`, which returns to the last kept level. A
+        // restart without the key returns to `info`.
+        let level = crate::log::set_level(log_level);
         let mut run = match build(&mut plan, manager, &self.status) {
             Ok(run) => run,
             Err(failure) => {
@@ -630,6 +637,9 @@ impl EmbeddedRuntime {
             return Err(error);
         }
         self.run = Some(run);
+        if let Some(level) = level {
+            level.keep();
+        }
         Ok(())
     }
 

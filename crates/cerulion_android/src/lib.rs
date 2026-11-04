@@ -18,11 +18,16 @@ pub mod runtime;
 
 mod host;
 mod jni;
+mod log;
 
 /// Embedded runtime API and observable status types.
-pub use config::LanAccessConfig;
+pub use config::{LanAccessConfig, LogLevelConfig};
 /// Stable error-code constants.
 pub use error::{codes, EmbedError};
+/// TEST SEAM: install the logcat subscriber over a fake sink.
+#[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
+pub use log::{install_with_sink as install_log_sink_for_test, LogPriority, LogSink};
 pub use runtime::{
     EmbeddedRuntime, NodeFailure, NodeFailures, RecorderSummary, RuntimeState, Status,
 };
