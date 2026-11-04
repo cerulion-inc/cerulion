@@ -36,13 +36,17 @@
 //! log behind a brief-append `Mutex`, so ONE [`Arc<OpsServer>`] serves EVERY
 //! session CONCURRENTLY. A stalled/hostile session — parked on a blocking read,
 //! holding NO lock — cannot delay another session. In particular a paired
-//! `engage-estop` runs on its OWN concurrent session and reaches the lease
-//! immediately: the safety EFFECT (`lease.engage_estop`) runs BEFORE its audit
-//! receipt (e-stop is non-mutating, so no intent receipt precedes it), and the
-//! ONLY contention it can ever see is the brief receipt append — never a whole
-//! session. This is "e-stop = permission floor, any session, always wins" applied
-//! to the transport layer. Hash-chain integrity holds under concurrent appends
-//! because the sink's `Mutex` serializes each `record` as one atomic append.
+//! `engage-estop` runs on its OWN concurrent session: the safety EFFECT
+//! (`lease.engage_estop`) runs BEFORE its audit receipt (e-stop is
+//! non-mutating, so no intent receipt precedes it). Before the effect it waits
+//! on the lease's lock for at most the one act-verb send that holds it and one
+//! brief check by each running act verb: the engage is counted on the shared
+//! [`EstopLease`] before it waits, and an act verb that reads the count under
+//! the lock sends nothing. After the effect it waits for the brief receipt
+//! append. No wait is for a whole session. This is "e-stop = permission floor,
+//! any session, always wins" applied to the transport layer. Hash-chain
+//! integrity holds under concurrent appends because the sink's `Mutex`
+//! serializes each `record` as one atomic append.
 //!
 //! Each session is still BOUNDED by [`OPS_SESSION_DEADLINE`] (an authed-then-
 //! stalled peer's connection is CLOSED at the deadline, unwedging its blocking
@@ -82,6 +86,7 @@ use cerud::verbs::{InventoryVerb, LogTailVerb, RestartVerb, VerbHandler, VerbReg
 use crate::authorizer::PairingAuthorizer;
 use crate::clock::RemotedClock;
 use crate::error::RemotedError;
+use crate::estop_lease::EstopLease;
 use crate::host::OpsHost;
 use crate::pairing_verbs::{
     ClaimVerb, CodePairFinishVerb, CodePairStartVerb, EngageEstopVerb, PairVerb, PresentGrantVerb,
@@ -130,6 +135,8 @@ impl OpsServing {
     /// authorizer over `shared` (the LIVE trust state), and open the receipt log.
     ///
     /// `lease` is the shared control lease the `engage-estop` floor engages;
+    /// the e-stop verb and the act verbs share one [`EstopLease`] over it, so
+    /// an engage waiting for its lock is counted where the act verbs read it.
     /// `sessions` is the CPace fallback session store; `clock` is the robot's
     /// TRUSTED clock the pairing verbs verify against; `log_root` is the
     /// `log-tail` allow-list root; `receipt_path` is the audit log.
@@ -331,11 +338,16 @@ fn verb_registry(
 ) -> VerbRegistry {
     let (restart, engage_estop, act_lease): (Box<dyn VerbHandler>, Box<dyn VerbHandler>, _) =
         match host {
-            OpsHost::Daemon { lease } => (
-                Box::new(RestartVerb::new()),
-                Box::new(EngageEstopVerb::new(lease.clone())),
-                Some(lease),
-            ),
+            OpsHost::Daemon { lease } => {
+                // One `EstopLease` for the plane: the e-stop verb engages through
+                // it and the act verbs read its count before each send.
+                let lease = EstopLease::new(lease);
+                (
+                    Box::new(RestartVerb::new()),
+                    Box::new(EngageEstopVerb::new(lease.clone())),
+                    Some(lease),
+                )
+            }
             OpsHost::Embedded => (
                 Box::new(DaemonOnlyVerb::RESTART),
                 Box::new(DaemonOnlyVerb::ENGAGE_ESTOP),

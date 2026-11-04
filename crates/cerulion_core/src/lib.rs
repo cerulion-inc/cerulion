@@ -844,8 +844,8 @@ pub use transport::subscriber::{CerulionSubscriber, ReceivedMessage};
 pub use transport::team_auth::{NetworkAuth, TeamAnchors, TeamAuth, TeamAuthError};
 pub use transport::uds_write::{prepare_accepted_stream, write_line_bounded, UdsWriteOutcome};
 pub use transport::{
-    ix_config_shm_identity_from_json, IceoryxShmIdentity, NetworkPosture, TopicPublisherNode,
-    TopicRequirements, TransportConfig, TransportManager,
+    ix_config_shm_identity_from_json, FullQueueSend, IceoryxShmIdentity, NetworkPosture,
+    TopicPublisherNode, TopicRequirements, TransportConfig, TransportManager,
 };
 pub use wire::{StepTag, WireError, WireHeader};
 

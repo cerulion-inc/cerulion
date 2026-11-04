@@ -159,6 +159,11 @@ pub fn robot_pub(
         type_name: type_name.to_string(),
         frames: count("frames")?,
         subscribers: usize::try_from(count("subscribers")?).unwrap_or(usize::MAX),
+        // A robot whose result carries no `skipped` count reports none.
+        skipped: match result.get("skipped") {
+            None => 0,
+            Some(_) => count("skipped")?,
+        },
     }
     .line())
 }

@@ -68,6 +68,8 @@
 //!   stream to `cerud::OpsServer::serve_connection` via a `QuicOpsStream` adapter.
 //! - [`pairing_verbs`]: the self-gating bootstrap and safety verbs (`claim`, `pair`,
 //!   `code-pair-start`, `code-pair-finish`, `engage-estop`).
+//! - [`estop_lease`]: the control lease shared with a count of the e-stop engages
+//!   waiting for its lock, which the act verbs read before each send.
 //! - [`flashback`]: publishes a capture request when the ops-plane e-stop is engaged.
 //! - [`clock`]: the robot's TRUSTED clock for pairing verification (never a
 //!   client-supplied time).
@@ -93,6 +95,7 @@ pub mod daemon;
 pub mod device_index;
 pub mod epoch_pull;
 pub mod error;
+pub mod estop_lease;
 pub mod flashback;
 pub mod forward;
 pub mod host;
@@ -119,6 +122,7 @@ pub use daemon::{
 };
 pub use device_index::DeviceAccountIndex;
 pub use error::RemotedError;
+pub use estop_lease::EstopLease;
 pub use flashback::{EstopCaptureAsk, TransportAsk};
 pub use host::{BoundPlane, KeyFiles, KeyProvider, RemotePlane};
 pub use local_schema::SchemaSource;

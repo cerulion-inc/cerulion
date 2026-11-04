@@ -31,6 +31,7 @@ use cerulion_core::transport::service::{
     derive_client_guid, reply_topic, request_topic, ServiceClient,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
+use cerulion_core::FullQueueSend;
 
 use crate::text::{body_to_json, message_frame, qualified_type_name, InterfaceKind, VerbError};
 
@@ -223,6 +224,14 @@ pub fn resolve_store_service_types(
 /// within what is left of it, is [`VerbError::Unavailable`]. An interrupted
 /// call returns [`VerbError::Unavailable`] too; a `running` cleared before
 /// the request goes out sends no request, even to a server that is ready.
+///
+/// The client's request publisher is built with [`FullQueueSend::Discard`],
+/// so the send returns without waiting on a server whose request queue is
+/// full (a request topic created without safe overflow) and skips that
+/// server. A request that reaches none of the servers subscribed before and
+/// after the send is [`VerbError::Unavailable`] naming the full request
+/// queue; one that reaches some of them waits for its response, and an error
+/// after that says how many servers it skipped.
 pub fn service_call(
     req: &CallRequest<'_>,
     types: &ServiceTypes,
@@ -267,8 +276,11 @@ pub fn service_call_gated(
         )));
     }
     let mut sent = None;
+    let servers_before = client.server_count();
     if running.load(Ordering::Relaxed) {
-        send_gate(&mut || sent = Some(client.send_request(&request_frame[WireHeader::SIZE..])));
+        send_gate(&mut || {
+            sent = Some(client.send_request_counted(&request_frame[WireHeader::SIZE..]));
+        });
     }
     let Some(sent) = sent else {
         return Err(VerbError::Unavailable(format!(
@@ -276,16 +288,31 @@ pub fn service_call_gated(
             req.service
         )));
     };
-    let sequence = sent?;
+    let (sequence, reached) = sent?;
+    let skipped = request_reach(
+        req.service,
+        reached,
+        servers_before.min(client.server_count()),
+    )?;
+    if let Some(note) = &skipped {
+        tracing::warn!(service = %req.service, reached, "{note}");
+    }
+    let skipped = skipped.map(|note| format!(". {note}")).unwrap_or_default();
     let mut response: Option<Vec<u8>> = None;
     let answered = wait_until(deadline, running, || {
         take_response(&mut client, sequence, &mut response)
     });
     let Some(body) = response.filter(|_| answered) else {
+        if !running.load(Ordering::Relaxed) {
+            return Err(VerbError::Unavailable(format!(
+                "the call to '{}' was stopped before its response arrived{skipped}",
+                req.service
+            )));
+        }
         return Err(VerbError::Unavailable(format!(
-            "service '{}' sent no response within {}. A server that refuses the request \
-             type drops it: check that schemas/ holds the same {} the server was built with \
-             (request schema hash 0x{request_hash:016x}; {} dropped on the response hash)",
+            "service '{}' sent no response within {}{skipped}. A server that refuses the \
+             request type drops it: check that schemas/ holds the same {} the server was built \
+             with (request schema hash 0x{request_hash:016x}; {} dropped on the response hash)",
             req.service,
             format_secs(req.timeout),
             req.type_name,
@@ -293,6 +320,36 @@ pub fn service_call_gated(
         )));
     };
     body_to_json(&types.walker, response_hash, &body)
+}
+
+/// What a request that reached `reached` servers means for the call, given
+/// `servers`, the smaller of the server counts read before and after its
+/// send: an error when it reached none, the servers it skipped in words when
+/// it reached fewer than `servers`, `None` when it reached them all.
+fn request_reach(
+    service: &str,
+    reached: usize,
+    servers: usize,
+) -> Result<Option<String>, VerbError> {
+    match (reached, servers.saturating_sub(reached)) {
+        (0, 0) => Err(VerbError::Unavailable(format!(
+            "the request to '{service}' reached no server: nothing subscribes to {} now",
+            request_topic(service)
+        ))),
+        (0, _) => Err(VerbError::Unavailable(format!(
+            "the request to '{service}' was not delivered: the server's request queue was full \
+             ({servers} server(s) on this machine, none took the request)"
+        ))),
+        (_, 0) => Ok(None),
+        (_, 1) => Ok(Some(format!(
+            "The request reached {reached} of the {servers} servers on this machine; the \
+             request queue of the other was full"
+        ))),
+        (_, n) => Ok(Some(format!(
+            "The request reached {reached} of the {servers} servers on this machine; the \
+             request queues of the other {n} were full"
+        ))),
+    }
 }
 
 /// Open a client on the first free one of [`CLIENT_SLOTS`] client ids. A
@@ -312,12 +369,13 @@ fn open_client(
         if transport.topic_subscriber_count(&reply) > 0 {
             continue;
         }
-        let client = transport.create_service_client(
+        let client = transport.create_service_client_with(
             service,
             guid,
             SERVICE_SLICE_LEN,
             request_hash,
             response_hash,
+            FullQueueSend::Discard,
         )?;
         if transport.topic_subscriber_count(&reply) == 1 {
             return Ok(client);
@@ -564,6 +622,32 @@ mod tests {
         );
         let second = next_call_sequence();
         assert!(second < first, "{second} is not below {first}");
+    }
+
+    #[test]
+    fn a_request_that_reached_no_server_queue_names_the_full_queue() {
+        let full = request_reach("/arm/home", 0, 1).unwrap_err();
+        assert_eq!(full.exit_code(), crate::text::EXIT_UNAVAILABLE);
+        assert_eq!(
+            full.to_string(),
+            "the request to '/arm/home' was not delivered: the server's request queue was full \
+             (1 server(s) on this machine, none took the request)"
+        );
+        let gone = request_reach("/arm/home", 0, 0).unwrap_err();
+        assert_eq!(gone.exit_code(), crate::text::EXIT_UNAVAILABLE);
+        assert!(gone.to_string().contains("reached no server"), "{gone}");
+        assert_eq!(request_reach("/arm/home", 1, 1).unwrap(), None);
+        assert_eq!(request_reach("/arm/home", 2, 1).unwrap(), None);
+        assert_eq!(
+            request_reach("/arm/home", 1, 2).unwrap().unwrap(),
+            "The request reached 1 of the 2 servers on this machine; the request queue of the \
+             other was full"
+        );
+        assert_eq!(
+            request_reach("/arm/home", 1, 4).unwrap().unwrap(),
+            "The request reached 1 of the 4 servers on this machine; the request queues of the \
+             other 3 were full"
+        );
     }
 
     #[test]

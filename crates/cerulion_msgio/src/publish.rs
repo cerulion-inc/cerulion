@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::codegen::FrameWalker;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::ReinjectOutcome;
+use cerulion_core::{FullQueueSend, ReinjectOutcome};
 
 use crate::text::{message_frame, VerbError};
 
@@ -52,15 +52,35 @@ pub struct PubReport {
     pub frames: u64,
     /// Subscribers the last frame was delivered to.
     pub subscribers: usize,
+    /// Deliveries skipped: for each frame, the subscribers attached when it
+    /// was sent less the ones it was delivered to. A subscriber is skipped
+    /// when its queue is full on a topic created without safe overflow.
+    pub skipped: u64,
 }
 
 impl PubReport {
-    /// The one line `topic pub` prints.
+    /// The one line `topic pub` prints, with what was skipped after it when
+    /// a delivery was.
     pub fn line(&self) -> String {
-        format!(
+        let line = format!(
             "published: topic={} type={} frames={} subscribers={}",
             self.topic, self.type_name, self.frames, self.subscribers
-        )
+        );
+        match self.skipped_note() {
+            Some(note) => format!("{line}; {note}"),
+            None => line,
+        }
+    }
+
+    /// What was skipped, in words; `None` when every delivery was made.
+    pub fn skipped_note(&self) -> Option<String> {
+        match self.skipped {
+            0 => None,
+            1 => Some("1 delivery was skipped because a subscriber's queue was full".to_string()),
+            n => Some(format!(
+                "{n} deliveries were skipped because a subscriber's queue was full"
+            )),
+        }
     }
 }
 
@@ -105,6 +125,13 @@ pub fn frames_span(period: Duration, times: u64) -> Duration {
 /// half a second longer. With no subscriber after the wait it publishes anyway
 /// and reports `subscribers=0`. A cleared `running` stops between frames and
 /// reports the frames sent; before the first frame it is an error.
+///
+/// The publisher is built with [`FullQueueSend::Discard`], so a frame's send
+/// returns without waiting on a subscriber whose queue is full (a topic
+/// created without safe overflow) and skips that subscriber. Each frame's
+/// skipped subscribers, the topic's subscriber count read before and after
+/// the send (the smaller of the two) less the subscribers the frame reached,
+/// add up in [`PubReport::skipped`].
 pub fn publish_message<G>(
     req: &PubRequest<'_>,
     walker: &FrameWalker,
@@ -144,7 +171,12 @@ pub fn publish_message_gated<G>(
         })?;
 
     let transport = cerulion_core::TransportManager::get_or_init()?;
-    let injector = transport.create_ingress_injector(req.topic, header.schema_hash, slot)?;
+    let injector = transport.create_ingress_injector_with(
+        req.topic,
+        header.schema_hash,
+        slot,
+        FullQueueSend::Discard,
+    )?;
     let _held = on_open(header.schema_hash);
 
     let deadline = Instant::now() + req.wait_subscribers;
@@ -157,6 +189,7 @@ pub fn publish_message_gated<G>(
 
     let mut frames = 0u64;
     let mut subscribers = 0usize;
+    let mut skipped = 0u64;
     let mut gated = false;
     let mut next = Instant::now();
     while frames < req.times && running.load(Ordering::Relaxed) {
@@ -170,17 +203,18 @@ pub fn publish_message_gated<G>(
         header.timestamp_ns = transport.clock().now_ns();
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);
         let mut sent = None;
-        send_gate(&mut || sent = Some(injector.reinject_raw(&frame)));
+        send_gate(&mut || sent = Some(reinject_counted(&injector, &frame)));
         match sent {
             None => {
                 gated = true;
                 break;
             }
-            Some(ReinjectOutcome::Injected { recipients }) => {
+            Some((ReinjectOutcome::Injected { recipients }, attached)) => {
                 frames += 1;
                 subscribers = recipients;
+                skipped += attached.saturating_sub(recipients) as u64;
             }
-            Some(other) => {
+            Some((other, _)) => {
                 return Err(VerbError::Internal(format!(
                     "publishing frame {} on '{}' failed: {other:?}",
                     frames + 1,
@@ -203,7 +237,22 @@ pub fn publish_message_gated<G>(
         type_name: name.to_string(),
         frames,
         subscribers,
+        skipped,
     })
+}
+
+/// Re-inject `frame` and return the outcome with the topic's subscriber
+/// count, the smaller of its reads before and after the send, so a
+/// subscriber that attaches or leaves during the send is not counted as
+/// skipped.
+fn reinject_counted(
+    injector: &cerulion_core::IngressInjector,
+    frame: &[u8],
+) -> (ReinjectOutcome, usize) {
+    let before = injector.subscriber_count().unwrap_or(0);
+    let outcome = injector.reinject_raw(frame);
+    let after = injector.subscriber_count().unwrap_or(0);
+    (outcome, before.min(after))
 }
 
 /// Sleep until `at`, in slices that re-check `running`; false if it cleared.
@@ -270,15 +319,27 @@ mod tests {
 
     #[test]
     fn the_report_line_is_the_documented_shape() {
-        let report = PubReport {
+        let mut report = PubReport {
             topic: "/cmd_vel".to_string(),
             type_name: "geometry_msgs/Twist".to_string(),
             frames: 3,
             subscribers: 1,
+            skipped: 0,
         };
         assert_eq!(
             report.line(),
             "published: topic=/cmd_vel type=geometry_msgs/Twist frames=3 subscribers=1"
+        );
+        report.skipped = 1;
+        assert_eq!(
+            report.line(),
+            "published: topic=/cmd_vel type=geometry_msgs/Twist frames=3 subscribers=1; 1 \
+             delivery was skipped because a subscriber's queue was full"
+        );
+        report.skipped = 2;
+        assert_eq!(
+            report.skipped_note().unwrap(),
+            "2 deliveries were skipped because a subscriber's queue was full"
         );
     }
 }

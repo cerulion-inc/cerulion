@@ -5,9 +5,13 @@
 //! `topic-snapshot` read a live publisher's frame, and `service-call` gets an
 //! answer from `cerulion_core`'s `ServiceServer` (the server `rmw_cerulion`
 //! wraps) built from a `.srv` in the `CERULION_REMOTED_SCHEMAS_DIR` store.
+//! On a topic a raw iceoryx2 node created with safe overflow disabled, a
+//! publish whose frames meet a full queue returns and reports the skipped
+//! deliveries, and an e-stop engaged during a publish or a call there
+//! completes within a bound.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use cerud::verbs::VerbHandler;
@@ -17,6 +21,7 @@ use cerulion_msgio::text::{body_to_json, message_frame};
 use cerulion_remoted::act_verbs::{
     ServiceCallVerb, TopicEchoOnceVerb, TopicPublishVerb, TopicSnapshotVerb, SCHEMAS_DIR_ENV,
 };
+use iceoryx2::service::port_factory::PortFactory as _;
 use serde_json::json;
 use serial_test::serial;
 
@@ -460,4 +465,249 @@ fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable(
         started.elapsed() < Duration::from_secs(5),
         "the wait ended at the e-stop"
     );
+}
+
+type Raw = iceoryx2::service::ipc::Service;
+type RawSubscriber = iceoryx2::port::subscriber::Subscriber<Raw, [u8], ()>;
+
+/// How long a verb, or an e-stop engaged during one, may take in the
+/// full-queue tests below before the test ends the wait and fails.
+const BOUND: Duration = Duration::from_secs(20);
+
+/// A topic's data service a raw iceoryx2 node creates with safe overflow
+/// disabled, so a publisher's send meets a full queue instead of replacing
+/// the oldest queued sample. Its port caps and buffer ceiling are the ones
+/// Cerulion's openers require, so they accept it. `blocker` is a 1-deep
+/// subscriber that never takes: iceoryx2 gives each publisher and
+/// subscriber pair its own queue, so one frame from a publisher fills that
+/// publisher's queue to it. A send waits on a full queue only while both
+/// ends of it are attached; a subscriber attaches its end of a publisher's
+/// queue when it is created after that publisher, or when it updates its
+/// connections. `observer`, when present, is a subscriber the test drains.
+struct NoOverflowTopic {
+    blocker: Option<RawSubscriber>,
+    observer: Option<RawSubscriber>,
+    observed: usize,
+    service: iceoryx2::service::port_factory::publish_subscribe::PortFactory<Raw, [u8], ()>,
+    _node: iceoryx2::node::Node<Raw>,
+}
+
+impl NoOverflowTopic {
+    /// The data service on `topic`, with no subscriber yet.
+    fn create(topic: &str) -> Self {
+        let transport = cerulion_core::TransportManager::get_or_init().unwrap();
+        let caps = cerulion_core::transport::TopicServiceConfig::for_service_request(
+            transport.subscriber_buffer_size(),
+        );
+        let node = iceoryx2::node::NodeBuilder::new()
+            .config(&transport.iox_config())
+            .create::<Raw>()
+            .unwrap();
+        let name: iceoryx2::service::service_name::ServiceName =
+            format!("{topic}/data").as_str().try_into().unwrap();
+        let service = node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .enable_safe_overflow(false)
+            .subscriber_max_buffer_size(transport.subscriber_buffer_size())
+            .max_publishers(caps.max_publishers.unwrap())
+            .max_subscribers(caps.max_subscribers.unwrap())
+            .create_with_attributes(
+                &cerulion_core::transport::wire_header_attribute::data_service_specifier().unwrap(),
+            )
+            .unwrap();
+        assert!(!service.static_config().has_safe_overflow());
+        Self {
+            blocker: None,
+            observer: None,
+            observed: 0,
+            service,
+            _node: node,
+        }
+    }
+
+    /// Create the blocker and, when `observed`, the observer after it.
+    /// Each is attached to the queue of every publisher on the service now.
+    fn subscribe(&mut self, observed: bool) {
+        self.blocker = Some(
+            self.service
+                .subscriber_builder()
+                .buffer_size(1)
+                .create()
+                .unwrap(),
+        );
+        if observed {
+            self.observer = Some(self.service.subscriber_builder().create().unwrap());
+        }
+    }
+
+    /// Wait, within [`BOUND`], until a publisher is on the service.
+    fn wait_for_publisher(&self, what: &str) {
+        let deadline = std::time::Instant::now() + BOUND;
+        while self.service.dynamic_config().number_of_publishers() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} opened no publisher within {BOUND:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// What `rx` delivers within [`BOUND`]. Past it the blocker is dropped,
+    /// which ends a send waiting on its queue, and the test fails.
+    fn bounded<T>(&mut self, rx: &mpsc::Receiver<T>, what: &str) -> T {
+        match rx.recv_timeout(BOUND) {
+            Ok(value) => value,
+            Err(_) => {
+                drop(self.blocker.take());
+                panic!("{what} did not return within {BOUND:?}: a send waited on the full queue");
+            }
+        }
+    }
+
+    /// Drain the observer until it has received `n` samples in all, within
+    /// [`BOUND`]. Past it the blocker is dropped and the test fails.
+    fn wait_observed(&mut self, n: usize, what: &str) {
+        let deadline = std::time::Instant::now() + BOUND;
+        while self.observed < n {
+            let observer = self.observer.as_ref().unwrap();
+            while self.observed < n && observer.receive().unwrap().is_some() {
+                self.observed += 1;
+            }
+            if self.observed < n && std::time::Instant::now() >= deadline {
+                drop(self.blocker.take());
+                panic!(
+                    "{what} delivered {} of {n} samples to the observer within {BOUND:?}: a \
+                     send waited on the blocker's full queue",
+                    self.observed
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// `f`'s value over a channel, from a new thread.
+fn in_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> mpsc::Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx
+}
+
+#[test]
+#[serial]
+fn a_publish_into_a_full_queue_returns_and_reports_the_skipped_deliveries() {
+    store();
+    let topic = format!("/act_verbs_test/full_queue/publish_{}", std::process::id());
+    let mut full = NoOverflowTopic::create(&topic);
+    let publish = in_thread({
+        let topic = topic.clone();
+        move || {
+            TopicPublishVerb::new(lease()).execute(&json!({"topic": topic,
+                "type": "std_msgs/String", "message": {"data": "x"}, "times": 3,
+                "rate_hz": 100, "wait_subscribers_s": 5}))
+        }
+    });
+    // The publish waits for a subscriber; the blocker, created after its
+    // publisher, is attached to that publisher's queue.
+    full.wait_for_publisher("the publish");
+    full.subscribe(false);
+    let result = full.bounded(&publish, "the publish").unwrap();
+    // Frame 1 fills the blocker's queue; frames 2 and 3 skip it.
+    assert_eq!(
+        (
+            &result["frames"],
+            &result["subscribers"],
+            &result["skipped"]
+        ),
+        (&json!(3), &json!(0), &json!(2))
+    );
+    assert_eq!(
+        result["line"],
+        format!(
+            "published: topic={topic} type=std_msgs/String frames=3 subscribers=0; 2 \
+             deliveries were skipped because a subscriber's queue was full"
+        )
+    );
+}
+
+#[test]
+#[serial]
+fn an_estop_engaged_while_a_publish_meets_a_full_queue_completes_within_the_bound() {
+    store();
+    let topic = format!("/act_verbs_test/full_queue/estop_{}", std::process::id());
+    let mut full = NoOverflowTopic::create(&topic);
+    let l = lease();
+    let publish = in_thread({
+        let (l, topic) = (l.clone(), topic.clone());
+        move || {
+            TopicPublishVerb::new(l).execute(&json!({"topic": topic,
+                "type": "std_msgs/String", "message": {"data": "x"}, "times": 500,
+                "rate_hz": 50, "wait_subscribers_s": 5}))
+        }
+    });
+    full.wait_for_publisher("the publish");
+    full.subscribe(true);
+    // The blocker's queue is full after the first frame it takes, so at
+    // least two of the three frames the observer receives met that full
+    // queue.
+    full.wait_observed(3, "the publish");
+    let engaged = in_thread({
+        let l = l.clone();
+        move || {
+            l.lock().unwrap().engage_estop("test");
+        }
+    });
+    full.bounded(&engaged, "engaging the e-stop");
+    match full.bounded(&publish, "the publish").unwrap_err() {
+        CerudError::Verb(m) => assert!(
+            m.starts_with("unavailable: the robot's e-stop engaged after ")
+                && m.contains("of 500 frames; ")
+                && m.ends_with(" skipped because a subscriber's queue was full"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The call sends its one request through a request publisher it creates,
+/// and iceoryx2 gives each publisher and subscriber pair its own queue, so
+/// the request meets an empty queue at both servers even with safe overflow
+/// disabled. The call then waits for a response neither sends, and an e-stop
+/// engaged during that wait completes at once and ends the call.
+#[test]
+#[serial]
+fn a_call_on_a_no_overflow_request_topic_is_bounded_and_an_estop_during_it_completes() {
+    store();
+    let service = format!("/act_verbs_test/full_queue/call_{}", std::process::id());
+    let request = cerulion_core::transport::service::request_topic(&service);
+    let mut full = NoOverflowTopic::create(&request);
+    full.subscribe(true);
+    let l = lease();
+    let call = in_thread({
+        let (l, service) = (l.clone(), service.clone());
+        move || {
+            ServiceCallVerb::new(l).execute(
+                &json!({"service": service, "type": "demo_srvs/srv/Ping", "timeout_s": 10}),
+            )
+        }
+    });
+    full.wait_observed(1, "the call");
+    let engaged = in_thread({
+        let l = l.clone();
+        move || {
+            l.lock().unwrap().engage_estop("test");
+        }
+    });
+    full.bounded(&engaged, "engaging the e-stop");
+    match full.bounded(&call, "the call").unwrap_err() {
+        CerudError::Verb(m) => assert!(
+            m.starts_with("unavailable: the robot's e-stop engaged")
+                && m.contains("stopped before its response arrived"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
 }
