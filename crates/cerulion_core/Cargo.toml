@@ -207,9 +207,10 @@ zenoh = { version = "1.10.1", default-features = false, features = [
     "transport_tls",
     "unstable",
 ] }
-# Reads a `quic/` listener's certificate at session open to refuse a CA:TRUE
-# certificate, which webpki rejects as an end entity at handshake time
-# (`apply_tls` in transport/network.rs). The version zenoh-link-commons already uses.
+# Reads a `quic/` or `tls/` listener's certificate at session open and at
+# `cerulion-netd` start-up to refuse a CA:TRUE certificate, which webpki
+# rejects as an end entity at handshake time (`check_tls_files` in
+# transport/carrier.rs). The version zenoh-link-commons already uses.
 x509-parser = "0.18"
 # Team certificate profile and names (`transport/team_auth.rs`): a team session
 # checks its leaf and issuing CA certificates with the same code that issues them.

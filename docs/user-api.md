@@ -381,6 +381,36 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | `cerulion logout` | Sign this machine out. Removes the session and refresh tokens from `~/.cerulion/auth.json` (the account id and the signed-in-before marker stay, the same record Cerulion Studio's "Sign out" writes), then revokes the session at the account service (`POST /v1/auth/revoke`). Every command the login gate covers is then refused (exit 7, "signed out") until the next `cerulion login`; at a terminal that command starts the sign-in instead. STDOUT is one line, `signed_out: account=<id>`, or `not_signed_in` when no session was stored (exit 0, nothing changed). Exit 1 when `auth.json` could not be rewritten (nothing was signed out), or when the machine was signed out but the service did not confirm the revoke (offline, service error): the session then stays valid at the service until it expires. A cached device certificate is left; revoke the device with `cerulion account devices revoke`. |
 | `cerulion account devices list` / `devices revoke <DEVICE_ID>` | List and revoke the desks enrolled on your account: self-service management of your own machines. Robot access management lives in Studio and the web account page, not the CLI. |
 
+### `cerulion doctor`
+
+`cerulion doctor [--json] [--local] [--check ID]... [--timeout-ms MS]` checks this host for problems that slow or stop Cerulion. Each check reads one fact about the machine and reports `pass`, `info` (a fact with no judgement), `warn` (Cerulion works, slower or less reliably in the way the line says), `fail` (a Cerulion feature does not work here as the machine is) or `skip` (the check does not apply on this platform, or was not run on request). Every `warn` and `fail` prints why it matters and the exact command or edit that fixes it. No check needs root, and none writes a file or changes a sysctl or a network setting; `limits.open-files` raises the verb's own soft open-file limit the way `graph run` does, so it reads the limit a graph gets. The verb runs on a machine that has never signed in: the login gate does not run before it. Like every command it sends one usage event when telemetry is on; no finding is in it.
+
+| Flag | Effect |
+|---|---|
+| `--json` | Print the report as one JSON object on stdout instead of the table. |
+| `--local` | Skip the checks that use the network; no check in this release does. `CERULION_NETWORK=off` does the same. |
+| `--check ID` | Run only this check; repeatable. An unknown id is a usage error (exit 2). |
+| `--timeout-ms MS` | How long to wait for the checks, which run at the same time. A check that has not answered by then is reported as `warn` and nothing it would have read is shown. Default 4000: twice the bounded scan the stale-node check makes. |
+
+Exit 0 when no check failed (warnings included), 1 when any check failed, 2 for a usage error.
+
+The JSON object carries `report_version` (1; it changes only when a field is removed or changes meaning), `cerulion_version`, `os`, `arch`, `timeout_ms`, `exit_code`, `counts` (one number per status) and `checks`, one entry per check in the order below: `id`, `status`, `summary`, `why`, `fix` (a string for every `warn` and `fail`, else `null`), `network`, `elapsed_ms` (`null` for a check that did not answer) and `readings`, the named values the check read. A check id is never reused for another meaning.
+
+| Check | Reads | Fails or warns when |
+|---|---|---|
+| `limits.open-files` | The open-file limit after the raise `graph run` makes, and each workspace graph's ports | Fails when `graph run` would refuse a workspace graph at that limit; the fix is the refusal's own remedy |
+| `shm.dev-shm` | Linux: `/dev/shm` size, free space and mount flags | Fails when it is missing or read-only; warns when one scheduler-trace ring no longer fits |
+| `shm.stale-nodes` | The iceoryx2 node registry, and on macOS the `/tmp/*.shm_state` files, read the way `cerulion clean --report-only` reads them | Warns when dead processes left nodes or state files (the fix is `cerulion clean`), or when the registry or the state-file scan could not be read in full |
+| `iceoryx2.cwd-config` | `config/iceoryx2.toml` in the current directory against the user and system iceoryx2 config | Warns when a process started here uses another shared-memory root or prefix than one started elsewhere |
+| `disk.recordings` | The filesystem under the first of `./recordings` (where `graph run --record` writes) and `<workspace>/recordings` (where flashback captures go) that exists, else the current directory (where `bag record` writes and `graph run --record` would create `recordings/`); `CERULION_FLASHBACK_DIR` is not read | For a recordings directory, fails when it is read-only, not writable or full; for the current directory, warns instead. Warns when it is tmpfs |
+| `account.login` | The local sign-in state, with no network | Fails when this machine never signed in, signed out, the sign-in file cannot be read or parsed, or no config directory resolves |
+| `cpu.governor` | Linux: each CPU's frequency governor, floor and maximum | Never: it is `info` only, and Cerulion changes no governor |
+| `clock.sync` | Linux and macOS: the kernel's clock discipline state (`ntp_adjtime`, a read that changes nothing), with its error bound and last offset | Warns when the kernel marks the clock unsynchronised |
+| `net.mtu` | Linux: the MTU of each IP interface (Ethernet, PPP, raw-IP LTE and 5G modems, IP tunnels, WireGuard, TUN) that is up and not a loopback | Warns when an interface is below 1228 bytes: a QUIC datagram carries at least 1200 bytes plus the UDP and IPv4 headers |
+| `gpu.cuda` | Linux: the NVIDIA driver version, `/dev/nvidia<N>` devices, Jetson release, CUDA toolkit version and whether the loader cache names `libcuda.so.1`, from files only | Warns when this host has an NVIDIA device node or is a Jetson and `/etc/ld.so.cache` does not name `libcuda.so.1`; otherwise `info` |
+| `ros.distro` | `ROS_DISTRO`, `ROS_VERSION` and `AMENT_PREFIX_PATH` | Never: `info` when a ROS 2 distribution is sourced, `skip` when none is (a ROS 1 shell, `ROS_VERSION=1`, counts as none) |
+| `ros.rmw` | Whether `librmw_cerulion.so` is where `cerulion ros2 run` looks (`CERULION_LIB_DIR`, else beside `cerulion`), and `RMW_IMPLEMENTATION` | Fails when a ROS 2 environment is sourced and the library is missing or its directory cannot be resolved (the fix is the one `ros2 run` prints); warns or informs otherwise. Not applicable on macOS |
+
 ### Other
 
 | Command | Effect |
@@ -711,6 +741,60 @@ An Android app links its nodes this way into one native library, its app runtime
 ---
 
 ## Node author API (the macros)
+
+### What a node crate depends on
+
+A node needs the runtime and the message types, and there are two manifests
+that provide them.
+
+One dependency, which is what `cargo add cerulion` writes:
+
+```toml
+[dependencies]
+cerulion = "1.0.0"
+```
+
+`cerulion` is an umbrella crate that re-exports the other three at a single
+version. A node written against it imports `cerulion::prelude::*` and takes
+its port types from `cerulion::msgs`.
+
+Or the crates themselves, which is what `cerulion workspace create` scaffolds
+and what every example in this document uses:
+
+```toml
+[dependencies]
+cerulion_core = "1.0.0"
+native_ros2_messages = "1.0.0"
+```
+
+Either works. The macros read the package's own `Cargo.toml` at expansion
+time to decide how to spell the paths they emit, because Rust resolves the
+first segment of an absolute path only against a crate the package names in
+its own manifest:
+
+| The package names | Generated paths start with |
+|---|---|
+| `cerulion_core` and not `cerulion` | `::cerulion_core` |
+| `cerulion` and not `cerulion_core` | `::cerulion::core` |
+| both, with `cerulion` a plain `[dependencies]` entry without `optional = true`, and `cerulion_core` not one | `::cerulion::core` |
+| both, any other way | `::cerulion_core` |
+
+The third row is the layout where only the umbrella is linked into every
+target: `cerulion_core` sits in `[dev-dependencies]`, in a
+`[target.'cfg(..)'.dependencies]` table, or behind `optional = true`. A
+package whose generated paths start with `::cerulion_core` gets the same
+generated code it got before the macros read the manifest, so a type error on
+a node's field is still reported at that field.
+
+A package that names neither is refused: Cargo does not hand a package its
+transitive dependencies, so a re-export in some crate further down cannot
+stand in. The macros report that by name, with both manifests spelled out,
+rather than leaving a resolution error against a path nobody wrote.
+
+`cerulion_macros` is never a direct dependency. The macros arrive with the
+prelude.
+
+### The shape of a node
 
 A node lives in `nodes/<type>/src/lib.rs` and looks like this:
 
@@ -2239,8 +2323,8 @@ rejection names the offending topic or setting and the fix:
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
 | Duplicates | The same topic twice in one list. |
-| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
-| Certificate files | A `quic/` or `tls/` listener without `tls.certificate` + `tls.private_key`, a `quic/` or `tls/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` or `tls/` connect, or `certificate`/`private_key` with no `quic/` or `tls/` listen. |
+| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`ws/`, no `<carrier>/`), a `rel`/`mixed_rel` value zenoh refuses, or a datagram-only locator (plain `udp/<host>:<port>`, `udp/...?rel=0`, `quic/...?rel=0`), which sends each message once with no retransmission. |
+| Certificate files | A `quic/` or `tls/` listener without `tls.certificate` + `tls.private_key`, a `quic/` or `tls/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` or `tls/` connect, `certificate`/`private_key` with no `quic/` or `tls/` listen, or a `tls:` block that sets no file. |
 | Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
@@ -3315,7 +3399,7 @@ below; that is why they exist.
 | Variable | Meaning |
 |---|---|
 | `CERULION_RECORD_DISCOVERY` | `off` disables live-topic discovery for any recorder in that environment. The rule is whether the topic set was **inferred or named**: discovery is ON for `graph run --record` and for `cerulion bag record --run`, whose universes are both inferred from a run, and OFF whenever you named the topics yourself (`bag record` with positional topics, `--all` or `--regex`). It is on for `--run` because a run's DECLARED outputs need not be what it actually puts on the wire: a bridge graph can declare a handful of topics while many more bridge routes stream, and a bag claiming to describe a run while omitting most of it is the defect discovery exists to close. Reach for `off` when you want a strictly declaration-shaped bag, or when discovery's extra taps are competing for subscriber slots on a busy machine. |
-| `CERULION_RECORD_DISCOVERY_SETTLE_MS` | How long the recorder holds bag creation open for late-appearing topics, in ms. Default **2000**, with an absolute floor of 500 ms once discovery is on. `0` disables the hold. Widen it when a bag reports a topic as `appeared_after_bag_creation`; the equivalent flag is `cerulion bagd --discovery-settle-ms`. |
+| `CERULION_RECORD_DISCOVERY_SETTLE_MS` | How long the recorder holds bag creation open for late-appearing topics, in ms. This is a CAP: the hold is released as soon as 500 ms have passed with nothing new discovered and the recorder's first look at the live topics is in, so a graph whose topic set is already complete pays about that 500 ms and not the cap. Default **2000**. `0` disables the hold. Widen it when a bag reports a topic as `appeared_after_bag_creation`; the equivalent flag is `cerulion bagd --discovery-settle-ms`. |
 | `CERULION_RECORD_SCHEMA_DEMAND_MS` | The budget, in ms, for resolving a recorded channel's schema over the network when the local corpus does not name it (default **4000**). `0` disables the networked rungs. It matters most on a `ros2 attach` robot, where the bridged routes are exactly the channels a local schema store may not know. Flag equivalent: `cerulion bagd --schema-demand-timeout-ms`. |
 
 One more recording switch is read by the RUN (each process that writes scheduler
@@ -3485,6 +3569,9 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` | `off` forces a strictly LOCAL-ONLY daemon: no zenoh session ever, and a remote demand surfaces a plain "not network-configured" answer instead of hanging. Only the exact value `off` engages it; any other non-empty value warns and the network stays on. Mirrors `CERULION_NETWORK=off` but scoped to the daemon, so it never surprises a `graph run` sharing the machine. The commands that reach the network through the daemon honor it too: with `CERULION_NETD_NETWORK=off`, `topic list`, `topic echo`, `topic hz`, `topic info` and `schema info` stay LOCAL-ONLY, opening no discovery session of their own; with either variable at `off`, `cerulion viz --robot` refuses before contacting the daemon. |
 | `CERULION_NETD_CONNECT` / `CERULION_VIZD_CONNECT` | Comma/whitespace-separated zenoh locators to dial (`tcp/192.168.123.99:7683`). Each is where the corresponding verb's `--connect` is threaded when that command STARTS its daemon: `cerulion viz --connect` into the vizd one, a demanding consumer's `--connect` into the netd one. |
 | `CERULION_NETD_LISTEN` / `CERULION_VIZD_LISTEN` | Comma/whitespace-separated zenoh locators to bind (`tcp/0.0.0.0:7447`). The `--listen` counterpart of the row above, threaded the same way. |
+| `CERULION_NETD_TLS_ROOT_CA` | Absolute path of the PEM certificate(s) the peer of a `quic/` or `tls/` connect locator must chain to (graph `tls.root_ca`). Such a connect locator needs it, and it is refused when no connect locator is `quic/` or `tls/`. |
+| `CERULION_NETD_TLS_CERTIFICATE` | Absolute path of the PEM certificate a `quic/` or `tls/` listen locator presents (graph `tls.certificate`). It must not be marked `CA:TRUE`. |
+| `CERULION_NETD_TLS_PRIVATE_KEY` | Absolute path of the PEM private key for `CERULION_NETD_TLS_CERTIFICATE` (graph `tls.private_key`). A `quic/` or `tls/` listen locator needs both, and both are refused when no listen locator is `quic/` or `tls/`. `cerulion-netd` applies the graph-load carrier rules to these variables and to `CERULION_NETD_CONNECT` / `CERULION_NETD_LISTEN` at start-up, and refuses to start, naming the variable, on a setting that cannot work. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
 | `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
