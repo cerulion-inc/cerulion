@@ -5,9 +5,7 @@
 //! The graph is one relay node that reads the app topic `cmd` on a trigger
 //! input and writes `echo`, a graph output: each frame copies `x` and writes
 //! the node's tick count into `z`. The app subscribes to both topics, so one
-//! publish shows up once on each. A second graph holds one node that sends a
-//! single frame from its `init` and never again. It runs under both
-//! transports: the default
+//! publish shows up once on each. It runs under both transports: the default
 //! cross-process one, and the in-process one an app uses
 //! (`--features local-transport`). The node registry and the transport are
 //! process state, so this file is its own binary and holds ONE test that runs
@@ -17,68 +15,17 @@ use std::time::{Duration, Instant};
 
 use cerulion_android::codes;
 use cerulion_android::{EmbeddedRuntime, RuntimeState};
-use cerulion_core::error::TransportResult;
-use cerulion_core::graph::node::{NodeContext, NodeEntry, NodeInfo};
 use cerulion_core::transport::TransportManager;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::MacroPolicy;
 use serde_json::json;
 use tempfile::tempdir;
 
 cerulion_android::embed_nodes! {
     "test_node_macro_relay_rlib" => test_node_macro_relay_rlib::RelayNodeEntry,
-    "init_sender" => InitSender,
 }
 
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
 const VECTOR3: &str = "geometry_msgs/Vector3";
-
-/// A node that sends one frame on `state` from its `init` and nothing
-/// after: its period is an hour, and its tick sends nothing. It keeps its
-/// context, so the publisher outlives the frame.
-#[derive(Default)]
-struct InitSender {
-    context: Option<NodeContext>,
-}
-
-impl InitSender {
-    fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl NodeEntry for InitSender {
-    fn info(&self) -> TransportResult<NodeInfo> {
-        Ok(
-            NodeInfo::from_names(Vec::new(), vec!["state".to_string()]).with_policy(
-                MacroPolicy::Period {
-                    period_ms: 3_600_000,
-                },
-            ),
-        )
-    }
-
-    fn init(&mut self, mut context: NodeContext) -> TransportResult<()> {
-        let frame = cerulion_android::encode::encode_json(
-            &schemas_layout(VECTOR3),
-            r#"{"x":7.0}"#,
-            64,
-            0,
-            0,
-        )
-        .expect("a Vector3 frame");
-        context
-            .publisher_mut("state")
-            .expect("the state output")
-            .publish_raw(&frame)?;
-        self.context = Some(context);
-        Ok(())
-    }
-
-    fn tick(&mut self) -> TransportResult<()> {
-        Ok(())
-    }
-}
 
 struct Topics {
     cmd: String,
@@ -293,34 +240,6 @@ fn a_frame_of_another_schema_is_consumed_and_counted(runtime: &mut EmbeddedRunti
     runtime.stop().expect("stop the subscription-only run");
 }
 
-/// The one frame a node sends from its `init` reaches the app: the
-/// subscription attaches before any node starts.
-fn receives_the_frame_a_node_sends_from_init(runtime: &mut EmbeddedRuntime, pid: u32) {
-    let prefix = format!("poll_init_{pid}");
-    let state = format!("/{prefix}/boot/state");
-    let config = json!({
-        "graph_yaml": format!(
-            "prefix: {prefix}
-nodes:
-  - id: boot
-    type: init_sender
-    outputs:
-      - name: state
-        schema: {VECTOR3}
-"
-        ),
-        "subscribe": [{"topic": state, "schema": VECTOR3}],
-    })
-    .to_string();
-    runtime
-        .start(&config)
-        .expect("a start whose node sends from init");
-    assert_eq!(poll_n(runtime, &state, 1), [r#"{"x":7.0,"y":0.0,"z":0.0}"#]);
-    assert_eq!(poll(runtime, &state), None);
-    assert_eq!(counts(runtime, &state), (1, 0, 0));
-    runtime.stop().expect("stop the init-send run");
-}
-
 fn schemas_layout(name: &str) -> cerulion_core::dynamic::WireLayout {
     let (schemas, _) = cerulion_core::dynamic::SchemaSet::from_schemas(
         cerulion_cli_engine::schema_cmd::parse_builtin_schemas(),
@@ -335,19 +254,6 @@ fn refuses_a_subscription_it_cannot_serve(runtime: &mut EmbeddedRuntime, topics:
         (
             json!({"subscribe": [{"topic": "/poll/deep", "schema": VECTOR3, "depth": 17}]}),
             "depth 17 for '/poll/deep' exceeds the subscription queue limit 16".to_string(),
-        ),
-        (
-            // A graph output attaches inside the graph build, which keeps
-            // the refusal's own code and text.
-            json!({
-                "graph_yaml": topics.graph,
-                "publish": [{"topic": topics.cmd, "schema": VECTOR3}],
-                "subscribe": [{"topic": topics.echo, "schema": VECTOR3, "depth": 17}],
-            }),
-            format!(
-                "depth 17 for '{}' exceeds the subscription queue limit 16",
-                topics.echo
-            ),
         ),
         (
             json!({"subscribe": [{"topic": "/poll/pose", "schema": "geometry_msgs/Pose"}]}),
@@ -432,6 +338,5 @@ fn an_app_polls_a_graph_output_and_an_app_topic() {
     runtime.stop().expect("stop the second run");
 
     a_frame_of_another_schema_is_consumed_and_counted(&mut runtime, pid);
-    receives_the_frame_a_node_sends_from_init(&mut runtime, pid);
     refuses_a_subscription_it_cannot_serve(&mut runtime, &topics);
 }

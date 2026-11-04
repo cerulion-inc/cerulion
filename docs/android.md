@@ -376,10 +376,9 @@ is counted from the gap in its publisher's message sequence, so a message
 dropped before the first one the subscription receives from that publisher
 is not counted. A message that
 does not decode, for example one of another schema, is still taken off the
-queue, so the next poll reads the one after it. The runtime attaches a
-subscription to a graph output before any node's `init` runs, so it receives
-the first message a node sends, also one sent from `init`. A subscription
-can read a graph output, an app `publish` topic, or a
+queue, so the next poll reads the one after it. The runtime creates every
+subscription before the graph runs, so it receives the first message a node
+sends. A subscription can read a graph output, an app `publish` topic, or a
 topic another publisher in the process sends; a start logs a warning for a
 subscribe topic that is neither an app `publish` topic nor a graph output,
 because a misspelled topic polls `EMPTY` forever. `poll` reads a run that

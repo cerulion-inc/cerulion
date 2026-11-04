@@ -49,16 +49,6 @@ impl Subscription {
         }
     }
 
-    /// Open the connection to every publisher the topic has now, and take
-    /// no message. A subscriber connects at its creation and then only when
-    /// it receives, so one created before a publisher has no connection to
-    /// it until then. If that publisher sends and is dropped first, the
-    /// frame is lost. A connection that fails here fails the next poll
-    /// too, which returns the error.
-    pub(crate) fn connect(&self) {
-        let _queued = self.subscriber.has_pending_sample();
-    }
-
     /// Take the oldest queued message and decode it into JSON text, or
     /// return `None` when the queue is empty. Returns the subscription's
     /// counts after this poll with the result.

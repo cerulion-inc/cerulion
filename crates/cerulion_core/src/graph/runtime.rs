@@ -4178,8 +4178,6 @@ impl GraphRuntime {
             recorded_topics,
             cross_process,
             purpose,
-            // No caller hook between the service pre-create and node `init`.
-            None,
         )
     }
 
@@ -4298,46 +4296,6 @@ impl GraphRuntime {
             // IS the full graph, so there is no cross-group requirement union
             // and no split `block` edge to bind.
             CrossProcessWiring::none(),
-            None,
-        )
-    }
-
-    /// [`Self::build_live_with_schema_hashes_policy_and_recorded`] plus
-    /// `before_init`, which the build calls once: after it has created the
-    /// service of every topic the graph produces, and before the first
-    /// node's `init`. A subscriber the callback opens on a graph output
-    /// therefore receives a frame a node sends from its `init`; one opened
-    /// after the build misses that frame when the output keeps no history.
-    /// An error from the callback fails the build before any node starts.
-    /// Such a subscriber predates the nodes' publishers and connects to them
-    /// only when it next receives or probes
-    /// ([`crate::CerulionSubscriber::has_pending_sample`]): make that call
-    /// once the build returns, before a node can finish and drop its
-    /// publisher.
-    ///
-    /// The embedded Android runtime attaches its app subscriptions here.
-    #[allow(clippy::too_many_arguments)]
-    // hot-path-alloc-ok-fn: cold: graph BUILD runs once per process, before the first step
-    pub fn build_live_with_schema_hashes_policy_recorded_and_before_init(
-        config: GraphConfig,
-        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
-        transport: &TransportManager,
-        clock: Arc<dyn Clock>,
-        schema_hashes: Option<&HashMap<String, u64>>,
-        policy: crate::monitor_wait::MonitorWaitPolicy,
-        recorded_topics: Option<&std::collections::HashSet<String>>,
-        before_init: &mut dyn FnMut() -> TransportResult<()>,
-    ) -> TransportResult<Self> {
-        Self::build_live_core(
-            config,
-            node_factories,
-            transport,
-            clock,
-            schema_hashes,
-            policy,
-            recorded_topics,
-            CrossProcessWiring::none(),
-            Some(before_init),
         )
     }
 
@@ -4395,7 +4353,6 @@ impl GraphRuntime {
             // path (the record arm is `build_live_deterministic_free_run`).
             None,
             cross_process,
-            None,
         )
     }
 
@@ -4417,8 +4374,6 @@ impl GraphRuntime {
         policy: crate::monitor_wait::MonitorWaitPolicy,
         recorded_topics: Option<&std::collections::HashSet<String>>,
         cross_process: CrossProcessWiring<'_>,
-        // See `build_with_scheduler`'s parameter of the same name.
-        before_init: Option<&mut dyn FnMut() -> TransportResult<()>>,
     ) -> TransportResult<Self> {
         super::validation::validate_graph_with(&config, cross_process.validation_options())?;
         let clock_dyn = clock.clone();
@@ -4447,7 +4402,6 @@ impl GraphRuntime {
             cross_process,
             // A live build exists to be driven.
             BuildPurpose::Execution,
-            before_init,
         )
     }
 
@@ -4828,8 +4782,6 @@ impl GraphRuntime {
             cross_process,
             // A deterministic-live build (monolith or worker) is driven.
             BuildPurpose::Execution,
-            // No caller hook between the service pre-create and node `init`.
-            None,
         )?;
         Ok(runtime)
     }
@@ -5145,12 +5097,6 @@ impl GraphRuntime {
         // teardown reconciliation line by marking the context BEFORE `init()`
         // moves it into a cdylib.
         purpose: BuildPurpose,
-        // Called once after the pre-create pass has created every OWNED
-        // topic's service and before the first node's `init`, so a
-        // subscriber it opens receives what a node sends from `init`. `None`
-        // on every caller but
-        // `build_live_with_schema_hashes_policy_recorded_and_before_init`.
-        before_init: Option<&mut dyn FnMut() -> TransportResult<()>>,
     ) -> TransportResult<Self> {
         // A `ros2:` entry is SPAWNED by `cerulion graph run` as a supervised
         // process, never scheduled by this runtime — a config still carrying
@@ -6944,11 +6890,6 @@ impl GraphRuntime {
         // how many of those topics a sibling group was planned to read.
         let mut producer_doorbells_armed: usize = 0;
         let mut producer_doorbells_planned: usize = 0;
-        // Every owned topic's service exists (the pre-create pass above) and
-        // no node has run `init` yet.
-        if let Some(before_init) = before_init {
-            before_init()?;
-        }
         for node_def in &config.nodes {
             let mut entry = node_factories.swap_remove(&node_def.id).ok_or_else(|| {
                 TransportError::GraphError {
