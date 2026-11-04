@@ -25,7 +25,7 @@ use cerulion_core::transport::{
     TRANSPORT_KIND,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess};
+use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess, TransportError};
 use cerulion_mdns::MdnsAdvertiseGuard;
 use iceoryx2::config::Config as IoxConfig;
 use iceoryx2::prelude::{FilePath, SemanticString};
@@ -1335,20 +1335,50 @@ fn build_into(
         &mut run.publishers,
     )?;
 
-    // 3. The graph, built but not yet running.
+    // 3. The graph, built but not yet running. The build creates the
+    //    service of every topic the graph produces and then initializes the
+    //    nodes, and a node can send from its `init`. So an app subscription
+    //    to a topic this run produces attaches between the two, and the
+    //    first frame a node sends lands in its queue.
     let graph_runtime = if let Some(inputs) = plan.graph.as_mut() {
         let clock: Arc<dyn Clock> = Arc::new(RealClock);
         let schema_hashes = schema_hash_map(&plan.schemas);
-        let mut graph_runtime = GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
-            inputs.config.clone(),
-            std::mem::take(&mut inputs.factories),
-            &manager,
-            Arc::clone(&clock),
-            Some(&schema_hashes),
-            cerulion_cli_engine::graph_cmd::embedded_live_monitor_wait_policy(),
-            plan.recorded_graph_topics.as_ref(),
-        )
-        .map_err(|error| EmbedError::Graph(error.to_string()))?;
+        let mut subscribe_error = None;
+        let mut attach_subscriptions = || {
+            create_subscriptions(
+                plan.subscribes.iter().filter(|item| item.produced_in_run),
+                &manager,
+                &mut run.subscriptions,
+            )
+            .map_err(|error| {
+                let reason = format!("app subscriptions: {error}");
+                subscribe_error = Some(error);
+                TransportError::GraphError { reason }
+            })
+        };
+        let mut graph_runtime =
+            GraphRuntime::build_live_with_schema_hashes_policy_recorded_and_before_init(
+                inputs.config.clone(),
+                std::mem::take(&mut inputs.factories),
+                &manager,
+                Arc::clone(&clock),
+                Some(&schema_hashes),
+                cerulion_cli_engine::graph_cmd::embedded_live_monitor_wait_policy(),
+                plan.recorded_graph_topics.as_ref(),
+                &mut attach_subscriptions,
+            )
+            .map_err(|error| {
+                subscribe_error
+                    .take()
+                    .unwrap_or_else(|| EmbedError::Graph(error.to_string()))
+            })?;
+        // Those subscriptions predate the nodes' publishers. Connect them
+        // while every publisher is alive: a node that sends once and then
+        // finishes drops its publisher, and its frame goes with it unless
+        // the subscription has opened that connection.
+        for subscription in run.subscriptions.values() {
+            subscription.connect();
+        }
         graph_runtime.set_live_transport(Arc::clone(&manager));
         // The graph thread takes the runtime: status keeps this reader.
         lock_status(status).node_failures =
@@ -1358,9 +1388,17 @@ fn build_into(
         None
     };
 
-    // 3b. App subscriptions, after every topic this run produces exists and
-    //     before any producer runs, so the first frame lands in the queue.
-    create_subscriptions(&plan.subscribes, &manager, &mut run.subscriptions)?;
+    // 3b. The other app subscriptions: all of them when there is no graph,
+    //     else the ones to a topic no producer of this run sends. Such a
+    //     topic can feed a graph input, so it attaches after the graph has
+    //     opened that service at the depth its inputs need.
+    create_subscriptions(
+        plan.subscribes
+            .iter()
+            .filter(|item| graph_runtime.is_none() || !item.produced_in_run),
+        &manager,
+        &mut run.subscriptions,
+    )?;
 
     // 4. The recorder runs before any producer, as `armed_before_producers`
     //    requires.
@@ -1664,8 +1702,8 @@ fn create_publishers(
     Ok(())
 }
 
-fn create_subscriptions(
-    config: &[ResolvedSubscribe],
+fn create_subscriptions<'a>(
+    config: impl IntoIterator<Item = &'a ResolvedSubscribe>,
     manager: &TransportManager,
     subscriptions: &mut BTreeMap<String, Subscription>,
 ) -> Result<(), EmbedError> {
