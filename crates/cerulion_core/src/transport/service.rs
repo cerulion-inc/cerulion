@@ -29,7 +29,7 @@
 //! The server keeps a reply publisher and a request-sequence entry per
 //! client GUID, and forgets a client whose reply topic has no subscriber
 //! left: when a request arrives from a GUID it holds no entry for, it checks
-//! every client it holds and drops the departed ones, and a response that
+//! every other client it holds and drops the departed ones, and a response that
 //! reaches no subscriber drops that client's entries. A client that is
 //! dropped and recreated under a new GUID (an `rmw_cerulion` client after a
 //! restart) therefore leaves nothing behind once the next new client sends
@@ -767,10 +767,10 @@ impl ServiceServer {
     /// ([`TransportManager::topic_subscriber_count_checked`] reads `Some(0)`).
     /// A client whose reply topic cannot be probed is kept, and the failed
     /// probes are counted in one warning. The client whose request arrived
-    /// (`arrived`) is not probed: its sequence entry is what reports a gap in
-    /// its next request, with or without a reply subscriber. Runs one iceoryx2
-    /// service open per other client the server holds, each time a request
-    /// arrives from a new GUID.
+    /// (`arrived`) is not probed, so a client without a reply subscriber keeps
+    /// its entry until a later sweep or a response that reaches no subscriber.
+    /// Runs one iceoryx2 service open per other client the server holds, each
+    /// time a request arrives from a new GUID.
     fn forget_departed_clients(&mut self, arrived: &[u8; 16]) {
         let mut guids: Vec<[u8; 16]> = self
             .last_seen_seq
@@ -808,9 +808,8 @@ impl ServiceServer {
                 service = %self.service,
                 clients = unprobed,
                 first_topic = first_unprobed.as_deref().unwrap_or(""),
-                "could not open the reply topics of these service clients to read \
-                 whether they are still present; their reply publishers are kept \
-                 (the open error is logged at debug level)"
+                "could not probe the reply topics of these service clients for a \
+                 subscriber; their reply publishers are kept"
             );
         }
     }
