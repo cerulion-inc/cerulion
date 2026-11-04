@@ -111,7 +111,8 @@ impl Drop for GatewayOwnership {
 
 /// Reset the manager-wide gateway state to the quiescent baseline: LAN
 /// access paired, no egress topic announced (the bare robot-identity token
-/// stays), no bridge flag registered and the latched schema serving empty.
+/// stays), no bridge flag registered and the latched catalog serving empty
+/// (schemas, hashes, boot topics and observed frames).
 /// Idempotent; it logs a failure and never returns one, so it can run on
 /// every teardown path. Call it only while no gateway drives the manager.
 fn quiesce(manager: &TransportManager) {

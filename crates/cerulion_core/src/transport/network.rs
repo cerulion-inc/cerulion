@@ -2332,8 +2332,8 @@ fn runs_serve_decision(
 /// [`cerulion_q::CatalogReply`]. The GATEWAY owns the writers - it drains the
 /// runtime-registration control channel into `hashes`, and `boot_topics` is set
 /// at boot (and by a host restart's `SchemaServingHandles::replace`) - while the query-surface callback (on the zenoh callback thread) reads
-/// them + the live bridge manager to answer a catalog GET. Cheap to clone (three
-/// `Arc`s).
+/// them + the live bridge manager to answer a catalog GET. Cheap to clone
+/// (reference-counted handles only).
 #[derive(Clone)]
 pub struct CatalogSource {
     /// Canonical runtime-registered topic → the `schema_hash` the producing
@@ -2382,8 +2382,9 @@ pub struct CatalogSource {
     pub producer_probe: Option<Weak<TransportManager>>,
     /// The shared DATA-FLOW liveness table
     /// ([`TopicLivenessObserver::table`](super::liveness::TopicLivenessObserver::table))
-    /// the gateway's observer writes on its drive thread and this serve reads on
-    /// the zenoh callback thread. Stamps each entry's
+    /// the running gateway's observer writes on its drive thread (a gateway
+    /// rebuilt under this latched surface writes the same table) and this serve
+    /// reads on the zenoh callback thread. Stamps each entry's
     /// [`CatalogEntry::liveness`](super::cerulion_q::CatalogEntry::liveness).
     ///
     /// This exists because [`Self::producer_probe`] answers the WRONG question
@@ -5538,6 +5539,10 @@ impl NetworkManager {
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.hashes),
             Arc::clone(&catalog.boot_topics),
+            // A surface started without a liveness table (a test seam)
+            // serves no liveness, so a later gateway records into a table
+            // nothing reads, matching what this surface serves.
+            catalog.liveness.clone().unwrap_or_default(),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -5607,7 +5612,7 @@ impl NetworkManager {
     /// `start_query_surface` no-ops on the latch), so a caller merging serving
     /// into "what the catalog/schema verbs serve" MUST merge through these —
     /// handles taken from a later gateway object name maps the callback never
-    /// reads. Cheap (three `Arc`s).
+    /// reads. Cheap (`Arc`s only).
     pub fn query_surface_serving_handles(
         &self,
     ) -> Option<crate::transport::gateway::SchemaServingHandles> {
@@ -6720,6 +6725,7 @@ mod tests {
             snapshot_lock,
             Arc::clone(&catalog.hashes),
             Arc::clone(&catalog.boot_topics),
+            Default::default(),
         );
 
         // The restart: the next run serves /run_two/cam only.
@@ -6815,6 +6821,7 @@ mod tests {
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.hashes),
             Arc::clone(&catalog.boot_topics),
+            Default::default(),
         );
         handles.merge(&crate::transport::gateway::SchemaServing {
             topic_schemas: vec![crate::transport::gateway::TopicSchema {
