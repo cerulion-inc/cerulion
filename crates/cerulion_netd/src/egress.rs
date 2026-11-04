@@ -215,6 +215,12 @@ pub trait EgressPlane: Send + Sync {
         None
     }
 
+    /// Every egress topic's send-queue counters on the shared gateway, sorted
+    /// by topic, or `None` when this plane runs no gateway.
+    fn egress_stats(&self) -> Option<Vec<cerulion_core::EgressTopicStats>> {
+        None
+    }
+
     /// Release the egress registration for `id`. The registered egress LINGERS
     /// on the shared gateway past release (the reg-channel is add-only; retraction
     /// is not implemented); any declared topic announce token also lingers. The
@@ -273,6 +279,10 @@ struct RunningGateway {
     /// zero-demand wait from outside, since the gateway itself is owned by the
     /// thread.
     stats: Arc<cerulion_core::GatewayDriveStats>,
+    /// Principle #3: the gateway's per-topic egress send-queue counters
+    /// (forwarded, dropped, refused, failed, discarded), cloned before the
+    /// gateway moves onto the thread. `status` reports them.
+    egress: Arc<cerulion_core::EgressStats>,
     /// Set by the drive thread IF [`GatewayRuntime::run`] returned an error (an
     /// abnormal drive-loop death, distinct from the clean exit-flag teardown). While
     /// set, [`GatewayEgressPlane::ensure_gateway_booted`] treats this slot as dead and
@@ -333,8 +343,8 @@ fn run_gateway_drive(
                 reason: "netd egress drive fault (test seam)".to_string(),
             });
         }
-        let forwarded = gateway.drive_once()?;
-        if forwarded == 0 {
+        let queued = gateway.drive_once()?;
+        if queued == 0 {
             // Backlog-aware pacing (a forwarded pass loops again immediately).
             // The idle tick is the gateway's OWN `idle_wait` —
             // the 1 ms `GATEWAY_IDLE_POLL` while any demand is ON,
@@ -731,6 +741,7 @@ impl GatewayEgressPlane {
         // gateway is moved onto the drive thread — after the move the plane has no
         // other handle on either.
         let stats = gateway.drive_stats();
+        let egress = gateway.egress_stats();
         let wake = self.manager.bridge_manager().demand_signal();
         let exit = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
@@ -763,6 +774,7 @@ impl GatewayEgressPlane {
             exit,
             wake,
             stats,
+            egress,
             dead,
             fault,
             handle: Some(handle),
@@ -861,6 +873,14 @@ impl EgressPlane for GatewayEgressPlane {
             schema_serving,
             ix_config_json,
         })
+    }
+
+    fn egress_stats(&self) -> Option<Vec<cerulion_core::EgressTopicStats>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|g| g.egress.snapshot())
     }
 
     fn register_egress(

@@ -772,6 +772,7 @@ impl Ctx {
             // daemon's absent field (which decodes to `None`).
             connect_endpoints: Some(self.connect_endpoints.clone()),
             lan_access: self.egress_plane.lan_access(),
+            egress: self.egress_plane.egress_stats(),
         })
     }
 

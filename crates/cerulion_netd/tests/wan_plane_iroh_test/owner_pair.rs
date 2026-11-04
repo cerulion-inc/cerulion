@@ -199,7 +199,7 @@ fn first_owner_demand_pairs_once_delivers_data_and_invalidates_sessions() {
     assert_oracle_and_gap_free(&frames);
     assert_eq!(robot.binding(&seed), Some(OWNER));
     let store = TrustStore::load(&robot.config.store_file, MAC).unwrap();
-    let row = store.is_allowed(&OWNER, T_NOW).unwrap();
+    let row = store.account_access(&OWNER, T_NOW).unwrap();
     assert_eq!(row.scope, Scope::OWNER_FULL);
     assert_eq!(row.source, cerulion_pairing::verify::PairingSource::Claim);
     assert_eq!(row.expires_at_ns, None);

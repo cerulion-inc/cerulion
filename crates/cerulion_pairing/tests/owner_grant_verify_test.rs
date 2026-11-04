@@ -225,7 +225,7 @@ fn establish_writes_an_owner_signed_row_and_is_allowed_reports_it() {
 
     // The durable row exists with the OwnerSignedGrant provenance + the effective scope.
     let row = store
-        .is_allowed(&acct(SUBJECT), T_NOW)
+        .account_access(&acct(SUBJECT), T_NOW)
         .expect("subject is allowed");
     assert_eq!(row.source, PairingSource::OwnerSignedGrant);
     assert_eq!(row.scope, op_scope());
@@ -234,7 +234,7 @@ fn establish_writes_an_owner_signed_row_and_is_allowed_reports_it() {
 
     // The owner's own row is untouched (still OWNER_FULL from the claim).
     let owner_row = store
-        .is_allowed(&acct(OWNER), T_NOW)
+        .account_access(&acct(OWNER), T_NOW)
         .expect("owner still allowed");
     assert_eq!(owner_row.scope, Scope::OWNER_FULL);
 }
@@ -300,7 +300,7 @@ fn a_revoked_subject_device_is_refused_through_the_owner_grant_path_tombstone() 
             Some("desk".into()),
         )
         .expect("the owner grant establishes before revocation");
-    assert!(store.is_allowed(&acct(SUBJECT), T_NOW).is_some());
+    assert!(store.account_access(&acct(SUBJECT), T_NOW).is_some());
 
     // Epoch 2 revokes the subject's DEVICE key (the SUBJECT account is untouched).
     let e = make_epoch_with_devices(
@@ -676,6 +676,59 @@ fn refuses_a_subject_revoked_by_the_owner() {
 }
 
 #[test]
+fn an_owner_grant_from_a_new_device_cannot_readmit_an_owner_revoked_subject() {
+    let mut store = claimed_store();
+    store
+        .establish_by_owner_grant(&good_presentation(), &subject_peer(), T_NOW, None)
+        .unwrap();
+    // The subject's second device presents the same owner-signed grant.
+    let laptop = pk(&sk(22));
+    let mut pres = good_presentation();
+    pres.subject_cert = device_cert(acct(SUBJECT), laptop, op_scope(), wide_validity());
+    // Verified while the subject still has access.
+    let laptop_pairing = store.verify_owner_grant(&pres, &laptop, T_NOW).unwrap();
+    store.owner_revoke(&acct(OWNER), &acct(SUBJECT)).unwrap();
+
+    // A fresh presentation from the laptop is refused and writes no row.
+    let rows = store.access_rows().to_vec();
+    let err = store
+        .establish_by_owner_grant(&pres, &laptop, T_NOW, None)
+        .unwrap_err();
+    assert!(matches!(err, PairingError::RevokedByOwner), "got {err:?}");
+    assert_eq!(store.access_rows(), rows.as_slice());
+    assert!(store.is_allowed(&acct(SUBJECT), &laptop, T_NOW).is_none());
+
+    // The grant verified before the revoke writes the laptop's row revoked.
+    store
+        .establish_pairing(
+            &laptop_pairing,
+            PairingSource::OwnerSignedGrant,
+            None,
+            T_NOW,
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.access_rows().len(), rows.len() + 1);
+    assert!(
+        store.is_allowed(&acct(SUBJECT), &laptop, T_NOW).is_none(),
+        "a new device's owner grant must not readmit an owner-revoked subject"
+    );
+    assert!(store.account_access(&acct(SUBJECT), T_NOW).is_none());
+
+    store.owner_readmit(&acct(OWNER), &acct(SUBJECT)).unwrap();
+    assert_eq!(
+        store
+            .is_allowed(&acct(SUBJECT), &laptop, T_NOW)
+            .unwrap()
+            .device,
+        Some(laptop)
+    );
+    assert!(store
+        .establish_by_owner_grant(&pres, &laptop, T_NOW, None)
+        .is_ok());
+}
+
+#[test]
 fn refuses_a_subject_revoked_by_epoch() {
     let mut store = claimed_store();
     // Push an epoch revoking the subject.
@@ -734,7 +787,7 @@ fn a_failed_verification_never_advances_the_floor_or_writes_a_row() {
         "a rejected grant must not move the floor"
     );
     assert!(
-        store.is_allowed(&acct(SUBJECT), T_NOW).is_none(),
+        store.account_access(&acct(SUBJECT), T_NOW).is_none(),
         "no row written on refusal"
     );
 }
@@ -766,7 +819,7 @@ fn a_time_boxed_owner_grant_row_is_denied_once_it_expires() {
 
     // The durable row carries the grant's finite bound (hand oracle).
     let row = store
-        .is_allowed(&acct(SUBJECT), T_NOW)
+        .account_access(&acct(SUBJECT), T_NOW)
         .expect("allowed at establishment time");
     assert_eq!(
         row.expires_at_ns,
@@ -775,21 +828,23 @@ fn a_time_boxed_owner_grant_row_is_denied_once_it_expires() {
     );
 
     // Admitted strictly BEFORE the bound (T_NOW and one ns before expiry).
-    assert!(store.is_allowed(&acct(SUBJECT), T_NOW).is_some());
+    assert!(store.account_access(&acct(SUBJECT), T_NOW).is_some());
     assert!(
         store
-            .is_allowed(&acct(SUBJECT), GRANT_EXPIRY_NS - 1)
+            .account_access(&acct(SUBJECT), GRANT_EXPIRY_NS - 1)
             .is_some(),
         "allowed up to the instant before expiry"
     );
     // DENIED at the bound and beyond (`now_ns >= not_after_ns`), with NO revoke.
     assert!(
-        store.is_allowed(&acct(SUBJECT), GRANT_EXPIRY_NS).is_none(),
+        store
+            .account_access(&acct(SUBJECT), GRANT_EXPIRY_NS)
+            .is_none(),
         "denied exactly at the expiry instant (half-open window)"
     );
     assert!(
         store
-            .is_allowed(&acct(SUBJECT), GRANT_EXPIRY_NS + 1_000_000_000)
+            .account_access(&acct(SUBJECT), GRANT_EXPIRY_NS + 1_000_000_000)
             .is_none(),
         "still denied well past expiry"
     );
@@ -798,7 +853,7 @@ fn a_time_boxed_owner_grant_row_is_denied_once_it_expires() {
     // indefinitely — proving expiry is scoped to the owner-signed grant, not global.
     assert!(
         store
-            .is_allowed(&acct(OWNER), GRANT_EXPIRY_NS + 1_000_000_000)
+            .account_access(&acct(OWNER), GRANT_EXPIRY_NS + 1_000_000_000)
             .is_some(),
         "an established (None-expiry) row never rots"
     );
@@ -825,7 +880,7 @@ fn an_unbounded_owner_grant_row_never_expires() {
         .expect("an unbounded grant establishes");
 
     let row = store
-        .is_allowed(&acct(SUBJECT), T_NOW)
+        .account_access(&acct(SUBJECT), T_NOW)
         .expect("allowed now");
     assert_eq!(
         row.expires_at_ns, None,
@@ -833,7 +888,7 @@ fn an_unbounded_owner_grant_row_never_expires() {
     );
     assert!(
         store
-            .is_allowed(&acct(SUBJECT), GRANT_EXPIRY_NS + 1_000_000_000)
+            .account_access(&acct(SUBJECT), GRANT_EXPIRY_NS + 1_000_000_000)
             .is_some(),
         "an unbounded owner grant never rots"
     );
@@ -873,7 +928,7 @@ fn a_delegator_revoked_late_gate_writes_no_row_and_does_not_advance_the_floor() 
         "a late-gate refusal must not advance the anti-rollback floor"
     );
     assert!(
-        store.is_allowed(&acct(SUBJECT), T_NOW).is_none(),
+        store.account_access(&acct(SUBJECT), T_NOW).is_none(),
         "a late-gate refusal must write NO subject row"
     );
 }
@@ -921,7 +976,7 @@ fn an_owner_grant_for_owner_late_gate_writes_no_row_and_leaves_the_owner_row_int
     );
     // The owner's own row is UNTOUCHED — no OwnerSignedGrant write clobbered it.
     let owner_row = store
-        .is_allowed(&acct(OWNER), T_NOW)
+        .account_access(&acct(OWNER), T_NOW)
         .expect("owner still allowed");
     assert_eq!(owner_row.source, PairingSource::Claim);
     assert_eq!(owner_row.scope, Scope::OWNER_FULL);

@@ -812,7 +812,8 @@ pub use scheduler::{
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
 pub use transport::carrier::{
-    classify_locator, Carrier, EgressQos, EgressReliability, MixedRel, NetworkTls,
+    check_carrier_settings, check_tls_files, classify_locator, stream_only_locators, Carrier,
+    CarrierSettingNames, EgressQos, EgressReliability, MixedRel, NetworkTls,
 };
 pub use transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, RunEntry, RunEntryState, RunsCompleteness,
@@ -822,6 +823,7 @@ pub use transport::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
+pub use transport::egress_send::{EgressStats, EgressTopicStats};
 pub use transport::events::PubSubEvent;
 pub use transport::gateway::{
     GatewayDriveStats, GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime,
