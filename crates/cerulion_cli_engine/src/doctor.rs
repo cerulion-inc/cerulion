@@ -14,9 +14,11 @@
 //!
 //! [`run`] starts every selected check on its own thread and waits for all of
 //! them up to one deadline. A check that has not answered by then is
-//! reported as `warn` (did not answer) and its thread is abandoned; the
-//! process exits once the report is printed, so the abandoned thread ends
-//! with it. Checks only read, so abandoning one leaves nothing half done.
+//! reported as `warn` (did not answer) and its thread is abandoned, as are
+//! the probe threads `net.udp` leaves behind after its own budget. The `cerulion`
+//! binary exits once the report is printed, so the abandoned threads end with
+//! it; an embedder calling [`run`] keeps them until they finish. A check
+//! changes nothing on the host, so an abandoned one leaves nothing half done.
 //!
 //! [`Report`] renders as the human table ([`Report::render_human`]) and as
 //! JSON ([`Report::to_json`]), whose shape is versioned by
@@ -36,9 +38,11 @@ mod disk;
 mod gpu;
 mod iceoryx2_config;
 mod limits;
+mod mdns;
 mod mtu;
 mod ros;
 mod shm;
+pub mod udp_probe;
 
 /// The version of the `--json` report shape. It changes only when a field is
 /// removed or changes meaning; a new check or a new reading keeps it.
@@ -154,6 +158,8 @@ impl Outcome {
 pub struct Context {
     /// The directory the command runs in.
     pub cwd: PathBuf,
+    /// The `--udp-target` endpoints (`host:port`) for `net.udp`.
+    pub udp_targets: Vec<String>,
 }
 
 impl Context {
@@ -199,6 +205,8 @@ pub static CATALOGUE: &[Check] = &[
     certificates::CERTIFICATES,
     daemons::NETD,
     daemons::REMOTED,
+    mdns::MDNS,
+    udp_probe::UDP,
 ];
 
 /// The ids of every check, in catalogue order (for `--check` completion).
@@ -564,6 +572,7 @@ mod tests {
     fn ctx() -> Context {
         Context {
             cwd: PathBuf::from("/"),
+            udp_targets: Vec::new(),
         }
     }
 
@@ -576,10 +585,12 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("Cargo.toml");
         let inside = Context {
             cwd: root.join("nodes/a"),
+            udp_targets: Vec::new(),
         };
         assert_eq!(inside.workspace_root(), Some(root));
         let outside = Context {
             cwd: tmp.path().to_path_buf(),
+            udp_targets: Vec::new(),
         };
         assert_eq!(outside.workspace_root(), None);
     }
@@ -617,6 +628,16 @@ mod tests {
         assert!(err
             .to_string()
             .starts_with("no check is named `no.such`; the checks are: limits.open-files"));
+    }
+
+    #[test]
+    fn exactly_the_mdns_and_udp_checks_use_the_network() {
+        let network: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|c| c.network)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(network, vec!["net.mdns", "net.udp"]);
     }
 
     #[test]
