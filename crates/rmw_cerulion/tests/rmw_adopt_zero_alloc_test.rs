@@ -691,11 +691,11 @@ fn a_copy_path_take_costs_zero_rust_allocations() {
     }
 }
 
-/// More publishers on one topic than the old 16-entry gid cache held. Each
-/// take WITH a message-info pointer resolves the sender's gid; once every
-/// publisher has been seen, that lookup is a cache hit and allocates
-/// nothing. A cache smaller than the topic's publisher count would miss on
-/// every take here, and each miss walks the publisher list, which allocates.
+/// Twenty publishers on one topic, each frame taken WITH a message-info
+/// pointer. The take reports the sender's gid from the sample's origin id,
+/// which allocates nothing, so a take with info costs no more allocations
+/// than one without, whatever the number of publishers. A gid lookup that
+/// walked the topic's publisher list would allocate on these takes.
 #[test]
 #[serial]
 fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations() {
@@ -745,7 +745,7 @@ fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations()
             assert!(taken, "a published frame must be takeable");
             info
         };
-        // Warm-up: one frame from every publisher, so each origin is cached.
+        // Warm-up: one frame from every publisher, taken before measuring.
         for (i, p) in publishers.iter().enumerate() {
             publish_scan(*p, 16, i as f32);
             let info = take_with_info(&mut msg);

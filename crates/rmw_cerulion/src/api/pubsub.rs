@@ -760,17 +760,11 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // degraded-open behavior governs and a resulting warn is then GENUINE
         // (the create-side-floor precedent: create provisions the
         // ceiling, a later open merely tolerates it).
-        // The entity gid (`crate::gid`), minted before the port so the port
-        // is created under the name that carries it: a subscription in any
-        // process reads the name back from the sample's origin id and reports
-        // this gid as the message's publisher gid.
-        let gid = crate::gid::mint_gid();
-        let publisher = match rt.transport.create_named_publisher_with_topic_config(
+        let publisher = match rt.transport.create_publisher_with_topic_config(
             &topic,
             slice_len,
             history,
             topic_config,
-            &crate::gid::publisher_port_name(&gid),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -778,6 +772,10 @@ pub unsafe extern "C" fn rmw_create_publisher(
                 return std::ptr::null_mut();
             }
         };
+        // The publisher gid is its iceoryx2 port id (`crate::gid`), the id
+        // every sample this port sends carries as its origin, so a take in
+        // any process reports this gid as the message's publisher gid.
+        let gid = crate::gid::publisher_gid(publisher.publisher_id());
 
         // The depth this endpoint reports is its clamped ask: TRANSIENT_LOCAL
         // depth-N reports N clamped to the type's limit (KEEP_ALL reports the
@@ -2592,23 +2590,6 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 return std::ptr::null_mut();
             }
         };
-        // The publisher gid each take reports is read from the topic's
-        // publisher directory. A subscription without one would report the
-        // all-zero gid on every take, and rclcpp would then deliver each
-        // intra-process message twice, so the create fails instead.
-        let publisher_directory = match rt.transport.open_publisher_directory(&topic) {
-            Ok(d) => d,
-            Err(e) => {
-                let reason = format!(
-                    "subscription creation failed on {topic}: the topic's publisher \
-                     directory did not open ({e}), and without it a take cannot report \
-                     which publisher sent a message"
-                );
-                tracing::error!("{reason}");
-                let _ = ffi::rcutils_set_error_state_best_effort(&reason);
-                return std::ptr::null_mut();
-            }
-        };
         // The effective borrow budget is the
         // service's real capacity — smaller than the requested floor when the
         // service already existed (the floor is CREATE-leg-only). The adopt
@@ -2684,9 +2665,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // Adopt-take hot path: the
         // adoption scratch is reserved UP FRONT to the type's forgeable-
         // member count — the high-water bound both Vecs ever reach — so the
-        // FIRST adopted take allocates only the structural Arc, plus, when
-        // the take asks for message info, the one publisher-list walk that
-        // resolves a publisher's gid the first time it is seen. A
+        // FIRST adopted take allocates only the structural Arc. A
         // `Vec::new()` here would make the first adopted receive grow both
         // scratch Vecs before the one allocation the contract allows. Zero
         // for a type with no forgeable member (no reservation at all).
@@ -2716,7 +2695,6 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 // the first adopted take grows neither (see above).
                 adopt_ranges: Vec::with_capacity(forgeable_members),
                 adopt_registered: Vec::with_capacity(forgeable_members),
-                publisher_gids: crate::gid::PublisherGidResolver::new(Some(publisher_directory)),
             }),
             gid,
             decode_failures: std::sync::Mutex::new(
@@ -3118,10 +3096,6 @@ unsafe fn take_impl_live(
             );
         }
     });
-    let publisher_gid = match info_out {
-        Some((_, _, origin)) if !message_info.is_null() => inner.publisher_gids.resolve(origin),
-        _ => [0u8; 16],
-    };
     drop(inner);
 
     match receive {
@@ -3143,7 +3117,7 @@ unsafe fn take_impl_live(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            super::stamp_publisher_gid(&mut info, &publisher_gid);
+            super::stamp_publisher_gid(&mut info, info_out.map(|(_, _, origin)| origin));
             info.from_intra_process = false;
             *message_info = info;
         }
@@ -3997,11 +3971,6 @@ unsafe fn take_adopted(
         // with nothing adoptable in it.
         _ => adopt.stats.fallbacks.fetch_add(1, Ordering::Relaxed),
     };
-    let publisher_gid = if message_info.is_null() {
-        [0u8; 16]
-    } else {
-        inner.publisher_gids.resolve(origin)
-    };
     drop(inner);
     *taken = true;
     if !message_info.is_null() {
@@ -4013,7 +3982,7 @@ unsafe fn take_adopted(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        super::stamp_publisher_gid(&mut info, &publisher_gid);
+        super::stamp_publisher_gid(&mut info, Some(origin));
         info.from_intra_process = false;
         *message_info = info;
     }
@@ -4479,7 +4448,6 @@ unsafe fn take_loaned_impl(
     *loaned_message = loaned_ptr;
     *taken = true;
     if !message_info.is_null() {
-        let publisher_gid = inner.publisher_gids.resolve(origin);
         // Identical fill to `take_impl`.
         let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
         info.source_timestamp = ts as i64;
@@ -4488,7 +4456,7 @@ unsafe fn take_loaned_impl(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        super::stamp_publisher_gid(&mut info, &publisher_gid);
+        super::stamp_publisher_gid(&mut info, Some(origin));
         info.from_intra_process = false;
         *message_info = info;
     }

@@ -461,7 +461,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         // replayable.
         crate::replay::report_serialized_take(&data.topic);
         // Poisoned = wedged: never re-enter torn iceoryx2 state.
-        let Some(mut inner) = runtime::lock_unpoisoned(&data.inner) else {
+        let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
             tracing::error!("entity wedged by an earlier panic; failing call");
             return RMW_RET_ERROR;
         };
@@ -479,10 +479,6 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
             info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             frame = Some(buf);
         });
-        let publisher_gid = match info_out {
-            Some((_, _, origin)) if !message_info.is_null() => inner.publisher_gids.resolve(origin),
-            _ => [0u8; 16],
-        };
         drop(inner);
         if let Err(e) = receive {
             tracing::error!(topic = %data.topic, error = %e, "serialized take failed");
@@ -514,7 +510,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            super::stamp_publisher_gid(&mut info, &publisher_gid);
+            super::stamp_publisher_gid(&mut info, info_out.map(|(_, _, origin)| origin));
             info.from_intra_process = false;
             *message_info = info;
         }

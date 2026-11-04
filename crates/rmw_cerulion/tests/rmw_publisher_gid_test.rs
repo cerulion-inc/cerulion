@@ -8,10 +8,13 @@
 //! rclcpp drops the rmw copy of a message its intra-process path already
 //! delivered when `rmw_message_info_t::publisher_gid` equals the gid
 //! `rmw_get_gid_for_publisher` returned for one of its own publishers
-//! (compared with `rmw_compare_gids_equal`). These tests pin that every take
-//! path with an info out-parameter reports the publishing rmw publisher's gid,
-//! that a non-rmw publisher reports the all-zero gid, that gids are unique
-//! across processes (two child processes with equal entity numbers), and that
+//! (compared with `rmw_compare_gids_equal`). These tests pin that a
+//! publisher's gid is the id of its iceoryx2 port (the origin every sample
+//! the port sends carries) and does not change while the publisher lives,
+//! that every take path with an info out-parameter reports the publishing
+//! rmw publisher's gid, that a frame another port re-sends (a native
+//! publisher, as a gateway relays) reports that port's id, which matches no
+//! rmw publisher, that publisher gids differ across processes, and that
 //! endpoint info reports the same gids.
 //!
 //! ⚠️ iceoryx2 shared memory is a process singleton: run with
@@ -42,6 +45,7 @@ const ENV_X: &str = "CER_PUBLISHER_GID_X";
 const CHILD_TEST: &str = "subprocess_child_publishes_once";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_GID: &str = "CHILD_GID=";
+const PROBE_PORT: &str = "CHILD_PORT=";
 const PROBE_READY: &str = "CHILD_READY";
 
 fn cstr(s: &str) -> *const c_char {
@@ -209,6 +213,25 @@ fn assert_this_process_layout(gid: &[u8; 16]) {
     );
 }
 
+/// The id of an rmw publisher's iceoryx2 port, read from the port itself.
+unsafe fn port_id(publisher: *const ffi::rmw_publisher_t) -> u128 {
+    let data = &*((*publisher).data as *const rmw_cerulion::runtime::PublisherData);
+    data.inner
+        .lock()
+        .expect("publisher lock")
+        .publisher
+        .publisher_id()
+}
+
+/// The gid a port id stands for: its 16 bytes, least significant first.
+fn le_bytes(id: u128) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = (id >> (8 * i)) as u8;
+    }
+    out
+}
+
 unsafe fn publisher_gid(publisher: *const ffi::rmw_publisher_t) -> ffi::rmw_gid_t {
     let mut gid: ffi::rmw_gid_t = std::mem::zeroed();
     assert_eq!(rmw_get_gid_for_publisher(publisher, &mut gid), RMW_RET_OK);
@@ -261,7 +284,8 @@ unsafe fn take_with_info(
 /// message info reports the publisher's own gid, so rclcpp's
 /// `rmw_compare_gids_equal` filter finds its own publisher and drops the
 /// duplicate. A second rmw publisher on the topic reports its own, distinct,
-/// gid, and a native (non-rmw) publisher reports the all-zero gid.
+/// gid, and a native (non-rmw) publisher that re-sends an rmw frame reports
+/// its own port's id, which matches neither rmw publisher.
 #[test]
 #[serial]
 fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
@@ -289,15 +313,39 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
         let pub_gid = publisher_gid(publisher);
         let second_gid = publisher_gid(second);
         let pub_bytes = gid_bytes(&pub_gid);
-        assert_this_process_layout(&pub_bytes);
-        assert_this_process_layout(&gid_bytes(&second_gid));
+        assert_eq!(
+            pub_bytes,
+            le_bytes(port_id(publisher)),
+            "a publisher's gid is its port id"
+        );
+        assert_eq!(gid_bytes(&second_gid), le_bytes(port_id(second)));
+        assert_ne!(pub_bytes, [0u8; 16]);
         assert!(
             !gids_equal(&pub_gid, &second_gid),
             "two publishers, two gids"
         );
 
+        // A native subscriber on the topic sees the same id as each sample's
+        // origin: the gid is the id the transport stamps on what the port
+        // sends, not a value rmw keeps beside it.
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let native_sub = rt
+            .transport
+            .create_subscriber(&ros_topic)
+            .expect("native subscriber on the rmw topic");
+
         // rmw_take: no info out-parameter, the message still arrives.
         publish(publisher, 1.0);
+        let mut origin = None;
+        assert!(native_sub
+            .try_receive_one(|msg| origin = Some(msg.origin()))
+            .expect("native receive"));
+        assert_eq!(
+            origin.map(le_bytes),
+            Some(pub_bytes),
+            "the sample's origin is the publisher's gid"
+        );
+        drop(native_sub);
         let mut out = CPoint::default();
         let mut taken = false;
         assert_eq!(
@@ -410,9 +458,9 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
             RMW_RET_OK
         );
 
-        // A native publisher (no rmw port name) reports the all-zero gid,
-        // which matches no rmw publisher.
-        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        // A native publisher re-sends the rmw frame, as a gateway relays a
+        // frame it received: the take reports the native port's id, which
+        // matches no rmw publisher, so rclcpp keeps the message.
         let mut native = rt
             .transport
             .create_publisher(&ros_topic, MaxSliceLen::const_new(4096), 0)
@@ -423,16 +471,26 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
             out.x, 6.0,
             "the native publisher re-sent the serialized frame"
         );
-        assert_eq!(gid_bytes(&info.publisher_gid), [0u8; 16]);
+        assert_eq!(
+            gid_bytes(&info.publisher_gid),
+            le_bytes(native.publisher_id())
+        );
         assert!(!gids_equal(&info.publisher_gid, &pub_gid));
         assert!(!gids_equal(&info.publisher_gid, &second_gid));
         drop(native);
 
-        // The first publisher again: the cached entry still answers.
+        // The first publisher again, after its peers came and went: the same
+        // gid from both rmw_get_gid_for_publisher and the take.
         publish(publisher, 8.0);
         let (out, info) = take_with_info(subscription);
         assert_eq!(out.x, 8.0);
         assert!(gids_equal(&info.publisher_gid, &pub_gid));
+        assert_eq!(
+            gid_bytes(&publisher_gid(publisher)),
+            pub_bytes,
+            "a publisher's gid does not change while it lives"
+        );
+        assert_eq!(gid_bytes(&publisher_gid(second)), gid_bytes(&second_gid));
 
         assert_eq!(rmw_destroy_publisher(node, second), RMW_RET_OK);
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
@@ -442,7 +500,8 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
 }
 
 /// Endpoint info reports the gid `rmw_get_gid_for_publisher` returns, and a
-/// subscription's gid follows the same layout.
+/// subscription's gid follows the layout for this process (pid-namespace id,
+/// process id, entity counter).
 #[test]
 #[serial]
 fn endpoint_info_reports_the_same_gids() {
@@ -520,8 +579,10 @@ fn subprocess_child_publishes_once() {
         let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
         assert!(!publisher.is_null());
         let gid = gid_bytes(&publisher_gid(publisher));
+        let port = port_id(publisher);
         publish(publisher, x);
         println!("{PROBE_GID}{}", hex(&gid));
+        println!("{PROBE_PORT}{port:032x}");
         println!("{PROBE_READY}");
         let mut sink = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut sink);
@@ -533,6 +594,7 @@ fn subprocess_child_publishes_once() {
 struct Child {
     process: std::process::Child,
     gid: [u8; 16],
+    port: u128,
 }
 
 /// Spawns a child, reads its gid and waits until it has published.
@@ -568,6 +630,7 @@ fn spawn_child(topic: &str, type_name: &str, x: f64) -> Child {
     });
     let deadline = Instant::now() + CHILD_TIMEOUT;
     let mut gid = None;
+    let mut port = None;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let line = match rx.recv_timeout(left) {
@@ -583,6 +646,10 @@ fn spawn_child(topic: &str, type_name: &str, x: f64) -> Child {
         if let Some(at) = line.find(PROBE_GID) {
             gid = Some(unhex(line[at + PROBE_GID.len()..].trim()));
         }
+        if let Some(at) = line.find(PROBE_PORT) {
+            let digits = line[at + PROBE_PORT.len()..].trim();
+            port = Some(u128::from_str_radix(digits, 16).expect("port id"));
+        }
         if line.contains(PROBE_READY) {
             break;
         }
@@ -590,6 +657,7 @@ fn spawn_child(topic: &str, type_name: &str, x: f64) -> Child {
     Child {
         process,
         gid: gid.expect("the child reports its gid before ready"),
+        port: port.expect("the child reports its port id before ready"),
     }
 }
 
@@ -612,10 +680,9 @@ fn finish_child(mut child: Child) {
     }
 }
 
-/// Two child processes run the same creation sequence, so their publishers
-/// hold the same entity number; their gids still differ (process id), each
-/// follows the layout for its own process, and a take in this process
-/// reports each message's own publisher's gid.
+/// Two child processes run the same creation sequence. Each child's
+/// publisher gid is its own port's id, the two differ, and a take in this
+/// process reports each message's own publisher's gid.
 #[test]
 #[serial]
 fn gids_are_unique_across_processes_and_a_cross_process_take_reports_the_childs_gid() {
@@ -634,20 +701,9 @@ fn gids_are_unique_across_processes_and_a_cross_process_take_reports_the_childs_
         let a = spawn_child(&ros_topic, &type_name, 10.0);
         let b = spawn_child(&ros_topic, &type_name, 20.0);
 
-        assert_eq!(
-            a.gid[8..],
-            b.gid[8..],
-            "equal entity numbers in the two children"
-        );
+        assert_eq!(a.gid, le_bytes(a.port), "child a's gid is its port id");
+        assert_eq!(b.gid, le_bytes(b.port), "child b's gid is its port id");
         assert_ne!(a.gid, b.gid, "gids differ across processes");
-        assert_eq!(
-            u32::from_le_bytes(a.gid[4..8].try_into().unwrap()),
-            a.process.id()
-        );
-        assert_eq!(
-            u32::from_le_bytes(b.gid[4..8].try_into().unwrap()),
-            b.process.id()
-        );
 
         for _ in 0..2 {
             let (out, info) = take_with_info(subscription);

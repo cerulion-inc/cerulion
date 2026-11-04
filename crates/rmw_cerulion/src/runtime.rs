@@ -701,8 +701,8 @@ pub struct PublisherData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<PublisherInner>,
-    /// Entity gid ([`crate::gid`]), also carried by the iceoryx2 port's name
-    /// ([`crate::gid::publisher_port_name`]).
+    /// Publisher gid: the iceoryx2 port id, which every sample the port
+    /// sends carries as its origin ([`crate::gid::publisher_gid`]).
     pub gid: [u8; 16],
     pub sequence: AtomicU64,
     /// Flood-suppressed loudness + an unconditional counter for
@@ -876,9 +876,6 @@ pub struct SubscriptionInner {
     /// adopted take — the all-or-nothing rollback ledger (see
     /// `adopt_ranges`).
     pub adopt_registered: Vec<(usize, usize)>,
-    /// Resolves each taken sample's origin publisher id to the publisher's
-    /// rmw gid, reported in `rmw_message_info_t::publisher_gid`.
-    pub publisher_gids: crate::gid::PublisherGidResolver,
 }
 
 /// One outstanding loaned take.
