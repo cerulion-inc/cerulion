@@ -527,7 +527,11 @@ fn double_drain_and_dead_client_response() {
     server
         .send_response(&ghost, b"into-the-void")
         .expect("response to dead client is Ok (warned, not an error)");
-    assert_eq!(server.known_client_count(), 1);
+    assert_eq!(
+        server.known_client_count(),
+        0,
+        "a response that reaches no subscriber keeps no reply publisher"
+    );
 
     // Empty double-drain.
     let mut calls = 0usize;
@@ -540,6 +544,83 @@ fn double_drain_and_dead_client_response() {
         0
     );
     assert_eq!(calls, 0);
+}
+
+/// Clients that depart leave nothing behind on the server. Each client below
+/// gets a GUID no earlier client had, as an `rmw_cerulion` client does after
+/// a restart, sends one request, takes its response and is dropped. A
+/// CONTROL client stays alive throughout and keeps its entries; the next new
+/// client's request makes the server forget every departed one.
+///
+/// Hand oracle: after five such clients and one new live client, the server
+/// holds exactly the control and the new client (2 reply publishers, 2
+/// sequence entries), where it held 7 of each before departed clients were
+/// forgotten. A client that sends a request and departs before the response
+/// is forgotten when the response reaches no subscriber.
+#[test]
+fn departed_clients_leave_no_reply_publisher_or_sequence_entry_behind() {
+    let transport = test_transport("departed");
+    let service = &unique_service("/departed_svc");
+    let mut server = transport
+        .create_service_server(service, SLICE, req_hash(service), resp_hash(service))
+        .expect("server");
+    let client = |instance: u64| {
+        transport
+            .create_service_client(
+                service,
+                derive_client_guid("departing", service, instance),
+                SLICE,
+                req_hash(service),
+                resp_hash(service),
+            )
+            .expect("client")
+    };
+    let round_trip = |server: &mut ServiceServer, client: &mut ServiceClient| {
+        client.send_request(b"ping").expect("send");
+        let mut envelopes = Vec::new();
+        drain_requests(server, |e, _| envelopes.push(e)).expect("take");
+        assert_eq!(envelopes.len(), 1, "one request");
+        server.send_response(&envelopes[0], b"pong").expect("respond");
+        let mut got = Vec::new();
+        drain_responses(client, |_, p| got.push(p.to_vec())).expect("take response");
+        assert_eq!(got, vec![b"pong".to_vec()], "the client got its response");
+    };
+
+    let mut control = client(0);
+    round_trip(&mut server, &mut control);
+    assert_eq!(server.known_client_count(), 1);
+
+    for instance in 1..=5 {
+        let mut departing = client(instance);
+        round_trip(&mut server, &mut departing);
+        drop(departing);
+    }
+    let mut fresh = client(6);
+    round_trip(&mut server, &mut fresh);
+    assert_eq!(
+        (server.known_client_count(), server.tracked_client_count()),
+        (2, 2),
+        "the control and the new client only (7 and 7 when departed clients are kept)"
+    );
+    // The control is still served after the departed clients were forgotten.
+    round_trip(&mut server, &mut control);
+    assert_eq!(server.known_client_count(), 2);
+
+    // A client that departs between its request and the response.
+    let mut early = client(7);
+    early.send_request(b"ping").expect("send");
+    drop(early);
+    let mut envelopes = Vec::new();
+    drain_requests(&mut server, |e, _| envelopes.push(e)).expect("take");
+    assert_eq!(envelopes.len(), 1);
+    server
+        .send_response(&envelopes[0], b"pong")
+        .expect("a response to a departed client is Ok");
+    assert_eq!(
+        (server.known_client_count(), server.tracked_client_count()),
+        (2, 2),
+        "the departed client's entries are gone, the two live clients' kept"
+    );
 }
 
 /// A failed send must not burn a sequence number —
