@@ -2627,8 +2627,10 @@ the partitioner start from these same link rules; the census then adds its own f
 (`graphs/<NAME>.costs.yaml`, written by `cerulion graph profile`) shows it is safe: the unit's summed
 p50 tick, the new node included, stays under a quarter of the shortest period the merged unit is fed at,
 and under a quarter of the tightest `tick_within_ms` of its members. A unit is fed at each member's own
-period, at the profiled rate of each trigger edge into a member, and at the profiled fire rate of each member
-that no graph node triggers (an external source). **Without a profile nothing merges**: every data-triggered
+period, at the profiled rate of each trigger edge into a member (an edge the profile does not rate feeds it
+as often as its producer is fed, or at an unknown rate from another process), and at the profiled fire rate (the
+fastest profiled trigger edge out) of each member that no graph node triggers or that fires on a topic no
+graph node publishes; a member whose fire rate the profile does not hold makes the feed unknown. **Without a profile nothing merges**: every data-triggered
 node is a unit of its own, so a slow node never holds another node from the first run.
 
 Each unit `cerulion graph plan <NAME>` prints names why its first node starts it:

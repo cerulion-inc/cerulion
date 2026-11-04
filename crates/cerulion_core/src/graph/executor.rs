@@ -31,17 +31,16 @@
 //! node is a unit of its own, so a slow node never holds a fast one from the
 //! first run.
 //!
-//! A unit is fed at each member's own period, else at the fastest profiled
-//! rate of the member's trigger edges in; a member no graph node triggers is
-//! fed at the fastest profiled rate of its trigger edges out (its fire rate).
-//! A member the profile rates no edge into is fed through each trigger edge
-//! from outside its group: from another node of the process at the period
-//! that node's group is fed at before any merge (the node and the nodes
-//! `isolate: false` and couplings joined to it), from another process at an
-//! unknown rate.
-//! Every member's feeds are gathered before the first merge, so a merge is
-//! judged against every feed of the merged unit whichever chain is walked
-//! first.
+//! A unit is fed at each member's own period, else through each trigger edge
+//! into the member: at the edge's profiled rate, or, when the profile does not
+//! rate it, from another node of the process at the period that node's group
+//! is fed at before any merge (the node and the nodes `isolate: false` and
+//! couplings joined to it), from another process at an unknown rate. A member
+//! no graph node triggers, or one with a trigger input no graph node
+//! publishes, is also fed at its fire rate: the fastest profiled rate of its
+//! trigger edges out, unknown when the profile rates none. Every member's
+//! feeds are gathered before the first merge, so a merge is judged against
+//! every feed of the merged unit whichever chain is walked first.
 //!
 //! Each node that starts a unit carries the reason ([`Boundary`]): a source, an
 //! edge that is no link (latest-value, fan-out, join, a period or sync
@@ -240,7 +239,9 @@ pub struct UnitGraph {
     /// once per consumer input.
     pub trigger_edges: Vec<(String, String)>,
     /// The shared chain predicate's verdict on every consumer edge
-    /// ([`linear_links`]); an edge with no bar is a link.
+    /// ([`linear_links`]); an edge with no bar is a link, and an edge barred
+    /// [`ChainBar::NoInGraphProducer`] is a trigger input whose topic no graph
+    /// node publishes.
     pub links: Vec<ConsumerEdgeVerdict>,
     /// Each node's `isolate:` declaration.
     pub isolate: IndexMap<String, bool>,
@@ -365,25 +366,26 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
-/// The period `node` is fed at as the profile and its declarations show it:
-/// its own period, else the fastest profiled rate of its trigger edges in. A
-/// node no graph node triggers fires at the rate of its trigger edges out, so
-/// for it the fastest profiled one of those.
-fn feed_period_ns(node: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>) -> Option<u64> {
-    if let Some(p) = graph.period_ns.get(node) {
-        return Some(*p);
-    }
-    let costs = costs?;
-    let triggered = graph.trigger_edges.iter().any(|(_, c)| c == node);
+/// The period of a trigger edge's profiled rate; none when the profile does
+/// not rate the edge or rates it 0.
+fn rated_period_ns(edge: &(String, String), costs: Option<&PartitionCosts>) -> Option<u64> {
+    costs?
+        .edge_rate_mhz
+        .get(edge)
+        .copied()
+        .filter(|r| *r > 0)
+        .map(|mhz| 1_000_000_000_000 / mhz)
+}
+
+/// How often `node` fires as the profile shows it: the shortest period of its
+/// profiled trigger edges out.
+fn fire_period_ns(node: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>) -> Option<u64> {
     graph
         .trigger_edges
         .iter()
-        .filter(|(p, c)| if triggered { c == node } else { p == node })
-        .filter_map(|edge| costs.edge_rate_mhz.get(edge))
-        .copied()
-        .filter(|r| *r > 0)
-        .max()
-        .map(|mhz| 1_000_000_000_000 / mhz)
+        .filter(|(p, _)| p == node)
+        .filter_map(|edge| rated_period_ns(edge, costs))
+        .min()
 }
 
 /// What a group of members is fed at.
@@ -665,25 +667,30 @@ pub fn derive_units(
         !candidates.contains(n) && link_out.get(n).is_some_and(|f| candidates.contains(*f))
     };
     // What each group is fed at, keyed by its root, from every member before
-    // the first merge: the member's own period or profiled rate
-    // (`feed_period_ns`); without one, each trigger edge into it from outside
-    // its group, where an edge from another group of this host carries that
-    // group's feed and an edge from another process makes the feed unknown. A
-    // member no graph node triggers and the profile does not rate makes it
-    // unknown too.
+    // the first merge: the member's own period; else each trigger edge into
+    // it at the edge's profiled rate, or, for an edge the profile does not
+    // rate, at the feed of the producer's group when that is another group of
+    // this host and at an unknown rate when the producer is in another
+    // process. A member no graph node triggers, or one with a trigger input no
+    // graph node publishes, is also fed at its fire rate (`fire_period_ns`),
+    // unknown when the profile rates none of its edges out.
     let mut fed: IndexMap<usize, Feed<'_>> = IndexMap::new();
     let mut carried: Vec<(usize, usize)> = Vec::new();
     for (i, member) in members.iter().enumerate() {
         let n = member.as_str();
         let r = root(&mut parent, i);
-        if let Some(period_ns) = feed_period_ns(n, graph, costs) {
+        if let Some(&period_ns) = graph.period_ns.get(n) {
             feed(&mut fed, r, Feed::Every(period_ns));
             continue;
         }
         let mut triggered = false;
-        for (p, _) in graph.trigger_edges.iter().filter(|(_, c)| c == n) {
+        for edge in graph.trigger_edges.iter().filter(|(_, c)| c == n) {
             triggered = true;
-            match index(p) {
+            if let Some(period_ns) = rated_period_ns(edge, costs) {
+                feed(&mut fed, r, Feed::Every(period_ns));
+                continue;
+            }
+            match index(&edge.0) {
                 Some(j) => {
                     let from = root(&mut parent, j);
                     if from != r {
@@ -695,8 +702,13 @@ pub fn derive_units(
                 }
             }
         }
-        if !triggered {
-            feed(&mut fed, r, Feed::Unknown(n));
+        let from_outside = graph
+            .links
+            .iter()
+            .any(|e| e.consumer == n && e.bar == Some(ChainBar::NoInGraphProducer));
+        if !triggered || from_outside {
+            let fires = fire_period_ns(n, graph, costs).map_or(Feed::Unknown(n), Feed::Every);
+            feed(&mut fed, r, fires);
         }
     }
     // Carry each group's feed across those edges until no feed changes. A
@@ -1604,6 +1616,124 @@ mod tests {
             unknown.describe(),
             "the profile holds no rate for how often e is fed, so the merged unit's period is \
              unknown (run `cerulion graph profile` while e is fed)"
+        );
+    }
+
+    /// A trigger input of `consumer` whose topic no graph node publishes.
+    fn outside_input(consumer: &str, topic: &str) -> ConsumerEdgeVerdict {
+        ConsumerEdgeVerdict {
+            topic: topic.to_string(),
+            producer: None,
+            consumer: consumer.to_string(),
+            input: "outside".to_string(),
+            bar: Some(ChainBar::NoInGraphProducer),
+        }
+    }
+
+    /// `h` (10 Hz) links to `a`; `x` has no policy and fires on `a`'s topic
+    /// and on `/cam`, which no graph node publishes, and declares isolate:
+    /// false, so `a` and `x` share one unit. `x` triggers `z` of another
+    /// process. Every node ticks 1 ms.
+    fn fed_from_outside() -> UnitGraph {
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(&[("h", "a")], &[("a", "x", join)], &[("h", 100)]);
+        g.links.push(outside_input("x", "/cam"));
+        g.trigger_edges.push(("x".into(), "z".into()));
+        g.isolate.insert("x".into(), false);
+        g
+    }
+
+    const EVERY_TICK_1_MS: [(&str, u64); 3] =
+        [("h", 1_000_000), ("a", 1_000_000), ("x", 1_000_000)];
+
+    #[test]
+    fn a_trigger_input_no_graph_node_publishes_feeds_the_unit_at_the_members_fire_rate() {
+        // The profile rates `h -> a` and `a -> x` at 10 Hz and `x -> z` at
+        // 1 kHz: `x` fires every 1 ms, so the unit is fed every 1 ms and `a`
+        // stays out of `h`'s unit at 3 ms.
+        let c = costs(
+            &EVERY_TICK_1_MS,
+            &[
+                ("h", "a", 10_000),
+                ("a", "x", 10_000),
+                ("x", "z", 1_000_000),
+            ],
+        );
+        let units = derive_units("g", &s(&["h", "a", "x"]), &fed_from_outside(), profile(&c));
+        assert_eq!(nodes(&units), [s(&["h"]), s(&["a", "x"])], "{units:?}");
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&over_period("a", 3_000_000, 1_000_000))
+        );
+    }
+
+    #[test]
+    fn a_member_fed_from_outside_the_graph_without_a_fire_rate_has_an_unknown_feed() {
+        // The profile rates no edge out of `x`, so how often `x` fires is
+        // unknown.
+        let c = costs(&EVERY_TICK_1_MS, &[("h", "a", 10_000), ("a", "x", 10_000)]);
+        let units = derive_units("g", &s(&["h", "a", "x"]), &fed_from_outside(), profile(&c));
+        assert_eq!(nodes(&units), [s(&["h"]), s(&["a", "x"])], "{units:?}");
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&Boundary::UnknownFeed { node: "x".into() })
+        );
+    }
+
+    /// `h` (10 Hz) links to `a`; the join `x`, triggered by `a` and by
+    /// `other`, declares isolate: false, so `a` and `x` share one unit. The
+    /// profile rates `h -> a` and `a -> x` at 10 Hz and not `other -> x`, and
+    /// every node ticks 1 ms.
+    fn rated_beside_unrated(other: &str) -> (UnitGraph, PartitionCosts) {
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[("h", "a")],
+            &[("a", "x", join.clone()), (other, "x", join)],
+            &[("h", 100)],
+        );
+        g.isolate.insert("x".into(), false);
+        let c = costs(
+            &[
+                ("h", 1_000_000),
+                ("a", 1_000_000),
+                ("x", 1_000_000),
+                (other, 1_000_000),
+            ],
+            &[("h", "a", 10_000), ("a", "x", 10_000)],
+        );
+        (g, c)
+    }
+
+    #[test]
+    fn an_unrated_trigger_edge_from_another_process_beside_a_rated_one_makes_the_feed_unknown() {
+        // `o` is in another process: its edge feeds the unit at an unknown
+        // rate.
+        let (g, c) = rated_beside_unrated("o");
+        let units = derive_units("g", &s(&["h", "a", "x"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["h"]), s(&["a", "x"])], "{units:?}");
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&Boundary::UnknownFeed { node: "x".into() })
+        );
+    }
+
+    #[test]
+    fn an_unrated_trigger_edge_from_another_group_beside_a_rated_one_carries_its_feed() {
+        // `p` is in this process, runs at 1 kHz and declares isolate: true,
+        // so `x` does not join it: its edge feeds the unit every 1 ms, and
+        // 3 ms reaches a quarter of that.
+        let (mut g, c) = rated_beside_unrated("p");
+        g.period_ns.insert("p".into(), 1_000_000);
+        g.isolate.insert("p".into(), true);
+        let units = derive_units("g", &s(&["h", "a", "p", "x"]), &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["h"]), s(&["a", "x"]), s(&["p"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&over_period("a", 3_000_000, 1_000_000))
         );
     }
 
