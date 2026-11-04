@@ -1040,7 +1040,11 @@ topic with no label had one writer. A read that popped several frames is fed
 its `batch_frame` frames and then the frame it served, each by its own writer
 and sequence; nothing is counted back from the served sequence. Live
 evictions, several consumers of one topic and several writers on one topic
-then change nothing about what a replayed read sees.
+then change nothing about what a replayed read sees. Every frame of one feed
+leaves the replay's one feed port, so a fed read keys each frame on the writer
+the recording names for it: a `drop_oldest` input counts evictions and raises
+its `#[on_event]` events per recorded writer, as it does per writer live, and a
+callback read's `ReceivedMessage::origin` is that writer's token.
 
 The replay first collects the `(writer, sequence)` of every frame the replayed
 reads consume (only the steps inside `--duration` when it is given) and indexes

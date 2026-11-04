@@ -1239,6 +1239,12 @@ impl ReadFeed for BagReadFeed {
         log.frames += read.frames.len();
         Ok(())
     }
+
+    fn frames(&self, key: &StageKey, step: u64, ordinal: u32) -> Option<&[(u64, u32)]> {
+        self.plan
+            .read(key, step, ordinal)
+            .map(|read| read.ids.as_slice())
+    }
 }
 
 #[cfg(test)]

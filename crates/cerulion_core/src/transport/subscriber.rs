@@ -96,7 +96,9 @@ struct SampleGate {
 /// policy). Zero-copy: the detector reads the 4-byte wire `sequence` from
 /// frames already in the drain path plus iceoryx2's own
 /// [`Sample::origin`](iceoryx2::sample::Sample) publisher id (no wire-format
-/// change, no extra FFI).
+/// change, no extra FFI). A read a replay feed served takes every frame from
+/// the feed's one port, so there each frame is keyed on the writer its
+/// recording names instead ([`stream_key`]).
 ///
 /// **Exact per publisher stream**: the wire sequence is
 /// per-publisher monotonic, and the origin id pins each gap to one
@@ -110,8 +112,8 @@ struct SampleGate {
 /// [`GapClass::Backward`]); corrupt or errored drains reset ALL baselines
 /// and may under-report one interval.
 struct DropOldestProbe {
-    /// Per-publisher baselines: (origin id, highest wire sequence
-    /// consumed, drain counter when the stream was last SEEN). Empty until
+    /// Per-publisher baselines: (stream key ([`stream_key`]), highest wire
+    /// sequence consumed, drain counter when the stream was last SEEN). Empty until
     /// the first drain (and re-emptied by a corrupt drain — or an ERRORED
     /// drain that actually popped frames: both consume frames the probe
     /// never observed; an error before the first pop keeps the still-valid
@@ -130,7 +132,7 @@ struct DropOldestProbe {
     /// every entry was seen this drain, the set grows instead of
     /// miscounting (dead publishers' still-queued frames can transiently
     /// exceed `max_publishers` distinct ids in one drain).
-    baselines: Vec<(UniquePublisherId, u32, u64)>,
+    baselines: Vec<(u128, u32, u64)>,
     /// Baseline capacity = the topic's iceoryx2 `max_publishers`
     /// (concurrent publishers are bounded by it, so a new id implies a
     /// dead slot exists — though not WHICH baseline entry is the dead one;
@@ -285,6 +287,28 @@ fn producer_token(id: UniquePublisherId) -> u64 {
     crate::wire::fnv1a_hash(&id.value().to_le_bytes())
 }
 
+/// The key of the writer stream one popped frame belongs to.
+///
+/// Live (`fed` is `None`), the value of the frame's origin
+/// [`UniquePublisherId`]. On a read a replay feed served, `fed` is the recorded
+/// `(writer token, wire sequence)` of each frame the feed published for the
+/// admission, in pop order, all of them through the feed's one port: the frame
+/// at pop position `pos` whose wire sequence `seq` is the one recorded there is
+/// keyed on that recorded writer token, widened, and a frame the list does not
+/// name at its position keeps its origin's value.
+#[inline]
+fn stream_key(
+    origin: UniquePublisherId,
+    seq: Option<u32>,
+    fed: Option<&[(u64, u32)]>,
+    pos: usize,
+) -> u128 {
+    match fed.and_then(|frames| frames.get(pos)) {
+        Some(&(writer, recorded)) if seq == Some(recorded) => u128::from(writer),
+        _ => origin.value(),
+    }
+}
+
 /// The `(sequence, producer token)` of each frame one drain popped, in pop
 /// order, held to a length fixed when the read stage is installed.
 ///
@@ -400,13 +424,13 @@ pub fn reset_listener_drain_count() {
 }
 
 /// Per-drain, per-publisher-stream observation captured
-/// during the drain loop. One entry per distinct `sample.origin()` id seen
-/// in the drain; lives in the subscriber's reusable scratch (taken before
+/// during the drain loop. One entry per distinct stream key ([`stream_key`])
+/// seen in the drain; lives in the subscriber's reusable scratch (taken before
 /// the drain, restored after — capacity retained, zero-alloc steady state).
 #[derive(Debug, Clone, Copy)]
 struct StreamObservation {
-    /// Origin publisher id of this stream.
-    id: UniquePublisherId,
+    /// The stream's key ([`stream_key`]).
+    id: u128,
     /// First-drained (oldest in queue order) wire sequence of this stream —
     /// the gap between the stream's baseline and this is its eviction
     /// count. Under history replay a LATER re-delivered frame may carry a
@@ -1236,7 +1260,10 @@ impl<'a> ReceivedMessage<'a> {
     /// so an observer can keep the streams of a `multi_publisher_topics`
     /// topic apart. Sample metadata: reading it parses and allocates nothing.
     /// The id is run random, so it is compared only within one run; `0` for
-    /// a message built with [`Self::new`].
+    /// a message built with [`Self::new`]. On a read a replay feed served,
+    /// where every frame leaves the feed's one port, it is the writer token
+    /// the recording names for the frame, widened, so the frames of one
+    /// recorded writer share it.
     pub fn origin(&self) -> u128 {
         self.origin
     }
@@ -1851,19 +1878,23 @@ impl CerulionSubscriber {
     /// sequence and its zero-allocation profile.
     ///
     /// Answers `None` when the plan is armed but admits nothing here, and
-    /// `Some(due)` with the admission to spend. The caller has already
-    /// established that a gate is armed, so `Ungated` cannot come back.
+    /// `Some((due, ordinal))` with the admission to spend and its position in
+    /// the step's plan. The caller has already established that a gate is
+    /// armed, so `Ungated` cannot come back.
     #[inline(never)]
     fn gate_admission(
         gate: &crate::read_outcome::ReadPlanStage,
-    ) -> Option<crate::read_outcome::DueRead> {
-        match gate.admit() {
-            crate::read_outcome::GateAnswer::Exact(due) => Some(due),
+    ) -> Option<(crate::read_outcome::DueRead, u32)> {
+        match gate.admit_at() {
+            (crate::read_outcome::GateAnswer::Exact(due), ordinal) => Some((due, ordinal)),
             // `Ungated` is unreachable from an armed gate; withholding on it
             // keeps the two answers that mean "pop nothing" on one arm rather
             // than adding a fall-through to a live pop.
-            crate::read_outcome::GateAnswer::Withhold
-            | crate::read_outcome::GateAnswer::Ungated => None,
+            (
+                crate::read_outcome::GateAnswer::Withhold
+                | crate::read_outcome::GateAnswer::Ungated,
+                _,
+            ) => None,
         }
     }
 
@@ -3233,7 +3264,7 @@ impl CerulionSubscriber {
         let granted = match self.replay_gate() {
             None => None,
             Some(gate) => match Self::gate_admission(gate) {
-                Some(due) => Some(due),
+                Some(grant) => Some(grant),
                 None => {
                     // The gate held the pop back: nothing left the queue, and
                     // the record is the one an empty drain at this site
@@ -3253,7 +3284,15 @@ impl CerulionSubscriber {
         // receive closure reads it to stop after the granted pops while the
         // per-sample closure writes it, and the two capture it immutably.
         let count = std::cell::Cell::new(0usize);
-        let pop_bound: usize = granted.map_or(usize::MAX, |due| due.pop_count() as usize);
+        let pop_bound: usize = granted.map_or(usize::MAX, |(due, _)| due.pop_count() as usize);
+        // A fed admission's frames all leave the feed's one port, so each is
+        // handed to the callback under the writer its recording names
+        // (`stream_key`).
+        let fed = self
+            .replay_plan
+            .as_deref()
+            .zip(granted)
+            .and_then(|(gate, (_, ordinal))| gate.fed_frames(ordinal));
         // The LEGACY batch-drain read outcome: this is the
         // `TriggerSubscriber::try_receive_timestamps` path (Separate
         // data-trigger + Sync drains) and the accumulate-all
@@ -3318,10 +3357,18 @@ impl CerulionSubscriber {
                 // The header `deliver_raw_frame` parsed comes back instead of being
                 // read again here: the served sequence and the cursor below both
                 // want the same thirty-two bytes.
-                removals.set(removals.get() + 1);
-                if let Some(header) =
-                    deliver_raw_frame(topic, sample.payload(), sample.origin().value(), callback)
-                {
+                let pos = removals.get();
+                removals.set(pos + 1);
+                let origin = match fed {
+                    Some(_) => stream_key(
+                        sample.origin(),
+                        wire_sequence(sample.payload()),
+                        fed,
+                        pos as usize,
+                    ),
+                    None => sample.origin().value(),
+                };
+                if let Some(header) = deliver_raw_frame(topic, sample.payload(), origin, callback) {
                     count.set(count.get() + 1);
                     // The served-sequence parse follows the CAPTURE bit or the
                     // GRANT, either of which consumes it: the record below
@@ -3403,7 +3450,7 @@ impl CerulionSubscriber {
         // grant is proof the gate was armed at the consult, so re-testing
         // `is_armed` here would drop the compare for a pop the gate authorised
         // and pay a second `Acquire` load per drain.
-        if let Some(due) = granted {
+        if let Some((due, _)) = granted {
             if let Some(gate) = self.replay_plan.as_deref() {
                 gate.settle(due, count as u64, newest_seq);
             }
@@ -3805,7 +3852,7 @@ impl CerulionSubscriber {
         let granted = match self.replay_gate() {
             None => None,
             Some(gate) => match Self::gate_admission(gate) {
-                Some(due) => Some(due),
+                Some(grant) => Some(grant),
                 None => {
                     // No stale EVENT drain here either, for the reason the body
                     // below states: on a unified binding this is the node's BODY
@@ -3816,8 +3863,21 @@ impl CerulionSubscriber {
                 }
             },
         };
-        let outcome = self.drain_with_accounting_body(limit_one, granted.map(|d| d.pop_count()));
-        if let (Some(gate), Some(due)) = (self.replay_plan.as_deref(), granted) {
+        // A fed admission's frames all leave the feed's one port, so the body
+        // keys each on the writer its recording names (`stream_key`). The list
+        // borrows the feed the plan holds, so the drain runs on a clone of the
+        // plan handle.
+        let plan = granted.and_then(|_| self.replay_plan.as_ref().map(Arc::clone));
+        let fed = plan
+            .as_deref()
+            .zip(granted)
+            .and_then(|(gate, (_, ordinal))| gate.fed_frames(ordinal));
+        let outcome = self.drain_with_accounting_body(
+            limit_one,
+            granted.map(|(due, _)| due.pop_count()),
+            fed,
+        );
+        if let (Some(gate), Some((due, _))) = (self.replay_plan.as_deref(), granted) {
             // The surviving frame's own wire sequence, read off the slot the
             // body kept. `Empty` and `Err` carry none, and a DECIMATED drain's
             // survivor is nothing either, its recorded `served_seq` names the
@@ -3834,11 +3894,13 @@ impl CerulionSubscriber {
 
     /// The pop body itself. `pop_budget` is `Some(n)` under an armed gate that
     /// granted `n` pops and `None` otherwise, in which case the consume mode
-    /// supplies the bound it always had.
+    /// supplies the bound it always had. `fed` is a fed admission's recorded
+    /// frame list ([`stream_key`]) and `None` otherwise.
     fn drain_with_accounting_body(
         &mut self,
         limit_one: bool,
         pop_budget: Option<u32>,
+        fed: Option<&[(u64, u32)]>,
     ) -> DrainOutcome {
         // iceoryx2 0.10: this path does NOT drain the event listener, and that
         // is the change, not an omission.
@@ -3941,6 +4003,8 @@ impl CerulionSubscriber {
         // fire, so the returned `popped` (the trigger's signal count)
         // excludes them. Always 0 on the latest-wins drain.
         let junk_skipped = std::cell::Cell::new(0u64);
+        // The pop position of the next probed frame, the index into `fed`.
+        let mut probed = 0usize;
         let drain_result = drain_with_block_accounting(
             || {
                 if delivered.get() >= pop_bound {
@@ -3966,9 +4030,11 @@ impl CerulionSubscriber {
             },
             |sample| {
                 if probing {
+                    let pos = probed;
+                    probed += 1;
                     match wire_sequence(sample.payload()) {
                         Some(seq) => {
-                            let id = sample.origin();
+                            let id = stream_key(sample.origin(), Some(seq), fed, pos);
                             match scratch.iter_mut().find(|o| o.id == id) {
                                 None => scratch.push(StreamObservation {
                                     id,
@@ -4169,7 +4235,7 @@ impl CerulionSubscriber {
                                     tracing::debug!(
                                         node_id = %probe.node_id,
                                         input = %probe.input,
-                                        evicted_stream = %evicted_id,
+                                        evicted_stream = evicted_id,
                                         last_seen_drain = last_seen,
                                         current_drain = now_drain,
                                         "baseline capacity reached — evicting the \
@@ -7798,5 +7864,173 @@ mod tests {
                 .expect("second view"),
             Some(second)
         );
+    }
+
+    /// A replay feed over ONE port: each admission of step 0 publishes the
+    /// frames `reads[ordinal]` names, a wire frame per `(writer token,
+    /// sequence)` carrying that sequence.
+    struct OnePortFeed {
+        port: std::sync::Mutex<crate::transport::publisher::CerulionPublisher>,
+        reads: Vec<Vec<(u64, u32)>>,
+    }
+
+    impl std::fmt::Debug for OnePortFeed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OnePortFeed")
+                .field("reads", &self.reads)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl crate::replay_feed::ReadFeed for OnePortFeed {
+        fn fill(
+            &self,
+            _key: &crate::read_outcome::StageKey,
+            _step: u64,
+            ordinal: u32,
+        ) -> Result<(), crate::replay_feed::ReadFeedFault> {
+            let mut port = self.port.lock().expect("feed port");
+            for &(_, seq) in &self.reads[ordinal as usize] {
+                port.publish_raw(&batch_frame_bytes(seq)).map_err(|e| {
+                    crate::replay_feed::ReadFeedFault {
+                        detail: e.to_string(),
+                    }
+                })?;
+            }
+            Ok(())
+        }
+
+        fn frames(
+            &self,
+            _key: &crate::read_outcome::StageKey,
+            _step: u64,
+            ordinal: u32,
+        ) -> Option<&[(u64, u32)]> {
+            self.reads.get(ordinal as usize).map(Vec::as_slice)
+        }
+    }
+
+    /// A subscriber on `topic` whose read gate is armed for step 0 with one
+    /// admission per entry of `reads`, fed by a [`OnePortFeed`] over them.
+    fn one_port_fed_subscriber(
+        topic: &str,
+        reads: Vec<Vec<(u64, u32)>>,
+    ) -> (
+        Arc<crate::transport::TransportManager>,
+        CerulionSubscriber,
+        Arc<crate::read_outcome::ReadPlanStage>,
+    ) {
+        use crate::read_outcome::{ConsultRule, DueRead, ReadPlanStage, ReadStageRole, StageKey};
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: topic.into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let port = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let due: Vec<DueRead> = reads
+            .iter()
+            .map(|r| DueRead::pops(r.len() as u32, r.last().map(|&(_, seq)| seq)))
+            .collect();
+        let plan = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sink".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        assert!(plan.install_feed(Arc::new(OnePortFeed {
+            port: std::sync::Mutex::new(port),
+            reads,
+        })));
+        plan.arm(ConsultRule::Counted)
+            .expect("a stage with no blocker arms");
+        plan.install_step(0, &due).expect("step 0 installs");
+        sub.set_replay_read_plan(Arc::clone(&plan));
+        (mgr, sub, plan)
+    }
+
+    /// Writer tokens of the fed tests below.
+    const FED_WRITER_A: u64 = 0xA;
+    const FED_WRITER_B: u64 = 0xB;
+
+    /// The `drop_oldest` probe on a fed stage keeps one baseline per RECORDED
+    /// writer, although one feed port publishes every frame.
+    ///
+    /// Hand oracle: three admissions feed writer A's sequence 10, writer B's
+    /// sequence 100 and writer A's sequence 12. Per writer, B is first seen at
+    /// 100 and A goes from 10 to 12, so exactly one frame (A's 11) was lost:
+    /// the count is 1 and one event carries it. One stream over the port would
+    /// count 10 to 100 as 89 lost and 100 to 12 as re-delivery.
+    #[test]
+    fn a_fed_probe_counts_evictions_per_recorded_writer() {
+        let (_mgr, mut sub, plan) = one_port_fed_subscriber(
+            "fed_probe_per_writer",
+            vec![
+                vec![(FED_WRITER_A, 10)],
+                vec![(FED_WRITER_B, 100)],
+                vec![(FED_WRITER_A, 12)],
+            ],
+        );
+        let counters = Arc::new(BackpressureCounters::new());
+        sub.register_drop_oldest_probe(Arc::clone(&counters), "sink".into(), "inp".into(), 16);
+        let mut served = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        let mut events = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        for _ in 0..3 {
+            let outcome = sub.drain_one_with_accounting();
+            assert_eq!(outcome.popped, 1, "each admission pops its one fed frame");
+            if let FrozenSlot::Sample(sample) = &outcome.slot {
+                served.push(wire_sequence(sample.payload()));
+            }
+            if let Some(ev) = sub.try_take_backpressure_event() {
+                events.push((ev.dropped, ev.count_total));
+            }
+        }
+        assert_eq!(served, vec![Some(10), Some(100), Some(12)]);
+        assert!(plan.take_violations().is_empty(), "every admission settled");
+        assert_eq!(sub.drop_oldest_count(), Some(1), "only A's 11 was lost");
+        assert_eq!(
+            events,
+            vec![(1, 1)],
+            "one event, carrying the one lost frame"
+        );
+    }
+
+    /// A fed batch drain hands each frame to the read under the writer its
+    /// recording names, the identity two frames of one publisher share.
+    ///
+    /// Hand oracle: writer A's sequence 10, writer B's 100, then one batch of
+    /// A's 11 and B's 101, all through one feed port: the reads see A, B, A, B.
+    #[test]
+    fn a_fed_drain_names_each_frame_under_its_recorded_writer() {
+        let (_mgr, sub, plan) = one_port_fed_subscriber(
+            "fed_drain_per_writer",
+            vec![
+                vec![(FED_WRITER_A, 10)],
+                vec![(FED_WRITER_B, 100)],
+                vec![(FED_WRITER_A, 11), (FED_WRITER_B, 101)],
+            ],
+        );
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        for _ in 0..3 {
+            sub.try_receive(|msg| seen.push((msg.origin(), msg.header().sequence)))
+                .expect("a fed drain succeeds");
+        }
+        assert!(plan.take_violations().is_empty(), "every admission settled");
+        let (a, b) = (u128::from(FED_WRITER_A), u128::from(FED_WRITER_B));
+        assert_eq!(seen, vec![(a, 10), (b, 100), (a, 11), (b, 101)]);
     }
 }

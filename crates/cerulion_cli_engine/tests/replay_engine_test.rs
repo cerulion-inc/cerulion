@@ -40924,6 +40924,252 @@ fn a_batch_on_a_multi_writer_edge_is_fed_each_frame_under_its_writer() {
     assert!(outcome.passed, "{:?}", outcome.violations);
 }
 
+// ---------------------------------------------------------------------------
+// Writers whose sequences run apart on one bus: a fed consumer's drop_oldest
+// probe keeps one baseline per recorded writer, as the live probe keeps one
+// per writer port.
+// ---------------------------------------------------------------------------
+
+/// A writer at five frames per step: its wire sequence runs five times as fast
+/// as a once-per-step writer's on the same bus.
+#[cerulion_node(period_ms = 1)]
+#[derive(Default)]
+struct RiFastWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiFastWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// How one consumer's eviction accounting rides its read log entry: the events
+/// its `#[on_event]` handler saw, times this, plus the loss count the last
+/// event carried.
+const RI_EVENT_SCALE: f64 = 1_000_000.0;
+
+/// A per-message `drop_oldest` consumer whose queue holds a whole step (16
+/// frames per writer, the deepest a `multi_publisher_topics` bus admits), so the
+/// live queue evicts nothing. Its handler counts eviction events and keeps the
+/// last event's loss count; every fire logs both beside the frame it read.
+#[cerulion_node]
+#[derive(Default)]
+struct RiDeepEventSink {
+    #[input(trigger, backpressure = drop_oldest, depth = 16)]
+    inp: Vector3,
+    tag: f64,
+    events: f64,
+    lost: f64,
+}
+
+#[cerulion_node_impl]
+impl RiDeepEventSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(
+            self.tag,
+            self.inp.x,
+            self.inp.y,
+            self.events * RI_EVENT_SCALE + self.lost,
+        );
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, e: BackpressureEvent) {
+        self.events += 1.0;
+        self.lost = e.count_total as f64;
+    }
+}
+
+/// The same consumer on a depth-two queue, so the live queue evicts the fast
+/// writer's oldest frames every step.
+#[cerulion_node]
+#[derive(Default)]
+struct RiShallowEventSink {
+    #[input(trigger, backpressure = drop_oldest, depth = 2)]
+    inp: Vector3,
+    tag: f64,
+    events: f64,
+    lost: f64,
+}
+
+#[cerulion_node_impl]
+impl RiShallowEventSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(
+            self.tag,
+            self.inp.x,
+            self.inp.y,
+            self.events * RI_EVENT_SCALE + self.lost,
+        );
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, e: BackpressureEvent) {
+        self.events += 1.0;
+        self.lost = e.count_total as f64;
+    }
+}
+
+const RI_DEEP: f64 = 4.0;
+const RI_SHALLOW: f64 = 5.0;
+
+/// Three writers on one bus, the middle one five times as fast, read per
+/// message by a deep and a shallow `drop_oldest` consumer.
+fn ri_writer_baseline_yaml() -> &'static str {
+    "name: riwb\nprefix: riwb\nmulti_publisher_topics:\n  - /riwb/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: w2\n    type: ri_fast_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: deep\n    type: ri_deep_event_sink\n    inputs:\n      - name: inp\n        source: /riwb/bus\n\
+     \x20 - id: shallow\n    type: ri_shallow_event_sink\n    inputs:\n      - name: inp\n        source: /riwb/bus\n"
+}
+
+fn ri_writer_baseline_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        (
+            "w2",
+            Box::new(RiFastWriterNodeEntry::with_state(RiFastWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        ("w3", writer(3.0)),
+        (
+            "deep",
+            Box::new(RiDeepEventSinkEntry::with_state(RiDeepEventSink {
+                tag: RI_DEEP,
+                ..Default::default()
+            })),
+        ),
+        (
+            "shallow",
+            Box::new(RiShallowEventSinkEntry::with_state(RiShallowEventSink {
+                tag: RI_SHALLOW,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// `(events, loss count)` as one consumer's read logged them.
+fn ri_event_accounting(z: u64) -> (u64, u64) {
+    let z = f64::from_bits(z);
+    let events = (z / RI_EVENT_SCALE).floor();
+    (events as u64, (z - events * RI_EVENT_SCALE) as u64)
+}
+
+/// The hand oracle over one side's reads, live or replayed.
+///
+/// Per step, writers 1 and 3 publish one frame each and writer 2 publishes
+/// five, read in turn by both consumers.
+///
+/// * The deep consumer's queue holds a whole step, so it never loses a frame:
+///   every read logs no event and a loss count of 0.
+/// * The shallow consumer's queue keeps the newest two frames per writer, so
+///   each step evicts exactly three of writer 2's five, seen by the first of
+///   its two writer 2 reads; writers 1 and 3 lose nothing, so the reads
+///   between two steps' evictions are clean and every eviction opens a new
+///   event. Every read therefore logs a loss count of exactly three per event.
+///
+/// A probe that took the three writers for one stream reads, at the shallow
+/// consumer, writer 1's first frame followed by writer 2's fourth as two lost
+/// frames: an event and a loss count the live run never had. From there on
+/// writer 2's sequence leads, and writers 1 and 3 read as re-delivery.
+fn ri_assert_per_writer_accounting(side: &str, reads: &[RiRead]) {
+    let by = ri_by_consumer(reads);
+    let deep = by
+        .get(&RI_DEEP.to_bits())
+        .unwrap_or_else(|| panic!("{side}: the deep consumer read"));
+    assert!(
+        deep.len() >= RI_MIN_READS,
+        "{side}: deep made {} reads",
+        deep.len()
+    );
+    for (i, (_, _, z)) in deep.iter().enumerate() {
+        assert_eq!(
+            ri_event_accounting(*z),
+            (0, 0),
+            "{side}: deep read {i} saw an eviction event its queue never had"
+        );
+    }
+    let shallow = by
+        .get(&RI_SHALLOW.to_bits())
+        .unwrap_or_else(|| panic!("{side}: the shallow consumer read"));
+    assert!(
+        shallow.len() >= RI_MIN_READS,
+        "{side}: shallow made {} reads",
+        shallow.len()
+    );
+    for (i, (_, _, z)) in shallow.iter().enumerate() {
+        let (events, lost) = ri_event_accounting(*z);
+        assert_eq!(
+            lost,
+            3 * events,
+            "{side}: shallow read {i}: {events} events must carry {} lost frames, not {lost}",
+            3 * events
+        );
+    }
+    let (events, _) = ri_event_accounting(shallow.last().expect("shallow read").2);
+    assert!(
+        events as usize >= RI_MIN_READS,
+        "{side}: one eviction event per step, {events} over {RI_STEPS} steps"
+    );
+}
+
+/// Three writers whose wire sequences run apart on one bus, read through two
+/// `drop_oldest` consumers with an `#[on_event]` handler each: every replayed
+/// read, its event count and its loss count included, equals the live read.
+/// The fed replay publishes every writer's frames through one feed port, and
+/// the consumers' probes still count each recorded writer's sequence apart.
+#[test]
+#[serial]
+fn a_fed_replay_counts_evictions_per_recorded_writer_on_one_bus() {
+    let live = ri_record(ri_writer_baseline_yaml(), ri_writer_baseline_factories);
+    let writers: std::collections::BTreeSet<u64> = ri_by_consumer(&live.reads)
+        [&RI_SHALLOW.to_bits()]
+        .iter()
+        .map(|(x, _, _)| *x)
+        .collect();
+    assert_eq!(
+        writers.len(),
+        3,
+        "PREMISE: the shallow consumer read all three writers"
+    );
+    ri_assert_per_writer_accounting("live", &live.reads);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_writer_baselines.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_writer_baseline_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    ri_assert_per_writer_accounting("replayed", &replayed);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
+    println!("RI_ORACLE writer_baselines: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
 /// Remove every `BatchFrame` record and the producer annotation staged with it
 /// (the record just before it, on the same node and input); returns the
 /// `(batch frames, annotations)` removed.

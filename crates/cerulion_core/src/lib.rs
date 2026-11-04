@@ -800,7 +800,11 @@ pub mod wire;
 ///   `run_writer`, the token of each read site's open run. The gate's admission and
 ///   the subscriber's take paths run inside a node library, so a library built
 ///   against an earlier core pops a fed stage's empty queue without asking the
-///   feed and serves nothing where the recording served a frame.
+///   feed and serves nothing where the recording served a frame. `ReadFeed`
+///   gains `frames`, the recorded writer and sequence of each frame a fill
+///   publishes, and `StreamObservation::id` and the `drop_oldest` baselines
+///   hold a `u128` key, a fed frame's recorded writer token or a live frame's
+///   origin port id.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///

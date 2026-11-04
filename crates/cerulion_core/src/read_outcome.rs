@@ -2810,18 +2810,22 @@ impl ReadPlanStage {
     /// position in this gate's pop stream. Withholding at it would hold back
     /// the frame the recording served, and the divergence would then reach a
     /// verdict as a byte difference charged to the candidate.
+    ///
+    /// Beside an `Exact` answer it returns the ordinal of the plan entry it
+    /// grants, the position [`crate::replay_feed::ReadFeed::fill`] was called
+    /// with; beside any other answer, 0.
     #[inline(never)]
-    pub(crate) fn admit(&self) -> GateAnswer {
+    pub(crate) fn admit_at(&self) -> (GateAnswer, u32) {
         // An unarmed stage is UNGATED, which is a different fact from a zero
         // quota: the drain takes today's path byte for byte. Answered here so
         // the arm is produced by the one function that can know it, rather than
         // documented as unreachable at a caller that filters on `is_armed`.
         if !self.is_armed() {
-            return GateAnswer::Ungated;
+            return (GateAnswer::Ungated, 0);
         }
         let now = self.now_step.load(Ordering::Acquire);
         let Ok(mut inner) = self.lock_plan() else {
-            return GateAnswer::Withhold;
+            return (GateAnswer::Withhold, 0);
         };
         // The NOT-INSTALLED test comes FIRST, and the order is load bearing. An
         // armed stage the step's install omitted has a ZERO quota for that step;
@@ -2864,7 +2868,7 @@ impl ReadPlanStage {
                     );
                 }
             }
-            return GateAnswer::Withhold;
+            return (GateAnswer::Withhold, 0);
         }
         if inner.step != now {
             inner.mismatches = inner.mismatches.saturating_add(1);
@@ -2875,7 +2879,7 @@ impl ReadPlanStage {
             // frame the replay's input stream does not, which names the
             // candidate for a harness fault.
             inner.refused_consults = inner.refused_consults.saturating_add(1);
-            return GateAnswer::Withhold;
+            return (GateAnswer::Withhold, 0);
         }
         loop {
             let Some(due) = inner.due.get(inner.cursor).copied() else {
@@ -2922,7 +2926,7 @@ impl ReadPlanStage {
                         );
                     }
                 }
-                return GateAnswer::Withhold;
+                return (GateAnswer::Withhold, 0);
             };
             inner.cursor += 1;
             match due.shape() {
@@ -2931,7 +2935,7 @@ impl ReadPlanStage {
                 DueShape::ServedWithoutPop => continue,
                 DueShape::Nothing => {
                     inner.refused_consults = inner.refused_consults.saturating_add(1);
-                    return GateAnswer::Withhold;
+                    return (GateAnswer::Withhold, 0);
                 }
                 DueShape::Pops { pops, .. } => {
                     // The step's QUOTA spent, which is what the next consult
@@ -2951,10 +2955,25 @@ impl ReadPlanStage {
                             self.mint(now, ReplayReadViolationKind::FeedFailed { ordinal });
                         }
                     }
-                    return GateAnswer::Exact(due);
+                    return (GateAnswer::Exact(due), ordinal);
                 }
             }
         }
+    }
+
+    /// [`Self::admit_at`]'s answer without its ordinal.
+    #[cfg(test)]
+    pub(crate) fn admit(&self) -> GateAnswer {
+        self.admit_at().0
+    }
+
+    /// The recorded `(writer token, wire sequence)` of each frame the installed
+    /// feed published for this step's admission at `ordinal`, in pop order
+    /// ([`crate::replay_feed::ReadFeed::frames`]); `None` on a stage no feed is
+    /// installed on.
+    pub(crate) fn fed_frames(&self, ordinal: u32) -> Option<&[(u64, u32)]> {
+        let step = self.now_step.load(Ordering::Acquire);
+        self.feed.get()?.frames(&self.key, step, ordinal)
     }
 
     /// Compare what the drain DID against the admission it was granted.

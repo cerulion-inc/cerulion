@@ -30,6 +30,16 @@
 //! The call is made from the drain site that consulted the gate, which may be a
 //! node's own tick on any thread, so a feed is `Send + Sync`.
 //!
+//! # Whose frame a fed frame is
+//!
+//! Every frame of one stage's feed leaves the replay's one feed port, so the
+//! frames' iceoryx2 origin names no writer. The drain that pops a fed read asks
+//! [`ReadFeed::frames`] for the recorded writer token and wire sequence of each
+//! frame, in pop order, and keys each frame on its recorded writer: the
+//! `drop_oldest` probe keeps one eviction baseline per recorded writer, as it
+//! keeps one per writer port live, and a callback read's
+//! `ReceivedMessage::origin` is the recorded writer token, widened.
+//!
 //! # Feed names
 //!
 //! A feed's service name carries the replay's identifier, a fixed-width digest
@@ -163,13 +173,15 @@ pub struct ReplayIdUnavailable {
 /// the buffer is raised to `buffer` (the deepest single read the recording
 /// holds for this stage, never below the input's own depth), history is off,
 /// and the publisher side is producer-less (`External`), so the replay's one
-/// feed publisher opens the service the subscriber created.
+/// feed publisher opens the service the subscriber created. The publisher
+/// slot count stays the live topic's: the subscriber sizes its `drop_oldest`
+/// probe's per-writer baselines from it, and a fed read keys its frames on
+/// their recorded writers, as many as the live topic has.
 #[must_use]
 pub fn replay_feed_topic_config(live: TopicServiceConfig, buffer: usize) -> TopicServiceConfig {
     let mut cfg = live;
     cfg.subscriber_max_buffer_size = cfg.subscriber_max_buffer_size.max(buffer);
     cfg.history_size = 0;
-    cfg.max_publishers = None;
     cfg.max_subscribers = None;
     cfg.publisher_provisioning = crate::transport::PublisherProvisioning::External;
     cfg
@@ -193,6 +205,12 @@ pub trait ReadFeed: Send + Sync + std::fmt::Debug {
     /// it as a replay read violation on `key`; the pop that follows then finds
     /// fewer frames than the admission names and the shortfall is minted too.
     fn fill(&self, key: &StageKey, step: u64, ordinal: u32) -> Result<(), ReadFeedFault>;
+
+    /// The recorded `(writer token, wire sequence)` of each frame
+    /// [`Self::fill`] publishes for the read at position `ordinal` of `step`'s
+    /// installed plan, in the order it publishes them; `None` when the feed
+    /// holds no such read.
+    fn frames(&self, key: &StageKey, step: u64, ordinal: u32) -> Option<&[(u64, u32)]>;
 }
 
 /// Which edges a recording stages a PRODUCER annotation on.
@@ -590,6 +608,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A feed's service config keeps the live topic's publisher slots, so a
+    /// fed `drop_oldest` probe holds as many per-writer baselines as it does
+    /// live: a `multi_publisher_topics` bus's 16 stay 16, while the buffer is
+    /// raised to the feed's, history is off, the subscriber slots are unset and
+    /// the publisher side is producer-less.
+    #[test]
+    fn a_feed_config_keeps_the_live_topics_publisher_slots() {
+        use crate::transport::PublisherProvisioning;
+        let live = TopicServiceConfig {
+            subscriber_max_buffer_size: 4,
+            subscriber_max_borrowed_samples: None,
+            create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
+            max_subscribers: Some(17),
+            max_publishers: Some(16),
+            publisher_provisioning: PublisherProvisioning::Multi,
+            history_size: 3,
+            extra_event_listeners: 0,
+            publisher_max_loaned_samples: None,
+        };
+        let fed = replay_feed_topic_config(live, 6);
+        assert_eq!(fed.max_publishers, Some(16));
+        assert_eq!(fed.subscriber_max_buffer_size, 6);
+        assert_eq!(fed.history_size, 0);
+        assert_eq!(fed.max_subscribers, None);
+        assert_eq!(fed.publisher_provisioning, PublisherProvisioning::External);
     }
 
     #[test]
