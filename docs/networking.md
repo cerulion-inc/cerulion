@@ -555,9 +555,9 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external}` map (see "Carriers and per-topic reliability"). |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external, send_queue}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
-| `tls` | Certificate files for `quic/` locators (see below). |
+| `tls` | Certificate files for `quic/` and `tls/` locators (see below). |
 
 `router` mode is deliberately not exposed: a graph declares a participant,
 not infrastructure. A Strict block's scouting stays OFF (the mesh is exactly
@@ -577,6 +577,7 @@ locator string is the whole choice. TCP stays the default.
 | `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection and port | `tls` files |
 | `tls/<host>:<port>` | TLS 1.3 over TCP, for a path where UDP does not get through | the same `tls` files as `quic/` |
 | `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication | a WireGuard overlay that supplies both |
+| `udp/<host>:<port>`, `udp/...?rel=0`, `quic/...?rel=0` | datagram only: refused (rule 7) | |
 
 **TCP after idle on Linux.** With `net.ipv4.tcp_slow_start_after_idle`
 nonzero, the Linux default, the congestion window of a TCP connection that
@@ -608,10 +609,10 @@ Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
 lets the peer decide, which is why it does not satisfy a `best_effort` topic
 (the connection may come up with streams only).
 
-`quic/` encrypts the link and lets the CONNECTING side check the listener's
-certificate. The listener does not check who connects (no client certificate
-is requested), so on a robot that listens on `quic/`, who may pull which topic
-is still the pairing grant's decision, as on `tcp/`.
+`quic/` and `tls/` encrypt the link and let the CONNECTING side check the
+listener's certificate. The listener does not check who connects (no client
+certificate is requested), so on a robot that listens on `quic/` or `tls/`,
+who may pull which topic is still the pairing grant's decision, as on `tcp/`.
 
 ```yaml
 network:
@@ -671,6 +672,37 @@ network:
       certificate: /etc/cerulion/robot.pem
       private_key: /etc/cerulion/robot.key
   ```
+- **`send_queue`**: how many frames the gateway holds for the topic while
+  the link is congested (a whole number, 1 or more; default: the depth of the
+  gateway's tap on the topic). Each egress topic has its own queue and its own
+  sender, so a congested link holds up the topics it carries and not the
+  gateway's other links (closing LAN access while a put waits on a congested
+  link waits for that put); topics sent to the same peer share that peer's
+  link. Each queued frame is a heap copy, so a topic's queue can hold up to
+  `send_queue` times its frame size.
+  The node that publishes the topic writes to shared memory and does not wait
+  on the network. A `reliable` frame waits for zenoh's transmit queue instead
+  of being dropped at the sender, for up to zenoh's `wait_before_close` (5 s
+  by default); then zenoh drops it and closes the link to that peer. When the
+  topic's queue is full, a `reliable` topic refuses the new frame, counts it
+  as `refused` and logs a warning naming the topic; a `best_effort` topic
+  drops its oldest queued frame and counts it as `dropped`. Every 10 s the
+  gateway logs a warning for a topic whose `refused` or `failed` rose (an
+  info line when only best-effort `dropped` rose), and each topic's totals
+  when it stops. A graph with a `network:`
+  block runs its own gateway process, so its log is where these appear. The
+  gateway `cerulion-netd` hosts for runs without a `network:` block also
+  reports each topic's `forwarded`, `dropped`, `refused`, `failed`,
+  `discarded`, `queued`, `in_flight` and `send_queue` in its `status` reply.
+  A sustained `refused` count means the link is slower than the topic: raise
+  `send_queue` to ride out longer bursts, lower the publish rate, or mark the
+  topic `best_effort`.
+
+  ```yaml
+  egress:
+    - topic: /robot/camera/image
+      send_queue: 32
+  ```
 - **`tls`**: absolute paths to PEM files, read when the gateway opens its
   session (a missing file fails the open, naming the path). A `quic/` or
   `tls/` listener needs `certificate` and `private_key`; a `quic/` or `tls/`
@@ -694,10 +726,12 @@ network:
   its subject alternative names. zenoh also trusts the public Web PKI root
   set beside `root_ca`, so a listener holding a publicly issued certificate
   for that name is accepted too.
-- **`cerulion-netd`** reads the same files for its own `quic/` locators from
-  `CERULION_NETD_TLS_ROOT_CA`, `CERULION_NETD_TLS_CERTIFICATE` and
-  `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
-  `CERULION_NETD_LISTEN`.
+- **`cerulion-netd`** reads the same files for its own `quic/` and `tls/`
+  locators from `CERULION_NETD_TLS_ROOT_CA`, `CERULION_NETD_TLS_CERTIFICATE`
+  and `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
+  `CERULION_NETD_LISTEN`. It applies rules 7 to 9 below to those variables
+  when it starts, reads each file then, and refuses to start, naming the
+  variable, on a setting that cannot work.
 - **Discovery** still speaks TCP: the mDNS beacon advertises a `tcp/` listen
   port (plus `udp_rel=<port>` under `CERULION_UNENCRYPTED_QUIC=on`, below; a
   graph listening on `quic/` alone is not advertised), and
@@ -790,20 +824,29 @@ Every rejection names the offending topic or setting and states the fix:
 5. **No lists under `disabled`.**
 6. **No duplicates within a list** (a bare name and a map naming the same
    topic are duplicates).
-7. **Known carrier**: `tcp/`, `quic/`, `tls/` or `udp/`, with `rel` /
-   `mixed_rel` values zenoh accepts (`mixed_rel` only on `quic/` and
-   `udp/...?rel=1`).
+7. **Known carrier, not datagram only**: `tcp/`, `quic/`, `tls/` or `udp/`,
+   with `rel` / `mixed_rel` values zenoh accepts (`mixed_rel` only on `quic/`
+   and `udp/...?rel=1`). A datagram-only locator (plain `udp/<host>:<port>`,
+   `udp/...?rel=0`, `quic/...?rel=0`) is refused: zenoh sends every message
+   on it once with no retransmission, so a lost packet loses a reliable
+   topic's frame or one of zenoh's own declarations. Use
+   `udp/<host>:<port>?rel=1;mixed_rel=1` or `quic/<host>:<port>?mixed_rel=1`
+   to carry best-effort topics on datagrams beside reliable streams.
 8. **`quic/` and `tls/` have their files**: `certificate` + `private_key` for
    a `quic/` or `tls/` listener, `root_ca` for a `quic/` or `tls/` connect;
    absolute paths only.
 9. **No inert `tls` setting**: `root_ca` without a `quic/` or `tls/` connect
    locator, or `certificate` / `private_key` without a `quic/` or `tls/`
-   listen locator, is refused (each is read only by that side).
+   listen locator, is refused (each is read only by that side), and so is a
+   `tls:` block that sets no file.
 10. **Best effort needs a datagram link**: a `best_effort` topic, and a
     `default_reliability: best_effort`, each need a `mixed_rel=1` QUIC
     locator (not `auto`) in `listen` or `connect`; without one the topics
     would ride the reliable link with nothing saying so. The default is
-    refused even when every entry sets its own `reliability`.
+    refused even when every entry sets its own `reliability`. When the graph
+    also has locators with no datagram link, graph load logs a WARN naming
+    them: a peer reached through one of them receives the best-effort topics
+    on its reliable link.
 
 Empty `egress`/`ingress` with `peer`/`client` mode is valid.
 
@@ -1113,6 +1156,12 @@ status reply):
 `lan_access` is the shared gateway's LAN posture (`open` or `paired`). A daemon
 without a network session, or an older daemon, omits it, and the omission means
 unknown, never open.
+
+`egress` appears once the daemon's shared gateway has booted: one entry per
+egress topic a remote has demanded, with that topic's `reliability`,
+`send_queue`, `queued`, `in_flight`, `forwarded`, `dropped`, `refused`,
+`failed` and `discarded` (see `send_queue` under "Carriers and per-topic
+reliability"). A daemon with no gateway, or an older daemon, omits it.
 
 Interpreting `connect_endpoints`:
 
