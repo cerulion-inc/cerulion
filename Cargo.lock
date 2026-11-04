@@ -1656,14 +1656,19 @@ dependencies = [
 name = "cerulion_rcpd"
 version = "1.0.0"
 dependencies = [
+ "base64 0.22.1",
  "cerud",
+ "cerulion_bag",
  "cerulion_core",
  "clap",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "native_ros2_messages",
  "rmcp",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1673,6 +1678,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

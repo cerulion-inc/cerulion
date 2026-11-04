@@ -139,13 +139,59 @@ impl ReceiptLock {
     }
 }
 
+/// A handle that appends to the daemon's one receipt log, so every writer
+/// (tool calls and eye answers) extends the same hash chain.
+#[derive(Clone)]
+pub struct ReceiptSink(Arc<Mutex<ReceiptLog>>);
+
+impl std::fmt::Debug for ReceiptSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReceiptSink")
+    }
+}
+
+impl ReceiptSink {
+    /// Open the log at `path` on its own, for a writer with no tool host.
+    ///
+    /// # Errors
+    ///
+    /// [`RcpdError::Receipts`] when the log cannot be opened.
+    pub fn open(path: &Path) -> Result<Self, RcpdError> {
+        ReceiptLog::open(path)
+            .map(|log| Self(Arc::new(Mutex::new(log))))
+            .map_err(|e| RcpdError::Receipts {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })
+    }
+
+    /// Append one receipt, durable before this returns; `None` (logged) when
+    /// it could not be written.
+    pub fn record(
+        &self,
+        caller: &str,
+        verb: &str,
+        digest: &str,
+        outcome: ReceiptOutcome,
+    ) -> Option<Receipt> {
+        let mut log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match log.record(caller, verb, digest, outcome) {
+            Ok(receipt) => Some(receipt),
+            Err(e) => {
+                tracing::error!(verb, error = %e, "receipt not written");
+                None
+            }
+        }
+    }
+}
+
 /// The tools, the receipt log, the e-stop latch and the journal.
 pub struct ToolHost {
     tools: Vec<ToolSpec>,
     journal: Journal,
     latch: Arc<AtomicBool>,
     latch_file: PathBuf,
-    receipts: Mutex<ReceiptLog>,
+    receipts: ReceiptSink,
     /// Serializes calls other than `estop`.
     call_lock: tokio::sync::Mutex<()>,
     /// Who clears the latch.
@@ -293,7 +339,7 @@ impl ToolHost {
             journal,
             latch,
             latch_file,
-            receipts: Mutex::new(log),
+            receipts: ReceiptSink(Arc::new(Mutex::new(log))),
             call_lock: tokio::sync::Mutex::new(()),
             estop_clear: EstopClear::Agent,
             latch_io: Mutex::new(()),
@@ -330,14 +376,12 @@ impl ToolHost {
     }
 
     fn record(&self, verb: &str, digest: &str, outcome: ReceiptOutcome) -> Option<Receipt> {
-        let mut log = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
-        match log.record(CALLER, verb, digest, outcome) {
-            Ok(receipt) => Some(receipt),
-            Err(e) => {
-                tracing::error!(verb, error = %e, "receipt not written");
-                None
-            }
-        }
+        self.receipts.record(CALLER, verb, digest, outcome)
+    }
+
+    /// A handle on this host's receipt log for other writers.
+    pub fn receipt_sink(&self) -> ReceiptSink {
+        self.receipts.clone()
     }
 
     /// `tools/list`: the manifest's tools, then `estop`, then `estop_clear`

@@ -21,6 +21,8 @@ CERULION_RCP_TOKEN=... cerulion-rcpd --manifest rcp.yaml --http   # 127.0.0.1:78
 CERULION_RCP_TOKEN=... cerulion-rcpd --manifest rcp.yaml --http 127.0.0.1:7900
 cerulion-rcpd --manifest rcp.yaml --receipts /var/log/rcp/receipts.jsonl
 cerulion-rcpd --verify-receipts /var/log/rcp/receipts.jsonl   # 0: chain intact, 1: missing, empty or broken
+cerulion-rcpd --verify-bag run.mcap --manifest rcp.yaml       # 0: every Jev answer has its receipt
+cerulion-rcpd jev status --manifest rcp.yaml                  # also: jev on, jev off
 ```
 
 `--receipts` defaults to `.cerulion/rcp/receipts.jsonl` beside the manifest.
@@ -226,3 +228,71 @@ each refresh.
 
 One per `state` entry: the newest frame seen on that `std_msgs/String` topic,
 as text. Reading one before any frame has arrived is an error.
+
+## Jev, the gate's second eye
+
+With an `eyes.jev` section, the daemon answers the graph's requests for a
+second look at a wrist-camera frame with Jev, TypeSafe's System One model,
+through OpenRouter by default. Jev reads; the graph's gate decides.
+
+```yaml
+eyes:
+  jev:
+    base_url: https://openrouter.ai/api  # default; requests go to {base_url}/v1/systemone
+    model: typesafe/jev-1.14             # default; a pinned name, never an alias
+    credential_file: keys/jev.key        # optional, relative to this file
+    region: US                           # optional; picks the data notice
+    frame_topic: /wrist/image            # sensor_msgs/CompressedImage, JPEG
+    ask_topic: /rcp/eye/ask              # default
+    answer_topic: /rcp/eye/answer        # default
+    timeout_ms: 1500                     # default and maximum
+    question_sets:
+      - name: press_gate
+        state: Wrist camera frame from an arm in front of a coffee machine.
+        numbers: [jaw_gap_mm]            # optional: the numbers an ask may carry
+        questions:
+          edge_visible: { type: noul, instructions: The rim's lower edge is visible in `frame`. }
+          rim: { type: box, instructions: The chrome rim band in `frame`. }
+        visible: { question: edge_visible, threshold: 0.7 }   # optional
+```
+
+A node asks with one `std_msgs/String` frame on the ask topic:
+`{"ask_id": 7, "question_set": "press_gate", "frame": {"topic": "/wrist/image", "seq": 412}, "deadline_ms": 1500, "numbers": {"jaw_gap_mm": 3.5}}`.
+`seq` is the wire sequence number of a frame on the frame topic; the daemon
+keeps the newest 8 and waits up to 100 ms for one not yet seen. It sends one
+request carrying that frame unchanged, the set's text and the numbers, and
+publishes one answer frame per ask on the answer topic with an `outcome`:
+`ok`, or one of `disabled`, `no_credential`, `unavailable`, `timeout`,
+`rate_limited`, `quota`, `throttled`, `refused`, `wrong_model`, `malformed`,
+`not_visible` and `not_recorded`, each meaning Jev is absent. An answer later
+than its deadline is receipted `late` and never published. The frame records
+the questions, the state, the model asked and the model that answered, and
+the SHA-256 of the image and of the request body; never the image bytes or
+the key. A receipt (`eye.jev`, caller `rcp-eye`) is written before each
+answer is published.
+
+Before any request the daemon refuses an ask that is not one of these shapes
+(`malformed`), an image that is not a JPEG of at most 640 x 480 pixels and
+200 KB with sides of at least 280 pixels (`refused`), a request over 4,000
+estimated input tokens (`refused`), more than 2 requests in flight or more
+than 5 looks a second after a burst of 10 (`throttled`), every request for
+the `Retry-After` of a 429 (`rate_limited`), and, once the route reports a
+spend limit reached, every request until 00:00 UTC (`quota`, logged once).
+
+The key is read before every look from `CERULION_JEV_KEY_FILE`, else
+`credential_file`, else `jev.key` beside the receipt log. The file holds one
+per-robot key and must not be readable by group or others. Jev is on while a
+key is on file and the switch is not off:
+
+- `cerulion-rcpd jev off` stops requests with the next ask (`disabled`);
+  `jev on` turns it back on; `jev status` prints on or off, the route, the
+  model, today's asks and looks (UTC) and the last outcome.
+- The first start with Jev on logs one line saying that wrist frames leave
+  the robot and how to turn Jev off. A region whose law requires more gets
+  the line at every start (`clear`), or Jev off until `jev on` (`opt_in`).
+
+The answer topic has no producer inside the graph, so a recording replays
+the answers as recorded and nothing calls Jev. `--verify-bag` checks that
+every answer in a recording has its receipt, names an ask the recording
+holds, and, where the recording holds the frame, that the image and request
+digests recompute from it.

@@ -290,7 +290,7 @@ const MIN_STRING_PAYLOAD: usize = RosString::WIRE_FIXED_SIZE + 8 * RosString::VA
 /// or not 8-byte aligned, so both are refused first; anything else the reader
 /// panics on is caught, so a malformed frame from any local publisher costs
 /// that frame, never the journal thread.
-fn decode_string(payload: &[u8]) -> Result<String, String> {
+pub(crate) fn decode_string(payload: &[u8]) -> Result<String, String> {
     if payload.len() < MIN_STRING_PAYLOAD {
         return Err(format!(
             "payload of {} bytes is shorter than the {MIN_STRING_PAYLOAD} a String needs",
@@ -310,7 +310,7 @@ fn decode_string(payload: &[u8]) -> Result<String, String> {
 }
 
 /// Decode every frame queued on `subscriber`, oldest first.
-fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
+pub(crate) fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
     let mut out = Vec::new();
     let read = subscriber.try_receive(|message| {
         if message.header().schema_hash != RosString::SCHEMA_HASH {

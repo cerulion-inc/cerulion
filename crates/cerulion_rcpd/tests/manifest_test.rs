@@ -251,3 +251,85 @@ fn the_refuse_switch_fails_the_load_naming_the_tool() {
     .expect("write");
     RcpManifest::load_full(&manifest).expect("a reversible tool still loads");
 }
+
+const EYES: &str = "
+eyes:
+  jev:
+    frame_topic: /wrist/image
+    question_sets:
+      - name: press
+        state: Wrist camera frame in front of a coffee machine.
+        numbers: [gap]
+        questions:
+          edge_visible: { type: noul, instructions: The rim's lower edge is visible in `frame`. }
+          rim: { type: box, instructions: The chrome rim band in `frame`. }
+          side: { type: choice, instructions: Which side is the rim on?, criteria: { left: on the left, right: on the right } }
+          depth: { type: score, instructions: How far is the rim?, criteria: [ touching, near, far ] }
+        visible: { question: edge_visible, threshold: 0.7 }
+";
+
+#[test]
+fn an_eyes_section_parses_with_the_pinned_defaults() {
+    let m = RcpManifest::parse(EYES).expect("parse");
+    let jev = m.eyes.jev.expect("eyes.jev");
+    assert_eq!(jev.base_url, "https://openrouter.ai/api");
+    assert_eq!(jev.model, "typesafe/jev-1.14");
+    assert_eq!(jev.ask_topic, "/rcp/eye/ask");
+    assert_eq!(jev.answer_topic, "/rcp/eye/answer");
+    assert_eq!(jev.timeout_ms, 1_500);
+    assert_eq!(jev.question_sets[0].questions.len(), 4);
+    assert!(RcpManifest::parse("eyes: {}\n")
+        .expect("no jev")
+        .eyes
+        .jev
+        .is_none());
+}
+
+#[test]
+fn an_eyes_section_the_eye_cannot_serve_is_refused() {
+    let refused = |from: &str, to: &str, needle: &str| {
+        assert!(EYES.contains(from), "{from}");
+        let err = RcpManifest::parse(&EYES.replacen(from, to, 1)).expect_err(needle);
+        assert!(err.contains(needle), "{needle}: {err}");
+    };
+    let jev = "  jev:\n";
+    refused(jev, "  jev:\n    model: ~typesafe/jev-latest\n", "pinned");
+    refused(jev, "  jev:\n    model: jev-latest\n", "pinned");
+    refused(
+        jev,
+        "  jev:\n    base_url: http://openrouter.ai/api\n",
+        "loopback",
+    );
+    refused(
+        jev,
+        "  jev:\n    base_url: https://k:s@openrouter.ai/api\n",
+        "user info",
+    );
+    refused(jev, "  jev:\n    timeout_ms: 1501\n", "timeout_ms");
+    refused(jev, "  jev:\n    region: Germany\n", "region");
+    refused(jev, "  jev:\n    prompt: anything\n", "prompt");
+    refused(jev, "  jev:\n    ask_topic: /wrist/image\n", "must differ");
+    refused(
+        "type: noul, instructions",
+        "type: text, instructions",
+        "type",
+    );
+    refused(
+        "type: box, instructions: The chrome",
+        "type: box, criteria: { a: b }, instructions: The chrome",
+        "no criteria",
+    );
+    refused("question: edge_visible", "question: rim", "noul");
+    refused("threshold: 0.7", "threshold: 1.0", "threshold");
+    refused("numbers: [gap]", "numbers: [gap, gap]", "number");
+    refused("name: press", "name: press gate", "question set name");
+    let long = format!("state: {}", "x".repeat(8_000));
+    refused(
+        "state: Wrist camera frame in front of a coffee machine.",
+        &long,
+        "input tokens",
+    );
+    let collides = format!("journal:\n  calls_topic: /rcp/eye/ask\n{EYES}");
+    let err = RcpManifest::parse(&collides).expect_err("collision");
+    assert!(err.contains("journal or state topic"), "{err}");
+}

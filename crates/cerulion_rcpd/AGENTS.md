@@ -39,6 +39,16 @@ User reference: docs/rcp.md.
   `(safety class: irreversible)` description suffix and `safety_class` in
   every call result. Receipt lines carry the tool name, not the class.
 - stdout carries only the MCP stream in stdio mode; logs go to stderr.
+- The Jev eye (`src/eye/`) runs on its own `rcp-eye` thread, never the
+  journal thread, and only when the manifest has `eyes.jev`. Every check in
+  `EyeCore::admit` runs before any network call; every answer frame gets its
+  `eye.jev` receipt (caller `rcp-eye`, digest = `request_sha256` or
+  `ask_sha256`) BEFORE it is published, and an unreceipted answer is not
+  published. `Look` has no `Default` and no `bool` conversion; every outcome
+  but `ok` is `Absent`. The key never enters a frame, a receipt, a log or
+  the status file; the client sends it only in a sensitive `Authorization`
+  header. The v1 limits in `eye/limits.rs` are the numbers in the Jev limits
+  table; change them only with it.
 
 ## Testing
 
@@ -46,6 +56,12 @@ User reference: docs/rcp.md.
   tests use per-test SHM roots (`init_for_test`) and unique topics;
   `binary_smoke_test.rs` spawns the binary on the default root, so each of its
   manifests names journal topics unique to the test and process.
+- `eye_stub_test.rs` drives `EyeCore` and the HTTP client against a local
+  stand-in route (no real key, no network); `eye_graph_test.rs` runs the eye
+  thread on a private SHM root, records a bag, scans it, the receipts, the
+  status file and every log line for key bytes, resims from it and runs
+  `--verify-bag`. It installs the process's log subscriber, so it stays one
+  test per binary.
 - `tools_test.rs` drives the MCP surface against a stand-in graph thread and
   asserts the exact receipt sequence of each scenario; `binary_smoke_test.rs`
   checks the manifest switches reach the shipped binary.

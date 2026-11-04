@@ -330,7 +330,8 @@ members = [
     "crates/cerulion_accountd",
     # The Robot Context Protocol daemon: an MCP server over the live robot
     # graph. Hosts streamable HTTP on hyper (already in the default build),
-    # not axum, so its only new crates are rmcp and its small helpers.
+    # not axum, so its only new crates are rmcp, its small helpers and `h2`
+    # (the Jev eye's HTTP/2 client).
     "crates/cerulion_rcpd",
 ]
 # default-members: the LEAN build set — every workspace member EXCEPT the
@@ -381,8 +382,9 @@ default-members = [
     "crates/cerulion_ops_proto",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
-    # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
-    # default build: its HTTP side runs on hyper, already here.
+    # The RCP daemon adds only rmcp, sse-stream, a second base64 and `h2` to
+    # the default build: its HTTP server and its Jev client run on hyper,
+    # already here.
     "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a

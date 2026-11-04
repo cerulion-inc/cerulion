@@ -202,3 +202,68 @@ fn the_binary_refuses_an_irreversible_tool_under_the_refuse_switch() {
         "{stderr}"
     );
 }
+
+#[test]
+fn jev_off_on_and_status_drive_the_switch_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prefix = format!("rcpd_smoke_jev_{}", std::process::id());
+    let path = dir.path().join("rcp.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "robot: smoke
+eyes:
+  jev:
+    frame_topic: /{prefix}/wrist
+    ask_topic: /{prefix}/ask
+    answer_topic: /{prefix}/answer
+    question_sets:
+      - name: press
+        state: A wrist camera frame.
+        questions:
+          rim: {{ type: box, instructions: The rim in `frame`. }}
+"
+        ),
+    )
+    .expect("write manifest");
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cerulion-rcpd"))
+            .arg("jev")
+            .args(args)
+            .arg("--manifest")
+            .arg(&path)
+            .env_remove(cerulion_rcpd::eye::JEV_KEY_FILE_ENV)
+            .output()
+            .expect("run cerulion-rcpd");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let status = run(&["status"]);
+    assert!(status.contains("jev: off"), "no key on file: {status}");
+    assert!(
+        status.contains("credential: credential_missing"),
+        "{status}"
+    );
+    assert!(status.contains("model: typesafe/jev-1.14"), "{status}");
+    let off = run(&["off"]);
+    assert!(off.contains("Jev is off"), "{off}");
+    let switch = dir.path().join(".cerulion/rcp/jev.switch");
+    assert_eq!(
+        std::fs::read_to_string(&switch).expect("switch").trim(),
+        "off"
+    );
+    assert!(run(&["status"]).contains("switch: off"));
+    let on = run(&["on"]);
+    assert!(
+        on.contains("cerulion-rcpd jev off"),
+        "the notice names the off switch: {on}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&switch).expect("switch").trim(),
+        "on"
+    );
+}
