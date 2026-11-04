@@ -1358,8 +1358,16 @@ fn build_into(
         None
     };
 
-    // 3b. App subscriptions, after every topic this run produces exists and
-    //     before any producer runs, so the first frame lands in the queue.
+    // 3b. App subscriptions. They attach after the graph build, which ran
+    //     every node's `init`, and before the graph thread starts, so a
+    //     subscription holds every frame a node sends from `tick`. A frame
+    //     a node sends from `init` reaches it only through the output's
+    //     `history_size`, which the node's publisher delivers at the live
+    //     loop's history pump while the node keeps that publisher. A
+    //     subscriber that exists when a publisher sends keeps the frame
+    //     after that publisher is dropped (iceoryx2 keeps a connection that
+    //     holds undelivered data), which is what lets `poll` read a run that
+    //     finished.
     create_subscriptions(&plan.subscribes, &manager, &mut run.subscriptions)?;
 
     // 4. The recorder runs before any producer, as `armed_before_producers`

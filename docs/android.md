@@ -363,7 +363,9 @@ if (code == CerulionRuntime.OK) {
 ```
 
 Only `OK` appends to the builder. A subscription's queue holds `depth`
-messages; when it is full, the oldest message is dropped. `status` counts
+messages from each publisher of the topic; a graph output has one publisher,
+so it holds `depth` messages. When a publisher's part is full, its oldest
+message is dropped. `status` counts
 each subscription under `subscribed`: `polled` messages `poll` returned,
 `dropped` messages missing from a publisher's message sequence, most often
 the full queue dropping its oldest, and also a send that failed after the
@@ -377,8 +379,15 @@ dropped before the first one the subscription receives from that publisher
 is not counted. A message that
 does not decode, for example one of another schema, is still taken off the
 queue, so the next poll reads the one after it. The runtime creates every
-subscription before the graph runs, so it receives the first message a node
-sends. A subscription can read a graph output, an app `publish` topic, or a
+subscription after the graph build, which runs each node's `init`, and
+before the first tick, so a subscription receives every message a node
+sends from `tick`, from the first one on. A message a node sends from `init`
+is not in the queue unless the node's output declares `history_size` (see
+the [graph YAML reference](user-api.md#graph-yaml-reference)): the node's
+publisher then delivers its last `history_size` messages, up to the
+subscription's `depth`, at the graph's next loop pass, as to any late
+joiner, as long as the node keeps its publisher. A
+subscription can read a graph output, an app `publish` topic, or a
 topic another publisher in the process sends; a start logs a warning for a
 subscribe topic that is neither an app `publish` topic nor a graph output,
 because a misspelled topic polls `EMPTY` forever. `poll` reads a run that

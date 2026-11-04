@@ -2,9 +2,10 @@
 //! App subscriptions read with `poll`.
 //!
 //! The subscription queue is the transport's own subscriber queue, `depth`
-//! messages deep: a full queue drops its oldest message. `poll` takes one
-//! message off it and decodes it into JSON text; that text is an app-side
-//! copy, not the zero-copy node path.
+//! messages deep per publisher of the topic (one publisher for a graph
+//! output): a publisher whose part is full drops its oldest message. `poll`
+//! takes one message off it and decodes it into JSON text; that text is an
+//! app-side copy, not the zero-copy node path.
 use cerulion_core::dynamic::WireLayout;
 use cerulion_core::CerulionSubscriber;
 use serde::Serialize;
