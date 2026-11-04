@@ -2627,10 +2627,12 @@ the partitioner start from these same link rules; the census then adds its own f
 (`graphs/<NAME>.costs.yaml`, written by `cerulion graph profile`) shows it is safe: the unit's summed
 p50 tick, the new node included, stays under a quarter of the shortest period the merged unit is fed at,
 and under a quarter of the tightest `tick_within_ms` of its members. A unit is fed at each member's own
-period, at the profiled rate of each trigger edge into a member (an edge the profile does not rate feeds it
-as often as its producer is fed, or at an unknown rate from another process), and at the profiled fire rate (the
+period, at the profiled rate of each trigger edge into a member, and at the profiled fire rate (the
 fastest profiled trigger edge out) of each member that no graph node triggers or that fires on a topic no
-graph node publishes; a member whose fire rate the profile does not hold makes the feed unknown. **Without a profile nothing merges**: every data-triggered
+graph node publishes; a member whose fire rate the profile does not hold makes the feed unknown. A trigger
+edge the profile does not rate feeds the unit at an unknown rate from another process, and from a node of
+the process as often as that node's unit is fed before any chain link joins it: the node and every node
+`isolate: false` or a `block` edge keeps with it. **Without a profile nothing merges**: every data-triggered
 node is a unit of its own, so a slow node never holds another node from the first run.
 
 `cerulion graph plan <NAME>` prints why each node that starts a unit starts it:
@@ -2642,7 +2644,7 @@ node is a unit of its own, so a slow node never holds another node from the firs
 | `isolate: true` | declares it |
 | after an isolated node | is fed by a node that declares `isolate: true` |
 | no profile | no profile shows that joining its producer's unit is safe |
-| unknown feed | the profile holds no rate for how often a node that feeds the merged unit, or one of its members, is fed (the reason names it), so the unit's period is unknown |
+| unknown feed | the profile holds no rate for how often a node is fed (the reason names it), so the merged unit's period is unknown; the node is a member of the merged unit, or of a unit that feeds it through trigger edges the profile does not rate (the unit as `isolate: false` and `block` edges make it, before any chain link joins it) |
 | tick budget | the profile shows the merged unit would tick for a quarter or more of the shortest period it is fed at, or of the tightest `tick_within_ms` of its members |
 | on a cycle of chain links | sits on a cycle made only of chain links, which no chain head reaches |
 

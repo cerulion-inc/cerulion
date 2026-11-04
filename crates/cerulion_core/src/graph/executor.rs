@@ -128,8 +128,9 @@ pub enum Boundary {
     /// A link whose merged unit is fed at a period the profile does not
     /// hold: no rate it holds says how often `node` is fed.
     UnknownFeed {
-        /// The node whose feed is unknown: a node that feeds the merged
-        /// unit, or one of its members.
+        /// The node whose feed is unknown: a member of the merged unit, or a
+        /// member of a unit (as it stands before any link merge) that feeds
+        /// it through trigger edges the profile does not rate.
         node: String,
     },
     /// A link whose merge would put the unit over its tick budget.
@@ -394,8 +395,9 @@ fn fire_period_ns(node: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>)
 enum Feed<'a> {
     /// At this period, at the shortest.
     Every(u64),
-    /// Through `node` (a member or a node that feeds one), at a rate the
-    /// profile does not hold.
+    /// Through `node`, at a rate the profile does not hold: a member of the
+    /// group, or of a group that feeds it through trigger edges the profile
+    /// does not rate.
     Unknown(&'a str),
 }
 
@@ -1819,6 +1821,77 @@ mod tests {
                 ("h1".to_string(), Boundary::Source),
                 ("b".to_string(), over_period("b", 310_000, 1_000_000)),
             ]
+        );
+    }
+
+    /// `p` (10 Hz) triggers `m` and `c`. The join `m`, also triggered by `o`
+    /// of another process at `o_mhz`, declares isolate: false, so `p` and `m`
+    /// share one unit. `k` (100 Hz) and `p` trigger the join `c`, and `c`
+    /// links to `q`. The profile rates `p -> m`, `k -> c` and `c -> q` and
+    /// never `p -> c`, so `c` is fed through that edge as often as the unit
+    /// of `p` and `m` is.
+    fn fed_through_a_producers_partner(o_mhz: Option<u64>) -> Vec<ExecutorUnit> {
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[("c", "q")],
+            &[
+                ("p", "m", join.clone()),
+                ("o", "m", join.clone()),
+                ("p", "c", join.clone()),
+                ("k", "c", join),
+            ],
+            &[("p", 100), ("k", 10)],
+        );
+        g.isolate.insert("m".into(), false);
+        let mut rates = vec![("p", "m", 10_000), ("k", "c", 100_000), ("c", "q", 100_000)];
+        if let Some(mhz) = o_mhz {
+            rates.push(("o", "m", mhz));
+        }
+        let c = costs(
+            &[
+                ("p", 10_000),
+                ("m", 10_000),
+                ("k", 10_000),
+                ("c", 200_000),
+                ("q", 200_000),
+            ],
+            &rates,
+        );
+        derive_units("g", &s(&["p", "m", "k", "c", "q"]), &g, profile(&c))
+    }
+
+    #[test]
+    fn an_unknown_feed_names_a_partner_of_the_producer_of_an_unrated_edge() {
+        // No rate says how often `o` feeds `m`, so the unit of `p` and `m` is
+        // fed at an unknown rate, and so is `c` through the unrated `p -> c`:
+        // the merge of `q` is refused naming `m`, which is in neither `c` nor
+        // `q` and triggers neither.
+        let units = fed_through_a_producers_partner(None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["p", "m"]), s(&["k"]), s(&["c"]), s(&["q"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "q"),
+            Some(&Boundary::UnknownFeed { node: "m".into() })
+        );
+    }
+
+    #[test]
+    fn an_unrated_edge_feeds_its_consumer_at_the_feed_of_the_producers_whole_unit() {
+        // `o` feeds `m` at 1 kHz, so the unit of `p` and `m` is fed every
+        // 1 ms, and so is `c` through the unrated `p -> c`, though `p` fires
+        // every 100 ms: `c` and `q` would tick 0.4 ms, over a quarter of 1 ms.
+        let units = fed_through_a_producers_partner(Some(1_000_000));
+        assert_eq!(
+            nodes(&units),
+            [s(&["p", "m"]), s(&["k"]), s(&["c"]), s(&["q"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "q"),
+            Some(&over_period("q", 400_000, 1_000_000))
         );
     }
 
