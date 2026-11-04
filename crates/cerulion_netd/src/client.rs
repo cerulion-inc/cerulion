@@ -1572,9 +1572,25 @@ impl NetdClient {
 
     /// One `status` round-trip for [`Self::lan_access`].
     fn lan_access_once(&mut self) -> Result<Option<LanAccess>, ClientError> {
+        self.status_once().map(|s| s.lan_access)
+    }
+
+    /// The daemon's whole `status` answer: its demands, connection count
+    /// (this connection included), idleness, connect endpoints and LAN access
+    /// posture, read with a round-trip that registers nothing. Unlike
+    /// [`Self::lan_access`] it is not retried: that retry reconnects through
+    /// the path that can start a daemon, so a daemon that closes this
+    /// connection during its idle exit is reported as the error
+    /// [`closed_while_exiting`] recognises.
+    pub fn status(&mut self) -> Result<crate::protocol::StatusResponse, ClientError> {
+        self.status_once()
+    }
+
+    /// One `status` round-trip.
+    fn status_once(&mut self) -> Result<crate::protocol::StatusResponse, ClientError> {
         let id = self.next_request_id();
         match self.round_trip(&Request::Status { id })? {
-            Response::Status(s) => Ok(s.lan_access),
+            Response::Status(s) => Ok(s),
             Response::Error(e) => Err(ClientError::Netd {
                 error: e.error,
                 robot: e.robot,
@@ -1981,6 +1997,14 @@ pub fn is_not_running(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     )
+}
+
+/// Whether `e` is the error a daemon gives when it closes a connection it has
+/// just accepted, at or before the first exchange, because it is exiting
+/// (idle or shutting down): the shape [`NetdClient::status`] returns instead
+/// of retrying.
+pub fn closed_while_exiting(e: &ClientError) -> bool {
+    is_closed_early(e)
 }
 
 /// Whether a [`ClientError`] is the daemon-accepted-then-closed WEDGE/RACE

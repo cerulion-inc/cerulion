@@ -28,8 +28,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod account;
+mod certificates;
 mod clock;
 mod cpu;
+mod daemons;
 mod disk;
 mod gpu;
 mod iceoryx2_config;
@@ -194,6 +196,9 @@ pub static CATALOGUE: &[Check] = &[
     gpu::CUDA,
     ros::DISTRO,
     ros::RMW,
+    certificates::CERTIFICATES,
+    daemons::NETD,
+    daemons::REMOTED,
 ];
 
 /// The ids of every check, in catalogue order (for `--check` completion).
