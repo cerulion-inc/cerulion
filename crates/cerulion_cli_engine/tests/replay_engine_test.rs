@@ -3196,11 +3196,17 @@ fn latest_relay_round_trip(
     let bag = dir.path().join("latest.mcap");
     write_bag(&rec, &bag, None);
     let a = replay(&bag, make, None, None).expect("replay runs");
+    assert_clean_verdict(&a, node_type);
     assert!(
-        a.passed && a.trace_divergence.is_none(),
-        "{node_type} replays byte-exact: {:?} / {:?}",
-        a.violations,
-        a.trace_divergence
+        a.topics_checked >= 1 && a.topics_passed == a.topics_checked,
+        "{node_type}: every topic was compared and passed: {} of {}",
+        a.topics_passed,
+        a.topics_checked
+    );
+    assert!(
+        a.injection_stand_downs.is_empty(),
+        "{node_type}: no injection stood down: {:?}",
+        a.injection_stand_downs
     );
     let b = replay(&bag, make, None, None).expect("replay runs");
     assert_eq!(
@@ -3208,6 +3214,15 @@ fn latest_relay_round_trip(
         serde_json::to_string(&b).unwrap(),
         "two replays of one bag are byte-identical"
     );
+
+    // The same recording stamped free run: the fire re-derivation runs only
+    // on a free-run bag, so this is where the latest decider reads a real
+    // read log, and a `LatestFire` finding would surface as the read-log
+    // verdict `assert_clean_verdict` requires to be absent.
+    let free = dir.path().join("latest_free_run.mcap");
+    write_bag_with_coordination(&rec, &free, replay_engine::CoordinationMode::FreeRun);
+    let f = replay(&free, make, None, None).expect("free-run replay runs");
+    assert_clean_verdict(&f, &format!("{node_type} (free run)"));
 }
 
 /// A `consume = latest` relay fed BURSTS: one output per step that saw
