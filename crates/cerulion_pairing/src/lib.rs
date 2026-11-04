@@ -28,8 +28,10 @@
 //!
 //! ## Revocation is not expiry
 //!
-//! A robot-local, durable **access list** is the source of truth: established
-//! pairings never rot offline. Short-lived certs gate *new* pairings only.
+//! A robot-local, durable **access list** is the source of truth: an established
+//! pairing lapses offline only at a finite expiry its row carries (an owner-signed
+//! grant's `not_after`; for a cloud device, no later than its certificate's
+//! `not_after`), and short-lived certs otherwise gate *new* pairings only.
 //! Revocation propagates via a monotonic, signed **access-list epoch** (CRL-lite)
 //! that every trusted client pushes on connect, plus direct owner "revoke-now".
 //! A **tamper-evident MAC'd trust store** persists an **anti-rollback high-water**
@@ -61,6 +63,7 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod account_uuid;
 pub mod client;
 mod crypto;
 mod error;

@@ -22,6 +22,10 @@ build() {
   # The direct data demand probe runs on the host, beside the host CLI.
   cargo build -p android_e2e_demand_probe
   cargo ndk -t "$ABI" --platform 30 build -p cerulion_cli -p cerulion_netd
+  # The remote metadata probe runs on the device beside its netd. It is a
+  # separate invocation: the example builds with cerulion_remoted's dev
+  # dependencies, whose features must not reach the CLI and netd binaries.
+  cargo ndk -t "$ABI" --platform 30 build -p cerulion_remoted --example android_e2e_remoted_probe
   (cd "$ROOT/examples/basic_timer" && cargo ndk -t "$ABI" --platform 30 build)
   # The app ships ONE native library: the sample runtime library, which
   # links cerulion_android and the graph's nodes. `cargo ndk -o` would also
@@ -40,14 +44,77 @@ build() {
   gradle -p "$ROOT/crates/cerulion_android/android" assembleDebug ${GRADLE_ARGS:-}
 }
 
+# The run measures how long the graph and the app ran in milliseconds.
+# `date +%s%3N` is GNU only: BSD and macOS date print a literal N. Bash 5
+# keeps the time in $EPOCHREALTIME (whole seconds, the locale's radix
+# character, six digits of microseconds), so no external tool is needed.
+# The run already needs bash 4.3 or newer (`mapfile`, `${nums[-1]}`), and
+# require_ms_clock refuses an older bash at start-up with the fix.
+require_ms_clock() {
+  if (( BASH_VERSINFO[0] < 5 )); then
+    echo "FAIL millisecond clock: bash ${BASH_VERSION} has no \$EPOCHREALTIME; run this script with bash 5 or newer (on macOS: brew install bash, then run it with that bash)" >&2
+    exit 1
+  fi
+}
+# ms_from_epochrealtime VALUE: the milliseconds in one $EPOCHREALTIME value.
+ms_from_epochrealtime() {
+  if [[ ! "$1" =~ ^[0-9]+[^0-9][0-9]{6}$ ]]; then
+    echo "FAIL millisecond clock: unexpected \$EPOCHREALTIME value '$1'" >&2
+    exit 1
+  fi
+  local digits=${1//[!0-9]/}
+  printf '%s\n' "${digits%???}"
+}
+now_ms() {
+  ms_from_epochrealtime "$EPOCHREALTIME"
+}
+# self_test: the clock checks, with no device, cargo or adb.
+self_test() {
+  require_ms_clock
+  local got want input first second wall
+  while IFS='|' read -r input want; do
+    got=$(ms_from_epochrealtime "$input")
+    [[ "$got" == "$want" ]] ||
+      { echo "FAIL ms_from_epochrealtime $input: got '$got', want '$want'" >&2; exit 1; }
+  done <<'EOF'
+1730000000.123456|1730000000123
+1730000000,123456|1730000000123
+1730000000.000999|1730000000000
+1730000000.999999|1730000000999
+EOF
+  echo "PASS ms_from_epochrealtime: a dot and a comma radix give the same milliseconds"
+  for input in 1730000000123N 1730000000.12345 1730000000 '' .123456; do
+    if (ms_from_epochrealtime "$input") >/dev/null 2>&1; then
+      echo "FAIL ms_from_epochrealtime refuses '$input': it printed a value" >&2
+      exit 1
+    fi
+  done
+  echo "PASS ms_from_epochrealtime: refuses a malformed value"
+  first=$(now_ms)
+  second=$(now_ms)
+  wall=$(date +%s)
+  [[ "$first" =~ ^[0-9]+$ && "$second" =~ ^[0-9]+$ ]] ||
+    { echo "FAIL now_ms: not only digits: '$first' '$second'" >&2; exit 1; }
+  (( second >= first )) ||
+    { echo "FAIL now_ms: went back: $first then $second" >&2; exit 1; }
+  (( first / 1000 - wall <= 2 && wall - first / 1000 <= 2 )) ||
+    { echo "FAIL now_ms: $first ms is not within 2 s of date +%s ($wall s)" >&2; exit 1; }
+  echo "PASS now_ms: digits only, $first then $second, within 2 s of date +%s"
+}
+
 if [[ "${1:-}" == build ]]; then
   build
   exit 0
 fi
+if [[ "${1:-}" == self-test ]]; then
+  self_test
+  exit 0
+fi
 if [[ "${1:-}" != run ]]; then
-  echo "usage: $0 build|run" >&2
+  echo "usage: $0 build|run|self-test" >&2
   exit 2
 fi
+require_ms_clock
 
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/e2e.log") 2>&1
@@ -71,6 +138,7 @@ HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run" RUST_LOG=wa
 HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
+DEV_REMOTED_PROBE="$DEV/android_e2e_remoted_probe"
 GRAPH_PID="$DEV/graph.pid"
 NETD_PID="$DEV/netd.pid"
 CHECKS=0
@@ -180,6 +248,24 @@ run_probe() {
   verdict="$("$SCRIPT_DIR/android_e2e_probe_verdict.sh" "$expect" "$APP_IDENTITY" "$out")" ||
     fail "$label" "$verdict"
   pass "$label" "$verdict"
+}
+# run_remoted_probe LABEL FILE WANT ARG...: one run of the remote metadata
+# probe on the device, with the device netd's environment and working
+# directory (so it resolves the same control socket and shared-memory
+# namespace). It serves the `cerulion-remoted` wire plane and sends a catalog
+# and a schema request over loopback iroh; each answer is read from the netd
+# serving snapshot through the deadline-bounded control connect. A pass needs
+# exit code 0 and a fact line matching WANT.
+run_remoted_probe() {
+  local label=$1 file=$2 want=$3 rc=0 out fact
+  shift 3
+  out="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open RUST_LOG=warn; timeout 150 '$DEV_REMOTED_PROBE' $*" 2>&1)" || rc=$?
+  out="${out//$'\r'/}"
+  printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
+  (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
+  fact="$(grep '^remoted_probe ' <<<"$out" || true)"
+  [[ "$fact" =~ ^${want}$ ]] || fail "$label" "expected '$want', output=$out"
+  pass "$label" "${fact#remoted_probe }"
 }
 # host_netd_pids: the pids of the live host processes named cerulion-netd. A
 # zombie is dead: it holds no socket and answers nothing, so it is left out.
@@ -312,8 +398,14 @@ created_dev=1
 device "mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'" 
 device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"
 device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
+# Serving needs a saved login even with CERULION_LOGIN_GATE=off. This is a
+# fixture login: an expired session the serving gate accepts offline. The
+# device netd points its account service at a closed loopback port, so no
+# registration or refresh leaves the emulator.
+device "mkdir -p '$DEV/home/.cerulion' && printf '%s' '{\"account_id\":\"00112233-4455-4677-8899-aabbccddeeff\",\"session_token\":\"e2e-expired-session\",\"refresh_token\":\"e2e-offline-refresh\",\"expires_at_ns\":0,\"logged_in_ever\":true}' > '$DEV/home/.cerulion/auth.json' && chmod 600 '$DEV/home/.cerulion/auth.json'"
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
+"${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/examples/android_e2e_remoted_probe" "$DEV_REMOTED_PROBE" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/Cargo.toml" "$DEV/basic_timer/Cargo.toml" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/graphs" "$DEV/basic_timer/graphs" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/nodes" "$DEV/basic_timer/nodes" >/dev/null
@@ -325,10 +417,10 @@ mapfile -t node_libs < <(
 while IFS= read -r lib; do
   "${ADB[@]}" push "$lib" "$DEV/basic_timer/target/$TRIPLE/debug/" >/dev/null
 done < <(printf '%s\n' "${node_libs[@]}")
-device "chmod 755 '$DEV_CER' '$DEV_NETD'"
+device "chmod 755 '$DEV_CER' '$DEV_NETD' '$DEV_REMOTED_PROBE'"
 pass "device push" "node_libraries=${#node_libs[@]}"
 
-device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
+device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_ACCOUNT_SERVICE=http://127.0.0.1:1 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
 started_netd=1
 deadline=$((SECONDS + 20))
 ready=0
@@ -344,7 +436,7 @@ period_ms="$(sed -nE 's/.*period_ms[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' \
   "$ROOT/examples/basic_timer/nodes/timer/src/lib.rs" | head -1)"
 [[ "$period_ms" =~ ^[0-9]+$ && period_ms -gt 0 ]] ||
   fail "timer period" "could not read period_ms from the timer node"
-graph_started_ms="$(date +%s%3N)"
+graph_started_ms="$(now_ms)"
 device "cd '$DEV/basic_timer' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; nohup '$DEV_CER' graph run basic_timer --record='$DEV/record' > '$DEV/graph.log' 2>&1 & echo \$! > '$GRAPH_PID'"
 started_graph=1
 sleep 2
@@ -379,10 +471,18 @@ printf 'rc=%s\n%s\n' "$host_echo_rc" "$host_echo_output" > "$OUT/host-echo.txt"
   fail "host echo" "rc=$host_echo_rc output=$host_echo_output"
 host_values="$(printf '%s\n' "$host_echo_output" | numeric_values)"
 assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
+# Remote metadata through the robot's local netd while the graph serves the
+# timer topic: the catalog names it std_msgs/Int32 from netd's snapshot (a
+# topic binding or the wire-hash binding of its frames), the schema reply names
+# a type for it too (a builtin, so no custom closure), and no socket file
+# exists at the control path, so the reads came over the abstract namespace.
+run_remoted_probe "remoted catalog and schema" remoted-probe-served.txt \
+  'remoted_probe mode=served topic=/basic_timer/timer/count catalog_rows=[0-9]+ catalog_schema=std_msgs/Int32 schema_reply=builtin control_socket=abstract' \
+  served /basic_timer/timer/count std_msgs/Int32
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
 wait_remote_dead "$GRAPH_PID"
 started_graph=0
-graph_stopped_ms="$(date +%s%3N)"
+graph_stopped_ms="$(now_ms)"
 bag_remote="$(device "find '$DEV/record' -type f -name '*.mcap' | head -1" | tr -d '\r')"
 [[ -n "$bag_remote" ]] || fail "recording file" "no MCAP was created"
 "${ADB[@]}" pull "$bag_remote" "$OUT/phase-a.mcap" >/dev/null
@@ -401,6 +501,10 @@ pass "phase A bag" "frames=$bag_frames floor=$floor schema=$bag_schema"
 device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
 wait_remote_dead "$NETD_PID"
 started_netd=0
+# With the device netd stopped, both reads fail and name the missing daemon.
+run_remoted_probe "remoted reads without netd" remoted-probe-absent.txt \
+  'remoted_probe mode=absent topic=/basic_timer/timer/count catalog=refused schema=refused' \
+  absent /basic_timer/timer/count
 "${ADB[@]}" forward --remove tcp:7683 >/dev/null
 added_forward=0
 
@@ -481,7 +585,7 @@ if ! grep -qx 'iceoryx2.toml' <<<"$leftover" || ! grep -qx 'cerulion-shm' <<<"$l
   fail "app start after kill" "the killed run left no files/iceoryx2.toml and files/cerulion-shm: ${leftover//$'\n'/ }"
 fi
 "${ADB[@]}" logcat -c
-open_started_ms="$(date +%s%3N)"
+open_started_ms="$(now_ms)"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
 open_list=
@@ -621,7 +725,7 @@ assert_node_rows() {
   pass "$label" "/app/timer/count and /app/relay/echo std_msgs/Int32, frames >= $floor"
 }
 stop_app "app stop" 1
-open_stopped_ms="$(date +%s%3N)"
+open_stopped_ms="$(now_ms)"
 pass "app stop" "stop=0"
 pull_bag "app bag finalized" "$app_bag" "$OUT/app.mcap"
 app_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
@@ -638,7 +742,7 @@ assert_node_rows "app bag node frames" "$app_info" $((open_stopped_ms - open_sta
 
 # Restart in the same process: a new intent reaches the stopped activity,
 # which starts the runtime again with fresh nodes and a new recording.
-restart_started_ms="$(date +%s%3N)"
+restart_started_ms="$(now_ms)"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
 while (( SECONDS < deadline )); do
@@ -680,7 +784,7 @@ printf 'rc=%s\n%s\n' "$restart_rc" "$restart_echo" > "$OUT/restart-node-echo.txt
   fail "app restart same process" "timer echo rc=$restart_rc output=$restart_echo"
 assert_increasing "restart timer echo (rc=$restart_rc)" "$restart_values"
 stop_app "app restart stop" 2
-restart_stopped_ms="$(date +%s%3N)"
+restart_stopped_ms="$(now_ms)"
 pull_bag "app restart bag finalized" "$restart_bag" "$OUT/app-restart.mcap"
 restart_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app-restart.mcap" 2>&1)" ||
   fail "app restart bag info" "$restart_info"

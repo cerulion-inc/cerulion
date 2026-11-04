@@ -203,7 +203,9 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
     let desk_identity = DeviceIdentity::from_seed(&config.desk_seed);
     let desk_pubkey = desk_identity.public_key();
     let desk_eid_hex = hex::encode(desk_pubkey.0);
-    let account = AccountId(config.account.unwrap_or(desk_pubkey.0));
+    // A robot binds a code pairing only to the self-account (the desk key's
+    // public half); refuse any other account here, before dialing.
+    let account = self_account_for(config.account, &desk_pubkey.0)?;
 
     // The `pairing:` state line (STDOUT, machine-parseable). The desk-side eid IS
     // the robot's eid (the dial target) — display it so a driver can correlate.
@@ -380,6 +382,23 @@ fn run_ceremony(
         .map_err(classify_call_error)?;
 
     parse_finish_reply(&finish)
+}
+
+/// The account a code pairing binds: the desk key's public half. An explicit
+/// `--account` must equal it; any other value is a usage error, because the
+/// robot refuses it (a cloud account is admitted by certificate presentation).
+fn self_account_for(
+    requested: Option<[u8; 32]>,
+    desk_public_key: &[u8; 32],
+) -> Result<AccountId, PairError> {
+    match requested {
+        Some(account) if &account != desk_public_key => Err(PairError::Usage(
+            "--account must be this desk's own key: a robot binds a code pairing only to the \
+             self-account; a signed-in desk is admitted by its account certificate instead"
+                .into(),
+        )),
+        _ => Ok(AccountId(*desk_public_key)),
+    }
 }
 
 /// Parse the `code-pair-finish` reply into `(account_hex, source)`. Requires a
@@ -655,6 +674,20 @@ mod tests {
             EXIT_REFUSED,
             "a malformed robot reply is REFUSED (2), never USAGE (1)"
         );
+    }
+
+    #[test]
+    fn code_pairing_account_is_the_desk_key_and_any_other_is_refused() {
+        let desk = [0x21; 32];
+        assert_eq!(self_account_for(None, &desk).unwrap(), AccountId(desk));
+        assert_eq!(
+            self_account_for(Some(desk), &desk).unwrap(),
+            AccountId(desk)
+        );
+        match self_account_for(Some([0x22; 32]), &desk) {
+            Err(PairError::Usage(message)) => assert!(message.contains("--account")),
+            other => panic!("expected a usage refusal, got {:?}", other.map(|a| a.0)),
+        }
     }
 
     #[test]

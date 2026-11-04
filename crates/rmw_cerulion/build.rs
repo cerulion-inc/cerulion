@@ -113,16 +113,18 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 /// | `message_info_sequence_numbers` | Humble | `rmw_message_info_t` growth |
 /// | `discovery_options` | Iron | embedded in `rmw_init_options_t` |
 /// | `matched_events` | Iron | matched/incompatible-type events |
+/// | `durability_best_available` | Iron | `RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE` (best-available QoS policies) |
 /// | `message_lost_event` | Galactic | `RMW_EVENT_MESSAGE_LOST` |
 /// | `event_type_max` | Lyrical | `RMW_EVENT_TYPE_MAX` sentinel |
 /// | `type_hash` | Iron | typesupport type-hash trio (RIHS) |
 /// | `features` | Humble | `rmw/features.h` |
 /// | `network_flow` | Galactic | network-flow endpoints |
 /// | `actual_domain_id` | Galactic | `rmw_context_t` gained the resolved domain |
+/// | `service_endpoint_info` | Lyrical | `rmw/service_endpoint_info_array.h` |
 ///
 /// Token-choice rule: each token appears in the bindgen output IFF the
 /// capability's type/field/constant exists in the sourced headers (all
-/// 17 verified present in the vendored rolling snapshot, and absent
+/// 19 verified present in the vendored rolling snapshot, and absent
 /// per-era in the downloaded foxy/humble/jazzy/lyrical branch headers).
 /// Substring matching is deliberate — `discovery_options` matching
 /// `rmw_discovery_options_t` AND the `rmw_init_options_s` field is the
@@ -145,12 +147,17 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ),
     ("discovery_options", "discovery_options"),
     ("matched_events", "RMW_EVENT_SUBSCRIPTION_MATCHED"),
+    (
+        "durability_best_available",
+        "RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE",
+    ),
     ("message_lost_event", "RMW_EVENT_MESSAGE_LOST"),
     ("event_type_max", "RMW_EVENT_TYPE_MAX"),
     ("type_hash", "get_type_hash_func"),
     ("features", "rmw_feature_t"),
     ("network_flow", "rmw_network_flow_endpoint_array_t"),
     ("actual_domain_id", "actual_domain_id"),
+    ("service_endpoint_info", "rmw_service_endpoint_info_array_t"),
 ];
 
 /// Post-Foxy headers probed on the filesystem (bindgen path only): when
@@ -190,6 +197,10 @@ const HEADER_PROBES: &[(&str, &str)] = &[
         "CERULION_HAS_QOS_STRING_CONVERSIONS_H",
         "rmw/qos_string_conversions.h",
     ), // Galactic+
+    (
+        "CERULION_HAS_SERVICE_ENDPOINT_INFO_ARRAY_H",
+        "rmw/service_endpoint_info_array.h",
+    ), // Lyrical+
 ];
 
 /// Render `message` safe for cargo's DIRECTIVE channel, then print it as

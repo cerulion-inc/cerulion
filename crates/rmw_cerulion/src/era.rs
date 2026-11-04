@@ -2225,12 +2225,20 @@ mod tests {
             ),
             ("discovery_options", cfg!(cerulion_has_discovery_options)),
             ("matched_events", cfg!(cerulion_has_matched_events)),
+            (
+                "durability_best_available",
+                cfg!(cerulion_has_durability_best_available),
+            ),
             ("message_lost_event", cfg!(cerulion_has_message_lost_event)),
             ("event_type_max", cfg!(cerulion_has_event_type_max)),
             ("type_hash", cfg!(cerulion_has_type_hash)),
             ("features", cfg!(cerulion_has_features)),
             ("network_flow", cfg!(cerulion_has_network_flow)),
             ("actual_domain_id", cfg!(cerulion_has_actual_domain_id)),
+            (
+                "service_endpoint_info",
+                cfg!(cerulion_has_service_endpoint_info),
+            ),
         ] {
             any_present |= present;
             assert_eq!(caps.contains(&token), present, "capability token {token}");
@@ -2238,7 +2246,7 @@ mod tests {
         // The token set is CLOSED: a new capability
         // added to build.rs must land here too, and the `"none"` spelling
         // is correct only when every cfg is really off.
-        const KNOWN: [&str; 17] = [
+        const KNOWN: [&str; 19] = [
             "fetch_function",
             "is_key",
             "any_key_member",
@@ -2250,12 +2258,14 @@ mod tests {
             "message_info_sequence_numbers",
             "discovery_options",
             "matched_events",
+            "durability_best_available",
             "message_lost_event",
             "event_type_max",
             "type_hash",
             "features",
             "network_flow",
             "actual_domain_id",
+            "service_endpoint_info",
         ];
         if caps == ["none"] {
             assert!(

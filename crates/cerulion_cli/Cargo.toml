@@ -97,6 +97,8 @@ cerulion_bagd = { workspace = true }
 # bags with cerulion_bag's reader. Path-only (publish-cycle clean, matches the
 # cerulion_core dev-dep note below).
 cerulion_bag = { path = "../cerulion_bag" }
+# `config_home_test` pins the robot-state root mirror in this crate.
+cerulion_discovery = { path = "../cerulion_discovery" }
 # The multi-process SUPERVISOR test
 # (`tests/mp_supervisor_box_test.rs`) spawns the REAL `cerulion` binary as a
 # supervisor, reads the workers' dumped fire traces, and runs an in-process

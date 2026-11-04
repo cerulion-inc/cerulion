@@ -63,6 +63,8 @@ use std::path::PathBuf;
 mod browse;
 pub use browse::{browse_rung, browse_rung_report, instance_from_fullname, BrowseRungReport};
 
+use cerulion_discovery::unencrypted_quic::tcp_twin_of_udp_rel;
+pub use cerulion_discovery::unencrypted_quic::UDP_REL_TXT_KEY;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Deserialize;
 
@@ -81,6 +83,14 @@ const AGENT_TOKEN: &str = "cerulion";
 /// would have to re-word for its own verb.
 #[derive(Debug, thiserror::Error)]
 pub enum MdnsError {
+    /// Existing endpoint facts could not be read during a refresh.
+    #[error("mDNS: cannot read robot endpoint facts at {}: {source}", path.display())]
+    FactsRead {
+        /// The shared public facts path.
+        path: PathBuf,
+        /// The filesystem failure.
+        source: std::io::Error,
+    },
     /// The `ServiceInfo` could not be built (an mdns-sd validation refusal — a
     /// hostile instance label, an over-length TXT value that survived the
     /// per-key validation, …).
@@ -124,11 +134,8 @@ pub enum MdnsError {
 // partial file NEVER fails or delays the beacon — the facts-derived keys are
 // simply omitted.
 
-/// The default on-robot state root — MIRRORS `cerulion_remoted`'s
-/// `cerud::constants::DEFAULT_STATE_ROOT` (not linkable here). Overridable via
-/// [`STATE_ROOT_ENV`], exactly like remoted.
-const DEFAULT_STATE_ROOT: &str = "/var/lib/cerulion";
 /// The state-root override env var (mirrors remoted's `--state-root` clap env).
+#[cfg(test)]
 const STATE_ROOT_ENV: &str = "CERULION_STATE_ROOT";
 /// remoted's namespaced subdir under the state root (mirrors `config.rs`).
 const REMOTED_STATE_SUBDIR: &str = "remoted";
@@ -164,19 +171,14 @@ struct BeaconFactsOnDisk {
 }
 
 /// The path remoted publishes its beacon facts to:
-/// `<state-root>/remoted/beacon_facts.json`, state root =
-/// [`STATE_ROOT_ENV`] or [`DEFAULT_STATE_ROOT`] (mirrors remoted's convention).
-///
-/// NOTE: the advertiser reads the state root from the ENV only. remoted's
-/// `--state-root` flag also has `env = "CERULION_STATE_ROOT"`, so a co-visible
-/// env keeps the two in sync — but a remoted started with the FLAG and a
-/// non-default path (no matching env) diverges from this reader, and the
-/// enrichment (best-effort) is silently omitted. Co-set the env for enrichment.
-fn beacon_facts_path() -> PathBuf {
-    let root = std::env::var(STATE_ROOT_ENV).unwrap_or_else(|_| DEFAULT_STATE_ROOT.to_string());
-    PathBuf::from(root)
-        .join(REMOTED_STATE_SUBDIR)
-        .join(BEACON_FACTS_FILENAME)
+/// `<state-root>/remoted/beacon_facts.json`. Automatic startup and this reader
+/// share the per-user root resolver; an explicit deployment override wins.
+fn beacon_facts_path() -> Option<PathBuf> {
+    Some(
+        cerulion_discovery::robot_state::resolve()?
+            .join(REMOTED_STATE_SUBDIR)
+            .join(BEACON_FACTS_FILENAME),
+    )
 }
 
 /// Load remoted's PUBLIC beacon facts, if present. An ABSENT file → `None`
@@ -188,18 +190,25 @@ fn beacon_facts_path() -> PathBuf {
 /// [`parse_beacon_facts`]. Either way the enrichment is additive and NEVER fails
 /// or delays the beacon (once per advertise, so a `warn!` cannot flood).
 fn load_beacon_facts() -> Option<BeaconTxtFacts> {
-    let path = beacon_facts_path();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_beacon_facts(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "beacon facts file exists but could NOT be read (permission / I/O); mDNS TXT enrichment (eid/iroh_port/claimable) omitted this advertise — check the file's permissions (it is PUBLIC, meant to be world-readable)"
-            );
+    match read_beacon_facts() {
+        Ok(facts) => facts,
+        Err(error) => {
+            tracing::warn!(error = %error, "robot endpoint facts unavailable; LAN advertisement omits their TXT fields");
             None
         }
+    }
+}
+
+// Refresh callers receive I/O failures so their bounded loop can stop and log
+// once. The initial advertisement reports the error while keeping LAN available.
+fn read_beacon_facts() -> Result<Option<BeaconTxtFacts>, MdnsError> {
+    let Some(path) = beacon_facts_path() else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(parse_beacon_facts(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(MdnsError::FactsRead { path, source }),
     }
 }
 
@@ -327,6 +336,24 @@ pub fn sanitize_instance(robot: &str) -> String {
 pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16> {
     let ep = listen_endpoints.iter().find(|e| e.starts_with("tcp/"))?;
     let endpoint = ep.strip_prefix("tcp/")?;
+    lan_dialable_port(endpoint)
+}
+
+/// The port of the first `udp/<host>:<port>?rel=1` listen endpoint (exactly that
+/// metadata) whose host is not loopback and whose port is nonzero: what a
+/// gateway advertises as [`UDP_REL_TXT_KEY`] while `CERULION_UNENCRYPTED_QUIC=on`.
+/// `None` when there is none. Pure.
+pub fn udp_rel_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16> {
+    let ep = listen_endpoints
+        .iter()
+        .find(|e| tcp_twin_of_udp_rel(e).is_some())?;
+    let endpoint = ep.strip_prefix("udp/")?.strip_suffix("?rel=1")?;
+    lan_dialable_port(endpoint)
+}
+
+/// `<host>:<port>` to its port when the host is not loopback (an IP literal or
+/// a `.localhost` name) and the port is nonzero.
+fn lan_dialable_port(endpoint: &str) -> Option<u16> {
     let (host, raw_port) = endpoint.rsplit_once(':')?;
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
@@ -361,9 +388,14 @@ pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16
 /// ignores the extra keys — NOT byte-identical to the old beacon. Address
 /// auto-detection is enabled so the daemon fills the A/AAAA records — the `""`
 /// ip is intentional.
-fn build_gateway_service_info(robot: &str, port: u16) -> Result<ServiceInfo, MdnsError> {
+#[cfg(test)]
+fn build_gateway_service_info(
+    robot: &str,
+    port: u16,
+    udp_rel_port: Option<u16>,
+) -> Result<ServiceInfo, MdnsError> {
     let facts = load_beacon_facts();
-    build_gateway_service_info_with_facts(robot, port, facts.as_ref())
+    build_gateway_service_info_with_facts(robot, port, udp_rel_port, facts.as_ref())
 }
 
 /// The PURE inner builder — takes the already-loaded beacon facts (so the TXT
@@ -371,11 +403,15 @@ fn build_gateway_service_info(robot: &str, port: u16) -> Result<ServiceInfo, Mdn
 fn build_gateway_service_info_with_facts(
     robot: &str,
     port: u16,
+    udp_rel_port: Option<u16>,
     facts: Option<&BeaconTxtFacts>,
 ) -> Result<ServiceInfo, MdnsError> {
     let instance = sanitize_instance(robot);
     let host_name = format!("{instance}.local.");
-    let properties = gateway_txt_properties(robot, facts);
+    let mut properties = gateway_txt_properties(robot, facts);
+    if let Some(udp_rel) = udp_rel_port.filter(|&p| p != 0) {
+        properties.push((UDP_REL_TXT_KEY.to_string(), udp_rel.to_string()));
+    }
     let prop_refs: Vec<(&str, &str)> = properties
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -407,12 +443,31 @@ fn build_gateway_service_info_with_facts(
 /// registration failure is a loud `Err` the caller demotes to a warn — the
 /// advertisement is an additive overlay, never load-bearing.
 pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, MdnsError> {
+    advertise_gateway_with_udp_rel(robot, port, None)
+}
+
+/// [`advertise_gateway`], plus the TXT key [`UDP_REL_TXT_KEY`]`=<udp_rel_port>`
+/// when `udp_rel_port` is `Some` nonzero: the port of this gateway's unencrypted
+/// QUIC listener (`udp/<addr>:<udp_rel_port>?rel=1`). A gateway passes it only
+/// while `CERULION_UNENCRYPTED_QUIC=on`; with `None` the record is exactly the one
+/// [`advertise_gateway`] publishes.
+pub fn advertise_gateway_with_udp_rel(
+    robot: &str,
+    port: u16,
+    udp_rel_port: Option<u16>,
+) -> Result<MdnsAdvertiseGuard, MdnsError> {
     // Build the (pure) ServiceInfo BEFORE starting the daemon: `ServiceDaemon`
     // has no `Drop` shutdown, so any early return between `new()` and the
     // guard construction would leak its background
     // thread. Info-first leaves `register` as the only fallible step after
     // the daemon exists, and that path shuts it down explicitly below.
-    let info = build_gateway_service_info(robot, port)?;
+    let record = GatewayRecord {
+        robot: robot.into(),
+        port,
+        udp_rel_port,
+    };
+    let facts = load_beacon_facts();
+    let info = record.service_info(facts.as_ref())?;
     let fullname = info.get_fullname().to_string();
     let daemon = ServiceDaemon::new().map_err(|e| MdnsError::DaemonStart { source: e })?;
     if let Err(e) = daemon.register(info) {
@@ -428,10 +483,16 @@ pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, M
     tracing::info!(
         robot = %robot,
         port,
+        udp_rel_port,
         fullname = %fullname,
         "advertising the gateway over mDNS (_cerulion._tcp)"
     );
-    Ok(MdnsAdvertiseGuard { daemon, fullname })
+    Ok(MdnsAdvertiseGuard {
+        daemon,
+        fullname,
+        record,
+        facts,
+    })
 }
 
 /// Live mDNS advertisement handle. Held for the gateway's lifetime; its
@@ -442,14 +503,62 @@ pub struct MdnsAdvertiseGuard {
     /// The registered service fullname (`<instance>._cerulion._tcp.local.`),
     /// the key `unregister` takes.
     fullname: String,
+    record: GatewayRecord,
+    facts: Option<BeaconTxtFacts>,
+}
+
+/// What an advertisement registers. The guard keeps it, so a facts refresh
+/// re-registers the same robot, SRV port and `udp_rel` key with the new facts.
+struct GatewayRecord {
+    robot: String,
+    port: u16,
+    udp_rel_port: Option<u16>,
+}
+
+impl GatewayRecord {
+    fn service_info(&self, facts: Option<&BeaconTxtFacts>) -> Result<ServiceInfo, MdnsError> {
+        build_gateway_service_info_with_facts(&self.robot, self.port, self.udp_rel_port, facts)
+    }
 }
 
 impl MdnsAdvertiseGuard {
+    /// Update the existing registration after this robot's server writes its facts.
+    /// Partial, stale-identity, and unchanged facts do not replace the record.
+    pub fn refresh_robot_facts(&mut self, expected_eid: &str) -> Result<bool, MdnsError> {
+        let Some(facts) = read_beacon_facts()? else {
+            return Ok(false);
+        };
+        if !should_refresh_facts(self.facts.as_ref(), &facts, expected_eid) {
+            return Ok(false);
+        }
+        let info = self.record.service_info(Some(&facts))?;
+        self.daemon
+            .register(info)
+            .map_err(|source| MdnsError::Register {
+                robot: self.record.robot.clone(),
+                source,
+            })?;
+        self.facts = Some(facts);
+        Ok(true)
+    }
+
     /// The registered service fullname (`<instance>._cerulion._tcp.local.`) —
     /// the Principle-#3 observable a caller reports or a test asserts on.
     pub fn fullname(&self) -> &str {
         &self.fullname
     }
+}
+
+fn should_refresh_facts(
+    current: Option<&BeaconTxtFacts>,
+    incoming: &BeaconTxtFacts,
+    expected_eid: &str,
+) -> bool {
+    is_valid_eid(expected_eid)
+        && incoming.eid.as_deref() == Some(expected_eid)
+        && incoming.iroh_port.is_some_and(|port| port != 0)
+        && incoming.claimable.as_deref() == Some("0")
+        && current != Some(incoming)
 }
 
 impl Drop for MdnsAdvertiseGuard {
@@ -476,6 +585,39 @@ impl Drop for MdnsAdvertiseGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn late_robot_facts_refresh_only_the_expected_complete_changed_identity() {
+        let mut facts = full_facts();
+        facts.claimable = Some("0".into());
+        let eid = facts.eid.clone().unwrap();
+        assert!(should_refresh_facts(None, &facts, &eid));
+        assert!(!should_refresh_facts(Some(&facts), &facts, &eid));
+        assert!(!should_refresh_facts(None, &facts, &"44".repeat(32)));
+        for change in 0..3 {
+            let mut incomplete = facts.clone();
+            match change {
+                0 => incomplete.iroh_port = Some(0),
+                1 => incomplete.eid = None,
+                _ => incomplete.claimable = Some("1".into()),
+            }
+            assert!(!should_refresh_facts(None, &incomplete, &eid));
+        }
+        let mut restarted = facts.clone();
+        restarted.iroh_port = Some(55555);
+        assert!(should_refresh_facts(Some(&facts), &restarted, &eid));
+        let record = GatewayRecord {
+            robot: "robot".into(),
+            port: 7447,
+            udp_rel_port: Some(7683),
+        };
+        let info = record.service_info(Some(&restarted)).unwrap();
+        assert_eq!(info.get_port(), 7447);
+        assert_eq!(info.get_property_val_str("iroh_port"), Some("55555"));
+        assert_eq!(info.get_property_val_str("claimable"), Some("0"));
+        // The refreshed record keeps the unencrypted QUIC port it was advertised with.
+        assert_eq!(info.get_property_val_str(UDP_REL_TXT_KEY), Some("7683"));
+    }
+
     use super::*;
 
     #[test]
@@ -591,6 +733,59 @@ mod tests {
     }
 
     #[test]
+    fn udp_rel_port_reads_the_first_lan_unencrypted_quic_listener() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            udp_rel_port_from_listen_endpoints(&s(&["tcp/0.0.0.0:7683", "udp/0.0.0.0:7683?rel=1"])),
+            Some(7683)
+        );
+        assert_eq!(
+            udp_rel_port_from_listen_endpoints(&s(&["udp/[::]:7690?rel=1"])),
+            Some(7690)
+        );
+        // Not the unencrypted QUIC spelling, loopback, or port zero: none.
+        for listen in [
+            s(&["tcp/0.0.0.0:7683"]),
+            s(&["udp/0.0.0.0:7683"]),
+            s(&["udp/0.0.0.0:7683?rel=1;mixed_rel=1"]),
+            s(&["udp/127.0.0.1:7683?rel=1"]),
+            s(&["udp/0.0.0.0:0?rel=1"]),
+            s(&["quic/0.0.0.0:7683"]),
+        ] {
+            assert_eq!(
+                udp_rel_port_from_listen_endpoints(&listen),
+                None,
+                "{listen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_udp_rel_txt_key_is_present_only_when_a_port_is_given() {
+        let txt_of = |udp_rel: Option<u16>| {
+            let info =
+                build_gateway_service_info_with_facts("go2", 7683, udp_rel, None).expect("builds");
+            let props = info.get_properties();
+            props
+                .get_property_val_str(UDP_REL_TXT_KEY)
+                .map(str::to_string)
+        };
+        assert_eq!(txt_of(Some(7683)).as_deref(), Some("7683"));
+        assert_eq!(txt_of(None), None);
+        assert_eq!(txt_of(Some(0)), None);
+        // With no port the property set is exactly the one `advertise_gateway`
+        // has always published.
+        let plain = build_gateway_service_info_with_facts("go2", 7683, None, None).expect("builds");
+        let mut keys: Vec<String> = plain
+            .get_properties()
+            .iter()
+            .map(|p| p.key().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["agent", "arch", "os", "robot", "ver"]);
+    }
+
+    #[test]
     fn build_gateway_service_info_pins_fullname_port_and_txt() {
         // Oracle pins on the advertise-side ServiceInfo — sanitized instance
         // in the fullname, the SRV port, and the UNSANITIZED robot in TXT. The
@@ -599,7 +794,7 @@ mod tests {
         // + facts keys are purely ADDITIVE — an older browser reads
         // `robot=` and ignores the rest), so this is backward-compatible, NOT a
         // byte-identical TXT record.
-        let info = build_gateway_service_info("orin/cam.1", 7683).expect("builds");
+        let info = build_gateway_service_info("orin/cam.1", 7683, None).expect("builds");
         assert_eq!(info.get_fullname(), "orin-cam-1._cerulion._tcp.local.");
         assert_eq!(info.get_port(), 7683);
         assert_eq!(info.get_property_val_str("robot"), Some("orin/cam.1"));
@@ -791,7 +986,7 @@ mod tests {
             iroh_port: Some(41234),
             claimable: Some("maybe".to_string()),
         };
-        let info = build_gateway_service_info_with_facts("go2", 7683, Some(&facts))
+        let info = build_gateway_service_info_with_facts("go2", 7683, None, Some(&facts))
             .expect("a hostile facts file must NOT fail the registration");
         assert_eq!(info.get_property_val_str("robot"), Some("go2"));
         assert_eq!(info.get_property_val_str("eid"), None);
@@ -838,7 +1033,7 @@ mod tests {
     fn build_service_info_with_full_facts_carries_every_txt_key() {
         let facts = full_facts();
         let info =
-            build_gateway_service_info_with_facts("go2", 7683, Some(&facts)).expect("builds");
+            build_gateway_service_info_with_facts("go2", 7683, None, Some(&facts)).expect("builds");
         assert_eq!(info.get_fullname(), "go2._cerulion._tcp.local.");
         assert_eq!(info.get_port(), 7683);
         assert_eq!(info.get_property_val_str("robot"), Some("go2"));
@@ -859,12 +1054,23 @@ mod tests {
     }
 
     /// RAII: restore `CERULION_STATE_ROOT` to its pre-test value on drop.
-    struct StateRootGuard(Option<std::ffi::OsString>);
+    struct StateRootGuard(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
     impl StateRootGuard {
         fn set(value: &std::path::Path) -> Self {
             let prev = std::env::var_os(STATE_ROOT_ENV);
             std::env::set_var(STATE_ROOT_ENV, value);
-            StateRootGuard(prev)
+            StateRootGuard(prev, std::env::var_os("CERULION_HOME"))
+        }
+    }
+    impl StateRootGuard {
+        fn config_only(value: &std::path::Path) -> Self {
+            let guard = Self(
+                std::env::var_os(STATE_ROOT_ENV),
+                std::env::var_os("CERULION_HOME"),
+            );
+            std::env::remove_var(STATE_ROOT_ENV);
+            std::env::set_var("CERULION_HOME", value);
+            guard
         }
     }
     impl Drop for StateRootGuard {
@@ -872,6 +1078,10 @@ mod tests {
             match &self.0 {
                 Some(v) => std::env::set_var(STATE_ROOT_ENV, v),
                 None => std::env::remove_var(STATE_ROOT_ENV),
+            }
+            match &self.1 {
+                Some(v) => std::env::set_var("CERULION_HOME", v),
+                None => std::env::remove_var("CERULION_HOME"),
             }
         }
     }
@@ -899,7 +1109,7 @@ mod tests {
         assert_eq!(facts.claimable.as_deref(), Some("0"));
 
         // And the production entry point enriches the ServiceInfo end-to-end.
-        let info = build_gateway_service_info("go2", 7683).expect("builds");
+        let info = build_gateway_service_info("go2", 7683, None).expect("builds");
         assert_eq!(info.get_property_val_str("robot"), Some("go2"));
         assert_eq!(
             info.get_property_val_str("eid"),
@@ -907,6 +1117,29 @@ mod tests {
         );
         assert_eq!(info.get_property_val_str("iroh_port"), Some("50505"));
         assert_eq!(info.get_property_val_str("claimable"), Some("0"));
+    }
+
+    #[test]
+    fn refresh_read_errors_are_returned_for_one_shot_reporting() {
+        let _env_lk = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = StateRootGuard::set(dir.path());
+        let path = dir.path().join("remoted/beacon_facts.json");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(
+            matches!(read_beacon_facts(), Err(MdnsError::FactsRead { path: failed, .. }) if failed == path)
+        );
+    }
+
+    #[test]
+    fn automatic_state_root_uses_the_login_config_home() {
+        let _env_lk = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = StateRootGuard::config_only(dir.path());
+        assert_eq!(
+            beacon_facts_path(),
+            Some(dir.path().join("robot-state/remoted/beacon_facts.json"))
+        );
     }
 
     #[test]

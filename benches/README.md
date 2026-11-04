@@ -34,6 +34,8 @@ python3 benches/latency/bench.py compile-csv && python3 benches/latency/bench.py
 | Directory | Status | What it is |
 |---|---|---|
 | `latency/` | **ACTIVE: the public suite** | Complete, self-contained latency campaign: native floor + comparison lines, real-CLI workspace lines (`cerulion graph run`, mono + split + split3 legs, free-run default with an opt-in lockstep arm), ROS 2 cell matrix in Docker, driver (`bench.py`), strict offline aggregation, smoke gate, plot system. Raw `.bin` samples → offline percentiles; no number ships without its harness (Principle #13). |
+| `wire-formats/` | **ACTIVE: microbenchmark** | Single-threaded serialization microbenchmark: Cerulion generated types against FlatBuffers, Protobuf (prost) and Cap'n Proto on the same IMU, Image and PointCloud2 content. Encode into a preallocated slot, read fields from bytes in memory, bytes on the wire. No transport. Criterion; FlatBuffers and Cap'n Proto code vendored. See [`wire-formats/README.md`](wire-formats/README.md). |
+| `wake_census/` | Measurement tool | `wake_census.py` counts how often each process of an idle graph wakes up (Linux: context switches, scheduler runs, wakeups, optional perf count of wakeups raised from interrupt context; macOS: idle and interrupt wakeups, context switches). It reports and gates nothing; usage is in the script's docstring (`--help`). |
 
 ## Conventions (all suites)
 

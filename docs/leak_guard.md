@@ -194,7 +194,15 @@ names and emails (the identity policy accepts the forge noreply address, the for
 web-flow address, project role addresses, or an address listed in
 `--allow-email-file`), pull request title and body, and any further body handed to it by
 name (`--body-env VAR --body-label issue-body`), which is how the workflow reaches an
-issue body, an issue comment and a pull request review comment. `names` mode scans paths and
+issue body, an issue comment and a pull request review comment. The workflows read a
+title or a body out of the event payload file inside the step and set that variable
+there. They never pass it through a step's `env:` block, an action's `with:` inputs or
+any other `${{ }}` expression the run log prints, because the log keeps that copy after
+the text is edited or deleted. The scanner self-test refuses any workflow under
+`.github/workflows` that does. An issue or a pull request opened with no description
+reads as an empty body; a payload that is missing the text, such as a comment with no
+body, stops the scan and fails the check, and never reads as a clean empty body.
+`names` mode scans paths and
 the branch name. `media` mode parses PNG, JPEG, GIF, WebP and the MP4 and MOV family
 for comments, EXIF, XMP, location boxes and trailing bytes; a document, archive or
 container no walker can read is a hit until an allowlist entry names it.

@@ -2991,12 +2991,12 @@ mod tests {
     /// The ZERO-PUBLISHER fast path settles — pinned
     /// DIRECTLY, on the verdict.
     ///
-    /// `mirror_provenance_e2e_test::no_mirror_desk_gathers_empty_instantly`
-    /// asserts the records and the latency but predates `GatherCompleteness`, so
-    /// it asserts NO verdict: the whole `Settled` arm of the fast path was
-    /// reachable by no assertion anywhere. It is the majority shipping path —
-    /// every desk with no re-injector — and the one place an empty answer is
-    /// authoritative for free.
+    /// `mirror_provenance_e2e_test::no_mirror_desk_settles_at_once_without_ringing_the_doorbell`
+    /// asserts the records, the elapsed time and the silent doorbell but predates
+    /// `GatherCompleteness`, so it asserts NO verdict: the whole `Settled` arm of
+    /// the fast path was reachable by no assertion anywhere. It is the majority
+    /// shipping path (every desk with no re-injector) and the one place an
+    /// empty answer is authoritative for free.
     ///
     /// Its PAIR is `an_unheard_live_writer_...` below: same empty `records`, the
     /// opposite verdict, and the difference is the entire point of the type.
@@ -3121,10 +3121,10 @@ mod tests {
     /// `GatherCompleteness` exists.
     ///
     /// The pairing deliberately names IN-MODULE arms rather than
-    /// `mirror_provenance_e2e_test::no_mirror_desk_gathers_empty_instantly`,
-    /// which predates the verdict and
-    /// asserts only the records and the latency, so it pins no `Settled` at all
-    /// and could not serve as the opposite half of anything.
+    /// `mirror_provenance_e2e_test::no_mirror_desk_settles_at_once_without_ringing_the_doorbell`,
+    /// which predates the verdict and asserts only the records, the elapsed time
+    /// and the silent doorbell, so it pins no `Settled` at all and could not
+    /// serve as the opposite half of anything.
     #[test]
     fn an_unheard_live_writer_yields_an_empty_gather_that_is_not_an_absence_claim() {
         use crate::transport::{TransportConfig, TransportManager};

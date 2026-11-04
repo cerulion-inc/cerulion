@@ -146,9 +146,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 #                       matching rmw_iceoryx.
 #   shm_guard.rs        init-time THP/RLIMIT detection + a create-time
 #                       /proc/self/maps scan that madvises our SHM pool VMAs.
+#   team_auth.rs        team-session credentials: certificate checks and PEM
+#                       encoding when the credentials are built
+#                       (`TeamAuth::new`), and the locator checks and zenoh
+#                       config entries (TLS, protocols, scouting autoconnect,
+#                       access control), set when `NetworkManager` opens its
+#                       zenoh session. No message, sample or payload passes
+#                       through it.
+#   test_ca.rs          `cfg(any(test, feature = "test-helpers"))` only: an
+#                       in-memory test team issuer for networked tests.
 TRANSPORT_EXCLUDE="adaptive_sizer.rs bridge.rs cerulion_q.rs discovery.rs \
 gateway.rs mirror_registry.rs mod.rs network.rs \
-reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
+reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs \
+team_auth.rs test_ca.rs"
 
 # cerulion_core/src/graph — the level executor lives here (runtime.rs).
 #

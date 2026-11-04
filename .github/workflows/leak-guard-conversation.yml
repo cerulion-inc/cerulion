@@ -82,23 +82,37 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+    # The body is read out of the event payload file inside each step that
+    # needs it, never through a step's `env:` block: the run log prints a
+    # step's env values, and that copy would outlive an edit or a delete of the
+    # text, the guard's own clean up included. This filter is the one reading
+    # both steps use, keyed on the payload's shape: a comment event's body is
+    # the comment's own text and nothing else, an issue event's body is the
+    # issue's. The forge sends `null` for an issue opened with no description,
+    # which is an empty body. A comment with no text, an issue with no `body`
+    # key, an empty file or a payload that is not an object produces no string,
+    # so `jq -e` fails rather than reading it as an empty body. The leak
+    # scanner's self-test runs this filter on hand-written payloads.
+    env:
+      LG_BODY_JQ: >-
+        objects | if has("comment") then .comment.body | strings
+        else .issue | objects | select(has("body")) | .body // "" | strings end
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Scanner self-test
         run: python3 -B tools/scripts/leak_scan.py --self-test
 
-      # The body reaches the scanner through an environment variable NAME, never
-      # interpolated into a shell line, and is neither echoed nor written to
-      # disk. What the scanner prints is a masked shape and a class, which is
-      # what every other job here prints.
+      # The body reaches the scanner through the NAME of a variable this shell
+      # sets from the event payload file, never interpolated into a shell line,
+      # and is neither echoed nor written to disk. What the scanner prints is a
+      # masked shape and a class, which is what every other job here prints.
       - name: Scan the body
         id: scan
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
           EVENT_NAME: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
-          LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
         run: |
           set -uo pipefail
           case "$EVENT_NAME" in
@@ -118,10 +132,16 @@ jobs:
             # the ask left for it and clears the label if that was the last one,
             # which is the only way a label on a deleted comment ever comes off.
             echo "the body was deleted; treating it as clean"
-          else
+          elif LG_BODY=$(jq -e -j "$LG_BODY_JQ" "$GITHUB_EVENT_PATH"); then
+            export LG_BODY
             python3 -B tools/scripts/leak_scan.py messages --require-private --format github \
               --conversation --skip-code --body-env LG_BODY --body-label "$label" \
               --hard-classes-file "$classes" || rc=$?
+          else
+            # A payload that cannot be read is a scan that did not happen, never
+            # an empty body: the step below refuses any exit but 0 and 1.
+            echo "::error ::the event payload could not be read"
+            rc=2
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 
@@ -149,7 +169,6 @@ jobs:
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           EVENT_NAME: ${{ github.event_name }}
           COMMENT_ID: ${{ github.event.comment.id }}
-          LG_BODY: ${{ github.event.comment.body || github.event.issue.body }}
         run: |
           set -euo pipefail
           # 0 is clean and 1 is a finding. Everything else, a usage error at 2, a
@@ -173,7 +192,10 @@ jobs:
           classes="${RUNNER_TEMP:-/tmp}/leak-guard-classes.txt"
           [ -f "$classes" ] || : > "$classes"
           scope=${COMMENT_ID:-body}
-          digest=$(printf '%s' "$LG_BODY" | sha256sum | cut -c1-16)
+          # Digested byte for byte straight from the payload file, with the
+          # reading the scan step used, so the body never passes through a shell
+          # variable or `env:` here. A payload that cannot be read stops the step.
+          digest=$(jq -e -j "$LG_BODY_JQ" "$GITHUB_EVENT_PATH" | sha256sum | cut -c1-16)
           prefix="<!--leak-guard:$EVENT_NAME:$scope:"
           marker="$prefix$digest-->"
 

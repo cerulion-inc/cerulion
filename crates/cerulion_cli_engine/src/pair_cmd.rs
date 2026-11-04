@@ -51,8 +51,9 @@ pub struct PairArgs {
     /// The short pairing code (`--code`). When omitted, `cerulion-connectd pair`
     /// reads it from stdin (a TTY prompt for a human, a piped line for Studio).
     pub code: Option<String>,
-    /// The account (64-char hex) this pairing is FOR (`--account`). When omitted,
-    /// the desk derives a self-account from its device key.
+    /// The account (64-char hex) this pairing is FOR (`--account`). It must be the
+    /// desk's self-account (the public half of its device key), which is also the
+    /// value used when omitted; `cerulion-connectd pair` refuses any other.
     pub account: Option<String>,
     /// The access-list label the robot stores (`--label`). When omitted, the desk
     /// hostname is used.

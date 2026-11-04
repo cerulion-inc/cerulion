@@ -53,9 +53,10 @@ pub struct QosSnapshot {
     /// its RETENTION, the frames it really keeps:
     ///
     ///
-    /// - PUBLISHER: the clamped history. `TRANSIENT_LOCAL` depth 1000 ⇒ 16,
-    ///   depth 5 ⇒ 5, and VOLATILE ⇒ 0 (it retains nothing for a late
-    ///   joiner). NOT the topic's `subscriber_max_buffer_size` ceiling,
+    /// - PUBLISHER: the clamped history. `TRANSIENT_LOCAL` (and
+    ///   BEST_AVAILABLE, which a publisher resolves to it) depth 1000 ⇒ 16,
+    ///   depth 5 ⇒ 5, and VOLATILE ⇒ 0 (it asks for no history of its
+    ///   own). NOT the topic's `subscriber_max_buffer_size` ceiling,
     ///   which is a subscriber-SLOT budget rather than a depth anything
     ///   retains — reporting it would make a depth-5 publisher claim 16.
     /// - SUBSCRIPTION: the transport's default subscriber buffer, which IS

@@ -375,10 +375,40 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | Command | Effect |
 |---|---|
 | `cerulion pair [ROBOT] [--eid HEX] [--addr IP:PORT]... [--code CODE] [--account HEX] [--label NAME] [--key-file PATH] [--relay-url URL] [--relay-disabled]` | Enroll this desk with a robot, once. `ROBOT` is a 64-char-hex endpoint id or a name resolved from the robot's mDNS record (else `~/.cerulion/robots.toml`); `--eid` gives the id directly. `--code` is the short pairing code the robot owner shared; **prefer omitting it** and typing it at the prompt, because a code passed on the command line is visible in process listings for the ceremony window and it authorizes durable enrollment. `--label` is the name the robot stores on its access-list row so its owner recognizes this desk (default: your hostname). `--key-file` is the desk device key (default this machine's key `~/.cerulion/identity/device.key`, also named `~/.cerulion/desk.key`, created `0600` on first pair or sign-in and reused after). Pairing writes the robot's name pin, so `cerulion connect <name>` works afterwards. |
-| `cerulion connect [ROBOT] [--eid HEX] [--addr IP:PORT]... [--topic TOPIC]... [--all] [--key-file PATH] [--schemas-dir DIR] [--relay-url URL] [--relay-disabled] [--network off]` | Dial a paired robot's wire plane and re-inject its topics into desk-local shared memory, so `topic echo` and `viz` see them as LOCAL topics. `--topic` (repeatable) selects what to bring across; `--all` brings everything. Runs until Ctrl+C. It spawns the `cerulion-connectd` sibling binary (a separate binary because it links iroh), which it looks for beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it, and `CERULION_CONNECTD_BIN` points at one that lives elsewhere. |
+| `cerulion connect [ROBOT] [--eid HEX] [--addr IP:PORT]... [--topic TOPIC]... [--all] [--key-file PATH] [--schemas-dir DIR] [--relay-url URL] [--relay-disabled] [--network off]` | Dial a paired robot's wire plane and re-inject its topics into desk-local shared memory, so `topic echo` and `viz` see them as LOCAL topics. Data flows from the robot to the desk only: the `cerulion/wire/2` connection it opens has no path for writing a topic or sending teleop commands to the robot. `--topic` (repeatable) selects what to bring across; `--all` brings everything. Runs until Ctrl+C. It spawns the `cerulion-connectd` sibling binary (a separate binary because it links iroh), which it looks for beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it, and `CERULION_CONNECTD_BIN` points at one that lives elsewhere. |
 | `cerulion login` | Sign in to a Cerulion account. Runs the RFC 8628 device-code flow: prints a short code and a verification URL to open on any device, then waits for you to authorize. It is headless-friendly, so it works over SSH. Use it any time to sign in, re-authenticate or switch accounts. Ordinary commands require a signed-in machine: on one that has never signed in, the first command starts this flow at a terminal and refuses with this command's name anywhere else. Exempt: `login` itself, `logout`, `telemetry` (so consent can be read or changed before signing in), `completions`, `clean`, `--help`, `--version`, and the internal `graph run-worker` and `graph run-gateway` subprocess verbs a gated parent spawns. |
 | `cerulion logout` | Sign this machine out. Removes the session and refresh tokens from `~/.cerulion/auth.json` (the account id and the signed-in-before marker stay, the same record Cerulion Studio's "Sign out" writes), then revokes the session at the account service (`POST /v1/auth/revoke`). Every command the login gate covers is then refused (exit 7, "signed out") until the next `cerulion login`; at a terminal that command starts the sign-in instead. STDOUT is one line, `signed_out: account=<id>`, or `not_signed_in` when no session was stored (exit 0, nothing changed). Exit 1 when `auth.json` could not be rewritten (nothing was signed out), or when the machine was signed out but the service did not confirm the revoke (offline, service error): the session then stays valid at the service until it expires. A cached device certificate is left; revoke the device with `cerulion account devices revoke`. |
 | `cerulion account devices list` / `devices revoke <DEVICE_ID>` | List and revoke the desks enrolled on your account: self-service management of your own machines. Robot access management lives in Studio and the web account page, not the CLI. |
+
+### `cerulion doctor`
+
+`cerulion doctor [--json] [--local] [--check ID]... [--timeout-ms MS]` checks this host for problems that slow or stop Cerulion. Each check reads one fact about the machine and reports `pass`, `info` (a fact with no judgement), `warn` (Cerulion works, slower or less reliably in the way the line says), `fail` (a Cerulion feature does not work here as the machine is) or `skip` (the check does not apply on this platform, or was not run on request). Every `warn` and `fail` prints why it matters and the exact command or edit that fixes it. No check needs root, and none writes a file or changes a sysctl or a network setting; `limits.open-files` raises the verb's own soft open-file limit the way `graph run` does, so it reads the limit a graph gets. The verb runs on a machine that has never signed in: the login gate does not run before it. Like every command it sends one usage event when telemetry is on; no finding is in it.
+
+| Flag | Effect |
+|---|---|
+| `--json` | Print the report as one JSON object on stdout instead of the table. |
+| `--local` | Skip the checks that use the network; no check in this release does. `CERULION_NETWORK=off` does the same. |
+| `--check ID` | Run only this check; repeatable. An unknown id is a usage error (exit 2). |
+| `--timeout-ms MS` | How long to wait for the checks, which run at the same time. A check that has not answered by then is reported as `warn` and nothing it would have read is shown. Default 4000: twice the bounded scan the stale-node check makes. |
+
+Exit 0 when no check failed (warnings included), 1 when any check failed, 2 for a usage error.
+
+The JSON object carries `report_version` (1; it changes only when a field is removed or changes meaning), `cerulion_version`, `os`, `arch`, `timeout_ms`, `exit_code`, `counts` (one number per status) and `checks`, one entry per check in the order below: `id`, `status`, `summary`, `why`, `fix` (a string for every `warn` and `fail`, else `null`), `network`, `elapsed_ms` (`null` for a check that did not answer) and `readings`, the named values the check read. A check id is never reused for another meaning.
+
+| Check | Reads | Fails or warns when |
+|---|---|---|
+| `limits.open-files` | The open-file limit after the raise `graph run` makes, and each workspace graph's ports | Fails when `graph run` would refuse a workspace graph at that limit; the fix is the refusal's own remedy |
+| `shm.dev-shm` | Linux: `/dev/shm` size, free space and mount flags | Fails when it is missing or read-only; warns when one scheduler-trace ring no longer fits |
+| `shm.stale-nodes` | The iceoryx2 node registry, and on macOS the `/tmp/*.shm_state` files, read the way `cerulion clean --report-only` reads them | Warns when dead processes left nodes or state files (the fix is `cerulion clean`), or when the registry or the state-file scan could not be read in full |
+| `iceoryx2.cwd-config` | `config/iceoryx2.toml` in the current directory against the user and system iceoryx2 config | Warns when a process started here uses another shared-memory root or prefix than one started elsewhere |
+| `disk.recordings` | The filesystem under the first of `./recordings` (where `graph run --record` writes) and `<workspace>/recordings` (where flashback captures go) that exists, else the current directory (where `bag record` writes and `graph run --record` would create `recordings/`); `CERULION_FLASHBACK_DIR` is not read | For a recordings directory, fails when it is read-only, not writable or full; for the current directory, warns instead. Warns when it is tmpfs |
+| `account.login` | The local sign-in state, with no network | Fails when this machine never signed in, signed out, the sign-in file cannot be read or parsed, or no config directory resolves |
+| `cpu.governor` | Linux: each CPU's frequency governor, floor and maximum | Never: it is `info` only, and Cerulion changes no governor |
+| `clock.sync` | Linux and macOS: the kernel's clock discipline state (`ntp_adjtime`, a read that changes nothing), with its error bound and last offset | Warns when the kernel marks the clock unsynchronised |
+| `net.mtu` | Linux: the MTU of each IP interface (Ethernet, PPP, raw-IP LTE and 5G modems, IP tunnels, WireGuard, TUN) that is up and not a loopback | Warns when an interface is below 1228 bytes: a QUIC datagram carries at least 1200 bytes plus the UDP and IPv4 headers |
+| `gpu.cuda` | Linux: the NVIDIA driver version, `/dev/nvidia<N>` devices, Jetson release, CUDA toolkit version and whether the loader cache names `libcuda.so.1`, from files only | Warns when this host has an NVIDIA device node or is a Jetson and `/etc/ld.so.cache` does not name `libcuda.so.1`; otherwise `info` |
+| `ros.distro` | `ROS_DISTRO`, `ROS_VERSION` and `AMENT_PREFIX_PATH` | Never: `info` when a ROS 2 distribution is sourced, `skip` when none is (a ROS 1 shell, `ROS_VERSION=1`, counts as none) |
+| `ros.rmw` | Whether `librmw_cerulion.so` is where `cerulion ros2 run` looks (`CERULION_LIB_DIR`, else beside `cerulion`), and `RMW_IMPLEMENTATION` | Fails when a ROS 2 environment is sourced and the library is missing or its directory cannot be resolved (the fix is the one `ros2 run` prints); warns or informs otherwise. Not applicable on macOS |
 
 ### Other
 
@@ -710,6 +740,60 @@ An Android app links its nodes this way into one native library, its app runtime
 ---
 
 ## Node author API (the macros)
+
+### What a node crate depends on
+
+A node needs the runtime and the message types, and there are two manifests
+that provide them.
+
+One dependency, which is what `cargo add cerulion` writes:
+
+```toml
+[dependencies]
+cerulion = "1.0.0"
+```
+
+`cerulion` is an umbrella crate that re-exports the other three at a single
+version. A node written against it imports `cerulion::prelude::*` and takes
+its port types from `cerulion::msgs`.
+
+Or the crates themselves, which is what `cerulion workspace create` scaffolds
+and what every example in this document uses:
+
+```toml
+[dependencies]
+cerulion_core = "1.0.0"
+native_ros2_messages = "1.0.0"
+```
+
+Either works. The macros read the package's own `Cargo.toml` at expansion
+time to decide how to spell the paths they emit, because Rust resolves the
+first segment of an absolute path only against a crate the package names in
+its own manifest:
+
+| The package names | Generated paths start with |
+|---|---|
+| `cerulion_core` and not `cerulion` | `::cerulion_core` |
+| `cerulion` and not `cerulion_core` | `::cerulion::core` |
+| both, with `cerulion` a plain `[dependencies]` entry without `optional = true`, and `cerulion_core` not one | `::cerulion::core` |
+| both, any other way | `::cerulion_core` |
+
+The third row is the layout where only the umbrella is linked into every
+target: `cerulion_core` sits in `[dev-dependencies]`, in a
+`[target.'cfg(..)'.dependencies]` table, or behind `optional = true`. A
+package whose generated paths start with `::cerulion_core` gets the same
+generated code it got before the macros read the manifest, so a type error on
+a node's field is still reported at that field.
+
+A package that names neither is refused: Cargo does not hand a package its
+transitive dependencies, so a re-export in some crate further down cannot
+stand in. The macros report that by name, with both manifests spelled out,
+rather than leaving a resolution error against a path nobody wrote.
+
+`cerulion_macros` is never a direct dependency. The macros arrive with the
+prelude.
+
+### The shape of a node
 
 A node lives in `nodes/<type>/src/lib.rs` and looks like this:
 
@@ -2185,12 +2269,39 @@ network:
   every `egress` entry that sets no `reliability`. An entry's own
   `reliability` wins in both directions: `{topic: /r/cmd, reliability:
   reliable}` stays reliable under a `best_effort` default.
-- `tls`: absolute PEM paths for `quic/` locators: `certificate` +
-  `private_key` for a `quic/` listener, `root_ca` for a `quic/` connect (the
+- Egress send queue: the gateway hands each egress topic's frames to that
+  topic's own send queue and sender thread, so a congested link holds up the
+  topics it carries and not the gateway's other links (closing LAN access
+  while a put waits on a congested link waits for that put). Topics sent to
+  the same peer share that peer's link. A publishing node writes to shared
+  memory and does not wait on the network. A `reliable` frame waits for
+  zenoh's transmit queue instead of being dropped at the sender, for up to
+  zenoh's `wait_before_close` (5 s by default), after which zenoh drops it and
+  closes its link to that peer. When the topic's send queue is itself full, a
+  `reliable` topic refuses the new frame, counts it, and a warning names the
+  topic; a `best_effort` topic drops its oldest queued frame instead (newest
+  wins), counted too. An entry's `send_queue: N` (a whole number of frames,
+  1 or more) sets the queue's bound, for example `{topic: /r/camera,
+  send_queue: 32}`; without it the bound is the depth of the gateway's tap on
+  the topic. Each queued frame is a heap copy, so a topic's queue can hold
+  up to `send_queue` times its frame size. Every gateway logs, every 10 s, a
+  warning for a topic that refused or failed frames since the last report
+  (an info line for best-effort drops alone), and each topic's totals when it
+  stops. The gateway `cerulion-netd` hosts (a run with no
+  `network:` block) also reports each topic's `forwarded`, `dropped`,
+  `refused`, `failed`, `discarded`, `queued`, `in_flight` and `send_queue` in
+  its `status` reply; a run with a `network:` block uses its own gateway
+  process, which reports through its log. `forwarded` counts puts zenoh
+  accepted; a best-effort frame zenoh discards inside its own transmit queue
+  afterwards, and a reliable frame dropped at `wait_before_close`, are not
+  reported to the gateway.
+- `tls`: absolute PEM paths for `quic/` and `tls/` locators: `certificate` +
+  `private_key` for a listener, `root_ca` for a connect (the
   connect also checks the certificate names the host or IP dialled, and zenoh
   trusts the public Web PKI roots beside `root_ca`). The carrier is the
   locator's first segment:
-  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, or
+  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, `tls/<host>:<port>`
+  (TLS 1.3 over TCP, reading the same `tls` files as `quic/`), or
   `udp/<host>:<port>?rel=1;mixed_rel=1` (QUIC without encryption or peer
   authentication, for a WireGuard overlay only). See `docs/networking.md`
   "Carriers and per-topic reliability".
@@ -2211,8 +2322,8 @@ rejection names the offending topic or setting and the fix:
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
 | Duplicates | The same topic twice in one list. |
-| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`tls/`, `ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
-| Certificate files | A `quic/` listener without `tls.certificate` + `tls.private_key`, a `quic/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` connect, or `certificate`/`private_key` with no `quic/` listen. |
+| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`ws/`, no `<carrier>/`), a `rel`/`mixed_rel` value zenoh refuses, or a datagram-only locator (plain `udp/<host>:<port>`, `udp/...?rel=0`, `quic/...?rel=0`), which sends each message once with no retransmission. |
+| Certificate files | A `quic/` or `tls/` listener without `tls.certificate` + `tls.private_key`, a `quic/` or `tls/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` or `tls/` connect, `certificate`/`private_key` with no `quic/` or `tls/` listen, or a `tls:` block that sets no file. |
 | Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
@@ -2971,7 +3082,7 @@ default: loud over silent).
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). **Auto default: ON for live runs** (`--time-source real`/`external`), off for `--time-source virtual`. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this env in both directions. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |
+| `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). **Auto default: ON for live runs** (`--time-source real`/`external`), off for `--time-source virtual`. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this env in both directions. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (a one-rung park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |
 | `CERULION_DOORBELL` | Data-**doorbell** arm of the park: `1` forces it on (a producer's publish rings a shared-memory line that wakes the parked consumer instantly; implies the park), `0` disables it (timer-only park). Exact match; near-misses warn and use the auto default (**ON for live runs**). On Linux a parked consumer hears the ring through the CPU monitor-wait primitive; on macOS 14.4 and later it kernel-blocks on the ring's wake word instead (see `CERULION_DOORBELL_OS_SYNC` below). Where neither exists a ring is still made, but it is observed no sooner than the park's recheck poll already observes the listener, so the doorbell is **forced off** with a warning if you request it. It never implies the park on a target without a CPU monitor-wait primitive. **Native live loop only:** `rmw_cerulion` does NOT read this flag; its publishers always arm the topic doorbell (one atomic increment per publish on Linux; on macOS 14.4 and later two in one cache line, and a kernel wake syscall only while a consumer holds the page's parked claim, a claim a killed consumer leaves set, so a later publish can pay a syscall with nobody there) and its `rmw_wait` park tier is governed by `CERULION_MONITOR_WAIT` alone. |
 | `CERULION_CPU_DMA_LOCK` | CPU C-state cap override (Linux; needs root / `CAP_SYS_NICE` for `/dev/cpu_dma_latency`: a failed acquire warns and the run continues). `1` forces a hard C0 pin, `0` disables the cap (exact match; near-misses warn and use the auto decision). **Auto default:** a graph-derived exit-latency cap computed from the graph's tightest timing, and **skipped entirely while the monitor-wait park is active** (they are alternative shallow-idle mitigations). The `--no-cpu-dma-lock` flag disables the auto cap. No-op off Linux. |
 | `CERULION_CPU_DMA_LOCK_US` | Explicit C-state exit-latency cap in µs (e.g. `=10`), used under the auto mode. A valid non-negative integer wins over the graph-derived cap (but **not** over `CERULION_CPU_DMA_LOCK=1`/`=0`); malformed/negative values warn and fall through to the graph-derived cap. |
@@ -3172,7 +3283,8 @@ PARKS on them with the same CPU monitor-wait the native live loop uses
 (`UMWAIT`/`WFE`; a bounded sleep-recheck where the CPU has no primitive), so
 a publish wakes the waiter hardware-instantly. Whether that tier is ON is a
 platform default set by measurement (see the `CERULION_MONITOR_WAIT` row
-below): aarch64 parks by default, x86 does not: its `ppoll` kernel wait
+below): aarch64 parks the first rung of each call by default, x86 does
+not: its `ppoll` kernel wait
 measured faster at both 2 ms and 10 ms. Where it runs the park is bounded
 and yields the core every recheck slice: 20 µs where `UMWAIT` honors the
 deadline; on the aarch64 `WFE` tier (the park's platform-default home) one
@@ -3194,7 +3306,7 @@ empty wake.
 | Variable | Meaning |
 |---|---|
 | `CERULION_LIVE_SPIN_US` | The SAME knob as in "Live-loop tuning" above, read by `rmw_wait` through the same parse and the same 100 000 µs (100 ms) ceiling. The ONE asymmetry: **unset means the consumer's own default, and the rmw wait's default is PARK-FIRST, no spin** (it has no graph to derive wake-imminence from; the native loop's derived default spins only while a wake is provably imminent). A positive `N` arms the µs busy-probe in front of the FIRST kernel block of each `rmw_wait` call, at most twice per call: once on entry, and at most one recovery spin after a wake whose probe found nothing (consumed on first use, never re-armed); never after an empty timeout. The entry spin is also bounded ACROSS calls: it is armed only by a previous call that RETURNED READY, and a call that delivered nothing disarms it (however its blocks woke), so neither an idle executor nor a notification-without-readiness storm spins more than once per idle period, even at the 100 ms cap (the value that is safe on the native loop's imminence-gated spin). It yields between probes. `0` disables (what unset already means here); malformed warns once and stays park-first. The measured basis for the park-first default: spin off is best-or-equal in every posture (stock 30 µs, C1 cap 19, C0 pin 17; 64 B ping-pong p50), while spin on put roughly half the processes into a per-lifetime ~123 µs same-core scheduling mode in the stock and C0 postures (never under a C1 cap). Ignored entirely under `CERULION_RMW_EVENT_WAIT=off`. |
-| `CERULION_MONITOR_WAIT` | The SAME flag as in "Live-loop tuning" above, resolved by `rmw_wait` through the same classification, applied to a PLATFORM default that is measured, not chosen: **unset ⇒ the platform default: park ON on aarch64 (`WFE`), OFF on x86**; `1` ⇒ force the park on (on x86 the bounded one-rung shape, the experiment hatch); `0` ⇒ off (the wait blocks in `ppoll` on the entities' fds; still event-driven, µs wakes); any other non-empty value warns once and keeps the default. The basis (64 B rmw ping-pong p50): x86-64 2 ms park-on 30.1 vs **off 27.7**, 10 ms park-on 58.8 vs **off 19.8**; aarch64 (Jetson) 2 ms park-on **74.8** vs off 127.1, 10 ms park-on **84.3** vs off 135.7. The park, where it runs, is bounded and yields the core every recheck slice: 20 µs where `UMWAIT` honors the deadline, one generic-timer event-stream period (machine-specific, around 130 µs on an Orin-class board) on the aarch64 `WFE` tier that is the park's default home (a parked thread looks busy to the scheduler, so an unbounded park can starve a thread sharing its core). Elsewhere no ring wakes this wait's park, so the flag changes nothing there. rmw publishers open the topic bell unowned and never unlink it (a ROS topic may carry two publishers, so a dying one must not pull the page from under the survivor; a re-created publisher joins the same page), and a page replaced by an owned creator is re-mapped automatically on the first frame that arrives without a ring. Residual: one 64-byte page per topic can outlive every publisher on the machine until the next creator. Ignored under `CERULION_RMW_EVENT_WAIT=off`. |
+| `CERULION_MONITOR_WAIT` | The SAME flag as in "Live-loop tuning" above, resolved by `rmw_wait` through the same classification, applied to a PLATFORM default that is measured, not chosen: **unset ⇒ the platform default: park ON for the first rung of each call on aarch64 (`WFE`), OFF on x86**; `1` ⇒ force the park on (on x86 the bounded one-rung shape, the experiment hatch); `0` ⇒ off (the wait blocks in `ppoll` on the entities' fds; still event-driven, µs wakes); any other non-empty value warns once and keeps the default. The basis (64 B rmw ping-pong p50): x86-64 2 ms park-on 30.1 vs **off 27.7**, 10 ms park-on 58.8 vs **off 19.8**; aarch64 (Jetson), park held through every block, 2 ms park-on **74.8** vs off 127.1, 10 ms park-on **84.3** vs off 135.7; that shape held one core per idle subscriber, so the aarch64 default parks only the first rung of each call. The park, where it runs, is bounded and yields the core every recheck slice: 20 µs where `UMWAIT` honors the deadline, one generic-timer event-stream period (machine-specific, around 130 µs on an Orin-class board) on the aarch64 `WFE` tier that is the park's default home (a parked thread looks busy to the scheduler, so an unbounded park can starve a thread sharing its core). Elsewhere no ring wakes this wait's park, so the flag changes nothing there. rmw publishers open the topic bell unowned and never unlink it (a ROS topic may carry two publishers, so a dying one must not pull the page from under the survivor; a re-created publisher joins the same page), and a page replaced by an owned creator is re-mapped automatically on the first frame that arrives without a ring. Residual: one 64-byte page per topic can outlive every publisher on the machine until the next creator. Ignored under `CERULION_RMW_EVENT_WAIT=off`. |
 | `CERULION_RMW_EVENT_WAIT` | The one rmw-only knob, the kill-switch. `off` restores the polling wait loop **verbatim**: probe, `sleep(100 µs)`, probe: **no fd block, no park, AND no spin** (`CERULION_LIVE_SPIN_US` is ignored, and the once-only `info!` says so). Everything else (the ready probe, the zero-timeout arm, the 20 ms publisher-event pump cadence) is identical. `on`/unset/empty = event-driven (the default); any other value warns once and stays ON (exact match, no case forgiveness). Independently of this switch, a wait set whose listener drain FAILS mid-call degrades itself to the same sleep pacing for the rest of that call (loud once, counted in `degraded_waits`) and retries the event path on the next call. |
 
 ### ROS 2 rmw slice ceilings
@@ -3223,7 +3335,7 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 | `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. The run and query entry points match `off` after trimming, ASCII case-insensitively; an empty or whitespace-only value is treated as unset, and any other non-empty value fails CLOSED: a loud notice names it and the run or query goes LOCAL-ONLY too. Read by `graph run`, `node run`, `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`, and `schema info`; on `topic list` it skips the whole remote query, the same scope `--local` selects. `--local` and the legacy `--network off` run flags are the same switch (`--network` accepts only `off`), and `--local` on `topic list` (also spelled `--no-network`), `topic echo`, `topic hz` and `topic info` selects the same scope by flag; no flag enables networking over an engaged kill-switch. `cerulion connect` and the `cerulion-remoted` daemon honor the switch too: when it is engaged, each warns and exits before starting its network transport. They differ from the run and query entry points only in how they parse the value. `cerulion connect` engages the switch on the exact value `off`; any other non-empty value warns and it still connects. `cerulion-remoted` trims and lowercases the value, so `off` with surrounding whitespace or capitals engages the switch and `on` is accepted explicitly; any other non-empty value warns and its network stays on. `cerulion viz --robot` refuses under the switch, with the run and query parse, before it spawns or contacts `cerulion-vizd`, and `cerulion pair` refuses under it before its mDNS lookup and before it spawns `cerulion-connectd`. |
 | `CERULION_GATEWAY_PORT` | The port the network gateway listens on, instead of the well-known **7683** (which bind-probes upward on conflict). Set it when 7683 is taken by something else on the robot, or to run two gateways on one box. |
 | `CERULION_ROBOT_IDENTITY` | The robot's announced network identity: the name that shows up in `cerulion topic list`'s `ROBOTS` section, in the mDNS `_cerulion._tcp` record, and as the first chunk of every announce key. Default: this machine's hostname (`.local` stripped). Set it on a stock-image fleet where every machine boots with the same hostname, or when the hostname is not the name your operators use. Resolved identically by the gateway and the remote-plane daemon, so the LAN and WAN planes can never advertise two different names. |
-| `CERULION_LAN_ACCESS` | Who may demand this machine's topics over the LAN, read by `cerulion-netd` and the `graph run` gateway. `open` removes the paired-only posture gate, leaving each demand to the configured inner authorizer (which can still deny it); `paired` refuses every LAN topic demand, catalog and schema query with a reason naming the posture, and re-injects no frame a LAN peer publishes into an ingress topic. On a host that runs the paired remote plane (`cerulion-remoted` beside `cerulion-netd`), topic reads and writes then go through that plane; an Android embedded app does not host it, so under `paired` its topics are not reachable over the LAN at all. Unset or whitespace-only selects the platform default: `paired` on Android, `open` elsewhere. Values match after trimming, ASCII case-insensitively; any other value warns and fails CLOSED to `paired`. A non-Unicode value also warns and fails closed to `paired`. Choose the posture at startup with this variable; an Android app sets its posture with the `lan_access` runtime key. Opening access after a paired start does not replay topic announcements withheld while paired; an Android app started with open access announces its registered topics when its start completes. |
+| `CERULION_LAN_ACCESS` | Who may demand this machine's topics over the LAN, read by `cerulion-netd` and the `graph run` gateway. `open` removes the paired-only posture gate, leaving each demand to the configured inner authorizer (which can still deny it); `paired` refuses every LAN topic demand, catalog and schema query with a reason naming the posture, and re-injects no frame a LAN peer publishes into an ingress topic. A paired desk with observe access (`CAP_OBSERVE`) can still read this machine's topics through the paired remote plane (`cerulion-remoted` beside `cerulion-netd`), but that plane carries data from the robot to the desk only: it has no path for a desk to write a topic or send teleop commands, so under `paired` no LAN peer and no paired desk can write into this machine's ingress topics. (A machine that subscribes to topics from a robot still receives that robot's frames; `paired` governs who may read or write this machine's topics.) An Android embedded app does not host the remote plane, so under `paired` its topics are not reachable over the LAN at all. Unset or whitespace-only selects the platform default: `paired` on Android, `open` elsewhere. Values match after trimming, ASCII case-insensitively; any other value warns and fails CLOSED to `paired`. A non-Unicode value also warns and fails closed to `paired`. Choose the posture at startup with this variable; an Android app sets its posture with the `lan_access` runtime key. Opening access after a paired start does not replay topic announcements withheld while paired; an Android app started with open access announces its registered topics when its start completes. |
 | `CERULION_MULTICAST_SCOUTING` | `on` (trimmed, ASCII case-insensitive) turns zenoh multicast scouting back on: periodic scout packets to UDP `224.0.0.224:7446`. Default off: peers are found through the `_cerulion._tcp` mDNS browse, the peer cache and the hostname rung, and an idle machine sends no discovery traffic after its one mDNS registration. Set it on a network where mDNS does not cross but multicast does, on every machine that should find or be found that way: a session with it off neither sends nor answers scouts. `off` or empty keeps the default; any other value keeps it off and logs a warning. Read by `cerulion-netd` and `cerulion-vizd` at daemon start, by `graph run` for a permissive gateway process it spawns itself, and by the `topic list` discovery session. A running daemon picks a change up only when it restarts, and a permissive `graph run` whose egress rides a running `cerulion-netd` gets that daemon's value. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
 | `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (`auth.json`, the machine key `identity/device.key` and its legacy name `desk.key`, `device.cert`, `robots.toml`, `peers.json`, `config.toml`, `epochs/`, `runs/`, `ros2/`). Empty counts as unset. The isolation knob for a test rig or a second identity on one machine. |
@@ -3252,7 +3364,7 @@ below; that is why they exist.
 | Variable | Meaning |
 |---|---|
 | `CERULION_RECORD_DISCOVERY` | `off` disables live-topic discovery for any recorder in that environment. The rule is whether the topic set was **inferred or named**: discovery is ON for `graph run --record` and for `cerulion bag record --run`, whose universes are both inferred from a run, and OFF whenever you named the topics yourself (`bag record` with positional topics, `--all` or `--regex`). It is on for `--run` because a run's DECLARED outputs need not be what it actually puts on the wire: a bridge graph can declare a handful of topics while many more bridge routes stream, and a bag claiming to describe a run while omitting most of it is the defect discovery exists to close. Reach for `off` when you want a strictly declaration-shaped bag, or when discovery's extra taps are competing for subscriber slots on a busy machine. |
-| `CERULION_RECORD_DISCOVERY_SETTLE_MS` | How long the recorder holds bag creation open for late-appearing topics, in ms. Default **2000**, with an absolute floor of 500 ms once discovery is on. `0` disables the hold. Widen it when a bag reports a topic as `appeared_after_bag_creation`; the equivalent flag is `cerulion bagd --discovery-settle-ms`. |
+| `CERULION_RECORD_DISCOVERY_SETTLE_MS` | How long the recorder holds bag creation open for late-appearing topics, in ms. This is a CAP: the hold is released as soon as 500 ms have passed with nothing new discovered and the recorder's first look at the live topics is in, so a graph whose topic set is already complete pays about that 500 ms and not the cap. Default **2000**. `0` disables the hold. Widen it when a bag reports a topic as `appeared_after_bag_creation`; the equivalent flag is `cerulion bagd --discovery-settle-ms`. |
 | `CERULION_RECORD_SCHEMA_DEMAND_MS` | The budget, in ms, for resolving a recorded channel's schema over the network when the local corpus does not name it (default **4000**). `0` disables the networked rungs. It matters most on a `ros2 attach` robot, where the bridged routes are exactly the channels a local schema store may not know. Flag equivalent: `cerulion bagd --schema-demand-timeout-ms`. |
 
 One more recording switch is read by the RUN (each process that writes scheduler
@@ -3422,8 +3534,11 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` | `off` forces a strictly LOCAL-ONLY daemon: no zenoh session ever, and a remote demand surfaces a plain "not network-configured" answer instead of hanging. Only the exact value `off` engages it; any other non-empty value warns and the network stays on. Mirrors `CERULION_NETWORK=off` but scoped to the daemon, so it never surprises a `graph run` sharing the machine. The commands that reach the network through the daemon honor it too: with `CERULION_NETD_NETWORK=off`, `topic list`, `topic echo`, `topic hz`, `topic info` and `schema info` stay LOCAL-ONLY, opening no discovery session of their own; with either variable at `off`, `cerulion viz --robot` refuses before contacting the daemon. |
 | `CERULION_NETD_CONNECT` / `CERULION_VIZD_CONNECT` | Comma/whitespace-separated zenoh locators to dial (`tcp/192.168.123.99:7683`). Each is where the corresponding verb's `--connect` is threaded when that command STARTS its daemon: `cerulion viz --connect` into the vizd one, a demanding consumer's `--connect` into the netd one. |
 | `CERULION_NETD_LISTEN` / `CERULION_VIZD_LISTEN` | Comma/whitespace-separated zenoh locators to bind (`tcp/0.0.0.0:7447`). The `--listen` counterpart of the row above, threaded the same way. |
+| `CERULION_NETD_TLS_ROOT_CA` | Absolute path of the PEM certificate(s) the peer of a `quic/` or `tls/` connect locator must chain to (graph `tls.root_ca`). Such a connect locator needs it, and it is refused when no connect locator is `quic/` or `tls/`. |
+| `CERULION_NETD_TLS_CERTIFICATE` | Absolute path of the PEM certificate a `quic/` or `tls/` listen locator presents (graph `tls.certificate`). It must not be marked `CA:TRUE`. |
+| `CERULION_NETD_TLS_PRIVATE_KEY` | Absolute path of the PEM private key for `CERULION_NETD_TLS_CERTIFICATE` (graph `tls.private_key`). A `quic/` or `tls/` listen locator needs both, and both are refused when no listen locator is `quic/` or `tls/`. `cerulion-netd` applies the graph-load carrier rules to these variables and to `CERULION_NETD_CONNECT` / `CERULION_NETD_LISTEN` at start-up, and refuses to start, naming the variable, on a setting that cannot work. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
-| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. |
+| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
 
 WSD graph and node reads include a `version` field containing the lowercase

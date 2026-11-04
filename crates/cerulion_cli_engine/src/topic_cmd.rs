@@ -3301,25 +3301,36 @@ fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> Strin
 /// FAILURE never reaches this renderer; it stays a distinct loud error at the
 /// dispatch site.
 pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool) -> String {
-    render_remote_topic_rows(disc, had_endpoints, &[], &|_| None)
+    render_remote_topic_rows(disc, had_endpoints, &[], "", &|_| None)
 }
 
 /// The one REMOTE-section renderer behind [`render_remote_topics_section`],
-/// [`render_remote_topics_section_with_mirrors`] and the typed `topic list -t`
-/// listing. `column` gives a row an optional column printed two spaces after
-/// the topic name (the type of `-t`), before any streaming marker; it is
-/// printed as given, so the caller sanitizes it. Every other rule is the one
-/// those two renderers document.
+/// [`render_remote_topics_section_with_mirrors`],
+/// [`render_remote_topics_section_with_mirrors_and_robot_rows`] and the typed
+/// `topic list -t` listing. `account_rows` are already-sanitized account
+/// directory rows appended to `ROBOTS` (a `ROBOTS` header is written when LAN
+/// discovery rendered none). `column` gives a row an optional column printed
+/// two spaces after the topic name (the type of `-t`), before any streaming
+/// marker; it is printed as given, so the caller sanitizes it. Every other
+/// rule is the one those renderers document.
 pub(crate) fn render_remote_topic_rows(
     disc: &RemoteDiscovery,
     had_endpoints: bool,
     streaming: &[MirrorStreamRow],
+    account_rows: &str,
     column: &dyn Fn(&str) -> Option<String>,
 ) -> String {
-    if !streaming.is_empty() {
-        return render_remote_rows_with_mirrors(disc, streaming, column);
-    }
     let mut out = render_robots_section(&disc.robots, &disc.peers);
+    if !account_rows.is_empty() {
+        if out.is_empty() {
+            out.push_str("\nROBOTS\n");
+        }
+        out.push_str(account_rows);
+    }
+    if !streaming.is_empty() {
+        push_remote_rows_with_mirrors(&mut out, disc, streaming, column);
+        return out;
+    }
     let topics = &disc.topics;
     if topics.is_empty() {
         // The "pass --connect tcp/<host>:7683" escape is
@@ -3455,19 +3466,29 @@ pub fn render_remote_topics_section_with_mirrors(
     had_endpoints: bool,
     streaming: &[MirrorStreamRow],
 ) -> String {
-    // No mirrors ⇒ identical to the mirror-less renderer (incl. its
-    // one-line none-discovered arms).
-    render_remote_topic_rows(disc, had_endpoints, streaming, &|_| None)
+    render_remote_topic_rows(disc, had_endpoints, streaming, "", &|_| None)
+}
+
+/// [`render_remote_topics_section_with_mirrors`] with already-sanitized
+/// account-directory rows appended to `ROBOTS`, after the LAN rows. The caller
+/// renders these rows with `account_robot_access::render_rows` on Unix.
+pub fn render_remote_topics_section_with_mirrors_and_robot_rows(
+    disc: &RemoteDiscovery,
+    had_endpoints: bool,
+    streaming: &[MirrorStreamRow],
+    account_rows: &str,
+) -> String {
+    render_remote_topic_rows(disc, had_endpoints, streaming, account_rows, &|_| None)
 }
 
 /// The merged-rows half of [`render_remote_topic_rows`] (at least one
-/// streaming row).
-fn render_remote_rows_with_mirrors(
+/// streaming row), appended to `out`.
+fn push_remote_rows_with_mirrors(
+    out: &mut String,
     disc: &RemoteDiscovery,
     streaming: &[MirrorStreamRow],
     column: &dyn Fn(&str) -> Option<String>,
-) -> String {
-    let mut out = render_robots_section(&disc.robots, &disc.peers);
+) {
     out.push_str("\nREMOTE TOPICS\n");
     // Union rows keyed by canonical topic: streaming (Some robot) wins over an
     // idle-announce (None) entry for the same topic (dedup — one row, streaming).
@@ -3483,14 +3504,34 @@ fn render_remote_rows_with_mirrors(
     }
     for (topic, robot) in rows {
         out.push_str(&sanitize_display(topic));
-        push_column(&mut out, column(topic));
+        push_column(out, column(topic));
         if let Some(robot) = robot {
             out.push_str("  ● streaming  ");
             out.push_str(&sanitize_display(robot));
         }
         out.push('\n');
     }
-    out
+}
+
+/// Render independently observed account and mirror rows when LAN discovery
+/// failed or was skipped. A missing gather supplies no empty-topic evidence.
+pub fn render_remote_evidence_without_discovery(
+    streaming: &[MirrorStreamRow],
+    account_rows: &str,
+) -> String {
+    if !streaming.is_empty() {
+        return render_remote_topics_section_with_mirrors_and_robot_rows(
+            &RemoteDiscovery::empty(),
+            false,
+            streaming,
+            account_rows,
+        );
+    }
+    if account_rows.is_empty() {
+        String::new()
+    } else {
+        format!("\nROBOTS\n{account_rows}")
+    }
 }
 
 /// Idle "heartbeat" timeout for the event-driven observer loops

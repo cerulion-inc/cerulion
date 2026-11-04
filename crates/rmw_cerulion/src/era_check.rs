@@ -103,12 +103,14 @@ pub const CAPABILITY_MIN_ERA: &[(&str, usize)] = &[
     ("features", ERA_HUMBLE),
     ("discovery_options", ERA_IRON),
     ("matched_events", ERA_IRON),
+    ("durability_best_available", ERA_IRON),
     ("type_hash", ERA_IRON),
     ("event_members", ERA_IRON),
     ("is_key", ERA_JAZZY),
     ("any_key_member", ERA_JAZZY),
     ("is_rosidl_buffer", ERA_LYRICAL),
     ("event_type_max", ERA_LYRICAL),
+    ("service_endpoint_info", ERA_LYRICAL),
 ];
 
 /// Known distro names → era rank. Includes out-of-matrix distros
@@ -1318,6 +1320,7 @@ mod tests {
         "features",
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
     ];
@@ -1333,6 +1336,7 @@ mod tests {
         "features",
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
         "is_key",
@@ -1350,12 +1354,14 @@ mod tests {
         "features",
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
         "is_key",
         "any_key_member",
         "is_rosidl_buffer",
         "event_type_max",
+        "service_endpoint_info",
     ];
 
     const GALACTIC_ONLY: &[&str] = &[
@@ -1374,11 +1380,16 @@ mod tests {
     const IRON_ONLY: &[&str] = &[
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
     ];
     const JAZZY_ONLY: &[&str] = &["is_key", "any_key_member"];
-    const LYRICAL_ONLY: &[&str] = &["is_rosidl_buffer", "event_type_max"];
+    const LYRICAL_ONLY: &[&str] = &[
+        "is_rosidl_buffer",
+        "event_type_max",
+        "service_endpoint_info",
+    ];
 
     fn contradiction(
         verdict: DistroClaimVerdict,
@@ -1570,6 +1581,7 @@ mod tests {
             &[
                 "discovery_options",
                 "matched_events",
+                "durability_best_available",
                 "type_hash",
                 "event_members",
                 "is_key",

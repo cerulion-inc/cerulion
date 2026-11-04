@@ -839,6 +839,35 @@ fn record_uniform_with_read_log(
     )
 }
 
+/// [`record_uniform_with_read_log`] with an [`InStepFeed`]: the drive's topic
+/// has ONE publisher, shared between the recorder (the drive's pre-step frames)
+/// and the node that publishes onto it while it fires.
+fn record_uniform_with_read_log_and_feed(
+    graph_yaml: &str,
+    make_factories: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    externals: &[ExternalDrive],
+    steps: usize,
+    feed: &InStepFeed,
+) -> Recording {
+    record_reference_impl_fed(
+        graph_yaml,
+        make_factories,
+        externals,
+        &vec![DELTA_MS; steps],
+        16,
+        true,
+        Some(feed),
+    )
+}
+
+/// An external topic whose ONE publisher the reference run parks in `slot`, so
+/// a node can publish onto the topic from inside its own tick: frames that
+/// arrive WHILE the consumer fires, which the refill between its fires pulls.
+struct InStepFeed {
+    topic: &'static str,
+    slot: &'static std::sync::Mutex<Option<cerulion_core::transport::publisher::CerulionPublisher>>,
+}
+
 /// [`record_reference`] with an explicit reference-transport subscriber
 /// buffer. The catch-up-burst test records through a DEEP reference tap (the
 /// production recorder, bagd, runs deep buffers) so the bag holds the FULL
@@ -871,6 +900,28 @@ fn record_reference_impl(
     deltas_ms: &[u64],
     subscriber_buffer: usize,
     read_log: bool,
+) -> Recording {
+    record_reference_impl_fed(
+        graph_yaml,
+        make_factories,
+        externals,
+        deltas_ms,
+        subscriber_buffer,
+        read_log,
+        None,
+    )
+}
+
+/// [`record_reference_impl`] with `in_step_feed`, which parks one drive's
+/// publisher where a node can reach it ([`InStepFeed`]).
+fn record_reference_impl_fed(
+    graph_yaml: &str,
+    make_factories: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    externals: &[ExternalDrive],
+    deltas_ms: &[u64],
+    subscriber_buffer: usize,
+    read_log: bool,
+    in_step_feed: Option<&InStepFeed>,
 ) -> Recording {
     let config = cerulion_core::graph::parse_graph(graph_yaml).expect("reference graph parses");
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
@@ -922,7 +973,14 @@ fn record_reference_impl(
                     ext.topic
                 )
             });
-        ext_pubs.insert(ext.topic.clone(), p);
+        match in_step_feed {
+            Some(feed) if feed.topic == ext.topic => {
+                *feed.slot.lock().expect("feed slot") = Some(p);
+            }
+            _ => {
+                ext_pubs.insert(ext.topic.clone(), p);
+            }
+        }
     }
 
     let mut messages: IndexMap<String, Vec<Vec<u8>>> = IndexMap::new();
@@ -941,7 +999,17 @@ fn record_reference_impl(
         // Publish this step's external frames BEFORE stepping (stamped at the
         // pre-step gating clock), so the graph drains them at the step start.
         for ext in externals {
-            let publisher = ext_pubs.get_mut(&ext.topic).unwrap();
+            // The feed's publisher is held only while the pre-step frames go
+            // out, and released before the step that lets the node publish.
+            let mut fed = in_step_feed
+                .filter(|feed| feed.topic == ext.topic)
+                .map(|feed| feed.slot.lock().expect("feed slot"));
+            let publisher = match fed.as_mut() {
+                Some(slot) => slot
+                    .as_mut()
+                    .expect("the feed slot holds the drive's publisher"),
+                None => ext_pubs.get_mut(&ext.topic).unwrap(),
+            };
             // Every frame of one step's BURST is loaned and published at the
             // SAME pre-step gating clock, so they share a wire timestamp and
             // differ only in `sequence` — which is exactly why the cap
@@ -1052,6 +1120,9 @@ fn record_reference_impl(
     // Harvested BEFORE `shutdown()`: the accessor borrows the
     // live runtime's own table.
     let publisher_ids = runtime.read_log_publisher_ids().clone();
+    if let Some(feed) = in_step_feed {
+        feed.slot.lock().expect("feed slot").take();
+    }
     runtime.shutdown();
 
     Recording {
@@ -28804,6 +28875,336 @@ fn a_bag_fed_frame_still_drives_the_backpressure_event_it_recorded() {
 }
 
 // ===========================================================================
+// A step that takes more frames than its declared depth
+// ===========================================================================
+
+/// The external topic the late relay reads.
+const RQ_FEED_TOPIC: &str = "/rq/ext/feed";
+/// The relay's DECLARED input depth (`#[input(depth = 4)]` below).
+const RQ_DEPTH: usize = 4;
+/// Frames the reference run's relay publishes onto its own input while it
+/// fires during step 0: one per fire, so the refill between fires pulls each.
+const RQ_IN_STEP_ARRIVALS: u32 = 5;
+const RQ_STEPS: usize = 4;
+const RQ_RELAY_OUT: &str = "/rq/relay/out";
+
+/// The feed's ONE publisher while the reference run records (see
+/// [`InStepFeed`]); empty otherwise.
+static RQ_FEED_SLOT: std::sync::Mutex<
+    Option<cerulion_core::transport::publisher::CerulionPublisher>,
+> = std::sync::Mutex::new(None);
+
+/// A relay whose step is LONG: while it fires, frames keep arriving on its
+/// input. The reference run makes that deterministic by having each of its
+/// first [`RQ_IN_STEP_ARRIVALS`] fires publish the next frame onto the input
+/// itself, through the parked feed publisher, so step 0 takes
+/// `1 + RQ_IN_STEP_ARRIVALS` frames against a depth of [`RQ_DEPTH`] while its
+/// queue never holds more than one. A replay instance publishes nothing.
+#[cerulion_node]
+#[derive(Default)]
+struct LateRelayNode {
+    #[input(trigger, backpressure = drop_oldest, depth = 4)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    feeds_left: u32,
+}
+
+#[cerulion_node_impl]
+impl LateRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 1000.0;
+        if self.feeds_left > 0 {
+            self.feeds_left -= 1;
+            let mut slot = RQ_FEED_SLOT
+                .lock()
+                .map_err(|_| NodeError::Logic("the feed slot is poisoned".to_string()))?;
+            let publisher = slot
+                .as_mut()
+                .ok_or_else(|| NodeError::Logic("no feed publisher is parked".to_string()))?;
+            let mut proxy = publisher
+                .loan_proxy::<Vector3>()
+                .map_err(|e| NodeError::Logic(e.to_string()))?;
+            proxy.x = self.inp.x + 1.0;
+            drop(proxy);
+        }
+        Ok(())
+    }
+}
+
+fn rq_yaml() -> &'static str {
+    "name: rqgraph\nprefix: rq\nnodes:\n\
+     \x20 - id: relay\n    type: late_relay_node\n    inputs:\n      - name: inp\n        source: /rq/ext/feed\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: relay_node\n    inputs:\n      - name: inp\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn rq_factories_with(feeds_left: u32) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "relay",
+            Box::new(LateRelayNodeEntry::with_state(LateRelayNode {
+                feeds_left,
+                ..Default::default()
+            })) as Box<dyn NodeEntry>,
+        ),
+        (
+            "sink",
+            Box::new(RelayNodeEntry::with_state(RelayNode {
+                addend: 1.0,
+                ..Default::default()
+            })) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+fn rq_record_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    rq_factories_with(RQ_IN_STEP_ARRIVALS)
+}
+
+fn rq_replay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    rq_factories_with(0)
+}
+
+/// One process per node: `relay` on rank 0, `sink` on rank 1.
+fn rq_rank_of(id: &str) -> u32 {
+    u32::from(id == "sink")
+}
+
+/// Record the late-relay graph, check the premise ON THE RECORDING, and write it
+/// as a two-rank free-run bag.
+fn rq_bag(dir: &std::path::Path) -> std::path::PathBuf {
+    let externals = vec![ExternalDrive::singles(
+        RQ_FEED_TOPIC,
+        vec![1.0, 20.0, 30.0, 40.0],
+    )];
+    let rec = record_uniform_with_read_log_and_feed(
+        rq_yaml(),
+        rq_record_factories,
+        &externals,
+        RQ_STEPS,
+        &InStepFeed {
+            topic: RQ_FEED_TOPIC,
+            slot: &RQ_FEED_SLOT,
+        },
+    );
+
+    // PREMISE 1: the recording lost nothing. Every frame on the feed, the ones
+    // that arrived during step 0 included, reached the relay's output in order.
+    let feed: Vec<f64> = rec.messages[RQ_FEED_TOPIC]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        feed,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 20.0, 30.0, 40.0],
+        "the feed carries the pre-step frames and the in-step arrivals"
+    );
+    let relayed: Vec<f64> = rec.messages[RQ_RELAY_OUT]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        relayed,
+        feed.iter().map(|x| x + 1000.0).collect::<Vec<_>>(),
+        "the live relay served every frame: its queue never evicted"
+    );
+    // PREMISE 2: step 0 took more frames than the declared depth.
+    let relay_idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == "relay")
+        .expect("the relay is a node") as u32;
+    let step0_fires = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay_idx && r.step == 0)
+        .count();
+    assert_eq!(
+        step0_fires,
+        1 + RQ_IN_STEP_ARRIVALS as usize,
+        "the relay fired once per frame during step 0"
+    );
+    assert!(
+        step0_fires > RQ_DEPTH,
+        "step 0 must take more frames than the declared depth ({step0_fires} vs {RQ_DEPTH})"
+    );
+    let step0_reads = rec
+        .trace
+        .iter()
+        .filter(|r| {
+            r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == 0
+        })
+        .count();
+    assert!(
+        step0_reads > 0,
+        "the recording carries the relay's step-0 reads"
+    );
+
+    let bag = dir.join("late_relay_two_rank.mcap");
+    write_multi_rank_bag_coordinated(
+        &rec,
+        rq_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        replay_engine::CoordinationMode::FreeRun,
+    );
+    bag
+}
+
+/// The arm's ORACLE over one replay of [`rq_bag`]: the bag-fed input is
+/// STEERED, every read the replay made is the recorded one, and every produced
+/// frame matches. `Err` lists EVERY failed clause, one per line, so a failing
+/// run shows the stand-down and what it cost together.
+fn rq_verdict(outcome: &ReplayOutcome) -> Result<(), String> {
+    let mut failed: Vec<String> = Vec::new();
+    if let Some(sd) = injection_stand_down(outcome, RQ_FEED_TOPIC) {
+        failed.push(format!(
+            "the steered injection stood down on {RQ_FEED_TOPIC}: {} ({})",
+            sd.code, sd.detail
+        ));
+    }
+    if !outcome
+        .injection_coverage
+        .iter()
+        .any(|c| c.topic == RQ_FEED_TOPIC)
+    {
+        failed.push(format!(
+            "{RQ_FEED_TOPIC} is not reported as steered: {:?}",
+            outcome.injection_coverage
+        ));
+    }
+    if let Some(divergence) = &outcome.read_log_divergence {
+        failed.push(format!(
+            "the replayed reads are not the recorded ones: {divergence:?}"
+        ));
+    }
+    // The read-log verifier compares the SINK's edge. It stands down on
+    // `relay.inp` by design: the feed's writer is outside the graph, so no
+    // rank manifest names its producer token. The relay's reads are pinned by
+    // its own output instead, which is `input + 1000` frame for frame, so a
+    // missing or evicted input frame is a byte divergence on `/rq/relay/out`.
+    match &outcome.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. }
+            if *edges_compared >= 1 => {}
+        other => failed.push(format!("the read log is not verified clean: {other:?}")),
+    }
+    if !outcome.violations.is_empty() || !outcome.passed {
+        failed.push(format!(
+            "the produced frames diverged: {:?}",
+            outcome.violations
+        ));
+    }
+    // A clean verdict over nothing proves nothing: both produced topics compared.
+    if outcome.topics_checked < 2 || outcome.topics_passed != outcome.topics_checked {
+        failed.push(format!(
+            "expected both produced topics compared and passed, got {}/{}",
+            outcome.topics_passed, outcome.topics_checked
+        ));
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("\n"))
+    }
+}
+
+/// **A live step that took more frames than its declared depth replays with
+/// the same reads.**
+///
+/// The relay's step 0 takes six frames against a depth of four: frames arrive
+/// while it fires and the refill between fires pulls them, so its queue never
+/// held more than one. The steered injection places all six before step 0, so
+/// the replayed queue holds six at once. Built at the declared depth it would
+/// evict two; the replay builds it six deep, logs that once, and reproduces
+/// every read and every frame.
+///
+/// Standing down instead (the shape before the queue was provisioned) falls
+/// back to the recorded-clock window, which hands the depth-four queue the
+/// whole step at once: this arm then fails on the `queue_overflow` stand-down
+/// and on the diverged reads.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_step_that_took_more_frames_than_its_depth_replays_with_the_recorded_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = rq_bag(dir.path());
+
+    let outcome =
+        replay(&bag, rq_replay_factories, None, None).expect("the late-relay bag replays");
+    assert_eq!(
+        outcome.coordination.mode,
+        replay_engine::CoordinationMode::FreeRun
+    );
+    if let Err(why) = rq_verdict(&outcome) {
+        panic!("{why}");
+    }
+
+    // ONE line for the raised input, naming both depths.
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("building this bag-fed input's queue deeper than it declares"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("declared_depth=4")
+                    && line.contains(&format!("provisioned_depth={}", 1 + RQ_IN_STEP_ARRIVALS))
+                    && line.contains("node=relay")
+                    && line.contains("input=inp") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE line raising relay.inp from 4 to {}, got {other:?}",
+                1 + RQ_IN_STEP_ARRIVALS
+            )),
+        }
+    });
+}
+
+/// **The MUTANT that restores the stand-down is caught by the late-relay
+/// oracle.**
+///
+/// `CERULION_REPLAY_DEPTH_STAND_DOWN_MUTANT` leaves the engine unable to build a
+/// bag-fed input deeper than it declares, which is the planner refusing the
+/// six-frame step as `queue_overflow` and the pass falling back to the
+/// recorded-clock window. The oracle must fail on the stand-down AND on the
+/// reads it costs.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_depth_stand_down_mutant_is_caught_by_the_late_relay_oracle() {
+    const MUTANT: &str = "CERULION_REPLAY_DEPTH_STAND_DOWN_MUTANT";
+    /// Disarms the mutant however the arm exits.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            std::env::remove_var(MUTANT);
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bag = rq_bag(dir.path());
+
+    std::env::set_var(MUTANT, "1");
+    let _disarm = Disarm;
+    let outcome =
+        replay(&bag, rq_replay_factories, None, None).expect("the mutant replay still runs");
+
+    let why = rq_verdict(&outcome).expect_err("the oracle must catch the restored stand-down");
+    assert!(
+        why.contains("stood down") && why.contains("queue_overflow"),
+        "the oracle names the stand-down: {why}"
+    );
+    assert!(
+        why.contains("the replayed reads are not the recorded ones")
+            || why.contains("the produced frames diverged"),
+        "…and what the fallback cost: {why}"
+    );
+}
+
+// ===========================================================================
 // Report accuracy: the decline, the per-rank range, and
 // the fire-plan fold's own precondition
 // ===========================================================================
@@ -35588,13 +35989,14 @@ fn a_fire_that_published_nothing_is_reported_as_an_after_fire_disagreement() {
 /// partition that splits a block edge). `plan_ranks` carries no such
 /// refusal, and a bag is untrusted input, so the question is whether
 /// a manifest putting `far` (whose `gate` is `backpressure = block`) on rank 2
-/// and its producer `gate_src` on rank 0 reaches `run_rank_pass`'s
+/// and its producer `gate_src` on rank 0 reaches the pass's
 /// `BlockEdgeObservation` derivation. It does NOT: `build_pass_runtime` builds
 /// rank 2's SUBGRAPH, and `GraphTopology::validate` refuses a `block` input
 /// whose topic has no in-graph producer — exit 5, naming the input and the
-/// co-location remedy — strictly BEFORE `prepare_pass_verification`
-/// runs. Two refusals, one at the partition and one at the build, and nothing
-/// between them.
+/// co-location remedy, strictly BEFORE the pass that judges the derived
+/// edges runs. Two refusals, one at the partition and one at the build. The
+/// pass's plan, which derives the edge list, runs before the build, so the
+/// list is derived for this bag and then dropped with the refused pass.
 ///
 /// Consequence: the derivation loop in
 /// `prepare_pass_verification` (and the `verify_conservation` plane it feeds)
@@ -38856,4 +39258,370 @@ fn a_popped_record_that_names_no_sequence_is_an_exit_2_refusal() {
         "the same craft on a bag that arms no gate is NOT a refusal: {:?}",
         lockstep.err().map(|e| (e.exit_code(), e.to_string()))
     );
+}
+
+/// A single-rank, capture-shaped bag: [`write_bag_with_coordination`]'s
+/// attachments plus the Flashback manifest declaring `covered_through_ns` as
+/// `anchor.resim_covered_through_ns`, the value a capture's recorder derives
+/// from the last boundary its trace carries.
+fn write_capture_shaped_bag(
+    rec: &Recording,
+    trace: &[TraceRingRecord],
+    path: &std::path::Path,
+    covered_through_ns: u64,
+) {
+    let topics: Vec<TopicSchema> = rec
+        .messages
+        .keys()
+        .map(|t| TopicSchema {
+            topic: t.clone(),
+            schema_name: VECTOR3_SCHEMA.to_string(),
+            schema_hash: 0,
+            wire_fixed_size: 24,
+        })
+        .collect();
+    let mut w = BagWriter::create(path, BagWriterConfig::default(), &topics).unwrap();
+    w.write_chunk(|c| {
+        let max_len = rec.messages.values().map(Vec::len).max().unwrap_or(0);
+        for k in 0..max_len {
+            for (topic, frames) in &rec.messages {
+                let Some(frame) = frames.get(k) else { continue };
+                let hdr = WireHeader::read_from_buf(frame);
+                let (seq, ts) = hdr.map(|h| (h.sequence, h.timestamp_ns)).unwrap_or((0, 0));
+                c.write_message(topic, seq, ts, ts, &[&frame[..]])?;
+            }
+        }
+        for (i, r) in trace.iter().enumerate() {
+            c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    w.write_attachment(
+        "graph.yaml",
+        "application/yaml",
+        0,
+        0,
+        rec.graph_yaml.as_bytes(),
+    )
+    .unwrap();
+    let mut manifest = serde_json::json!({
+        "rank": 0,
+        "generation": 0,
+        "node_ids": rec.node_ids,
+    });
+    if let Some(inputs) = &rec.input_names {
+        manifest["inputs"] = serde_json::json!(inputs);
+    }
+    w.write_attachment(
+        "__cerulion/trace_manifest_rank0.json",
+        "application/json",
+        0,
+        0,
+        &serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    w.write_attachment(
+        "__cerulion/recorder.json",
+        "application/json",
+        0,
+        0,
+        &production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+    )
+    .unwrap();
+    w.write_attachment(
+        "__cerulion/flashback.json",
+        "application/json",
+        0,
+        0,
+        &serde_json::to_vec(&serde_json::json!({
+            "anchor": { "resim_covered_through_ns": covered_through_ns }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    w.finalize().unwrap();
+}
+
+/// The last STEP_BOUNDARY target `trace` carries.
+fn capture_last_boundary_target(trace: &[TraceRingRecord]) -> u64 {
+    trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .map(|r| r.fire_time_ns)
+        .next_back()
+        .expect("the trace carries a boundary")
+}
+
+/// A CAPTURE CUT BETWEEN AN OUTPUT AND ITS READ RECORD, replayed both ways.
+///
+/// A capture of a live run reads its trace, then drains its frames. The
+/// scheduler pushes a node's FIRE after its tick publishes and that level's
+/// READ_OUTCOME records at the level's end, so a trace read between the two
+/// holds the relay's last fire and not the read behind it, while the frames
+/// drained afterwards hold the relay's output for that step.
+///
+/// LEG 1 builds that capture as a recorder that carries its trace as read
+/// writes it: every frame of the run, the trace without the last step's
+/// read, and the covered range ending at the last boundary. The gated replay
+/// drives the last step, finds no recorded read for the relay's consult, and
+/// exits 6.
+///
+/// LEG 2 passes the same trace through the recorder's end cut
+/// (`cerulion_bagd::end_at_last_complete_step`), which ends it at the last
+/// step the next boundary proves, and declares the range the cut trace backs.
+/// The replay verifies clean (exit 0), and the last step's frames are reported
+/// as trailing the range rather than compared.
+#[test]
+#[serial]
+fn a_capture_cut_between_an_output_and_its_read_exits_6_and_the_end_cut_replays_it_clean() {
+    let steps = 6;
+    const LAST_STEP: u64 = 5;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let relay_topic = rec
+        .messages
+        .keys()
+        .find(|t| t.ends_with("relay/out"))
+        .expect("the relay's output topic is recorded")
+        .clone();
+    assert_eq!(
+        rec.messages[&relay_topic].len(),
+        steps,
+        "PRECONDITION: the relay published at every step, the last included"
+    );
+    let snapshot: Vec<TraceRingRecord> = rec
+        .trace
+        .iter()
+        .copied()
+        .filter(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == LAST_STEP))
+        .collect();
+    assert!(
+        snapshot
+            .iter()
+            .any(|r| r.record_type == RECORD_TYPE_FIRE && r.step == LAST_STEP)
+            && snapshot
+                .iter()
+                .any(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == LAST_STEP),
+        "PRECONDITION: the cut trace holds the last step's boundary and fires"
+    );
+    assert_eq!(
+        rec.trace.len() - snapshot.len(),
+        1,
+        "PRECONDITION: exactly the last step's one read record is behind the cut"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // LEG 1: the capture as carried before the end cut.
+    let uncut = dir.path().join("capture_cut_mid_step.mcap");
+    write_capture_shaped_bag(
+        &rec,
+        &snapshot,
+        &uncut,
+        capture_last_boundary_target(&snapshot),
+    );
+    let outcome = replay(&uncut, source_relay_factories, None, None)
+        .expect("an inconsistent capture is a verdict, never a refusal");
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("the gate's finding reaches the verdict");
+    assert_eq!(v.unmet.len(), 1, "{v:?}");
+    assert_eq!(v.unmet[0].cause, "unplanned_consult");
+    assert_eq!(v.unmet[0].node_id, "relay");
+    assert_eq!(v.unmet[0].step, LAST_STEP);
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        6,
+        "the capture holds an output whose read it does not: {outcome:?}"
+    );
+
+    // LEG 2: the same trace through the recorder's end cut.
+    let complete = cerulion_bagd::end_at_last_complete_step(snapshot.iter().copied());
+    assert_eq!(complete.steps_cut, 1, "one rank, one final step");
+    assert_eq!(
+        complete.cut,
+        snapshot.iter().filter(|r| r.step == LAST_STEP).count(),
+        "the cut removes exactly the last step's records"
+    );
+    assert!(complete.cut > 0);
+    assert!(complete.records.iter().all(|r| r.step < LAST_STEP));
+    assert_eq!(
+        kind6_records(&Recording {
+            trace: complete.records.clone(),
+            ..rec.clone()
+        })
+        .len(),
+        steps - 1,
+        "every kept step keeps its read"
+    );
+    let cut = dir.path().join("capture_end_cut.mcap");
+    write_capture_shaped_bag(
+        &rec,
+        &complete.records,
+        &cut,
+        capture_last_boundary_target(&complete.records),
+    );
+    let outcome =
+        replay(&cut, source_relay_factories, None, None).expect("the end-cut capture replays");
+    assert!(outcome.passed, "the end-cut capture verifies: {outcome:?}");
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        0,
+        "{outcome:?}"
+    );
+    let covered = outcome
+        .covered_range
+        .as_ref()
+        .expect("a capture-shaped bag reports its covered range");
+    assert_eq!(
+        covered.through_ns,
+        capture_last_boundary_target(&complete.records)
+    );
+    assert_eq!(
+        covered.trailing_frames.get(&relay_topic).copied(),
+        Some(1),
+        "the relay's last-step output trails the range rather than being compared: {covered:?}"
+    );
+}
+
+/// A CAPTURE WHOSE FINAL STEP TIES ITS PREDECESSOR'S TARGET, through the end cut.
+///
+/// Equal consecutive targets are legal (a 0-delta step), and a data-triggered
+/// node fires on one like on any other step, so the final step's frame carries
+/// the same stamp as the step before it. The end cut removes the final step
+/// because no next boundary proves it; its frame stays in the bag. A covered
+/// range ending at the kept step's target then holds that frame, and the replay,
+/// which never drives the removed step, reports it missing.
+///
+/// HAND ORACLE. Five steps stamped 5, 10, 15, 20 and 20 ms; the relay publishes
+/// once per step at its step's target. The end cut removes every step at the
+/// final target (steps 3 and 4), so the range ends at 15 ms, the two 20 ms relay
+/// frames trail it, and the three steps the trace carries verify clean.
+#[test]
+#[serial]
+fn a_capture_whose_final_step_ties_its_predecessors_target_replays_clean_through_the_end_cut() {
+    const STEPS: usize = 5;
+    let deltas = [DELTA_MS, DELTA_MS, DELTA_MS, DELTA_MS, 0];
+    let per_step: Vec<f64> = (0..STEPS).map(|k| (k * 10 + 1) as f64).collect();
+    let rec = record_reference_impl(
+        ext_graph_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive::singles(RW_EXT_TOPIC, per_step)],
+        &deltas,
+        16,
+        true,
+    );
+    let out_topic = "/xr/relay/out";
+    let tie = rw_target_at(&rec, 4);
+    assert_eq!(
+        rw_target_at(&rec, 3),
+        tie,
+        "PRECONDITION: the final step ties its predecessor's target"
+    );
+    assert_eq!(
+        rw_values_at(&rec, out_topic, tie).len(),
+        2,
+        "PRECONDITION: the relay published at both tied steps, so the removed step's \
+         frame shares the kept step's stamp"
+    );
+
+    let complete = cerulion_bagd::end_at_last_complete_step(rec.trace.iter().copied());
+    let through = capture_last_boundary_target(&complete.records);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("capture_end_cut_tie.mcap");
+    write_capture_shaped_bag(&rec, &complete.records, &bag, through);
+    let outcome =
+        replay(&bag, ext_relay_factories, None, None).expect("the end-cut capture replays");
+    assert!(
+        outcome.passed,
+        "a capture whose final step ties its predecessor verifies clean: {:?}",
+        outcome.violations
+    );
+    assert_eq!(
+        through,
+        rw_target_at(&rec, 2),
+        "the range ends at step 2's target, below the tie"
+    );
+    assert!(
+        complete.records.iter().all(|r| r.step <= 2),
+        "every step at the final target is removed: {:?}",
+        complete.records.iter().map(|r| r.step).collect::<Vec<_>>()
+    );
+    assert_eq!(complete.steps_cut, 2, "steps 3 and 4 are removed");
+    let covered = outcome
+        .covered_range
+        .as_ref()
+        .expect("a capture-shaped bag reports its covered range");
+    assert_eq!(covered.through_ns, through);
+    assert_eq!(
+        covered.trailing_frames.get(out_topic).copied(),
+        Some(2),
+        "both tied relay frames trail the range: {covered:?}"
+    );
+}
+
+/// Why a rank with no complete step DECLINES the resume claim.
+///
+/// A two-rank from-start capture under free run whose peer's trace held only its
+/// first boundary when the trace was read, while the frames read afterwards hold
+/// the peer's step 1 output. The end cut removes the peer's every record. A
+/// covered range folded over the ranks that kept a boundary is rank 0's, 15 ms,
+/// and the peer's 10 ms frame sits inside it with no boundary of its own rank to
+/// match, so the replay refuses the bag as inconsistent. No declared range can
+/// avoid that (the reader raises a lower declaration to the same fold), which is
+/// why the recorder marks such a capture not resimmable rather than declaring a
+/// range for it.
+#[test]
+#[serial]
+fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_peer_unproven.mcap");
+    write_multi_rank_bag_impl(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| {
+            // The snapshot: the peer's first boundary only.
+            per_rank[1].retain(|r| r.step == 0);
+            // The recorder's end cut over both ranks' records.
+            let all: Vec<TraceRingRecord> = per_rank.concat();
+            let complete = cerulion_bagd::end_at_last_complete_step(all);
+            for (rank, stream) in per_rank.iter_mut().enumerate() {
+                *stream = complete
+                    .records
+                    .iter()
+                    .copied()
+                    .filter(|r| r.rank() == rank as u32)
+                    .collect();
+            }
+            assert!(
+                per_rank[1].is_empty(),
+                "PRECONDITION: the end cut leaves the peer nothing"
+            );
+        },
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        Some(15_000_000),
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+    let refused = replay(&bag, mp_slow_b_factories, None, None);
+    match &refused {
+        Err(ReplayError::RecordingInconsistent { .. }) => {}
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
 }

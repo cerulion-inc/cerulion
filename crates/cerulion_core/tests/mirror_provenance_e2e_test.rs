@@ -17,9 +17,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use cerulion_core::message::ShmMessage;
-use cerulion_core::transport::mirror_registry::MirrorRecord;
+use cerulion_core::transport::mirror_registry::{
+    MirrorRecord, MIRROR_DOORBELL_MAX_LISTENERS, MIRROR_DOORBELL_MAX_NOTIFIERS,
+    MIRROR_REGISTRY_DOORBELL_SERVICE_NAME,
+};
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
+use iceoryx2::port::listener::Listener;
+use iceoryx2::prelude::{NodeBuilder, ServiceName};
+use iceoryx2::service::ipc_threadsafe;
 use native_ros2_messages::geometry_msgs::Vector3;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -165,29 +171,81 @@ fn provenance_expires_when_the_reinjector_drops() {
     );
 }
 
-/// The no-mirror desk fast path: a reader on a root with NO live mirror writer
-/// gathers EMPTY (the `number_of_publishers == 0` instant return) AND pays no
-/// gather window. Hand oracle + timing bound: even with a large 2 s window
-/// requested, the no-publisher fast path returns well under 100 ms (a generous CI
-/// margin — the real cost is a service open + one dynamic-config read).
+/// How many rings a doorbell listener has queued, draining them.
+fn rings_heard(listener: &Listener<ipc_threadsafe::Service>) -> u64 {
+    listener
+        .try_wait(|_| {})
+        .expect("poll the witness listener")
+}
+
+/// A desk with no mirror writer answers at once and rings no doorbell.
+///
+/// The gather has a fast path for a registry with no live writer: it returns an
+/// empty answer without opening a reader or minting the doorbell notifier. Two
+/// checks show that the fast path was taken.
+///
+/// Time: a gather that pays its window takes at least the full window, the fast
+/// path takes milliseconds, and half the window keeps that verdict on a loaded
+/// runner.
+///
+/// Doorbell: a gather that gets past the fast path rings the doorbell on its
+/// first pass. The doorbell service is removed when its last holder drops it,
+/// so the test holds a listener on it for the whole run and reads it after the
+/// gather.
 #[test]
-fn no_mirror_desk_gathers_empty_instantly() {
+fn no_mirror_desk_settles_at_once_without_ringing_the_doorbell() {
     let root = cerulion_core::testing::iceoryx_test_config();
     let id = unique_id();
     let reader = manager_on(&root, &format!("reader_{id}"));
+
+    let witness_node = NodeBuilder::new()
+        .config(&root)
+        .create::<ipc_threadsafe::Service>()
+        .expect("witness node");
+    let doorbell_name =
+        ServiceName::new(MIRROR_REGISTRY_DOORBELL_SERVICE_NAME).expect("doorbell name");
+    let doorbell = witness_node
+        .service_builder(&doorbell_name)
+        .event()
+        .max_listeners(MIRROR_DOORBELL_MAX_LISTENERS)
+        .max_notifiers(MIRROR_DOORBELL_MAX_NOTIFIERS)
+        .open_or_create()
+        .expect("doorbell service");
+    let listener = doorbell
+        .listener_builder()
+        .create()
+        .expect("witness listener");
+    // The witness must hear a ring on this root, or hearing none proves nothing.
+    doorbell
+        .notifier_builder()
+        .create()
+        .expect("witness notifier")
+        .notify()
+        .expect("witness ring");
+    assert_eq!(
+        rings_heard(&listener),
+        1,
+        "the witness listener hears a ring on this root"
+    );
+
+    let window = Duration::from_secs(2);
     let started = Instant::now();
-    let got = reader
-        .gather_mirror_provenance(Duration::from_secs(2))
-        .expect("gather");
+    let got = reader.gather_mirror_provenance(window).expect("gather");
     let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < window / 2,
+        "a desk with no mirror writer must not pay the gather window \
+         (elapsed {elapsed:?}, window {window:?})"
+    );
     assert!(
         got.is_empty(),
         "a desk with no mirror gathers nothing: {got:?}"
     );
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "the no-publisher fast path must not pay the gather window (elapsed {elapsed:?}, \
-         requested 2s window)"
+    assert_eq!(
+        rings_heard(&listener),
+        0,
+        "a desk with no mirror writer must not ring the doorbell"
     );
 }
 

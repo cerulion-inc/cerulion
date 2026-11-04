@@ -4066,7 +4066,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         None => None,
     };
 
-    // The loop has NO `?`. Each of its four fallible seams
+    // The loop has NO `?`. Each of its fallible seams
     // `break`s out with the failing rank and its error instead, so the
     // epilogue below runs on an abort exactly as it runs on completion —
     // over whatever the earlier passes accumulated — and the ORIGINAL error
@@ -4138,6 +4138,15 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 Some(Err(e)) => break 'passes Some((rank, e)),
                 Some(Ok(None)) | None => plan.subgraph().clone(),
             };
+            // PLAN this pass's injection before its runtime exists: the steered
+            // schedule decides how deep a bag-fed input's subscriber is built
+            // (`PassVerification::depth_floors`). The admission half, which
+            // needs the built runtime's stage census, runs inside the pass.
+            let topics = pass_topics(plan, &classes, pass.is_lockstep());
+            let verification = match plan_pass_verification(&pass, &topics) {
+                Ok(verification) => verification,
+                Err(e) => break 'passes Some((rank, e)),
+            };
             let mut runtime = match build_pass_runtime(
                 plan,
                 subgraph,
@@ -4145,7 +4154,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 &transport,
                 &clock,
                 schema_hashes.as_ref(),
-                &burst_floors,
+                pass_wiring(&burst_floors, &verification.depth_floors),
             ) {
                 Ok(runtime) => runtime,
                 Err(e) => break 'passes Some((rank, e)),
@@ -4206,11 +4215,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             }
             let outcome = match run_rank_pass(
                 pass,
+                topics,
+                verification,
                 &mut runtime,
                 &clock,
                 &transport,
                 resume.as_ref(),
-                &classes,
                 &mut fire_tap,
                 &mut warned_partial_discard,
             ) {
@@ -7726,6 +7736,23 @@ fn build_replay_context(
     }
 }
 
+/// One pass's build provisioning: the recording's per-topic burst floors, and
+/// per `(node, input)` the depth a bag-fed input's subscriber is built at when
+/// its steered schedule holds more frames than it declares
+/// (`PassVerification::depth_floors`). An empty map adds nothing.
+fn pass_wiring<'a>(
+    burst_floors: &'a BTreeMap<String, cerulion_core::transport::TopicRequirements>,
+    depth_floors: &'a BTreeMap<(String, String), usize>,
+) -> cerulion_core::graph::CrossProcessWiring<'a> {
+    let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
+    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning);
+    if depth_floors.is_empty() {
+        wiring
+    } else {
+        wiring.with_input_depth_floors(depth_floors)
+    }
+}
+
 /// Stand up ONE pass's [`GraphRuntime`]: the plan's subgraph over the shared
 /// transport, with exactly the plan's own node instances taken out of the
 /// shared factory map.
@@ -7741,7 +7768,8 @@ fn build_pass_runtime(
     transport: &Arc<TransportManager>,
     clock: &Arc<VirtualClock>,
     schema_hashes: Option<&std::collections::HashMap<String, u64>>,
-    burst_floors: &BTreeMap<String, cerulion_core::transport::TopicRequirements>,
+    // The pass's provisioning, from `pass_wiring`.
+    wiring: cerulion_core::graph::CrossProcessWiring<'_>,
 ) -> Result<GraphRuntime, ReplayError> {
     // GRAPH order, so the runtime's node insertion order (which decides
     // within-level fire order) is the graph's — Principle #5.
@@ -7758,14 +7786,13 @@ fn build_pass_runtime(
             })?;
         pass_factories.insert(member.clone(), entry);
     }
-    let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
-    GraphRuntime::build_with_schema_hashes_and_provisioning(
+    GraphRuntime::build_with_schema_hashes_and_wiring(
         subgraph,
         pass_factories,
         transport,
         clock.clone(),
         schema_hashes,
-        provisioning,
+        wiring,
     )
     .map_err(|e| ReplayError::Internal {
         reason: format!(
@@ -10068,6 +10095,14 @@ struct PassVerification {
     /// reason. They take today's drain; the report names them so an absent gate
     /// is never read as an absent edge.
     admission_ungateable: Vec<String>,
+    /// What [`plan_pass_admission`] needs from the bag, kept until this pass's
+    /// runtime exists. `Some` only on a rank that holds a gated edge and
+    /// carries read records.
+    pending_admission: Option<PendingAdmission>,
+    /// Per `(node, input)`, the depth this pass builds the bag-fed input's
+    /// subscriber at, where its steered schedule holds more frames at once than
+    /// the declared depth (the deepest of the input's read sites).
+    depth_floors: BTreeMap<(String, String), usize>,
     enforce_topics: usize,
     /// Why no gate was built over a non-empty enforce set, in the words of the
     /// site that found it. `None` when the gate was built, or when the rank
@@ -10256,6 +10291,8 @@ impl PassVerification {
             block_edges: Vec::new(),
             admission: std::collections::HashMap::new(),
             admission_ungateable: Vec::new(),
+            pending_admission: None,
+            depth_floors: BTreeMap::new(),
             enforce_topics: 0,
             enforcement_skipped: None,
             declined: None,
@@ -11049,9 +11086,9 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// THIRTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
-// at `run_engine` entry beside `coordination`, and `bag_side` is the pre-pass's
-// plan for THIS rank, so both arrive the same way every other pass input does.
+// ELEVEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// at `run_engine` entry beside `coordination`, so it arrives the same way every
+// other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
 // make the function clearer.
 #[allow(clippy::too_many_arguments)]
@@ -11069,15 +11106,6 @@ fn prepare_pass_verification(
     // consumers apart, and an empty set leaves this function's behaviour
     // byte-identical.
     enforce_topics: &[String],
-    // The core's own stage census: every wired stage with whether
-    // the gate may hold its frames back, the ONE authority on both questions
-    // (`replay_read_enforceable`).
-    census: &[cerulion_core::read_outcome::ReadEdgeCapability],
-    // What the PRE-PASS planned for THIS rank from the recording's own staging
-    // rows, before pass 0. `None` = it had nothing to plan from (see
-    // `plan_bag_side_admissions`), and the only such case this function plans
-    // for itself is a bag that states no rows at all.
-    bag_side: Option<&RankBagSide>,
     // May this bag's kind-6 role bits be read as roles? The
     // steering and the re-derivation feed both branch on it, see
     // `ROLE_STAMPED_MIN_TRACE_FORMAT`.
@@ -11452,6 +11480,10 @@ fn prepare_pass_verification(
     let mut stand_downs = Vec::new();
     let mut coverage = Vec::new();
     let mut notes: Vec<RederivationNote> = Vec::new();
+    // Per `(node, input)`: the topic and the deepest raise its steered
+    // schedule needs.
+    let mut depth_raises: BTreeMap<(String, String), (String, replay_inject::DepthRaise)> =
+        BTreeMap::new();
     for topic in inject_topics {
         // A HEADERLESS recorded frame is absent from the positional model and
         // present in the feed, so every later `frame_index` addresses the wrong
@@ -11488,6 +11520,7 @@ fn prepare_pass_verification(
             continue;
         }
         let mut edges: Vec<replay_inject::ConsumerEdge> = Vec::new();
+        let provisionable_depth = replay_provisionable_depth(config, topic);
         for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
             let info = node_infos.get(node.as_str());
             let depth = info.and_then(|i| {
@@ -11514,6 +11547,7 @@ fn prepare_pass_verification(
                         input_consume_mode(i, input)
                     }),
                     depth,
+                    provisionable_depth,
                     // The two queues need distinct identities, and the SITE is
                     // what a stand-down renders — so an operator reading it
                     // learns WHICH read path could not be reconciled, which the
@@ -11760,6 +11794,21 @@ fn prepare_pass_verification(
                         );
                     }
                 }
+                // The body and drain sites of one input are two subscribers
+                // built from one depth, so the input takes the deeper need.
+                for raise in &schedule.depth_raises {
+                    let key = (raise.edge.node_id.clone(), raise.edge.input.clone());
+                    match depth_raises.entry(key) {
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert((topic.clone(), raise.clone()));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut slot) => {
+                            if raise.required > slot.get().1.required {
+                                slot.get_mut().1 = raise.clone();
+                            }
+                        }
+                    }
+                }
                 coverage.push(InjectionCoverageNote {
                     rank: plan.rank(),
                     topic: topic.clone(),
@@ -11790,17 +11839,35 @@ fn prepare_pass_verification(
         }
     }
 
+    // ── the bag-fed inputs built deeper than they declare ─────────────────
+    //
+    // ONE line per input. A live consumer can take more frames in one step than
+    // its declared depth, because the refill between its fires pulls frames
+    // that arrive while it fires. The steered injection places every frame a
+    // step took before that step, so the replayed queue holds them all at once.
+    let mut depth_floors: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for ((node, input), (topic, raise)) in depth_raises {
+        tracing::info!(
+            rank = plan.rank(),
+            topic = %topic,
+            node = %node,
+            input = %input,
+            declared_depth = raise.declared,
+            provisioned_depth = raise.required,
+            step = raise.peak_step,
+            "replay: building this bag-fed input's queue deeper than it declares. The \
+             steered injection places every frame a step's recorded reads took before \
+             that step, so at step `step` this queue holds `provisioned_depth` frames at \
+             once (the recording took some of them as they arrived while the consumer \
+             fired); at `declared_depth` it would evict frames the recording delivered"
+        );
+        depth_floors.insert((node, input), raise.required as usize);
+    }
+
     // ── the recorded ADMISSIONS of each graph-produced edge ──────────────
     //
-    // The other end of the same log. An injected topic is one another rank
-    // produces, so its plan places recorded FRAMES onto steps; a topic THIS rank
-    // produces and consumes has no feed to inject from, so its plan places the
-    // recorded READS onto steps and the core's gate holds the producer's live
-    // frame back until the step the recording read it at.
-    let mut admission: std::collections::HashMap<String, Vec<replay_inject::StageAdmission>> =
-        std::collections::HashMap::new();
+    // Planned by `plan_pass_admission` against the built runtime's census.
     // Why no gate was built over a non-empty enforce set. `None` once one is.
-    let mut admission_ungateable: Vec<String> = Vec::new();
     let mut enforcement_skipped: Option<String> = None;
     // `reads` EMPTY is a bag that carries no read log for this rank (every
     // `trace_format` <= 2 bag, and any rank whose records the census thinned to
@@ -11823,299 +11890,19 @@ fn prepare_pass_verification(
             enforce_topics.len()
         ));
     }
-    if !enforce_topics.is_empty() && !reads.is_empty() {
-        // THE CENSUS HALF. The bag side was planned ONCE, before pass 0, from the
-        // recording's own staging rows (`plan_bag_side_admissions`), and is
-        // CONSUMED here, and COMPLETED where this build's census gates a stage the
-        // plan does not carry: the plan's own wiring answer is conservative, so the
-        // pass is the authority on which stages are gated and may not leave one of
-        // them ungated. A stage both tables carry is never re-planned, and a
-        // difference between the two over one stage is an engine fault, refused as
-        // one below rather than armed.
-        let stages = replay_inject::StageTable::new(&recorded_inputs, census).with_recorded_stages(
-            recorded_rims
+    // The CENSUS half is planned once this pass's runtime exists
+    // (`plan_pass_admission`): what it needs from the bag is kept here.
+    let pending_admission =
+        (!enforce_topics.is_empty() && !reads.is_empty()).then(|| PendingAdmission {
+            recorded_inputs: recorded_inputs.clone(),
+            recorded_stages: recorded_rims
                 .per_edge
                 .iter()
                 .flat_map(|rows| rows.keys().cloned())
-                .collect::<Vec<_>>(),
-        );
-        for topic in enforce_topics {
-            // (1) THE WIRING COMPARISON, per consuming edge. A difference between
-            //     the stage set the recording staged and the one this build wires
-            //     is the stage-set skew refusal, and it is also what makes
-            //     consuming the pre-pass plan sound: that plan placed each record
-            //     on a RECORDED stage, and past this comparison the recorded
-            //     stages ARE the wired ones.
-            for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
-                let (input_idx, roles) = match stages.resolve(node, input) {
-                    Ok(v) => v,
-                    // The bag-side arms of this resolution were already decided
-                    // before pass 0; what reaches here is the CENSUS-derived one
-                    // (this build wires no stage at that index).
-                    Err(reason) => {
-                        let detail = reason.to_string();
-                        tracing::warn!(
-                            rank = plan.rank(),
-                            topic = %topic,
-                            cause = reason.code(),
-                            detail = %detail,
-                            "replay: this recording's read log cannot be ENFORCED on a \
-                             graph-produced input edge, so the replay is REFUSED rather than \
-                             run against whatever the consumer's queue happened to hold"
-                        );
-                        return Err(ReplayError::ReadLogNotEnforceable {
-                            edge: reason.edge_label(),
-                            cause: reason.code().to_string(),
-                            detail,
-                        });
-                    }
-                };
-                if let Some((recorded, wired)) = stages.recorded_stage_skew(node, input_idx, roles)
-                {
-                    let reason = replay_inject::AdmissionRefusalReason::StageSetSkew {
-                        node: node.clone(),
-                        input: input.clone(),
-                        recorded,
-                        wired,
-                    };
-                    let detail = reason.to_string();
-                    tracing::warn!(
-                        rank = plan.rank(),
-                        topic = %topic,
-                        cause = reason.code(),
-                        detail = %detail,
-                        "replay: this replay's wiring is not the one the recording staged its \
-                         reads on, so the replay is REFUSED before this rank's first step \
-                         rather than run against a plan placed on queues it does not have"
-                    );
-                    return Err(ReplayError::ReadLogNotEnforceable {
-                        edge: reason.edge_label(),
-                        cause: reason.code().to_string(),
-                        detail,
-                    });
-                }
-            }
-            // (2) The PRE-PASS plan for this topic, CONSUMED as it stands here and
-            //     COMPLETED at (4). The `None` arm is
-            //     reachable two ways and neither is a second plan: a bag that
-            //     states NO staging rows (there was nothing to plan from before
-            //     pass 0, so this is the FIRST plan), and a topic with no
-            //     consuming edge on this rank, which plans nothing on either
-            //     side.
-            let planned_stages: Vec<replay_inject::StageAdmission> =
-                match bag_side.and_then(|b| b.admission.get(topic)) {
-                    Some(stages) => stages.clone(),
-                    None => {
-                        let planned =
-                            topic_admission_for(topic, &consumed, node_infos, &per_input, config);
-                        match replay_inject::plan_edge_admission(&planned, &stages) {
-                            replay_inject::AdmissionPlan::Enforced { stages, .. } => stages,
-                            replay_inject::AdmissionPlan::NotGateable(_) => Vec::new(),
-                            replay_inject::AdmissionPlan::Refused(refusal) => {
-                                let detail = refusal.reason.to_string();
-                                tracing::warn!(
-                                    rank = plan.rank(),
-                                    topic = %topic,
-                                    cause = refusal.reason.code(),
-                                    detail = %detail,
-                                    "replay: this recording's read log cannot be ENFORCED on a \
-                                     graph-produced input edge, so the replay is REFUSED rather \
-                                     than run against whatever the consumer's queue happened to \
-                                     hold"
-                                );
-                                return Err(ReplayError::ReadLogNotEnforceable {
-                                    edge: refusal.reason.edge_label(),
-                                    cause: refusal.reason.code().to_string(),
-                                    detail,
-                                });
-                            }
-                        }
-                    }
-                };
-            // (3) WHICH of the planned stages the core will gate. A stage it
-            //     refuses takes today's drain and is NAMED, which is the
-            //     report-only path the per-set Sync and multi-publisher classes
-            //     keep; the gate is armed on the rest.
-            let mut armed: Vec<replay_inject::StageAdmission> = Vec::new();
-            let mut ungateable: Vec<(cerulion_core::read_outcome::StageKey, String)> = Vec::new();
-            for stage in planned_stages {
-                if stages.stage_gateable(&stage.key) == Some(true) {
-                    armed.push(stage);
-                    continue;
-                }
-                let reason = stages.refusal(&stage.key).map_or_else(
-                    || "the core refuses to gate this stage".to_string(),
-                    |r| r.to_string(),
-                );
-                ungateable.push((stage.key.clone(), reason));
-            }
-            // The stages the PRE-PASS never planned because this build's wiring
-            // blocks them, named from THIS census (which carries the core's own
-            // reason, where the pre-pass's conservative answer carries none). A
-            // blocked stage the report does not name is the silence the
-            // `not_gateable` status exists to replace, and the pre-pass plan
-            // excludes those stages by construction, so they can only be found
-            // here.
-            for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
-                let Ok((input_idx, roles)) = stages.resolve(node, input) else {
-                    continue;
-                };
-                for role in roles.wired() {
-                    let key = cerulion_core::read_outcome::StageKey {
-                        node: node.clone(),
-                        input_idx,
-                        role,
-                    };
-                    if stages.stage_gateable(&key) == Some(true)
-                        || ungateable.iter().any(|(k, _)| *k == key)
-                    {
-                        continue;
-                    }
-                    let reason = stages.refusal(&key).map_or_else(
-                        || "the core refuses to gate this stage".to_string(),
-                        |r| r.to_string(),
-                    );
-                    ungateable.push((key, reason));
-                }
-            }
-            for (key, reason) in &ungateable {
-                tracing::warn!(
-                    rank = plan.rank(),
-                    topic = %topic,
-                    stage = %key.label(),
-                    reason = %reason,
-                    "replay: this topic is produced and consumed inside one rank and its \
-                     consuming stage cannot be GATED on its recorded reads, so that edge's \
-                     intra-step arrival is whatever its queue holds (report only, the replay \
-                     proceeds exactly as an ungated one)"
-                );
-            }
-            admission_ungateable.extend(render_ungateable(&ungateable));
-            // (4) COMPLETE the plan. A stage THIS census gates that the consumed
-            //     plan lacks is planned here, from the same records through the
-            //     same planner, so a pre-pass answer that excluded a stage for
-            //     any reason can never leave a gateable recorded read ungated.
-            //     The shared stages must come out identical (one decode, one
-            //     placement rule, and the stage sets agree past the comparison
-            //     above); a difference is the two tables disagreeing, which is an
-            //     engine fault and is refused as one rather than armed.
-            let missing: Vec<cerulion_core::read_outcome::StageKey> = consumed
-                .iter()
-                .filter(|(t, _, _)| t == topic)
-                .filter_map(|(_, node, input)| {
-                    stages.resolve(node, input).ok().map(|(input_idx, roles)| {
-                        roles
-                            .wired()
-                            .into_iter()
-                            .map(move |role| cerulion_core::read_outcome::StageKey {
-                                node: node.clone(),
-                                input_idx,
-                                role,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .flatten()
-                .filter(|key| stages.stage_gateable(key) == Some(true))
-                .filter(|key| !armed.iter().any(|s| s.key == *key))
-                .collect();
-            if !missing.is_empty() {
-                let planned = topic_admission_for(topic, &consumed, node_infos, &per_input, config);
-                match replay_inject::plan_edge_admission(&planned, &stages) {
-                    replay_inject::AdmissionPlan::Enforced { stages: full, .. } => {
-                        for stage in full {
-                            if missing.contains(&stage.key) {
-                                tracing::debug!(
-                                    rank = plan.rank(),
-                                    topic = %topic,
-                                    stage = %stage.key.label(),
-                                    "replay: this stage is gated by this build's wiring and the \
-                                     plan made before the first step did not carry it, so it is \
-                                     planned here from the same records"
-                                );
-                                armed.push(stage);
-                            } else if let Some(have) = armed.iter().find(|a| a.key == stage.key) {
-                                if *have != stage {
-                                    return Err(ReplayError::Internal {
-                                        reason: format!(
-                                            "rank {}: the admission plan made before the first \
-                                             step and the one this pass derives disagree about \
-                                             stage {} of topic {topic}, over the same records. \
-                                             This is a bug in the replay engine, please report",
-                                            plan.rank(),
-                                            stage.key.label()
-                                        ),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    // Nothing to complete: no stage of this topic can be gated.
-                    replay_inject::AdmissionPlan::NotGateable(_) => {}
-                    replay_inject::AdmissionPlan::Refused(refusal) => {
-                        let detail = refusal.reason.to_string();
-                        tracing::warn!(
-                            rank = plan.rank(),
-                            topic = %topic,
-                            cause = refusal.reason.code(),
-                            detail = %detail,
-                            "replay: this recording's read log cannot be ENFORCED on a \
-                             graph-produced input edge, so the replay is REFUSED rather than run \
-                             against whatever the consumer's queue happened to hold"
-                        );
-                        return Err(ReplayError::ReadLogNotEnforceable {
-                            edge: refusal.reason.edge_label(),
-                            cause: refusal.reason.code().to_string(),
-                            detail,
-                        });
-                    }
-                }
-            }
-            // (5) THE STATUS INVARIANT. The report may not say enforced over a
-            //     stage this census gates and this pass did not arm: that is the
-            //     partial coverage the enforcement exists to delete, and it would
-            //     render as `enforced` with `stages_not_gateable` zero. Past (4)
-            //     this is a guard and not a path.
-            for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
-                let Ok((input_idx, roles)) = stages.resolve(node, input) else {
-                    continue;
-                };
-                for role in roles.wired() {
-                    let key = cerulion_core::read_outcome::StageKey {
-                        node: node.clone(),
-                        input_idx,
-                        role,
-                    };
-                    if stages.stage_gateable(&key) != Some(true)
-                        || armed.iter().any(|s| s.key == key)
-                    {
-                        continue;
-                    }
-                    return Err(ReplayError::Internal {
-                        reason: format!(
-                            "rank {}: stage {} of topic {topic} is gated by this build's wiring \
-                             and no admission was armed on it, so the enforcement would report \
-                             coverage it does not have. This is a bug in the replay engine, \
-                             please report",
-                            plan.rank(),
-                            key.label()
-                        ),
-                    });
-                }
-            }
-            if armed.is_empty() {
-                continue;
-            }
-            tracing::debug!(
-                rank = plan.rank(),
-                topic = %topic,
-                gated = armed.len(),
-                ungateable = ungateable.len(),
-                "replay: this topic's consuming stages will be GATED on their recorded reads"
-            );
-            admission.insert(topic.clone(), armed);
-        }
-    }
+                .collect(),
+            consumed: consumed.clone(),
+            per_input: std::mem::take(&mut per_input),
+        });
 
     // ── the rank's declarations, reads and block edges ───────────────────
     let input_topic: std::collections::HashMap<(String, String), String> = consumed
@@ -12199,8 +11986,8 @@ fn prepare_pass_verification(
     // reach here: `validate_partition` refuses a split at record time,
     // and `build_pass_runtime` builds THIS rank's subgraph, whose
     // `GraphTopology::validate` refuses a `block` input with no in-graph
-    // producer (exit 5) strictly before `prepare_pass_verification` runs. So
-    // `block_edges` is empty on every pass, and the `verify_conservation`
+    // producer (exit 5) strictly before the pass that reads `block_edges`
+    // runs. So no pass ever judges a non-empty list, and the `verify_conservation`
     // plane it feeds is held by its pure oracles alone. It stays because
     // deleting it is a design call over that plane (`Decider::BlockCredit`,
     // three stand-down reasons, eight oracles), not a local tidy-up.
@@ -12256,13 +12043,348 @@ fn prepare_pass_verification(
         reads_by_step,
         decls,
         block_edges,
-        admission,
-        admission_ungateable,
+        admission: std::collections::HashMap::new(),
+        admission_ungateable: Vec::new(),
+        pending_admission,
+        depth_floors,
         enforce_topics: enforce_topics.len(),
         enforcement_skipped,
         declined: None,
         declined_detail: None,
     })
+}
+
+/// What [`plan_pass_admission`] reads off the bag, kept by
+/// [`prepare_pass_verification`] for the pass whose runtime is not built yet.
+struct PendingAdmission {
+    /// The bag's merged manifest input tables.
+    recorded_inputs: BTreeMap<String, Vec<String>>,
+    /// The stages the recording's staging rows name.
+    recorded_stages: Vec<cerulion_core::read_outcome::StageKey>,
+    /// This rank's consuming edges, `(topic, node, input)`.
+    consumed: Vec<(String, String, String)>,
+    /// The enforcement stream per `(node, input)`, in record order.
+    per_input: BTreeMap<(String, String), Vec<replay_inject::SitedRead>>,
+}
+
+/// The recorded ADMISSIONS of each graph-produced edge, planned against this
+/// pass's built runtime: the admission plans per topic, and the rendered stages
+/// the core refuses to gate.
+type PassAdmission = (
+    std::collections::HashMap<String, Vec<replay_inject::StageAdmission>>,
+    Vec<String>,
+);
+
+/// Plan the gated reads of the topics this rank both produces and consumes,
+/// against `census`, the core's stage table for this pass's runtime.
+///
+/// The other end of the read log from the injection plan: an injected topic is
+/// one another rank produces, so its plan places recorded FRAMES onto steps; a
+/// topic THIS rank produces and consumes has no feed to inject from, so its
+/// plan places the recorded READS onto steps and the core's gate holds the
+/// producer's live frame back until the step the recording read it at.
+fn plan_pass_admission(
+    pending: PendingAdmission,
+    plan: &RankPlan,
+    config: &GraphConfig,
+    node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    enforce_topics: &[String],
+    census: &[cerulion_core::read_outcome::ReadEdgeCapability],
+    bag_side: Option<&RankBagSide>,
+) -> Result<PassAdmission, ReplayError> {
+    let PendingAdmission {
+        recorded_inputs,
+        recorded_stages,
+        consumed,
+        per_input,
+    } = pending;
+    let mut admission: std::collections::HashMap<String, Vec<replay_inject::StageAdmission>> =
+        std::collections::HashMap::new();
+    let mut admission_ungateable: Vec<String> = Vec::new();
+    // THE CENSUS HALF. The bag side was planned ONCE, before pass 0, from the
+    // recording's own staging rows (`plan_bag_side_admissions`), and is
+    // CONSUMED here, and COMPLETED where this build's census gates a stage the
+    // plan does not carry: the plan's own wiring answer is conservative, so the
+    // pass is the authority on which stages are gated and may not leave one of
+    // them ungated. A stage both tables carry is never re-planned, and a
+    // difference between the two over one stage is an engine fault, refused as
+    // one below rather than armed.
+    let stages = replay_inject::StageTable::new(&recorded_inputs, census)
+        .with_recorded_stages(recorded_stages);
+    for topic in enforce_topics {
+        // (1) THE WIRING COMPARISON, per consuming edge. A difference between
+        //     the stage set the recording staged and the one this build wires
+        //     is the stage-set skew refusal, and it is also what makes
+        //     consuming the pre-pass plan sound: that plan placed each record
+        //     on a RECORDED stage, and past this comparison the recorded
+        //     stages ARE the wired ones.
+        for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
+            let (input_idx, roles) = match stages.resolve(node, input) {
+                Ok(v) => v,
+                // The bag-side arms of this resolution were already decided
+                // before pass 0; what reaches here is the CENSUS-derived one
+                // (this build wires no stage at that index).
+                Err(reason) => {
+                    let detail = reason.to_string();
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        topic = %topic,
+                        cause = reason.code(),
+                        detail = %detail,
+                        "replay: this recording's read log cannot be ENFORCED on a \
+                         graph-produced input edge, so the replay is REFUSED rather than \
+                         run against whatever the consumer's queue happened to hold"
+                    );
+                    return Err(ReplayError::ReadLogNotEnforceable {
+                        edge: reason.edge_label(),
+                        cause: reason.code().to_string(),
+                        detail,
+                    });
+                }
+            };
+            if let Some((recorded, wired)) = stages.recorded_stage_skew(node, input_idx, roles) {
+                let reason = replay_inject::AdmissionRefusalReason::StageSetSkew {
+                    node: node.clone(),
+                    input: input.clone(),
+                    recorded,
+                    wired,
+                };
+                let detail = reason.to_string();
+                tracing::warn!(
+                    rank = plan.rank(),
+                    topic = %topic,
+                    cause = reason.code(),
+                    detail = %detail,
+                    "replay: this replay's wiring is not the one the recording staged its \
+                     reads on, so the replay is REFUSED before this rank's first step \
+                     rather than run against a plan placed on queues it does not have"
+                );
+                return Err(ReplayError::ReadLogNotEnforceable {
+                    edge: reason.edge_label(),
+                    cause: reason.code().to_string(),
+                    detail,
+                });
+            }
+        }
+        // (2) The PRE-PASS plan for this topic, CONSUMED as it stands here and
+        //     COMPLETED at (4). The `None` arm is
+        //     reachable two ways and neither is a second plan: a bag that
+        //     states NO staging rows (there was nothing to plan from before
+        //     pass 0, so this is the FIRST plan), and a topic with no
+        //     consuming edge on this rank, which plans nothing on either
+        //     side.
+        let planned_stages: Vec<replay_inject::StageAdmission> = match bag_side
+            .and_then(|b| b.admission.get(topic))
+        {
+            Some(stages) => stages.clone(),
+            None => {
+                let planned = topic_admission_for(topic, &consumed, node_infos, &per_input, config);
+                match replay_inject::plan_edge_admission(&planned, &stages) {
+                    replay_inject::AdmissionPlan::Enforced { stages, .. } => stages,
+                    replay_inject::AdmissionPlan::NotGateable(_) => Vec::new(),
+                    replay_inject::AdmissionPlan::Refused(refusal) => {
+                        let detail = refusal.reason.to_string();
+                        tracing::warn!(
+                            rank = plan.rank(),
+                            topic = %topic,
+                            cause = refusal.reason.code(),
+                            detail = %detail,
+                            "replay: this recording's read log cannot be ENFORCED on a \
+                             graph-produced input edge, so the replay is REFUSED rather \
+                             than run against whatever the consumer's queue happened to \
+                             hold"
+                        );
+                        return Err(ReplayError::ReadLogNotEnforceable {
+                            edge: refusal.reason.edge_label(),
+                            cause: refusal.reason.code().to_string(),
+                            detail,
+                        });
+                    }
+                }
+            }
+        };
+        // (3) WHICH of the planned stages the core will gate. A stage it
+        //     refuses takes today's drain and is NAMED, which is the
+        //     report-only path the per-set Sync and multi-publisher classes
+        //     keep; the gate is armed on the rest.
+        let mut armed: Vec<replay_inject::StageAdmission> = Vec::new();
+        let mut ungateable: Vec<(cerulion_core::read_outcome::StageKey, String)> = Vec::new();
+        for stage in planned_stages {
+            if stages.stage_gateable(&stage.key) == Some(true) {
+                armed.push(stage);
+                continue;
+            }
+            let reason = stages.refusal(&stage.key).map_or_else(
+                || "the core refuses to gate this stage".to_string(),
+                |r| r.to_string(),
+            );
+            ungateable.push((stage.key.clone(), reason));
+        }
+        // The stages the PRE-PASS never planned because this build's wiring
+        // blocks them, named from THIS census (which carries the core's own
+        // reason, where the pre-pass's conservative answer carries none). A
+        // blocked stage the report does not name is the silence the
+        // `not_gateable` status exists to replace, and the pre-pass plan
+        // excludes those stages by construction, so they can only be found
+        // here.
+        for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
+            let Ok((input_idx, roles)) = stages.resolve(node, input) else {
+                continue;
+            };
+            for role in roles.wired() {
+                let key = cerulion_core::read_outcome::StageKey {
+                    node: node.clone(),
+                    input_idx,
+                    role,
+                };
+                if stages.stage_gateable(&key) == Some(true)
+                    || ungateable.iter().any(|(k, _)| *k == key)
+                {
+                    continue;
+                }
+                let reason = stages.refusal(&key).map_or_else(
+                    || "the core refuses to gate this stage".to_string(),
+                    |r| r.to_string(),
+                );
+                ungateable.push((key, reason));
+            }
+        }
+        for (key, reason) in &ungateable {
+            tracing::warn!(
+                rank = plan.rank(),
+                topic = %topic,
+                stage = %key.label(),
+                reason = %reason,
+                "replay: this topic is produced and consumed inside one rank and its \
+                 consuming stage cannot be GATED on its recorded reads, so that edge's \
+                 intra-step arrival is whatever its queue holds (report only, the replay \
+                 proceeds exactly as an ungated one)"
+            );
+        }
+        admission_ungateable.extend(render_ungateable(&ungateable));
+        // (4) COMPLETE the plan. A stage THIS census gates that the consumed
+        //     plan lacks is planned here, from the same records through the
+        //     same planner, so a pre-pass answer that excluded a stage for
+        //     any reason can never leave a gateable recorded read ungated.
+        //     The shared stages must come out identical (one decode, one
+        //     placement rule, and the stage sets agree past the comparison
+        //     above); a difference is the two tables disagreeing, which is an
+        //     engine fault and is refused as one rather than armed.
+        let missing: Vec<cerulion_core::read_outcome::StageKey> = consumed
+            .iter()
+            .filter(|(t, _, _)| t == topic)
+            .filter_map(|(_, node, input)| {
+                stages.resolve(node, input).ok().map(|(input_idx, roles)| {
+                    roles
+                        .wired()
+                        .into_iter()
+                        .map(move |role| cerulion_core::read_outcome::StageKey {
+                            node: node.clone(),
+                            input_idx,
+                            role,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten()
+            .filter(|key| stages.stage_gateable(key) == Some(true))
+            .filter(|key| !armed.iter().any(|s| s.key == *key))
+            .collect();
+        if !missing.is_empty() {
+            let planned = topic_admission_for(topic, &consumed, node_infos, &per_input, config);
+            match replay_inject::plan_edge_admission(&planned, &stages) {
+                replay_inject::AdmissionPlan::Enforced { stages: full, .. } => {
+                    for stage in full {
+                        if missing.contains(&stage.key) {
+                            tracing::debug!(
+                                rank = plan.rank(),
+                                topic = %topic,
+                                stage = %stage.key.label(),
+                                "replay: this stage is gated by this build's wiring and the \
+                                 plan made before the first step did not carry it, so it is \
+                                 planned here from the same records"
+                            );
+                            armed.push(stage);
+                        } else if let Some(have) = armed.iter().find(|a| a.key == stage.key) {
+                            if *have != stage {
+                                return Err(ReplayError::Internal {
+                                    reason: format!(
+                                        "rank {}: the admission plan made before the first \
+                                         step and the one this pass derives disagree about \
+                                         stage {} of topic {topic}, over the same records. \
+                                         This is a bug in the replay engine, please report",
+                                        plan.rank(),
+                                        stage.key.label()
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                // Nothing to complete: no stage of this topic can be gated.
+                replay_inject::AdmissionPlan::NotGateable(_) => {}
+                replay_inject::AdmissionPlan::Refused(refusal) => {
+                    let detail = refusal.reason.to_string();
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        topic = %topic,
+                        cause = refusal.reason.code(),
+                        detail = %detail,
+                        "replay: this recording's read log cannot be ENFORCED on a \
+                         graph-produced input edge, so the replay is REFUSED rather than run \
+                         against whatever the consumer's queue happened to hold"
+                    );
+                    return Err(ReplayError::ReadLogNotEnforceable {
+                        edge: refusal.reason.edge_label(),
+                        cause: refusal.reason.code().to_string(),
+                        detail,
+                    });
+                }
+            }
+        }
+        // (5) THE STATUS INVARIANT. The report may not say enforced over a
+        //     stage this census gates and this pass did not arm: that is the
+        //     partial coverage the enforcement exists to delete, and it would
+        //     render as `enforced` with `stages_not_gateable` zero. Past (4)
+        //     this is a guard and not a path.
+        for (_, node, input) in consumed.iter().filter(|(t, _, _)| t == topic) {
+            let Ok((input_idx, roles)) = stages.resolve(node, input) else {
+                continue;
+            };
+            for role in roles.wired() {
+                let key = cerulion_core::read_outcome::StageKey {
+                    node: node.clone(),
+                    input_idx,
+                    role,
+                };
+                if stages.stage_gateable(&key) != Some(true) || armed.iter().any(|s| s.key == key) {
+                    continue;
+                }
+                return Err(ReplayError::Internal {
+                    reason: format!(
+                        "rank {}: stage {} of topic {topic} is gated by this build's wiring \
+                         and no admission was armed on it, so the enforcement would report \
+                         coverage it does not have. This is a bug in the replay engine, \
+                         please report",
+                        plan.rank(),
+                        key.label()
+                    ),
+                });
+            }
+        }
+        if armed.is_empty() {
+            continue;
+        }
+        tracing::debug!(
+            rank = plan.rank(),
+            topic = %topic,
+            gated = armed.len(),
+            ungateable = ungateable.len(),
+            "replay: this topic's consuming stages will be GATED on their recorded reads"
+        );
+        admission.insert(topic.clone(), armed);
+    }
+    Ok((admission, admission_ungateable))
 }
 
 /// Read every node's DECLARED metadata out of the shared factory map, before
@@ -12319,109 +12441,56 @@ fn collect_pass_node_infos(
     (out, notes)
 }
 
-/// Drive ONE rank's runtime across ITS OWN recorded step slice.
-///
-/// This is the engine's one execution loop: a LOCKSTEP replay runs it once over
-/// a whole-graph plan (byte-identical to a whole-graph re-execution — see
-/// [`build_rank_plans`]), a FREE-RUN replay runs it once per recorded worker
-/// rank, sequentially, over the shared transport.
-///
-/// # What free-run changes, and why each change is forced
-///
-/// * **The clock is PLACED, per rank.** Each rank's boundary stream is
-///   wall-faithful and shares only the GO epoch, so the pass starts at its own
-///   `first_target_ns` — and re-phases every `Period` deadline in the same
-///   breath, because `Scheduler::add_node` baselines them against the clock AT
-///   BUILD TIME and moving the clock afterwards would unleash the catch-up loop.
-///   The placement can move the clock BACKWARD between passes (rank 1's epoch
-///   may sit below rank 0's), which is sound only because each pass builds a
-///   FRESH runtime whose schedule is re-phased against the placed value.
-/// * **Fires come from the TRACE.** A cross-process `block`
-///   producer's pre-fire gate reads occupancy nothing records, and per-rank
-///   clocks are non-comparable domains, so an independently re-derived schedule
-///   can legally differ from the recorded one under any legal interleave. The
-///   plan is installed per step; a step the plan does not describe fires
-///   NOTHING (never a fall-through to live deciding, which would fabricate
-///   fires the recording does not hold).
-/// * **The `block` pre-fire gate is DEMOTED**, for the same reason — it is a
-///   fire decider that reads cross-rank state. What replaces it as a check is
-///   the credit CONSERVATION assert below: loud on violation, never a verdict.
-/// * **The structural trace comparator does not run.** With fires driven from
-///   the trace, a positional compare against that same trace is tautological;
-///   what a free-run pass reports instead is the fires the recording holds that
-///   this run did NOT perform ([`GraphRuntime::unconsumed_replay_fires`]),
-///   which is a genuine fire-schedule divergence with a nameable cause.
-// The argument list is the pass's whole environment, and bundling it further
-// would only move the same names behind one more type: `PassInputs` already
-// carries everything the pass READS, and what is left is the four things it
-// MUTATES (the runtime, the fire tap, the shared warn set) plus the two `Arc`s
-// it hands to the transport layer. A struct of `&mut`s would borrow-conflict
-// with the accumulators the caller keeps live across passes.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-fn run_rank_pass(
-    mut pass: PassInputs<'_>,
-    runtime: &mut GraphRuntime,
-    clock: &Arc<VirtualClock>,
-    transport: &Arc<TransportManager>,
-    resume: Option<&ResumePlan>,
-    classes: &TopicClasses,
-    fire_tap: &mut Option<FireTap>,
-    warned_partial_discard: &mut std::collections::HashSet<Arc<str>>,
-) -> Result<PassOutcome, ReplayError> {
-    let plan = pass.plan;
-    let lockstep = pass.is_lockstep();
-
-    // ── clock placement ───────────────────────────────────────────────────
-    //
-    // LOCKSTEP from-start begins at clock 0 with build-time deadlines, exactly
-    // as it always has; a RESUMED pass of either mode was placed by
-    // `apply_resume` (the clock at the anchor, the resume step, the state) and
-    // by the pass loop's three-rung `Period` ladder. A FREE-RUN pass with no
-    // resume places the clock on this rank's own first recorded boundary and
-    // re-phases the `Period` schedule in the same breath; see the fn doc.
-    //
-    // The resumed free-run pass is deliberately NOT re-placed here even though
-    // the values agree (a one-rank recording's `first_target_ns` IS the resume
-    // anchor's clock and its `first_step` IS the first replay step): this
-    // arm's `restore_period_schedule` is rung (ii) ALONE, and running it after
-    // the ladder would overwrite rung (i), the framework section's own
-    // `next_fire_ns`, with the trace value, which is exactly the un-seeding
-    // the ladder exists to prevent.
-    if !lockstep {
-        if resume.is_none() {
-            clock.set(plan.first_target_ns());
-            let baselines = first_recorded_fire_times(pass.trace, pass.rank_tables)?;
-            runtime.restore_period_schedule(&baselines);
-            // A rank whose first recorded boundary is step `S` replays FROM ITS
-            // START at `S`, so its emitted trace records must carry the
-            // recording's step numbers rather than restarting from 0.
-            runtime.set_resume_step(plan.first_step());
-        }
-        // Demote the `block` pre-fire gate from a fire
-        // decider to an observation. ASKED FOR explicitly (never a default) —
-        // this is the one seam that could silently disable lossless
-        // backpressure on a real robot. Resumed or not: it is a property of
-        // the free-run contract, not of where the clock started.
-        runtime.set_block_gate_replay_bypass(true);
+/// One pass's [`PassVerification`], planned from the bag alone, before the
+/// pass's runtime is built. LOCKSTEP plans nothing (see
+/// [`PassVerification::inert`]).
+fn plan_pass_verification(
+    pass: &PassInputs<'_>,
+    topics: &PassTopics,
+) -> Result<PassVerification, ReplayError> {
+    if pass.is_lockstep() {
+        return Ok(PassVerification::inert());
     }
+    let plan = pass.plan;
+    let verification = prepare_pass_verification(
+        plan,
+        pass.trace,
+        pass.rank_tables,
+        pass.recorded_messages,
+        pass.config,
+        pass.node_infos,
+        &topics.inject_topics,
+        &topics.enforce_topics,
+        pass.roles_stamped,
+        pass.kind_width,
+        pass.catchup_onset,
+    )?;
+    Ok(verification)
+}
 
-    // ── 4. Consumer-first: create every capture subscriber +
-    //    injection publisher BEFORE the first step, so frame 0 is captured and
-    //    the first injected frame is on the wire when the graph's first step
-    //    drains.
-    //
-    //    Both sets are scoped to THIS pass. A capture belongs to the rank that
-    //    PRODUCES the topic; an injector to a rank that CONSUMES a topic it
-    //    does not produce — which under free-run includes the cross-rank edges
-    //    (cross-rank edges are served from the RECORDED
-    //    frames) and the external sources, re-keyed per CONSUMING rank because
-    //    `inject_up_to(target)` has no single "the target" once each rank has
-    //    its own clock.
-    //
-    //    Both lists are filtered out of the GRAPH-ordered class lists rather
-    //    than out of the plan's sorted sets, so a whole-graph (lockstep) plan
-    //    keeps the graph's own order exactly.
+/// The topic sets one pass works over, derived from its plan alone.
+struct PassTopics {
+    /// The graph-produced topics this rank produces, in graph order.
+    produced: Vec<String>,
+    /// The topics this rank consumes and another rank (or no graph node)
+    /// produces: what the pass injects from the bag.
+    inject_topics: Vec<String>,
+    /// The cross-rank topics this rank consumes. Empty under lockstep.
+    cross: BTreeSet<String>,
+    /// The topics this rank both produces and consumes, whose recorded reads
+    /// the gate admits.
+    enforce_topics: Vec<String>,
+}
+
+/// Derive [`PassTopics`] for `plan`.
+///
+/// Both injection sets are scoped to THIS pass. A capture belongs to the rank
+/// that PRODUCES the topic; an injector to a rank that CONSUMES a topic it does
+/// not produce, which under free-run includes the cross-rank edges and the
+/// external sources. Both lists are filtered out of the GRAPH-ordered class
+/// lists rather than out of the plan's sorted sets, so a whole-graph (lockstep)
+/// plan keeps the graph's own order exactly.
+fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool) -> PassTopics {
     let produced: Vec<String> = classes
         .produced
         .iter()
@@ -12470,10 +12539,121 @@ fn run_rank_pass(
     } else {
         rank_enforce_topics(plan, classes)
     };
-    // PLAN before opening the injectors — the steered schedule is
-    // what an injector is CONSTRUCTED with, and a topic that stood down must get
-    // the wall-window injector, not a steered one nobody could justify.
-    // LOCKSTEP plans nothing (see `PassVerification::inert`).
+    PassTopics {
+        produced,
+        inject_topics,
+        cross: cross.into_iter().map(str::to_string).collect(),
+        enforce_topics,
+    }
+}
+
+/// Drive ONE rank's runtime across ITS OWN recorded step slice.
+///
+/// This is the engine's one execution loop: a LOCKSTEP replay runs it once over
+/// a whole-graph plan (byte-identical to a whole-graph re-execution — see
+/// [`build_rank_plans`]), a FREE-RUN replay runs it once per recorded worker
+/// rank, sequentially, over the shared transport.
+///
+/// # What free-run changes, and why each change is forced
+///
+/// * **The clock is PLACED, per rank.** Each rank's boundary stream is
+///   wall-faithful and shares only the GO epoch, so the pass starts at its own
+///   `first_target_ns` — and re-phases every `Period` deadline in the same
+///   breath, because `Scheduler::add_node` baselines them against the clock AT
+///   BUILD TIME and moving the clock afterwards would unleash the catch-up loop.
+///   The placement can move the clock BACKWARD between passes (rank 1's epoch
+///   may sit below rank 0's), which is sound only because each pass builds a
+///   FRESH runtime whose schedule is re-phased against the placed value.
+/// * **Fires come from the TRACE.** A cross-process `block`
+///   producer's pre-fire gate reads occupancy nothing records, and per-rank
+///   clocks are non-comparable domains, so an independently re-derived schedule
+///   can legally differ from the recorded one under any legal interleave. The
+///   plan is installed per step; a step the plan does not describe fires
+///   NOTHING (never a fall-through to live deciding, which would fabricate
+///   fires the recording does not hold).
+/// * **The `block` pre-fire gate is DEMOTED**, for the same reason — it is a
+///   fire decider that reads cross-rank state. What replaces it as a check is
+///   the credit CONSERVATION assert below: loud on violation, never a verdict.
+/// * **The structural trace comparator does not run.** With fires driven from
+///   the trace, a positional compare against that same trace is tautological;
+///   what a free-run pass reports instead is the fires the recording holds that
+///   this run did NOT perform ([`GraphRuntime::unconsumed_replay_fires`]),
+///   which is a genuine fire-schedule divergence with a nameable cause.
+// The argument list is the pass's whole environment, and bundling it further
+// would only move the same names behind one more type: `PassInputs` already
+// carries everything the pass READS, `PassTopics` and `PassVerification` what
+// the pass loop derived from them before the build, and what is left is the
+// three things it MUTATES (the runtime, the fire tap, the shared warn set) plus
+// the two `Arc`s it hands to the transport layer. A struct of `&mut`s would borrow-conflict
+// with the accumulators the caller keeps live across passes.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn run_rank_pass(
+    mut pass: PassInputs<'_>,
+    topics: PassTopics,
+    mut verification: PassVerification,
+    runtime: &mut GraphRuntime,
+    clock: &Arc<VirtualClock>,
+    transport: &Arc<TransportManager>,
+    resume: Option<&ResumePlan>,
+    fire_tap: &mut Option<FireTap>,
+    warned_partial_discard: &mut std::collections::HashSet<Arc<str>>,
+) -> Result<PassOutcome, ReplayError> {
+    let plan = pass.plan;
+    let lockstep = pass.is_lockstep();
+
+    // ── clock placement ───────────────────────────────────────────────────
+    //
+    // LOCKSTEP from-start begins at clock 0 with build-time deadlines, exactly
+    // as it always has; a RESUMED pass of either mode was placed by
+    // `apply_resume` (the clock at the anchor, the resume step, the state) and
+    // by the pass loop's three-rung `Period` ladder. A FREE-RUN pass with no
+    // resume places the clock on this rank's own first recorded boundary and
+    // re-phases the `Period` schedule in the same breath; see the fn doc.
+    //
+    // The resumed free-run pass is deliberately NOT re-placed here even though
+    // the values agree (a one-rank recording's `first_target_ns` IS the resume
+    // anchor's clock and its `first_step` IS the first replay step): this
+    // arm's `restore_period_schedule` is rung (ii) ALONE, and running it after
+    // the ladder would overwrite rung (i), the framework section's own
+    // `next_fire_ns`, with the trace value, which is exactly the un-seeding
+    // the ladder exists to prevent.
+    if !lockstep {
+        if resume.is_none() {
+            clock.set(plan.first_target_ns());
+            let baselines = first_recorded_fire_times(pass.trace, pass.rank_tables)?;
+            runtime.restore_period_schedule(&baselines);
+            // A rank whose first recorded boundary is step `S` replays FROM ITS
+            // START at `S`, so its emitted trace records must carry the
+            // recording's step numbers rather than restarting from 0.
+            runtime.set_resume_step(plan.first_step());
+        }
+        // Demote the `block` pre-fire gate from a fire
+        // decider to an observation. ASKED FOR explicitly (never a default) —
+        // this is the one seam that could silently disable lossless
+        // backpressure on a real robot. Resumed or not: it is a property of
+        // the free-run contract, not of where the clock started.
+        runtime.set_block_gate_replay_bypass(true);
+    }
+
+    // ── 4. Consumer-first: create every capture subscriber +
+    //    injection publisher BEFORE the first step, so frame 0 is captured and
+    //    the first injected frame is on the wire when the graph's first step
+    //    drains. The topic sets are `pass_topics`'s; the injectors are re-keyed
+    //    per CONSUMING rank because `inject_up_to(target)` has no single "the
+    //    target" once each rank has its own clock.
+    let PassTopics {
+        produced,
+        inject_topics,
+        cross: cross_rank_topics,
+        enforce_topics,
+    } = topics;
+    let cross: BTreeSet<&str> = cross_rank_topics.iter().map(String::as_str).collect();
+    // The steered schedule was PLANNED before this runtime was built
+    // (`plan_pass_verification`, called by the pass loop), because it decides
+    // how deep a bag-fed input's subscriber is built; it is what an injector is
+    // CONSTRUCTED with, and a topic that stood down gets the wall-window
+    // injector. LOCKSTEP plans nothing (see `PassVerification::inert`).
     // The rule every gate of this pass arms under, read off the bag's trace
     // format: a format 7 recording holds a record at every consult, so a
     // consult the plan has no position for is a schedule the recording did not
@@ -12484,25 +12664,22 @@ fn run_rank_pass(
     } else {
         cerulion_core::read_outcome::ConsultRule::Counted
     };
-    let mut verification = if lockstep {
-        PassVerification::inert()
-    } else {
-        prepare_pass_verification(
+    // The admission half needs this runtime's stage census, the ONE authority
+    // on which stages exist and which the gate may hold back
+    // (`replay_read_enforceable`).
+    if let Some(pending) = verification.pending_admission.take() {
+        let (admission, ungateable) = plan_pass_admission(
+            pending,
             plan,
-            pass.trace,
-            pass.rank_tables,
-            pass.recorded_messages,
             pass.config,
             pass.node_infos,
-            &inject_topics,
             &enforce_topics,
             &runtime.replay_read_enforceable_under(consult_rule),
             pass.bag_side.get(&plan.rank()),
-            pass.roles_stamped,
-            pass.kind_width,
-            pass.catchup_onset,
-        )?
-    };
+        )?;
+        verification.admission = admission;
+        verification.admission_ungateable = ungateable;
+    }
     // ARM the read gate, once, before step 0 and after the census.
     //
     // An unarmed stage is UNGATED for the whole run and takes today's drain byte
@@ -14760,6 +14937,61 @@ pub fn burst_provisioning(
         );
     }
     floors
+}
+
+/// The deepest queue a replay pass builds for a bag-fed input on `topic`: the
+/// shared multi-publisher buffer ceiling on a `multi_publisher_topics` topic
+/// (every graph opening it must agree on that ceiling), and the deepest depth
+/// an input may declare on any other. Every publisher pool on the topic is
+/// sized from its buffer ceiling, one `max_slice_len` slot per unit, so the
+/// raise stays within the depths a declared graph can already ask for.
+fn replay_provisionable_depth(config: &GraphConfig, topic: &str) -> Option<u32> {
+    if depth_stand_down_mutant() {
+        return None;
+    }
+    let ceiling = if config.is_multi_publisher(topic) {
+        cerulion_core::transport::MULTI_TOPIC_BUFFER_CEILING
+    } else {
+        cerulion_core::graph::topology::MAX_CONSUMER_DEPTH
+    };
+    u32::try_from(ceiling).ok()
+}
+
+/// MUTANT, behind `oracle-mutants`: with `CERULION_REPLAY_DEPTH_STAND_DOWN_MUTANT`
+/// set, no bag-fed input can be built deeper than it declares, so a steered
+/// schedule over the declared depth stands down to the recorded-clock window.
+#[cfg(feature = "oracle-mutants")]
+fn depth_stand_down_mutant() -> bool {
+    std::env::var_os("CERULION_REPLAY_DEPTH_STAND_DOWN_MUTANT").is_some()
+}
+
+/// Without `oracle-mutants` the mutant cannot be armed.
+#[cfg(not(feature = "oracle-mutants"))]
+const fn depth_stand_down_mutant() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod provisionable_depth_tests {
+    use super::replay_provisionable_depth;
+
+    /// The bound is the shared ceiling on a listed multi-publisher topic and
+    /// the declared-depth maximum on any other.
+    #[test]
+    fn the_bound_is_the_multi_publisher_ceiling_on_a_listed_topic_and_the_depth_cap_elsewhere() {
+        let config = cerulion_core::graph::parse_graph(
+            "name: pd\nprefix: pd\nmulti_publisher_topics:\n  - /pd/shared\nnodes: []\n",
+        )
+        .expect("the graph parses");
+        assert_eq!(
+            replay_provisionable_depth(&config, "/pd/shared"),
+            Some(cerulion_core::transport::MULTI_TOPIC_BUFFER_CEILING as u32)
+        );
+        assert_eq!(
+            replay_provisionable_depth(&config, "/pd/other"),
+            Some(cerulion_core::graph::topology::MAX_CONSUMER_DEPTH as u32)
+        );
+    }
 }
 
 // ===========================================================================
@@ -29350,6 +29582,7 @@ mod label_consequence_tests {
             uncovered: Vec::new(),
             unconsumed: Vec::new(),
             local_frames: Vec::new(),
+            depth_raises: Vec::new(),
         })
     }
 

@@ -76,7 +76,12 @@
 //!   `sequence` is per-publisher and names no frame on its own;
 //! - a read log that accounts for more frames than the bag recorded, or whose
 //!   served sequence disagrees with the frame its own `popped` sum lands on;
-//! - a [`ConsumeMode::Latest`] read the earliest-wins schedule cannot reproduce.
+//! - a [`ConsumeMode::Latest`] read the earliest-wins schedule cannot reproduce;
+//! - a connection the schedule fills past the deepest queue the caller can
+//!   build ([`StandDownReason::QueueOverflow`]). Below that bound an injected
+//!   connection over its declared depth is not a refusal: the schedule names
+//!   the depth it needs ([`InjectionSchedule::depth_raises`]) and the caller
+//!   builds the subscriber that deep.
 //!
 //! # A NAMED RESIDUAL: the promote-serve slot state
 //!
@@ -471,6 +476,19 @@ pub struct ConsumerEdge {
     /// With a depth in hand that is a detected [`StandDownReason::QueueOverflow`];
     /// without one it is an unmodelled residual.
     pub depth: Option<u32>,
+    /// The deepest queue the caller can build for this edge's subscriber, or
+    /// `None` when the declared [`Self::depth`] is the only depth it can build.
+    ///
+    /// A live consumer can pop more frames in one step than its declared depth:
+    /// frames that arrive WHILE it fires are pulled by the refill between fires,
+    /// so the queue never held them all at once. Earliest-wins places every frame
+    /// a step consumed before that step, so the injected connection holds them
+    /// all at once. When that occupancy is at most this bound the plan steers and
+    /// names the depth the subscriber needs ([`InjectionSchedule::depth_raises`]);
+    /// above it the plan stands down with [`StandDownReason::QueueOverflow`]
+    /// against this bound. A LOCAL producer's live connection is judged against
+    /// the declared depth, because its frames are published live during the step.
+    pub provisionable_depth: Option<u32>,
     /// The recorded kind-6 stream, in record order, annotations included.
     pub reads: Vec<RecordedRead>,
 }
@@ -664,6 +682,24 @@ pub struct InjectionSchedule {
     /// EMPTY whenever [`LocalProducers`] is, which is every topic the shipped
     /// rank split injects.
     pub local_frames: Vec<DueFrame>,
+    /// The covered edges whose injected connection this schedule fills past the
+    /// declared depth, one entry per edge, in edge order. The caller must build
+    /// each one's subscriber at least [`DepthRaise::required`] deep before the
+    /// first injection, or `drop_oldest` evicts a frame the recording delivered.
+    pub depth_raises: Vec<DepthRaise>,
+}
+
+/// One edge whose subscriber the schedule needs deeper than its declared depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthRaise {
+    /// The edge.
+    pub edge: EdgeId,
+    /// The declared depth.
+    pub declared: u32,
+    /// The most frames the injected connection holds at any read of the run.
+    pub required: u32,
+    /// The first step at which it holds [`Self::required`].
+    pub peak_step: u64,
 }
 
 /// Which of a topic's recorded producers ran on the RANK BEING
@@ -863,16 +899,22 @@ pub enum StandDownReason {
         /// Frames the recording says the read consumed.
         recorded_popped: u32,
     },
-    /// The schedule drives an edge's queue past its provisioned depth, so
-    /// `drop_oldest` would evict a frame the recording delivered.
+    /// The schedule drives one connection of an edge's queue past the deepest
+    /// queue the caller can build, so `drop_oldest` would evict a frame the
+    /// recording delivered.
+    ///
+    /// Two shapes reach it: a LOCAL producer's live connection over the declared
+    /// depth, and the injected connection over
+    /// [`ConsumerEdge::provisionable_depth`] (the declared depth when the caller
+    /// can build no deeper queue).
     QueueOverflow {
         /// The edge.
         edge: EdgeId,
         /// The step at which the queue would be over-deep.
         step: u64,
-        /// Frames the schedule leaves pending.
+        /// Frames the schedule leaves pending on the over-deep connection.
         pending: usize,
-        /// The provisioned depth.
+        /// The depth that connection cannot exceed.
         depth: u32,
     },
 }
@@ -1122,6 +1164,7 @@ struct EdgePlan {
     id: EdgeId,
     mode: ConsumeMode,
     depth: Option<u32>,
+    provisionable_depth: Option<u32>,
     reads: Vec<PlannedRead>,
 }
 
@@ -1240,12 +1283,15 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
         }
     }
 
-    if let Err(reason) = verify_fan_out(&covered, &earliest, topic, local) {
-        return TopicPlan::StandDown(StandDown {
-            topic: topic.topic.clone(),
-            reason,
-        });
-    }
+    let depth_raises = match verify_fan_out(&covered, &earliest, topic, local) {
+        Ok(raises) => raises,
+        Err(reason) => {
+            return TopicPlan::StandDown(StandDown {
+                topic: topic.topic.clone(),
+                reason,
+            })
+        }
+    };
 
     // The LABEL-PARTITIONED walk. One pass over the frame stream
     // in FILE order, placing each frame by what produced it.
@@ -1310,6 +1356,7 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
         uncovered,
         unconsumed,
         local_frames,
+        depth_raises,
     })
 }
 
@@ -1456,6 +1503,7 @@ fn fold_edge(edge: &ConsumerEdge, topic: &TopicReplay) -> Result<EdgeFold, Stand
         id: edge.id.clone(),
         mode: edge.mode,
         depth: edge.depth,
+        provisionable_depth: edge.provisionable_depth,
         reads,
     }))
 }
@@ -1504,13 +1552,22 @@ fn verify_producer(
 /// is a claim about the queue's DEPTH and the schedule has to honour it. Both
 /// modes are therefore checked; what differs is WHICH frame the replayed drain
 /// would serve — the newest pending for `Latest`, the head for `EachFifo`.
+///
+/// It also answers the depth each covered edge's injected connection needs:
+/// the most frames that connection holds at any read of the run, returned as a
+/// [`DepthRaise`] wherever it exceeds the declared depth and fits
+/// [`ConsumerEdge::provisionable_depth`].
 fn verify_fan_out(
     covered: &[EdgePlan],
     earliest: &[Option<u64>],
     topic: &TopicReplay,
     local: &LocalProducers,
-) -> Result<(), StandDownReason> {
+) -> Result<Vec<DepthRaise>, StandDownReason> {
+    let mut raises = Vec::new();
     for plan in covered {
+        // The deepest injected occupancy this edge reaches, and the first step
+        // it is reached at.
+        let mut peak: Option<(usize, u64)> = None;
         let mut cursor = 0usize;
         for read in &plan.reads {
             // `earliest` is non-decreasing over its `Some` prefix (see
@@ -1529,14 +1586,33 @@ fn verify_fan_out(
             let pending = occupancy.total();
 
             if let Some(depth) = plan.depth {
-                let worst_connection = occupancy.max_connection();
-                if worst_connection > depth as usize {
+                // A LOCAL producer publishes live during the replayed step, so
+                // its connection keeps the declared depth.
+                let worst_local = occupancy.max_local();
+                if worst_local > depth as usize {
                     return Err(StandDownReason::QueueOverflow {
                         edge: plan.id.clone(),
                         step: read.step,
-                        pending: worst_connection,
+                        pending: worst_local,
                         depth,
                     });
+                }
+                // The injector places every frame this step consumed before the
+                // step, so its connection holds them all at once: provisioned
+                // up to the bound, refused past it.
+                if occupancy.injected > depth as usize {
+                    let bound = plan.provisionable_depth.unwrap_or(depth).max(depth);
+                    if occupancy.injected > bound as usize {
+                        return Err(StandDownReason::QueueOverflow {
+                            edge: plan.id.clone(),
+                            step: read.step,
+                            pending: occupancy.injected,
+                            depth: bound,
+                        });
+                    }
+                    if peak.is_none_or(|(held, _)| occupancy.injected > held) {
+                        peak = Some((occupancy.injected, read.step));
+                    }
                 }
             }
 
@@ -1610,24 +1686,33 @@ fn verify_fan_out(
             }
             cursor = read.end;
         }
+        if let (Some((held, peak_step)), Some(declared)) = (peak, plan.depth) {
+            raises.push(DepthRaise {
+                edge: plan.id.clone(),
+                declared,
+                // At most the bound, which is a `u32`, by the refusal above.
+                required: u32::try_from(held).unwrap_or(u32::MAX),
+                peak_step,
+            });
+        }
     }
-    Ok(())
+    Ok(raises)
 }
 
 /// Per-connection occupancy of a queue's PENDING span.
 ///
 /// iceoryx2 applies subscriber capacity PER PUBLISHER CONNECTION, not as one
 /// shared pool a topic's writers jointly deepen: `drop_oldest` eviction is a
-/// property of ONE publisher's own backlog against the subscriber's declared
+/// property of ONE publisher's own backlog against the subscriber's buffer
 /// depth. So a co-located topic's LOCAL producer node(s) and the INJECTOR
 /// (which carries every frame this rank's own [`LocalProducers`] table does
 /// not attribute — every frame another rank, or an out-of-graph publisher,
-/// produced) are each their OWN connection, each independently capped at the
-/// edge's depth — never summed into one pool, which a two-term
+/// produced) are each their OWN connection, each independently capped at that
+/// depth, never summed into one pool, which a two-term
 /// return would invite the caller to do.
 ///
-/// Empty (every count zero) whenever `local` is empty, which is every topic
-/// the shipped rank split injects.
+/// `by_local_node` is empty whenever `local` is, which is every topic the
+/// shipped rank split injects.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConnectionOccupancy {
     /// Local producer node id → frames pending on ITS OWN connection.
@@ -1642,27 +1727,23 @@ impl ConnectionOccupancy {
     /// ([`StandDownReason::FanOutInfeasible`]'s `pending` field, which
     /// explains a fan-out MISMATCH rather than asserting an eviction), never
     /// for deciding [`StandDownReason::QueueOverflow`] (see
-    /// [`Self::max_connection`]).
+    /// [`Self::max_local`]).
     fn total(&self) -> usize {
         self.injected + self.by_local_node.values().sum::<usize>()
     }
 
-    /// The DEEPEST single connection — the quantity `drop_oldest` actually
-    /// enforces eviction against, and the ONLY one a [`QueueOverflow`]
-    /// refusal may convict on. A topic whose local producer(s) and the
-    /// injector each sit within the declared depth never evicts, even when
-    /// their SUM exceeds it — summing is the defect this pins: it
-    /// stood a valid co-located topic down as `QueueOverflow`
-    /// on a depth every real connection actually satisfied.
+    /// The DEEPEST single LOCAL connection. `drop_oldest` enforces eviction per
+    /// connection, so a [`QueueOverflow`] refusal convicts on one connection
+    /// at a time, never on the sum: a topic whose local producer(s) and the
+    /// injector each sit within their depth never evicts, even when their SUM
+    /// exceeds it. Summing stood a valid co-located topic down as
+    /// `QueueOverflow` on a depth every real connection satisfied. The
+    /// injector's connection ([`Self::injected`]) is judged on its own,
+    /// against the depth the caller can provision it to.
     ///
     /// [`QueueOverflow`]: StandDownReason::QueueOverflow
-    fn max_connection(&self) -> usize {
-        self.by_local_node
-            .values()
-            .copied()
-            .chain(std::iter::once(self.injected))
-            .max()
-            .unwrap_or(0)
+    fn max_local(&self) -> usize {
+        self.by_local_node.values().copied().max().unwrap_or(0)
     }
 }
 
@@ -2848,6 +2929,7 @@ mod tests {
             id,
             mode,
             depth: None,
+            provisionable_depth: None,
             reads,
         }
     }
@@ -3766,6 +3848,116 @@ mod tests {
         assert_eq!(shape(&s), vec![(1, vec![1, 2, 3])]);
     }
 
+    /// The live shape: a consumer whose ONE step popped more frames than its
+    /// declared depth, because the refill between its fires pulled frames that
+    /// arrived during the step. Earliest-wins injects all six before step 0, so
+    /// the injected connection holds six against a declared four. With a deeper
+    /// queue buildable, the plan steers the same schedule and names the depth.
+    #[test]
+    fn a_step_that_popped_past_its_declared_depth_steers_and_names_the_depth_it_needs() {
+        let mut relay = edge(
+            edge_id("relay", "inp"),
+            ConsumeMode::EachFifo,
+            (0..6)
+                .map(|s| served(0, s, 1))
+                .chain([served(1, 6, 1)])
+                .collect(),
+        );
+        relay.depth = Some(4);
+        relay.provisionable_depth = Some(64);
+        let t = topic(false, frames(&[0, 1, 2, 3, 4, 5, 6]), vec![relay]);
+
+        let s = expect_steered(plan_no_local(&t));
+
+        assert_eq!(
+            shape(&s),
+            vec![(0, vec![0, 1, 2, 3, 4, 5]), (1, vec![6])],
+            "the raise changes no frame's placement"
+        );
+        assert_eq!(
+            s.depth_raises,
+            vec![DepthRaise {
+                edge: edge_id("relay", "inp"),
+                declared: 4,
+                required: 6,
+                peak_step: 0,
+            }]
+        );
+    }
+
+    /// The fan-out twin of the stand-down arm above: the same `shallow` edge,
+    /// with a deeper queue buildable, steers and needs exactly the occupancy
+    /// that arm refused on, while `fast` (no declared depth) needs nothing.
+    #[test]
+    fn an_injected_connection_over_its_declared_depth_is_provisioned_not_refused() {
+        let build = |declared: u32, provisionable: Option<u32>| {
+            let fast = edge(
+                edge_id("fast", "in"),
+                ConsumeMode::EachFifo,
+                vec![served(1, 1, 1), served(1, 2, 1), served(1, 3, 1)],
+            );
+            let mut shallow = edge(
+                edge_id("shallow", "in"),
+                ConsumeMode::EachFifo,
+                vec![served(4, 1, 1), served(5, 2, 1), served(6, 3, 1)],
+            );
+            shallow.depth = Some(declared);
+            shallow.provisionable_depth = provisionable;
+            topic(false, frames(&[1, 2, 3]), vec![fast, shallow])
+        };
+
+        let s = expect_steered(plan_no_local(&build(2, Some(8))));
+        assert_eq!(shape(&s), vec![(1, vec![1, 2, 3])]);
+        assert_eq!(
+            s.depth_raises,
+            vec![DepthRaise {
+                edge: edge_id("shallow", "in"),
+                declared: 2,
+                required: 3,
+                peak_step: 4,
+            }]
+        );
+
+        // At the bound: still provisioned.
+        let s = expect_steered(plan_no_local(&build(2, Some(3))));
+        assert_eq!(s.depth_raises.len(), 1);
+
+        // Within the declared depth: nothing to raise.
+        let s = expect_steered(plan_no_local(&build(3, Some(8))));
+        assert_eq!(s.depth_raises, Vec::new());
+    }
+
+    /// Past the deepest buildable queue the plan still stands down, and the
+    /// refusal names that bound rather than the declared depth.
+    #[test]
+    fn an_injected_connection_past_the_provisionable_depth_stands_down_against_that_bound() {
+        let fast = edge(
+            edge_id("fast", "in"),
+            ConsumeMode::EachFifo,
+            vec![served(1, 1, 1), served(1, 2, 1), served(1, 3, 1)],
+        );
+        let mut shallow = edge(
+            edge_id("shallow", "in"),
+            ConsumeMode::EachFifo,
+            vec![served(4, 1, 1), served(5, 2, 1), served(6, 3, 1)],
+        );
+        shallow.depth = Some(1);
+        shallow.provisionable_depth = Some(2);
+        let t = topic(false, frames(&[1, 2, 3]), vec![fast, shallow]);
+
+        let sd = expect_stand_down(plan_no_local(&t));
+
+        assert_eq!(
+            sd.reason,
+            StandDownReason::QueueOverflow {
+                edge: edge_id("shallow", "in"),
+                step: 4,
+                pending: 3,
+                depth: 2,
+            }
+        );
+    }
+
     /// A producer annotation belongs to exactly the read that FOLLOWS it. A
     /// stream where an annotation is followed by a non-serving read must not
     /// leak that token onto the next serving read.
@@ -4308,6 +4500,7 @@ mod tests {
                     id: edge_id("sink", "in"),
                     mode: ConsumeMode::Latest,
                     depth: Some(depth),
+                    provisionable_depth: None,
                     reads: vec![producer_note(5, "peer/out"), batch(5, 7, 3)],
                 }],
             )
@@ -4348,6 +4541,9 @@ mod tests {
                 id: edge_id("sink", "in"),
                 mode: ConsumeMode::Latest,
                 depth: Some(2),
+                // A deeper queue is buildable, and still the LOCAL connection
+                // is refused: its frames are published live, not injected.
+                provisionable_depth: Some(64),
                 reads: vec![producer_note(5, "peer/out"), batch(5, 7, 4)],
             }],
         );

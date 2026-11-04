@@ -95,8 +95,11 @@ pub struct RetiredGeneration {
 }
 
 /// A team's trust anchors at one generation: the current issuing CA, the
-/// retired generations the bundle still carries, and the leaf of
-/// every robot in the team.
+/// issuing CA of generation `generation + 1`, the retired generations the
+/// bundle still carries, and the leaf of every robot in the team.
+/// [`verify_team_trust_bundle`] checks that the next CA names the bundle's team
+/// and the generation after the current one, so a bundle at generation
+/// `u32::MAX` never verifies.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct TeamTrustBundle {
     /// Format version.
@@ -111,6 +114,8 @@ pub struct TeamTrustBundle {
     pub issued_at_ns: u64,
     /// The current issuing CA certificate, DER.
     pub issuing_ca_der: Vec<u8>,
+    /// The issuing CA certificate of generation `generation + 1`, DER.
+    pub next_ca_der: Vec<u8>,
     /// Retired generations, strictly descending by generation, each below
     /// `generation`.
     pub retired: Vec<RetiredGeneration>,
@@ -130,6 +135,7 @@ impl SignedPayload for TeamTrustBundle {
             .fixed(&self.generation.to_le_bytes())
             .u64(self.issued_at_ns)
             .bytes(&self.issuing_ca_der)
+            .bytes(&self.next_ca_der)
             .count(self.retired.len());
         for r in &self.retired {
             w.fixed(&r.generation.to_le_bytes()).bytes(&r.ca_der);
@@ -172,9 +178,9 @@ impl TeamTrustBundle {
 }
 
 /// Verify a trust bundle: the intermediate against `root_set`, the bundle
-/// signature, its issuance time, the current and retired CA certificates
-/// (team and generation must match their slot), and every robot leaf (role
-/// robot, issued by the current CA).
+/// signature, its issuance time, the current, next and retired CA
+/// certificates (team and generation must match their slot), and every robot
+/// leaf (role robot, issued by the current CA).
 pub fn verify_team_trust_bundle(
     root_set: &RootSet,
     signed: &SignedTeamTrustBundle,
@@ -195,6 +201,12 @@ pub fn verify_team_trust_bundle(
     let current = check_team_ca(&b.issuing_ca_der)?;
     if current.team != b.team_short || current.generation != b.generation {
         return Err(invalid("the issuing CA names another team or generation"));
+    }
+    let next = check_team_ca(&b.next_ca_der)?;
+    if next.team != b.team_short || Some(next.generation) != b.generation.checked_add(1) {
+        return Err(invalid(
+            "the next CA must name the same team and the generation after the current one",
+        ));
     }
     let mut below = b.generation;
     for r in &b.retired {

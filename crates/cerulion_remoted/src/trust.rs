@@ -47,7 +47,8 @@ use cerulion_pairing::format::{
 };
 use cerulion_pairing::pake::CpaceConfirmed;
 use cerulion_pairing::verify::{
-    EpochOutcome, OwnerGrantPresentation, PairingPresentation, TrustStore,
+    AccessRow, EpochOutcome, OwnerCertificatePresentationWire, OwnerGrantPresentation,
+    PairingPresentation, TrustStore,
 };
 use cerulion_pairing::PairingError;
 
@@ -74,6 +75,10 @@ pub enum KeyAccess {
     DeviceRevoked,
     /// The key maps to an account currently on the access list; the granted scope.
     Allowed(Scope),
+    /// The key's row is a cloud row and this robot's allow-from-cloud switch is
+    /// OFF ([`TrustStore::cloud_allowed`]). Refused on every plane and for every
+    /// verb, bootstrap verbs included.
+    CloudRefused,
 }
 
 /// A mutation of the shared trust state failed.
@@ -220,6 +225,29 @@ impl SharedTrust {
     /// [`KeyAccess::NotAllowed`] — the accept gate denies it without an explicit
     /// revoke.
     pub fn snapshot_for_key(&self, device_key: &[u8; 32]) -> (bool, KeyAccess) {
+        let (claimed, access, ()) = self.read_key(device_key, |_| ());
+        (claimed, access)
+    }
+
+    /// [`SharedTrust::snapshot_for_key`] plus, when the key is
+    /// [`KeyAccess::Allowed`], a copy of the access row that allows it (its
+    /// account, device, scope and principal kind), all from the same locked read.
+    pub fn snapshot_row_for_key(
+        &self,
+        device_key: &[u8; 32],
+    ) -> (bool, KeyAccess, Option<AccessRow>) {
+        self.read_key(device_key, |row| row.cloned())
+    }
+
+    /// The one locked read behind both snapshots: `(claimed, access)` and
+    /// `on_row` applied to the allowing access row (`None` unless allowed). A
+    /// cloud row on a robot whose allow-from-cloud switch is OFF reads
+    /// [`KeyAccess::CloudRefused`] with no row ([`TrustStore::cloud_allowed`]).
+    fn read_key<T>(
+        &self,
+        device_key: &[u8; 32],
+        on_row: impl FnOnce(Option<&AccessRow>) -> T,
+    ) -> (bool, KeyAccess, T) {
         // Read the trusted time OUTSIDE the store lock (the wall clock is a syscall).
         let now_ns = self.clock.now_ns();
         let key = PublicKey(*device_key);
@@ -229,18 +257,20 @@ impl SharedTrust {
         // account row (the account's other devices stay allowed). Checked FIRST so a
         // revoked device is cut even while its account is fine, and so the
         // mid-session sweep evicts it the moment a synced epoch flips this bit.
-        let access = if guard.store.is_device_revoked(&key) {
-            KeyAccess::DeviceRevoked
+        let (access, row) = if guard.store.is_device_revoked(&key) {
+            (KeyAccess::DeviceRevoked, None)
         } else {
             match guard.index.account_for(&key) {
-                None => KeyAccess::Unpaired,
-                Some(account) => match guard.store.is_allowed(&account, now_ns) {
-                    None => KeyAccess::NotAllowed,
-                    Some(row) => KeyAccess::Allowed(row.scope),
+                None => (KeyAccess::Unpaired, None),
+                Some(account) => match guard.store.is_allowed(&account, &key, now_ns) {
+                    None => (KeyAccess::NotAllowed, None),
+                    Some(row) if !guard.store.cloud_allowed(row) => (KeyAccess::CloudRefused, None),
+                    Some(row) => (KeyAccess::Allowed(row.scope), Some(row)),
                 },
             }
         };
-        (claimed, access)
+        let mapped = on_row(row);
+        (claimed, access, mapped)
     }
 
     /// The robot's own transport key (its iroh `EndpointId`), recorded at
@@ -294,6 +324,67 @@ impl SharedTrust {
         let account = verified.account();
         self.commit(guard, authenticated_peer_key, account)?;
         Ok(account)
+    }
+
+    /// Certificate presentation: admit a certified device of the current owner
+    /// with its own access row, never rewriting the owner row. The verified
+    /// binding is published only after store and index persist.
+    pub fn verify_owner_certificate_and_establish(
+        &self,
+        presentation: &OwnerCertificatePresentationWire,
+        authenticated_peer_key: &[u8; 32],
+        now_ns: u64,
+    ) -> Result<AccountId, TrustError> {
+        let peer = PublicKey(*authenticated_peer_key);
+        let _writer = self.writer_lock();
+        let mut guard = self.lock();
+        let account = guard
+            .store
+            .verify_owner_certificate(presentation, &peer, now_ns)?;
+        self.commit(guard, authenticated_peer_key, account)?;
+        Ok(account)
+    }
+
+    /// Set the robot's allow-from-cloud switch for the caller `device_key`, which
+    /// must be bound to the OWNER account through a row whose principal is not
+    /// cloud. The new value is written to disk first and published to the live
+    /// store only after the write succeeds; on a write failure the live switch
+    /// keeps its old value.
+    pub fn set_allow_cloud(&self, device_key: &[u8; 32], allow: bool) -> Result<(), TrustError> {
+        let key = PublicKey(*device_key);
+        let now_ns = self.clock.now_ns();
+        let _writer = self.writer_lock();
+        let guard = self.lock();
+        if guard.store.is_device_revoked(&key) {
+            return Err(TrustError::Pairing(PairingError::NotOwner));
+        }
+        let account = guard
+            .index
+            .account_for(&key)
+            .ok_or(TrustError::Pairing(PairingError::NotOwner))?;
+        let row = guard
+            .store
+            .is_allowed(&account, &key, now_ns)
+            .ok_or(TrustError::Pairing(PairingError::NotOwner))?;
+        if row.principal_kind == cerulion_pairing::format::PrincipalKind::Cloud {
+            return Err(TrustError::Pairing(PairingError::NotOwner));
+        }
+        let mut staged = guard.store.clone();
+        staged.set_allow_cloud(&account, allow)?;
+        drop(guard);
+        if !self.mac_key.is_empty() {
+            staged
+                .save(&self.mac_key)
+                .map_err(|e| TrustError::Persist(format!("trust store (allow-from-cloud): {e}")))?;
+        }
+        // The writer lock is still held, so no other mutation ran in between.
+        self.lock().store.set_allow_cloud(&account, allow)?;
+        Ok(())
+    }
+
+    /// The robot's allow-from-cloud switch.
+    pub fn allow_cloud(&self) -> bool {
+        self.lock().store.allow_cloud()
     }
 
     /// Verify a desk-carried, owner-signed [`OwnerGrantPresentation`] OFFLINE against
@@ -594,6 +685,134 @@ mod tests {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    fn owner_certificate(key: [u8; 32]) -> OwnerCertificatePresentationWire {
+        let chain = pair_chain(OWNER, key, Scope::OWNER_FULL);
+        OwnerCertificatePresentationWire::new(chain.intermediate, chain.device_cert)
+    }
+
+    #[test]
+    fn owner_certificate_adds_durable_binding_without_changing_owner_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let owner_row = postcard::to_stdvec(shared.lock().store.access_rows()).unwrap();
+        assert_eq!(shared.lock().store.access_rows().len(), 1);
+        let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
+        assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+        assert_eq!(
+            shared
+                .verify_owner_certificate_and_establish(&owner_certificate(key), &key, T_NOW + 1)
+                .unwrap(),
+            OWNER
+        );
+        assert_eq!(
+            shared.snapshot_for_key(&key).1,
+            KeyAccess::Allowed(Scope::OWNER_FULL)
+        );
+        // The owner row is byte-for-byte unchanged and the device row follows it.
+        let check = |shared: &SharedTrust| {
+            let guard = shared.lock();
+            let rows = guard.store.access_rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(postcard::to_stdvec(&rows[..1]).unwrap(), owner_row);
+            assert_eq!(rows[1].account, OWNER);
+            assert_eq!(rows[1].device, Some(PublicKey(key)));
+            assert_eq!(rows[1].scope, Scope::OWNER_FULL);
+            assert_eq!(rows[1].principal_kind, PrincipalKind::Human);
+            assert_eq!(rows[1].source, PairingSource::CertificatePresentation);
+        };
+        check(&shared);
+        let loaded = reload(
+            &dir.path().join("trust_store"),
+            &dir.path().join("device_index.json"),
+        );
+        assert_eq!(
+            loaded.snapshot_for_key(&key).1,
+            KeyAccess::Allowed(Scope::OWNER_FULL)
+        );
+        check(&loaded);
+        assert_eq!(loaded.lock().store.high_water_ns(), T_NOW + 1);
+    }
+
+    #[test]
+    fn owner_certificate_store_and_index_failures_never_publish_new_binding() {
+        for fail_store in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let shared = provision(dir.path());
+            shared
+                .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+                .unwrap();
+            // A directory at the saved file's own path makes the rename onto it
+            // fail, independent of the uid and of the temp name the save picks. The
+            // real file is set aside first and restored before the reload.
+            let blocked = dir.path().join(if fail_store {
+                "trust_store"
+            } else {
+                "device_index.json"
+            });
+            let aside = dir.path().join("set_aside");
+            std::fs::rename(&blocked, &aside).unwrap();
+            std::fs::create_dir(&blocked).unwrap();
+            let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
+            assert!(matches!(
+                shared.verify_owner_certificate_and_establish(
+                    &owner_certificate(key),
+                    &key,
+                    T_NOW + 1
+                ),
+                Err(TrustError::Persist(_))
+            ));
+            assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+            std::fs::remove_dir(&blocked).unwrap();
+            std::fs::rename(&aside, &blocked).unwrap();
+            let loaded = reload(
+                &dir.path().join("trust_store"),
+                &dir.path().join("device_index.json"),
+            );
+            assert_eq!(loaded.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+            assert_eq!(
+                loaded.snapshot_for_key(&[7; 32]).1,
+                KeyAccess::Allowed(Scope::OWNER_FULL)
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_switch_write_leaves_the_live_switch_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        // A directory at the saved file's own path makes the rename onto it
+        // fail, whatever temp name the save picks; the real file is set aside
+        // first and restored before the reload.
+        let blocker = dir.path().join("trust_store");
+        let aside = dir.path().join("set_aside");
+        std::fs::rename(&blocker, &aside).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(matches!(
+            shared.set_allow_cloud(&[7; 32], false),
+            Err(TrustError::Persist(_))
+        ));
+        std::fs::remove_dir(&blocker).unwrap();
+        std::fs::rename(&aside, &blocker).unwrap();
+        assert!(shared.allow_cloud(), "the live switch is unchanged");
+        let reload_switch = || {
+            reload(
+                &dir.path().join("trust_store"),
+                &dir.path().join("device_index.json"),
+            )
+            .allow_cloud()
+        };
+        assert!(reload_switch());
+        shared.set_allow_cloud(&[7; 32], false).unwrap();
+        assert!(!shared.allow_cloud());
+        assert!(!reload_switch(), "a successful write persists");
+    }
+
     #[test]
     fn a_successful_claim_binds_the_key_anti_tautology() {
         // Control: a claim whose persist SUCCEEDS (a writable temp dir) binds the
@@ -844,9 +1063,162 @@ mod tests {
         // The row is a real strong-chain row on disk.
         let store = TrustStore::load(dir.path().join("trust_store"), MAC).unwrap();
         assert_eq!(
-            store.is_allowed(&account_a, T_NOW).unwrap().source,
+            store
+                .is_allowed(&account_a, &PublicKey(k), T_NOW)
+                .unwrap()
+                .source,
             PairingSource::StrongChain
         );
+    }
+
+    // ── the robot's own revocation fetch (epoch_pull) ─────────────────────────
+
+    fn write_pending(dir: &std::path::Path, epoch: cerulion_pairing::format::SignedEpoch) {
+        let wire = cerulion_pairing::verify::EpochSyncWire {
+            version: cerulion_pairing::verify::EPOCH_SYNC_WIRE_VERSION,
+            intermediate: good_intermediate_cert(),
+            signed_epoch: epoch,
+        };
+        let path = dir.join(crate::epoch_pull::EPOCH_PENDING_FILE);
+        std::fs::write(&path, hex::encode(postcard::to_stdvec(&wire).unwrap())).unwrap();
+        owner_only(&path, 0o600);
+    }
+
+    fn owner_only(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_fetched_epoch_cuts_the_revoked_desk_with_no_desk_push() {
+        use crate::epoch_pull::{EpochPull, PullOutcome, EPOCH_PENDING_FILE};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let account_a = AccountId([20; 32]);
+        let (k_a, k_b) = ([2u8; 32], [3u8; 32]);
+        for key in [k_a, k_b] {
+            shared
+                .verify_and_establish(&pair_chain(account_a, key, VIEWER_SCOPE), &key, None, T_NOW)
+                .unwrap();
+        }
+        owner_only(dir.path(), 0o700);
+        let pull = EpochPull::new(dir.path(), shared.clone(), RemotedClock::fixed(T_NOW));
+        assert_eq!(pull.apply_pending(), PullOutcome::Nothing);
+
+        // A pending file another user could have written (group/world bits) is
+        // refused unread and removed.
+        write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
+        owner_only(&dir.path().join(EPOCH_PENDING_FILE), 0o644);
+        assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
+        assert!(!dir.path().join(EPOCH_PENDING_FILE).exists());
+        assert!(matches!(
+            shared.snapshot_for_key(&k_a).1,
+            KeyAccess::Allowed(_)
+        ));
+
+        write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
+        assert_eq!(pull.apply_pending(), PullOutcome::Applied { epoch: 1 });
+        assert!(!dir.path().join(EPOCH_PENDING_FILE).exists());
+        assert_eq!(shared.snapshot_for_key(&k_a).1, KeyAccess::DeviceRevoked);
+        assert!(matches!(
+            shared.snapshot_for_key(&k_b).1,
+            KeyAccess::Allowed(_)
+        ));
+        let reloaded = reload(
+            &dir.path().join("trust_store"),
+            &dir.path().join("device_index.json"),
+        );
+        assert_eq!(reloaded.snapshot_for_key(&k_a).1, KeyAccess::DeviceRevoked);
+
+        // The same epoch again changes nothing.
+        write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
+        assert_eq!(pull.apply_pending(), PullOutcome::NotNewer);
+        // Garbage, and an epoch the robot's own CA did not sign, change nothing.
+        std::fs::write(dir.path().join(EPOCH_PENDING_FILE), "not an epoch").unwrap();
+        owner_only(&dir.path().join(EPOCH_PENDING_FILE), 0o600);
+        assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
+        let forged = AccessListEpoch {
+            version: FORMAT_VERSION,
+            robot: ROBOT,
+            epoch: 2,
+            revoked_accounts: vec![],
+            revoked_devices: vec![PublicKey(k_b)],
+            issued_at_ns: ISSUED,
+            issuer_key: pubkey(&int_sk()),
+        }
+        .sign(&SigningKey::from_bytes(&[0x99; 32]));
+        write_pending(dir.path(), forged);
+        assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
+        assert!(!dir.path().join(EPOCH_PENDING_FILE).exists());
+        assert!(matches!(
+            shared.snapshot_for_key(&k_b).1,
+            KeyAccess::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn an_admitted_key_asks_for_an_early_fetch_once_per_recheck_interval() {
+        use crate::epoch_pull::{EpochPull, EPOCH_REQUEST_FILE};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let pull = EpochPull::new(dir.path(), shared, RemotedClock::fixed(T_NOW));
+        let request = dir.path().join(EPOCH_REQUEST_FILE);
+        // An unknown key never asks.
+        assert!(!pull.note_accept(&[0x42; 32]));
+        assert!(!request.exists());
+        assert!(pull.note_accept(&[1u8; 32]));
+        assert!(request.exists());
+        std::fs::remove_file(&request).unwrap();
+        assert!(
+            !pull.note_accept(&[1u8; 32]),
+            "seen within the recheck interval"
+        );
+        assert!(!request.exists());
+    }
+
+    #[test]
+    fn the_recheck_interval_comes_from_its_setting_and_is_honoured() {
+        use crate::epoch_pull::{resolve_key_recheck, EpochPull, EPOCH_REQUEST_FILE};
+        let secs = |v: Option<&str>| resolve_key_recheck(v).as_secs();
+        assert_eq!(secs(None), 60);
+        assert_eq!(secs(Some(" 15 ")), 15);
+        assert_eq!(secs(Some("5")), 5);
+        assert_eq!(secs(Some("3600")), 3_600);
+        for bad in ["4", "3601", "0", "1m", "x"] {
+            assert_eq!(secs(Some(bad)), 60, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        // An in-range 5 s interval: a second accept within it asks for nothing, one
+        // at the interval asks again.
+        let pull = EpochPull::new(dir.path(), shared, RemotedClock::fixed(T_NOW))
+            .with_recheck(std::time::Duration::from_secs(5));
+        let t0 = std::time::Instant::now();
+        let request = dir.path().join(EPOCH_REQUEST_FILE);
+        assert!(pull.note_accept_at(&[1u8; 32], t0));
+        std::fs::remove_file(&request).unwrap();
+        assert!(!pull.note_accept_at(&[1u8; 32], t0 + std::time::Duration::from_secs(4)));
+        assert!(!request.exists());
+        assert!(pull.note_accept_at(&[1u8; 32], t0 + std::time::Duration::from_secs(5)));
+        assert!(request.exists());
+        // The setting is read from the environment remoted inherits.
+        let prior = std::env::var_os(crate::epoch_pull::KEY_RECHECK_ENV);
+        std::env::set_var(crate::epoch_pull::KEY_RECHECK_ENV, "7");
+        let configured = crate::epoch_pull::key_recheck_from_env();
+        match prior {
+            Some(value) => std::env::set_var(crate::epoch_pull::KEY_RECHECK_ENV, value),
+            None => std::env::remove_var(crate::epoch_pull::KEY_RECHECK_ENV),
+        }
+        assert_eq!(configured, std::time::Duration::from_secs(7));
     }
 
     // ── SharedTrust::apply_epoch device revocation ───────────────────────────

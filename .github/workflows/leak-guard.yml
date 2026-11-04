@@ -208,12 +208,15 @@ jobs:
           echo "require=$require" >> "$GITHUB_OUTPUT"
 
       # On a pull request the range is the pull request's own commits plus its
-      # title and body, which arrive through environment variable NAMES so no
-      # untrusted text is ever interpolated into this block. On the merge queue
-      # the range holds the FINAL squash messages before they become permanent,
-      # the one server-side moment a message can still be stopped. On a push
-      # the range is before..after and a red run is an alarm, not a gate: main
-      # is never rewritten.
+      # title and body, which this shell reads out of the event payload file and
+      # hands to the scanner through environment variable NAMES, so no
+      # untrusted text is ever interpolated into this block. They never pass
+      # through the step's `env:` block: the run log prints a step's env values,
+      # and that copy would outlive an edit of the title or the body. On the
+      # merge queue the range holds the FINAL squash messages before they become
+      # permanent, the one server-side moment a message can still be stopped. On
+      # a push the range is before..after and a red run is an alarm, not a gate:
+      # main is never rewritten.
       - name: Scan commit messages, identities and pull request text
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
@@ -223,13 +226,26 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           BEFORE_SHA: ${{ github.event.before }}
           AFTER_SHA: ${{ github.event.after }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
           # The AUTHOR's login, not `github.actor`: `user.login` is set when the
           # pull request opens, while `github.actor` is whoever pushed the run,
           # so a maintainer push to an updater branch would change it. Empty on
           # the merge queue and on a push, where the key below is never taken.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # The filters the shell below reads the title and the body with. Both
+          # read empty where the payload carries no pull request: the merge
+          # queue and a push. The forge sends a `null` body for a pull request
+          # opened with no description, which is an empty body. A title that is
+          # not text, a pull request with no `body` key, an empty file or a
+          # payload that is not an object produces no string, so `jq -e` fails
+          # rather than reading it as empty. The leak scanner's self-test runs
+          # these filters on hand-written payloads.
+          LG_PR_TITLE_JQ: >-
+            objects | if has("pull_request") then .pull_request.title | strings
+            else "" end
+          LG_PR_BODY_JQ: >-
+            objects | if has("pull_request")
+            then .pull_request | objects | select(has("body")) | .body // "" | strings
+            else "" end
         run: |
           # Two scans, and both always run. The COMMIT RANGE and the TITLE keep
           # the full hard set: a commit message and a title are the author's own
@@ -259,6 +275,15 @@ jobs:
           # squash message there is PR_TITLE alone by repository setting, so no
           # body text reaches it.
           set -uo pipefail
+          # Read with the filters in `env:` above. A payload that cannot be read
+          # is a scan that did not happen, never an empty title and body, so the
+          # step refuses.
+          if ! PR_TITLE=$(jq -e -j "$LG_PR_TITLE_JQ" "$GITHUB_EVENT_PATH") \
+             || ! PR_BODY=$(jq -e -j "$LG_PR_BODY_JQ" "$GITHUB_EVENT_PATH"); then
+            echo "::error ::the event payload could not be read"
+            exit 1
+          fi
+          export PR_TITLE PR_BODY
           flags=()
           if [ "$PR_AUTHOR" != 'dependabot[bot]' ]; then flags+=(--hard ref-unverified); fi
           if [ "$REQUIRE" = yes ]; then flags+=(--require-private); fi
@@ -287,6 +312,12 @@ jobs:
                 range="$BASE_SHA...$HEAD_SHA"
               fi
               echo "commit range: $range"
+              # Every pull request has a title, so an empty one is a payload that
+              # was not read, never a clean title.
+              if [ -z "$PR_TITLE" ]; then
+                echo "::error ::the event payload carries no pull request title"
+                exit 1
+              fi
               flags+=(--require-commits --pr-title-env PR_TITLE)
               body=yes
               ;;

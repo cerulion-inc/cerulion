@@ -349,7 +349,7 @@ fn demand_authorizer_denies_a_revoked_wan_subject() {
     // The owner revokes the subject → it leaves the allow list (is_allowed → None).
     store.owner_revoke(&OWNER, &SUBJECT).unwrap();
     assert!(
-        store.is_allowed(&SUBJECT, T_NOW).is_none(),
+        store.account_access(&SUBJECT, T_NOW).is_none(),
         "revoked subject must be denied by is_allowed"
     );
 

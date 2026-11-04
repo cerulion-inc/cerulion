@@ -167,7 +167,9 @@ check_title() {
         return
     fi
     if ! printf '%s' "$_t" | grep -qE "$TITLE_RE"; then
-        fail "PR title does not match '<type>(<scope>): <description>' — got: '$_t'
+        # The title itself is not printed: the CI log keeps what it prints after
+        # the author edits the title, and the title is on the pull request page.
+        fail "PR title does not match '<type>(<scope>): <description>'
     types: ${TYPES//|/, }
     scope is optional and lowercase, e.g. 'feat(transport): add the wake set'
     several scopes may be comma-separated with no spaces, e.g. 'fix(core,cli): …'
@@ -301,6 +303,21 @@ self_test() {
     _expect_title bad 'fix(core, cli): spaced list'       # space after comma
     _expect_title bad 'fix(core,,cli): doubled comma'     # empty scope mid-list
     _expect_title bad 'Bump serde from 1.0.219 to 1.0.221'  # no prefix configured
+
+    # A rejected title is refused WITHOUT being printed. The command
+    # substitution is a subshell with its own violation count, so it prints
+    # that count on a last line of its own after what check_title printed. No
+    # file is written: the self-test stays free of I/O.
+    _run=$((_run + 1))
+    _cpt_out=$(violations=0
+               check_title 'Rejected title marker q7xz' 2>&1
+               printf '\nviolations=%s' "$violations")
+    case "$_cpt_out" in
+        *q7xz*|*"
+violations=0")
+            printf 'SELF-TEST FAIL: a rejected title must be refused without being printed\n' >&2
+            _fails=$((_fails + 1)) ;;
+    esac
 
     # THE TRACKER-ID SAMPLES ARE DERIVED FROM TRACKER_RE, NOT TYPED. A gate that
     # spells the token it bans is itself a leak (the agent-docs gate derives its
