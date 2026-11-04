@@ -279,6 +279,45 @@ fn rejects_publish_topics_that_are_graph_outputs() {
     );
 }
 
+/// A graph output is a topic the start serves, so `egress` may list it; a
+/// start without `listen` builds no gateway and the list has no effect.
+#[test]
+fn an_egress_list_may_name_a_graph_output() {
+    let temp = tempdir().unwrap();
+    let node_lib_dir = fixture_dir();
+    assert!(
+        node_lib_dir
+            .join("libtest_node_macro_period_cdylib.so")
+            .is_file(),
+        "build the fixture first: cargo build -p test_node_macro_period_cdylib"
+    );
+    let prefix = format!("egress_{}", std::process::id());
+    let topic = format!("/{prefix}/ticker/cmd");
+    let graph_yaml = format!(
+        "prefix: {prefix}\nnodes:\n  - id: ticker\n    type: test_node_macro_period_cdylib\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n"
+    );
+    let mut runtime =
+        EmbeddedRuntime::new(temp.path().to_path_buf(), "android_test".into()).unwrap();
+    runtime
+        .start(
+            &json!({
+                "graph_yaml": graph_yaml,
+                "node_lib_dir": node_lib_dir,
+                "egress": [topic]
+            })
+            .to_string(),
+        )
+        .expect("an egress list may name a graph output");
+    {
+        let status = runtime.status_handle();
+        let status = status.lock().unwrap();
+        assert_eq!(status.state, cerulion_android::RuntimeState::Running);
+        assert!(status.listen.is_empty());
+        assert_eq!(status.lan_access, None, "no listen builds no gateway");
+    }
+    runtime.stop().unwrap();
+}
+
 #[test]
 fn dropping_a_running_runtime_finalizes_its_recording() {
     let temp = tempdir().unwrap();
