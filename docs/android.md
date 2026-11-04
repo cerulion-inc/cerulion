@@ -302,6 +302,41 @@ error code 5; `start` still returns `OK` because it only queues the start, and
 that names the type and the linked types. `status` lists the linked types in
 `linked_nodes`.
 
+To send app events into a linked node, publish them on an app topic and read
+that topic in the graph through an absolute `source:` (a name that starts with
+`/`). No node in the graph produces the topic, so the graph attaches to the
+topic the app publishes. Here `logic` is a node type listed in the library's
+`embed_nodes!`:
+
+```json
+{
+  "graph_yaml": "<the text of graph.yaml>",
+  "publish": [{"topic": "/myapp/taps", "schema": "geometry_msgs/Vector3"}]
+}
+```
+
+```yaml
+prefix: myapp
+nodes:
+  - id: logic
+    type: logic
+    inputs:
+      - name: taps
+        source: /myapp/taps
+    outputs:
+      - name: state
+        schema: geometry_msgs/Vector3
+```
+
+Each `CerulionRuntime.publish("/myapp/taps", ...)` call is one frame on the
+node's input. A trigger input (`#[input(trigger)]`) ticks the node once per
+frame, in publish order; a burst larger than the input's `depth` (default 10)
+drops its oldest frames. On an app topic that is not recorded, a `depth` above
+16 fails the start. A plain `#[input]` on a `period_ms` node holds the
+latest frame: the node produces nothing until the first publish, and then
+reads the newest value on each tick. The runtime creates every `publish` topic
+with room for a node that holds its latest value, so both kinds of input start.
+
 The app's graph topics are served by its gateway. A host sees them with
 `adb forward tcp:7683 tcp:7683` and
 `cerulion topic list --connect tcp/127.0.0.1:7683`. A `cerulion topic list`

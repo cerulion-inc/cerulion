@@ -21,7 +21,8 @@ use cerulion_core::transport::gateway::{
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
-    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
+    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, SUBSCRIBER_MAX_BORROWED_HELD,
+    TRANSPORT_KIND,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess};
@@ -1464,20 +1465,19 @@ fn create_publishers(
                     "publisher slot size exceeds the wire transport limit".to_string(),
                 )
             })?;
-        // A RECORDED app topic gets the same tap
-        // provisioning the graph build applies to recorded graph outputs;
-        // a non-recorded publisher keeps the default config.
-        let publisher = if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
-            manager.create_publisher_with_topic_config(
-                &item.topic,
-                slot_len,
-                0,
-                recorded_publisher_config(manager.default_topic_config(), slot_len),
-            )
-        } else {
-            manager.create_publisher(&item.topic, slot_len, 0)
+        // The app creates its topics before the graph builds, so each one is
+        // created at the borrow floor a graph output gets: a graph node that
+        // holds the topic as a latest-value input (an absolute `source:`)
+        // needs it to open the topic. A RECORDED app topic also gets the tap
+        // provisioning the graph build applies to recorded graph outputs.
+        let mut topic_config = manager.default_topic_config();
+        topic_config.create_borrow_floor = Some(SUBSCRIBER_MAX_BORROWED_HELD);
+        if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
+            topic_config = recorded_publisher_config(topic_config, slot_len);
         }
-        .map_err(|error| EmbedError::Publish(error.to_string()))?;
+        let publisher = manager
+            .create_publisher_with_topic_config(&item.topic, slot_len, 0, topic_config)
+            .map_err(|error| EmbedError::Publish(error.to_string()))?;
         publishers.insert(
             item.topic.clone(),
             PublisherState {
@@ -1532,7 +1532,8 @@ fn wait_recorder_ready(
 
 /// The topic service config an app publisher on a
 /// RECORDED topic creates the service with: the graph build's recorded-topic
-/// raise applied to a default-opener base, so the bagd tap gets the same
+/// raise applied to `base` (the caller passes the default config with the
+/// app topics' borrow floor set), so the bagd tap gets the same
 /// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
 /// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
 fn recorded_publisher_config(
