@@ -165,7 +165,10 @@ impl OpsServing {
                 sessions,
                 clock,
             )))
-            .register(Box::new(EngageEstopVerb::new(lease)));
+            .register(Box::new(EngageEstopVerb::new(lease)))
+            .register(Box::new(crate::robot_settings::CloudAccessVerb::new(
+                shared.clone(),
+            )));
 
         let authorizer: Box<dyn Authorizer> = Box::new(PairingAuthorizer::from_shared(shared));
         let receipts = ReceiptLog::open(receipt_path).map_err(|e| {

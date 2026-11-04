@@ -177,15 +177,28 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
     topic: &str,
     raw: &[u8],
 ) -> crate::error::TransportResult<(WireHeader, std::ops::Range<usize>)> {
+    let (header, payload) = validate_wire_frame_raw(topic, raw, Some(T::SCHEMA_HASH))?;
+    validate_reader_prefix::<T>(topic, raw, payload.end)?;
+    Ok((header, payload))
+}
+
+/// The two checks of [`validate_wire_frame`] that depend on the schema type:
+/// `total_size` leaves room for `T`'s fixed section and offset table, and the
+/// frame starts 8-aligned. Shared with the spin receive path, which parses the
+/// header itself.
+pub(crate) fn validate_reader_prefix<T: ShmMessage>(
+    topic: &str,
+    raw: &[u8],
+    total_size: usize,
+) -> crate::error::TransportResult<()> {
     use crate::error::TransportError;
 
-    let (header, payload) = validate_wire_frame_raw(topic, raw, Some(T::SCHEMA_HASH))?;
-    let total_size = payload.end;
-    // The reader `T::build_reader` returns REINTERPRETS the payload bytes, so
-    // it ASSERTS on a buffer too small for the fixed section and on one whose
-    // start is misaligned. An assert in a reader is a panic in a node body,
-    // and a node body must never panic through an accessor, so both conditions
-    // are refused HERE with a reason instead.
+    // The reader `T::build_reader` returns REINTERPRETS the payload bytes. A
+    // fixed-schema reader (`&<Name>Shm`) ASSERTS on a buffer too small for the
+    // fixed section and on one whose start is misaligned, and an assert in a
+    // reader is a panic in a node body. A variable-schema reader reads such a
+    // buffer from a heap copy instead, which would put an allocation on the
+    // receive path. Both conditions are refused HERE with a reason.
     //
     // A frame a publisher wrote always satisfies both, which is why the frames
     // in front of these checks are the malformed ones: a header claiming a
@@ -211,11 +224,7 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
             ),
         });
     }
-    // 8 is the wire format's own alignment: [`WireHeader`] is
-    // `#[repr(C, align(8))]`, the header is exactly 40 bytes so a payload
-    // starts 8-aligned whenever the frame does, and 8 bytes is the widest
-    // primitive a generated fixed section holds.
-    const WIRE_ALIGN: usize = 8;
+    const WIRE_ALIGN: usize = crate::shm_runtime::FRAME_ALIGN;
     if raw.as_ptr().align_offset(WIRE_ALIGN) != 0 {
         return Err(TransportError::Deserialization {
             topic: topic.to_string(),
@@ -225,7 +234,7 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
             ),
         });
     }
-    Ok((header, payload))
+    Ok(())
 }
 
 /// The untyped core of [`validate_wire_frame`]: the checks that need no

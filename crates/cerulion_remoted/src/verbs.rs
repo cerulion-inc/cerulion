@@ -37,7 +37,10 @@ pub const ENGAGE_ESTOP: &str = "engage-estop";
 /// Physical-possession claim (chassis secret). The ONLY verb admissible on an
 /// unclaimed robot.
 pub const CLAIM: &str = "claim";
-/// Strong-path new pairing (a signed certificate chain, verified offline).
+/// Strong-path new pairing (a signed certificate chain, verified offline), or
+/// certificate presentation: an owner-account device presents its device
+/// certificate chain and is admitted with its own row, with no code and no
+/// user step (`owner_certificate_postcard`).
 pub const PAIR: &str = "pair";
 /// A5: establish access from a DESK-CARRIED, OWNER-SIGNED access grant,
 /// verified offline against the robot's own owner. Self-gating (its proof is the
@@ -52,3 +55,10 @@ pub const CODE_PAIR_START: &str = "code-pair-start";
 /// CPace fallback pairing — STEP 2: verify the initiator confirmation tag and
 /// persist the code-paired access row (the durable, mutating effect).
 pub const CODE_PAIR_FINISH: &str = "code-pair-finish";
+
+// ── Owner robot settings ─────────────────────────────────────────────────────
+
+/// Read or set the robot's allow-from-cloud switch (`{"allow": bool}` sets it;
+/// no argument reads it). Owner only, from a non-cloud device. While OFF,
+/// every cloud device of every account is refused on every plane.
+pub const CLOUD_ACCESS: &str = "cloud-access";
