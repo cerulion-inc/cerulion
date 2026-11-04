@@ -2642,7 +2642,7 @@ Each unit `cerulion graph plan <NAME>` prints names why its first node starts it
 | `isolate: true` | declares it |
 | after an isolated node | is fed by a node that declares `isolate: true` |
 | no profile | no profile shows that joining its producer's unit is safe |
-| unknown feed | the profile holds no rate for how often a node of the merged unit (the reason names it) is fed, so the unit's period is unknown |
+| unknown feed | the profile holds no rate for how often a node that feeds the merged unit, or one of its members, is fed (the reason names it), so the unit's period is unknown |
 | tick budget | the profile shows the merged unit would tick for a quarter of its period or more, or of a member's `tick_within_ms` |
 
 Latest-value inputs never join units. Every producer and consumer of a topic with a `block` consumer

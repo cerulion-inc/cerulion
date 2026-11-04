@@ -128,7 +128,8 @@ pub enum Boundary {
     /// A link whose merged unit is fed at a period the profile does not
     /// hold: no rate it holds says how often `node` is fed.
     UnknownFeed {
-        /// The member of the merged unit whose feed is unknown.
+        /// The node whose feed is unknown: a node that feeds the merged
+        /// unit, or one of its members.
         node: String,
     },
     /// A link whose merge would put the unit over its tick budget.
@@ -393,7 +394,8 @@ fn fire_period_ns(node: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>)
 enum Feed<'a> {
     /// At this period, at the shortest.
     Every(u64),
-    /// By `node`, at a rate the profile does not hold.
+    /// Through `node` (a member or a node that feeds one), at a rate the
+    /// profile does not hold.
     Unknown(&'a str),
 }
 
