@@ -4993,9 +4993,10 @@ impl DylibNodeEntry {
         // ABI bump: the macro emits `"consume":"latest"` only for `latest`,
         // and an absent key is `fifo`, so every cdylib built before the key
         // existed loads exactly as it did. Unit variants from plain strings,
-        // the `BackpressureJson` shape.
+        // the `BackpressureJson` shape; an unknown value or a map-shaped value
+        // with any other key fails the parse.
         #[derive(serde::Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum ConsumeJson {
             Fifo,
             Latest,
@@ -7460,6 +7461,18 @@ mod tests {
         )
         .expect_err("lifo is not a consume mode");
         assert!(err.contains("invalid JSON"), "{err}");
+    }
+
+    #[test]
+    fn info_json_map_shaped_consume_with_another_key_refuses_the_load() {
+        for consume in [r#"{"latest":null,"depth":1}"#, r#"{"lifo":null}"#] {
+            let json = format!(
+                r#"{{"inputs":[{{"name":"cam","trigger":true,"consume":{consume}}}],"outputs":[]}}"#
+            );
+            let err = DylibNodeEntry::parse_info_json(&json)
+                .expect_err("a consume value carrying another key is not a consume mode");
+            assert!(err.contains("invalid JSON"), "{consume}: {err}");
+        }
     }
 
     #[test]
