@@ -19,8 +19,10 @@
 //!
 //! `topic-publish` and `service-call` check only the e-stop, not the control
 //! lease: each is refused while the e-stop latch (`cerud::lease::ControlLease`)
-//! is engaged, and a running publish or call stops at the next check (every
-//! 10 ms) after the latch engages. A publish still running
+//! is engaged, a running publish or call stops at the next check (every
+//! 10 ms) after the latch engages, and each `topic-publish` frame and the
+//! `service-call` request are sent only while the verb holds the lease's
+//! lock and reads the latch clear. A publish still running
 //! [`PUBLISH_DEADLINE`] after it started is stopped too. A `message` or
 //! `request` longer than [`MAX_MESSAGE_TEXT_BYTES`] is refused. A topic under
 //! the reserved `/__cerulion` namespace is refused.
@@ -199,13 +201,17 @@ enum Stop {
 /// Run `op` with a running flag that a watcher thread clears when the
 /// e-stop on `lease` engages or, given one, `deadline` passes, checked every
 /// [`ESTOP_POLL`]. The watcher ends with `op`. Returns what `op` returned and
-/// why the flag was cleared, if it was.
+/// why the flag was cleared, if it was. With the latch engaged when this is
+/// called, `op` runs with the flag already cleared and no watcher.
 fn watched<R>(
     lease: &Arc<Mutex<ControlLease>>,
     verb: &'static str,
     deadline: Option<Instant>,
     op: impl FnOnce(&AtomicBool) -> R,
 ) -> (R, Option<Stop>) {
+    if refuse_under_estop(lease, verb).is_err() {
+        return (op(&AtomicBool::new(false)), Some(Stop::Estop));
+    }
     let running = Arc::new(AtomicBool::new(true));
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
@@ -250,6 +256,21 @@ fn refuse_under_estop(lease: &Mutex<ControlLease>, verb: &str) -> CerudResult<()
     Ok(())
 }
 
+/// Run `send` while holding `lease`'s lock, if its e-stop latch reads clear
+/// under that lock; true when `send` ran. An e-stop engaged before the lock
+/// is taken keeps `send` from running, and engaging it while `send` runs
+/// waits for the lock (one request or frame publish, which does not block on
+/// a full queue).
+fn send_unless_estop(lease: &Mutex<ControlLease>, send: &mut dyn FnMut()) -> bool {
+    match lease.lock() {
+        Ok(lease) if matches!(lease.estop(), EstopState::Clear) => {
+            send();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Refuse a topic in the reserved control-plane namespace.
 fn refuse_reserved(topic: &str) -> CerudResult<()> {
     let canonical = if topic.starts_with('/') {
@@ -272,8 +293,9 @@ fn refuse_reserved(topic: &str) -> CerudResult<()> {
 }
 
 /// `topic-publish`: publish frames of one message on a local topic. Refused
-/// while the e-stop is engaged; an e-stop engaged mid-publish stops it
-/// before the next frame.
+/// while the e-stop is engaged; each frame goes out only with the latch read
+/// clear under the lease's lock at its send, so an e-stop engaged
+/// mid-publish stops it before the next frame.
 pub struct TopicPublishVerb {
     lease: Arc<Mutex<ControlLease>>,
 }
@@ -345,11 +367,25 @@ impl VerbHandler for TopicPublishVerb {
             wait_subscribers: wait,
         };
         // The publish loop polls the running flag in the subscriber wait,
-        // between frames and in the linger.
+        // between frames and in the linger, and sends each frame through
+        // send_unless_estop.
         let deadline = Instant::now() + PUBLISH_DEADLINE;
+        let mut estop_at_send = false;
         let (report, stop) = watched(&self.lease, TOPIC_PUBLISH, Some(deadline), |running| {
-            publish::publish_message(&req, &walker, &name, running, |_| ())
+            publish::publish_message_gated(
+                &req,
+                &walker,
+                &name,
+                running,
+                |_| (),
+                |send| estop_at_send = !send_unless_estop(&self.lease, send),
+            )
         });
+        let stop = if estop_at_send {
+            Some(Stop::Estop)
+        } else {
+            stop
+        };
         let sent = report.as_ref().map_or(0, |r| r.frames);
         match stop {
             Some(Stop::Estop) => {
@@ -378,8 +414,9 @@ impl VerbHandler for TopicPublishVerb {
 }
 
 /// `service-call`: call a service on this robot once. Refused while the
-/// e-stop is engaged; an e-stop engaged during the server or response wait
-/// ends the call as unavailable.
+/// e-stop is engaged; the request goes out only with the latch read clear
+/// under the lease's lock at the send, and an e-stop engaged during the
+/// server or response wait ends the call as unavailable.
 pub struct ServiceCallVerb {
     lease: Arc<Mutex<ControlLease>>,
 }
@@ -415,9 +452,17 @@ impl VerbHandler for ServiceCallVerb {
             request: &request,
             timeout,
         };
+        let mut estop_at_send = false;
         let (call, stop) = watched(&self.lease, SERVICE_CALL, None, |running| {
-            service::service_call(&req, &types, running)
+            service::service_call_gated(&req, &types, running, |send| {
+                estop_at_send = !send_unless_estop(&self.lease, send);
+            })
         });
+        let stop = if estop_at_send {
+            Some(Stop::Estop)
+        } else {
+            stop
+        };
         let text = match (call, stop) {
             (Err(_), Some(Stop::Estop)) => {
                 return Err(verb_error(VerbError::Unavailable(format!(
@@ -672,10 +717,19 @@ mod tests {
         assert_eq!(stop, Some(Stop::Deadline));
         assert!(held < Duration::from_secs(4), "held {held:?}");
         let engaged = lease();
-        engaged.lock().unwrap().engage_estop("test");
-        let (held, stop) = watched(&engaged, TOPIC_PUBLISH, None, hold);
+        let (held, stop) = watched(&engaged, TOPIC_PUBLISH, None, |running| {
+            engaged.lock().unwrap().engage_estop("test");
+            hold(running)
+        });
         assert_eq!(stop, Some(Stop::Estop));
         assert!(held < Duration::from_secs(4), "held {held:?}");
+        // Engaged before the call: the operation starts with the flag
+        // already cleared.
+        let (set_at_start, stop) = watched(&engaged, TOPIC_PUBLISH, None, |running| {
+            running.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        assert!(!set_at_start);
+        assert_eq!(stop, Some(Stop::Estop));
         let (_, stop) = watched(&lease(), TOPIC_PUBLISH, None, |_| ());
         assert_eq!(stop, None);
     }

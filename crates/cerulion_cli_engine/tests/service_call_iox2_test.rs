@@ -231,6 +231,98 @@ fn a_cleared_running_flag_sends_no_request_to_a_ready_server() {
     assert!(seen.is_empty(), "the server took {seen:?}");
 }
 
+/// The next request `server` takes, waiting up to 10 s for one.
+fn take_request(
+    server: &mut cerulion_core::transport::service::ServiceServer,
+) -> cerulion_core::transport::service::ServiceEnvelope {
+    for _ in 0..5000 {
+        let mut got = None;
+        server
+            .try_take_one_request(|envelope, _| got = Some(envelope))
+            .expect("take");
+        if let Some(envelope) = got {
+            return envelope;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no request reached the server");
+}
+
+#[test]
+#[serial]
+fn a_late_answer_to_a_stopped_call_is_not_taken_by_the_next_call_on_its_client_id() {
+    const SERVICE: &str = "/service_call_test/late/set_hardware_component_state";
+    const TYPE: &str = "controller_manager_msgs/srv/SetHardwareComponentState";
+    let dir = store();
+    let types = resolve_service_types(TYPE, Some(dir.path())).expect("types");
+    let transport = cerulion_core::TransportManager::get_or_init().expect("transport");
+    let mut server = transport
+        .create_service_server(
+            SERVICE,
+            MaxSliceLen::const_new(4 * 1024 * 1024),
+            types.walker.schema_hash_for(&types.request).unwrap(),
+            types.walker.schema_hash_for(&types.response).unwrap(),
+        )
+        .expect("server");
+    let call = |request: &'static str, running: Arc<AtomicBool>| {
+        let schemas = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let req = CallRequest {
+                service: SERVICE,
+                type_name: TYPE,
+                request,
+                timeout: Duration::from_secs(10),
+            };
+            service_call(&req, Some(&schemas), &running)
+        })
+    };
+    // The first call is stopped once the server holds its request, so it
+    // ends unanswered and its client id is free again.
+    let first_running = Arc::new(AtomicBool::new(true));
+    let first = call(
+        "name: first\ntarget_state: {id: 1, label: x}\n",
+        first_running.clone(),
+    );
+    let first_request = take_request(&mut server);
+    first_running.store(false, Ordering::SeqCst);
+    let err = first.join().unwrap().unwrap_err();
+    assert_eq!(err.exit_code(), EXIT_UNAVAILABLE, "{err}");
+    let second = call(
+        "name: second\ntarget_state: {id: 3, label: active}\n",
+        Arc::new(AtomicBool::new(true)),
+    );
+    let second_request = take_request(&mut server);
+    assert_eq!(
+        second_request.client_guid, first_request.client_guid,
+        "the second call opens the client id the first call freed"
+    );
+    // The late answer to the first call reaches the second call's reply
+    // topic ahead of the answer to its own request.
+    let late = message_frame(
+        &types.walker,
+        &types.response,
+        r#"{"ok": false, "state": {"id": 1, "label": "late"}}"#,
+        0,
+    )
+    .unwrap();
+    let own = message_frame(
+        &types.walker,
+        &types.response,
+        r#"{"ok": true, "state": {"id": 3, "label": "active"}}"#,
+        0,
+    )
+    .unwrap();
+    server
+        .send_response(&first_request, &late[WireHeader::SIZE..])
+        .expect("late answer");
+    server
+        .send_response(&second_request, &own[WireHeader::SIZE..])
+        .expect("answer");
+    let out = second.join().unwrap().expect("second call");
+    assert_eq!(out, r#"{"ok":true,"state":{"id":3,"label":"active"}}"#);
+    assert_ne!(first_request.sequence, second_request.sequence);
+}
+
 #[test]
 #[serial]
 fn a_call_with_no_server_is_unavailable_after_the_timeout() {

@@ -82,7 +82,9 @@
 //!   A caller may pass its own GUID instead: `rmw_cerulion` passes a
 //!   host-unique entity gid (process id included), which differs per run,
 //!   so a restarted `rmw_cerulion` client replies on a new topic.
-//! - Sequence numbers are a per-client monotonic counter starting at 1.
+//! - Sequence numbers are a per-client monotonic counter starting at 1,
+//!   or at the number the caller gives
+//!   [`ServiceClient::start_sequence_at`].
 //! - Which clients a server still holds (see "Topology") depends on whether
 //!   their reply subscribers are attached when a new client's first request
 //!   is taken, so the request-sequence diagnostics of a client that left and
@@ -412,6 +414,15 @@ impl ServiceClient {
             "service request sent"
         );
         Ok(sequence)
+    }
+
+    /// Number this client's next request `first` (at least 1) instead of
+    /// the next number of its own count. A response carries the sequence of
+    /// the request it answers, so a late response to an earlier client on
+    /// the same GUID matches none of this client's requests while their
+    /// numbers differ from every number the earlier client sent.
+    pub fn start_sequence_at(&mut self, first: i64) {
+        self.next_sequence = first.max(1);
     }
 
     /// The client's GUID (envelope identity).

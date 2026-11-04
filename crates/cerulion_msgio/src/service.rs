@@ -8,8 +8,11 @@
 //! leading slash), the response comes back on this client's own
 //! `svc/<service>/reply/<guid>` topic, each frame carries the
 //! `[client guid][sequence]` envelope, and the payload is the message body
-//! in the Cerulion wire layout. The request and response types are the two
-//! parts of the service's `.srv` file, `<pkg>/<Name>_Request` and
+//! in the Cerulion wire layout. Calls to one service share 16 client ids, and
+//! each call numbers its request below every sequence an earlier call sent
+//! (counting down from the wall clock), so a late response to an earlier
+//! call on the same id matches no later one. The request and response types
+//! are the two parts of the service's `.srv` file, `<pkg>/<Name>_Request` and
 //! `<pkg>/<Name>_Response`, read from the workspace store
 //! (`schemas/<pkg>/srv/<Name>.srv`). A field-less part, and every field-less
 //! message they use, gets the one `uint8` member ROS 2's IDL generation adds
@@ -20,8 +23,8 @@
 //! local shared memory.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerulion_core::codegen::{FrameWalker, MessageSchema};
 use cerulion_core::transport::service::{
@@ -225,6 +228,20 @@ pub fn service_call(
     types: &ServiceTypes,
     running: &AtomicBool,
 ) -> Result<String, VerbError> {
+    service_call_gated(req, types, running, |send| send())
+}
+
+/// [`service_call`] with `send_gate` around the send: once a server is up
+/// and `running` is still set, the call passes the send to `send_gate` as a
+/// closure, and the request goes out only if `send_gate` runs it. A gate
+/// that returns without running it ends the call as
+/// [`VerbError::Unavailable`] with no request sent.
+pub fn service_call_gated(
+    req: &CallRequest<'_>,
+    types: &ServiceTypes,
+    running: &AtomicBool,
+    send_gate: impl FnOnce(&mut dyn FnMut()),
+) -> Result<String, VerbError> {
     check_service_name(req.service)?;
     let request_frame = message_frame(&types.walker, &types.request, req.request, 0)?;
     let request_hash = types
@@ -238,6 +255,7 @@ pub fn service_call(
 
     let transport = cerulion_core::TransportManager::get_or_init()?;
     let mut client = open_client(&transport, req.service, request_hash, response_hash)?;
+    client.start_sequence_at(next_call_sequence());
 
     let deadline = Instant::now() + req.timeout;
     if !wait_until(deadline, running, || client.server_available()) {
@@ -248,14 +266,17 @@ pub fn service_call(
             request_topic(req.service)
         )));
     }
-    if !running.load(Ordering::Relaxed) {
+    let mut sent = None;
+    if running.load(Ordering::Relaxed) {
+        send_gate(&mut || sent = Some(client.send_request(&request_frame[WireHeader::SIZE..])));
+    }
+    let Some(sent) = sent else {
         return Err(VerbError::Unavailable(format!(
             "the call to '{}' was stopped before its request was sent",
             req.service
         )));
-    }
-
-    let sequence = client.send_request(&request_frame[WireHeader::SIZE..])?;
+    };
+    let sequence = sent?;
     let mut response: Option<Vec<u8>> = None;
     let answered = wait_until(deadline, running, || {
         take_response(&mut client, sequence, &mut response)
@@ -306,6 +327,29 @@ fn open_client(
         "all {CLIENT_SLOTS} service call client ids for '{service}' are in use by calls \
          running now"
     )))
+}
+
+/// The first sequence of a call's client: below every sequence an earlier
+/// call in this process took (an atomic minimum) and at most `i64::MAX` less
+/// the wall clock's nanoseconds since the Unix epoch, so, on a clock that
+/// moved forward, below what a call in an earlier process sent too. A server
+/// answers on the client id's reply topic with the request's sequence, so a
+/// late answer to an earlier call on the same id matches no later call. A
+/// server reads a sequence below the last one it saw from an id as a client
+/// restarted with a reused id, and one above it by more than one as requests
+/// lost from its queue.
+fn next_call_sequence() -> i64 {
+    static LAST: AtomicI64 = AtomicI64::new(i64::MAX);
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    let below = |last: i64| (i64::MAX - since_epoch).min(last - 1);
+    let last = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(below(last))
+        })
+        .unwrap_or_else(|last| last);
+    below(last)
 }
 
 /// Take queued responses until the one answering `sequence` arrives; true
@@ -498,6 +542,28 @@ mod tests {
             .unwrap();
         assert_eq!(err.exit_code(), crate::text::EXIT_USAGE);
         assert!(err.to_string().contains("demo_msgs/srv/Bad.srv"), "{err}");
+    }
+
+    #[test]
+    fn a_call_sequence_is_below_the_wall_clock_countdown_and_the_last_call() {
+        // next_call_sequence is at most i64::MAX less the wall clock's
+        // nanoseconds it reads, and this reading is taken first, so it is no
+        // later than that one. The atomic minimum alone gives i64::MAX - 1 to
+        // the first call of every process.
+        let before = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let first = next_call_sequence();
+        assert!(
+            first <= i64::MAX - before,
+            "{first} is above i64::MAX less the {before} ns read before the call"
+        );
+        let second = next_call_sequence();
+        assert!(second < first, "{second} is not below {first}");
     }
 
     #[test]

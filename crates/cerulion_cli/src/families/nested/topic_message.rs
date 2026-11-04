@@ -83,8 +83,8 @@ enum TopicMessageAction {
         #[arg(long, value_name = "NAME", conflicts_with = "local",
               add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// Where to write the JPEG (default: a file in the system temp
-        /// directory)
+        /// Where to write the JPEG (default: a new file in a new private
+        /// directory under the system temp directory)
         #[arg(short = 'o', long = "output", value_name = "PATH")]
         output: Option<PathBuf>,
         /// Seconds to wait for a frame

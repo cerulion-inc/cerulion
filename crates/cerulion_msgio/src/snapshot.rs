@@ -8,7 +8,8 @@
 //! the BT.601 limited-range matrix) and encoded; a
 //! `sensor_msgs/CompressedImage` frame holding a JPEG is written as it came.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -137,6 +138,45 @@ pub fn default_file_name(topic: &str, stamp_ns: i64) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     format!("cerulion-snapshot-{name}-{stamp_ns}.jpg")
+}
+
+/// Write `jpeg` to `output`, or with none to a new file named
+/// [`default_file_name`] in a new directory under the system temp
+/// directory, and return the path written.
+///
+/// The default directory gets a random `cerulion-snapshot-` name and is made
+/// with one `mkdir` (mode 0700 on Unix), which fails on an existing entry of
+/// that name, a symlink included; the file in it is opened with
+/// `create_new`, which fails on an existing entry rather than following it.
+/// An `output` is written with `std::fs::write`, which follows a symlink the
+/// caller named.
+pub fn write_jpeg(
+    output: Option<&Path>,
+    topic: &str,
+    stamp_ns: i64,
+    jpeg: &[u8],
+) -> Result<PathBuf, VerbError> {
+    if let Some(output) = output {
+        std::fs::write(output, jpeg)?;
+        return Ok(output.to_path_buf());
+    }
+    let mut dir = tempfile::Builder::new();
+    dir.prefix("cerulion-snapshot-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        dir.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir
+        .tempdir()?
+        .keep()
+        .join(default_file_name(topic, stamp_ns));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?
+        .write_all(jpeg)?;
+    Ok(path)
 }
 
 /// Decode one wire frame (header included) and return the JPEG bytes,
@@ -496,6 +536,49 @@ mod tests {
         let err = frame_to_jpeg(&walker, &frame, 80).unwrap_err();
         assert_eq!(err.exit_code(), EXIT_ENCODE);
         assert!(err.to_string().contains("std_msgs/String"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_default_snapshot_goes_to_a_new_private_directory_past_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        // The name the default path had in the temp directory itself, with
+        // the zero stamp every unstamped frame gets, planted as a symlink to
+        // a file another user would want overwritten.
+        let topic = format!("/snapshot_symlink_probe/{}", std::process::id());
+        let planted = std::env::temp_dir().join(default_file_name(&topic, 0));
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let _ = std::fs::remove_file(&planted);
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let written = write_jpeg(None, &topic, 0, b"jpeg bytes");
+        std::fs::remove_file(&planted).unwrap();
+        let written = written.unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_ne!(written, planted);
+        assert_eq!(std::fs::read(&written).unwrap(), b"jpeg bytes");
+        let dir = written.parent().unwrap();
+        assert_eq!(dir.parent().unwrap(), std::env::temp_dir());
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("cerulion-snapshot-"));
+        assert_eq!(
+            written.file_name().unwrap().to_string_lossy(),
+            default_file_name(&topic, 0)
+        );
+        assert_eq!(
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A second snapshot of the same name gets its own directory.
+        let again = write_jpeg(None, &topic, 0, b"second").unwrap();
+        assert_ne!(again.parent(), written.parent());
+        for path in [written, again] {
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]

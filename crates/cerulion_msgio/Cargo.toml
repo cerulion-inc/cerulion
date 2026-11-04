@@ -28,6 +28,5 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # The robot-side `topic-snapshot` verb returns the JPEG as base64 text.
 base64 = "0.22"
-
-[dev-dependencies]
+# A default snapshot file goes in a new randomly named private directory.
 tempfile = "3"

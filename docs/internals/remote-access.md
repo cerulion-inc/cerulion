@@ -367,11 +367,13 @@ CLI's exit code (2, 1, 3, 1). Timeouts are capped at 60 s and a result at
 12 MiB, inside the 16 MiB ops frame, and a `message` or `request` at 1 MiB of
 text. `topic-publish` and `service-call` are refused while
 the e-stop latch (`cerud::lease::ControlLease`) is engaged; a running publish
-or call checks the latch every 10 ms and stops when it engages, and a call
-stopped before its request goes out sends none. A publish is refused when its
-subscriber wait plus its frames at the rate exceed 90 s, and is stopped if it
-is still running 100 s after it started (a frame that takes longer to send
-than its period delays the rest). A topic under
+or call checks the latch every 10 ms and stops when it engages, a call
+stopped before its request goes out sends none, and a publish sends each
+frame, and a call its request, only while it holds the lease's lock and reads
+the latch clear. A publish is
+refused when its subscriber wait plus its frames at the rate exceed 90 s, and
+is stopped if it is still running 100 s after it started (a frame that takes
+longer to send than its period delays the rest). A topic under
 `/__cerulion` is refused. `service-call` also returns `response_text`.
 
 ## 6. The wire plane (robot side)
@@ -721,7 +723,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 |---|---|
 | `crates/cerulion_remoted/tests/act_verbs_daemon_test.rs` | Every act verb is registered in the production `serve_endpoint` daemon: each answers `{}` with its own usage error over a real ops session |
 | `crates/cerulion_remoted/tests/act_verbs_cloud_test.rs` | The act verbs under the allow-from-cloud switch: a cloud device is refused publish and snapshot only while the switch is off |
-| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, the unavailable class |
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, the unavailable class |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |

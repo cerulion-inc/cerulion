@@ -996,7 +996,7 @@ own binary.
 | `topic_types_network_live_test.rs` | `topic list -t` / `find` remote typing from a loopback robot's catalog, and the `topic type` remote-walker ladder | no | none |
 | `topic_observer_iox2_test.rs` | `topic echo`/`hz` observer loops: multiplicity oracle, timeout drain, rate-line math, notify-flood pacing counter | yes (process-global transport singleton) | none |
 | `topic_pub_iox2_test.rs` | `topic pub` frames reach a live subscriber with the encoded body, consecutive sequences and the type's hash; a bad value opens no publisher | no (distinct topics per test) | none |
-| `service_call_iox2_test.rs` | `service call` against `cerulion_core`'s `ServiceServer` (the server `rmw_cerulion` wraps) built from the same ros2_control `.srv` files: request decoded by the server, response JSON, two calls from one process, no-server timeout exit class | no (distinct services per test) | none |
+| `service_call_iox2_test.rs` | `service call` against `cerulion_core`'s `ServiceServer` (the server `rmw_cerulion` wraps) built from the same ros2_control `.srv` files: request decoded by the server, response JSON, two calls from one process, a late answer to a stopped call not taken by the next call on its client id, no-server timeout exit class | no (distinct services per test) | none |
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
 | `convergence_adoption_test.rs` | Structural walk: the observer seams adopt the converged query verbs | no | none |
 | `bag_record_run_attach_test.rs` | `bag record --run` mid-run attach over a real lapped live trace ring | no | none |

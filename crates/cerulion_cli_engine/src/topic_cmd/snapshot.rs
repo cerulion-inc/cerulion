@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 pub use cerulion_msgio::snapshot::{
     default_file_name, frame_to_jpeg, jpeg_dimensions, take_newest_frame, to_jpeg, to_rgb,
-    RawImage, SnapshotReport, DEFAULT_JPEG_QUALITY, DEFAULT_SNAPSHOT_TIMEOUT,
+    write_jpeg, RawImage, SnapshotReport, DEFAULT_JPEG_QUALITY, DEFAULT_SNAPSHOT_TIMEOUT,
 };
 
 use super::{ensure_topic_available, local_walker_from_workspace, TopicScope, TopicSource};
@@ -27,7 +27,8 @@ const REOPEN_DELAY: Duration = Duration::from_millis(200);
 pub struct SnapshotRequest<'a> {
     /// The camera topic.
     pub topic: &'a str,
-    /// Where to write the JPEG; `None` is a file in the system temp directory.
+    /// Where to write the JPEG; `None` is a new file in a new private
+    /// directory under the system temp directory ([`write_jpeg`]).
     pub output: Option<&'a Path>,
     /// How long to wait for a frame.
     pub timeout: Duration,
@@ -86,11 +87,7 @@ pub fn topic_snapshot(
         )));
     };
     let (jpeg, width, height, encoding, stamp_ns) = frame_to_jpeg(&walker, &frame, req.quality)?;
-    let path = match req.output {
-        Some(p) => p.to_path_buf(),
-        None => std::env::temp_dir().join(default_file_name(req.topic, stamp_ns)),
-    };
-    std::fs::write(&path, &jpeg)?;
+    let path = write_jpeg(req.output, req.topic, stamp_ns, &jpeg)?;
     Ok(SnapshotReport {
         path,
         width,

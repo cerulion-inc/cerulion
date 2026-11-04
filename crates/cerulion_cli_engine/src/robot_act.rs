@@ -196,8 +196,9 @@ pub fn response_line(text: &str) -> Result<&str, VerbError> {
 }
 
 /// `topic snapshot --robot`: take the snapshot on the robot, write the JPEG
-/// on this machine (`req.output`, or the default file in the system temp
-/// directory) and return the JSON line the local verb prints.
+/// on this machine (`req.output`, or the default file in a new private
+/// directory under the system temp directory) and return the JSON line the
+/// local verb prints.
 pub fn robot_snapshot(
     robot: &str,
     req: &crate::topic_cmd::snapshot::SnapshotRequest<'_>,
@@ -212,13 +213,14 @@ pub fn robot_snapshot(
 }
 
 /// Write the JPEG of a `topic-snapshot` result on this machine
-/// (`req.output`, or the default file in the system temp directory) and
+/// ([`cerulion_msgio::snapshot::write_jpeg`]: `req.output`, or the default
+/// file in a new private directory under the system temp directory) and
 /// return the JSON line the local verb prints, naming the local path.
 pub fn write_snapshot(
     result: &Value,
     req: &crate::topic_cmd::snapshot::SnapshotRequest<'_>,
 ) -> Result<String, VerbError> {
-    use cerulion_msgio::snapshot::{base64_decode, default_file_name, SnapshotReport};
+    use cerulion_msgio::snapshot::{base64_decode, write_jpeg, SnapshotReport};
     let field = |key: &str| {
         result.get(key).and_then(Value::as_i64).ok_or_else(|| {
             VerbError::Internal(format!("the robot's result has no integer `{key}`"))
@@ -227,11 +229,7 @@ pub fn write_snapshot(
     let jpeg = base64_decode(result_str(result, "jpeg_base64")?)
         .ok_or_else(|| VerbError::Internal("the robot's JPEG is not base64".to_string()))?;
     let stamp_ns = field("stamp_ns")?;
-    let path = match req.output {
-        Some(p) => p.to_path_buf(),
-        None => std::env::temp_dir().join(default_file_name(req.topic, stamp_ns)),
-    };
-    std::fs::write(&path, &jpeg)?;
+    let path = write_jpeg(req.output, req.topic, stamp_ns, &jpeg)?;
     let dimension = |key: &str| {
         field(key).and_then(|v| {
             u32::try_from(v)
@@ -354,20 +352,37 @@ mod tests {
             serde_json::json!({"path": path.to_string_lossy(), "width": 2, "height": 1,
                 "encoding": "mono8", "stamp_ns": 42, "bytes": jpeg.len()})
         );
-        // No -o: the default file in the system temp directory.
+        // No -o: the default file in a new private directory under the
+        // system temp directory, past a symlink planted at the name the
+        // default path had in the temp directory itself.
         let req = SnapshotRequest {
+            topic: "/wrist/image_raw_symlink_probe",
             output: None,
             ..req
         };
-        let line = write_snapshot(&result, &req).unwrap();
-        let v: Value = serde_json::from_str(&line).unwrap();
+        let planted = std::env::temp_dir().join(format!(
+            "cerulion-snapshot-wrist_image_raw_symlink_probe-{}.jpg",
+            std::process::id()
+        ));
+        let mut stamped = result.clone();
+        stamped["stamp_ns"] = Value::from(std::process::id());
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let _ = std::fs::remove_file(&planted);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let line = write_snapshot(&stamped, &req);
+        let _ = std::fs::remove_file(&planted);
+        let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let written = std::path::PathBuf::from(v["path"].as_str().unwrap());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(written.file_name(), planted.file_name());
         assert_eq!(
-            written,
-            std::env::temp_dir().join("cerulion-snapshot-wrist_image_raw-42.jpg")
+            written.parent().and_then(std::path::Path::parent),
+            Some(std::env::temp_dir().as_path())
         );
         assert_eq!(std::fs::read(&written).unwrap(), jpeg);
-        std::fs::remove_file(written).unwrap();
+        std::fs::remove_dir_all(written.parent().unwrap()).unwrap();
         // A result whose JPEG is not base64 is refused.
         let mut bad = result.clone();
         bad["jpeg_base64"] = Value::from("***");

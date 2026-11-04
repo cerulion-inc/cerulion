@@ -112,6 +112,23 @@ pub fn publish_message<G>(
     running: &AtomicBool,
     on_open: impl FnOnce(u64) -> G,
 ) -> Result<PubReport, VerbError> {
+    publish_message_gated(req, walker, name, running, on_open, |send| send())
+}
+
+/// [`publish_message`] with `send_gate` around each frame's send: the
+/// publish passes every frame's send to `send_gate` as a closure, and the
+/// frame goes out only if `send_gate` runs it. A gate that returns without
+/// running it stops the publish there as a cleared `running` does, with no
+/// linger: the frames sent before it are reported, and with none sent it is
+/// an error.
+pub fn publish_message_gated<G>(
+    req: &PubRequest<'_>,
+    walker: &FrameWalker,
+    name: &str,
+    running: &AtomicBool,
+    on_open: impl FnOnce(u64) -> G,
+    mut send_gate: impl FnMut(&mut dyn FnMut()),
+) -> Result<PubReport, VerbError> {
     let period = publish_period(req.times, req.rate_hz)?;
     let mut frame = message_frame(walker, name, req.message, 0)?;
     let mut header = WireHeader::read_from_buf(&frame)
@@ -140,6 +157,7 @@ pub fn publish_message<G>(
 
     let mut frames = 0u64;
     let mut subscribers = 0usize;
+    let mut gated = false;
     let mut next = Instant::now();
     while frames < req.times && running.load(Ordering::Relaxed) {
         if frames > 0 {
@@ -151,12 +169,18 @@ pub fn publish_message<G>(
         header.sequence = header.sequence.wrapping_add(1);
         header.timestamp_ns = transport.clock().now_ns();
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);
-        match injector.reinject_raw(&frame) {
-            ReinjectOutcome::Injected { recipients } => {
+        let mut sent = None;
+        send_gate(&mut || sent = Some(injector.reinject_raw(&frame)));
+        match sent {
+            None => {
+                gated = true;
+                break;
+            }
+            Some(ReinjectOutcome::Injected { recipients }) => {
                 frames += 1;
                 subscribers = recipients;
             }
-            other => {
+            Some(other) => {
                 return Err(VerbError::Internal(format!(
                     "publishing frame {} on '{}' failed: {other:?}",
                     frames + 1,
@@ -171,7 +195,9 @@ pub fn publish_message<G>(
             req.topic
         )));
     }
-    sleep_until(Instant::now() + LINGER, running);
+    if !gated {
+        sleep_until(Instant::now() + LINGER, running);
+    }
     Ok(PubReport {
         topic: req.topic.to_string(),
         type_name: name.to_string(),

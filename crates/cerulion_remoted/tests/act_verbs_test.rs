@@ -310,6 +310,127 @@ fn an_estop_engaged_during_the_server_wait_stops_the_call_as_unavailable() {
 
 #[test]
 #[serial]
+fn an_estop_engaged_after_the_latch_checks_and_before_the_send_sends_no_request() {
+    let dir = store().to_path_buf();
+    let service = "/act_verbs_test/call/estop_at_send";
+    let l = lease();
+    let caller = {
+        let l = l.clone();
+        std::thread::spawn(move || {
+            ServiceCallVerb::new(l).execute(
+                &json!({"service": service, "type": "demo_srvs/srv/Ping", "timeout_s": 10}),
+            )
+        })
+    };
+    // The call opens its request publisher after the handler's latch check
+    // and the watcher's start, then waits for a server.
+    let transport = cerulion_core::TransportManager::get_or_init().unwrap();
+    let request = cerulion_core::transport::service::request_topic(service);
+    let mut polls = 0;
+    while transport.topic_publisher_count(&request) == 0 {
+        polls += 1;
+        assert!(polls < 5000, "the call never opened its client");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Holding the lease keeps the watcher from reading the latch, so the
+    // flag it clears stays set while the server comes up.
+    let mut held = l.lock().unwrap();
+    held.engage_estop("test");
+    let types =
+        cerulion_msgio::service::resolve_store_service_types("demo_srvs/Ping", Some(&dir)).unwrap();
+    let server = transport
+        .create_service_server(
+            service,
+            MaxSliceLen::const_new(4 * 1024 * 1024),
+            types.walker.schema_hash_for(&types.request).unwrap(),
+            types.walker.schema_hash_for(&types.response).unwrap(),
+        )
+        .unwrap();
+    // A call that reads only that flag sends within milliseconds of the
+    // server appearing; one that reads the latch under the lease's lock at
+    // the send waits for this test to release it.
+    let window = std::time::Instant::now() + Duration::from_secs(1);
+    while !server.has_pending_request() && std::time::Instant::now() < window {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(held);
+    let err = caller.join().unwrap().unwrap_err();
+    // The client's publish lands in the server's queue before it returns.
+    assert!(
+        !server.has_pending_request(),
+        "a request reached the server after the e-stop engaged"
+    );
+    match err {
+        CerudError::Verb(m) => assert!(
+            m.starts_with("unavailable: ") && m.contains("e-stop engaged"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+#[serial]
+fn an_estop_engaged_after_the_latch_checks_and_before_a_frame_publishes_no_frame() {
+    store();
+    let topic = "/act_verbs_test/publish/estop_at_send";
+    let l = lease();
+    let caller = {
+        let l = l.clone();
+        std::thread::spawn(move || {
+            TopicPublishVerb::new(l).execute(&json!({"topic": topic, "type": "std_msgs/String",
+                         "message": {"data": "x"}, "wait_subscribers_s": 10}))
+        })
+    };
+    // The publish opens its publisher after the handler's latch check and
+    // the watcher's start, then waits for a subscriber.
+    let transport = cerulion_core::TransportManager::get_or_init().unwrap();
+    let mut polls = 0;
+    while transport.topic_publisher_count(topic) == 0 {
+        polls += 1;
+        assert!(polls < 5000, "the publish never opened its publisher");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Holding the lease keeps the watcher from reading the latch, so the
+    // flag it clears stays set while the subscriber comes up.
+    let mut held = l.lock().unwrap();
+    held.engage_estop("test");
+    let subscriber = transport.create_subscriber(topic).unwrap();
+    // A publish that reads only that flag sends its frame within one
+    // subscriber poll (20 ms) of the subscriber appearing; one that reads the
+    // latch under the lease's lock at each frame waits for this test to
+    // release it.
+    let mut got = Vec::new();
+    let window = std::time::Instant::now() + Duration::from_secs(1);
+    while got.is_empty() && std::time::Instant::now() < window {
+        subscriber
+            .wait_for_message(Duration::from_millis(20), |m| {
+                got.push(m.payload().to_vec())
+            })
+            .unwrap();
+    }
+    drop(held);
+    let err = caller.join().unwrap().unwrap_err();
+    // A frame lands in the subscriber's queue before its publish returns.
+    subscriber
+        .try_receive(|m| got.push(m.payload().to_vec()))
+        .unwrap();
+    assert!(
+        got.is_empty(),
+        "{} frame(s) reached the subscriber after the e-stop engaged",
+        got.len()
+    );
+    match err {
+        CerudError::Verb(m) => assert!(
+            m.starts_with("unavailable: ") && m.contains("e-stop engaged after 0 of 1"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+#[serial]
 fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable() {
     store();
     let l = lease();
