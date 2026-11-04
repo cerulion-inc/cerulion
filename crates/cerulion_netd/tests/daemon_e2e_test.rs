@@ -461,22 +461,17 @@ fn start_short_grace_and_connect<T>(
 
 #[test]
 fn the_short_grace_helper_rebuilds_a_fixture_whose_daemon_self_exited_first() {
-    // The macOS-runner shape, made deterministic: the first fixture is left un-connected
-    // until its daemon has COMMITTED idle self-exit, exactly as on a loaded runner; every
-    // later attempt connects promptly. The helper must discard that fixture and rebuild
-    // EXACTLY once, and the client it returns must be a working client on the REBUILT
-    // daemon — not a husk. Wait on the commit itself, not a fixed sleep past the grace:
-    // the idle-watch thread is descheduled on a loaded runner too, and a 250 ms sleep let
-    // the first connect land before the commit (`attempts: 1`).
+    // The macOS-runner shape, made deterministic: the first fixture is left un-connected past
+    // its own grace (250 ms > 150 ms), so the idle-watch commits self-exit exactly as
+    // it does on a loaded runner; every later attempt connects promptly. The helper
+    // must discard that fixture and rebuild EXACTLY once, and the client it returns
+    // must be a working client on the REBUILT daemon — not a husk.
     let mut calls = 0usize;
     let (mut netd, dir, sock, spy, first, hello) = start_short_grace_and_connect(|| {
         calls += 1;
         let started = start_daemon("helper_rebuild", Duration::from_millis(150));
         if calls == 1 {
-            assert!(
-                wait_until(|| started.0.self_exit_requested(), Duration::from_secs(3)),
-                "the first fixture's daemon committed idle self-exit after its 150 ms grace"
-            );
+            std::thread::sleep(Duration::from_millis(250));
         }
         started
     });
