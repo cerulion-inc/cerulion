@@ -55,18 +55,19 @@ pub(super) fn decide(robots: &[String], window_elapsed_cleanly: bool) -> Outcome
     }
 }
 
-/// The names of the robots that answered, sorted and without repeats. A name
-/// is LAN-supplied text, so each goes through
-/// [`crate::topic_cmd::sanitize_display`] first: a peer cannot put terminal
-/// escapes into the summary.
+/// The names of the robots that answered, sorted and without repeats, as
+/// they print. A name is LAN-supplied text, so each goes through
+/// [`crate::topic_cmd::sanitize_display`]: a peer cannot put terminal escapes
+/// into the summary. Repeats go before that, on the names as sent, so two
+/// names that differ only in a control character still count as two.
 pub(super) fn answered_robots(names: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut robots: Vec<String> = names
-        .into_iter()
-        .map(|name| crate::topic_cmd::sanitize_display(&name))
-        .collect();
+    let mut robots: Vec<String> = names.into_iter().collect();
     robots.sort();
     robots.dedup();
     robots
+        .iter()
+        .map(|name| crate::topic_cmd::sanitize_display(name))
+        .collect()
 }
 
 fn run(_ctx: &Context) -> Outcome {
@@ -108,6 +109,15 @@ mod tests {
         assert_eq!(robots, ["go2\u{FFFD}[2J\u{FFFD}", "lab"]);
         let o = decide(&robots, true);
         assert!(!o.summary.chars().any(char::is_control), "{:?}", o.summary);
+    }
+
+    #[test]
+    fn two_names_that_differ_only_in_a_control_character_count_as_two() {
+        let robots = answered_robots(["go2\r".to_string(), "go2\n".to_string()]);
+        assert_eq!(robots, ["go2\u{FFFD}", "go2\u{FFFD}"]);
+        let o = decide(&robots, true);
+        assert_eq!(o.readings.get("robots"), Some(&Reading::Int(2)));
+        assert!(o.summary.contains("2 answered"), "{:?}", o.summary);
     }
 
     #[test]
