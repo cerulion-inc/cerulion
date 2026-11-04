@@ -27,6 +27,8 @@ crate-type = ["cdylib", "rlib"]
 # of the BARE lib is `cargo clippy -p rmw_cerulion -- -D warnings` — run it
 # after touching any `cfg(feature = "test-seams")` gate.
 test-seams = []
+# Period-learned park (prototype, default off, Linux): learn each subscribed topic's arrival period, sleep in the kernel fd block until shortly before the next expected frame, then park on that topic's doorbell for at most 200 us. Irregular topics, CERULION_MONITOR_WAIT=0, CPUs without a monitor-wait primitive and wait sets of more than 16 topics keep the stock wait.
+period-park = []
 
 [dependencies]
 cerulion_core = { path = "../cerulion_core" }

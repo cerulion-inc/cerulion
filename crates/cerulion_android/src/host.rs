@@ -355,6 +355,8 @@ static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn init(files_dir: &str, robot_name: &str) -> i32 {
     guarded_code(
         || {
+            #[cfg(target_os = "android")]
+            crate::log::install_logcat();
             let _init_guard = INIT_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);

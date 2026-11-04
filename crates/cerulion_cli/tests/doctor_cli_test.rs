@@ -68,7 +68,8 @@ fn run_env(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> Out
         .env_remove("ROS_DISTRO")
         .env_remove("AMENT_PREFIX_PATH")
         .env_remove("RMW_IMPLEMENTATION")
-        .env_remove("CERULION_LIB_DIR");
+        .env_remove("CERULION_LIB_DIR")
+        .env("CERULION_NETD_SOCK", root.join("netd.sock"));
     for (name, value) in env {
         cmd.env(name, value);
     }
@@ -86,7 +87,7 @@ fn json_of(out: &Output) -> serde_json::Value {
 }
 
 /// The catalogue as the verb lists it, in order.
-const CHECK_IDS: [&str; 12] = [
+const CHECK_IDS: [&str; 17] = [
     "limits.open-files",
     "shm.dev-shm",
     "shm.stale-nodes",
@@ -99,12 +100,18 @@ const CHECK_IDS: [&str; 12] = [
     "gpu.cuda",
     "ros.distro",
     "ros.rmw",
+    "account.certificates",
+    "daemon.netd",
+    "daemon.remoted",
+    "net.mdns",
+    "net.udp",
 ];
 
 #[test]
 fn a_full_json_report_lists_every_check_in_order_and_exits_1_on_the_failed_login() {
     let sb = Sandbox::new("full");
-    let out = sb.run(&["doctor", "--json"]);
+    // `--local` keeps the run on this machine: the network checks report skip.
+    let out = sb.run(&["doctor", "--json", "--local"]);
     let json = json_of(&out);
     assert_eq!(json["report_version"], 1);
     let ids: Vec<&str> = json["checks"]
@@ -314,4 +321,127 @@ fn a_sourced_ros_without_the_rmw_library_fails() {
             .contains(&*expected.to_string_lossy()),
         "{check}"
     );
+}
+
+/// No daemon listens at the sandbox's private netd socket: the check reports
+/// it as not running and exits 0, and starts nothing.
+#[cfg(unix)]
+#[test]
+fn a_netd_that_is_not_running_is_info_and_nothing_is_started() {
+    let sb = Sandbox::new("nonetd");
+    let out = sb.run(&["doctor", "--json", "--check", "daemon.netd"]);
+    assert_eq!(out.status.code(), Some(0));
+    let check = &json_of(&out)["checks"][0];
+    assert_eq!(check["status"], "info", "{check}");
+    assert_eq!(check["readings"]["running"], false);
+    assert!(
+        !sb.root.join("netd.sock").exists(),
+        "doctor started a daemon"
+    );
+}
+
+#[test]
+fn a_machine_without_a_device_certificate_skips_that_check() {
+    let sb = Sandbox::new("nocert");
+    let out = sb.run(&["doctor", "--json", "--check", "account.certificates"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_of(&out)["checks"][0]["status"], "skip");
+}
+
+/// `--local` and `CERULION_NETWORK=off` skip the network checks without
+/// running them, each naming its cause.
+#[test]
+fn the_network_checks_are_skipped_under_local_and_the_kill_switch() {
+    let sb = Sandbox::new("netgate");
+    let local = sb.run(&[
+        "doctor", "--json", "--local", "--check", "net.mdns", "--check", "net.udp",
+    ]);
+    assert_eq!(local.status.code(), Some(0));
+    for check in json_of(&local)["checks"].as_array().unwrap() {
+        assert_eq!(check["status"], "skip", "{check}");
+        assert!(
+            check["summary"].as_str().unwrap().contains("--local"),
+            "{check}"
+        );
+        assert_eq!(check["elapsed_ms"], 0, "{check}");
+    }
+    let off = run_env(
+        &sb.root,
+        &sb.cwd(),
+        &["doctor", "--json", "--check", "net.mdns"],
+        &[("CERULION_NETWORK", Path::new("off"))],
+    );
+    assert_eq!(off.status.code(), Some(0));
+    let check = &json_of(&off)["checks"][0];
+    assert_eq!(check["status"], "skip", "{check}");
+    assert!(
+        check["summary"]
+            .as_str()
+            .unwrap()
+            .contains("CERULION_NETWORK"),
+        "{check}"
+    );
+}
+
+/// A `--udp-target` on loopback with a stand-in that answers the probe the
+/// way RFC 9000 requires: the check passes.
+#[test]
+fn a_udp_target_that_answers_version_negotiation_passes() {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let responder = std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        let (n, from) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 1200);
+        let dlen = usize::from(buf[5]);
+        let dcid = buf[6..6 + dlen].to_vec();
+        let slen = usize::from(buf[6 + dlen]);
+        let scid = buf[7 + dlen..7 + dlen + slen].to_vec();
+        let mut answer = vec![0xc0, 0, 0, 0, 0, u8::try_from(slen).unwrap()];
+        answer.extend_from_slice(&scid);
+        answer.push(u8::try_from(dlen).unwrap());
+        answer.extend_from_slice(&dcid);
+        answer.extend_from_slice(&1u32.to_be_bytes());
+        server.send_to(&answer, from).unwrap();
+    });
+    let sb = Sandbox::new("udpok");
+    let target = addr.to_string();
+    let out = sb.run(&[
+        "doctor",
+        "--json",
+        "--check",
+        "net.udp",
+        "--udp-target",
+        &target,
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    let check = &json_of(&out)["checks"][0];
+    assert_eq!(check["status"], "pass", "{check}");
+    assert_eq!(check["readings"]["answered"], 1);
+    responder.join().unwrap();
+}
+
+#[test]
+fn no_named_quic_endpoint_skips_the_udp_check() {
+    let sb = Sandbox::new("udpnone");
+    let out = sb.run(&["doctor", "--json", "--check", "net.udp"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_of(&out)["checks"][0]["status"], "skip");
+}
+
+#[test]
+fn a_udp_target_without_a_port_is_a_usage_error() {
+    let sb = Sandbox::new("udpbad");
+    let out = sb.run(&[
+        "doctor",
+        "--check",
+        "net.udp",
+        "--udp-target",
+        "robot.local",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("has no port"));
 }

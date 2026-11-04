@@ -648,6 +648,14 @@ if ! grep -q '"nodes":3' <<<"$open_status" ||
   fail "app linked nodes" "status=${open_status:-none}"
 fi
 pass "app linked nodes" "nodes=3 linked_nodes=printer,relay,timer pid=$open_pid (paired run pid=$paired_pid)"
+# The runtime's own `tracing` lines reach logcat under the Cerulion tag: the
+# open run listens on a fixed TCP port, so the runtime logs whether its mDNS
+# beacon was raised, at info or warn.
+runtime_line="$(device logcat -d --pid="$open_pid" -s Cerulion:V 2>/dev/null | tr -d '\r' |
+  grep -m1 'cerulion_android::runtime: mDNS beacon' || true)"
+[[ -n "$runtime_line" ]] ||
+  fail "runtime line in logcat" "no Cerulion-tagged mDNS beacon line from pid $open_pid"
+pass "runtime line in logcat" "$runtime_line"
 pass "app start after kill" "start=0 in pid $open_pid after force-stop of pid $paired_pid, stale files tolerated"
 # The open `host_list` and `host_echo` spawned a new host netd: stop it too.
 stop_host_netd

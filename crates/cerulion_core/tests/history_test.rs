@@ -272,3 +272,49 @@ fn native_history_variable_schema_round_trips() {
     assert_eq!(mono.0, 8, "height preserved through native history");
     assert_eq!(mono.2, vec![1u8, 2, 3, 4], "data bytes preserved");
 }
+
+// ============================================================
+// The retaining mark: a publisher that asks for history names its port
+// ============================================================
+
+/// A publisher that asks for history carries `RETAINING_PUBLISHER_NAME` in
+/// the service's dynamic config, one that asks for none does not, and a
+/// dropped publisher leaves the list. `rmw_cerulion` resolves a BEST_AVAILABLE
+/// subscription from these flags.
+#[test]
+fn a_publisher_that_asks_for_history_carries_the_retaining_mark_until_it_drops() {
+    let topic = unique_topic("retain_mark");
+    let tt = cerulion_core::testing::TestTransport::with_buffer_size(8);
+    let mgr = tt.manager();
+    assert_eq!(
+        mgr.topic_publisher_retain_marks(&topic).ok(),
+        Some(Vec::new()),
+        "a topic with no service has no publisher"
+    );
+    let retaining = tt.publisher(&topic, MaxSliceLen::const_new(256), 3);
+    assert_eq!(
+        mgr.topic_publisher_retain_marks(&topic).ok(),
+        Some(vec![true]),
+        "the history-3 publisher carries the mark"
+    );
+    let plain = tt.publisher(&topic, MaxSliceLen::const_new(256), 0);
+    let mut marks = mgr
+        .topic_publisher_retain_marks(&topic)
+        .expect("the probe reads the service");
+    marks.sort_unstable();
+    assert_eq!(
+        marks,
+        vec![false, true],
+        "the history-0 publisher on the same service carries none"
+    );
+    drop(retaining);
+    assert_eq!(
+        mgr.topic_publisher_retain_marks(&topic).ok(),
+        Some(vec![false])
+    );
+    drop(plain);
+    assert_eq!(
+        mgr.topic_publisher_retain_marks(&topic).ok(),
+        Some(Vec::new())
+    );
+}
