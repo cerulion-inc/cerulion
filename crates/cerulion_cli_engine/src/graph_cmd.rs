@@ -5262,8 +5262,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     // interval) late — well inside the signal-matrix arms' seconds-scale exit
     // bounds, and nothing an operator can perceive.
     while running.load(Ordering::Relaxed) {
-        let forwarded = gateway.drive_once()?;
-        if forwarded == 0 {
+        let queued = gateway.drive_once()?;
+        if queued == 0 {
             gateway.idle_wait();
         }
     }
@@ -6130,6 +6130,16 @@ pub fn graph_run(
     );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
+    // A single-process recording (on Unix the only `--record` run the monolith
+    // takes) of a graph that reads a topic no node in it publishes is refused
+    // HERE, on the native graph the run would build, before the `ros2:`
+    // entries are spawned, the run directory is written or a recorder starts:
+    // that recording's clock cannot place an outside writer's frames (see the
+    // fn).
+    #[cfg(unix)]
+    if record.is_some() && matches!(deployment, Ok(Deployment::Monolith)) {
+        refuse_outside_inputs_in_single_process_recording(&config, graph_name)?;
+    }
 
     let _exit_hygiene = crate::ipc_cleanup::ExitHygieneGuard::armed();
 
@@ -21614,15 +21624,10 @@ pub fn resolve_recorded_topics(
     // wins; multi-publisher producers share a schema).
     let mut out: indexmap::IndexMap<String, cerulion_bagd::RecordedTopic> =
         indexmap::IndexMap::new();
-    // Every graph-produced topic, selected or not: the external-consumer
-    // classification below is about who PRODUCES a topic, not what this
-    // recording selects.
-    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node_def in &config.nodes {
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
-            produced.insert(topic.clone());
             // The selection applies BEFORE the metadata lookup: a names-only
             // output the recording does not select must not fail startup.
             if selected.is_some_and(|set| !set.contains(&topic)) {
@@ -21749,13 +21754,15 @@ pub fn resolve_recorded_topics(
     // replay engine injects external topics FROM the bag; an unrecorded one
     // injects nothing, so its downstream consumers never fire). This is the
     // SHARED record-time seam: both the single-process path and the
-    // mp supervisor resolve their recorded set through this fn, so both warn
-    // identically at bring-up. Once per topic (consumers deduped, config
-    // order); graph-produced and consumer-less topics never warn. Mirrors the
-    // consumed∧¬produced classification `replay_engine::classify_topics`
-    // applies at replay time.
+    // mp supervisor resolve their recorded set through this fn, but the
+    // single-process path refuses a graph with such a topic before it gets
+    // here (`refuse_outside_inputs_in_single_process_recording`), so on
+    // `graph_run`'s routes only the mp supervisor reaches this warn with one.
+    // Once per topic (consumers deduped, config order); graph-produced and
+    // consumer-less topics never warn. Mirrors the consumed∧¬produced
+    // classification `replay_engine::classify_topics` applies at replay time.
     {
-        let unrecorded = external_consumers(config, &produced);
+        let unrecorded = external_consumers(config);
         for (topic, consumers) in &unrecorded {
             tracing::warn!(
                 topic = %topic,
@@ -21775,10 +21782,11 @@ pub fn resolve_recorded_topics(
 /// even when a recording's topic selection leaves it out of the bag: replay
 /// re-runs its producer and regenerates it.
 #[cfg(unix)]
-fn external_consumers(
-    config: &GraphConfig,
-    produced: &std::collections::HashSet<String>,
-) -> indexmap::IndexMap<String, Vec<String>> {
+fn external_consumers(config: &GraphConfig) -> indexmap::IndexMap<String, Vec<String>> {
+    // Every graph-produced topic, whatever a recording selects (the
+    // classification is about who PRODUCES a topic), by the derivation the
+    // replay's own topic classification uses.
+    let produced = crate::replay_engine::graph_produced_topics(config);
     let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
     for node_def in &config.nodes {
         for input in &node_def.inputs {
@@ -21793,6 +21801,64 @@ fn external_consumers(
         }
     }
     unrecorded
+}
+
+/// Refuse a single-process recording of a graph that reads a topic no node in
+/// it publishes, naming every such topic with its readers (config order).
+///
+/// The recording runs on a controlled gating clock that starts at 0 and
+/// follows measured wall time from the live loop's start, and every frame the
+/// graph publishes carries that clock in its wire `timestamp_ns`. A live
+/// process outside the graph (a plain `graph run`, a driver,
+/// `cerulion-rcpd`) stamps boot-monotonic time: `real_ns()`, or a clock
+/// placed at it when its loop starts. The resim re-advances this recording's
+/// clock from 0 and injects a recorded outside frame before the first step
+/// whose clock target is above the frame's stamp, or equal to it on a step
+/// that did not advance the clock (`replay_engine`'s `InjectionWindow`). A
+/// stamp that counts from boot lies above targets that count from the run's
+/// start, so the frame is injected late or not at all and `--verify` reports
+/// a divergence.
+///
+/// Placing this clock at its live anchor, as a free-run worker does
+/// (`GraphRuntime::place_gating_epoch_at_live_anchor`), puts both writers in
+/// one domain live, but the replay cannot follow it: the bag carries no epoch,
+/// and the replay of this lockstep-stamped bag starts its clock at 0 with each
+/// `Period` deadline one interval later, so its first step would advance by
+/// the whole epoch and every `Period` node would owe a catch-up fire for each
+/// interval since 0. The stamps are not the only gap: the runtime subscribes
+/// when it is built, before the recorder is spawned and taps an outside topic
+/// by discovery, so frames the graph reads in its first steps can be missing
+/// from the bag. `graph_run` calls this for a single-process recording right
+/// after it lifts the `ros2:` entries out of the graph, before it spawns them,
+/// writes the run directory, loads the node factories or builds the runtime.
+#[cfg(unix)]
+fn refuse_outside_inputs_in_single_process_recording(
+    config: &GraphConfig,
+    graph_name: &str,
+) -> CliResult<()> {
+    let outside = external_consumers(config);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = outside
+        .iter()
+        .map(|(topic, readers)| format!("'{topic}' (read by {})", readers.join(", ")))
+        .collect();
+    let what = if outside.len() == 1 {
+        "a topic"
+    } else {
+        "topics"
+    };
+    Err(CliError::Validation(format!(
+        "`graph run --record --single-process`: graph '{graph_name}' reads {what} that no node \
+         in it publishes: {}. A single-process recording stamps its own frames from a clock \
+         that starts at zero when the run starts, while a process outside the graph stamps \
+         boot-monotonic time, so `cerulion bag play --resim` could not inject the outside frames \
+         at the steps that read them. Record this graph without `--single-process`: the default \
+         multi-process run places each process's clock at boot-monotonic time when its loop \
+         starts.",
+        listed.join(", ")
+    )))
 }
 
 /// Parse every workspace `schemas/*.yaml` PLUS every
@@ -23480,10 +23546,18 @@ nodes:
             certificate: Some("/etc/cerulion/me.pem".into()),
             private_key: Some("/etc/cerulion/me.key".into()),
         };
-        let qos = vec![cerulion_core::EgressQos {
-            topic: "/r/scan".to_string(),
-            reliability: cerulion_core::EgressReliability::BestEffort,
-        }];
+        let qos = vec![
+            cerulion_core::EgressQos {
+                topic: "/r/scan".to_string(),
+                reliability: cerulion_core::EgressReliability::BestEffort,
+                send_queue: None,
+            },
+            cerulion_core::EgressQos {
+                topic: "/r/cam".to_string(),
+                reliability: cerulion_core::EgressReliability::Reliable,
+                send_queue: std::num::NonZeroUsize::new(8),
+            },
+        ];
         let cfg = cerulion_core::NetworkConfig {
             listen_endpoints: vec!["quic/0.0.0.0:7447?mixed_rel=1".to_string()],
             tls: Some(tls.clone()),
@@ -24360,19 +24434,133 @@ nodes:
                     - id: b\n    type: b\n    inputs:\n      - name: i\n        \
                     source: a/o\n      - name: j\n        source: /outside\n";
         let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
-        let produced: std::collections::HashSet<String> = config
-            .nodes
-            .iter()
-            .flat_map(|node| {
-                node.outputs.iter().map(|output| {
-                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
-                })
-            })
-            .collect();
-        let external = external_consumers(&config, &produced);
+        let external = external_consumers(&config);
         assert_eq!(
             external.into_iter().collect::<Vec<_>>(),
             vec![("/outside".to_string(), vec!["b".to_string()])]
+        );
+    }
+
+    /// The refusal names every topic no node publishes, each with its readers
+    /// in config order, and says why and what to run instead. A topic the
+    /// graph publishes is never named, whether a reader spells it relative or
+    /// absolute.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_process_recording_refuses_a_graph_that_reads_an_outside_topic() {
+        let yaml = "name: ext\nprefix: ext\nnodes:\n  - id: a\n    type: a\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+                    - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+                    source: a/o\n      - name: j\n        source: /outside\n  \
+                    - id: c\n    type: c\n    inputs:\n      - name: k\n        \
+                    source: /outside\n      - name: l\n        source: /other\n      \
+                    - name: m\n        source: /ext/a/o\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let msg = match refuse_outside_inputs_in_single_process_recording(&config, "ext") {
+            Err(CliError::Validation(msg)) => msg,
+            other => panic!("expected the validation refusal, got {other:?}"),
+        };
+        let expected = "`graph run --record --single-process`: graph 'ext' reads topics that \
+                        no node in it publishes: '/outside' (read by b, c), '/other' (read by \
+                        c). A single-process recording stamps its own frames from a clock that \
+                        starts at zero when the run starts, while a process outside the graph \
+                        stamps boot-monotonic time, so `cerulion bag play --resim` could not \
+                        inject the outside frames at the steps that read them. Record this \
+                        graph without `--single-process`: the default multi-process run places \
+                        each process's clock at boot-monotonic time when its loop starts.";
+        assert_eq!(msg, expected);
+    }
+
+    /// One outside topic reads in the singular; the same input refuses with
+    /// the same text every time.
+    #[cfg(unix)]
+    #[test]
+    fn the_refusal_of_one_outside_topic_is_singular_and_stable() {
+        let yaml = "name: one\nprefix: one\nnodes:\n  - id: r\n    type: r\n    \
+                    inputs:\n      - name: i\n        source: /feed/cmd\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let render = || match refuse_outside_inputs_in_single_process_recording(&config, "one") {
+            Err(CliError::Validation(msg)) => msg,
+            other => panic!("expected the validation refusal, got {other:?}"),
+        };
+        let first = render();
+        assert!(
+            first.starts_with(
+                "`graph run --record --single-process`: graph 'one' reads a topic that no \
+                 node in it publishes: '/feed/cmd' (read by r). "
+            ),
+            "{first}"
+        );
+        assert_eq!(first, render());
+    }
+
+    /// A graph whose every input is one of its own outputs, relative or
+    /// absolute, and a graph with no inputs at all, record as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_process_recording_accepts_a_graph_that_reads_only_its_own_topics() {
+        for yaml in [
+            "name: own\nprefix: own\nnodes:\n  - id: a\n    type: a\n    \
+             outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+             - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+             source: a/o\n      - name: j\n        source: /own/a/o\n",
+            "name: solo\nprefix: solo\nnodes:\n  - id: a\n    type: a\n    \
+             outputs:\n      - name: o\n        schema: std_msgs/String\n",
+        ] {
+            let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+            assert!(
+                refuse_outside_inputs_in_single_process_recording(&config, "g").is_ok(),
+                "{yaml}"
+            );
+        }
+    }
+
+    /// The outside-input refusal precedes every side effect of a recording run:
+    /// in `graph_run` it sits on the native graph after the `ros2:` split and
+    /// before the `ros2:` spawn, the run directory, the node factory load and
+    /// the recording dispatch, and `run_graph_recording` no longer makes it.
+    /// The e2e arm sees only that the single-process bring-up never logged;
+    /// this walk pins the order against each earlier side effect.
+    #[cfg(unix)]
+    #[test]
+    fn the_outside_input_refusal_precedes_every_side_effect_of_a_recording_run() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let refusal = body
+            .find("refuse_outside_inputs_in_single_process_recording(")
+            .expect("graph_run makes the outside-input refusal");
+        let split = body
+            .find("take_ros2_entries(")
+            .expect("graph_run lifts the `ros2:` entries out");
+        assert!(
+            split < refusal,
+            "the refusal must read the native graph, after the `ros2:` split"
+        );
+        for later in [
+            "Ros2Children::spawn(",
+            "begin_run_descriptor(",
+            "load_node_factories_from_cache(",
+            "run_graph_recording(RecordingRun",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("graph_run must still call `{later}`"));
+            assert!(
+                refusal < at,
+                "the refusal must come before `{later}`, or a refused run has already \
+                 started part of itself"
+            );
+        }
+        let recording = fn_body(
+            &src,
+            "fn run_graph_recording(run: RecordingRun) -> CliResult<()> {\n    let \
+             RecordingRun {\n        workspace_root,",
+        )
+        .expect("the Unix run_graph_recording must exist");
+        assert!(
+            !recording.contains("refuse_outside_inputs_in_single_process_recording("),
+            "the refusal has one call site, in graph_run"
         );
     }
 
@@ -25314,7 +25502,7 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let ready = tmp.path().join("never.ready");
         let running = AtomicBool::new(true);
-        let mut guard = spawn_fake("sleep 30");
+        let mut guard = spawn_fake("exec sleep 30");
         let err = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_millis(200))
             .expect_err("a never-ready child must time out");
         assert!(
@@ -25351,7 +25539,7 @@ nodes:
         let running = AtomicBool::new(true);
         // The fake child writes the sentinel itself then sleeps (still alive
         // when ready is observed — the production shape).
-        let mut guard = spawn_fake(&format!("touch {} && sleep 30", ready.display()));
+        let mut guard = spawn_fake(&format!("touch {} && exec sleep 30", ready.display()));
         let outcome = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_secs(10))
             .expect("sentinel must yield Ready");
         assert_eq!(outcome, BagdReadyWait::Ready);
@@ -25364,7 +25552,7 @@ nodes:
         let tmp = tempfile::tempdir().unwrap();
         let ready = tmp.path().join("never.ready");
         let running = AtomicBool::new(false); // Ctrl-C already observed
-        let mut guard = spawn_fake("sleep 30");
+        let mut guard = spawn_fake("exec sleep 30");
         let outcome = wait_for_bagd_ready(&mut guard, &ready, &running, Duration::from_secs(10))
             .expect("Ctrl-C is NOT an error");
         assert_eq!(outcome, BagdReadyWait::CtrlC, "user abort → CtrlC, not Err");
@@ -25381,7 +25569,7 @@ nodes:
             other => panic!("a fast-exiting child must report Exited, got {other:?}"),
         }
         // TimedOut arm (child still running at the deadline).
-        let mut slow = spawn_fake("sleep 30");
+        let mut slow = spawn_fake("exec sleep 30");
         match wait_for_child_bounded(&mut slow, Duration::from_millis(150)) {
             ChildExitWait::TimedOut => {}
             other => panic!("a still-running child must report TimedOut, got {other:?}"),
@@ -27409,7 +27597,7 @@ nodes:
         );
 
         // TimedOut → the finalize-deadline message (kills + reaps the child).
-        let mut slow_guard = spawn_fake("sleep 30");
+        let mut slow_guard = spawn_fake("exec sleep 30");
         let err = report_bagd_outcome("g", &out, ChildExitWait::TimedOut, &mut slow_guard)
             .expect_err("a finalize timeout must be an error");
         let msg = err.to_string();
