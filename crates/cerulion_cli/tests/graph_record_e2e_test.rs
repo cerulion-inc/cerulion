@@ -17,8 +17,10 @@
 //!    `/proc/<pid>/status` `Cpus_allowed_list` equals the requested core.
 //!
 //! Prerequisite (repo pattern, mirrors `rayon_fire_cdylib_serial_test`):
-//! `cargo build -p test_node_macro_period_cdylib` — the test PANICS with that
-//! instruction if the fixture artifact is missing.
+//! `cargo build -p test_node_macro_period_cdylib -p
+//! test_node_macro_data_trigger_cdylib` (the outside-input arm copies the
+//! second as its relay); a test PANICS with that instruction if a fixture
+//! artifact is missing.
 //!
 //! Runs on the GLOBAL iceoryx2 namespace (the production `graph run` path has
 //! no isolation seam — that is the point of an orchestration e2e); `#[serial]`
@@ -1231,4 +1233,84 @@ fn record_e2e_channel_wire_size_comes_from_the_node_when_the_workspace_file_disa
              proves nothing about this one; line:\n{warn}"
         );
     }
+}
+
+/// Stage the OUTSIDE-INPUT workspace: `build_workspace`'s, with `demo` replaced
+/// by one `relay` node (a copy of the prebuilt
+/// `test_node_macro_data_trigger_cdylib`, which fires on `trigger_in`) whose
+/// input reads `/{prefix}/ticker/cmd`, a topic no node in `demo` publishes.
+fn build_outside_input_workspace(root: &Path, prefix: &str) {
+    build_workspace(root, prefix);
+    std::fs::create_dir_all(root.join("nodes/relay/src")).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_fixtures/test_node_macro_data_trigger_cdylib/src/lib.rs"),
+        root.join("nodes/relay/src/lib.rs"),
+    )
+    .expect("copy relay fixture src");
+    std::fs::copy(
+        cerulion_core::testing::find_fixture_cdylib("test_node_macro_data_trigger_cdylib"),
+        root.join("target/debug").join(dylib_file("relay")),
+    )
+    .expect("copy relay fixture cdylib");
+    std::fs::write(
+        root.join("graphs/demo.yaml"),
+        format!(
+            "name: demo\nprefix: {prefix}\nnodes:\n- id: relay\n  type: relay\n  inputs:\n  \
+             - name: trigger_in\n    source: /{prefix}/ticker/cmd\n  outputs:\n  - name: cmd\n    \
+             schema: geometry_msgs/Vector3\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A single-process recording of a graph that reads a topic no node in it
+/// publishes is REFUSED before the run starts: exit 1, the refusal names the
+/// topic and its reader and says to record without `--single-process`, the
+/// single-process bring-up (which logs once the node libraries are loaded for
+/// the run) never began, and no bag was written.
+///
+/// Without the refusal, the same run with an outside publisher on that topic
+/// records, and `bag play --resim all --verify` on its bag exits 6 with the
+/// relay replaying none of its frames: the publisher's boot-monotonic stamps
+/// lie above every step target of this recording's clock, which starts at
+/// zero.
+#[test]
+#[serial]
+fn record_e2e_refuses_a_graph_that_reads_a_topic_no_node_in_it_publishes() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_outside_input_workspace(tmp.path(), "rece2eout");
+    let (mut guard, _stdout_path, stderr_path) = spawn_graph_record(tmp.path(), &[]);
+    let _bagd_guard = BagdGuard;
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(60))
+        .expect("a refused recording returns on its own");
+    let log = strip_ansi(&read_file(&stderr_path));
+    assert_eq!(status.code(), Some(1), "the refusal exits 1; log:\n{log}");
+    for want in [
+        "graph 'demo' reads a topic that no node in it publishes: \
+         '/rece2eout/ticker/cmd' (read by relay).",
+        "Record this graph without `--single-process`",
+    ] {
+        assert!(
+            log.contains(want),
+            "the refusal must say {want:?}; log:\n{log}"
+        );
+    }
+    assert!(
+        !log.contains("the never-returning-tick alarm is not reporting"),
+        "the refusal comes before the single-process bring-up; log:\n{log}"
+    );
+    let bags: Vec<PathBuf> = std::fs::read_dir(tmp.path().join("recordings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("mcap"))
+        .collect();
+    assert!(
+        bags.is_empty(),
+        "a refused recording writes no bag: {bags:?}"
+    );
 }
