@@ -1525,9 +1525,11 @@ pub struct CerulionSubscriber {
     /// Consecutive BOUNDARY RE-OFFERS of the same unserved frozen
     /// FIFO head (see [`Self::snapshot_latest_for_trigger`]). Reset to 0 the
     /// moment either trigger drain actually pops — i.e. the moment a tick took
-    /// the head. Non-zero only on the Unified drain discipline, for an
-    /// `EachFifo` input or a `consume = latest` trigger input, the two that
-    /// re-offer a frozen frame no tick has read.
+    /// the head. Non-zero only on the Unified drain discipline. For a
+    /// `consume = latest` trigger input it counts the boundaries since a tick
+    /// last read the input: a boundary that finds the frozen frame unread
+    /// increments it whether it re-offers that frame or replaces it with a
+    /// newer one, and a boundary that finds no unread frame resets it.
     ///
     /// The two sides are deliberately ASYMMETRIC: only a
     /// [`TriggerDrainSite::Boundary`] re-offer INCREMENTS it (a boundary runs

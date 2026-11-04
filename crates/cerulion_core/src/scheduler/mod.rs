@@ -3864,9 +3864,10 @@ impl Scheduler {
     ///
     /// From then on a step that fires the node with any pending arrival
     /// fires it once and clears the count, where the `fifo` default fires
-    /// once per arrival; a deferred step keeps the count. The arrivals beyond the first are not owed fires: the one
-    /// fire's read drains the queue to the newest frame. Refused for a node
-    /// whose policy is not `Data`, the [`Self::set_trigger_refill`] rule.
+    /// once per arrival; a deferred step keeps the count. The arrivals beyond
+    /// the first are not owed fires: the one fire's read drains the queue to
+    /// the newest frame. Refused for a node whose policy is not `Data`, the
+    /// [`Self::set_trigger_refill`] rule.
     // hot-path-alloc-ok-fn: cold: graph BUILD, once per `consume = latest` node
     pub fn set_data_consume_latest(&mut self, node_id: &str) -> TransportResult<()> {
         let node = self

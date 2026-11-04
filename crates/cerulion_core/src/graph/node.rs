@@ -214,8 +214,9 @@ pub enum InputConsume {
     /// At most one fire per scheduler step: the read drains the queue and
     /// serves the newest frame. The older frames it drained are not served.
     /// A frame no fire has read yet is kept until a newer one arrives, so a
-    /// deferred fire (`throttle_ms`, a `block` gate) still reads it; a receive
-    /// that fails at that drain replaces it with the error the read reports.
+    /// deferred fire (`throttle_ms`, a `block` gate) still reads it. A receive
+    /// that fails at that drain drops the frame; a fire on that step reads the
+    /// error.
     Latest,
 }
 

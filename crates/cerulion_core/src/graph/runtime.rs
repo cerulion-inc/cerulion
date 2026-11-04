@@ -5476,19 +5476,26 @@ impl GraphRuntime {
         // A `consume = latest` trigger input has the same borrow peak: its
         // subscriber keeps a frame no tick has read borrowed through the next
         // boundary's drain-to-latest (subscriber.rs `drain_for_trigger`), so
-        // held(1) + latest(1) + receive-transient(1) = 3 when two or more
-        // newer frames are queued behind it. At the iceoryx2 default of 2 the
-        // third receive fails with `ExceedsMaxBorrows`. Its source topic takes
-        // the same raise.
+        // with two or more newer frames queued behind it the drain's second
+        // receive is the third borrow, which fails with `ExceedsMaxBorrows`
+        // at the iceoryx2 default of 2. Its source topic takes the same raise,
+        // and with it the same open requirement: a service a foreign opener
+        // already created at the default refuses the build. Read on a
+        // `DataTrigger` node's named input only, the input the data-trigger
+        // wiring below treats as `latest`.
         for node_def in &config.nodes {
             let Some(info) = entry_infos.get(&node_def.id) else {
                 continue;
             };
+            let Some(MacroPolicy::DataTrigger { input_name }) = info.policy.as_ref() else {
+                continue;
+            };
             for input in &node_def.inputs {
-                if info
-                    .input_meta
-                    .iter()
-                    .any(|m| m.name == input.name && m.consume == InputConsume::Latest)
+                if input.name == *input_name
+                    && info
+                        .input_meta
+                        .iter()
+                        .any(|m| m.name == input.name && m.consume == InputConsume::Latest)
                 {
                     snapshot_source_topics.insert(resolve_source(&config.prefix, &input.source));
                 }
