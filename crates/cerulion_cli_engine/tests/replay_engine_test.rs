@@ -3217,12 +3217,33 @@ fn latest_relay_round_trip(
 
     // The same recording stamped free run: the fire re-derivation runs only
     // on a free-run bag, so this is where the latest decider reads a real
-    // read log, and a `LatestFire` finding would surface as the read-log
-    // verdict `assert_clean_verdict` requires to be absent.
+    // read log. A `LatestFire` finding surfaces as the trace divergence
+    // `assert_clean_verdict` requires to be absent.
     let free = dir.path().join("latest_free_run.mcap");
     write_bag_with_coordination(&rec, &free, replay_engine::CoordinationMode::FreeRun);
     let f = replay(&free, make, None, None).expect("free-run replay runs");
     assert_clean_verdict(&f, &format!("{node_type} (free run)"));
+    // A clean verdict also follows from the verifier standing aside, so the
+    // arm requires that it judged: no whole-rank decline (subject `rank N`),
+    // no node whose metadata could not be read (no `code`), and no stand-down
+    // of the latest decider (its label in the detail). The sampled relay is
+    // exempt from the last, because a decimated read stands the decider down
+    // by rule (`StandDownReason::DecimatedRead`).
+    let sampled = node_type == "sampled_latest_relay_node";
+    let stood_aside: Vec<_> = f
+        .rederivation_notes
+        .iter()
+        .filter(|n| {
+            n.kind == replay_engine::RederivationNoteKind::StandDown
+                && (n.subject.starts_with("rank ")
+                    || n.code.is_none()
+                    || (!sampled && n.detail.contains("consume = latest fire count")))
+        })
+        .collect();
+    assert!(
+        stood_aside.is_empty(),
+        "{node_type}: the verifier judged the free-run bag: {stood_aside:?}"
+    );
 }
 
 /// A `consume = latest` relay fed BURSTS: one output per step that saw
