@@ -480,9 +480,10 @@ fn parse_input_attr(
     Ok(result)
 }
 
-/// The refusal for `consume` on a non-trigger input. Shared with the
-/// `cerulion` source reader's mirror of this grammar, which must refuse the
-/// same source with the same words.
+/// The refusal for `consume` on a non-trigger input. The `cerulion` source
+/// reader's mirror of this grammar carries a copy of these words, and
+/// `the_consume_refusals_match_the_macro_source_word_for_word` in
+/// `cerulion_cli_engine` fails when the two differ.
 pub(crate) const CONSUME_NEEDS_TRIGGER: &str =
     "`consume` applies only to a trigger input: write `#[input(trigger, consume = latest)]`. \
      A non-trigger input never fires the node; it is a latest-value read that already \

@@ -214,7 +214,8 @@ pub enum InputConsume {
     /// At most one fire per scheduler step: the read drains the queue and
     /// serves the newest frame. The older frames it drained are not served.
     /// A frame no fire has read yet is kept until a newer one arrives, so a
-    /// deferred fire (`throttle_ms`, a `block` gate) still reads it.
+    /// deferred fire (`throttle_ms`, a `block` gate) still reads it; a receive
+    /// that fails at that drain replaces it with the error the read reports.
     Latest,
 }
 
@@ -5403,14 +5404,6 @@ impl DylibNodeEntry {
                 },
             })
             .collect();
-        // The FFI half of the duplicate-port-name
-        // enforcement: a buggy cdylib emitting two entries with the same
-        // name would otherwise silently last-win in
-        // `build_output_meta_lookup` (conflicting schema_hash /
-        // max_slice_len) or first-win in input wiring. FFI input is
-        // runtime-bound, so this is an `Err` (caught by `info()`'s loud
-        // error!-and-default fallback) — the constructors' asserts guard
-        // the in-crate paths and must not be reachable from FFI data.
         // `consume` on a non-trigger input is refused, as the macro refuses
         // it at compile time: a hand-written info block must not load a
         // declaration no `#[cerulion_node]` source can produce, and that
@@ -5443,6 +5436,14 @@ impl DylibNodeEntry {
                 entry.name
             ));
         }
+        // The FFI half of the duplicate-port-name
+        // enforcement: a buggy cdylib emitting two entries with the same
+        // name would otherwise silently last-win in
+        // `build_output_meta_lookup` (conflicting schema_hash /
+        // max_slice_len) or first-win in input wiring. FFI input is
+        // runtime-bound, so this is an `Err` (caught by `info()`'s loud
+        // error!-and-default fallback) — the constructors' asserts guard
+        // the in-crate paths and must not be reachable from FFI data.
         for (idx, name) in input_names.iter().enumerate() {
             if input_names[..idx].contains(name) {
                 // `parse_info_json` returns `Err(String)`; the caller wraps it

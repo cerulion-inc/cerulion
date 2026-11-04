@@ -498,8 +498,10 @@ struct ScheduledNode {
     next_fire_ns: Option<u64>,
     pending_data_count: u64,
     /// The node's `Data` trigger input declares `consume = latest`: a step
-    /// with any pending arrival fires the node ONCE and clears the count,
-    /// because that one fire's read drains the queue to its newest frame.
+    /// that fires the node with any pending arrival fires it ONCE and clears
+    /// the count, because that one fire's read drains the queue to its newest
+    /// frame. A deferred step (`throttle_ms`, a `block` gate) returns before
+    /// the collapse and keeps the count.
     /// Set at graph build by [`Scheduler::set_data_consume_latest`]; `false`
     /// (one fire per arrival) otherwise.
     data_consume_latest: bool,
@@ -3860,9 +3862,9 @@ impl Scheduler {
 
     /// Declare that `node_id`'s `Data` trigger input is `consume = latest`.
     ///
-    /// From then on a step that finds any pending arrival fires the node
-    /// once and clears the count, where the `fifo` default fires once per
-    /// arrival. The arrivals beyond the first are not owed fires: the one
+    /// From then on a step that fires the node with any pending arrival
+    /// fires it once and clears the count, where the `fifo` default fires
+    /// once per arrival; a deferred step keeps the count. The arrivals beyond the first are not owed fires: the one
     /// fire's read drains the queue to the newest frame. Refused for a node
     /// whose policy is not `Data`, the [`Self::set_trigger_refill`] rule.
     // hot-path-alloc-ok-fn: cold: graph BUILD, once per `consume = latest` node

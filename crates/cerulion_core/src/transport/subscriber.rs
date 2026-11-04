@@ -1516,16 +1516,18 @@ pub struct CerulionSubscriber {
     /// `EachFifo`: pop exactly ONE sample per read, in FIFO arrival order —
     /// the per-message delivery contract for data-trigger inputs ("fire on
     /// each message arriving"). Set at graph WIRING time for every
-    /// Data-policy trigger input (both Unified and Separate drain
-    /// disciplines); the scheduler pairs it with one fire per pending frame
+    /// Data-policy trigger input declared `consume = fifo`, the default (both
+    /// Unified and Separate drain disciplines); a `consume = latest` trigger
+    /// input keeps `Latest`. The scheduler pairs it with one fire per pending frame
     /// (carrying the remainder across steps), so a burst of N frames yields
     /// N ticks each observing exactly one frame, in order.
     consume_mode: ConsumeMode,
     /// Consecutive BOUNDARY RE-OFFERS of the same unserved frozen
     /// FIFO head (see [`Self::snapshot_latest_for_trigger`]). Reset to 0 the
     /// moment either trigger drain actually pops — i.e. the moment a tick took
-    /// the head. Only ever non-zero for an `EachFifo` input on the Unified
-    /// drain discipline, which is the only place a head can be re-offered.
+    /// the head. Non-zero only on the Unified drain discipline, for an
+    /// `EachFifo` input or a `consume = latest` trigger input, the two that
+    /// re-offer a frozen frame no tick has read.
     ///
     /// The two sides are deliberately ASYMMETRIC: only a
     /// [`TriggerDrainSite::Boundary`] re-offer INCREMENTS it (a boundary runs
@@ -5228,7 +5230,10 @@ impl CerulionSubscriber {
         // Nothing is lost by the silence. A `next_head` cannot survive a step
         // in which its input's head was NOT served (the re-offer guard above
         // returns while `frozen` is `Some(Sample)`, so this branch is
-        // unreachable then), and when it IS served the burst refill promotes in
+        // unreachable then; a `consume = latest` input passes that guard with
+        // its frame held aside, but only the Sync descent,
+        // `sync_peek_next_stamp`, stages a `next_head`, and `latest` is
+        // refused on Sync nodes), and when it IS served the burst refill promotes in
         // the same step — so the head at the NEXT fire is re-recorded by that
         // step's own boundary drain or by the matcher's ops, never left to this
         // one to announce.
