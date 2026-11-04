@@ -48,6 +48,8 @@ mod guard_wait;
 mod init;
 mod misc;
 mod node;
+#[cfg(any(test, feature = "period-park"))]
+mod period_learner;
 mod pubsub;
 mod services;
 

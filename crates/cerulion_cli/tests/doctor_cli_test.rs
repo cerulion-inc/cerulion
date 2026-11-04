@@ -68,7 +68,8 @@ fn run_env(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> Out
         .env_remove("ROS_DISTRO")
         .env_remove("AMENT_PREFIX_PATH")
         .env_remove("RMW_IMPLEMENTATION")
-        .env_remove("CERULION_LIB_DIR");
+        .env_remove("CERULION_LIB_DIR")
+        .env("CERULION_NETD_SOCK", root.join("netd.sock"));
     for (name, value) in env {
         cmd.env(name, value);
     }
@@ -86,7 +87,7 @@ fn json_of(out: &Output) -> serde_json::Value {
 }
 
 /// The catalogue as the verb lists it, in order.
-const CHECK_IDS: [&str; 12] = [
+const CHECK_IDS: [&str; 15] = [
     "limits.open-files",
     "shm.dev-shm",
     "shm.stale-nodes",
@@ -99,6 +100,9 @@ const CHECK_IDS: [&str; 12] = [
     "gpu.cuda",
     "ros.distro",
     "ros.rmw",
+    "account.certificates",
+    "daemon.netd",
+    "daemon.remoted",
 ];
 
 #[test]
@@ -314,4 +318,29 @@ fn a_sourced_ros_without_the_rmw_library_fails() {
             .contains(&*expected.to_string_lossy()),
         "{check}"
     );
+}
+
+/// No daemon listens at the sandbox's private netd socket: the check reports
+/// it as not running and exits 0, and starts nothing.
+#[cfg(unix)]
+#[test]
+fn a_netd_that_is_not_running_is_info_and_nothing_is_started() {
+    let sb = Sandbox::new("nonetd");
+    let out = sb.run(&["doctor", "--json", "--check", "daemon.netd"]);
+    assert_eq!(out.status.code(), Some(0));
+    let check = &json_of(&out)["checks"][0];
+    assert_eq!(check["status"], "info", "{check}");
+    assert_eq!(check["readings"]["running"], false);
+    assert!(
+        !sb.root.join("netd.sock").exists(),
+        "doctor started a daemon"
+    );
+}
+
+#[test]
+fn a_machine_without_a_device_certificate_skips_that_check() {
+    let sb = Sandbox::new("nocert");
+    let out = sb.run(&["doctor", "--json", "--check", "account.certificates"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_of(&out)["checks"][0]["status"], "skip");
 }

@@ -13,7 +13,7 @@ use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
 use cerulion_core::dynamic::{SchemaSet, WireLayout};
 use cerulion_core::graph::{
-    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
+    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry, NodeTickPanicRecords,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
@@ -21,7 +21,8 @@ use cerulion_core::transport::gateway::{
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
-    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
+    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, SUBSCRIBER_MAX_BORROWED_HELD,
+    TRANSPORT_KIND,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess};
@@ -162,6 +163,90 @@ pub struct LastError {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// A graph node whose tick panicked. The graph runtime contains the panic:
+/// the node does not run again, and the rest of the graph keeps running.
+pub struct NodeFailure {
+    /// The node's graph id.
+    pub node_id: String,
+    /// The node's first panic message.
+    pub message: String,
+}
+
+/// The nodes of the current graph whose tick panicked, in graph order.
+///
+/// Read while the graph runs: [`Self::list`] and the status JSON read the
+/// graph runtime's records at the time of the read. A clone keeps the list
+/// as it was when cloned, so a cloned [`Status`] is a snapshot. The records
+/// stay readable after `stop`; the next start whose config parses and
+/// passes its path checks clears them, also when that start then fails.
+#[derive(Default)]
+pub struct NodeFailures {
+    source: FailureSource,
+}
+
+enum FailureSource {
+    /// The records the graph's tick callbacks write.
+    Live(NodeTickPanicRecords),
+    /// A fixed list: empty before a graph is built, or the list a clone read.
+    Snapshot(Vec<NodeFailure>),
+}
+
+impl Default for FailureSource {
+    fn default() -> Self {
+        Self::Snapshot(Vec::new())
+    }
+}
+
+impl NodeFailures {
+    fn live(records: NodeTickPanicRecords) -> Self {
+        Self {
+            source: FailureSource::Live(records),
+        }
+    }
+
+    /// The failed nodes, in graph order.
+    pub fn list(&self) -> Vec<NodeFailure> {
+        match &self.source {
+            FailureSource::Live(records) => records
+                .snapshot()
+                .into_iter()
+                .map(|(node_id, message)| NodeFailure { node_id, message })
+                .collect(),
+            FailureSource::Snapshot(list) => list.clone(),
+        }
+    }
+}
+
+impl Clone for NodeFailures {
+    fn clone(&self) -> Self {
+        Self {
+            source: FailureSource::Snapshot(self.list()),
+        }
+    }
+}
+
+impl PartialEq for NodeFailures {
+    fn eq(&self, other: &Self) -> bool {
+        // Two reads of one live view could straddle a new panic.
+        std::ptr::eq(self, other) || self.list() == other.list()
+    }
+}
+
+impl Eq for NodeFailures {}
+
+impl std::fmt::Debug for NodeFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.list()).finish()
+    }
+}
+
+impl Serialize for NodeFailures {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.list().serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// The recorder totals written by a completed runtime.
 pub struct RecorderSummary {
     /// Total user messages written.
@@ -205,6 +290,9 @@ pub struct Status {
     pub recorder: Option<RecorderSummary>,
     /// Most recent runtime error.
     pub last_error: Option<LastError>,
+    /// Graph nodes whose tick panicked, in graph order. The state stays
+    /// `running`: the graph keeps running without them.
+    pub node_failures: NodeFailures,
 }
 
 impl Status {
@@ -222,6 +310,7 @@ impl Status {
             published: BTreeMap::new(),
             recorder: None,
             last_error: None,
+            node_failures: NodeFailures::default(),
         }
     }
 }
@@ -490,6 +579,7 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
+        let log_level = config.log_level;
         {
             let mut status = lock_status(&self.status);
             status.state = RuntimeState::Starting;
@@ -504,6 +594,7 @@ impl EmbeddedRuntime {
             status.published.clear();
             status.recorder = None;
             status.last_error = None;
+            status.node_failures = NodeFailures::default();
         }
         let planned = install_iceoryx_config(&self.files_dir)
             .and_then(|()| self.plan_start(config))
@@ -515,6 +606,12 @@ impl EmbeddedRuntime {
                 return Err(error);
             }
         };
+        // Set just before the build, so the build's lines use it. A start
+        // refused before this point never touches the process-wide level; a
+        // later failure (another runtime owns the gateway, a recording file
+        // exists) drops `level`, which returns to the last kept level. A
+        // restart without the key returns to `info`.
+        let level = crate::log::set_level(log_level);
         let mut run = match build(&mut plan, manager, &self.status) {
             Ok(run) => run,
             Err(failure) => {
@@ -540,6 +637,9 @@ impl EmbeddedRuntime {
             return Err(error);
         }
         self.run = Some(run);
+        if let Some(level) = level {
+            level.keep();
+        }
         Ok(())
     }
 
@@ -1200,6 +1300,9 @@ fn build_into(
         )
         .map_err(|error| EmbedError::Graph(error.to_string()))?;
         graph_runtime.set_live_transport(Arc::clone(&manager));
+        // The graph thread takes the runtime: status keeps this reader.
+        lock_status(status).node_failures =
+            NodeFailures::live(graph_runtime.node_tick_panic_records());
         Some(graph_runtime)
     } else {
         None
@@ -1464,20 +1567,19 @@ fn create_publishers(
                     "publisher slot size exceeds the wire transport limit".to_string(),
                 )
             })?;
-        // A RECORDED app topic gets the same tap
-        // provisioning the graph build applies to recorded graph outputs;
-        // a non-recorded publisher keeps the default config.
-        let publisher = if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
-            manager.create_publisher_with_topic_config(
-                &item.topic,
-                slot_len,
-                0,
-                recorded_publisher_config(manager.default_topic_config(), slot_len),
-            )
-        } else {
-            manager.create_publisher(&item.topic, slot_len, 0)
+        // The app creates its topics before the graph builds, so each one is
+        // created at the borrow floor a graph output gets: a graph node that
+        // holds the topic as a latest-value input (an absolute `source:`)
+        // needs it to open the topic. A RECORDED app topic also gets the tap
+        // provisioning the graph build applies to recorded graph outputs.
+        let mut topic_config = manager.default_topic_config();
+        topic_config.create_borrow_floor = Some(SUBSCRIBER_MAX_BORROWED_HELD);
+        if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
+            topic_config = recorded_publisher_config(topic_config, slot_len);
         }
-        .map_err(|error| EmbedError::Publish(error.to_string()))?;
+        let publisher = manager
+            .create_publisher_with_topic_config(&item.topic, slot_len, 0, topic_config)
+            .map_err(|error| EmbedError::Publish(error.to_string()))?;
         publishers.insert(
             item.topic.clone(),
             PublisherState {
@@ -1532,7 +1634,8 @@ fn wait_recorder_ready(
 
 /// The topic service config an app publisher on a
 /// RECORDED topic creates the service with: the graph build's recorded-topic
-/// raise applied to a default-opener base, so the bagd tap gets the same
+/// raise applied to `base` (the caller passes the default config with the
+/// app topics' borrow floor set), so the bagd tap gets the same
 /// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
 /// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
 fn recorded_publisher_config(
@@ -2247,6 +2350,61 @@ mod tests {
         assert_eq!(
             json["linked_nodes"],
             serde_json::json!(["printer", "relay"])
+        );
+    }
+
+    #[test]
+    fn status_json_lists_no_node_failures_before_a_graph_runs() {
+        let status = Status::new("robot".to_string());
+        assert!(status.node_failures.list().is_empty());
+        let json = serde_json::to_value(&status).expect("status JSON");
+        assert_eq!(json["node_failures"], serde_json::json!([]));
+    }
+
+    /// A graph whose one node `wheel` is the panic fixture: it panics on its
+    /// third 50 ms tick.
+    fn panic_fixture_graph() -> GraphRuntime {
+        let config = parse_graph(
+            "prefix: status_unit
+nodes:
+  - id: wheel
+    type: test_node_macro_period_panic_cdylib
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+",
+        )
+        .expect("parse the panic graph");
+        let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> =
+            indexmap::IndexMap::new();
+        factories.insert(
+            "wheel".to_string(),
+            Box::new(test_node_macro_period_panic_cdylib::PeriodNodeEntry::new()),
+        );
+        let clock = Arc::new(cerulion_core::clock::VirtualClock::new());
+        GraphRuntime::build_for_test(config, factories, clock, 4096).expect("build the panic graph")
+    }
+
+    #[test]
+    fn node_failures_read_live_and_a_clone_keeps_what_it_read() {
+        let mut graph = panic_fixture_graph();
+        let live = NodeFailures::live(graph.node_tick_panic_records());
+        let before = live.clone();
+        // Ticks 1 and 2 publish; tick 3 panics.
+        for _ in 0..3 {
+            graph.step(Duration::from_millis(50));
+        }
+        let expected = vec![NodeFailure {
+            node_id: "wheel".to_string(),
+            message: "injected candidate crash at tick 3 (exit-3 twin)".to_string(),
+        }];
+        assert_eq!(live.list(), expected);
+        assert!(before.list().is_empty(), "a clone is a snapshot");
+        assert_ne!(live, before);
+        assert_eq!(live.clone(), live);
+        assert_eq!(
+            format!("{live:?}"),
+            "[NodeFailure { node_id: \"wheel\", message: \"injected candidate crash at tick 3 (exit-3 twin)\" }]"
         );
     }
 

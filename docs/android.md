@@ -302,6 +302,41 @@ error code 5; `start` still returns `OK` because it only queues the start, and
 that names the type and the linked types. `status` lists the linked types in
 `linked_nodes`.
 
+To send app events into a linked node, publish them on an app topic and read
+that topic in the graph through an absolute `source:` (a name that starts with
+`/`). No node in the graph produces the topic, so the graph attaches to the
+topic the app publishes. Here `logic` is a node type listed in the library's
+`embed_nodes!`:
+
+```json
+{
+  "graph_yaml": "<the text of graph.yaml>",
+  "publish": [{"topic": "/myapp/taps", "schema": "geometry_msgs/Vector3"}]
+}
+```
+
+```yaml
+prefix: myapp
+nodes:
+  - id: logic
+    type: logic
+    inputs:
+      - name: taps
+        source: /myapp/taps
+    outputs:
+      - name: state
+        schema: geometry_msgs/Vector3
+```
+
+Each `CerulionRuntime.publish("/myapp/taps", ...)` call is one frame on the
+node's input. A trigger input (`#[input(trigger)]`) ticks the node once per
+frame, in publish order; a burst larger than the input's `depth` (default 10)
+drops its oldest frames. On an app topic that is not recorded, a `depth` above
+16 fails the start. A plain `#[input]` on a `period_ms` node holds the
+latest frame: the node produces nothing until the first publish, and then
+reads the newest value on each tick. The runtime creates every `publish` topic
+with room for a node that holds its latest value, so both kinds of input start.
+
 The app's graph topics are served by its gateway. A host sees them with
 `adb forward tcp:7683 tcp:7683` and
 `cerulion topic list --connect tcp/127.0.0.1:7683`. A `cerulion topic list`
@@ -420,6 +455,7 @@ The configuration keys are:
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
+| `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 
 Omitting `record.topics` records all graph output and app-published topics.
 Topics use canonical names with a leading `/`. Publish schemas must be known
@@ -439,9 +475,9 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `11 BUSY`, `12 PANIC`, and `13 SPAWN`.
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
-`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
-`last_error`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
-`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`,
+`last_error`, and `node_failures`. State is `idle`, `starting`, `running`,
+`stopping`, `finished`, `stopped`, or `failed`; `last_error` is null or an object with a stable code and
 message. `finished` means a graph ended on its own after a node requested
 shutdown. Call `stop` to finalize its recording, then start again. Before
 initialization, the state is `uninitialized`. With recording disabled, a
@@ -459,14 +495,55 @@ snapshot can look like this:
   "record_path": null,
   "published": {"/app/heartbeat": 2},
   "recorder": null,
-  "last_error": null
+  "last_error": null,
+  "node_failures": []
 }
 ```
+
+`node_failures` lists each graph node whose tick panicked, in graph order,
+as an object with the node's graph `node_id` and its first panic `message`.
+The runtime contains the panic: that node does not run again, the rest of
+the graph keeps running, and `state` stays `running`. A node is listed once.
+The list stays readable after `stop`. The next `start` whose config parses
+and passes its path checks clears it, also when that start then fails, for
+example on a node type that is not linked. A node that returns an error
+from its tick is not listed.
 
 The `recorder` summary is available after stop and includes message, channel,
 byte, per-topic, and output-path totals. App files are private to the app:
 recordings are stored in `files/bags/`, and custom schemas are read from
 `files/schemas/`.
+
+### Logs in logcat
+
+The runtime's own `tracing` lines, and those of every node linked into the
+app library, go to logcat under the tag `Cerulion`:
+
+```sh
+adb logcat -s Cerulion
+```
+
+Each line reads `<target>: <message> <field>=<value>...`, for example
+`cerulion_android::runtime: mDNS beacon registered port=7683`; span fields
+are not included. An `error` line has logcat priority `E`, `warn` has `W`,
+`info` has `I`, `debug` has `D` and `trace` has `V`.
+
+`embed_nodes!` installs the logcat subscriber when Java loads the library,
+so a node registration error reaches logcat too; `CerulionRuntime.init`
+installs it when the load did not. To keep your own `tracing` subscriber,
+write your own `JNI_OnLoad`, set your subscriber there as the global
+default, then call `cerulion_android::nodes::register`. The runtime then
+writes nothing to logcat, and `log_level` has no effect.
+
+The `log_level` start key sets the lowest level written, `info` unless set.
+Each start sets it again, so a start without the key returns to `info`. A
+start sets it just before it builds the graph and its components, so the
+lines of that build use it, and a start that fails after that puts the
+previous level back. A start refused earlier, for example because the
+runtime is already running or its config fails to parse or fails its path
+checks, never changes it. A release build of the app library keeps only `info` and
+above: its `debug` and `trace` lines are compiled out, whatever `log_level`
+says.
 
 ## Discovery and access
 
@@ -620,6 +697,7 @@ The lane also checks the sample app's linked graph nodes:
   second, finalized recording with both topics;
 - a start after `am force-stop` succeeds in a new process over the files the
   killed process left;
+- a `tracing` line from the runtime reaches logcat under the `Cerulion` tag;
 - no SELinux denial is logged for the app's domain in any run.
 
 Run it locally with a booted API 30 emulator:
@@ -696,8 +774,9 @@ abstract socket access depend on process ownership and SELinux policy. Native
 node libraries are built on a host and retain their target-triple directory
 when copied to a device. An Android app runs only the graph nodes linked into
 its native library, cannot run a graph with `process_groups` (error code 5),
-cannot host the paired remote plane, and cannot run `cerulion viz`. A `tracing`
-line logged by a node in an app does not reach logcat. A `cerulion topic list`
-run on the device cannot see an app's topics; read them from a host through
-the app's gateway. Emulator networking does not pass multicast to the host, so
-test mDNS from a physical device or from the device itself.
+cannot host the paired remote plane, and cannot run `cerulion viz`. A line
+logged through the `log` crate instead of `tracing` does not reach logcat. A
+`cerulion topic list` run on the device cannot see an app's topics; read them
+from a host through the app's gateway. Emulator networking does not pass
+multicast to the host, so test mDNS from a physical device or from the device
+itself.
