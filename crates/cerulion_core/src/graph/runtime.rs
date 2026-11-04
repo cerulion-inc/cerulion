@@ -5473,6 +5473,27 @@ impl GraphRuntime {
                 }
             }
         }
+        // A `consume = latest` trigger input has the same borrow peak: its
+        // subscriber keeps a frame no tick has read borrowed through the next
+        // boundary's drain-to-latest (subscriber.rs `drain_for_trigger`), so
+        // held(1) + latest(1) + receive-transient(1) = 3 when two or more
+        // newer frames are queued behind it. At the iceoryx2 default of 2 the
+        // third receive fails with `ExceedsMaxBorrows`. Its source topic takes
+        // the same raise.
+        for node_def in &config.nodes {
+            let Some(info) = entry_infos.get(&node_def.id) else {
+                continue;
+            };
+            for input in &node_def.inputs {
+                if info
+                    .input_meta
+                    .iter()
+                    .any(|m| m.name == input.name && m.consume == InputConsume::Latest)
+                {
+                    snapshot_source_topics.insert(resolve_source(&config.prefix, &input.source));
+                }
+            }
+        }
         // `block_involved_nodes`: a node is block-involved if EITHER (a) it has
         // any `block` input (a block consumer), OR (b) any of its outputs
         // resolves to a topic in `block_topics` (a block producer).
@@ -5976,7 +5997,8 @@ impl GraphRuntime {
                 );
             }
         }
-        // Raise borrowed-sample headroom on snapshot-source topics.
+        // Raise borrowed-sample headroom on snapshot-source topics (and on
+        // the sources of `consume = latest` trigger inputs, collected above).
         // A miss is a topology/`resolve_source` desync (topology records every
         // graph topic, and snapshot sources resolve to graph topics) — an
         // internal invariant violation, NOT user input. HARD-FAIL it here via
@@ -7585,9 +7607,10 @@ impl GraphRuntime {
                     .find(|m| m.name == *input_name)
                     .is_some_and(|m| m.consume == InputConsume::Latest);
                 if consume_latest {
-                    // No service cursor: a latest input serves no per-frame
-                    // position a resume could place, exactly like a
-                    // latest-value context input.
+                    // No service cursor is minted, so the node states no
+                    // `input_service` table and a mid-run resume keeps this
+                    // input's whole pre-anchor band, the degrade for an input
+                    // the recording states nothing about.
                     consume_latest_nodes.push(node_def.id.clone());
                 } else if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
                     body_sub.mark_fifo_consume();

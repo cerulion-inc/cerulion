@@ -22,7 +22,7 @@
 //! | backpressure | `consume = latest` |
 //! |---|---|
 //! | `drop_oldest` | evictions at the queue are counted; the read serves the newest survivor |
-//! | `block` | each fire's read empties the queue, so the producer is paced only while a deferred fire spans `depth` publishes; superseded frames are not served |
+//! | `block` | each fire's read empties the queue, so the producer is paced only when `depth` frames queue between two reads, as while a deferred fire spans `depth` publishes; superseded frames are not served |
 //! | `sample(N)` | the gate admits the drain's newest frame at most once per N ms; a decimated one is counted |
 //!
 //! `#[serial]`: the forced-Separate arms mutate the process-global
@@ -344,6 +344,50 @@ fn a_newer_frame_during_a_defer_supersedes_the_held_one() {
     let (observed, n) = run_bursts("latsuper", c, &[&[1], &[2], &[3], &[4]], 8);
     assert_eq!(observed, vec![1, 4]);
     assert_eq!(n, 2);
+}
+
+/// Two newer frames queued behind a held frame. The boundary drain keeps
+/// the held frame borrowed while it receives both, three samples borrowed on
+/// one connection, one above the iceoryx2 default, so the latest trigger's
+/// source topic is created with that headroom. Without it the drain fails
+/// with `ExceedsMaxBorrows` on every other deferred boundary (a failed drain
+/// leaves no held frame for the next one), and a fire landing on a failed
+/// boundary reads an error instead of a frame. The two schedules differ by
+/// one step, so whichever step the throttle releases on, one of them puts a
+/// failing boundary there.
+#[test]
+#[serial]
+fn two_newer_frames_behind_a_held_one_drain_without_a_failed_read() {
+    let c = Consumer {
+        throttle_ms: Some(5),
+        ..Consumer::latest()
+    };
+    for (prefix, lead) in [("lattwoa", 0u64), ("lattwob", 1)] {
+        let mut bursts: Vec<Vec<u64>> = vec![vec![1], vec![2]];
+        bursts.extend((0..lead).map(|_| Vec::new()));
+        bursts.extend((0..8u64).map(|k| vec![3 + 2 * k, 4 + 2 * k]));
+        let refs: Vec<&[u64]> = bursts.iter().map(Vec::as_slice).collect();
+        let (observed, n) = run_bursts(prefix, c, &refs, 12);
+        assert!(
+            n >= 3,
+            "{prefix}: the throttle releases more than once: {n} fires"
+        );
+        assert_eq!(
+            observed.len() as u64,
+            n,
+            "{prefix}: every fire reads a frame, none an error: {observed:?} over {n} fires"
+        );
+        assert_eq!(observed.first(), Some(&1), "{prefix}: {observed:?}");
+        assert_eq!(
+            observed.last(),
+            Some(&18),
+            "{prefix}: the newest frame is read last: {observed:?}"
+        );
+        assert!(
+            observed.windows(2).all(|w| w[0] < w[1]),
+            "{prefix}: reads only move forward: {observed:?}"
+        );
+    }
 }
 
 /// `drop_oldest` composition: a burst of 8 into a depth-4 queue evicts the
