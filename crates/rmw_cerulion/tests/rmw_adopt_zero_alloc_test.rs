@@ -745,15 +745,19 @@ fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations()
             assert!(taken, "a published frame must be takeable");
             info
         };
-        // Warm-up: one frame from every publisher, taken before measuring.
+        // Warm-up: one frame from every publisher, taken before measuring;
+        // each take reports its own publisher's gid.
         for (i, p) in publishers.iter().enumerate() {
             publish_scan(*p, 16, i as f32);
             let info = take_with_info(&mut msg);
-            assert_ne!(
+            let mut gid: ffi::rmw_gid_t = std::mem::zeroed();
+            assert_eq!(rmw_get_gid_for_publisher(*p, &mut gid), RMW_RET_OK);
+            assert_eq!(
                 info.publisher_gid.data[..16],
-                [0u8; 16],
+                gid.data[..16],
                 "publisher {i}'s gid"
             );
+            assert_ne!(gid.data[..16], [0u8; 16], "publisher {i}'s gid is set");
         }
         // Measured: one more frame from every publisher, taken with info.
         for (i, p) in publishers.iter().enumerate() {
@@ -767,7 +771,7 @@ fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations()
         assert_eq!(
             allocs, 0,
             "a take with info from {PUBLISHERS} publishers must cost zero RUST \
-             allocations once every publisher's gid is cached"
+             allocations whatever the number of publishers"
         );
 
         scan_fini(&mut *msg as *mut _ as *mut c_void);

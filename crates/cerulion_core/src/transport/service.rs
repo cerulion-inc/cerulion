@@ -83,6 +83,10 @@
 //!   host-unique entity gid (process id included), which differs per run,
 //!   so a restarted `rmw_cerulion` client replies on a new topic.
 //! - Sequence numbers are a per-client monotonic counter starting at 1.
+//! - Which clients a server still holds (see "Topology") depends on whether
+//!   their reply subscribers are attached when a new client's first request
+//!   is taken, so the request-sequence diagnostics of a client that left and
+//!   came back under the same GUID depend on when it left.
 //! - Timestamps come from the transport's [`Clock`] (the `VirtualClock`
 //!   under replay).
 //! - Requests are taken through the subscriber's FIFO, non-coalescing
@@ -542,7 +546,8 @@ pub struct ServiceServer {
     /// Lazily-created reply publishers, one per client GUID, in
     /// deterministic (BTreeMap) order. Creation is driven purely by
     /// request arrival (data), never by timing. A departed client's entry is
-    /// removed ([`Self::forget_departed_clients`]).
+    /// removed ([`Self::forget_departed_clients`]), which depends on whether
+    /// that client's reply subscriber is still attached.
     reply_pubs: BTreeMap<[u8; 16], CerulionPublisher>,
     transport: Arc<TransportManager>,
     reply_max_slice_len: MaxSliceLen,
@@ -759,9 +764,10 @@ impl ServiceServer {
 
     /// Removes the reply publisher and the request-sequence entry of every
     /// client whose reply topic has no subscriber
-    /// ([`TransportManager::topic_subscriber_count`], which reads 0 for a
-    /// topic it cannot open). A client the check drops by mistake loses only
-    /// its sequence history: its next response creates the publisher again.
+    /// ([`TransportManager::topic_subscriber_count_checked`] reads `Some(0)`).
+    /// A client whose reply topic cannot be probed is kept, and the failed
+    /// probes are counted in one warning. Runs one iceoryx2 service open per
+    /// client the server holds, each time a request arrives from a new GUID.
     fn forget_departed_clients(&mut self) {
         let mut guids: Vec<[u8; 16]> = self.last_seen_seq.keys().copied().collect();
         guids.extend(
@@ -769,16 +775,29 @@ impl ServiceServer {
                 .keys()
                 .filter(|guid| !self.last_seen_seq.contains_key(*guid)),
         );
+        let mut unprobed = 0usize;
         for guid in guids {
             let topic = reply_topic(&self.service, &guid);
-            if self.transport.topic_subscriber_count(&topic) == 0 {
-                tracing::debug!(
-                    service = %self.service,
-                    topic = %topic,
-                    "service client departed; its reply publisher is dropped"
-                );
-                self.forget_client(&guid);
+            match self.transport.topic_subscriber_count_checked(&topic) {
+                Some(0) => {
+                    tracing::debug!(
+                        service = %self.service,
+                        topic = %topic,
+                        "service client departed; its reply publisher is dropped"
+                    );
+                    self.forget_client(&guid);
+                }
+                Some(_) => {}
+                None => unprobed += 1,
             }
+        }
+        if unprobed > 0 {
+            tracing::warn!(
+                service = %self.service,
+                clients = unprobed,
+                "could not read whether these service clients are still present; \
+                 their reply publishers are kept"
+            );
         }
     }
 

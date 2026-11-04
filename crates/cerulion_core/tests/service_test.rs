@@ -555,8 +555,8 @@ fn double_drain_and_dead_client_response() {
 /// Hand oracle: after five such clients and one new live client, the server
 /// holds exactly the control and the new client (2 reply publishers, 2
 /// sequence entries), where it held 7 of each before departed clients were
-/// forgotten. A client that sends a request and departs before the response
-/// is forgotten when the response reaches no subscriber.
+/// forgotten. A client that departs after the server takes its request is
+/// forgotten when the response reaches no subscriber.
 #[test]
 fn departed_clients_leave_no_reply_publisher_or_sequence_entry_behind() {
     let transport = test_transport("departed");
@@ -606,13 +606,16 @@ fn departed_clients_leave_no_reply_publisher_or_sequence_entry_behind() {
     round_trip(&mut server, &mut control);
     assert_eq!(server.known_client_count(), 2);
 
-    // A client that departs between its request and the response.
+    // A client that departs between the server's take of its request and
+    // the response: the take finds it present (3 sequence entries), and the
+    // response that reaches no subscriber forgets it.
     let mut early = client(7);
     early.send_request(b"ping").expect("send");
-    drop(early);
     let mut envelopes = Vec::new();
     drain_requests(&mut server, |e, _| envelopes.push(e)).expect("take");
     assert_eq!(envelopes.len(), 1);
+    assert_eq!(server.tracked_client_count(), 3, "the early client is tracked");
+    drop(early);
     server
         .send_response(&envelopes[0], b"pong")
         .expect("a response to a departed client is Ok");

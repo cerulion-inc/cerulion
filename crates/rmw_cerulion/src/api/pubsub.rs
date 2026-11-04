@@ -2936,7 +2936,9 @@ unsafe fn serve_recorded_message(
         }
         *taken = true;
         if !message_info.is_null() {
-            // The same fill as the live take, from the recorded values.
+            // The live take's fill, from the recorded values, except the
+            // publisher gid: the log does not record it, so its 16 bytes
+            // stay zero.
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
             info.source_timestamp = rec.source_ts;
             info.received_timestamp = rec.received_ts;
@@ -2967,7 +2969,7 @@ unsafe fn take_impl_live(
     let expected_hash = data.bridge.schema_hash();
 
     // A poisoned lock means wedged: never re-enter torn iceoryx2 state.
-    let Some(mut inner) = runtime::lock_unpoisoned(&data.inner) else {
+    let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
         tracing::error!("entity wedged by an earlier panic; failing call");
         return RMW_RET_ERROR;
     };
