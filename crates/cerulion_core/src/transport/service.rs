@@ -677,7 +677,7 @@ impl ServiceServer {
         let hash_latch = &mut self.request_hash_mismatches;
         let short_latch = &mut self.short_request_frames;
         let mut delivered = false;
-        let mut new_client = false;
+        let mut new_client: Option<[u8; 16]> = None;
         loop {
             let got = self.request_sub.try_receive_one(|msg| {
                 if msg.header().schema_hash != expected_hash {
@@ -717,7 +717,7 @@ impl ServiceServer {
                         let prev = match last_seen.insert(envelope.client_guid, envelope.sequence) {
                             Some(prev) => prev,
                             None => {
-                                new_client = true;
+                                new_client = Some(envelope.client_guid);
                                 0
                             }
                         };
@@ -754,8 +754,8 @@ impl ServiceServer {
                 }
             })?;
             if delivered || !got {
-                if new_client {
-                    self.forget_departed_clients();
+                if let Some(arrived) = new_client {
+                    self.forget_departed_clients(&arrived);
                 }
                 return Ok(delivered);
             }
@@ -766,10 +766,18 @@ impl ServiceServer {
     /// client whose reply topic has no subscriber
     /// ([`TransportManager::topic_subscriber_count_checked`] reads `Some(0)`).
     /// A client whose reply topic cannot be probed is kept, and the failed
-    /// probes are counted in one warning. Runs one iceoryx2 service open per
-    /// client the server holds, each time a request arrives from a new GUID.
-    fn forget_departed_clients(&mut self) {
-        let mut guids: Vec<[u8; 16]> = self.last_seen_seq.keys().copied().collect();
+    /// probes are counted in one warning. The client whose request arrived
+    /// (`arrived`) is not probed: its sequence entry is what reports a gap in
+    /// its next request, with or without a reply subscriber. Runs one iceoryx2
+    /// service open per other client the server holds, each time a request
+    /// arrives from a new GUID.
+    fn forget_departed_clients(&mut self, arrived: &[u8; 16]) {
+        let mut guids: Vec<[u8; 16]> = self
+            .last_seen_seq
+            .keys()
+            .filter(|guid| *guid != arrived)
+            .copied()
+            .collect();
         guids.extend(
             self.reply_pubs
                 .keys()
