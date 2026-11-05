@@ -3243,6 +3243,7 @@ mod hosted_runs_tests {
                 .wait()
             {
                 Ok(replies) => {
+                    last = String::from("a GET with no reply");
                     while let Ok(reply) = replies.recv() {
                         match reply.into_result() {
                             Ok(sample) => {

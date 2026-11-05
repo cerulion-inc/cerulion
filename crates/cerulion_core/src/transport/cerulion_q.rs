@@ -6,8 +6,8 @@
 //! `queryable_key` (`cerulion_q/{robot}/**`) and dispatches inbound GETs by
 //! verb; remote consumers (dialers) send EXPLICIT-robot GETs. This module owns
 //! ALL `cerulion_q` key construction + parsing (no scattered format strings
-//! elsewhere) plus the wire types + encoding for the `catalog` and `schema`
-//! verbs' replies.
+//! elsewhere) plus the wire types + encoding for the `catalog`, `schema`,
+//! `runs` and `fires` verbs' replies.
 //!
 //! # Why a queryable + dialer GETs (the pinned zenoh 1.8 wire asymmetry)
 //!
@@ -68,11 +68,13 @@
 //!
 //! # Security (pairing integration point)
 //!
-//! All three verbs are currently UNAUTHENTICATED LAN reads, and the `catalog` +
-//! `schema` verbs expose STRICTLY MORE than the announce presence space — so this
-//! surface MUST be gated behind install-time PAIRING when that lands.
-//! The `schema` verb is the loudest of the three: it hands out the
-//! robot's verbatim custom `.msg`/YAML type definitions. Three facts:
+//! Every verb is a LAN read, and a LAN peer carries no paired identity. The
+//! `catalog` + `schema` verbs expose STRICTLY MORE than the announce presence
+//! space, so every verb asks the
+//! [`DemandAuthorizer`](super::demand_authorizer::DemandAuthorizer) before it
+//! reads anything, and [`LanAccess::Paired`](super::demand_authorizer::LanAccess)
+//! refuses every LAN peer. The `schema` verb hands out the robot's verbatim
+//! custom `.msg`/YAML type definitions. The facts:
 //!
 //! - The `catalog` verb's source is the gateway's bridge-REGISTERED topic set
 //!   (`registered_topics()` joined with the runtime schema-hash table), NOT the
@@ -85,7 +87,7 @@
 //!   one `cerulion_q/{robot}/catalog` GET reads type fingerprints + names the
 //!   announce space never exposes.
 //! - The `schema` verb serves the robot's verbatim custom `.msg`/YAML type
-//!   definitions — the richest exposure of the three. It is served ONLY from the
+//!   definitions. It is served ONLY from the
 //!   pre-built [`SchemaSource`](super::network::SchemaSource) (workspace custom
 //!   types; built-ins omitted), never from arbitrary filesystem paths, but an
 //!   unpaired peer must still not read a robot's private type schemas.
@@ -100,11 +102,11 @@
 //!   It is gated on the same decision as `runs`, and a refused GET reads
 //!   nothing and arms no lease ([`FiresOutcome::Refused`]).
 //!
-//! Therefore, when the presence-only-until-paired gate lands, the
-//! `catalog` + `schema` + `runs` verbs (and `demand`) MUST refuse an UNPAIRED
-//! peer — an unpaired GET must not enumerate a robot's registered topics + type
-//! fingerprints + schema text + graph topology or drive its egress. This is a
-//! doc marker only; no gate exists in this module.
+//! Therefore the `catalog` + `schema` + `runs` + `fires` verbs (and `demand`)
+//! MUST refuse an UNPAIRED peer: an unpaired GET must not enumerate a robot's
+//! registered topics + type fingerprints + schema text + graph topology, read
+//! its node fires, or drive its egress or its fire recording. This module holds
+//! no gate; the authorizer each verb consults is the gate.
 
 use std::collections::BTreeSet;
 
@@ -4497,6 +4499,10 @@ mod tests {
         assert_eq!(
             invalid(&served_seqs(10, 0, &[3, 4])),
             "row seq 3 is not after the page start 8 (2 row(s) and 0 lost end at 10)"
+        );
+        assert_eq!(
+            invalid(&served_seqs(10, 0, &[8, 9])),
+            "row seq 8 is not after the page start 8 (2 row(s) and 0 lost end at 10)"
         );
         assert_eq!(
             invalid(&served_seqs(1, 0, &[1, 2])),

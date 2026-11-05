@@ -9006,6 +9006,23 @@ mod fires_serve_tests {
         );
     }
 
+    /// `-` reads from now: rows recorded before a `-` GET belong to an earlier
+    /// lease or another desk, and a GET after 0 would return them.
+    #[test]
+    fn a_from_now_get_skips_the_rows_recorded_before_it() {
+        let run = tapped();
+        decide(&run.hosted, None);
+        run.tap.push(body(1, 0, FireCause::Period, 0));
+        run.tap.push(body(2, 1, FireCause::Data, 0));
+        let FiresOutcome::Served {
+            next, lost, fires, ..
+        } = decide(&run.hosted, None).outcome
+        else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!((next, lost, fires.len()), (2, 0, 0));
+    }
+
     #[test]
     fn records_the_ring_overwrote_before_the_read_are_counted_lost() {
         let run = tapped();
