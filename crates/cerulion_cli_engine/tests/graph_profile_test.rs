@@ -651,7 +651,7 @@ fn thawed_artifact_feeds_auto_partition() {
         prefix: "p".to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -666,7 +666,7 @@ fn thawed_artifact_feeds_auto_partition() {
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -678,7 +678,7 @@ fn thawed_artifact_feeds_auto_partition() {
                 outputs: vec![],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "laggard".to_string(),

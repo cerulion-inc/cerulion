@@ -95,7 +95,7 @@ fn build() -> GraphRuntime {
         prefix: "bs".to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -110,7 +110,7 @@ fn build() -> GraphRuntime {
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),

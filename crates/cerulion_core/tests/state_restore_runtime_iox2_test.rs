@@ -252,7 +252,7 @@ fn counter_graph(prefix: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "counter".to_string(),
@@ -267,7 +267,7 @@ fn counter_graph(prefix: &str) -> GraphConfig {
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

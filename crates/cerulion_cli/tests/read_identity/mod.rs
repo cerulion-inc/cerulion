@@ -684,90 +684,6 @@ fn ri_flush(id: &str, input: &str, reads: &mut Vec<[u64; 3]>) {
     reads.clear();
 }
 
-/// How many of the relay's first ticks [`ri_flush_times`] reports.
-#[allow(dead_code)]
-const RI_TIMED_TICKS: u32 = 4;
-
-/// Fields of one timed tick: index, entry and exit on the node's real clock,
-/// then [`ri_thread_snapshot`] at entry and at exit.
-#[allow(dead_code)]
-const RI_TIME_FIELDS: usize = 15;
-
-/// This thread's cumulative `[on-CPU ns, runqueue-wait ns, timeslices, CPU it
-/// last ran on, voluntary switches, involuntary switches]`, from
-/// `/proc/thread-self/{schedstat,stat,status}`. A field whose file is absent
-/// reads `u64::MAX`.
-#[allow(dead_code)]
-fn ri_thread_snapshot() -> [u64; 6] {
-    let mut out = [u64::MAX; 6];
-    let sched = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
-    for (slot, word) in out[..3].iter_mut().zip(sched.split_whitespace()) {
-        *slot = word.parse().unwrap_or(u64::MAX);
-    }
-    // Field 39 of `stat` is the CPU; the fields after the parenthesised
-    // command name start at field 3.
-    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
-    if let Some(cpu) = stat
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(39 - 3))
-        .and_then(|w| w.parse().ok())
-    {
-        out[3] = cpu;
-    }
-    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
-    for line in status.lines() {
-        let slot = if line.starts_with("voluntary_ctxt_switches:") {
-            4
-        } else if line.starts_with("nonvoluntary_ctxt_switches:") {
-            5
-        } else {
-            continue;
-        };
-        if let Some(v) = line.split_whitespace().nth(1).and_then(|w| w.parse().ok()) {
-            out[slot] = v;
-        }
-    }
-    out
-}
-
-/// The relay's timed ticks, held outside the node's state so they never
-/// reach a captured or compared node state.
-#[allow(dead_code)]
-static RI_TIMES: std::sync::Mutex<Vec<[u64; RI_TIME_FIELDS]>> = std::sync::Mutex::new(Vec::new());
-
-#[allow(dead_code)]
-fn ri_push_time(t: [u64; RI_TIME_FIELDS]) {
-    RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()).push(t);
-}
-
-/// Write the relay's timed ticks as `<id>_<pid>_<k>.times`, one line per tick:
-/// `tick` then the [`RI_TIME_FIELDS`] raw values, space separated.
-#[allow(dead_code)]
-fn ri_flush_times(id: &str) {
-    use std::io::Write as _;
-    let Some(dir) = std::env::var_os("CER_RI_READS_DIR") else {
-        return;
-    };
-    let times = std::mem::take(&mut *RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()));
-    if times.is_empty() {
-        return;
-    }
-    let mut out = String::new();
-    for t in times {
-        out.push_str("tick");
-        for v in t {
-            out.push_str(&format!(" {v}"));
-        }
-        out.push('\n');
-    }
-    static K: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let k = K.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::path::Path::new(&dir).join(format!("{id}_{}_{k}.times", std::process::id()));
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-        let _ = f.write_all(out.as_bytes());
-    }
-}
-
 fn ri_sleep(us: u64) {
     if us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(us));
@@ -825,10 +741,6 @@ struct RiRelayNode {
     ri_id: String,
     #[param(default = 100, description = "this writer's identity")]
     ri_writer: u64,
-    #[param(default = 0, description = "microseconds a sleeping fire sleeps")]
-    ri_sleep_us: u64,
-    #[param(default = 1, description = "every this many fires, one sleeps")]
-    ri_sleep_every: u64,
     tick_count: u32,
     ri_reads: Vec<[u64; 3]>,
 }
@@ -836,12 +748,6 @@ struct RiRelayNode {
 #[cerulion_node_impl]
 impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let timed = ri_on() && self.tick_count < RI_TIMED_TICKS;
-        let entry_ns = if timed { self.real_ns() } else { 0 };
-        let entry = if timed { ri_thread_snapshot() } else { [0; 6] };
-        if self.ri_sleep_every > 0 && u64::from(self.tick_count) % self.ri_sleep_every == 0 {
-            ri_sleep(self.ri_sleep_us);
-        }
         self.tick_count += 1;
         let r = [self.inp.x, self.inp.y, self.inp.z];
         if ri_on() {
@@ -850,23 +756,11 @@ impl RiRelayNode {
         self.out.x = self.ri_writer as f64;
         self.out.y = f64::from(self.tick_count);
         self.out.z = ri_fold(r);
-        if timed {
-            let exit_ns = self.real_ns();
-            let exit = ri_thread_snapshot();
-            let mut t = [0u64; RI_TIME_FIELDS];
-            t[0] = u64::from(self.tick_count - 1);
-            t[1] = entry_ns;
-            t[2] = exit_ns;
-            t[3..9].copy_from_slice(&entry);
-            t[9..15].copy_from_slice(&exit);
-            ri_push_time(t);
-        }
         Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), NodeError> {
         ri_flush(&self.ri_id, "inp", &mut self.ri_reads);
-        ri_flush_times(&self.ri_id);
         Ok(())
     }
 }
@@ -1080,57 +974,6 @@ impl RiFastNode {
 }
 "#,
     },
-    // The fast node as the HEAD side of a chain: records the same samples as
-    // `ri_fast` and republishes the frame, so a slow node can follow it.
-    NodeType {
-        name: "ri_fast_relay",
-        policy: MacroPolicy::DataTrigger {
-            input_name: String::new(),
-        },
-        trigger: Some("inp"),
-        inputs: &["inp"],
-        outputs: &["out"],
-        body: r#"#[cerulion_node]
-struct RiFastRelayNode {
-    #[input(trigger)]
-    inp: Vector3,
-    #[output]
-    out: Vector3,
-    samples: Vec<(u64, u64)>,
-}
-
-#[cerulion_node_impl]
-impl RiFastRelayNode {
-    fn tick(&mut self) -> Result<(), NodeError> {
-        let stamp = self.inp.x;
-        let now = self.real_ns();
-        self.samples.push((now, now.saturating_sub(stamp as u64)));
-        self.out.x = self.inp.x;
-        self.out.y = self.inp.y;
-        Ok(())
-    }
-
-    fn shutdown(&mut self) -> Result<(), NodeError> {
-        use std::io::Write as _;
-        if self.samples.is_empty() {
-            return Ok(());
-        }
-        let Some(dir) = std::env::var_os("CER_RI_SAMPLES_DIR") else {
-            return Ok(());
-        };
-        let mut out = String::with_capacity(self.samples.len() * 24);
-        for (t, lat) in &self.samples {
-            out.push_str(&format!("{t} {lat}\n"));
-        }
-        let path = std::path::Path::new(&dir).join(format!("fast_{}.samples", std::process::id()));
-        if let Ok(mut f) = std::fs::File::create(path) {
-            let _ = f.write_all(out.as_bytes());
-        }
-        Ok(())
-    }
-}
-"#,
-    },
     // The slow consumer behind a declared `block` edge: its producer is
     // deferred while two frames are unserved.
     NodeType {
@@ -1274,16 +1117,7 @@ pub enum Fixture {
     Ranks2,
     /// The same chain split `[src]` / `[relay]` / `[sink]`.
     Ranks3,
-    /// `Ranks3` with a relay that sleeps [`LATE_RELAY_SLEEP_US`] on every
-    /// [`LATE_RELAY_EVERY`]th fire, so its fires bunch (one step drains two or
-    /// three frames) without its queue overflowing.
-    Ranks3LateRelay,
 }
-
-/// How long a sleeping fire of [`Fixture::Ranks3LateRelay`]'s relay sleeps.
-pub const LATE_RELAY_SLEEP_US: u64 = 2_000;
-/// Every this many fires of [`Fixture::Ranks3LateRelay`]'s relay, one sleeps.
-pub const LATE_RELAY_EVERY: u64 = 20;
 
 /// A fixture's nodes, its process groups in rank order, and its
 /// multi-publisher topics.
@@ -1300,9 +1134,6 @@ pub enum Placement {
     Declared,
     /// Every node in one process (`graph run --single-process`).
     SingleProcess,
-    /// Every node in one declared process group: one worker process of a
-    /// multi-process run, whose nodes run in executor units.
-    OneGroup,
 }
 
 impl Placement {
@@ -1310,7 +1141,6 @@ impl Placement {
         match self {
             Placement::Declared => "declared",
             Placement::SingleProcess => "single_process",
-            Placement::OneGroup => "one_group",
         }
     }
 }
@@ -1334,7 +1164,6 @@ impl Fixture {
             Fixture::MultiWriter => "multi_writer",
             Fixture::Ranks2 => "ranks2",
             Fixture::Ranks3 => "ranks3",
-            Fixture::Ranks3LateRelay => "ranks3_late_relay",
         }
     }
 
@@ -1344,9 +1173,7 @@ impl Fixture {
             Fixture::SlowEvict => &[("slow", "inp")],
             Fixture::FanOut => &[("sink_a", "inp"), ("sink_b", "inp")],
             Fixture::MultiWriter => &[("tfbuf", "tf")],
-            Fixture::Ranks2 | Fixture::Ranks3 | Fixture::Ranks3LateRelay => {
-                &[("relay", "inp"), ("sink", "inp")]
-            }
+            Fixture::Ranks2 | Fixture::Ranks3 => &[("relay", "inp"), ("sink", "inp")],
         }
     }
 
@@ -1368,7 +1195,7 @@ impl Fixture {
                     inputs: Vec<InputDef>,
                     outputs: Vec<OutputDef>,
                     params: &[(&str, ParamValue)]| NodeDef {
-            isolate: None,
+            fuse: None,
             ros2: None,
             params: params
                 .iter()
@@ -1466,12 +1293,7 @@ impl Fixture {
                     vec![tf],
                 )
             }
-            Fixture::Ranks2 | Fixture::Ranks3 | Fixture::Ranks3LateRelay => {
-                let relay_sleep = if self == Fixture::Ranks3LateRelay {
-                    LATE_RELAY_SLEEP_US
-                } else {
-                    0
-                };
+            Fixture::Ranks2 | Fixture::Ranks3 => {
                 let nodes = vec![
                     src(),
                     node(
@@ -1479,12 +1301,7 @@ impl Fixture {
                         "ri_relay",
                         vec![input("inp", "src/out".into())],
                         vec![out("out", None)],
-                        &[
-                            id("relay"),
-                            writer(100),
-                            ("ri_sleep_us", ParamValue::UInt(relay_sleep)),
-                            ("ri_sleep_every", ParamValue::UInt(LATE_RELAY_EVERY)),
-                        ],
+                        &[id("relay"), writer(100)],
                     ),
                     node(
                         "sink",
@@ -1520,7 +1337,7 @@ pub fn node_def(
     params: &[(&str, ParamValue)],
 ) -> NodeDef {
     NodeDef {
-        isolate: None,
+        fuse: None,
         ros2: None,
         params: params
             .iter()
@@ -1586,7 +1403,7 @@ pub fn graph_config(
 pub struct RecordedRun {
     pub fixture: Fixture,
     pub placement: Placement,
-    pub dir: ScaffoldDir,
+    pub dir: tempfile::TempDir,
     pub bag: PathBuf,
     pub live: ReadLog,
     /// Where the live run's nodes wrote their records.
@@ -1713,9 +1530,6 @@ pub fn run_live(
     };
     let mut guard = ChildGuard::spawn_group_leader(&mut cmd)
         .unwrap_or_else(|e| panic!("RI_HARNESS: spawn graph run {graph}: {e}"));
-    let sampler = SAMPLE_UNIT_THREADS
-        .load(Ordering::Relaxed)
-        .then(|| UnitThreadSampler::start(guard.id(), dir.join(UNIT_THREAD_SAMPLES)));
     let start = std::time::Instant::now();
     while !ready() {
         if let Some(status) = guard.try_wait_noting().expect("RI_HARNESS: poll") {
@@ -1741,7 +1555,6 @@ pub fn run_live(
             logs()
         );
     }
-    drop(sampler);
     mp_support::send_signal(guard.id(), libc::SIGINT);
     let status = guard
         .wait_bounded(Duration::from_secs(90))
@@ -1762,132 +1575,6 @@ pub fn run_live(
         ready_ns,
         stop_ns,
     }
-}
-
-/// While set, [`run_live`] samples the executor-unit threads of the run's
-/// processes into [`UNIT_THREAD_SAMPLES`] in the run directory.
-pub static SAMPLE_UNIT_THREADS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// The file [`run_live`] writes unit-thread samples to, one line per change of
-/// a thread's state: `<real ns> <pid> <tid> <comm> <state> <wchan> <syscall>`,
-/// with `<syscall>` the first word of `/proc/<pid>/task/<tid>/syscall` and
-/// `-` for an unreadable file.
-pub const UNIT_THREAD_SAMPLES: &str = "unit_threads.samples";
-
-/// How often [`UnitThreadSampler`] reads each unit thread's state.
-const SAMPLE_PERIOD: Duration = Duration::from_micros(100);
-/// How often it looks for new processes under the run.
-const RESCAN_PERIOD: Duration = Duration::from_millis(20);
-/// How long it samples after the spawn.
-const SAMPLE_SPAN: Duration = Duration::from_secs(4);
-
-/// A thread sampling, on Linux, every `cerulion-unit-*` thread of every
-/// process under `root`: whenever a thread's (state, wchan, syscall) changes,
-/// one line goes to the samples file. It stops [`SAMPLE_SPAN`] after it starts
-/// or when dropped, and writes the file then.
-struct UnitThreadSampler {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl UnitThreadSampler {
-    fn start(root: u32, out: PathBuf) -> Self {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&stop);
-        let handle = std::thread::spawn(move || sample_unit_threads(root, &out, &flag));
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for UnitThreadSampler {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// Every process under `root`, `root` included, through
-/// `/proc/<pid>/task/<pid>/children`.
-fn descendants(root: u32) -> Vec<u32> {
-    let mut out = vec![root];
-    let mut i = 0;
-    while i < out.len() {
-        let pid = out[i];
-        let path = format!("/proc/{pid}/task/{pid}/children");
-        if let Ok(text) = std::fs::read_to_string(path) {
-            out.extend(
-                text.split_whitespace()
-                    .filter_map(|w| w.parse::<u32>().ok()),
-            );
-        }
-        i += 1;
-    }
-    out
-}
-
-fn sample_unit_threads(root: u32, out: &Path, stop: &std::sync::atomic::AtomicBool) {
-    use std::fmt::Write as _;
-    let read = |p: String| std::fs::read_to_string(p).unwrap_or_default();
-    let begin = std::time::Instant::now();
-    let mut last_scan: Option<std::time::Instant> = None;
-    let mut threads: Vec<(u32, u32, String)> = Vec::new();
-    let mut last: BTreeMap<u32, String> = BTreeMap::new();
-    let mut lines = String::new();
-    while !stop.load(Ordering::Relaxed) && begin.elapsed() < SAMPLE_SPAN {
-        if last_scan.is_none_or(|t| t.elapsed() >= RESCAN_PERIOD) {
-            last_scan = Some(std::time::Instant::now());
-            threads.clear();
-            for pid in descendants(root) {
-                let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-                    continue;
-                };
-                for task in tasks.flatten() {
-                    let Some(tid) = task.file_name().to_str().and_then(|t| t.parse().ok()) else {
-                        continue;
-                    };
-                    let comm = read(format!("/proc/{pid}/task/{tid}/comm"))
-                        .trim()
-                        .to_string();
-                    if comm.starts_with("cerulion-unit") {
-                        threads.push((pid, tid, comm));
-                    }
-                }
-            }
-        }
-        for (pid, tid, comm) in &threads {
-            let stat = read(format!("/proc/{pid}/task/{tid}/stat"));
-            let state = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-                .unwrap_or("-")
-                .to_string();
-            let wchan = read(format!("/proc/{pid}/task/{tid}/wchan"));
-            let wchan = if wchan.is_empty() {
-                "-".to_string()
-            } else {
-                wchan
-            };
-            let syscall = read(format!("/proc/{pid}/task/{tid}/syscall"));
-            let syscall = syscall.split_whitespace().next().unwrap_or("-").to_string();
-            let key = format!("{state} {wchan} {syscall}");
-            if last.get(tid) != Some(&key) {
-                let _ = writeln!(
-                    lines,
-                    "{} {pid} {tid} {comm} {key}",
-                    cerulion_core::real_ns()
-                );
-                last.insert(*tid, key);
-            }
-        }
-        std::thread::sleep(SAMPLE_PERIOD);
-    }
-    let _ = std::fs::write(out, lines);
 }
 
 /// Why a recording is not fit to judge: frames the recorder lost
@@ -1935,15 +1622,9 @@ fn recording_defect(bag: &Path) -> Option<String> {
 pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> RecordedRun {
     let mut last = String::new();
     for attempt in 0..RECORD_ATTEMPTS {
-        let dir = ScaffoldDir::new("ri_run");
+        let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
         let (graph, prefix) = unique_names(fixture.name());
-        let mut config = fixture.graph_config(&graph, &prefix);
-        if placement == Placement::OneGroup {
-            let all: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
-            config.process_groups = [("g_all".to_string(), all)].into_iter().collect();
-            config.process_group_order = Vec::new();
-        }
-        write_graph(ws, &config);
+        write_graph(ws, &fixture.graph_config(&graph, &prefix));
         let reads = dir.path().join("live_reads");
         let recordings = dir.path().join("recordings");
         std::fs::create_dir_all(&reads).expect("RI_HARNESS: reads dir");

@@ -318,7 +318,7 @@ fn build_graph(
         None => EXT_TOPIC.to_string(),
     };
     let mut nodes = vec![NodeDef {
-        isolate: None,
+        fuse: None,
         params: Default::default(),
         ros2: None,
         id: "trig_prod".to_string(),
@@ -328,7 +328,7 @@ fn build_graph(
     }];
     if let Some(samp_type) = samp_prod {
         nodes.push(NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "samp_prod".to_string(),
@@ -338,7 +338,7 @@ fn build_graph(
         });
     }
     nodes.push(NodeDef {
-        isolate: None,
+        fuse: None,
         params: Default::default(),
         ros2: None,
         id: "dut".to_string(),
@@ -362,7 +362,7 @@ fn build_graph(
         }],
     });
     nodes.push(NodeDef {
-        isolate: None,
+        fuse: None,
         params: Default::default(),
         ros2: None,
         id: "sink".to_string(),

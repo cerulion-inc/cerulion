@@ -103,7 +103,7 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("mux_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "mux".to_string(),

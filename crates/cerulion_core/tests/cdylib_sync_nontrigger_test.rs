@@ -156,7 +156,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
@@ -184,7 +184,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -547,7 +547,7 @@ fn build_seq_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
@@ -575,7 +575,7 @@ fn build_seq_graph(
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

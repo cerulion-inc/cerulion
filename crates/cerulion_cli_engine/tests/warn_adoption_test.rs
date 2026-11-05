@@ -59,7 +59,7 @@ const VALIDATE_CALL: &str = "cerulion_core::graph::validate_partition(";
 /// The supervisor function that owns the multi-process deployment.
 const SUPERVISOR_FN: &str = "fn graph_run_supervisor(";
 /// The worker-spawn loop — everything the warn must precede.
-const SPAWN_LOOP: &str = "crate::multiprocess::host_spawn_order(";
+const SPAWN_LOOP: &str = "crate::multiprocess::spawn_order(";
 
 fn graph_cmd_src() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
