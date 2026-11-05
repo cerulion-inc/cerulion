@@ -3,11 +3,19 @@
 //!
 //! The thread owns its transport ports (they stay on the thread that made
 //! them): a subscriber on the ask topic, a subscriber on the frame topic and
-//! a publisher on the answer topic. It is separate from the journal thread,
-//! so a look never delays an e-stop frame.
+//! a publisher on the answer topic. It is separate from the journal thread:
+//! no look runs on it, and a request on the network holds nothing the
+//! journal or the tools take. Its receipts go to the tools' receipt log and
+//! take the same lock as the e-stop's intent receipt, which is written
+//! before the e-stop frame is queued, so one eye receipt (one `sync_data`)
+//! can delay an e-stop frame. The ask bound ([`limits::ASK_BURST`] asks at
+//! once, [`limits::ASKS_PER_SECOND`] sustained) caps how many receipts the
+//! eye writes; an ask over it is dropped unanswered and unreceipted, and
+//! the gate's own deadline makes Jev absent.
 //!
 //! Each pass of its loop, it keeps the newest [`FRAMES_HELD`] frames, reads
-//! every ask in arrival order and hands each to [`EyeCore::admit`], which
+//! every ask in arrival order, drops the asks over the ask bound
+//! ([`EyeCore::intake`]) and hands each other ask to [`EyeCore::admit`], which
 //! answers at once (off, no key, a bad ask, a frame that breaks the shape, a
 //! limit) or yields a request. A request runs as a task on the daemon's
 //! runtime and reports back over a channel; the thread writes the receipt,
@@ -20,6 +28,12 @@
 //! [`limits::LATE_GRACE`] after the ask arrived; a reply in that window is
 //! logged as late with a `late` receipt and never published, and at its end
 //! the request is cancelled.
+//!
+//! The data notice is checked at spawn and again before the first request
+//! of the run leaves the robot, so a key placed after the daemon started
+//! still gets its line before any frame is sent. A client that cannot be
+//! built (no system roots, say) leaves the eye running with every look
+//! answered `unavailable`.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -37,6 +51,7 @@ use serde_json::Value;
 
 use crate::eye::answer::{
     ask_id_of, classify, parse_ask, unread, unsent, Answer, AskProblem, ImageInfo, Prepared, Route,
+    ThirdParty,
 };
 use crate::eye::client::{placeholder, request_body, request_state, sha256_hex, JevClient};
 use crate::eye::config::{endpoint, EyesConfig, JevConfig};
@@ -247,7 +262,13 @@ pub enum Completed {
         retry_after: Option<Duration>,
     },
     /// A reply after the deadline: logged, receipted `late`, not published.
-    Late(Box<Answer>),
+    /// A 429 or spend-limit reply still holds requests back.
+    Late {
+        /// What the reply would have answered.
+        answer: Box<Answer>,
+        /// How long the route asked to wait.
+        retry_after: Option<Duration>,
+    },
     /// No reply within the grace after the deadline.
     Abandoned {
         /// The ask's id.
@@ -261,6 +282,7 @@ pub struct EyeCore {
     settings: Arc<EyeSettings>,
     route: Route,
     bucket: TokenBucket,
+    asks: TokenBucket,
     in_flight: InFlight,
     backoff_until: Option<Instant>,
     quota_until: Option<Instant>,
@@ -286,6 +308,7 @@ impl EyeCore {
             settings,
             route,
             bucket: TokenBucket::new(now),
+            asks: TokenBucket::for_asks(now),
             in_flight: InFlight::default(),
             backoff_until: None,
             quota_until: None,
@@ -300,6 +323,13 @@ impl EyeCore {
     /// The in-flight count.
     pub fn in_flight(&self) -> &InFlight {
         &self.in_flight
+    }
+
+    /// Whether an ask arriving at `now` is within the ask bound: a bucket of
+    /// [`limits::ASK_BURST`] refilled at [`limits::ASKS_PER_SECOND`]. An ask
+    /// outside it gets no answer and no receipt.
+    pub fn intake(&mut self, now: Instant) -> bool {
+        self.asks.try_take(now)
     }
 
     /// Note what an answer says about the route. A `rate_limited` answer
@@ -348,6 +378,7 @@ impl EyeCore {
             answers: None,
             usage: None,
             latency_ms: None,
+            provenance: ThirdParty,
         })
     }
 
@@ -491,7 +522,15 @@ pub async fn request(client: Arc<JevClient>, dispatch: Dispatch, done: mpsc::Sen
             let latency = millis(received.elapsed());
             let retry_after = reply.as_ref().ok().filter(|r| r.status == 429).and_then(|r| r.retry_after);
             let answer = classify(&prepared, reply.as_ref().map_err(|e| *e), latency);
-            let _ = done.send(Completed::Answer { answer: Box::new(answer), retry_after });
+            if Instant::now() < deadline {
+                let _ = done.send(Completed::Answer { answer: Box::new(answer), retry_after });
+            } else {
+                // The reply was taken at or after the deadline (both were
+                // ready at once): `timeout` is published and the reply is late.
+                let timeout = prepared.answer(Outcome::Timeout, Some("deadline"), Some(latency));
+                let _ = done.send(Completed::Answer { answer: Box::new(timeout), retry_after: None });
+                let _ = done.send(Completed::Late { answer: Box::new(answer), retry_after });
+            }
         }
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             let latency = millis(received.elapsed());
@@ -501,8 +540,9 @@ pub async fn request(client: Arc<JevClient>, dispatch: Dispatch, done: mpsc::Sen
             match tokio::time::timeout(left, &mut call).await {
                 Ok(reply) => {
                     let latency = millis(received.elapsed());
+                    let retry_after = reply.as_ref().ok().filter(|r| r.status == 429).and_then(|r| r.retry_after);
                     let late = classify(&prepared, reply.as_ref().map_err(|e| *e), latency);
-                    let _ = done.send(Completed::Late(Box::new(late)));
+                    let _ = done.send(Completed::Late { answer: Box::new(late), retry_after });
                 }
                 Err(_) => {
                     let _ = done.send(Completed::Abandoned { ask_id: prepared.ask.ask_id.clone() });
@@ -579,6 +619,13 @@ struct EyeLoop {
     /// Answers absent for a refused shape, another model or a malformed
     /// field: loud once, then counted, until an answer is `ok`.
     absent_answers: FailureRegimeLatch,
+    /// Asks dropped over the ask bound: loud once, then counted, until an
+    /// ask is within it.
+    ask_flood: FailureRegimeLatch,
+    /// Whether this run's data notice was checked with Jev on.
+    notice_given: bool,
+    /// The release the route last answered as.
+    release: Option<String>,
 }
 
 /// Log one failure through `latch`: the regime's first and each decade at
@@ -599,14 +646,48 @@ fn log_failure(latch: &mut FailureRegimeLatch, what: &'static str, detail: &str)
     }
 }
 
+/// The client for `endpoint`, built by `build`. `None` without an endpoint,
+/// and `None` with one error line when `build` fails: every look is then
+/// answered `unavailable` (`no_client`).
+fn client_for(
+    endpoint: Option<&url::Url>,
+    build: impl FnOnce(url::Url) -> Result<JevClient, String>,
+) -> Option<Arc<JevClient>> {
+    match build(endpoint?.clone()) {
+        Ok(client) => Some(Arc::new(client)),
+        Err(reason) => {
+            tracing::error!(
+                error = %reason,
+                "Jev client not built; every look is answered unavailable"
+            );
+            None
+        }
+    }
+}
+
+/// Log the data notice [`switch::startup_notice`] gives for `settings`,
+/// with Jev `on` or not.
+fn give_notice(settings: &EyeSettings, on: bool) {
+    let host = settings
+        .endpoint
+        .as_ref()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    match switch::startup_notice(&settings.state_dir, settings.notice, on, &host) {
+        Some((true, line)) => tracing::warn!(notice = %line, "Jev data notice"),
+        Some((false, line)) => tracing::info!(notice = %line, "Jev data notice"),
+        None => {}
+    }
+}
+
 impl EyeHost {
     /// Open the ports and start the thread; returns once the ports exist.
-    /// Prints the data notice the region's level calls for.
+    /// Prints the data notice the region's level calls for. A client that
+    /// cannot be built is logged, and every look is answered `unavailable`.
     ///
     /// # Errors
     ///
     /// [`RcpdError::Transport`] when a port cannot be created,
-    /// [`RcpdError::Session`] when the HTTP client cannot be built,
     /// [`RcpdError::ObserverSpawn`] when the thread cannot start.
     pub fn spawn(
         manager: Arc<TransportManager>,
@@ -614,24 +695,12 @@ impl EyeHost {
         receipts: ReceiptSink,
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, RcpdError> {
-        let client = match &settings.endpoint {
-            Some(endpoint) => Some(Arc::new(
-                JevClient::new(endpoint.clone()).map_err(|reason| RcpdError::Session { reason })?,
-            )),
-            None => None,
-        };
+        let client = client_for(settings.endpoint.as_ref(), JevClient::new);
+        let mut notice_given = false;
         if settings.jev.is_some() {
             let status = settings.status();
-            let host = settings
-                .endpoint
-                .as_ref()
-                .and_then(|u| u.host_str().map(str::to_owned))
-                .unwrap_or_default();
-            match switch::startup_notice(&settings.state_dir, settings.notice, status.on, &host) {
-                Some((true, line)) => tracing::warn!(notice = %line, "Jev data notice"),
-                Some((false, line)) => tracing::info!(notice = %line, "Jev data notice"),
-                None => {}
-            }
+            give_notice(&settings, status.on);
+            notice_given = status.on;
             tracing::info!(
                 on = status.on,
                 credential = %status.credential,
@@ -671,6 +740,9 @@ impl EyeHost {
                     counters: Counters::default(),
                     frame_failures: FailureRegimeLatch::new(),
                     absent_answers: FailureRegimeLatch::new(),
+                    ask_flood: FailureRegimeLatch::new(),
+                    notice_given,
+                    release: None,
                 };
                 eye.run(&thread_stop);
             })
@@ -694,8 +766,19 @@ impl EyeLoop {
             let mut busy = self.read_frames();
             let now = Instant::now();
             for text in drain_strings(&self.ports.asks, &self.core.settings().ask_topic) {
-                self.pending.push_back((text, now));
                 busy = true;
+                if self.core.intake(now) {
+                    if let Some(suppressed) = self.ask_flood.on_success() {
+                        tracing::info!(suppressed, "asks within the ask bound again");
+                    }
+                    self.pending.push_back((text, now));
+                } else {
+                    log_failure(
+                        &mut self.ask_flood,
+                        "dropped an ask over the ask bound",
+                        "unanswered, no receipt",
+                    );
+                }
             }
             busy |= self.admit_pending();
             while let Ok(done) = self.done_rx.try_recv() {
@@ -771,6 +854,10 @@ impl EyeLoop {
                     self.counters_today().looks += 1;
                     match &self.client {
                         Some(client) => {
+                            if !self.notice_given {
+                                give_notice(self.core.settings(), true);
+                                self.notice_given = true;
+                            }
                             let client = Arc::clone(client);
                             let done = self.done_tx.clone();
                             self.runtime.spawn(request(client, *dispatch, done));
@@ -814,7 +901,22 @@ impl EyeLoop {
                 }
                 self.finish(*answer);
             }
-            Completed::Late(answer) => {
+            Completed::Late {
+                answer,
+                retry_after,
+            } => {
+                // A late 429 or spend-limit reply still holds the route.
+                let held = self.core.note(
+                    answer.outcome,
+                    retry_after,
+                    Instant::now(),
+                    SystemTime::now(),
+                );
+                if held {
+                    tracing::info!(
+                        "Jev reached its daily limit on this robot; off until 00:00 UTC"
+                    );
+                }
                 tracing::info!(
                     ask_id = %answer.ask_id,
                     latency_ms = answer.latency_ms.unwrap_or(0),
@@ -867,6 +969,13 @@ impl EyeLoop {
                 if let Some(suppressed) = self.absent_answers.on_success() {
                     tracing::info!(suppressed, "Jev answers again");
                 }
+                if answer.model_answered.is_some() && answer.model_answered != self.release {
+                    tracing::info!(
+                        model_answered = answer.model_answered.as_deref().unwrap_or(""),
+                        "Jev answers as this release"
+                    );
+                    self.release.clone_from(&answer.model_answered);
+                }
             }
             _ => {}
         }
@@ -914,5 +1023,22 @@ impl EyeLoop {
         if let Err(e) = switch::write_status(&self.core.settings().state_dir, &status) {
             tracing::debug!(error = %e, "status file not written");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_for;
+
+    #[test]
+    fn a_client_that_cannot_be_built_leaves_the_eye_without_one() {
+        let endpoint = url::Url::parse("https://openrouter.ai/api/v1/systemone").expect("url");
+        let built = client_for(Some(&endpoint), |_| {
+            Err(String::from(
+                "No CA certificates were loaded from the system",
+            ))
+        });
+        assert!(built.is_none());
+        assert!(client_for(None, |_| unreachable!("no endpoint, no build")).is_none());
     }
 }

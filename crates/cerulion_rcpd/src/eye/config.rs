@@ -4,18 +4,18 @@
 //! ```yaml
 //! eyes:
 //!   jev:
-//!     base_url: https://openrouter.ai/api # the client posts to {base_url}/v1/systemone
-//!     model: typesafe/jev-1.14            # pinned: no alias
-//!     credential_file: keys/jev.key       # optional; relative to the manifest
-//!     region: US                          # optional; picks the data notice
-//!     frame_topic: /wrist/image           # sensor_msgs/CompressedImage, JPEG
-//!     ask_topic: /rcp/eye/ask             # optional; the default
-//!     answer_topic: /rcp/eye/answer       # optional; the default
-//!     timeout_ms: 1500                    # optional; 1..=1500, the default 1500
+//!     base_url: https://openrouter.ai/api/v1 # the client posts to {base_url}/systemone
+//!     model: typesafe/jev-1.14               # pinned: no alias
+//!     credential_file: keys/jev.key          # optional; relative to the manifest
+//!     region: US                             # optional; picks the data notice
+//!     frame_topic: /wrist/image              # sensor_msgs/CompressedImage, JPEG
+//!     ask_topic: /rcp/eye/ask                # optional; the default
+//!     answer_topic: /rcp/eye/answer          # optional; the default
+//!     timeout_ms: 1500                       # optional; 1..=1500, the default 1500
 //!     question_sets:
 //!       - name: press_gate
 //!         state: Wrist camera frame from a small arm in front of a coffee machine.
-//!         numbers: [jaw_gap_mm]           # optional; the numbers an ask may carry
+//!         numbers: [jaw_gap_mm]              # optional; the numbers an ask may carry
 //!         questions:
 //!           edge_visible: { type: noul, instructions: The rim's lower edge is visible in `frame`. }
 //!           rim: { type: box, instructions: The chrome rim band in `frame`. }
@@ -35,14 +35,15 @@ use serde_json::Value;
 
 use crate::eye::limits;
 
-/// The route used when the manifest names none: OpenRouter's System One API.
-pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api";
+/// The route used when the manifest names none: OpenRouter's API base, the
+/// `route.base_url` the account service issues with a robot's key.
+pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// The model used when the manifest names none.
 pub const DEFAULT_MODEL: &str = "typesafe/jev-1.14";
 
 /// The path the client appends to the base URL.
-pub const SYSTEM_ONE_PATH: &str = "/v1/systemone";
+pub const SYSTEM_ONE_PATH: &str = "/systemone";
 
 /// The most question sets a manifest declares.
 pub const MAX_QUESTION_SETS: usize = 16;
@@ -408,16 +409,35 @@ impl QuestionSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint, model_matches, pinned_model};
+    use super::{endpoint, model_matches, pinned_model, DEFAULT_BASE_URL, DEFAULT_MODEL};
+
+    #[test]
+    fn the_defaults_are_the_route_the_account_service_issues_with_a_key() {
+        // The `route` object of the key endpoint's 200 response.
+        let route = serde_json::json!({
+            "base_url": "https://openrouter.ai/api/v1",
+            "model": "typesafe/jev-1.14",
+        });
+        assert_eq!(route["base_url"], DEFAULT_BASE_URL);
+        assert_eq!(route["model"], DEFAULT_MODEL);
+        assert_eq!(
+            endpoint(DEFAULT_BASE_URL).expect("ok").as_str(),
+            "https://openrouter.ai/api/v1/systemone"
+        );
+    }
 
     #[test]
     fn a_route_is_https_or_loopback_http_with_nothing_attached() {
         assert_eq!(
-            endpoint("https://openrouter.ai/api").expect("ok").as_str(),
+            endpoint("https://openrouter.ai/api/v1")
+                .expect("ok")
+                .as_str(),
             "https://openrouter.ai/api/v1/systemone"
         );
         assert_eq!(
-            endpoint("https://api.typesafe.ai/").expect("ok").as_str(),
+            endpoint("https://api.typesafe.ai/v1/")
+                .expect("ok")
+                .as_str(),
             "https://api.typesafe.ai/v1/systemone"
         );
         assert!(endpoint("http://127.0.0.1:9/api").is_ok());

@@ -222,7 +222,9 @@ fn verify_eye_bag(
     match verify_bag(bag, &receipts, &topics) {
         Ok(report) if report.problems.is_empty() => {
             eprintln!(
-                "eye answers joined: {} of {} answers have their receipt; {} asks ({} without an                  answer in the recording), {} late receipts, {} requests recomputed from the                  recorded frame",
+                "eye answers joined: {} of {} answers have their receipt; {} asks ({} without an \
+                 answer in the recording), {} late receipts, {} requests recomputed from the \
+                 recorded frame",
                 report.joined,
                 report.answers,
                 report.asks,
@@ -363,14 +365,21 @@ async fn run(args: Args) -> Result<(), RcpdError> {
         results = %loaded.journal.results_topic,
         "tools journaled"
     );
-    // The eye's ports open only under `eyes.jev`.
+    // The eye's ports open only under `eyes.jev`. An eye that cannot start
+    // is logged and the daemon serves without it.
     let _eye = match &eye_settings.jev {
-        Some(_) => Some(EyeHost::spawn(
+        Some(_) => match EyeHost::spawn(
             manager.clone(),
             eye_settings,
             host.receipt_sink(),
             tokio::runtime::Handle::current(),
-        )?),
+        ) {
+            Ok(eye) => Some(eye),
+            Err(e) => {
+                tracing::error!(error = %e, "the Jev eye did not start; serving without it");
+                None
+            }
+        },
         None => None,
     };
     let source = GraphSource::new(manager, loaded.identity);

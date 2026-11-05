@@ -40,7 +40,13 @@ User reference: docs/rcp.md.
   every call result. Receipt lines carry the tool name, not the class.
 - stdout carries only the MCP stream in stdio mode; logs go to stderr.
 - The Jev eye (`src/eye/`) runs on its own `rcp-eye` thread, never the
-  journal thread, and only when the manifest has `eyes.jev`. Every check in
+  journal thread, and only when the manifest has `eyes.jev`. Its receipts
+  take the receipt log's lock, the lock the e-stop's intent receipt takes
+  before the e-stop frame is queued, so `EyeCore::intake` (the ask bound,
+  `limits::ASK_BURST` / `ASKS_PER_SECOND`) runs before anything else and
+  an ask over it gets no answer and no receipt. A failed `EyeHost::spawn`
+  is logged and the daemon serves without the eye; a client that cannot be
+  built answers `unavailable`. Every check in
   `EyeCore::admit` runs before any network call; every answer frame gets its
   `eye.jev` receipt (caller `rcp-eye`, digest = `request_sha256` or
   `ask_sha256`) BEFORE it is published, and an unreceipted answer is not
@@ -56,8 +62,16 @@ User reference: docs/rcp.md.
   tests use per-test SHM roots (`init_for_test`) and unique topics;
   `binary_smoke_test.rs` spawns the binary on the default root, so each of its
   manifests names journal topics unique to the test and process.
+- The `test-helpers` feature (on for tests through the self
+  dev-dependency) exposes the receipt log's fault seam, a client trusting
+  one extra root, and `jpeg_header_for_test`.
 - `eye_stub_test.rs` drives `EyeCore` and the HTTP client against a local
-  stand-in route (no real key, no network); `eye_graph_test.rs` runs the eye
+  stand-in route (no real key, no network); `eye_tls_test.rs` runs the
+  client over TLS (an untrusted root is refused before any request; a
+  trusted one speaks HTTP/2 by ALPN) and scans every log line for key
+  bytes; `eye_host_test.rs` drives the eye thread through an ask flood, a
+  key placed after start (notice before the first request), a receipt that
+  cannot be written, and no client; `eye_graph_test.rs` runs the eye
   thread on a private SHM root, records a bag, scans it, the receipts, the
   status file and every log line for key bytes, resims from it and runs
   `--verify-bag`. It installs the process's log subscriber, so it stays one

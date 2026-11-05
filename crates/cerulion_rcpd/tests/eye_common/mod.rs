@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A local stand-in for the System One route, and the manifest and key the
+//! A local stand-in for the System One route, over plain HTTP/1.1 or over
+//! TLS with HTTP/2 and HTTP/1.1 offered by ALPN, and the manifest and key the
 //! eye tests share. No test here reaches the network or holds a real key.
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
@@ -53,6 +54,7 @@ impl Reply {
 /// One request the stub received.
 #[derive(Debug, Clone)]
 pub struct Seen {
+    pub version: hyper::Version,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -78,6 +80,107 @@ pub struct Stub {
     pub addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
     accept: tokio::task::JoinHandle<()>,
+    tls: bool,
+    /// TLS handshakes that failed.
+    handshake_failures: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Answer one request with `script`'s reply, recording it in `seen`.
+async fn handle(
+    request: Request<Incoming>,
+    seen: Arc<Mutex<Vec<Seen>>>,
+    script: Arc<Mutex<Script>>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let version = request.version();
+    let path = request.uri().path().to_owned();
+    let headers = request
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+        .collect();
+    let body = request
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let reply = (script.lock().unwrap_or_else(PoisonError::into_inner))(&parsed);
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Seen {
+            version,
+            path,
+            headers,
+            body,
+        });
+    if !reply.delay.is_zero() {
+        tokio::time::sleep(reply.delay).await;
+    }
+    let mut response = Response::builder()
+        .status(reply.status)
+        .header("content-type", "application/json");
+    if let Some(secs) = reply.retry_after {
+        response = response.header("retry-after", secs.to_string());
+    }
+    Ok(response
+        .body(Full::new(Bytes::from(reply.body)))
+        .expect("response"))
+}
+
+/// A test root and a leaf for 127.0.0.1 it signs, valid from a day ago for
+/// a week: the server's TLS configuration (ALPN `h2`, then `http/1.1`) and
+/// the root a client must trust.
+fn tls_chain() -> (
+    rustls::ServerConfig,
+    rustls::pki_types::CertificateDer<'static>,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    let epoch = rcgen::date_time_ymd(1970, 1, 1);
+    let not_before = epoch + (now - Duration::from_secs(86_400));
+    let not_after = epoch + (now + Duration::from_secs(7 * 86_400));
+    let root_key = rcgen::KeyPair::generate().expect("root key");
+    let mut root = rcgen::CertificateParams::new(Vec::<String>::new()).expect("root params");
+    root.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    root.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    root.distinguished_name = rcgen::DistinguishedName::new();
+    root.distinguished_name
+        .push(rcgen::DnType::CommonName, "rcpd eye test root");
+    root.not_before = not_before;
+    root.not_after = not_after;
+    let root_cert = root.self_signed(&root_key).expect("root cert");
+    let issuer = rcgen::Issuer::from_params(&root, &root_key);
+    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+    let mut leaf = rcgen::CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    leaf.distinguished_name = rcgen::DistinguishedName::new();
+    leaf.distinguished_name
+        .push(rcgen::DnType::CommonName, "127.0.0.1");
+    leaf.subject_alt_names = vec![rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+        std::net::Ipv4Addr::LOCALHOST,
+    ))];
+    leaf.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    leaf.not_before = not_before;
+    leaf.not_after = not_after;
+    let leaf_cert = leaf.signed_by(&leaf_key, &issuer).expect("leaf cert");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf_cert.der().clone(), root_cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        )
+        .expect("server config");
+    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    (server, root_cert.der().clone())
 }
 
 impl Drop for Stub {
@@ -87,15 +190,36 @@ impl Drop for Stub {
 }
 
 impl Stub {
-    /// Serve `script`, which picks the reply from the request body.
+    /// Serve `script`, which picks the reply from the request body, over
+    /// plain HTTP/1.1.
     pub async fn start(script: impl FnMut(&Value) -> Reply + Send + 'static) -> Self {
+        Self::serve(script, None).await
+    }
+
+    /// Serve `script` over TLS, offering HTTP/2 and HTTP/1.1 by ALPN, with
+    /// a certificate for 127.0.0.1 from a fresh test root; returns the root.
+    pub async fn start_tls(
+        script: impl FnMut(&Value) -> Reply + Send + 'static,
+    ) -> (Self, rustls::pki_types::CertificateDer<'static>) {
+        let (config, root) = tls_chain();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        (Self::serve(script, Some(acceptor)).await, root)
+    }
+
+    async fn serve(
+        script: impl FnMut(&Value) -> Reply + Send + 'static,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub");
         let addr = listener.local_addr().expect("addr");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let script: Arc<Mutex<Script>> = Arc::new(Mutex::new(Box::new(script)));
+        let handshake_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accept_seen = Arc::clone(&seen);
+        let failures = Arc::clone(&handshake_failures);
+        let is_tls = tls.is_some();
         let accept = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -103,64 +227,52 @@ impl Stub {
                 };
                 let seen = Arc::clone(&accept_seen);
                 let script = Arc::clone(&script);
+                let tls = tls.clone();
+                let failures = Arc::clone(&failures);
                 tokio::spawn(async move {
                     let service = service_fn(move |request: Request<Incoming>| {
-                        let seen = Arc::clone(&seen);
-                        let script = Arc::clone(&script);
-                        async move {
-                            let path = request.uri().path().to_owned();
-                            let headers = request
-                                .headers()
-                                .iter()
-                                .map(|(k, v)| {
-                                    (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned())
-                                })
-                                .collect();
-                            let body = request
-                                .into_body()
-                                .collect()
-                                .await
-                                .map(|b| b.to_bytes().to_vec())
-                                .unwrap_or_default();
-                            let parsed: Value =
-                                serde_json::from_slice(&body).unwrap_or(Value::Null);
-                            let reply =
-                                (script.lock().unwrap_or_else(PoisonError::into_inner))(&parsed);
-                            seen.lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .push(Seen {
-                                    path,
-                                    headers,
-                                    body,
-                                });
-                            if !reply.delay.is_zero() {
-                                tokio::time::sleep(reply.delay).await;
-                            }
-                            let mut response = Response::builder()
-                                .status(reply.status)
-                                .header("content-type", "application/json");
-                            if let Some(secs) = reply.retry_after {
-                                response = response.header("retry-after", secs.to_string());
-                            }
-                            Ok::<_, Infallible>(
-                                response
-                                    .body(Full::new(Bytes::from(reply.body)))
-                                    .expect("response"),
-                            )
-                        }
+                        handle(request, Arc::clone(&seen), Arc::clone(&script))
                     });
-                    let _ = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
+                    match tls {
+                        None => {
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
+                        }
+                        Some(acceptor) => {
+                            let Ok(stream) = acceptor.accept(stream).await else {
+                                failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            };
+                            let _ = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                        }
+                    }
                 });
             }
         });
-        Self { addr, seen, accept }
+        Self {
+            addr,
+            seen,
+            accept,
+            tls: is_tls,
+            handshake_failures,
+        }
+    }
+
+    /// TLS handshakes the stub refused or that failed.
+    pub fn handshake_failures(&self) -> usize {
+        self.handshake_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The base URL a manifest names.
     pub fn base_url(&self) -> String {
-        format!("http://{}/api", self.addr)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://{}/api/v1", self.addr)
     }
 
     /// Every request so far.

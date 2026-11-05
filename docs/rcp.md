@@ -238,18 +238,18 @@ through OpenRouter by default. Jev reads; the graph's gate decides.
 ```yaml
 eyes:
   jev:
-    base_url: https://openrouter.ai/api  # default; requests go to {base_url}/v1/systemone
-    model: typesafe/jev-1.14             # default; a pinned name, never an alias
-    credential_file: keys/jev.key        # optional, relative to this file
-    region: US                           # optional; picks the data notice
-    frame_topic: /wrist/image            # sensor_msgs/CompressedImage, JPEG
-    ask_topic: /rcp/eye/ask              # default
-    answer_topic: /rcp/eye/answer        # default
-    timeout_ms: 1500                     # default and maximum
+    base_url: https://openrouter.ai/api/v1  # default; requests go to {base_url}/systemone
+    model: typesafe/jev-1.14                # default; a pinned name, never an alias
+    credential_file: keys/jev.key           # optional, relative to this file
+    region: US                              # optional; picks the data notice
+    frame_topic: /wrist/image               # sensor_msgs/CompressedImage, JPEG
+    ask_topic: /rcp/eye/ask                 # default
+    answer_topic: /rcp/eye/answer           # default
+    timeout_ms: 1500                        # default and maximum
     question_sets:
       - name: press_gate
         state: Wrist camera frame from an arm in front of a coffee machine.
-        numbers: [jaw_gap_mm]            # optional: the numbers an ask may carry
+        numbers: [jaw_gap_mm]               # optional: the numbers an ask may carry
         questions:
           edge_visible: { type: noul, instructions: The rim's lower edge is visible in `frame`. }
           rim: { type: box, instructions: The chrome rim band in `frame`. }
@@ -268,8 +268,17 @@ publishes one answer frame per ask on the answer topic with an `outcome`:
 than its deadline is receipted `late` and never published. The frame records
 the questions, the state, the model asked and the model that answered, and
 the SHA-256 of the image and of the request body; never the image bytes or
-the key. A receipt (`eye.jev`, caller `rcp-eye`) is written before each
-answer is published.
+the key. Every answer frame carries `"provenance": "third_party"`, so a
+training or labelling export can leave Jev's output out. A receipt
+(`eye.jev`, caller `rcp-eye`) is written before each answer is published,
+and an answer whose receipt cannot be written is not published.
+
+The daemon answers at most 20 asks at once and 10 a second after that,
+whatever the outcome; an ask over that bound gets no answer and no receipt,
+so the asking node's own deadline makes Jev absent; the first drop is
+logged, and later ones are counted.
+The eye's receipts share the receipt log, and its lock, with the tools and
+the e-stop.
 
 Before any request the daemon refuses an ask that is not one of these shapes
 (`malformed`), an image that is not a JPEG of at most 640 x 480 pixels and
@@ -287,12 +296,19 @@ key is on file and the switch is not off:
 - `cerulion-rcpd jev off` stops requests with the next ask (`disabled`);
   `jev on` turns it back on; `jev status` prints on or off, the route, the
   model, today's asks and looks (UTC) and the last outcome.
-- The first start with Jev on logs one line saying that wrist frames leave
-  the robot and how to turn Jev off. A region whose law requires more gets
-  the line at every start (`clear`), or Jev off until `jev on` (`opt_in`).
+- The first time Jev is on, at start or before the first request of a run
+  (a key placed while the daemon runs), the daemon logs one line saying that
+  wrist frames leave the robot and how to turn Jev off. A region whose law
+  requires more gets the line at every run (`clear`), or Jev off until
+  `jev on` (`opt_in`).
+- An eye that cannot start (its topics cannot be opened) is logged and the
+  daemon serves its tools without it; an HTTPS client that cannot be built
+  (no system root certificates) answers every look `unavailable`.
 
 The answer topic has no producer inside the graph, so a recording replays
-the answers as recorded and nothing calls Jev. `--verify-bag` checks that
-every answer in a recording has its receipt, names an ask the recording
-holds, and, where the recording holds the frame, that the image and request
-digests recompute from it.
+the answers as recorded and nothing calls Jev. A replayed ask gets a
+recorded answer only when its text is the text that answer was given for;
+any other ask gets `not_recorded`. `--verify-bag` checks that every answer
+in a recording has its receipt, names an ask the recording holds, and,
+where the recording holds the frame, that the image and request digests
+recompute from it and the recorded model, state and questions.

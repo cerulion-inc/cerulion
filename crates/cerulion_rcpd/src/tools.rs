@@ -165,6 +165,17 @@ impl ReceiptSink {
             })
     }
 
+    /// Arm the next [`ReceiptSink::record`] to fail at its `sync_data`, as a
+    /// full disk would.
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn fail_next_sync_for_test(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fail_next_sync_for_test();
+    }
+
     /// Append one receipt, durable before this returns; `None` (logged) when
     /// it could not be written.
     pub fn record(

@@ -272,7 +272,7 @@ eyes:
 fn an_eyes_section_parses_with_the_pinned_defaults() {
     let m = RcpManifest::parse(EYES).expect("parse");
     let jev = m.eyes.jev.expect("eyes.jev");
-    assert_eq!(jev.base_url, "https://openrouter.ai/api");
+    assert_eq!(jev.base_url, "https://openrouter.ai/api/v1");
     assert_eq!(jev.model, "typesafe/jev-1.14");
     assert_eq!(jev.ask_topic, "/rcp/eye/ask");
     assert_eq!(jev.answer_topic, "/rcp/eye/answer");

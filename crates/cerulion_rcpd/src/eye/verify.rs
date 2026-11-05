@@ -12,7 +12,9 @@
 //! 4. Every `late` receipt follows a `timeout` answer with the same request.
 //! 5. Where the recording holds the frame an answer sent, the image's
 //!    SHA-256 and the request body's SHA-256 recompute from the frame and
-//!    the answer's recorded model, state and questions.
+//!    the answer's recorded model, state and questions. An answer that sent
+//!    a request but does not record its frame, model, state or questions
+//!    fails.
 //!
 //! Asks without an answer are counted, not failed: a recording can stop
 //! between an ask and its answer.
@@ -163,9 +165,7 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
                 .problems
                 .push(format!("answer to ask {id} has no ask in the recording"));
         }
-        if let Some(problem) = check_request(&answer, &images, &mut report.requests_checked) {
-            report.problems.push(problem);
-        }
+        check_request(&answer, &images, &mut report);
     }
     for digest in late {
         report.late += 1;
@@ -184,28 +184,49 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
 }
 
 /// Recompute the image and request digests of `answer` from the recorded
-/// frame it names, when the recording holds it.
-fn check_request(
-    answer: &Value,
-    images: &BTreeMap<u32, Vec<u8>>,
-    checked: &mut usize,
-) -> Option<String> {
-    let request = answer.get("request_sha256")?.as_str()?;
+/// frame it names, when it sent a request and the recording holds that
+/// frame. [`EyeBagReport::requests_checked`] counts the requests whose
+/// digests were recomputed; each failure goes to
+/// [`EyeBagReport::problems`].
+fn check_request(answer: &Value, images: &BTreeMap<u32, Vec<u8>>, report: &mut EyeBagReport) {
+    let Some(request) = answer.get("request_sha256").and_then(Value::as_str) else {
+        return;
+    };
     let id = answer.get("ask_id").cloned().unwrap_or(Value::Null);
-    let seq = u32::try_from(answer.get("frame")?.get("seq")?.as_u64()?).ok()?;
-    let image = images.get(&seq)?;
-    *checked += 1;
+    let Some(seq) = answer
+        .get("frame")
+        .and_then(|f| f.get("seq"))
+        .and_then(Value::as_u64)
+        .and_then(|seq| u32::try_from(seq).ok())
+    else {
+        report.problems.push(format!(
+            "answer to ask {id} sent a request but names no frame"
+        ));
+        return;
+    };
+    let Some(image) = images.get(&seq) else {
+        return;
+    };
+    let field = |name: &str| answer.get(name).filter(|v| !v.is_null());
+    let model = field("model_requested").and_then(Value::as_str);
+    let (Some(model), Some(state), Some(questions)) = (model, field("state"), field("questions"))
+    else {
+        report.problems.push(format!(
+            "answer to ask {id} sent a request but does not record its model, state and questions"
+        ));
+        return;
+    };
     let image_sha256 = sha256_hex(image);
+    let body = request_body(model, state, questions, image);
+    report.requests_checked += 1;
     if answer.get("image_sha256").and_then(Value::as_str) != Some(image_sha256.as_str()) {
-        return Some(format!(
+        report.problems.push(format!(
             "answer to ask {id}: the recorded frame {seq} is not the image it sent"
         ));
     }
-    let model = answer.get("model_requested")?.as_str()?;
-    let state = answer.get("state")?;
-    let questions = answer.get("questions")?;
-    let body = request_body(model, state, questions, image);
-    (sha256_hex(&body) != request).then(|| {
-        format!("answer to ask {id}: request_sha256 does not recompute from the recording")
-    })
+    if sha256_hex(&body) != request {
+        report.problems.push(format!(
+            "answer to ask {id}: request_sha256 does not recompute from the recording"
+        ));
+    }
 }

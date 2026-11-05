@@ -72,7 +72,7 @@ async fn look(core: &mut EyeCore, client: &Arc<JevClient>, text: &str) -> (Answe
                             core.note(a.outcome, retry_after, Instant::now(), SystemTime::now());
                         answer = Some(*a);
                     }
-                    Completed::Late(a) => late = Some(*a),
+                    Completed::Late { answer: a, .. } => late = Some(*a),
                     Completed::Abandoned { .. } => {}
                 }
             }

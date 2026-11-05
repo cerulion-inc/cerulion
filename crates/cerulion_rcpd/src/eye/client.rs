@@ -144,6 +144,36 @@ impl JevClient {
             .and_then(|builder| builder.with_platform_verifier())
             .map_err(|e| format!("cannot build the Jev TLS configuration: {e}"))?
             .with_no_client_auth();
+        Ok(Self::with_tls(endpoint, tls))
+    }
+
+    /// [`JevClient::new`] with the platform verifier trusting `roots` as
+    /// well as the platform's roots: the same client for a test route
+    /// whose certificate chains to `roots`.
+    ///
+    /// # Errors
+    ///
+    /// The reason the TLS configuration could not be built.
+    #[cfg(all(feature = "test-helpers", not(target_os = "android")))]
+    #[doc(hidden)]
+    pub fn with_extra_roots(
+        endpoint: url::Url,
+        roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Result<Self, String> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier =
+            rustls_platform_verifier::Verifier::new_with_extra_roots(roots, Arc::clone(&provider))
+                .map_err(|e| format!("cannot build the Jev TLS configuration: {e}"))?;
+        let tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("cannot build the Jev TLS configuration: {e}"))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        Ok(Self::with_tls(endpoint, tls))
+    }
+
+    fn with_tls(endpoint: url::Url, tls: rustls::ClientConfig) -> Self {
         let mut tcp = HttpConnector::new();
         tcp.enforce_http(false);
         tcp.set_connect_timeout(Some(Duration::from_millis(crate::eye::limits::TIMEOUT_MS)));
@@ -164,7 +194,7 @@ impl JevClient {
             .http2_keep_alive_timeout(Duration::from_secs(5))
             .http2_keep_alive_while_idle(true)
             .build(connector);
-        Ok(Self { http, endpoint })
+        Self { http, endpoint }
     }
 
     /// The endpoint requests go to.

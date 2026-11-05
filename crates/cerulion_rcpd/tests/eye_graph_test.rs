@@ -434,6 +434,10 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         ("logs", logs.bytes()),
     ];
     assert!(!everything[3].1.is_empty(), "the log capture ran");
+    assert!(
+        String::from_utf8_lossy(&everything[3].1).contains("so those frames leave this robot"),
+        "the eye logged the data notice"
+    );
     for (what, bytes) in &everything {
         assert!(!holds_key(bytes), "{what} holds key bytes");
     }
@@ -471,6 +475,24 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
     assert_eq!(
         decide(&missing),
         format!("42 {:?}", Look::Absent(Outcome::NotRecorded))
+    );
+    assert_eq!(recorded_answers.divergences(), 0);
+    // A resim that asks about another frame under a recorded id is not
+    // given the recorded answer.
+    let mut again = RecordedAnswers::from_bag(&bag, &jev.answer_topic).expect("answers");
+    let (_, first_ask) = &asks[0];
+    let mut moved_ask: Value = serde_json::from_str(first_ask).expect("ask");
+    moved_ask["frame"]["seq"] = json!(moved_ask["frame"]["seq"].as_u64().expect("seq") + 1);
+    let diverged = again.answer(&moved_ask.to_string()).expect("answer");
+    assert_eq!(
+        decide(&diverged),
+        format!("0 {:?}", Look::Absent(Outcome::NotRecorded))
+    );
+    assert_eq!(again.divergences(), 1);
+    assert_eq!(
+        again.answer(first_ask).as_deref(),
+        Some(live[0].1.as_str()),
+        "the recorded ask still gets its answer"
     );
     assert_eq!(requests, 7, "the resim made no request");
 
@@ -575,5 +597,108 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         report.problems.iter().any(|p| p.contains("has no receipt")),
         "{:?}",
         report.problems
+    );
+
+    // A frame edited after the looks no longer recomputes its image digest.
+    let schemas = [
+        (
+            jev.frame_topic.clone(),
+            "sensor_msgs/CompressedImage",
+            CompressedImage::SCHEMA_HASH,
+            CompressedImage::WIRE_FIXED_SIZE,
+        ),
+        (
+            jev.ask_topic.clone(),
+            "std_msgs/String",
+            RosString::SCHEMA_HASH,
+            RosString::WIRE_FIXED_SIZE,
+        ),
+        (
+            jev.answer_topic.clone(),
+            "std_msgs/String",
+            RosString::SCHEMA_HASH,
+            RosString::WIRE_FIXED_SIZE,
+        ),
+    ];
+    let edited_frames: Vec<Recorded> = recorded
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            if r.topic == jev.frame_topic {
+                let run = r
+                    .frame
+                    .windows(64)
+                    .position(|w| w.iter().all(|&b| b == 0x20))
+                    .expect("the JPEG's padding");
+                r.frame[run + 32] = 0x21;
+            }
+            r
+        })
+        .collect();
+    let edited = dir.path().join("edited-frames.mcap");
+    write_bag(&edited, &edited_frames, &schemas);
+    let report = verify_bag(&edited, &receipts, &topics).expect("verify");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("is not the image it sent")),
+        "{:?}",
+        report.problems
+    );
+    assert_eq!(report.requests_checked, 7);
+
+    // An answer whose recorded state was edited, or dropped, fails the
+    // request recompute; its receipt still joins.
+    let edit_first_answer = |from: &[u8], to: &[u8]| -> Vec<Recorded> {
+        let mut done = false;
+        recorded
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if !done && r.topic == jev.answer_topic {
+                    if let Some(at) = r.frame.windows(from.len()).position(|w| w == from) {
+                        r.frame[at..at + to.len()].copy_from_slice(to);
+                        done = true;
+                    }
+                }
+                r
+            })
+            .collect()
+    };
+    let edited = dir.path().join("edited-state.mcap");
+    write_bag(
+        &edited,
+        &edit_first_answer(b"Wrist camera", b"wrist camera"),
+        &schemas,
+    );
+    let report = verify_bag(&edited, &receipts, &topics).expect("verify");
+    assert_eq!(report.joined, live.len());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("request_sha256 does not recompute")),
+        "{:?}",
+        report.problems
+    );
+    let edited = dir.path().join("dropped-state.mcap");
+    write_bag(
+        &edited,
+        &edit_first_answer(b"\"state\":{", b"\"stat_\":{"),
+        &schemas,
+    );
+    let report = verify_bag(&edited, &receipts, &topics).expect("verify");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("does not record its model, state and questions")),
+        "{:?}",
+        report.problems
+    );
+    assert_eq!(
+        report.requests_checked, 6,
+        "the request without a state was not checked"
     );
 }

@@ -5,8 +5,10 @@
 //! order: `ask_id`, `outcome`, `detail`, `question_set`, `frame`,
 //! `ask_sha256`, `route`, `model_requested`, `model_answered`,
 //! `request_sha256`, `image_sha256`, `image` (`{width, height, bytes}`),
-//! `questions`, `state`, `answers`, `usage` (`{input_tokens, cost}`) and
-//! `latency_ms`. Fields that do not apply are `null`.
+//! `questions`, `state`, `answers`, `usage` (`{input_tokens, cost}`),
+//! `latency_ms` and `provenance`. Fields that do not apply are `null`.
+//! `provenance` is always `third_party`, a field a training or labelling
+//! export filters Jev's output out on.
 //!
 //! [`classify`] maps a reply as the design's failure table says:
 //!
@@ -15,8 +17,8 @@
 //! | 200 with the pinned model and every question answered | `ok`, or `not_visible` under the set's threshold |
 //! | 200 from another model | `wrong_model` |
 //! | 200 with a missing or malformed field | `malformed` |
-//! | 401, or 403 that names no limit | `no_credential` |
-//! | 402, or 403 that names a limit, budget, credit, quota or spend | `quota` |
+//! | 401, or any other 403 | `no_credential` |
+//! | 402, or 403 whose message says `key limit exceeded`, `insufficient credits` or `budget` | `quota` |
 //! | 429 | `rate_limited` |
 //! | 400, 413, 422, or another 4xx | `refused` |
 //! | 5xx (529 included), anything else, no reply | `unavailable` |
@@ -107,6 +109,18 @@ pub struct Answer {
     pub usage: Option<Usage>,
     /// From the ask's arrival to the reply, milliseconds.
     pub latency_ms: Option<u64>,
+    /// Always [`ThirdParty`].
+    pub provenance: ThirdParty,
+}
+
+/// The `provenance` every answer frame carries: `third_party`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThirdParty;
+
+impl Serialize for ThirdParty {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("third_party")
+    }
 }
 
 fn outcome_code<S: serde::Serializer>(outcome: &Outcome, s: S) -> Result<S::Ok, S::Error> {
@@ -367,6 +381,7 @@ impl Prepared {
             answers: None,
             usage: None,
             latency_ms,
+            provenance: ThirdParty,
         }
     }
 }
@@ -391,6 +406,7 @@ pub fn unsent(ask: &Ask, route: &Route, outcome: Outcome, detail: Option<&str>) 
         answers: None,
         usage: None,
         latency_ms: None,
+        provenance: ThirdParty,
     }
 }
 
@@ -429,6 +445,7 @@ pub fn unread(
         answers: None,
         usage: None,
         latency_ms: None,
+        provenance: ThirdParty,
     })
 }
 
@@ -460,12 +477,19 @@ fn well_formed(answer: &Value, kind: &str, options: Option<&[String]>) -> bool {
     }
 }
 
-/// Whether a 403 body names a spend limit rather than a bad key.
+/// Whether a 403 names a spend limit rather than a bad key: its
+/// `error.message` (the whole body when it has none) holds `key limit
+/// exceeded` (a key's daily, monthly or total limit), `insufficient credits`
+/// or `budget` (a workspace budget), in any case.
 fn names_a_limit(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    ["limit", "budget", "credit", "quota", "spend"]
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+        .to_ascii_lowercase();
+    ["key limit exceeded", "insufficient credits", "budget"]
         .iter()
-        .any(|w| text.contains(w))
+        .any(|w| message.contains(w))
 }
 
 /// The answer frame for `prepared` given the route's reply.
@@ -669,9 +693,16 @@ question_sets:
             (
                 reply(
                     403,
-                    &json!({ "error": { "message": "Key limit exceeded" } }),
+                    &json!({ "error": { "message": "Key limit exceeded (daily limit)" } }),
                 ),
                 Outcome::Quota,
+            ),
+            (
+                reply(
+                    403,
+                    &json!({ "error": { "message": "Request blocked: image size limit" } }),
+                ),
+                Outcome::NoCredential,
             ),
             (reply(402, &json!({})), Outcome::Quota),
             (reply(429, &json!({})), Outcome::RateLimited),

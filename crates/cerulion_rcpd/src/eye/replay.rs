@@ -2,11 +2,16 @@
 //! Recorded answers for replay and resim: no network, byte for byte.
 //!
 //! [`RecordedAnswers`] holds a recording's answer frames by `ask_id`, in
-//! recorded order. [`RecordedAnswers::answer`] returns the recorded frame's
-//! text unchanged for an ask with a recorded answer, and a `not_recorded`
-//! frame for one without, so a gate re-run on a recording sees exactly the
-//! answers it saw live and sees Jev absent where the recording has nothing.
-//! Nothing here opens a connection.
+//! recorded order. [`RecordedAnswers::answer`] returns a recorded frame's
+//! text unchanged for an ask whose text is the one that answer was given
+//! for (its `ask_sha256` is the SHA-256 of the replayed ask), and a
+//! `not_recorded` frame otherwise, so a gate re-run on a recording sees
+//! exactly the answers it saw live and sees Jev absent where the recording
+//! has nothing for that exact ask. A replayed ask whose id has recorded
+//! answers but whose text matches none of them (another frame, question set
+//! or numbers) is a divergence: it gets `not_recorded`, the recorded
+//! answers stay, and [`RecordedAnswers::divergences`] counts it. Nothing
+//! here opens a connection.
 //!
 //! A bag stores each frame as its 40-byte wire header followed by the
 //! message; [`string_frames`] and [`image_frames`] read a topic's frames
@@ -22,7 +27,7 @@ use native_ros2_messages::sensor_msgs::CompressedImage;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::Value;
 
-use crate::eye::answer::{ask_id_of, Answer};
+use crate::eye::answer::{ask_id_of, Answer, ThirdParty};
 use crate::eye::client::sha256_hex;
 use crate::eye::verdict::Outcome;
 
@@ -31,23 +36,40 @@ fn id_key(id: &Value) -> String {
     id.to_string()
 }
 
+/// One recorded answer frame and the `ask_sha256` it carries.
+#[derive(Debug, Clone)]
+struct Recorded {
+    ask_sha256: Option<String>,
+    text: String,
+}
+
 /// A recording's answers, by ask.
 #[derive(Debug, Clone, Default)]
 pub struct RecordedAnswers {
-    by_ask: BTreeMap<String, VecDeque<String>>,
+    by_ask: BTreeMap<String, VecDeque<Recorded>>,
+    divergences: usize,
 }
 
 impl RecordedAnswers {
     /// File `texts` (answer frames in recorded order) by their `ask_id`.
     /// A frame without a usable `ask_id` is skipped.
     pub fn new(texts: impl IntoIterator<Item = String>) -> Self {
-        let mut by_ask: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
+        let mut by_ask: BTreeMap<String, VecDeque<Recorded>> = BTreeMap::new();
         for text in texts {
             if let Some(id) = ask_id_of(&text) {
-                by_ask.entry(id_key(&id)).or_default().push_back(text);
+                let ask_sha256 = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("ask_sha256")?.as_str().map(str::to_owned));
+                by_ask
+                    .entry(id_key(&id))
+                    .or_default()
+                    .push_back(Recorded { ask_sha256, text });
             }
         }
-        Self { by_ask }
+        Self {
+            by_ask,
+            divergences: 0,
+        }
     }
 
     /// The answers on `answer_topic` in the bag at `path`.
@@ -61,21 +83,37 @@ impl RecordedAnswers {
         Ok(Self::new(frames.into_iter().map(|(_, text)| text)))
     }
 
-    /// The answer for the ask frame `ask_text`: the next recorded answer to
-    /// its id, unchanged, or a `not_recorded` frame. `None` for an ask with
-    /// no usable id.
+    /// The answer for the ask frame `ask_text`: the oldest recorded answer
+    /// to its id whose `ask_sha256` is the SHA-256 of `ask_text`, unchanged,
+    /// or a `not_recorded` frame. `None` for an ask with no usable id.
     pub fn answer(&mut self, ask_text: &str) -> Option<String> {
         let id = ask_id_of(ask_text)?;
-        let recorded = self
-            .by_ask
-            .get_mut(&id_key(&id))
-            .and_then(VecDeque::pop_front);
-        Some(recorded.unwrap_or_else(|| not_recorded(id, ask_text).to_json()))
+        let digest = sha256_hex(ask_text.as_bytes());
+        let queue = self.by_ask.get_mut(&id_key(&id));
+        let recorded = match queue {
+            Some(queue) if !queue.is_empty() => {
+                let found = queue
+                    .iter()
+                    .position(|r| r.ask_sha256.as_deref() == Some(digest.as_str()));
+                if found.is_none() {
+                    self.divergences += 1;
+                }
+                found.and_then(|i| queue.remove(i))
+            }
+            _ => None,
+        };
+        Some(recorded.map_or_else(|| not_recorded(id, ask_text).to_json(), |r| r.text))
     }
 
     /// Recorded answers not yet served.
     pub fn remaining(&self) -> usize {
         self.by_ask.values().map(VecDeque::len).sum()
+    }
+
+    /// Replayed asks whose id has recorded answers, none of them for that
+    /// ask's text.
+    pub fn divergences(&self) -> usize {
+        self.divergences
     }
 }
 
@@ -99,6 +137,7 @@ pub fn not_recorded(ask_id: Value, ask_text: &str) -> Answer {
         answers: None,
         usage: None,
         latency_ms: None,
+        provenance: ThirdParty,
     }
 }
 
@@ -176,33 +215,65 @@ pub fn image_frames(reader: &BagReader, topic: &str) -> Result<BTreeMap<u32, Vec
 #[cfg(test)]
 mod tests {
     use super::RecordedAnswers;
-    use crate::eye::verdict::{EyeAnswer, Outcome};
+    use crate::eye::client::sha256_hex;
+    use crate::eye::verdict::{EyeAnswer, Look, Outcome};
+
+    /// An answer frame to `ask` with `outcome`.
+    fn answered(ask: &str, outcome: &str) -> String {
+        let id: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(ask).expect("ask")["ask_id"].clone();
+        serde_json::json!({
+            "ask_id": id,
+            "outcome": outcome,
+            "ask_sha256": sha256_hex(ask.as_bytes()),
+            "answers": {},
+        })
+        .to_string()
+    }
 
     #[test]
     fn a_recorded_answer_is_served_unchanged_and_a_new_ask_is_not_recorded() {
-        let first = r#"{"ask_id":1,"outcome":"ok","answers":{}}"#.to_owned();
-        let second = r#"{"ask_id":1,"outcome":"timeout"}"#.to_owned();
-        let other = r#"{"ask_id":"b","outcome":"refused"}"#.to_owned();
+        let ask_1 = r#"{"ask_id":1}"#;
+        let ask_b = r#"{"ask_id":"b"}"#;
+        let first = answered(ask_1, "ok");
+        let second = answered(ask_1, "timeout");
+        let other = answered(ask_b, "refused");
         let mut recorded = RecordedAnswers::new([first.clone(), second.clone(), other.clone()]);
         assert_eq!(recorded.remaining(), 3);
-        assert_eq!(
-            recorded.answer(r#"{"ask_id":1}"#).as_deref(),
-            Some(first.as_str())
-        );
-        assert_eq!(
-            recorded.answer(r#"{"ask_id":1}"#).as_deref(),
-            Some(second.as_str())
-        );
-        let third = recorded.answer(r#"{"ask_id":1}"#).expect("answer");
+        assert_eq!(recorded.answer(ask_1).as_deref(), Some(first.as_str()));
+        assert_eq!(recorded.answer(ask_1).as_deref(), Some(second.as_str()));
+        let third = recorded.answer(ask_1).expect("answer");
         assert_eq!(
             EyeAnswer::parse(&third).expect("parse").outcome,
             Outcome::NotRecorded
         );
-        assert_eq!(
-            recorded.answer(r#"{"ask_id":"b"}"#).as_deref(),
-            Some(other.as_str())
-        );
+        assert_eq!(recorded.answer(ask_b).as_deref(), Some(other.as_str()));
         assert_eq!(recorded.answer("not json"), None);
+        assert_eq!(recorded.remaining(), 0);
+        assert_eq!(recorded.divergences(), 0);
+    }
+
+    #[test]
+    fn a_replayed_ask_for_another_frame_is_not_given_the_recorded_answer() {
+        let live = r#"{"ask_id":7,"question_set":"press","frame":{"topic":"/wrist","seq":41}}"#;
+        let resim = r#"{"ask_id":7,"question_set":"press","frame":{"topic":"/wrist","seq":42}}"#;
+        let recorded_answer = answered(live, "ok");
+        let mut recorded = RecordedAnswers::new([recorded_answer.clone()]);
+        let given = recorded.answer(resim).expect("answer");
+        let parsed = EyeAnswer::parse(&given).expect("parse");
+        assert_eq!(parsed.outcome, Outcome::NotRecorded);
+        assert_eq!(
+            Look::compare(&parsed, |_| Some(1.0), 1.0, 8.0),
+            Look::Absent(Outcome::NotRecorded),
+            "a diverged ask never reads as agreement"
+        );
+        assert_eq!(recorded.divergences(), 1);
+        assert_eq!(recorded.remaining(), 1, "the recorded answer stays");
+        // The ask the recording answered still gets its answer.
+        assert_eq!(
+            recorded.answer(live).as_deref(),
+            Some(recorded_answer.as_str())
+        );
         assert_eq!(recorded.remaining(), 0);
     }
 }

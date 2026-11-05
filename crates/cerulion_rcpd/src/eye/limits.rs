@@ -10,6 +10,10 @@
 //!   [`MIN_IMAGE_SIDE`] pixels a side, and at most [`MAX_INPUT_TOKENS`]
 //!   estimated input tokens; anything else is answered `refused`.
 //! - Time: no answer within [`TIMEOUT_MS`] is answered `timeout`.
+//! - Asks: a second bucket of [`ASK_BURST`] tokens refilled at
+//!   [`ASKS_PER_SECOND`], twice the look bucket, bounds the asks the eye
+//!   answers at all, and so the receipts it writes. An ask that finds it
+//!   empty is dropped unanswered and unreceipted.
 //!
 //! The spend limits (per robot, per account, per fleet) are enforced by the
 //! route, which answers with a status the client maps to `quota`; the eye
@@ -27,6 +31,13 @@ pub const BURST: u32 = 10;
 
 /// Requests on the network at once.
 pub const MAX_IN_FLIGHT: usize = 2;
+
+/// Sustained asks per second the eye answers, any outcome: twice
+/// [`LOOKS_PER_SECOND`].
+pub const ASKS_PER_SECOND: u32 = 2 * LOOKS_PER_SECOND;
+
+/// Asks a full ask bucket answers at once: twice [`BURST`].
+pub const ASK_BURST: u32 = 2 * BURST;
 
 /// The largest image sent, bytes (200 KB).
 pub const MAX_IMAGE_BYTES: usize = 200_000;
@@ -74,19 +85,34 @@ pub fn max_fixed_text_bytes() -> usize {
     usize::try_from(tokens * BYTES_PER_TOKEN).unwrap_or(usize::MAX) - 1_024
 }
 
-/// The rate limit: [`BURST`] tokens, refilled at [`LOOKS_PER_SECOND`].
+/// A token bucket: the look limit ([`BURST`] tokens refilled at
+/// [`LOOKS_PER_SECOND`]) or the ask bound ([`ASK_BURST`] at
+/// [`ASKS_PER_SECOND`]).
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     tokens: f64,
     last: Instant,
+    rate: f64,
+    burst: f64,
 }
 
 impl TokenBucket {
-    /// A full bucket at `now`.
+    /// A full look bucket at `now`.
     pub fn new(now: Instant) -> Self {
+        Self::with_rate(now, LOOKS_PER_SECOND, BURST)
+    }
+
+    /// A full ask bucket at `now`.
+    pub fn for_asks(now: Instant) -> Self {
+        Self::with_rate(now, ASKS_PER_SECOND, ASK_BURST)
+    }
+
+    fn with_rate(now: Instant, rate: u32, burst: u32) -> Self {
         Self {
-            tokens: f64::from(BURST),
+            tokens: f64::from(burst),
             last: now,
+            rate: f64::from(rate),
+            burst: f64::from(burst),
         }
     }
 
@@ -94,7 +120,7 @@ impl TokenBucket {
     pub fn try_take(&mut self, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = self.last.max(now);
-        self.tokens = (self.tokens + elapsed * f64::from(LOOKS_PER_SECOND)).min(f64::from(BURST));
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -257,6 +283,8 @@ pub fn check_image(bytes: &[u8]) -> Result<JpegSize, ShapeRefusal> {
 /// A minimal JPEG header of `width` x `height`: start of image, one baseline
 /// start-of-frame segment and end of image. Not a decodable image; enough
 /// for [`jpeg_size`] and for tests that only need the shape.
+#[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
 pub fn jpeg_header_for_test(width: u16, height: u16, padding: usize) -> Vec<u8> {
     let mut out = vec![0xFF, 0xD8];
     // An APP0 segment of `padding` bytes to set the file size.
@@ -289,8 +317,40 @@ mod tests {
 
     use super::{
         check_image, estimate_input_tokens, jpeg_header_for_test, jpeg_size, max_fixed_text_bytes,
-        InFlight, JpegSize, ShapeRefusal, TokenBucket, BURST, MAX_INPUT_TOKENS, MAX_IN_FLIGHT,
+        InFlight, JpegSize, ShapeRefusal, TokenBucket, ASKS_PER_SECOND, ASK_BURST, BURST,
+        LOOKS_PER_SECOND, MAX_IMAGE_BYTES, MAX_IMAGE_HEIGHT, MAX_IMAGE_WIDTH, MAX_INPUT_TOKENS,
+        MAX_IN_FLIGHT, TIMEOUT_MS,
     };
+
+    #[test]
+    fn the_limits_are_the_ones_the_account_service_issues_with_a_key() {
+        // The `limits` object of the key endpoint's 200 response.
+        let issued = serde_json::json!({
+            "looks_per_second": 5, "burst": 10, "in_flight": 2, "timeout_ms": 1500,
+            "max_images": 1, "image_format": "jpeg", "max_image_width": 640,
+            "max_image_height": 480, "max_image_bytes": 200_000, "max_input_tokens": 4000,
+        });
+        let ours = serde_json::json!({
+            "looks_per_second": LOOKS_PER_SECOND, "burst": BURST, "in_flight": MAX_IN_FLIGHT,
+            "timeout_ms": TIMEOUT_MS, "max_images": 1, "image_format": "jpeg",
+            "max_image_width": MAX_IMAGE_WIDTH, "max_image_height": MAX_IMAGE_HEIGHT,
+            "max_image_bytes": MAX_IMAGE_BYTES, "max_input_tokens": MAX_INPUT_TOKENS,
+        });
+        assert_eq!(ours, issued);
+    }
+
+    #[test]
+    fn the_ask_bucket_answers_twenty_at_once_then_ten_a_second() {
+        let start = Instant::now();
+        let mut asks = TokenBucket::for_asks(start);
+        let flood = (0..1_000).filter(|_| asks.try_take(start)).count();
+        assert_eq!(flood, ASK_BURST as usize);
+        assert_eq!(ASK_BURST, 20);
+        let later = start + Duration::from_secs(1);
+        let refill = (0..1_000).filter(|_| asks.try_take(later)).count();
+        assert_eq!(refill, ASKS_PER_SECOND as usize);
+        assert_eq!(ASKS_PER_SECOND, 10);
+    }
 
     #[test]
     fn the_bucket_allows_a_burst_of_ten_then_five_a_second() {
