@@ -62,6 +62,7 @@ pub mod ffi;
 pub mod heaphook;
 pub mod loan_refusal_latch;
 pub mod publish_reject_latch;
+mod replay;
 pub mod rosidl_buffer;
 pub mod runtime;
 pub mod take_gate;

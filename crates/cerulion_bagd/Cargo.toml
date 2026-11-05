@@ -98,6 +98,18 @@ regex = "1"
 # identical lean edge, so this adds NOTHING to the default build tree. No cycle:
 # netd's own closure is {cerulion_core, cerulion_macros, cerulion_discovery}
 # (+ the wan-only leaves), none of which depends on this crate.
+# The kernel watch live-topic discovery blocks on: `inotify` on Linux,
+# `kqueue` on macOS (`src/service_dir_watch.rs`). Already in the tree - every
+# other workspace crate that needs a syscall reaches it the same way - so this
+# adds no package to the dependency graph and nothing to `deny.toml`.
+#
+# Hand-written rather than taken from a filesystem-watcher crate on purpose:
+# what is needed is one flag from one directory, the watcher crates are
+# recursive cross-platform engines that would add five packages to a binary that
+# ships on a robot, and the usual one carries a license this workspace's
+# `deny.toml` does not allow.
+libc = "0.2"
+
 [target.'cfg(unix)'.dependencies]
 cerulion_netd = { workspace = true }
 
@@ -129,8 +141,6 @@ cerulion_core = { workspace = true, features = ["test-helpers"] }
 mcap = { version = "0.25", default-features = false }
 serial_test = "3"
 tempfile = "3"
-# SIGTERM delivery (libc::kill) in the subprocess finalize test.
-libc = "0.2"
 # `#[traced_test]` pin for the pre-writer drop-oldest loud warn. no-env-filter
 # per repo memory: tracing-test's default EnvFilter scopes to the
 # test-crate-name only and would drop the warn emitted from the

@@ -224,7 +224,7 @@ async fn correct_code_establishes_a_code_paired_row_for_the_desk_key() {
     // for the account + the side-map binding the desk device key → that account.
     let account = AccountId(desk_pk);
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
-    let row = store.is_allowed(&account, 0).expect("desk row on disk");
+    let row = store.account_access(&account, 0).expect("desk row on disk");
     assert_eq!(row.source, PairingSource::CodePaired);
     let index = DeviceAccountIndex::load(&r.index_path, MAC_KEY).expect("index reloads");
     assert_eq!(index.account_for(&PublicKey(desk_pk)), Some(account));
@@ -256,7 +256,7 @@ async fn wrong_code_is_a_code_mismatch_and_writes_no_row() {
     let account = AccountId(desk_pubkey(desk_seed));
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
     assert!(
-        store.is_allowed(&account, 0).is_none(),
+        store.account_access(&account, 0).is_none(),
         "no row on a wrong code"
     );
 }
@@ -287,7 +287,7 @@ async fn no_armed_code_is_refused_and_writes_no_row() {
     let account = AccountId(desk_pubkey(desk_seed));
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
     assert!(
-        store.is_allowed(&account, 0).is_none(),
+        store.account_access(&account, 0).is_none(),
         "no row without an armed code"
     );
 }

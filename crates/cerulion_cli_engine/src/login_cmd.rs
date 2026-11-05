@@ -1062,9 +1062,9 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     if state.session_is_valid(auth::now_unix_ns()) {
         return Ok(None); // still fresh — no cloud call.
     }
-    // A refresh token is single-use, so refreshes are serialized across
-    // processes: hold the refresh lock, re-read, and exchange only if the stored
-    // session is still stale. A process that waited finds the session a peer
+    // A refresh token is single-use (beyond the account service's short reuse
+    // window), so refreshes are serialized across processes: hold the refresh
+    // lock, re-read, and exchange only if the stored session is still stale. A process that waited finds the session a peer
     // just refreshed and returns without a request.
     let auth_path = auth::auth_json_path().ok_or_else(|| {
         CliError::Login(
@@ -1107,19 +1107,28 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     // So the exchange runs unlocked and the publication is conditional — a peer
     // that signed out or logged in while we were refreshing is NOT overwritten
     // with the session it just retired.
-    let published = auth::with_store_lock(&auth_path, || {
-        match auth::load_from(&auth_path).state() {
-            Some(current) if current.refresh_token == state.refresh_token => {
-                auth::write_to(&auth_path, &new_state).map(|()| true)
+    let publication = auth::with_store_lock(&auth_path, || {
+        let current = auth::load_from(&auth_path);
+        let current_refresh = current.state().map(|c| c.refresh_token.as_str());
+        match refresh_publication(
+            current_refresh,
+            &state.refresh_token,
+            &new_state.refresh_token,
+        ) {
+            RefreshPublication::Publish => {
+                auth::write_to(&auth_path, &new_state).map(|()| RefreshPublication::Publish)
             }
-            // Absent, corrupt, or a different pair: another writer moved the
-            // store while the exchange was in flight, and its state is newer
-            // than ours.
-            _ => Ok(false),
+            other => Ok(other),
         }
     })
     .map_err(|e| CliError::Login(format!("could not persist the refreshed session: {e}")))?;
-    if !published {
+    if publication == RefreshPublication::AlreadyStored {
+        // A peer writer (Studio's team page) stored this same pair first: the
+        // service's reuse window answered both exchanges with the pair one
+        // rotation issued. It is the live pair, so it is kept, not revoked.
+        return Ok(Some(new_state));
+    }
+    if publication == RefreshPublication::Superseded {
         // The exchange rotated the session onto `new_state` (refresh is
         // single-use), and nothing on this machine holds that pair: a sign-out
         // revoked only the pair we exchanged, and a login or a peer's refresh
@@ -1136,6 +1145,32 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
         return Ok(None);
     }
     Ok(Some(new_state))
+}
+
+/// What [`refresh_session_if_stale`] does with the pair an exchange returned,
+/// decided under the store lock from the refresh token the store holds now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshPublication {
+    /// The store still holds the exchanged token: write the new pair.
+    Publish,
+    /// The store already holds the new pair (a peer stored the same replayed
+    /// pair): keep it.
+    AlreadyStored,
+    /// The store is absent, corrupt, or holds a different pair: a newer writer
+    /// moved it, and the new pair is revoked unpublished.
+    Superseded,
+}
+
+fn refresh_publication(
+    current_refresh: Option<&str>,
+    exchanged_refresh: &str,
+    new_refresh: &str,
+) -> RefreshPublication {
+    match current_refresh {
+        Some(c) if c == exchanged_refresh => RefreshPublication::Publish,
+        Some(c) if c == new_refresh => RefreshPublication::AlreadyStored,
+        _ => RefreshPublication::Superseded,
+    }
 }
 
 /// Register this machine's ed25519 device key with the account (`POST
@@ -1412,6 +1447,15 @@ fn post_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refreshed_pair_a_peer_already_stored_is_kept_not_revoked() {
+        use RefreshPublication::*;
+        assert_eq!(refresh_publication(Some("A"), "A", "B"), Publish);
+        assert_eq!(refresh_publication(Some("B"), "A", "B"), AlreadyStored);
+        assert_eq!(refresh_publication(Some("C"), "A", "B"), Superseded);
+        assert_eq!(refresh_publication(None, "A", "B"), Superseded);
+    }
 
     #[test]
     fn device_start_body_carries_only_the_anon_id() {

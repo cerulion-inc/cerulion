@@ -36,11 +36,16 @@ pub const BEACON_FACTS_FILENAME: &str = "beacon_facts.json";
 /// posture, and whether the network kill-switch is engaged.
 #[derive(Debug, Clone)]
 pub struct RemotedConfig {
-    /// The 32-byte device secret file.
+    /// The 32-byte device secret file. Provisioning creates it mode 0600. On Unix
+    /// the daemon clears its group and other permission bits when it loads it,
+    /// when the path itself is a regular file with a single link.
     pub key_file: PathBuf,
     /// The trust-store file.
     pub store_file: PathBuf,
     /// The trust-store MAC key file (skeleton seam — see the constant docs).
+    /// Provisioning creates it mode 0600. On Unix the daemon clears its group and
+    /// other permission bits when it loads it, when the path itself is a regular
+    /// file with a single link.
     pub store_mac_key_file: PathBuf,
     /// The device→account side-map file.
     pub index_file: PathBuf,

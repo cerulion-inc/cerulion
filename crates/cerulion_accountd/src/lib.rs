@@ -69,10 +69,11 @@ pub use api::build_router;
 pub use ca::{Ca, CaConfig};
 pub use codec::{decode_b64, encode_b64};
 pub use config::{
-    default_verification_base_uri, Clock, OAuthConfig, ProviderCreds, ServiceConfig, DEFAULT_BIND,
-    SEC_NS,
+    default_verification_base_uri, parse_refresh_reuse_window, Clock, OAuthConfig, ProviderCreds,
+    ServiceConfig, DEFAULT_BIND, DEFAULT_REFRESH_REUSE_WINDOW_NS, MAX_REFRESH_REUSE_WINDOW_NS,
+    REFRESH_REUSE_WINDOW_ENV, SEC_NS,
 };
-pub use db::{Db, EpochRow, RevocationTarget, RobotRow};
+pub use db::{Db, EpochRow, PreviousRotation, RevocationTarget, RobotRow};
 pub use device_code::{
     insert_with_collision_retry, poll_outcome, should_record_poll, AttemptOutcome,
     DeviceCodeSnapshot, DeviceCodeState, PollOutcome, RetryGiveUp,
@@ -84,7 +85,8 @@ pub use oauth::{
     Identity, IdentityResolver, LoggingEmailSender, Provider, Providers, UnconfiguredResolver,
 };
 pub use session::{
-    authenticate_session, evaluate_refresh, RefreshDecision, SessionAuth, SessionSnapshot,
+    authenticate_session, derive_rotated_pair, evaluate_refresh, reuse_window_open,
+    RefreshDecision, SessionAuth, SessionSnapshot,
 };
 pub use supabase::{
     JwksSource, ReqwestJwksSource, StaticJwksSource, SupabaseClaims, SupabaseConfig,
@@ -114,6 +116,10 @@ pub struct AppState {
     pub email: Arc<dyn EmailSender>,
     /// The configured Supabase JWT verifier, if the provider is enabled.
     pub supabase_verifier: Option<Arc<SupabaseVerifier>>,
+    /// The key refresh rotations derive their pairs under
+    /// ([`session::derive_rotated_pair`]): 32 random bytes drawn on the first
+    /// rotation and held only in memory.
+    rotation_key: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl AppState {
@@ -126,6 +132,15 @@ impl AppState {
         identity_resolver: Arc<dyn IdentityResolver>,
         email: Arc<dyn EmailSender>,
     ) -> Self {
+        let mut config = config;
+        if config.refresh_reuse_window_ns > MAX_REFRESH_REUSE_WINDOW_NS {
+            tracing::warn!(
+                requested_ns = config.refresh_reuse_window_ns,
+                max_ns = MAX_REFRESH_REUSE_WINDOW_NS,
+                "refresh_reuse_window_ns is above its maximum; using the maximum"
+            );
+            config.refresh_reuse_window_ns = MAX_REFRESH_REUSE_WINDOW_NS;
+        }
         let supabase_verifier = config.supabase.as_ref().map(|supabase| {
             Arc::new(SupabaseVerifier::new(
                 supabase.clone(),
@@ -148,7 +163,26 @@ impl AppState {
             identity_resolver,
             email,
             supabase_verifier,
+            rotation_key: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The rotation key, drawn from the OS RNG on first use. Concurrent first
+    /// uses agree on one key: `OnceLock::set` keeps the first value stored.
+    pub(crate) fn rotation_key(&self) -> Result<&[u8; 32]> {
+        if let Some(key) = self.rotation_key.get() {
+            return Ok(key);
+        }
+        let drawn = rng::fill::<32>()?;
+        let _ = self.rotation_key.set(drawn);
+        self.rotation_key
+            .get()
+            .ok_or_else(|| AccountdError::Internal("rotation key unset after set".into()))
+    }
+
+    /// The rotation key if a rotation in this process drew one.
+    pub(crate) fn existing_rotation_key(&self) -> Option<&[u8; 32]> {
+        self.rotation_key.get()
     }
 
     /// A dev/test instance: a **dev-provisioned** CA (in-process root ceremony —
