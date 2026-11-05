@@ -640,7 +640,7 @@ plane; see [Host the paired remote plane](#host-the-paired-remote-plane).
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `subscribed`,
-`recorder`, `last_error`, `node_failures`, and `remote`. State is `idle`, `starting`, `running`,
+`recorder`, `last_error`, `node_failures`, `remote`, and `fire_telemetry`. State is `idle`, `starting`, `running`,
 `stopping`, `finished`, `stopped`, or `failed`; `last_error` is null or an object with a stable code and
 message. `finished` means a graph ended on its own after a node requested
 shutdown. Call `stop` to finalize its recording, then start again. Before
@@ -662,7 +662,8 @@ snapshot can look like this:
   "recorder": null,
   "last_error": null,
   "node_failures": [],
-  "remote": null
+  "remote": null,
+  "fire_telemetry": null
 }
 ```
 
@@ -674,6 +675,20 @@ The list stays readable after `stop`. The next `start` whose config parses
 and passes its path checks clears it, also when that start then fails, for
 example on a node type that is not linked. A node that returns an error
 from its tick is not listed.
+
+`fire_telemetry` reports the node tick recording of the run the app
+describes to desks (see
+[What a desk reads about the app's graph](#what-a-desk-reads-about-the-apps-graph)).
+It is `null` when the app describes no run: before a start, after `stop`,
+for a start with no graph or with an empty `listen` and `connect`, and for a
+run the runtime could not describe, which logs a warning. Otherwise it is an
+object: `armed` is true while a desk's `fires` requests keep the recording
+on, `recorded` counts the ticks recorded while armed, lost ones included,
+and `capacity` is the number of ticks the runtime keeps:
+
+```json
+"fire_telemetry": {"armed": false, "recorded": 0, "capacity": 4096}
+```
 
 The `recorder` summary is available after stop and includes message, channel,
 byte, per-topic, and output-path totals. App files are private to the app:
@@ -818,6 +833,32 @@ list refuses every topic. The catalog still names every topic the app serves,
 with its schema and liveness, so a desk can see that `/app/notes` exists but
 cannot receive it. A start with `egress` and an empty `listen` and `connect`
 builds no gateway, so the list has no effect and the start logs a warning.
+
+### What a desk reads about the app's graph
+
+A start with a graph and a non-empty `listen` or `connect` describes the
+graph to desks. The gateway answers two read-only requests about it, under
+the same `lan_access` posture as the catalog:
+
+- `runs` lists the graph as one run: a run id, which each start mints anew;
+  the graph's `name:`, or `unnamed` when the YAML has none; the graph YAML
+  the runtime built from; and a `run.json` with the app's process id, the
+  app's `publish` and `subscribe` topics as the endpoint `app`, each node's
+  trigger, inputs and outputs, and the size and lease of the tick recording.
+  When the graph ends on its own (state `finished`), the run is listed as
+  `ending` until `stop`.
+- `fires` returns the node ticks of a listed run after the point the desk
+  names: for each tick, the node, what triggered it, when it started, how
+  long it ran and which outputs it wrote. The runtime records ticks only
+  while a desk asks. A request turns the recording on, it stops 5 s after
+  the last request, and the newest 4096 ticks are kept.
+
+Under `open`, any host that reaches the gateway can read the graph YAML, the
+`run.json` and the node ticks, and can turn the recording on. Like the
+catalog, the description names topics that `egress` keeps on the device.
+Under `paired` both requests are refused and the recording stays off.
+`stop` withdraws the run before LAN access closes: a desk then reads no
+run, and a `fires` request for the old run id is answered `unknown_run`.
 
 ### Let a LAN peer publish into the graph
 

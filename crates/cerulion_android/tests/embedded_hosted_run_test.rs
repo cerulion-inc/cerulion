@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cerulion_android::{EmbeddedRuntime, RuntimeState};
+use cerulion_android::{EmbeddedRuntime, RuntimeState, Status};
 use cerulion_core::fire_tap::{FireCause, FireFlags, FireTapStats};
-use cerulion_core::graph::parse_graph;
+use cerulion_core::graph::{parse_graph, GraphConfig};
 use cerulion_core::transport::cerulion_q::{
     decode_fires_reply, decode_runs_reply, fires_selector, parse_run_id, runs_selector,
     FiresOutcome, FiresReply, RunEntry, RunEntryState, RunsCompleteness, RunsReply,
@@ -277,17 +277,48 @@ impl Desk {
     }
 }
 
+/// The status as the app's `status` call reads it: a clone taken under the
+/// status lock.
+fn read_status(runtime: &EmbeddedRuntime) -> Status {
+    runtime.status_handle().lock().unwrap().clone()
+}
+
 fn fire_stats(runtime: &EmbeddedRuntime) -> Option<FireTapStats> {
-    runtime
-        .status_handle()
-        .lock()
-        .unwrap()
-        .fire_telemetry
-        .stats()
+    read_status(runtime).fire_telemetry.stats()
 }
 
 fn status_json(runtime: &EmbeddedRuntime) -> Value {
-    serde_json::to_value(&*runtime.status_handle().lock().unwrap()).expect("status JSON")
+    serde_json::to_value(read_status(runtime)).expect("status JSON")
+}
+
+/// Each node of `graph` with its type, its inputs as `(name, source)` and
+/// its outputs as `(name, schema)`.
+type NodeWiring<'a> = (
+    &'a str,
+    &'a str,
+    Vec<(&'a str, &'a str)>,
+    Vec<(&'a str, &'a str)>,
+);
+
+fn wiring(graph: &GraphConfig) -> Vec<NodeWiring<'_>> {
+    graph
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.as_str(),
+                node.node_type.as_str(),
+                node.inputs
+                    .iter()
+                    .map(|input| (input.name.as_str(), input.source.as_str()))
+                    .collect(),
+                node.outputs
+                    .iter()
+                    .map(|output| (output.name.as_str(), output.schema.as_str()))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// The only run of a reply that serves exactly one.
@@ -409,15 +440,33 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     assert_eq!(hosted_graph.identity(), "hosted_graph");
     assert_eq!(hosted_graph.prefix, "hosted");
     assert_eq!(
-        hosted_graph
-            .nodes
-            .iter()
-            .map(|node| (node.id.as_str(), node.node_type.as_str()))
-            .collect::<Vec<_>>(),
+        wiring(&hosted_graph),
         [
-            ("source", "test_node_macro_period_cdylib"),
-            ("relay", "test_node_macro_relay_rlib")
+            (
+                "source",
+                "test_node_macro_period_cdylib",
+                vec![],
+                vec![("cmd", VECTOR3)]
+            ),
+            (
+                "relay",
+                "test_node_macro_relay_rlib",
+                vec![("cmd", "source/cmd")],
+                vec![("echo", VECTOR3)]
+            ),
         ]
+    );
+    let started_graph =
+        parse_graph(&graph_yaml(Some("hosted_graph"))).expect("the started graph parses");
+    assert_eq!(
+        serde_json::to_value(&hosted_graph).expect("hosted graph JSON"),
+        serde_json::to_value(&started_graph).expect("started graph JSON"),
+        "the hosted graph.yaml parses to the graph the app started:\n{}",
+        first.graph_yaml
+    );
+    assert_eq!(
+        runtime.hosted_run_id_for_test().as_deref(),
+        Some(first.run_id.as_str())
     );
     let run_json: Value = serde_json::from_str(&first.run_json).expect("run.json is JSON");
     assert_eq!(
@@ -484,6 +533,7 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     //    settled empty answer, and the stopped run is unknown.
     runtime.stop().expect("stop the named graph");
     assert_eq!(fire_stats(&runtime), None, "a stopped run is not hosted");
+    assert_eq!(runtime.hosted_run_id_for_test(), None);
     runtime
         .start(&config(&listen, "open", None))
         .expect("start without a graph");
@@ -528,8 +578,8 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     assert_eq!(run_json["run_id"], second.run_id.as_str());
     runtime.stop().expect("stop the finished graph");
 
-    // 6. Paired: the run is hosted, and both verbs refuse the desk without
-    //    arming the tap.
+    // 6. Paired: the run is hosted, and both verbs refuse the desk; a fires
+    //    GET that names the hosted run does not arm its tap.
     runtime
         .start(&config(
             &listen,
@@ -537,17 +587,21 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
             Some(graph_yaml(Some("hosted_graph"))),
         ))
         .expect("start the paired graph");
+    let paired = runtime
+        .hosted_run_id_for_test()
+        .expect("a paired start hosts its run");
+    assert_ne!(paired, first.run_id);
     let refused = desk.runs_until(|reply| reply.error.is_some());
     assert!(refused.runs.is_empty(), "{refused:?}");
     let reason = refused.error.as_deref().unwrap_or_default();
     assert!(reason.contains("paired"), "{reason}");
-    assert!(
-        matches!(
-            desk.fires(&first.run_id, Some(0)).outcome,
-            FiresOutcome::Refused { .. }
-        ),
-        "a paired robot refuses fires"
-    );
+    for after in [None, Some(0)] {
+        let outcome = desk.fires(&paired, after).outcome;
+        assert!(
+            matches!(&outcome, FiresOutcome::Refused { reason } if reason.contains("paired")),
+            "a paired robot refuses fires from {after:?}: {outcome:?}"
+        );
+    }
     assert_eq!(
         fire_stats(&runtime),
         Some(FireTapStats {

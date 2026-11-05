@@ -847,6 +847,18 @@ impl EmbeddedRuntime {
         self.graph_exit = Some(Box::new(hook));
     }
 
+    /// TEST SEAM: the id of the run this runtime describes to desks, as the
+    /// `runs` verb serves it; `None` while it describes none.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn hosted_run_id_for_test(&self) -> Option<String> {
+        let run = self.run.as_ref()?;
+        run.hosted.as_ref()?;
+        run.hosted_plan
+            .as_ref()
+            .map(|hosted| format_run_id(hosted.run_id))
+    }
+
     pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
         // A component of a failed run or a finished graph may have left
         // siblings running; tear them down BEFORE the new config is
@@ -1490,29 +1502,15 @@ impl EmbeddedRuntime {
         let ready_file = bags_dir.join(format!("{}.ready", record.file));
         let mut recorded = Vec::new();
         if let Some(graph) = graph {
-            #[cfg(unix)]
-            {
-                // Apply the record selection inside the resolution so a
-                // names-only output that is NOT selected cannot fail startup.
-                let selected: Option<std::collections::HashSet<String>> = record
-                    .topics
-                    .as_ref()
-                    .map(|topics| topics.iter().cloned().collect());
-                recorded = resolve_recorded_topics(
-                    files_dir,
-                    &graph.config,
-                    &graph.infos,
-                    selected.as_ref(),
-                )
-                .map_err(|error| EmbedError::Recorder(error.to_string()))?;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = graph;
-                return Err(EmbedError::Recorder(
-                    "graph recording is only available on Unix".to_string(),
-                ));
-            }
+            // Apply the record selection inside the resolution so a
+            // names-only output that is NOT selected cannot fail startup.
+            let selected: Option<std::collections::HashSet<String>> = record
+                .topics
+                .as_ref()
+                .map(|topics| topics.iter().cloned().collect());
+            recorded =
+                resolve_recorded_topics(files_dir, &graph.config, &graph.infos, selected.as_ref())
+                    .map_err(|error| EmbedError::Recorder(error.to_string()))?;
         }
         for publish in publishes {
             recorded.push(RecordedTopic {
@@ -2244,17 +2242,9 @@ fn hosted_run_entry(
 
 /// The graph config the runtime built from, as the `graph.yaml` a hosted
 /// run serves: the render a `graph run --record` bag embeds.
-#[cfg(unix)]
 fn effective_graph_yaml(graph: &GraphConfig) -> Result<String, EmbedError> {
     cerulion_cli_engine::graph_cmd::render_effective_graph_yaml(graph)
         .map_err(|error| EmbedError::Graph(error.to_string()))
-}
-
-#[cfg(not(unix))]
-fn effective_graph_yaml(_graph: &GraphConfig) -> Result<String, EmbedError> {
-    Err(EmbedError::Graph(
-        "describing a hosted run is only available on Unix".to_string(),
-    ))
 }
 
 /// Wall-clock ns since the Unix epoch, the base a run's start time is
@@ -3343,6 +3333,50 @@ nodes:
             format!("{live:?}"),
             "[NodeFailure { node_id: \"wheel\", message: \"injected candidate crash at tick 3 (exit-3 twin)\" }]"
         );
+    }
+
+    /// The app's `status` call serializes a clone of the status, so the
+    /// clone must carry the fire telemetry it read.
+    #[test]
+    fn fire_telemetry_reads_the_tap_live_and_a_cloned_status_keeps_what_it_read() {
+        let mut graph = panic_fixture_graph();
+        let tap = graph.install_fire_tap(FIRE_TAP_CONFIG);
+        let mut status = Status::new("fire_unit".to_string());
+        assert_eq!(status.fire_telemetry.stats(), None);
+        assert_eq!(
+            serde_json::to_value(status.clone()).expect("status JSON")["fire_telemetry"],
+            serde_json::Value::Null
+        );
+        status.fire_telemetry = FireTelemetry::live(Arc::clone(&tap));
+        let unarmed = FireTapStats {
+            armed: false,
+            recorded: 0,
+            capacity: 4096,
+        };
+        let before = status.clone();
+        assert_eq!(before.fire_telemetry.stats(), Some(unarmed));
+
+        tap.serve(cerulion_core::fire_tap::Cursor::Now, 0);
+        graph.step(Duration::from_millis(50));
+        let armed = FireTapStats {
+            armed: true,
+            recorded: 1,
+            capacity: 4096,
+        };
+        assert_eq!(status.fire_telemetry.stats(), Some(armed));
+        let read = status.clone();
+        assert_eq!(read.fire_telemetry.stats(), Some(armed));
+        assert_eq!(
+            serde_json::to_value(&read).expect("status JSON")["fire_telemetry"],
+            serde_json::json!({"armed": true, "recorded": 1, "capacity": 4096})
+        );
+        assert_eq!(
+            before.fire_telemetry.stats(),
+            Some(unarmed),
+            "a clone is a snapshot"
+        );
+        assert_ne!(before.fire_telemetry, status.fire_telemetry);
+        assert_eq!(read.fire_telemetry, status.fire_telemetry);
     }
 
     /// A graph whose nodes `a` and `b` read `/app/cmd` on input `cmd` with

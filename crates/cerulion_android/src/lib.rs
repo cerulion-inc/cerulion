@@ -36,8 +36,8 @@ pub use error::{codes, EmbedError};
 #[doc(hidden)]
 pub use log::{install_with_sink as install_log_sink_for_test, LogPriority, LogSink};
 pub use runtime::{
-    EmbeddedRuntime, NodeFailure, NodeFailures, RecorderSummary, RemoteStatus, RuntimeState,
-    Status, MAX_PUBLISH_STAMP_LEAD_NS,
+    EmbeddedRuntime, FireTelemetry, NodeFailure, NodeFailures, RecorderSummary, RemoteStatus,
+    RuntimeState, Status, MAX_PUBLISH_STAMP_LEAD_NS,
 };
 pub use subscribe::SubscriptionCounts;
 
