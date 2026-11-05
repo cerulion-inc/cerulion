@@ -13589,6 +13589,11 @@ pub(crate) fn source_entry_infos(
     // its own fire, and it runs before any node library is loaded, so a
     // discarded value would leave that rule decidable and never decided.
     //
+    // The node-level `tick_within_ms` deadline rides it too: executor-unit
+    // planning from source (`graph plan`, `--single-process`, a run's recorded
+    // census) refuses a merge whose summed p50 ticks reach a quarter of a
+    // member's deadline, as the planner over the loaded libraries does.
+    //
     // The REMAINING `InputMeta` fields are still the topology-safe defaults —
     // the CLI's `PortDef` knows nothing about depth or `expect_within_ms` — and
     // `schema_hash: 0` + `DEFAULT_CONSUMER_DEPTH` + no `expect_within_ms` are
@@ -13598,6 +13603,7 @@ pub(crate) fn source_entry_infos(
     type TypeInput = (String, bool, cerulion_core::graph::node::BackpressurePolicy);
     type TypeMeta = (
         Option<cerulion_core::MacroPolicy>,
+        Option<u64>,
         Option<u64>,
         Vec<TypeInput>,
     );
@@ -13635,10 +13641,15 @@ pub(crate) fn source_entry_infos(
                 .collect();
             type_meta.insert(
                 node_type.clone(),
-                (metadata.policy, metadata.throttle_ms, inputs),
+                (
+                    metadata.policy,
+                    metadata.throttle_ms,
+                    metadata.tick_within_ms,
+                    inputs,
+                ),
             );
         }
-        let (policy, throttle_ms, inputs) = &type_meta[&node_type];
+        let (policy, throttle_ms, tick_within_ms, inputs) = &type_meta[&node_type];
         let input_meta: Vec<cerulion_core::graph::node::InputMeta> = inputs
             .iter()
             .map(
@@ -13658,6 +13669,9 @@ pub(crate) fn source_entry_infos(
         }
         if let Some(throttle_ms) = *throttle_ms {
             info = info.with_throttle_ms(throttle_ms);
+        }
+        if let Some(tick_within_ms) = *tick_within_ms {
+            info = info.with_tick_within_ms(tick_within_ms);
         }
         entry_infos.insert(node_def.id.clone(), info);
     }
@@ -23491,6 +23505,148 @@ nodes:
             flow.has_block_consumer(),
             "the flow must report a block consumer — the co-location predicate"
         );
+    }
+
+    /// A `tick_within_ms` declared in node SOURCE reaches every path that
+    /// derives executor units from source: `graph plan`, `--single-process`
+    /// and the run's recorded census, as it reaches the planner that reads the
+    /// loaded libraries.
+    ///
+    /// The case: a 100 ms source feeding a sink, both profiled at 1 ms a tick,
+    /// the sink declaring `tick_within_ms = 4`. Merged, the unit's ticks sum to
+    /// 2 ms. Two ms times the budget divisor (4) stays under the 100 ms period
+    /// and reaches the 4 ms deadline, so the deadline alone keeps the sink in a
+    /// unit of its own.
+    #[test]
+    fn a_tick_deadline_in_node_source_splits_the_units_on_every_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "td_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "deadline_sink",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(tick_within_ms = 4)]
+#[derive(Default)]
+struct DeadlineSinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: td
+prefix: td
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: deadline_sink
+    inputs:
+      - name: inp
+        source: src/out
+process_groups:
+  p0: [src, sink]
+";
+        std::fs::write(ws.root.join("graphs").join("td.yaml"), yaml).unwrap();
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "td".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000_000u64),
+                ("sink".to_string(), 1_000_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![ProfileEdge {
+                producer: "src".to_string(),
+                consumer: "sink".to_string(),
+                rate_mhz: 10_000,
+            }],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "td"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let config = cerulion_core::graph::parse_graph_raw(yaml).unwrap();
+
+        let infos = source_entry_infos(&ws.nodes_dir, &config, "a unit oracle").unwrap();
+        let deadlines = (
+            infos["src"].tick_within_ms(),
+            infos["sink"].tick_within_ms(),
+        );
+        let plan = graph_plan(&ws.root, "td").unwrap();
+        let groups: Vec<String> = run_unit_groups(
+            &ws.root,
+            &config,
+            crate::multiprocess::ExecutionMode::FreeRun,
+            true,
+        )
+        .expect("the run's units derive from source")
+        .into_keys()
+        .collect();
+        let single_process_splits = cfg!(unix).then(|| {
+            let mut single = config.clone();
+            single_process_hosts_units(&ws.root, &mut single, TimeSource::Real, None).unwrap()
+        });
+        eprintln!(
+            "deadlines {deadlines:?}; census units {groups:?}; --single-process splits \
+             {single_process_splits:?}; plan:\n{plan}"
+        );
+
+        assert_eq!(
+            deadlines,
+            (None, Some(4)),
+            "the source metadata carries each node's declared tick deadline"
+        );
+        assert!(
+            plan.contains("graph td: 1 process(es), 2 executor unit(s)"),
+            "graph plan shows two units; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains(
+                "starts at sink: tick budget: the unit's p50 ticks would sum to 2000000 ns >= \
+                 1000000 ns, 1/4 of sink's 4000000 ns tick_within"
+            ),
+            "the sink starts its own unit on its deadline; plan was:\n{plan}"
+        );
+        assert_eq!(
+            groups,
+            vec!["p0.src", "p0.sink"],
+            "the run's census is judged against two units"
+        );
+        if let Some(splits) = single_process_splits {
+            assert!(
+                splits,
+                "--single-process runs the two units rather than one level loop"
+            );
+        }
     }
 
     /// What `graph run --record` hands the recorder is what
