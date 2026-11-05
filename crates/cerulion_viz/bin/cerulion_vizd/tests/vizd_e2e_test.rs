@@ -2909,6 +2909,195 @@ fn netd_demand_plane_reconnects_after_the_daemon_dies() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── activity over the production netd plane. The daemon's follower reads a
+// hosted run's fires through a REAL in-process netd (its `query_fires` verb
+// and client) on a connection of its own, and lets it go once the controller
+// stops asking. Only the robot is a double: a netd query plane serving one run
+// whose node 0 fires once between polls.
+
+/// A netd query plane that hosts one run whose node 0 fires once between
+/// polls, and counts the fires GETs it serves. Every other query fails as a
+/// network-less netd's would.
+struct FiringRunQueryPlane {
+    gets: Arc<AtomicU32>,
+}
+
+impl cerulion_netd::query::QueryPlane for FiringRunQueryPlane {
+    fn query_catalog(
+        &self,
+        _robot: Option<&str>,
+    ) -> Result<CatalogGather, cerulion_netd::query::QueryError> {
+        Err(cerulion_netd::query::QueryError::NoNetwork)
+    }
+    fn query_schema(
+        &self,
+        _robot: Option<&str>,
+        _requested: &str,
+    ) -> Result<cerulion_netd::query::SchemaGather, cerulion_netd::query::QueryError> {
+        Err(cerulion_netd::query::QueryError::NoNetwork)
+    }
+    fn query_runs(
+        &self,
+        _robot: Option<&str>,
+    ) -> Result<cerulion_netd::RunsGather, cerulion_netd::query::QueryError> {
+        Err(cerulion_netd::query::QueryError::NoNetwork)
+    }
+    fn query_fires(
+        &self,
+        robot: &str,
+        run_id: &str,
+        after: Option<u64>,
+    ) -> Result<cerulion_core::transport::cerulion_q::FiresAnswer, cerulion_netd::query::QueryError>
+    {
+        use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
+        use cerulion_core::transport::cerulion_q::{
+            parse_run_id, FiresAnswer, FiresOutcome, FiresReply,
+        };
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let (next, fires) = match after {
+            None => (5119, Vec::new()),
+            Some(cursor) => (
+                cursor + 1,
+                vec![FireRecord {
+                    seq: cursor + 1,
+                    at_ns: 88_400_000_000,
+                    dur_ns: 38_211,
+                    node: 0,
+                    cause: FireCause::Period,
+                    flags: FireFlags(0),
+                    wrote: 1,
+                }],
+            ),
+        };
+        let run = parse_run_id(run_id).expect("netd forwards only a canonical run id");
+        Ok(FiresAnswer::Reply {
+            reply: FiresReply::new(
+                robot,
+                run,
+                FiresOutcome::Served {
+                    now_ns: 88_500_000_000,
+                    armed_since_ns: 87_900_000_000,
+                    next,
+                    lost: 0,
+                    in_tick: vec![],
+                    fires,
+                },
+            ),
+        })
+    }
+}
+
+#[test]
+fn activity_follows_a_hosted_run_through_netd_on_a_connection_of_its_own() {
+    const RUN: &str = "0x5d1c00000000000000000000000f9e02";
+    let gets = Arc::new(AtomicU32::new(0));
+    let netd_dir = std::env::temp_dir().join(format!("netd_activity_{}", std::process::id()));
+    std::fs::create_dir_all(&netd_dir).expect("mk netd tempdir");
+    let netd_sock = netd_dir.join("netd.sock");
+    let netd = netd_daemon::start_with_planes(
+        netd_sock.clone(),
+        Arc::new(OkMirrorPlane),
+        Arc::new(cerulion_netd::egress::NoopEgressPlane),
+        Arc::new(FiringRunQueryPlane {
+            gets: Arc::clone(&gets),
+        }),
+        NetdConfig {
+            idle_grace: Duration::from_secs(3600),
+            idle_watch_poll: Duration::from_millis(50),
+            ..NetdConfig::default()
+        },
+    )
+    .expect("in-process netd starts");
+    let (worker, _flush, _storage) = memory_worker("activity");
+    let (socket, dir) = temp_socket("activity");
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        isolated_transport("vizd_activity"),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::new(NetdDemandPlane::with_socket(netd_sock)),
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    let runs = client.request(r#"{"id":1,"method":"runs","robot":"temi"}"#);
+    assert!(
+        wait_until(Duration::from_secs(5), || netd.active_connections() == 1),
+        "the daemon's own plane holds one netd connection after `runs`: {runs}"
+    );
+
+    let mut ask = |id: u64, after: Option<u64>| -> Value {
+        let after = after.map_or(String::new(), |after| format!(r#","after":{after}"#));
+        let reply = client.request(&format!(
+            r#"{{"id":{id},"method":"activity","robot":"temi","run_id":"{RUN}"{after}}}"#
+        ));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["id"], id, "{reply}");
+        reply["activity"].clone()
+    };
+    let first = ask(2, None);
+    assert_eq!(first["state"]["kind"], "starting", "{first}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let live = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let answer = ask(3, Some(5119));
+        if answer["state"]["kind"] == "live"
+            && answer["fires"].as_array().is_some_and(|f| !f.is_empty())
+        {
+            break answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower never read a fire: {answer}"
+        );
+    };
+    let newest = &live["fires"][0];
+    assert_eq!(
+        live["next"], newest["seq"],
+        "next is the newest fire: {live}"
+    );
+    assert_eq!(
+        (live["lost"].as_u64(), live["skipped"].as_u64()),
+        (Some(0), Some(0)),
+        "{live}"
+    );
+    assert_eq!(
+        (
+            newest["node"].as_u64(),
+            newest["cause"].as_u64(),
+            newest["dur_ns"].as_u64(),
+            newest["wrote"].as_u64(),
+        ),
+        (Some(0), Some(1), Some(38_211), Some(1)),
+        "the robot's fire, through netd: {live}"
+    );
+    assert_eq!(
+        netd.active_connections(),
+        2,
+        "the follower polls on a netd connection of its own"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(8), || netd.active_connections() == 1),
+        "3 s after the last ask the follower ends and closes its connection"
+    );
+    let stopped = gets.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        stopped,
+        "no GET after the follow ended"
+    );
+
+    daemon.shutdown();
+    drop(netd);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&netd_dir);
+}
+
 // ── Test 5d: remote attach is idempotent + survives
 // detach. A daemon DEMANDS a remote topic's netd mirror at most ONCE per topic, so
 // a REPEAT remote attach reports already_attached (idempotent per-connection), a
