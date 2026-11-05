@@ -804,9 +804,11 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
     // which consumer read your info block would decide whether a typo is
     // visible at all. Same `unknown_key=` field name, so ONE grep finds both.
     //
-    // The legal set is the DOCUMENT's, not this parser's: `tick_within_ms`
-    // and `throttle_ms` are read by the runtime and merely not this
-    // consumer's business, so warning about them here would be wrong.
+    // The legal set is the DOCUMENT's: `tick_within_ms` and `throttle_ms` are
+    // envelope keys of the info block. The runtime reads both at load, and this
+    // parser reads both into `NodeMetadata` for the analysis that runs before
+    // any library is loaded (chain fusion reads `throttle_ms`, executor-unit
+    // planning reads `tick_within_ms`).
     const LEGAL_ENVELOPE_KEYS: &[&str] = &[
         "inputs",
         "outputs",
