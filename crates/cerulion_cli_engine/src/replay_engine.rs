@@ -4312,6 +4312,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         feed_index_budget.unwrap_or(crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET),
     )?;
     let mut fed_totals = (0usize, 0usize);
+    // The publisher slots of every topic the whole graph writes, which a pass
+    // that writes nothing on a topic does not see in its own subgraph.
+    let publisher_slots = cerulion_core::replay_feed::live_publisher_slots(&config);
     // One identifier per replay, named into every private feed service.
     let replay_id =
         cerulion_core::replay_feed::new_replay_id().map_err(|e| ReplayError::Internal {
@@ -4392,6 +4395,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 } else {
                     None
                 },
+                publisher_slots: publisher_slots.clone(),
             };
             let mut runtime = match build_pass_runtime(
                 plan,

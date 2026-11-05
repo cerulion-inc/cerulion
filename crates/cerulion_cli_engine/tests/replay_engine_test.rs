@@ -40043,10 +40043,8 @@ fn ri_writer_node(frame: &[u8]) -> String {
     format!("w{}", frame_x(frame) as u64)
 }
 
-/// Write `live` as a single-rank free-run bag the way a recorder does: the
-/// production `recorder.json`, the stage rows, the publisher table and, on a
-/// topic with several writers, one producer label per frame.
-fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
+/// The publisher table of every output `rec` published.
+fn ri_publishers(rec: &Recording) -> serde_json::Value {
     let mut writers: Vec<(String, String)> = Vec::new();
     for (node, outputs) in &rec.publisher_ids {
         for (output, _) in outputs {
@@ -40057,7 +40055,12 @@ fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
         .iter()
         .map(|(n, o)| (n.as_str(), o.as_str()))
         .collect();
-    let publishers = publishers_table(rec, &writer_refs);
+    publishers_table(rec, &writer_refs)
+}
+
+/// One producer label per frame of every topic `rec` recorded from several
+/// writers, the writer read off the frame's own `x`.
+fn ri_frame_label_rows(rec: &Recording) -> Vec<(String, cerulion_bag::ProducerAttribution, u128)> {
     let mut label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = Vec::new();
     for (topic, frames) in &rec.messages {
         let distinct: std::collections::BTreeSet<u64> =
@@ -40075,6 +40078,14 @@ fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
             ));
         }
     }
+    label_rows
+}
+
+/// Write `live` as a single-rank free-run bag the way a recorder does: the
+/// production `recorder.json`, the stage rows, the publisher table and, on a
+/// topic with several writers, one producer label per frame.
+fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
+    let label_rows = ri_frame_label_rows(rec);
     let labels: Vec<ProducerLabel<'_>> = label_rows
         .iter()
         .map(|(t, a, id)| (t.as_str(), *a, *id))
@@ -40090,9 +40101,52 @@ fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
         inputs_json,
         Some(serde_json::json!(0)),
         Some(recorder_json),
-        Some(publishers),
+        Some(ri_publishers(rec)),
         Some(&labels),
         Some(rec.stage_rows.clone()),
+    );
+}
+
+/// Write `live` as a two-rank free-run bag: the nodes `on_rank1` names on rank
+/// 1, every other node on rank 0, each rank declaring the stage rows of its own
+/// nodes, with the publisher table and the per-frame producer labels
+/// [`ri_bag`] writes.
+fn ri_two_rank_bag(rec: &Recording, path: &std::path::Path, on_rank1: fn(&str) -> bool) {
+    let rank_of = |id: &str| u32::from(on_rank1(id));
+    let stage_rows = rec.stage_rows.clone();
+    let staging = move |rank: u32| -> Option<serde_json::Value> {
+        let rows: serde_json::Map<String, serde_json::Value> = stage_rows
+            .as_object()?
+            .iter()
+            .filter(|(node, _)| u32::from(on_rank1(node)) == rank)
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        // A rank with no read stage declares no table: a present-but-empty one
+        // is refused as declaring nothing.
+        (!rows.is_empty()).then(|| serde_json::json!({ "capacities": rows }))
+    };
+    let label_rows = ri_frame_label_rows(rec);
+    let labels: Vec<ProducerLabel<'_>> = label_rows
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        path,
+        |_| {},
+        None,
+        Some(ri_free_run_recorder_json()),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(ri_publishers(rec)),
+            labels: &labels,
+        },
+        Some(&staging),
+        &[],
     );
 }
 
@@ -41167,6 +41221,34 @@ fn a_fed_replay_counts_evictions_per_recorded_writer_on_one_bus() {
     ri_assert_per_writer_accounting("replayed", &replayed);
     let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
     println!("RI_ORACLE writer_baselines: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// The same three writers and two consumers split over two ranks, the writers
+/// on rank 1 and the consumers on rank 0. Rank 0's subgraph writes nothing on
+/// the bus, so its own view of the bus names no publisher slots, while the
+/// live consumers read the bus at its `multi_publisher_topics` slots of 16.
+/// The fed consumers' feeds hold those 16, so each recorded writer keeps its
+/// baseline and every replayed read, its event count and its loss count
+/// included, equals the live read against the same hand oracle.
+#[test]
+#[serial]
+fn a_fed_consumer_rank_counts_evictions_of_three_writers_on_another_rank() {
+    let live = ri_record(ri_writer_baseline_yaml(), ri_writer_baseline_factories);
+    ri_assert_per_writer_accounting("live", &live.reads);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_writer_baselines_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id.starts_with('w'));
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_writer_baseline_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the two-rank fed replay runs");
+    ri_assert_fed(&outcome);
+    ri_assert_per_writer_accounting("replayed", &replayed);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
+    println!("RI_ORACLE writer_baselines_two_rank: compared={compared}");
     assert!(outcome.passed, "{:?}", outcome.violations);
 }
 

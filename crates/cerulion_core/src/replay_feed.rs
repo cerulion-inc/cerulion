@@ -40,6 +40,13 @@
 //! keeps one per writer port live, and a callback read's
 //! `ReceivedMessage::origin` is the recorded writer token, widened.
 //!
+//! The probe holds as many baselines as the feed service has publisher slots.
+//! A feed for a topic the recorded graph writes is created with the slots a
+//! build of the whole graph creates that topic with ([`live_publisher_slots`],
+//! carried in [`ReplayWiring::publisher_slots`]), which a rank that writes
+//! nothing on the topic does not see in its own subgraph. A feed for a topic
+//! no node of the graph writes takes the building runtime's own view of it.
+//!
 //! # Feed names
 //!
 //! A feed's service name carries the replay's identifier, a fixed-width digest
@@ -49,8 +56,9 @@
 //! the transport's topic name limit, and a compile-time assertion holds that
 //! bound to the limit.
 
+use crate::graph::GraphConfig;
 use crate::read_outcome::{ReadStageRole, StageKey};
-use crate::transport::TopicServiceConfig;
+use crate::transport::{PublisherProvisioning, TopicServiceConfig};
 
 /// The service-name root every private replay feed lives under.
 pub const REPLAY_FEED_TOPIC_ROOT: &str = "/__cerulion/replay_feed";
@@ -174,14 +182,20 @@ pub struct ReplayIdUnavailable {
 /// holds for this stage, never below the input's own depth), history is off,
 /// and the publisher side is producer-less (`External`), so the replay's one
 /// feed publisher opens the service the subscriber created. The publisher
-/// slot count stays the live topic's: the subscriber sizes its `drop_oldest`
-/// probe's per-writer baselines from it, and a fed read keys its frames on
-/// their recorded writers, as many as the live topic has.
+/// slot count is `live_publishers` when it is `Some`
+/// ([`ReplayWiring::live_publishers`]), else `live`'s own: the subscriber sizes
+/// its `drop_oldest` probe's per-writer baselines from it, and a fed read keys
+/// its frames on their recorded writers.
 #[must_use]
-pub fn replay_feed_topic_config(live: TopicServiceConfig, buffer: usize) -> TopicServiceConfig {
+pub fn replay_feed_topic_config(
+    live: TopicServiceConfig,
+    buffer: usize,
+    live_publishers: Option<usize>,
+) -> TopicServiceConfig {
     let mut cfg = live;
     cfg.subscriber_max_buffer_size = cfg.subscriber_max_buffer_size.max(buffer);
     cfg.history_size = 0;
+    cfg.max_publishers = live_publishers.or(cfg.max_publishers);
     cfg.max_subscribers = None;
     cfg.publisher_provisioning = crate::transport::PublisherProvisioning::External;
     cfg
@@ -400,9 +414,47 @@ pub struct ReplayWiring {
     /// map names the buffer a stage's feed needs (the deepest single recorded
     /// read on it). A stage the map omits takes its input's own depth.
     pub feeds: Option<std::collections::HashMap<StageKey, usize>>,
+    /// Per topic, the publisher slots a build of the whole recorded graph
+    /// creates its service with ([`live_publisher_slots`]). A fed stage's feed
+    /// service is created with its topic's entry; a topic the map omits takes
+    /// the slots of the building runtime's own view of the topic.
+    pub publisher_slots: std::collections::HashMap<String, usize>,
+}
+
+/// Per topic a native node of `config` writes, the publisher slots a build of
+/// the whole of `config` creates its service with: the
+/// [`MULTI_PUBLISHER_LOOSE_MAX`](crate::transport::MULTI_PUBLISHER_LOOSE_MAX)
+/// of a `multi_publisher_topics` topic, and 1 for any other. A multi-process
+/// deployment's supervisor creates every such service at that config before
+/// any worker starts, so the map also holds the slots of a topic a worker reads
+/// and another worker writes. A topic no native node writes is absent.
+#[must_use]
+pub fn live_publisher_slots(config: &GraphConfig) -> std::collections::HashMap<String, usize> {
+    let mut slots = std::collections::HashMap::new();
+    for node in config.native_nodes() {
+        for output in &node.outputs {
+            let topic = crate::graph::resolve_output_topic(&config.prefix, &node.id, output);
+            let provisioning = if config.is_multi_publisher(&topic) {
+                PublisherProvisioning::Multi
+            } else {
+                PublisherProvisioning::SingleWriter
+            };
+            if let Some(n) = provisioning.max_publishers() {
+                slots.insert(topic, n);
+            }
+        }
+    }
+    slots
 }
 
 impl ReplayWiring {
+    /// The publisher slots a fed stage reading `topic` creates its feed with,
+    /// or `None` when [`Self::publisher_slots`] holds none for the topic.
+    #[must_use]
+    pub fn live_publishers(&self, topic: &str) -> Option<usize> {
+        self.publisher_slots.get(topic).copied()
+    }
+
     /// The feed buffer for the stage `(node, input_idx, role)`, or `None` when
     /// this runtime is not fed.
     #[must_use]
@@ -617,7 +669,6 @@ mod tests {
     /// the publisher side is producer-less.
     #[test]
     fn a_feed_config_keeps_the_live_topics_publisher_slots() {
-        use crate::transport::PublisherProvisioning;
         let live = TopicServiceConfig {
             subscriber_max_buffer_size: 4,
             subscriber_max_borrowed_samples: None,
@@ -631,12 +682,72 @@ mod tests {
             extra_event_listeners: 0,
             publisher_max_loaned_samples: None,
         };
-        let fed = replay_feed_topic_config(live, 6);
+        let fed = replay_feed_topic_config(live, 6, None);
         assert_eq!(fed.max_publishers, Some(16));
         assert_eq!(fed.subscriber_max_buffer_size, 6);
         assert_eq!(fed.history_size, 0);
         assert_eq!(fed.max_subscribers, None);
         assert_eq!(fed.publisher_provisioning, PublisherProvisioning::External);
+    }
+
+    /// A rank that writes nothing on a bus holds an `External` view of it, with
+    /// no publisher slots. Its feed takes the whole graph's 16, and a feed with
+    /// no whole-graph entry keeps the rank's view.
+    #[test]
+    fn a_feed_config_takes_the_whole_graphs_publisher_slots_over_the_ranks_view() {
+        let rank_view = TopicServiceConfig {
+            subscriber_max_buffer_size: 16,
+            subscriber_max_borrowed_samples: None,
+            create_borrow_floor: None,
+            create_publisher_floor: None,
+            create_subscriber_floor: None,
+            max_subscribers: None,
+            max_publishers: None,
+            publisher_provisioning: PublisherProvisioning::External,
+            history_size: 0,
+            extra_event_listeners: 0,
+            publisher_max_loaned_samples: None,
+        };
+        assert_eq!(
+            replay_feed_topic_config(rank_view, 2, Some(16)).max_publishers,
+            Some(16)
+        );
+        assert_eq!(
+            replay_feed_topic_config(rank_view, 2, None).max_publishers,
+            None
+        );
+    }
+
+    /// Three writers on a `multi_publisher_topics` bus, a fourth writer on its
+    /// own output, and a consumer of a topic no node writes: the bus holds 16
+    /// slots, the fourth writer's topic 1, and the unwritten topic is absent.
+    #[test]
+    fn live_publisher_slots_name_every_written_topic_at_its_whole_graph_slots() {
+        let yaml = "name: lps\nprefix: lps\nmulti_publisher_topics:\n  - /lps/bus\nnodes:\n\
+            \x20 - id: w1\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /lps/bus\n\
+            \x20 - id: w2\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /lps/bus\n\
+            \x20 - id: w3\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /lps/bus\n\
+            \x20 - id: src\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+            \x20 - id: sink\n    type: s\n    inputs:\n      - name: a\n        source: /lps/bus\n      - name: b\n        source: /lps/ext\n";
+        let config: GraphConfig = serde_yaml::from_str(yaml).unwrap();
+        let slots = live_publisher_slots(&config);
+        let expected: std::collections::HashMap<String, usize> = [
+            (
+                "/lps/bus".to_string(),
+                crate::transport::MULTI_PUBLISHER_LOOSE_MAX,
+            ),
+            ("/lps/src/out".to_string(), 1),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(slots, expected);
+        assert_eq!(crate::transport::MULTI_PUBLISHER_LOOSE_MAX, 16);
+        let wiring = ReplayWiring {
+            publisher_slots: slots,
+            ..ReplayWiring::default()
+        };
+        assert_eq!(wiring.live_publishers("/lps/bus"), Some(16));
+        assert_eq!(wiring.live_publishers("/lps/ext"), None);
     }
 
     #[test]
@@ -649,6 +760,7 @@ mod tests {
             identity: EdgeIdentity::EveryEdge,
             replay_id: "r1".to_string(),
             feeds: Some(feeds),
+            publisher_slots: std::collections::HashMap::new(),
         };
         assert_eq!(fed.feed_buffer("sink", 2, ReadStageRole::Body), Some(7));
         assert_eq!(fed.feed_buffer("sink", 2, ReadStageRole::Drain), Some(0));

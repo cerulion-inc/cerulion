@@ -7379,8 +7379,11 @@ impl GraphRuntime {
                         },
                     );
                     let buffer = input_depth.max(feed_buffer);
-                    let feed_config =
-                        crate::replay_feed::replay_feed_topic_config(input_topic_config, buffer);
+                    let feed_config = crate::replay_feed::replay_feed_topic_config(
+                        input_topic_config,
+                        buffer,
+                        replay_wiring.live_publishers(&topic),
+                    );
                     // The replay is the private service's one writer, so the
                     // build creates it, at the feed's buffer, before the
                     // subscriber attaches; the handle lives as long as the
@@ -7871,6 +7874,7 @@ impl GraphRuntime {
                         let feed_config = crate::replay_feed::replay_feed_topic_config(
                             trigger_topic_config,
                             buffer,
+                            replay_wiring.live_publishers(&trigger_topic),
                         );
                         // Created by the build, as at the Body site.
                         precreated_services
@@ -8220,6 +8224,7 @@ impl GraphRuntime {
                             let feed_config = crate::replay_feed::replay_feed_topic_config(
                                 topic_config,
                                 feed_buffer,
+                                replay_wiring.live_publishers(&sync_topic),
                             );
                             // Created by the build, as at the Body site.
                             precreated_services.push(
