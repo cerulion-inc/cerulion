@@ -41,6 +41,7 @@ pub mod failure_regime_latch;
 pub mod fill_from;
 pub mod frame_drop_latch;
 pub mod gateway;
+pub mod hosted_runs;
 pub mod ingress_build;
 pub mod input_view;
 pub mod kind;

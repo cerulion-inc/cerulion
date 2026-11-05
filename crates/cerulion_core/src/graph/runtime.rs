@@ -46,6 +46,9 @@ use super::node::{
     FloodLogAction, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo, OutputMeta,
     ShutdownSignal,
 };
+use super::run_topology::{
+    RunTopology, TopologyNode, TopologyPort, TopologyTrigger, RUN_TOPOLOGY_VERSION,
+};
 use super::tick_failure_latch::{TickFailureLatch, TickFailureLog};
 use super::topology::{GraphTopology, Levels};
 use super::{resolve_output_topic, resolve_source};
@@ -3089,6 +3092,7 @@ pub struct GraphRuntime {
     config: GraphConfig,
     scheduler: Scheduler,
     handles: IndexMap<String, NodeHandle>,
+    topology_nodes: Vec<TopologyNode>,
     /// Per capture-time Sync node, its trigger topics and the per-input
     /// capture states its sync ops share. Read only by
     /// [`Self::restore_sync_input_timestamps`], which seeds each input's
@@ -5133,6 +5137,7 @@ impl GraphRuntime {
         // graph share one allocation.
         let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
         let mut handles = IndexMap::new();
+        let mut topology_nodes = Vec::with_capacity(config.nodes.len());
         // Exit-3 widening: one shared PANIC-CLASS failure record per
         // node (first reason wins), written by the tick callback at the catch
         // site / on the structural FFI variant, read post-run via
@@ -7033,8 +7038,13 @@ impl GraphRuntime {
             let node_replay_suppress = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let mut pubs = IndexMap::new();
+            let mut topology_outputs = Vec::with_capacity(node_def.outputs.len());
             for output in &node_def.outputs {
                 let topic = resolve_output_topic(&config.prefix, &node_def.id, output);
+                topology_outputs.push(TopologyPort {
+                    name: output.name.clone(),
+                    topic: topic.clone(),
+                });
                 let output_meta = output_meta_lookup.get(&output.name).copied();
                 let resolved_max_slice_len = resolve_max_slice_len(
                     output.max_slice_len,
@@ -7268,6 +7278,7 @@ impl GraphRuntime {
             }
 
             let mut subs = IndexMap::new();
+            let mut topology_inputs = Vec::with_capacity(node_def.inputs.len());
             // This node's read-outcome stages (body inputs
             // first, in wiring order — the order that ASSIGNS `input_idx` —
             // then any Separate/Sync trigger-drain stages, which REUSE their
@@ -7279,6 +7290,10 @@ impl GraphRuntime {
             let mut node_read_plans: Vec<Arc<crate::read_outcome::ReadPlanStage>> = Vec::new();
             for (input_pos, input) in node_def.inputs.iter().enumerate() {
                 let topic = resolve_source(&config.prefix, &input.source);
+                topology_inputs.push(TopologyPort {
+                    name: input.name.clone(),
+                    topic: topic.clone(),
+                });
                 let key = (node_def.id.clone(), input.name.clone());
                 // This input's iceoryx2 queue is its
                 // declared `#[input(depth = N)]`, or the wiring's deeper floor
@@ -7550,10 +7565,12 @@ impl GraphRuntime {
             // produce a `TriggerPolicy` directly via
             // `macro_policy_to_trigger`, no `DataTriggerBinding`
             // needed.
+            let mut data_trigger_topic = None;
             if let Some(MacroPolicy::DataTrigger { input_name }) = macro_policy {
                 let yaml_input =
                     resolve_macro_data_trigger_input(node_def, input_name, &config.prefix)?;
                 let trigger_topic = resolve_source(&config.prefix, &yaml_input.source);
+                data_trigger_topic = Some(trigger_topic.clone());
 
                 // Per-message FIFO consumption (the data-trigger default):
                 // mark the BODY subscriber so its reads pop exactly ONE
@@ -8455,6 +8472,36 @@ impl GraphRuntime {
                     TriggerPolicy::Data
                 }
             };
+            let trigger = match &policy {
+                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
+                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+                },
+                TriggerPolicy::Data => {
+                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
+                    let topics = match data_trigger_topic {
+                        Some(topic) => vec![topic],
+                        None => topology_inputs
+                            .iter()
+                            .map(|port| port.topic.clone())
+                            .collect(),
+                    };
+                    TopologyTrigger::Data { topics, ambiguous }
+                }
+                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
+                    topics: inputs.clone(),
+                    window_ns: window
+                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
+                },
+                TriggerPolicy::External => TopologyTrigger::External,
+            };
+            topology_nodes.push(TopologyNode {
+                id: node_def.id.clone(),
+                node_type: node_def.node_type.clone(),
+                trigger,
+                inputs: topology_inputs,
+                outputs: topology_outputs,
+                reports_writes: false,
+            });
             let handle = scheduler.add_node(NodeConfig {
                 id: node_def.id.clone(),
                 policy,
@@ -9253,6 +9300,7 @@ impl GraphRuntime {
             config,
             scheduler,
             handles,
+            topology_nodes,
             sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
@@ -17473,6 +17521,15 @@ impl GraphRuntime {
     /// Get the graph config.
     pub fn config(&self) -> &GraphConfig {
         &self.config
+    }
+
+    /// Snapshot this runtime's resolved nodes, ports and triggers in graph order.
+    // hot-path-alloc-ok-fn: cold: a run host requests a description outside node execution
+    pub fn run_topology(&self) -> RunTopology {
+        RunTopology {
+            version: RUN_TOPOLOGY_VERSION,
+            nodes: self.topology_nodes.clone(),
+        }
     }
 
     /// Shutdown the graph runtime.
