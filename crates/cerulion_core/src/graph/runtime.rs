@@ -5552,21 +5552,23 @@ impl GraphRuntime {
         // which now lives in `resolve_levels`).
         let levels = super::topology::resolve_levels(&config, &topology, &trigger_edges)?;
 
-        // CHAIN FUSION, resolved once and logged once. The decision combines
-        // the `CERULION_FUSE_CHAINS` seam with the per-node `fuse: false`
-        // opt-out; the census beside it says which edges the graph's
-        // declarations would allow and, for every other consumer edge, the
-        // reason it keeps the queued path.
-        //
-        // NOTHING BELOW READS EITHER. The pair is logged and dropped, so this
-        // build is byte-identical to one made before either existed. It is
-        // resolved HERE, beside the other build-time seams, because a decision
-        // read twice in one build could disagree with itself and a fusion set
-        // that varied within a build would make a replay a different program.
+        // CHAIN FUSION, resolved once and logged once. The decision is the
+        // `CERULION_FUSE_CHAINS` seam; the census beside it says which edges
+        // the graph's declarations allow and, for every other consumer edge,
+        // the reason it keeps the queued path. With the seam on, the census
+        // chains become this build's chain calls (`ChainCalls::from_census`);
+        // with it off nothing below reads either, so the build is
+        // byte-identical to one made before either existed. It is resolved
+        // HERE, beside the other build-time seams, because a decision read
+        // twice in one build could disagree with itself and a fusion set that
+        // varied within a build would make a replay a different program.
         //
         // The census is judged against the graph's DECLARED colocation, the
         // same shape `cerulion graph levels` reports and every run records, so
-        // one graph reads the same way from all three.
+        // one graph reads the same way from all three. An executor unit's
+        // runtime is built from its own subgraph, where an input fed from
+        // another unit names an absolute topic no node of the build produces:
+        // that edge is no chain link, so a chain call never leaves its unit.
         let mut called_chains: Vec<super::chain::FusedChain> = Vec::new();
         {
             let decision = super::chain::resolve_fusion();
