@@ -3968,6 +3968,11 @@ impl NetworkManager {
     /// The runs this process serves from memory through the `runs` verb. Every
     /// call returns a handle onto the same set; a run hosted through it is
     /// served by this manager's query surface until its guard drops.
+    ///
+    /// Only a declared query surface serves it ([`Self::has_query_surface`]). A
+    /// gateway declares one when it has egress topics or an `AllowAll` policy; a
+    /// deny-all, ingress-only gateway declares none, so a desk's `runs` GET to
+    /// such a robot gets no reply, hosted runs included.
     pub fn hosted_runs(&self) -> HostedRuns {
         self.hosted_runs.clone()
     }
