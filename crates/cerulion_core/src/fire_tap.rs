@@ -407,7 +407,7 @@ impl FireTap {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::clock::Clock;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1022,7 +1022,9 @@ mod tests {
     }
 
     thread_local! {
-        static ALLOCATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// This thread's allocation count while `Some`; the lib test binary's
+        /// allocator counts into it.
+        pub(crate) static ALLOCATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
     struct CountingAllocator;
