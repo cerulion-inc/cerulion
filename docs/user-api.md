@@ -3328,6 +3328,50 @@ with an error; `cerulion viz TOPIC` attaches it. The protocol version in the
 connect banner is unchanged, and a daemon without the verb answers it with the
 structured unknown-method error.
 
+`cerulion-vizd` also answers `activity`, which shows how the nodes of a run
+hosted on a robot are firing (a run whose `run.json` carries
+`telemetry.fires`, such as an Android app's embedded graph). No message content
+is read. `{"id":1,"method":"activity","robot":"temi","run_id":"0x5d1c00000000000000000000000f9e02","after":5119}`
+returns `{"id":1,"ok":true,"activity":{...}}`. `robot` is one robot name as the
+run's `runs` row gives it (no `/`, `*`, `$`, `?` or `#`, and not an `account:`
+route) and `run_id` is the run id as that row gives it (`0x` and 32 lowercase
+hex digits); anything else is refused with an error. The first `activity` for a
+run starts a follower that asks the robot for the run's fires four times a
+second, through `cerulion-netd` (protocol 10 or newer) on a connection of its
+own, and answers `starting`, so ask a few times a second. Each `activity` keeps
+the follower until three seconds after it; the robot records fires only while it
+is asked, and stops five seconds after the follower's last poll. At most four
+runs are followed at once: a fifth is answered `degraded` until one of the four
+goes three seconds without an `activity`.
+
+The answer carries `state`: `starting`, `live` (with `armed_since_ms_ago`, how
+long ago the robot began recording), `silent` (the robot did not answer),
+`unknown_run` (ask `runs` again), `not_served` (the run records no fires),
+`refused` (the robot refused this desk), `unusable` (the robot's answer cannot be
+read) and `degraded` (netd could not ask, or four runs are already followed);
+the last three carry a `reason`. Pass the answer's `next` as the next `after`: `next` is the
+last fire sequence the answer accounts for, and `fires` (newest first, at most
+256), `lost` and `skipped` together account for every sequence after `after` up
+to `next` (from the start of the follow when `after` is older or left out).
+`lost` counts fires the robot dropped before the follower read them; `skipped`
+counts fires the follower read that this answer leaves out, past the newest 256
+or older than the 2048 it keeps per run (a robot loss that old is counted there
+too). A fire is `{"seq","node","cause","flags","ms_ago","dur_ns","wrote"}`:
+`node` is an index into the run's `topology.nodes`, `cause` is `1` period, `3`
+data, `4` sync, `5` external or `0` unknown, `flags` has bit `1` panicked, `2`
+tick error, `4` writes not observed, `8` more than 64 outputs, `16` a duration
+past 4.29 s (`dur_ns` is capped) and `32` more than one input could have
+triggered the tick, and bit `k` of `wrote` means the node's output `k`
+wrote a frame in that tick. `nodes` has one row per node with a fire or inside a
+tick: `fires`, `panics`, `errors`, `dur_p50_ns` and `dur_max_ns` over the last
+`window_ms` (5000, or less once the run fired more in that span than the 2048
+fires kept; a follow younger than that holds fires only since its first poll),
+and `last_ms_ago`, `last_cause`, `last_wrote` and `last_flags` of its newest fire.
+`in_tick` lists `{"node","ms"}` for each node inside a tick and for how long.
+Every age is on this machine's clock, so the robot's clock needs no sync. The
+connect banner's protocol version is unchanged, and a daemon without the verb
+answers it with the structured unknown-method error.
+
 ### Model control protocol
 
 The visualization daemon accepts `load_model` with `id`, an absolute local
