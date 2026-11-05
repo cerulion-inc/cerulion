@@ -1218,6 +1218,44 @@ fn gather_runs_over(
     harvest
 }
 
+/// GET the node fires of the run `run_id` hosted on ONE robot, through the
+/// explicit `cerulion_q/{robot}/fires/{run_id}/{after}` selector
+/// ([`cerulion_q::fires_selector`]), and return every reply payload that
+/// arrived within `gather_window`, undecoded. The caller decodes each with
+/// [`cerulion_q::decode_fires_reply`].
+///
+/// Each GET arms or extends the run's fire tap lease on the robot, so a caller
+/// asks only while it shows the fires. An empty list means nothing came back:
+/// the robot is unreachable, predates the verb, or declares no query surface.
+pub fn query_robot_fires(
+    session: &zenoh::Session,
+    robot: &str,
+    run_id: &str,
+    after: Option<u64>,
+    gather_window: Duration,
+) -> Vec<Vec<u8>> {
+    let selector = cerulion_q::fires_selector(robot, run_id, after);
+    let replies = match session.get(&selector).timeout(gather_window).wait() {
+        Ok(replies) => replies,
+        Err(e) => {
+            tracing::debug!(
+                robot = %robot,
+                error = %e,
+                "fires GET could not be issued; this run's fires stay unknown"
+            );
+            return Vec::new();
+        }
+    };
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    while let Ok(reply) = replies.recv() {
+        if let Ok(sample) = reply.into_result() {
+            // hot-path-alloc-ok: cold, one bounded reply per fires GET on the control plane.
+            payloads.push(sample.payload().to_bytes().to_vec());
+        }
+    }
+    payloads
+}
+
 /// Returns the DEMAND (ingress-interest) liveliness key expression prefix used
 /// by Cerulion — the key-space the network bridge watch flips egress flags on.
 pub fn liveliness_prefix() -> &'static str {
