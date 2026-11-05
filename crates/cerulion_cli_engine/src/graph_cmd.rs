@@ -23779,6 +23779,127 @@ nodes:
         );
     }
 
+    /// Every sentence of the user-facing pages that calls a `--single-process`
+    /// run the monolith, or says it mints no ring, stamps `lockstep` or has no
+    /// ranks, names the executor-unit condition it holds under. On the real
+    /// clock `single_process_hosts_units` runs a graph whose nodes split into
+    /// several units through the supervisor as one process group, so that run
+    /// mints the trace rings, free-runs and records one rank per unit; a graph
+    /// that is one unit stays the monolith.
+    ///
+    /// Each page is read as prose blocks (a paragraph, a table row or a
+    /// heading, whitespace-normalized, fenced code skipped), and each block is
+    /// split into sentences after a `.`, `!` or `?` followed by a space, so the
+    /// condition has to sit in the sentence that makes the claim.
+    #[test]
+    fn the_docs_tie_every_single_process_monolith_claim_to_the_executor_units() {
+        const PAGES: [&str; 5] = [
+            "multi_process.md",
+            "bag.md",
+            "flashback.md",
+            "replay_determinism_footguns.md",
+            "user-api.md",
+        ];
+        const SUBJECTS: [&str; 2] = ["--single-process", "single-process run"];
+        const CLAIMS: [&str; 10] = [
+            "monolith",
+            "mint no ring",
+            "mints no ring",
+            "mint none",
+            "no trace ring",
+            "no ranks",
+            "frames-only",
+            "cannot be re-run",
+            "one-rank lockstep",
+            "stamps `lockstep`",
+        ];
+        const CONDITIONS: [&str; 2] = ["executor unit", "one unit"];
+
+        fn prose_blocks(text: &str) -> Vec<String> {
+            let mut blocks: Vec<String> = Vec::new();
+            let mut paragraph: Vec<&str> = Vec::new();
+            let mut fenced = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                let breaks = fenced
+                    || trimmed.is_empty()
+                    || trimmed.starts_with("```")
+                    || trimmed.starts_with('|')
+                    || trimmed.starts_with('#');
+                if breaks && !paragraph.is_empty() {
+                    blocks.push(paragraph.join(" "));
+                    paragraph.clear();
+                }
+                if trimmed.starts_with("```") {
+                    fenced = !fenced;
+                } else if !fenced && !trimmed.is_empty() {
+                    if breaks {
+                        blocks.push(trimmed.to_string());
+                    } else {
+                        paragraph.push(trimmed);
+                    }
+                }
+            }
+            if !paragraph.is_empty() {
+                blocks.push(paragraph.join(" "));
+            }
+            blocks
+                .iter()
+                .map(|b| b.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect()
+        }
+
+        fn sentences(block: &str) -> Vec<&str> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            for (i, c) in block.char_indices() {
+                if matches!(c, '.' | '!' | '?') && block.as_bytes().get(i + 1) == Some(&b' ') {
+                    out.push(block[start..=i].trim());
+                    start = i + 1;
+                }
+            }
+            out.push(block[start..].trim());
+            out.retain(|s| !s.is_empty());
+            out
+        }
+
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let mut unqualified = Vec::new();
+        for page in PAGES {
+            let path = docs.join(page);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let mut claims = 0;
+            for block in prose_blocks(&text) {
+                for sentence in sentences(&block) {
+                    let lower = sentence.to_lowercase();
+                    if !SUBJECTS.iter().any(|s| lower.contains(s))
+                        || !CLAIMS.iter().any(|c| lower.contains(c))
+                    {
+                        continue;
+                    }
+                    claims += 1;
+                    if !CONDITIONS.iter().any(|c| lower.contains(c)) {
+                        unqualified.push(format!("docs/{page}: {sentence}"));
+                    }
+                }
+            }
+            assert!(
+                claims > 0,
+                "docs/{page} carries no sentence that says what a --single-process run is \
+                 not, so this test reads nothing there; update PAGES or CLAIMS"
+            );
+        }
+        assert!(
+            unqualified.is_empty(),
+            "these sentences say a --single-process run is the monolith without the condition \
+             that makes it one (a graph that is one executor unit); on the real clock a graph \
+             whose nodes split into several units runs them in one worker process, which mints \
+             the rings and records one rank per unit:\n\n{}",
+            unqualified.join("\n\n")
+        );
+    }
+
     /// What `graph run --record` hands the recorder is what
     /// arms live-topic discovery, and nothing pinned it.
     ///

@@ -1179,7 +1179,8 @@ fn single_process_opt_out_runs_monolith_with_no_workers() {
 /// three units run in ONE worker process beside `graph run`, and no other
 /// worker starts. The opt-out still derives nothing and still says the
 /// auto-partition default is skipped, and the recording embeds what ran: one
-/// process group holding every node, with one rank per unit.
+/// process group holding every node, with one rank per unit plus the
+/// supervisor's departure ring, stamped `free_run`.
 #[cfg(target_os = "linux")]
 #[test]
 #[serial]
@@ -1279,6 +1280,24 @@ fn single_process_opt_out_hosts_every_unit_in_one_worker() {
             None,
         ],
         "one rank per executor unit, and no fourth"
+    );
+    assert_eq!(
+        read_manifest(&reader, u32::MAX),
+        Some(Vec::new()),
+        "the supervisor's departure ring is recorded, as on any multi-process run"
+    );
+    let recorder: serde_json::Value = serde_json::from_slice(
+        &reader
+            .attachment("__cerulion/recorder.json")
+            .expect("read attachments")
+            .expect("__cerulion/recorder.json attachment present")
+            .data,
+    )
+    .expect("recorder.json parses as JSON");
+    assert_eq!(
+        recorder["coordination"], "free_run",
+        "the units free-run, so the bag stamps free_run rather than the monolith's lockstep: \
+         {recorder}"
     );
     let (embed_text, embedded) = read_embedded_graph(&reader);
     let groups: Vec<(String, Vec<String>)> = embedded
