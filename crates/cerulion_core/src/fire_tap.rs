@@ -129,7 +129,9 @@ pub enum Cursor {
 pub struct FireBatch {
     /// Runtime clock at the request.
     pub now_ns: u64,
-    /// Runtime clock when the current lease interval began.
+    /// Runtime clock when the current lease interval began. Every tick the
+    /// interval admits starts at or after it, and the lease runs at least the
+    /// configured lease past it.
     pub armed_since_ns: u64,
     /// Last sequence accounted for; pass it to `Cursor::After` unchanged.
     pub next: u64,
@@ -155,10 +157,10 @@ pub struct FireTapStats {
 /// Bounded multi-producer, multi-reader fire telemetry.
 ///
 /// Only readers serialize lease-epoch bookkeeping. Producers never acquire
-/// that mutex, allocate, read a clock, or retry a slot claim. The stamp and
-/// data words are sequentially consistent: equal committed stamps surrounding
-/// the three data loads exclude any intervening writer. The claim CAS excludes
-/// overlapping writers even when a producer is lapped while paused.
+/// that mutex, allocate, read a clock, or retry a sequence or slot claim. The
+/// stamp and data words are sequentially consistent: equal committed stamps
+/// surrounding the three data loads exclude any intervening writer. The claim
+/// CAS excludes overlapping writers even when a producer is lapped while paused.
 pub struct FireTap {
     slots: Box<[Slot]>,
     head: AtomicU64,
@@ -173,7 +175,7 @@ impl std::fmt::Debug for FireTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FireTap")
             .field("capacity", &self.slots.len())
-            .field("recorded", &self.head.load(Ordering::Relaxed))
+            .field("recorded", &self.assigned())
             .field(
                 "lease_until_ns",
                 &self.lease_until_ns.load(Ordering::Relaxed),
@@ -237,11 +239,16 @@ impl FireTap {
             return Some(now);
         }
         // A reader's concurrent extension must not be cleared by this expiry.
+        // Every nonzero deadline is a reader's clock read plus `lease_ns`, and
+        // a re-arm reports that read as `armed_since_ns`, so a tick that read
+        // the clock before it stays out of that lease.
         match self
             .lease_until_ns
             .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
         {
-            Err(extended) if now < extended => Some(now),
+            Err(extended) if now < extended && now >= extended.saturating_sub(self.lease_ns) => {
+                Some(now)
+            }
             _ => None,
         }
     }
@@ -257,17 +264,9 @@ impl FireTap {
         if self.lease_until_ns.load(Ordering::Relaxed) == 0 {
             return;
         }
-        // Relaxed suffices: head assigns identities, never publishes data. The
-        // theoretical exhaustion case freezes instead of recycling stamp values.
-        let previous = self
-            .head
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |head| {
-                (head < LAST_SEQ).then_some(head + 1)
-            });
-        let Ok(previous) = previous else {
+        let Some(seq) = self.reserve(|| {}) else {
             return;
         };
-        let seq = previous + 1;
         let slot = &self.slots[((seq - 1) as usize) & (self.slots.len() - 1)];
         let stamp = slot.stamp.load(Ordering::SeqCst);
         let writing = 2 * seq + 1;
@@ -292,6 +291,28 @@ impl FireTap {
         slot.stamp.store(writing + 1, Ordering::SeqCst);
     }
 
+    /// One read-modify-write takes the next sequence, so a producer never
+    /// retries against another. `contend` is a test seam that runs just before it.
+    #[inline]
+    fn reserve(&self, contend: impl FnOnce()) -> Option<u64> {
+        contend();
+        // Relaxed suffices: head assigns identities, never publishes data.
+        let previous = self.head.fetch_add(1, Ordering::Relaxed);
+        if previous >= LAST_SEQ {
+            // Exhaustion freezes instead of recycling stamp values.
+            self.head.store(LAST_SEQ, Ordering::Relaxed);
+            return None;
+        }
+        Some(previous + 1)
+    }
+
+    /// Sequences assigned so far. After exhaustion `head` can briefly pass
+    /// `LAST_SEQ`.
+    #[inline]
+    fn assigned(&self) -> u64 {
+        self.head.load(Ordering::Relaxed).min(LAST_SEQ)
+    }
+
     /// Arm or extend the lease, then return a bounded page after `cursor`.
     /// A pending, unsuperseded claim ends the page without advancing its cursor.
     /// A zero limit arms the lease without consuming any sequence or loss.
@@ -300,33 +321,29 @@ impl FireTap {
             .armed_since_ns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let mut now_ns = self.clock.now_ns();
         let mut old = self.lease_until_ns.load(Ordering::Relaxed);
-        loop {
+        // The clock is read after `old` and before the CAS: an expiry that
+        // clears `old` in between fails the CAS and forces a later read, and a
+        // tick this CAS admits reads its clock after the CAS.
+        let now_ns = loop {
+            let now_ns = self.clock.now_ns();
             let until = old.max(now_ns.saturating_add(self.lease_ns));
-            match self.lease_until_ns.compare_exchange_weak(
+            match self.lease_until_ns.compare_exchange(
                 old,
                 until,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    if old == 0 {
-                        // A producer may have cleared the lease after the read
-                        // above and refused ticks until this CAS re-armed it.
-                        now_ns = self.clock.now_ns();
-                        *since = now_ns;
-                    } else if old <= now_ns {
-                        *since = now_ns;
-                    }
-                    break;
-                }
+                Ok(_) => break now_ns,
                 Err(actual) => old = actual,
             }
+        };
+        if old == 0 || old <= now_ns {
+            *since = now_ns;
         }
         let armed_since_ns = *since;
         drop(since);
-        let head = self.head.load(Ordering::Relaxed);
+        let head = self.assigned();
         let mut batch = FireBatch {
             now_ns,
             armed_since_ns,
@@ -398,7 +415,7 @@ impl FireTap {
     pub fn stats(&self) -> FireTapStats {
         FireTapStats {
             armed: self.armed_now().is_some(),
-            recorded: self.head.load(Ordering::Relaxed),
+            recorded: self.assigned(),
             capacity: self.slots.len(),
         }
     }
@@ -441,22 +458,34 @@ mod tests {
     struct PausingClock {
         now: AtomicU64,
         pause: std::sync::atomic::AtomicBool,
+        skip: AtomicU64,
+        late: std::sync::atomic::AtomicBool,
         arrived: std::sync::mpsc::SyncSender<()>,
         resume: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl Clock for PausingClock {
         fn now_ns(&self) -> u64 {
             let now = self.now.load(Ordering::Relaxed);
-            if self.pause.swap(false, Ordering::Relaxed) {
+            if self.pause.load(Ordering::Relaxed)
+                && self
+                    .skip
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_err()
+                && self.pause.swap(false, Ordering::Relaxed)
+            {
                 self.arrived.send(()).unwrap();
                 self.resume.lock().unwrap().recv().unwrap();
+                if self.late.load(Ordering::Relaxed) {
+                    return self.now.load(Ordering::Relaxed);
+                }
             }
             now
         }
     }
 
-    /// Once `pause` is set, the next clock read samples the time and then blocks
-    /// until the returned sender releases it.
+    /// Once `pause` is set, the clock passes `skip` reads, then the next read
+    /// blocks until the returned sender releases it. That read returns the time
+    /// from before the block, or from after it when `late` is set.
     fn pausing_tap() -> (
         FireTap,
         Arc<PausingClock>,
@@ -468,6 +497,8 @@ mod tests {
         let clock = Arc::new(PausingClock {
             now: AtomicU64::new(0),
             pause: std::sync::atomic::AtomicBool::new(false),
+            skip: AtomicU64::new(0),
+            late: std::sync::atomic::AtomicBool::new(false),
             arrived: arrived_tx,
             resume: Mutex::new(resume_rx),
         });
@@ -945,13 +976,65 @@ mod tests {
             clock.now.store(150, Ordering::Relaxed);
             let extension = tap.serve(Cursor::Now, 0);
             resume_tx.send(()).unwrap();
-            assert_eq!(expiry.join().unwrap(), Some(100));
+            assert_eq!(
+                expiry.join().unwrap(),
+                None,
+                "the tick at 100 predates the lease re-armed at 150"
+            );
             assert_eq!(extension.armed_since_ns, 150);
         });
         clock.now.store(249, Ordering::Relaxed);
         assert_eq!(tap.armed_now(), Some(249));
         clock.now.store(250, Ordering::Relaxed);
         assert_eq!(tap.armed_now(), None);
+    }
+
+    #[test]
+    fn a_tick_that_sees_its_lease_end_during_a_live_extension_joins_it() {
+        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        tap.serve(Cursor::Now, 0);
+        clock.now.store(95, Ordering::Relaxed);
+        clock.pause.store(true, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| tap.serve(Cursor::Now, 0));
+            arrived_rx.recv().unwrap();
+            clock.now.store(100, Ordering::Relaxed);
+            clock.pause.store(true, Ordering::Relaxed);
+            let tick = scope.spawn(|| tap.armed_now());
+            arrived_rx.recv().unwrap();
+            // The reader read 95 before the lease ended at 100; it extends first.
+            resume_tx.send(()).unwrap();
+            let extension = reader.join().unwrap();
+            resume_tx.send(()).unwrap();
+            assert_eq!(tick.join().unwrap(), Some(100));
+            assert_eq!(extension.armed_since_ns, 0);
+        });
+        clock.now.store(194, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), Some(194));
+        clock.now.store(195, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), None);
+    }
+
+    #[test]
+    fn a_tick_that_read_an_ended_lease_cannot_join_a_later_one() {
+        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        tap.serve(Cursor::Now, 0);
+        clock.now.store(150, Ordering::Relaxed);
+        clock.pause.store(true, Ordering::Relaxed);
+        let (stale, rearm) = std::thread::scope(|scope| {
+            let stale = scope.spawn(|| tap.armed_now());
+            arrived_rx.recv().unwrap();
+            assert_eq!(tap.armed_now(), None, "another tick ends the lease");
+            clock.now.store(160, Ordering::Relaxed);
+            let rearm = tap.serve(Cursor::Now, 0);
+            resume_tx.send(()).unwrap();
+            (stale.join().unwrap(), rearm)
+        });
+        assert_eq!(rearm.armed_since_ns, 160);
+        assert_eq!(
+            stale, None,
+            "the tick at 150 predates the lease armed at 160"
+        );
     }
 
     #[test]
@@ -984,6 +1067,67 @@ mod tests {
         assert_eq!(after.armed_since_ns, rearm.armed_since_ns);
         assert_eq!((after.next, after.lost), (1, 0));
         assert_eq!(after.records[0].at_ns, 106);
+    }
+
+    #[test]
+    fn a_tick_admitted_while_the_reader_arms_lies_inside_the_lease_it_reports() {
+        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        // Any reader clock read after the first one comes after its arm CAS.
+        clock.skip.store(1, Ordering::Relaxed);
+        clock.late.store(true, Ordering::Relaxed);
+        clock.pause.store(true, Ordering::Relaxed);
+        let done = clock.arrived.clone();
+        let (admitted, arm) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let batch = tap.serve(Cursor::Now, 0);
+                done.send(()).unwrap();
+                batch
+            });
+            arrived_rx.recv().unwrap();
+            // Still set only if the reader returned without a second read.
+            let paused = !clock.pause.swap(false, Ordering::Relaxed);
+            clock.now.store(10, Ordering::Relaxed);
+            let admitted = tap.armed_now();
+            if let Some(at_ns) = admitted {
+                tap.push(body(at_ns));
+            }
+            clock.now.store(20, Ordering::Relaxed);
+            if paused {
+                resume_tx.send(()).unwrap();
+            }
+            (admitted, reader.join().unwrap())
+        });
+        assert_eq!(admitted, Some(10));
+        assert_eq!(arm.armed_since_ns, 0, "the tick admitted at 10 predates it");
+        assert!(arm.armed_since_ns <= arm.now_ns);
+        clock.now.store(arm.armed_since_ns + 99, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), Some(arm.armed_since_ns + 99));
+        clock.now.store(arm.armed_since_ns + 100, Ordering::Relaxed);
+        assert_eq!(
+            tap.armed_now(),
+            None,
+            "the lease runs 100 ns from its start"
+        );
+        let page = tap.serve(Cursor::After(0), 512);
+        assert_eq!((page.next, page.lost, page.records.len()), (1, 0, 1));
+        assert_eq!(page.records[0].at_ns, 10);
+        assert_body(&page.records[0]);
+    }
+
+    #[test]
+    fn a_producer_that_loses_the_race_for_head_still_reserves_in_one_step() {
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let mut attempts = 0;
+        let seq = tap.reserve(|| {
+            attempts += 1;
+            if attempts == 1 {
+                tap.push(body(0));
+            }
+        });
+        assert_eq!(attempts, 1, "a reservation never retries");
+        assert_eq!(seq, Some(2));
+        assert_eq!(tap.stats().recorded, 2);
     }
 
     #[test]
