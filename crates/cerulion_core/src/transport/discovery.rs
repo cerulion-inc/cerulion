@@ -1249,7 +1249,6 @@ pub fn query_robot_fires(
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     while let Ok(reply) = replies.recv() {
         if let Ok(sample) = reply.into_result() {
-            // hot-path-alloc-ok: cold, one bounded reply per fires GET on the control plane.
             payloads.push(sample.payload().to_bytes().to_vec());
         }
     }
