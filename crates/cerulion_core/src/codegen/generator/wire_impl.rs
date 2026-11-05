@@ -81,6 +81,7 @@ pub(super) fn generate_shm_message_trait_impl(out: &mut String, schema: &Message
     writeln!(out, "    type Reader<'a> = &'a {shm_name};").unwrap();
     writeln!(out, "    type Writer<'a> = &'a mut {shm_name};").unwrap();
     writeln!(out).unwrap();
+    writeln!(out, "    #[inline]").unwrap();
     writeln!(
         out,
         "    fn build_reader(bytes: &[u8]) -> Self::Reader<'_> {{"
@@ -176,6 +177,7 @@ pub(super) fn generate_variable_shm_message_trait_impl(out: &mut String, schema:
     writeln!(out, "    type Reader<'a> = {shm_name}<'a>;").unwrap();
     writeln!(out, "    type Writer<'a> = {shm_name}<'a>;").unwrap();
     writeln!(out).unwrap();
+    writeln!(out, "    #[inline]").unwrap();
     writeln!(
         out,
         "    fn build_reader(bytes: &[u8]) -> Self::Reader<'_> {{"

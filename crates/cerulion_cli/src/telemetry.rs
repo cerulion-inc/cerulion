@@ -77,8 +77,18 @@ fn ci_run() -> bool {
 /// not been merged with yet. Holds no data; its presence is the flag. The
 /// merge joins to the account the events sent under the same consent file's
 /// id before the login: by CLI runs without a terminal, and by another
-/// surface on the machine such as the vizd daemon. CI runs send under their
-/// own per-process id ([`consent::event_anon_id`]), so this never joins them.
+/// surface on the machine such as the vizd daemon. Those events are
+/// personless (`$process_person_profile: false`); PostHog ingests them under a
+/// person id derived from the distinct id, and the `$create_alias` that names
+/// the id links them to the account's person through a person override.
+/// PostHog's handbook describes that override for `$identify`
+/// (<https://posthog.com/handbook/engineering/person-processing>), the
+/// ingestion pipeline handles `$create_alias` almost the same way
+/// (<https://posthog.com/docs/how-posthog-works/ingestion-pipeline>), and an
+/// alias merges past and future events into one person
+/// (<https://posthog.com/docs/product-analytics/identify>). CI runs send under
+/// their own per-process id ([`consent::event_anon_id`]), so this never joins
+/// them.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
@@ -96,10 +106,12 @@ const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 /// Printed to stderr once per machine, on the first run that could send and
 /// whose stderr is a terminal. One line, so it stays out of the way.
 pub const NOTICE: &str = "Cerulion sends usage telemetry; turn it off with \
-`cerulion telemetry off` (details: `cerulion telemetry status`).";
+`cerulion telemetry off` (details: https://cerulion.com/telemetry).";
 
-/// What is sent, in full; printed by `cerulion telemetry status`.
-const DETAILS_URL: &str = "https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
+/// The page that lists what is sent, in full: a short address that redirects
+/// to `docs/telemetry.md`. `cerulion telemetry status` prints it and
+/// [`NOTICE`] carries it.
+const DETAILS_URL: &str = "https://cerulion.com/telemetry";
 
 /// Verbs that record no `cli_command_run`: the consent verb itself (an
 /// opt-out must not be counted), the completion hook a shell runs on every

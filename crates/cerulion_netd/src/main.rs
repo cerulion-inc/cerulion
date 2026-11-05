@@ -103,6 +103,23 @@ ENVIRONMENT:
                                  prior `cerulion login`; an expired saved login
                                  still permits offline LAN serving.
                                  CERULION_NETD_NETWORK=off wins.
+    CERULION_NETD_TLS_ROOT_CA    Absolute path of the PEM certificate(s) the peer of
+                                 a quic/ or tls/ CONNECT locator must chain to. Such
+                                 a connect locator needs it, and it is refused
+                                 when no connect locator is quic/ or tls/.
+    CERULION_NETD_TLS_CERTIFICATE
+                                 Absolute path of the PEM certificate a quic/ or
+                                 tls/ LISTEN locator presents; it must not be marked
+                                 CA:TRUE.
+    CERULION_NETD_TLS_PRIVATE_KEY
+                                 Absolute path of the PEM private key for
+                                 CERULION_NETD_TLS_CERTIFICATE. A quic/ or tls/
+                                 listen locator needs both, and both are refused
+                                 when no listen locator is quic/ or tls/.
+                                 The daemon refuses to start, naming the variable,
+                                 on a locator or TLS setting that cannot work,
+                                 including a datagram-only locator (plain udp/,
+                                 or rel=0).
     CERULION_NETD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no network ever).
     CERULION_MULTICAST_SCOUTING=on
                                  Turn zenoh multicast scouting (periodic scout
@@ -243,11 +260,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // CERULION_UNENCRYPTED_QUIC=on, see `quic_first`); discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
-    // A standing gateway serves only under a prior login.
-    let configured_network = net::network_config_from_env();
-    if net::standing_gateway_requested(configured_network.as_ref()) {
-        cerulion_netd::serving_login::require_prior_login()?;
-    }
+    // `network_config_from_env` refuses a standing gateway with no prior login
+    // first, then a locator or TLS setting that cannot work, naming the
+    // variable; both before the fold below and before anything binds.
+    let configured_network = net::network_config_from_env()?;
     let (network, peer_fold) = match configured_network {
         Some(cfg) => {
             let (cfg, fold) = discovery_fold::fold_discovered_peers(cfg);
@@ -699,8 +715,8 @@ fn build_mirror_plane(
 /// `Starting with no listener endpoints!` at WARN whenever a peer session opens
 /// with no listen endpoint, which is exactly a desk's session (netd connects
 /// out and listens only when `CERULION_NETD_LISTEN` is set). On a desk it is
-/// the expected shape, not a warning, and the daemon inherits the spawning
-/// command's stderr on first use, so unfiltered it lands in every first user's terminal.
+/// the expected shape, not a warning, and unfiltered it is written on every desk
+/// start, into the startup log a failed first-use start quotes.
 /// A filter directive, never a change to the zenoh session config.
 const DEFAULT_FILTER: &str = "info,zenoh::net::runtime::orchestrator=error";
 
@@ -708,9 +724,13 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    // Colour codes only on a terminal: a daemon started on first use writes its
+    // stderr to the startup log, which a failed start quotes back verbatim.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(ansi)
         .try_init();
 }
 
@@ -890,6 +910,25 @@ mod tests {
         // able to find where revocations are read from).
         assert!(WAN_USAGE.contains(cerulion_netd::wan::EPOCH_DIR_ENV));
         assert!(WAN_USAGE.contains(cerulion_netd::wan::RELAY_DISABLED_ENV));
+    }
+
+    /// `--help` lists each network variable as exactly one row, at the start of
+    /// a line.
+    #[test]
+    fn usage_lists_each_network_variable_once() {
+        for var in [
+            net::CONNECT_ENV,
+            net::LISTEN_ENV,
+            net::TLS_ROOT_CA_ENV,
+            net::TLS_CERTIFICATE_ENV,
+            net::TLS_PRIVATE_KEY_ENV,
+        ] {
+            let rows = USAGE
+                .lines()
+                .filter(|l| l.trim_start().starts_with(var) && l.starts_with("    C"))
+                .count();
+            assert_eq!(rows, 1, "{var} rows in --help:\n{USAGE}");
+        }
     }
 
     #[cfg(not(feature = "wan"))]
