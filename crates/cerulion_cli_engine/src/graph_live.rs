@@ -10,8 +10,11 @@
 //!
 //! A run's `run.json` is read through [`RunView`], which ignores keys it does
 //! not know, so this desk reads the manifest of a robot newer than itself.
-//! Every string a robot sends passes through the terminal sanitizer before
-//! it is printed.
+//! Every string a robot sends is neutralized before it is printed: names,
+//! ids and topics through `sanitize_display`, free text (a refusal, or why an
+//! answer cannot be read) through `sanitize_refusal_reason`, which also
+//! bounds it.
+//! `--json` output carries the raw values, escaped by the JSON encoder.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -215,6 +218,7 @@ pub fn parse_run_json(run_json: &str) -> Result<RunView, String> {
 // Rendering.
 // ---------------------------------------------------------------------------
 
+/// A name, id or topic a robot sent, safe to print on a terminal.
 fn clean(text: &str) -> String {
     sanitize_display(text)
 }
@@ -374,7 +378,10 @@ fn render_run(robot: &str, entry: &RunEntry) -> String {
     let view = match view {
         Ok(view) => view,
         Err(reason) => {
-            out.push_str(&format!("  run.json does not read ({})\n", clean(&reason)));
+            out.push_str(&format!(
+                "  run.json does not read ({})\n",
+                sanitize_refusal_reason(&reason)
+            ));
             return out;
         }
     };
@@ -478,7 +485,7 @@ pub fn render_unanswered(harvest: &RunsHarvest) -> String {
             "robot {}: answered the runs query with something this desk cannot read ({}); \
              update cerulion on one side\n",
             clean(&answer.robot),
-            clean(&answer.reason)
+            sanitize_refusal_reason(&answer.reason)
         ));
     }
     for robot in &harvest.silent {
@@ -787,7 +794,7 @@ fn readable_fires_run(robot: &str, entry: &RunEntry) -> CliResult<SelectedRun> {
             return refuse(format!(
                 "run {}: its run.json does not read ({})",
                 describe_run(robot, entry),
-                clean(&reason)
+                sanitize_refusal_reason(&reason)
             ))
         }
     };
@@ -1215,7 +1222,7 @@ pub fn follow_fires(
             FiresPoll::Unusable { reason } => {
                 break FiresEnd::Failed(format!(
                     "the robot's fires answer cannot be read ({})",
-                    clean(&reason)
+                    sanitize_refusal_reason(&reason)
                 ));
             }
         }
@@ -2991,6 +2998,220 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             }
             other => panic!("expected the refusal, got {other:?}"),
         }
+    }
+
+    /// The characters a hostile robot puts in every string it sends: an
+    /// escape, BEL and a C1 control, the bidi and format controls that
+    /// reorder or hide text, and the Unicode line and paragraph separators.
+    const HOSTILE_CHARS: [char; 14] = [
+        '\u{1b}', '\u{7}', '\u{85}', '\u{061C}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}',
+        '\u{202A}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2068}', '\u{2069}',
+    ];
+    const HOSTILE: &str = "x\u{1b}[2J\u{7}\u{85}\u{061C}\u{200E}\u{200F}\u{2028}\u{2029}\u{202A}\
+                           \u{202D}\u{202E}\u{2066}\u{2068}\u{2069}y";
+    /// [`HOSTILE`] as a JSON string body.
+    const HOSTILE_JSON: &str = r"x\u001b[2J\u0007\u0085\u061c\u200e\u200f\u2028\u2029\u202a\u202d\u202e\u2066\u2068\u2069y";
+
+    /// The temi `run.json` with [`HOSTILE`] in every node id and type,
+    /// every topic, the endpoint id and the host.
+    fn hostile_run_json() -> String {
+        TEMI_RUN_JSON
+            .replace("\"/temi/", &format!("\"/{HOSTILE_JSON}/"))
+            .replace("\"id\": \"", &format!("\"id\": \"{HOSTILE_JSON}"))
+            .replace("\"type\": \"", &format!("\"type\": \"{HOSTILE_JSON}"))
+            .replace("\"embedded\"", &format!("\"{HOSTILE_JSON}\""))
+    }
+
+    fn assert_neutralized(text: &str) {
+        let raw: Vec<char> = text.chars().filter(|c| HOSTILE_CHARS.contains(c)).collect();
+        assert!(raw.is_empty(), "{raw:?} reached the terminal in {text:?}");
+    }
+
+    /// Answers each `fires` request from a list.
+    struct Replay(std::collections::VecDeque<FiresPoll>);
+
+    impl FiresSource for Replay {
+        fn fires(&mut self, _robot: &str, _run_id: &str, _after: Option<u64>) -> FiresPoll {
+            self.0.pop_front().unwrap_or(FiresPoll::Silent)
+        }
+    }
+
+    fn follow_replay(
+        run: &SelectedRun,
+        answers: Vec<FiresPoll>,
+        json: bool,
+    ) -> (CliResult<(FireStream, FiresEnd)>, String) {
+        let mut pacer = FakePacer {
+            now: Duration::ZERO,
+            sleeps: 0,
+        };
+        let mut out = Vec::new();
+        let result = follow_fires(
+            &mut Replay(answers.into()),
+            run,
+            None,
+            json,
+            &AtomicBool::new(true),
+            &mut pacer,
+            &mut out,
+        );
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    /// Every string a robot sends (its robot id, run ids, graph names, node
+    /// ids and types, topics, host and endpoint ids, its refusal and
+    /// undescribable reasons, and why its answers cannot be read) reaches the
+    /// terminal with no escape, line separator or bidi control left in it.
+    /// `--json` keeps the raw value, escaped by the JSON encoder.
+    #[test]
+    fn no_robot_string_reaches_the_terminal_with_a_control_left_in_it() {
+        let as_name = format!("x\u{FFFD}[2J{}y", "\u{FFFD}".repeat(13));
+        let as_reason = format!("x?[2J{}y", "?".repeat(13));
+        let run_json = hostile_run_json();
+        let view = parse_run_json(&run_json).expect("the hostile run.json reads");
+        let nodes = &view.topology.as_ref().expect("a topology").nodes;
+        assert_eq!(nodes[1].id, format!("{HOSTILE}logic"));
+        assert_eq!(nodes[1].outputs[0].topic, format!("/{HOSTILE}/logic/edge"));
+
+        let entry = RunEntry {
+            run_id: format!("0x5d1c{HOSTILE}"),
+            graph_name: HOSTILE.to_string(),
+            run_json,
+            ..temi_entry()
+        };
+        let mut answered = reply(HOSTILE, vec![entry.clone()]);
+        answered.undescribable = vec![UndescribableRun {
+            run_id: HOSTILE.to_string(),
+            reason: HOSTILE.to_string(),
+        }];
+        let mut refused = reply(HOSTILE, Vec::new());
+        refused.error = Some(HOSTILE.to_string());
+        let h = RunsHarvest {
+            replies: vec![answered.clone(), refused],
+            unusable: vec![UnusableRunsAnswer {
+                robot: HOSTILE.to_string(),
+                reason: HOSTILE.to_string(),
+            }],
+            silent: vec![HOSTILE.to_string()],
+        };
+
+        let mut shown: Vec<String> = h.replies.iter().map(render_live).collect();
+        assert_eq!(
+            render_unanswered(&h),
+            format!(
+                "robot {as_name}: answered the runs query with something this desk cannot read \
+                 ({as_reason}); update cerulion on one side\n\
+                 robot {as_name}: did not answer the runs query (a robot older than the runs \
+                 query, or one with no query surface)\n"
+            )
+        );
+        let mut twice = answered.clone();
+        twice.runs.push(entry.clone());
+        for (asked, run) in [(&h, Some("none")), (&harvest(vec![twice]), None)] {
+            match select_run(asked, run) {
+                Err(CliError::Validation(text)) => shown.push(text),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        let run = select_run(&h, None).expect("the one run that serves fires");
+        let page = |fires: Vec<FireRecord>| {
+            FiresPoll::Reply(FiresReply {
+                version: FIRES_WIRE_VERSION,
+                robot: HOSTILE.to_string(),
+                run_id: run.run_id.clone(),
+                outcome: FiresOutcome::Served {
+                    now_ns: 9_000_000,
+                    armed_since_ns: 0,
+                    next: 4,
+                    lost: 0,
+                    in_tick: Vec::new(),
+                    fires,
+                },
+            })
+        };
+        let rows = vec![
+            fire(1, 1_000_000, 38_000, 0, FireCause::Period, 0, 0b1),
+            fire(2, 2_000_000, 412_000, 1, FireCause::Data, 0, 0b11),
+            fire(3, 3_000_000, 95_000, 2, FireCause::Data, 0, 0b1),
+            fire(4, 4_000_000, 21_000, 3, FireCause::Data, 0, 0),
+        ];
+        let hostile_reply = |outcome| {
+            FiresPoll::Reply(FiresReply {
+                version: FIRES_WIRE_VERSION,
+                robot: HOSTILE.to_string(),
+                run_id: run.run_id.clone(),
+                outcome,
+            })
+        };
+        let endings = [
+            hostile_reply(FiresOutcome::Refused {
+                reason: HOSTILE.to_string(),
+            }),
+            FiresPoll::Unusable {
+                reason: HOSTILE.to_string(),
+            },
+            FiresPoll::Reply(FiresReply {
+                run_id: format!("0x9{HOSTILE}"),
+                ..FiresReply::new(HOSTILE, 9, FiresOutcome::UnknownRun)
+            }),
+        ];
+        for ending in endings {
+            let (result, text) = follow_replay(&run, vec![page(rows.clone()), ending], false);
+            assert_eq!(text.lines().count(), 6, "{text}");
+            shown.push(text);
+            match result {
+                Err(CliError::Validation(reason)) => shown.push(reason),
+                other => panic!("expected the reading to fail, got {other:?}"),
+            }
+        }
+        for text in &shown {
+            assert_neutralized(text);
+        }
+        assert!(shown[0].starts_with(&format!(
+            "robot {as_name} · run 0x5d1c{as_name} · graph {as_name} · live · host {as_name}"
+        )));
+        assert!(shown[0].contains(&format!("  {as_name}logic ")));
+        assert!(shown[0].contains(&format!("→ /{as_name}/logic/edge, /{as_name}/logic/pulse")));
+        assert!(shown[0].ends_with(&format!(
+            "robot {as_name} · run {as_name}: cannot be described ({as_reason})\n"
+        )));
+        assert_eq!(
+            shown[1],
+            format!("robot {as_name}: refused the runs query ({as_reason})\n")
+        );
+        assert!(shown.iter().any(|text| text.ends_with(&format!(
+            "the robot's fires answer cannot be read ({as_reason})"
+        ))));
+
+        for object in live_json(&h) {
+            let line = object.to_string();
+            assert!(!line.contains(['\u{1b}', '\u{7}']), "{line}");
+            let back: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+            assert_eq!(back, object);
+            assert_eq!(back["robot"], HOSTILE);
+        }
+        let first = &live_json(&h)[0];
+        assert_eq!(first["graph_name"], HOSTILE);
+        assert_eq!(first["nodes"][1]["id"], format!("{HOSTILE}logic"));
+        assert_eq!(
+            first["nodes"][1]["outputs"][0]["topic"],
+            format!("/{HOSTILE}/logic/edge")
+        );
+        let (_, text) = follow_replay(&run, vec![page(rows)], true);
+        let fires: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(!line.contains(['\u{1b}', '\u{7}']), "{line}");
+                serde_json::from_str(line).expect("valid JSON")
+            })
+            .collect();
+        assert_eq!(fires[1]["node_id"], format!("{HOSTILE}logic"));
+        assert_eq!(
+            fires[1]["wrote_topics"][1],
+            format!("/{HOSTILE}/logic/pulse")
+        );
+        assert_eq!(fires[1]["trigger_topics"][0], format!("/{HOSTILE}/in"));
     }
 
     /// A run whose fire telemetry or topology is a version this desk does
