@@ -21,7 +21,7 @@
 //! This module is transport-free (serde + `serde_json` only) so a future client
 //! (C3's migrated vizd / `topic echo` / connectd) can lift it verbatim.
 
-use cerulion_core::transport::cerulion_q::UnusableRunsAnswer;
+use cerulion_core::transport::cerulion_q::{FiresReply, UnusableRunsAnswer};
 use cerulion_core::{CatalogReply, GatewayPlan, LanAccess, RunsReply, SchemaReply, SchemaServing};
 use serde::{Deserialize, Serialize};
 
@@ -130,9 +130,20 @@ use serde::{Deserialize, Serialize};
 /// existing socket. A local serving-schema snapshot also lets remoted use the
 /// gateway's accumulated bindings without network discovery. Older daemons must
 /// be restarted before these operations.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// `10`: added the `query_fires` verb, which reads the node fires of a run a
+/// robot hosts (`cerulion_q/{robot}/fires/{run_id}/{after}`). Only the new verb
+/// is gated ([`FIRES_MIN_DAEMON_VERSION`]): a new client refuses it before
+/// sending to an older daemon, and an old client never sends it, so every
+/// other verb's request and response shape is unchanged.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 const _: () = assert!(crate::account_access::MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
+
+/// The minimum daemon [`PROTOCOL_VERSION`] that serves the `query_fires` verb:
+/// the version that introduced it.
+pub const FIRES_MIN_DAEMON_VERSION: u32 = 10;
+const _: () = assert!(FIRES_MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
 
 /// First protocol version with the local-only serving-schema snapshot.
 pub const SERVING_SCHEMA_MIN_DAEMON_VERSION: u32 = 9;
@@ -419,6 +430,27 @@ pub enum Request {
         #[serde(default)]
         robot: Option<String>,
     },
+    /// Read the node fires of the run `run_id` hosted on ONE robot: the rows
+    /// recorded after the cursor `after`. netd GETs
+    /// `cerulion_q/{robot}/fires/{run_id}/{after}` over its ONE zenoh session and
+    /// answers with a [`FiresQueryResponse`]. Each GET arms or extends the run's
+    /// fire tap lease on the robot, so a consumer asks only while it shows the
+    /// fires, and polls with the `next` of the previous served reply.
+    ///
+    /// Unlike [`Self::QueryRuns`] this verb MAY be polled: the robot reads a
+    /// bounded ring and gathers nothing.
+    QueryFires {
+        /// Correlation id echoed in the response.
+        id: u64,
+        /// The robot that hosts the run, named exactly (one key chunk).
+        robot: String,
+        /// The run, in the canonical `0x` + 32 lowercase hex form its `runs`
+        /// entry carries.
+        run_id: String,
+        /// The last sequence the consumer holds, or `None` to read from now.
+        #[serde(default)]
+        after: Option<u64>,
+    },
 }
 
 impl Request {
@@ -435,6 +467,7 @@ impl Request {
             | Request::QueryCatalog { id, .. }
             | Request::QuerySchema { id, .. }
             | Request::QueryRuns { id, .. }
+            | Request::QueryFires { id, .. }
             | Request::SubscribeCatalog { id } => *id,
         }
     }
@@ -453,6 +486,7 @@ impl Request {
             Request::QueryCatalog { .. } => "query_catalog",
             Request::QuerySchema { .. } => "query_schema",
             Request::QueryRuns { .. } => "query_runs",
+            Request::QueryFires { .. } => "query_fires",
             Request::SubscribeCatalog { .. } => "subscribe_catalog",
         }
     }
@@ -503,6 +537,9 @@ impl Request {
             // so the gate here IS the capability negotiation, and it deliberately
             // leaves every OTHER verb's minimum untouched.
             Request::QueryRuns { .. } => RUNS_MIN_DAEMON_VERSION,
+            // Not in the account-route arm above: that arm answers 9, and a v9
+            // daemon has no `query_fires` handler.
+            Request::QueryFires { .. } => FIRES_MIN_DAEMON_VERSION,
             // The catalog/schema query verbs need a v3 daemon.
             Request::QueryCatalog { .. } | Request::QuerySchema { .. } => 3,
             // A CONFIG-CARRYING `register_egress` needs a v4 daemon (only
@@ -952,6 +989,41 @@ pub struct RunsQueryResponse {
     pub plane_unsettled_ms: Option<u64>,
 }
 
+/// The response to [`Request::QueryFires`]. Discriminated by its REQUIRED
+/// `answer` field, which no other [`Response`] variant carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiresQueryResponse {
+    /// Echoed correlation id.
+    pub id: u64,
+    /// What netd learned from the robot.
+    pub answer: FiresAnswer,
+}
+
+/// What netd learned from one `fires` GET. The three answers have three
+/// different remedies, so a consumer must not fold one into another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FiresAnswer {
+    /// The robot answered usably. The reply's `outcome` says what it did with
+    /// the GET: served rows, did not know the run, records no fires for it,
+    /// or refused. `reply.robot` is the robot the request named.
+    Reply {
+        /// The robot's reply, validated as `decode_fires_reply` validates it.
+        reply: FiresReply,
+    },
+    /// Nothing came back within the window: the robot is unreachable, runs a
+    /// binary that predates the verb, or declares no query surface. Says
+    /// nothing about the run; the next poll may be answered.
+    Silent,
+    /// The robot answered with bytes this binary cannot use: a wire version
+    /// skew, corruption, or a reply about a different run. Asking again reads
+    /// the same bytes until the robot's binaries are rebuilt.
+    Unusable {
+        /// Why, in operator-readable text.
+        reason: String,
+    },
+}
+
 /// A structured error response (never a panic / dropped connection).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -1136,7 +1208,7 @@ pub fn classify_control_line(line: &str) -> ControlLine {
 /// ([`StatusResponse`]), `gateway_started`+`registered_topics` ([`EgressResponse`]),
 /// `released_topics` ([`EgressReleaseResponse`]), `catalogs` ([`CatalogQueryResponse`]),
 /// `replies` ([`SchemaQueryResponse`]), `run_replies` ([`RunsQueryResponse`]),
-/// `watching` ([`SubscribeCatalogResponse`]), and
+/// `answer` ([`FiresQueryResponse`]), `watching` ([`SubscribeCatalogResponse`]), and
 /// `error` ([`ErrorResponse`]). Those field
 /// sets are non-overlapping, so serde deserializes each line unambiguously. netd only
 /// ever SERIALIZES a `Response`; the consumer deserializes the concrete struct it
@@ -1171,6 +1243,9 @@ pub enum Response {
     /// A live-runs query result. Discriminated by its REQUIRED
     /// `run_replies` field, which no other variant carries.
     RunsQuery(RunsQueryResponse),
+    /// A node-fires query result. Discriminated by its REQUIRED `answer`
+    /// field, which no other variant carries.
+    FiresQuery(FiresQueryResponse),
     /// A catalog-change subscription accepted. Discriminated by its
     /// REQUIRED `watching` field, which no other variant carries.
     SubscribeCatalog(SubscribeCatalogResponse),
@@ -1204,6 +1279,8 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
+    use cerulion_core::transport::cerulion_q::FiresOutcome;
 
     #[test]
     fn hello_carries_marker_and_version() {
@@ -2341,5 +2418,234 @@ mod tests {
             }
             other => panic!("expected RunsQuery, got {other:?}"),
         }
+    }
+
+    const FIRES_RUN: &str = "0x0000000000000000000000000000002a";
+
+    fn fire(seq: u64, at_ns: u64, dur_ns: u32, node: u16, wrote: u64) -> FireRecord {
+        FireRecord {
+            seq,
+            at_ns,
+            dur_ns,
+            node,
+            cause: FireCause::Data,
+            flags: FireFlags(0),
+            wrote,
+        }
+    }
+
+    #[test]
+    fn the_fires_verb_needs_a_v10_daemon_and_leaves_its_siblings_alone() {
+        let fires = Request::QueryFires {
+            id: 1,
+            robot: "temi".to_string(),
+            run_id: FIRES_RUN.to_string(),
+            after: None,
+        };
+        assert_eq!(fires.method_name(), "query_fires");
+        assert_eq!(fires.id(), 1);
+        assert_eq!(FIRES_MIN_DAEMON_VERSION, 10);
+        assert_eq!(fires.min_daemon_version(), FIRES_MIN_DAEMON_VERSION);
+        const { assert!(PROTOCOL_VERSION >= FIRES_MIN_DAEMON_VERSION) };
+
+        // An account route stays a v10 request: the account arm answers 9, and a
+        // v9 daemon has no handler for this verb.
+        let account = Request::QueryFires {
+            id: 2,
+            robot: format!(
+                "{}{}",
+                crate::account_access::ACCOUNT_ROUTE_PREFIX,
+                "ab".repeat(32)
+            ),
+            run_id: FIRES_RUN.to_string(),
+            after: Some(4),
+        };
+        assert_eq!(account.min_daemon_version(), 10);
+
+        assert_eq!(
+            Request::QueryRuns { id: 3, robot: None }.min_daemon_version(),
+            7
+        );
+        assert_eq!(
+            Request::QueryCatalog { id: 4, robot: None }.min_daemon_version(),
+            3
+        );
+        assert_eq!(Request::SubscribeCatalog { id: 5 }.min_daemon_version(), 6);
+        assert_eq!(Request::Status { id: 6 }.min_daemon_version(), 1);
+    }
+
+    #[test]
+    fn a_fires_request_is_this_exact_line() {
+        let with_cursor = Request::QueryFires {
+            id: 7,
+            robot: "temi".to_string(),
+            run_id: FIRES_RUN.to_string(),
+            after: Some(5119),
+        };
+        let line = r#"{"method":"query_fires","id":7,"robot":"temi","run_id":"0x0000000000000000000000000000002a","after":5119}"#;
+        assert_eq!(with_cursor.to_json_line(), line);
+        assert_eq!(parse_request(line).expect("decodes"), with_cursor);
+
+        let from_now = Request::QueryFires {
+            id: 8,
+            robot: "temi".to_string(),
+            run_id: FIRES_RUN.to_string(),
+            after: None,
+        };
+        let line = r#"{"method":"query_fires","id":8,"robot":"temi","run_id":"0x0000000000000000000000000000002a","after":null}"#;
+        assert_eq!(from_now.to_json_line(), line);
+        assert_eq!(parse_request(line).expect("decodes"), from_now);
+        // The cursor may be left out: that reads from now.
+        let omitted = r#"{"method":"query_fires","id":8,"robot":"temi","run_id":"0x0000000000000000000000000000002a"}"#;
+        assert_eq!(parse_request(omitted).expect("decodes"), from_now);
+
+        // Robot and run are required: a request that names neither cannot be sent.
+        let err = parse_request(r#"{"method":"query_fires","id":9,"robot":"temi"}"#)
+            .expect_err("no run id");
+        assert_eq!(err.id, Some(9));
+        assert!(err.message.contains("run_id"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_served_fires_answer_is_this_exact_line() {
+        let reply = FiresReply::new(
+            "temi",
+            0x2a,
+            FiresOutcome::Served {
+                now_ns: 88_123_456_789,
+                armed_since_ns: 88_100_000_000,
+                next: 5123,
+                lost: 1,
+                in_tick: vec![(2, 88_123_100_000)],
+                fires: vec![
+                    fire(5122, 88_112_090_000, 21_007, 3, 0),
+                    fire(5123, 88_112_200_000, 95_001, 2, 0b1),
+                ],
+            },
+        );
+        let resp = Response::FiresQuery(FiresQueryResponse {
+            id: 7,
+            answer: FiresAnswer::Reply { reply },
+        });
+        let line = concat!(
+            r#"{"id":7,"answer":{"kind":"reply","reply":{"version":1,"robot":"temi","#,
+            r#""run_id":"0x0000000000000000000000000000002a","outcome":{"kind":"served","#,
+            r#""now_ns":88123456789,"armed_since_ns":88100000000,"next":5123,"lost":1,"#,
+            r#""in_tick":[[2,88123100000]],"fires":[[5122,88112090000,21007,3,3,0,0],"#,
+            r#"[5123,88112200000,95001,2,3,0,1]]}}}}"#
+        );
+        assert_eq!(resp.to_json_line(), line);
+        assert_eq!(
+            serde_json::from_str::<Response>(line).expect("untagged decode"),
+            resp
+        );
+    }
+
+    #[test]
+    fn the_other_fires_answers_are_these_exact_lines() {
+        let cases = [
+            (
+                FiresAnswer::Silent,
+                r#"{"id":8,"answer":{"kind":"silent"}}"#.to_string(),
+            ),
+            (
+                FiresAnswer::Unusable {
+                    reason: "unknown fires wire version 2 (this binary supports 1)".to_string(),
+                },
+                r#"{"id":8,"answer":{"kind":"unusable","reason":"unknown fires wire version 2 (this binary supports 1)"}}"#
+                    .to_string(),
+            ),
+            (
+                FiresAnswer::Reply {
+                    reply: FiresReply::new("temi", 0x2a, FiresOutcome::UnknownRun),
+                },
+                format!(
+                    r#"{{"id":8,"answer":{{"kind":"reply","reply":{{"version":1,"robot":"temi","run_id":"{FIRES_RUN}","outcome":{{"kind":"unknown_run"}}}}}}}}"#
+                ),
+            ),
+            (
+                FiresAnswer::Reply {
+                    reply: FiresReply::new("temi", 0x2a, FiresOutcome::NotServed),
+                },
+                format!(
+                    r#"{{"id":8,"answer":{{"kind":"reply","reply":{{"version":1,"robot":"temi","run_id":"{FIRES_RUN}","outcome":{{"kind":"not_served"}}}}}}}}"#
+                ),
+            ),
+            (
+                FiresAnswer::Reply {
+                    reply: FiresReply::new(
+                        "temi",
+                        0x2a,
+                        FiresOutcome::Refused {
+                            reason: "LAN access is paired".to_string(),
+                        },
+                    ),
+                },
+                format!(
+                    r#"{{"id":8,"answer":{{"kind":"reply","reply":{{"version":1,"robot":"temi","run_id":"{FIRES_RUN}","outcome":{{"kind":"refused","reason":"LAN access is paired"}}}}}}}}"#
+                ),
+            ),
+        ];
+        for (answer, line) in cases {
+            let resp = Response::FiresQuery(FiresQueryResponse { id: 8, answer });
+            assert_eq!(resp.to_json_line(), line);
+            assert_eq!(
+                serde_json::from_str::<Response>(&line).expect("untagged decode"),
+                resp
+            );
+        }
+    }
+
+    /// The answer's reply is validated on the way into the client exactly as
+    /// `decode_fires_reply` validates it on the way into netd, so an answer
+    /// carrying a page the serve side never produces fails to decode instead of
+    /// landing in another variant.
+    #[test]
+    fn a_fires_answer_carrying_an_impossible_page_refuses_to_decode() {
+        let line = format!(
+            r#"{{"id":8,"answer":{{"kind":"reply","reply":{{"version":1,"robot":"temi","run_id":"{FIRES_RUN}","outcome":{{"kind":"served","now_ns":9,"armed_since_ns":1,"next":5,"lost":0,"in_tick":[],"fires":[[5,1,1,0,3,0,0],[4,1,1,0,3,0,0]]}}}}}}}}"#
+        );
+        assert!(serde_json::from_str::<FiresQueryResponse>(&line).is_err());
+        assert!(serde_json::from_str::<Response>(&line).is_err());
+        // ANTI-TAUTOLOGY: the same page in increasing order decodes.
+        let ordered = line.replace(
+            "[[5,1,1,0,3,0,0],[4,1,1,0,3,0,0]]",
+            "[[4,1,1,0,3,0,0],[5,1,1,0,3,0,0]]",
+        );
+        assert!(matches!(
+            serde_json::from_str::<Response>(&ordered).expect("decodes"),
+            Response::FiresQuery(_)
+        ));
+    }
+
+    /// The untagged decode keys on `answer`; no other response can be read as a
+    /// fires answer and a fires answer is read as nothing else.
+    #[test]
+    fn a_fires_query_response_is_never_decoded_as_another_variant() {
+        let silent = r#"{"id":8,"answer":{"kind":"silent"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Response>(silent).expect("decodes"),
+            Response::FiresQuery(FiresQueryResponse { id: 8, .. })
+        ));
+        let empty_runs = Response::RunsQuery(RunsQueryResponse {
+            id: 9,
+            run_replies: vec![],
+            unusable: Vec::new(),
+            silent: Vec::new(),
+            discovery: DiscoveryState::Settled,
+            plane_unsettled_ms: None,
+        });
+        assert_eq!(
+            serde_json::from_str::<Response>(&empty_runs.to_json_line()).expect("decodes"),
+            empty_runs
+        );
+        let error = Response::error(Some(10), "fires query failed", Some("temi".into()), None);
+        assert_eq!(
+            serde_json::from_str::<Response>(&error.to_json_line()).expect("decodes"),
+            error
+        );
+        // An answer of a kind this binary does not know is a decode error, not
+        // a silently different answer.
+        assert!(serde_json::from_str::<Response>(r#"{"id":8,"answer":{"kind":"later"}}"#).is_err());
     }
 }

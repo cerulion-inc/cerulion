@@ -47,15 +47,16 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cerulion_core::transport::cerulion_q::UnusableRunsAnswer;
+use cerulion_core::transport::cerulion_q::{decode_fires_reply, UnusableRunsAnswer};
 use cerulion_core::transport::discovery::{
-    query_announce_entries, query_robot_catalog, query_robot_catalogs, query_robot_runs,
-    query_robot_runs_all, query_robot_schema, query_robot_schemas, RunsHarvest,
+    query_announce_entries, query_robot_catalog, query_robot_catalogs, query_robot_fires,
+    query_robot_runs, query_robot_runs_all, query_robot_schema, query_robot_schemas, RunsHarvest,
 };
 use cerulion_core::transport::TransportManager;
 use cerulion_core::{CatalogReply, RunsReply, SchemaReply, TransportError};
 
 pub use crate::protocol::DiscoveryState;
+use crate::protocol::FiresAnswer;
 
 /// The bounded window netd's announce-space harvest waits for liveliness replies —
 /// the same value the desk's transient path used (`topic_cmd::REMOTE_QUERY_GATHER_WINDOW`).
@@ -151,6 +152,10 @@ pub const COLD_START_DISCOVERY_BUDGET: Duration =
 /// `topic_cmd::CATALOG_GATHER_WINDOW`). The per-robot GETs run CONCURRENTLY, so the
 /// whole gather stays ~one harvest + one gather window regardless of robot count.
 pub(crate) const QUERY_GATHER_WINDOW: Duration = Duration::from_millis(250);
+
+/// How long one `fires` GET waits for the robot's reply. There is ONE GET and
+/// no cold-start retry: the consumer polls, so its next poll is the retry.
+pub const FIRES_GATHER_WINDOW: Duration = Duration::from_millis(300);
 
 /// What the plane should do after ONE harvest attempt. PURE — the whole
 /// cold-start decision, oracle-tested, with no clock and no network.
@@ -899,6 +904,23 @@ pub trait QueryPlane: Send + Sync {
     /// a consumer fetches once per `run_id` and must never fold it into a poll —
     /// see [`crate::protocol::Request::QueryRuns`].
     fn query_runs(&self, robot: Option<&str>) -> Result<RunsGather, QueryError>;
+
+    /// Read the node fires of the run `run_id` hosted on `robot`, after the
+    /// cursor `after` (`None` reads from now): ONE explicit-key GET that waits at
+    /// most [`FIRES_GATHER_WINDOW`]. The robot serves it from a bounded ring, so
+    /// unlike [`Self::query_runs`] a consumer MAY poll it. Each GET arms or
+    /// extends the run's fire tap lease on the robot.
+    ///
+    /// The default refuses with [`QueryError::NoNetwork`], so a plane that does
+    /// not implement the verb never answers it with a silence it did not hear.
+    fn query_fires(
+        &self,
+        _robot: &str,
+        _run_id: &str,
+        _after: Option<u64>,
+    ) -> Result<FiresAnswer, QueryError> {
+        Err(QueryError::NoNetwork)
+    }
 }
 
 /// A no-op query plane for a mirror-ONLY daemon (no network query surface) —
@@ -920,6 +942,14 @@ impl QueryPlane for NoopQueryPlane {
         Err(QueryError::NoNetwork)
     }
     fn query_runs(&self, _robot: Option<&str>) -> Result<RunsGather, QueryError> {
+        Err(QueryError::NoNetwork)
+    }
+    fn query_fires(
+        &self,
+        _robot: &str,
+        _run_id: &str,
+        _after: Option<u64>,
+    ) -> Result<FiresAnswer, QueryError> {
         Err(QueryError::NoNetwork)
     }
 }
@@ -1213,6 +1243,61 @@ impl QueryPlane for GatewayQueryPlane {
             unsettled_for: self.maturity.unsettled_for(),
         })
     }
+
+    fn query_fires(
+        &self,
+        robot: &str,
+        run_id: &str,
+        after: Option<u64>,
+    ) -> Result<FiresAnswer, QueryError> {
+        let net = self.manager.network().ok_or(QueryError::NoNetwork)?;
+        let session = net.session().map_err(|e| QueryError::Session {
+            source: Box::new(e),
+        })?;
+        let payloads = query_robot_fires(session, robot, run_id, after, FIRES_GATHER_WINDOW);
+        Ok(fires_answer(
+            robot,
+            run_id,
+            payloads.iter().map(Vec::as_slice),
+        ))
+    }
+}
+
+/// Classify the reply payloads of one `fires` GET for `run_id` on `robot`.
+///
+/// The first usable reply wins and is attributed to `robot`, the key it came
+/// back on (the `RunsReply` rule). A payload that does not decode, or decodes
+/// as a reply about another run, is unusable; with no usable reply the first
+/// such reason is the answer. No payload at all is silence. Pure.
+fn fires_answer<'a>(
+    robot: &str,
+    run_id: &str,
+    payloads: impl IntoIterator<Item = &'a [u8]>,
+) -> FiresAnswer {
+    let mut unusable: Option<String> = None;
+    for bytes in payloads {
+        match decode_fires_reply(bytes) {
+            Ok(mut reply) if reply.run_id == run_id => {
+                reply.robot = robot.to_string();
+                return FiresAnswer::Reply { reply };
+            }
+            Ok(reply) => {
+                unusable.get_or_insert_with(|| {
+                    format!(
+                        "the robot answered about run {} when asked about run {run_id}",
+                        reply.run_id
+                    )
+                });
+            }
+            Err(e) => {
+                unusable.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    match unusable {
+        Some(reason) => FiresAnswer::Unusable { reason },
+        None => FiresAnswer::Silent,
+    }
 }
 
 #[cfg(test)]
@@ -1220,6 +1305,9 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::AtomicUsize;
+
+    use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
+    use cerulion_core::transport::cerulion_q::{encode_fires_reply, FiresOutcome, FiresReply};
 
     /// The cold-start decision against a HAND-WRITTEN verdict table. Every
     /// row states the situation in words first, so the table is an oracle rather
@@ -2236,5 +2324,424 @@ mod tests {
             "carries the cause"
         );
         assert!(std::error::Error::source(&sess).is_some());
+    }
+
+    const RUN: &str = "0x0000000000000000000000000000002a";
+
+    fn served_bytes(robot: &str, run_id: u128) -> Vec<u8> {
+        encode_fires_reply(&FiresReply::new(
+            robot,
+            run_id,
+            FiresOutcome::Served {
+                now_ns: 2_000,
+                armed_since_ns: 1_000,
+                next: 1,
+                lost: 0,
+                in_tick: vec![(0, 1_900)],
+                fires: vec![FireRecord {
+                    seq: 1,
+                    at_ns: 1_500,
+                    dur_ns: 40,
+                    node: 0,
+                    cause: FireCause::Period,
+                    flags: FireFlags(0),
+                    wrote: 0b1,
+                }],
+            },
+        ))
+    }
+
+    fn answer(payloads: &[&[u8]]) -> FiresAnswer {
+        fires_answer("temi", RUN, payloads.iter().copied())
+    }
+
+    #[test]
+    fn no_fires_payload_is_silence() {
+        assert_eq!(answer(&[]), FiresAnswer::Silent);
+    }
+
+    #[test]
+    fn a_fires_reply_is_attributed_to_the_robot_the_request_named() {
+        // The robot wrote its hostname into the reply; the answer names the key.
+        let bytes = served_bytes("orin-7", 0x2a);
+        assert_eq!(
+            answer(&[&bytes]),
+            FiresAnswer::Reply {
+                reply: FiresReply {
+                    version: 1,
+                    robot: "temi".to_string(),
+                    run_id: RUN.to_string(),
+                    outcome: FiresOutcome::Served {
+                        now_ns: 2_000,
+                        armed_since_ns: 1_000,
+                        next: 1,
+                        lost: 0,
+                        in_tick: vec![(0, 1_900)],
+                        fires: vec![FireRecord {
+                            seq: 1,
+                            at_ns: 1_500,
+                            dur_ns: 40,
+                            node: 0,
+                            cause: FireCause::Period,
+                            flags: FireFlags(0),
+                            wrote: 0b1,
+                        }],
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn every_robot_outcome_rides_through_as_a_reply() {
+        for outcome in [
+            FiresOutcome::UnknownRun,
+            FiresOutcome::NotServed,
+            FiresOutcome::Refused {
+                reason: "LAN access is paired".to_string(),
+            },
+        ] {
+            let bytes = encode_fires_reply(&FiresReply::new("temi", 0x2a, outcome.clone()));
+            assert_eq!(
+                answer(&[&bytes]),
+                FiresAnswer::Reply {
+                    reply: FiresReply::new("temi", 0x2a, outcome),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_fires_payload_this_binary_cannot_use_is_unusable_with_its_reason() {
+        let skewed = br#"{"version":2,"robot":"temi","run_id":"0x0000000000000000000000000000002a","outcome":{"kind":"not_served"}}"#;
+        assert_eq!(
+            answer(&[skewed]),
+            FiresAnswer::Unusable {
+                reason: "unknown fires wire version 2 (this binary supports 1)".to_string(),
+            }
+        );
+        match answer(&[b"not json"]) {
+            FiresAnswer::Unusable { reason } => {
+                assert!(
+                    reason.starts_with("fires reply did not parse ("),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fires_reply_about_another_run_is_unusable() {
+        let other = served_bytes("temi", 0x2b);
+        assert_eq!(
+            answer(&[&other]),
+            FiresAnswer::Unusable {
+                reason: "the robot answered about run 0x0000000000000000000000000000002b \
+                         when asked about run 0x0000000000000000000000000000002a"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_first_usable_fires_reply_wins_over_unusable_ones() {
+        let good = served_bytes("temi", 0x2a);
+        let other_run = served_bytes("temi", 0x2b);
+        let not_served =
+            encode_fires_reply(&FiresReply::new("temi", 0x2a, FiresOutcome::NotServed));
+        for payloads in [
+            vec![
+                b"not json".as_slice(),
+                other_run.as_slice(),
+                good.as_slice(),
+            ],
+            vec![good.as_slice(), not_served.as_slice()],
+        ] {
+            match answer(&payloads) {
+                FiresAnswer::Reply { reply } => assert!(
+                    matches!(reply.outcome, FiresOutcome::Served { next: 1, .. }),
+                    "{reply:?}"
+                ),
+                other => panic!("expected the served reply, got {other:?}"),
+            }
+        }
+        // With no usable reply, the FIRST unusable reason is the answer.
+        match answer(&[b"not json", other_run.as_slice()]) {
+            FiresAnswer::Unusable { reason } => {
+                assert!(reason.starts_with("fires reply did not parse"), "{reason}");
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plane_without_a_fires_verb_refuses_it() {
+        assert!(matches!(
+            NoopQueryPlane.query_fires("temi", RUN, None),
+            Err(QueryError::NoNetwork)
+        ));
+
+        struct Predating;
+        impl QueryPlane for Predating {
+            fn query_catalog(&self, _: Option<&str>) -> Result<CatalogGather, QueryError> {
+                unreachable!()
+            }
+            fn query_schema(&self, _: Option<&str>, _: &str) -> Result<SchemaGather, QueryError> {
+                unreachable!()
+            }
+            fn query_runs(&self, _: Option<&str>) -> Result<RunsGather, QueryError> {
+                unreachable!()
+            }
+        }
+        assert!(matches!(
+            Predating.query_fires("temi", RUN, Some(3)),
+            Err(QueryError::NoNetwork)
+        ));
+    }
+
+    #[test]
+    fn the_fires_window_is_one_poll_plus_a_margin() {
+        assert_eq!(FIRES_GATHER_WINDOW, Duration::from_millis(300));
+    }
+}
+
+/// The production [`GatewayQueryPlane::query_fires`] against an in-process
+/// serving gateway over loopback TCP: the desk plane GETs the robot's `fires`
+/// key over its ONE session and folds the reply.
+#[cfg(test)]
+mod gateway_fires_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use cerulion_core::clock::VirtualClock;
+    use cerulion_core::fire_tap::{FireCause, FireFlags, FireTap, FireTapConfig};
+    use cerulion_core::graph::node::NodeEntry;
+    use cerulion_core::graph::{parse_graph, GraphRuntime};
+    use cerulion_core::testing::iceoryx_test_config;
+    use cerulion_core::transport::cerulion_q::{FiresOutcome, FiresReply, RunEntry};
+    use cerulion_core::transport::demand_authorizer::LanAccess;
+    use cerulion_core::transport::hosted_runs::{HostedRun, HostedRunGuard};
+    use cerulion_core::transport::network::NetworkConfig;
+    use cerulion_core::transport::run_registry::RunState;
+    use cerulion_core::transport::{TransportConfig, TransportManager};
+    use cerulion_core::{
+        ClosureNodeEntry, GatewayEgressPolicy, GatewayPlan, GatewayRuntime, MacroPolicy, NodeInfo,
+    };
+
+    use super::{GatewayQueryPlane, QueryError, QueryPlane, FIRES_GATHER_WINDOW};
+    use crate::protocol::FiresAnswer;
+
+    const ROBOT: &str = "temi";
+    const WIRE_CEILING: Duration = Duration::from_secs(20);
+
+    /// A robot gateway listening on a probed loopback port. Retried, because
+    /// another process can take the probed port first.
+    fn listening_robot() -> (Arc<TransportManager>, GatewayRuntime, u16) {
+        for attempt in 0..3 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("an ephemeral loopback port")
+                .port();
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("netd_fires_robot_{}_{attempt}", std::process::id()),
+                    network: Some(NetworkConfig {
+                        listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                        robot_identity: Some(ROBOT.to_string()),
+                        ..NetworkConfig::default()
+                    }),
+                    ..TransportConfig::default()
+                },
+                iceoryx_test_config(),
+            )
+            .expect("init robot manager");
+            let plan = GatewayPlan {
+                egress_policy: GatewayEgressPolicy::AllowAll,
+                announce: Vec::new(),
+                ingress: Vec::new(),
+            };
+            match GatewayRuntime::new(Arc::clone(&manager), plan) {
+                Ok(gateway) => return (manager, gateway, port),
+                Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
+            }
+        }
+        panic!("could not boot a listening robot gateway in 3 attempts");
+    }
+
+    /// netd's desk plane, dialing the robot.
+    fn desk_plane(port: u16) -> GatewayQueryPlane {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("netd_fires_desk_{}_{port}", std::process::id()),
+                network: Some(NetworkConfig {
+                    connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            iceoryx_test_config(),
+        )
+        .expect("init desk manager");
+        GatewayQueryPlane::with_cold_start_budget(manager, Duration::ZERO)
+    }
+
+    /// A one-node graph: `beat` ticks every millisecond and writes nothing.
+    fn beat_graph() -> GraphRuntime {
+        let yaml = "prefix: fires\nnodes:\n  - id: beat\n    type: beat\n";
+        let beat: Box<dyn NodeEntry> = Box::new(ClosureNodeEntry::new(
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::Period { period_ms: 1 }),
+            |_| Ok(()),
+        ));
+        GraphRuntime::build_for_test(
+            parse_graph(yaml).expect("graph parses"),
+            std::iter::once(("beat".to_string(), beat)).collect(),
+            Arc::new(VirtualClock::new()),
+            8,
+        )
+        .expect("graph builds")
+    }
+
+    fn host(
+        manager: &TransportManager,
+        run_id: u128,
+        fires: Option<Arc<FireTap>>,
+    ) -> HostedRunGuard {
+        let entry = RunEntry::new(
+            run_id,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+        manager.network().expect("a network").hosted_runs().host(
+            run_id,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+                fires,
+            },
+        )
+    }
+
+    /// Ask until the answer is a reply (the desk session may still be
+    /// connecting), and return it.
+    fn reply_within(plane: &GatewayQueryPlane, run_id: &str, after: Option<u64>) -> FiresReply {
+        let deadline = Instant::now() + WIRE_CEILING;
+        let mut last = String::from("no GET issued");
+        while Instant::now() < deadline {
+            match plane.query_fires(ROBOT, run_id, after) {
+                Ok(FiresAnswer::Reply { reply }) => return reply,
+                other => last = format!("{other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no fires reply within {WIRE_CEILING:?}; last {last}");
+    }
+
+    #[test]
+    fn the_desk_plane_reads_a_hosted_runs_fires_from_now_and_after_its_cursor() {
+        let (robot, _gateway, port) = listening_robot();
+        robot
+            .network()
+            .expect("a network")
+            .set_lan_access(LanAccess::Open);
+        let mut graph = beat_graph();
+        let tap = graph.install_fire_tap(FireTapConfig {
+            capacity: 64,
+            lease: Duration::from_secs(5),
+        });
+        let _guard = host(&robot, 0x2a, Some(Arc::clone(&tap)));
+        let plane = desk_plane(port);
+        let run = "0x0000000000000000000000000000002a";
+
+        let first = reply_within(&plane, run, None);
+        assert_eq!(first.robot, ROBOT);
+        assert_eq!(first.run_id, run);
+        match first.outcome {
+            FiresOutcome::Served {
+                next, lost, fires, ..
+            } => assert_eq!((next, lost, fires.len()), (0, 0, 0)),
+            other => panic!("expected a served page, got {other:?}"),
+        }
+        assert!(tap.stats().armed, "the netd GET armed the robot's tap");
+
+        graph.step(Duration::from_millis(1));
+        let second = reply_within(&plane, run, Some(0));
+        match second.outcome {
+            FiresOutcome::Served {
+                next, lost, fires, ..
+            } => {
+                assert_eq!((next, lost), (1, 0));
+                let row: Vec<_> = fires
+                    .iter()
+                    .map(|f| (f.seq, f.at_ns, f.node, f.cause, f.flags.0, f.wrote))
+                    .collect();
+                assert_eq!(
+                    row,
+                    vec![(1, 1_000_000, 0, FireCause::Period, FireFlags(0).0, 0)],
+                    "one period tick of node 0 at 1 ms that wrote nothing"
+                );
+            }
+            other => panic!("expected a served page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_desk_plane_carries_the_robots_other_outcomes() {
+        let (robot, _gateway, port) = listening_robot();
+        let network = robot.network().expect("a network");
+        network.set_lan_access(LanAccess::Open);
+        let _guard = host(&robot, 0x2b, None);
+        let plane = desk_plane(port);
+
+        let not_served = reply_within(&plane, "0x0000000000000000000000000000002b", None);
+        assert_eq!(not_served.outcome, FiresOutcome::NotServed);
+        let unknown = reply_within(&plane, "0x0000000000000000000000000000002c", Some(9));
+        assert_eq!(unknown.outcome, FiresOutcome::UnknownRun);
+
+        network.set_lan_access(LanAccess::Paired);
+        let refused = reply_within(&plane, "0x0000000000000000000000000000002b", None);
+        assert!(
+            matches!(refused.outcome, FiresOutcome::Refused { .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_robot_that_does_not_answer_is_silent_within_one_window() {
+        let (_robot, _gateway, port) = listening_robot();
+        let plane = desk_plane(port);
+        let started = Instant::now();
+        let answer = plane
+            .query_fires("nobody", "0x0000000000000000000000000000002a", None)
+            .expect("the GET runs");
+        assert_eq!(answer, FiresAnswer::Silent);
+        assert!(
+            started.elapsed() < FIRES_GATHER_WINDOW + Duration::from_secs(5),
+            "one GET, no retry ladder: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_desk_with_no_network_refuses_the_fires_query() {
+        let local = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("netd_fires_local_{}", std::process::id()),
+                network: None,
+                ..TransportConfig::default()
+            },
+            iceoryx_test_config(),
+        )
+        .expect("init local-only manager");
+        let plane = GatewayQueryPlane::new(local);
+        assert!(matches!(
+            plane.query_fires(ROBOT, "0x0000000000000000000000000000002a", None),
+            Err(QueryError::NoNetwork)
+        ));
     }
 }

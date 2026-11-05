@@ -56,7 +56,7 @@ use crate::convergence::{Converged, ConvergenceWait, WaitDecision, WaitOutcome};
 use crate::hygiene::{default_socket_path, SOCKET_ENV};
 use crate::protocol::{
     classify_control_line, CatalogChanged, ControlLine, DemandResponse, DiscoveryState,
-    EgressReleaseResponse, EgressResponse, Hello, ReleaseResponse, Request, Response,
+    EgressReleaseResponse, EgressResponse, FiresAnswer, Hello, ReleaseResponse, Request, Response,
     SubscribeCatalogResponse, HELLO_MARKER, PROTOCOL_VERSION, RUNS_MIN_DAEMON_VERSION,
 };
 use crate::query::{CatalogGather, RunsAnswer, RunsGather, SchemaGather};
@@ -1305,6 +1305,72 @@ impl NetdClient {
             }),
             other => Err(ClientError::Protocol(format!(
                 "expected a runs-query response, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Read the node fires of the run `run_id` hosted on `robot`, after the
+    /// cursor `after` (`None` reads from now), over netd's ONE zenoh session.
+    /// Pass the `next` of the previous served reply as `after` to read on.
+    ///
+    /// Each call arms or extends the run's fire tap lease on the robot, so call
+    /// it only while the fires are shown. It is cheap on the robot and MAY be
+    /// polled, unlike [`Self::query_runs`].
+    ///
+    /// # Reading the answer
+    ///
+    /// [`FiresAnswer::Reply`] carries what the robot did with the GET (its
+    /// `outcome`); [`FiresAnswer::Silent`] says nothing about the run; and
+    /// [`FiresAnswer::Unusable`] will not change until the robot is rebuilt. A
+    /// [`ClientError`] means netd could not run the query.
+    ///
+    /// # Version
+    ///
+    /// Needs a v10 daemon ([`crate::protocol::FIRES_MIN_DAEMON_VERSION`]). Against
+    /// an older one the per-verb gate refuses it BEFORE it is sent, with a
+    /// [`ClientError::Protocol`] naming both versions.
+    pub fn query_fires(
+        &mut self,
+        robot: &str,
+        run_id: &str,
+        after: Option<u64>,
+    ) -> Result<FiresAnswer, ClientError> {
+        // Like `demand`, the FIRST request on a fresh connection can race the daemon's
+        // idle-exit / shutdown (accepted-then-EOF); retry it ONCE (reconnect + resend),
+        // silently, and only on the first request (`next_id == 1`).
+        let first_request = self.next_id == 1;
+        match self.query_fires_once(robot, run_id, after) {
+            Err(e) if first_request && is_closed_early(&e) => {
+                self.reconnect()?;
+                self.query_fires_once(robot, run_id, after)
+            }
+            other => other,
+        }
+    }
+
+    /// One `query_fires` round-trip (see [`Self::query_fires`]).
+    fn query_fires_once(
+        &mut self,
+        robot: &str,
+        run_id: &str,
+        after: Option<u64>,
+    ) -> Result<FiresAnswer, ClientError> {
+        let id = self.next_request_id();
+        let req = Request::QueryFires {
+            id,
+            robot: robot.to_string(),
+            run_id: run_id.to_string(),
+            after,
+        };
+        match self.round_trip(&req)? {
+            Response::FiresQuery(r) => Ok(r.answer),
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "expected a fires-query response, got {other:?}"
             ))),
         }
     }
@@ -3135,6 +3201,150 @@ mod tests {
         );
         drop(client);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verb_compat_error_refuses_the_fires_verb_below_v10_and_accepts_newer() {
+        let fires = Request::QueryFires {
+            id: 1,
+            robot: "temi".into(),
+            run_id: "0x0000000000000000000000000000002a".into(),
+            after: Some(5),
+        };
+        for old in [1u32, 7, 9] {
+            let msg = verb_compat_error(old, &fires)
+                .unwrap_or_else(|| panic!("a v{old} daemon must refuse query_fires"));
+            assert!(msg.contains(&format!("v{old}")), "daemon version: {msg}");
+            assert!(msg.contains("query_fires"), "verb: {msg}");
+            assert!(
+                msg.contains("needs protocol v10"),
+                "required version: {msg}"
+            );
+            assert!(msg.contains("Upgrade cerulion-netd"), "fix: {msg}");
+        }
+        assert!(verb_compat_error(10, &fires).is_none());
+        assert!(verb_compat_error(11, &fires).is_none());
+        assert!(verb_compat_error(u32::MAX, &fires).is_none());
+    }
+
+    /// The fires skew matrix over a REAL UDS, with the daemon's served-request
+    /// count as the "refused before send" oracle (the runs-verb test's shape).
+    /// Every line the fake writes is minted by the production `Response`
+    /// serializer; the one it would answer a pre-10 daemon's `query_fires` with
+    /// is the unknown-method error a real v9 daemon's `parse_request` produces.
+    #[test]
+    fn the_fires_verb_is_refused_before_send_to_a_v9_daemon_and_served_by_v10_and_newer() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use crate::protocol::{FiresQueryResponse, FIRES_MIN_DAEMON_VERSION};
+
+        const RUN: &str = "0x0000000000000000000000000000002a";
+
+        fn serve(protocol: u32) -> (PathBuf, std::path::PathBuf, Arc<AtomicUsize>) {
+            let dir = std::env::temp_dir().join(format!(
+                "fires_skew_{}_{}_{}",
+                protocol,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("netd.sock");
+            let listener = UnixListener::bind(&sock).expect("bind");
+            let served = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&served);
+            std::thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut w = stream.try_clone().expect("clone");
+                let banner = Hello {
+                    hello: HELLO_MARKER.to_string(),
+                    protocol,
+                    wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
+                }
+                .to_json_line();
+                let _ = writeln!(w, "{banner}");
+                let _ = w.flush();
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let id = v["id"].as_u64().unwrap_or(0);
+                    let resp = if v["method"] == "query_fires" {
+                        if protocol < FIRES_MIN_DAEMON_VERSION {
+                            Response::error(
+                                Some(id),
+                                "malformed request: unknown variant `query_fires`",
+                                None,
+                                None,
+                            )
+                        } else {
+                            assert_eq!(v["robot"], "temi");
+                            assert_eq!(v["run_id"], RUN);
+                            assert_eq!(v["after"], 41);
+                            Response::FiresQuery(FiresQueryResponse {
+                                id,
+                                answer: FiresAnswer::Silent,
+                            })
+                        }
+                    } else {
+                        Response::CatalogQuery(crate::protocol::CatalogQueryResponse {
+                            id,
+                            catalogs: vec![],
+                            discovery: DiscoveryState::Settled,
+                            plane_unsettled_ms: None,
+                        })
+                    };
+                    let _ = writeln!(w, "{}", resp.to_json_line());
+                    let _ = w.flush();
+                }
+            });
+            (sock, dir, served)
+        }
+
+        // NEW client, v9 daemon: refused locally, nothing sent.
+        let (sock, dir, served) = serve(9);
+        let mut client = NetdClient::connect_or_spawn_at(sock).expect("connect to the v9 daemon");
+        assert_eq!(client.daemon_protocol(), 9);
+        match client.query_fires("temi", RUN, Some(41)) {
+            Err(ClientError::Protocol(msg)) => {
+                assert!(msg.contains("query_fires"), "names the verb: {msg}");
+                assert!(
+                    msg.contains("v9") && msg.contains("v10"),
+                    "names both versions: {msg}"
+                );
+            }
+            other => panic!("expected a Protocol refusal, got {other:?}"),
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 0, "refused BEFORE the send");
+        // The same connection still serves what a v9 daemon speaks.
+        assert!(client.query_catalog(None).is_ok());
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A v10 daemon and a NEWER daemon are both asked, and answer.
+        for protocol in [FIRES_MIN_DAEMON_VERSION, FIRES_MIN_DAEMON_VERSION + 1] {
+            let (sock, dir, served) = serve(protocol);
+            let mut client = NetdClient::connect_or_spawn_at(sock).expect("connect to the daemon");
+            assert_eq!(client.daemon_protocol(), protocol);
+            assert_eq!(
+                client
+                    .query_fires("temi", RUN, Some(41))
+                    .expect("the daemon serves the fires verb"),
+                FiresAnswer::Silent
+            );
+            assert_eq!(served.load(Ordering::SeqCst), 1, "the request was sent");
+            drop(client);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
