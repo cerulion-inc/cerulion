@@ -370,6 +370,10 @@ so run it before pushing any `src/` doc-comment change.
 `//!` header cannot break this gate, a useful thing to know before being cautious about
 the long doc comments this repo's test files carry.
 
+The `cerulion` binary of `cerulion_cli` sets `doc = false`. The umbrella library crate has the
+same name, rustdoc writes both to `target/doc/cerulion`, and the two outputs race under
+`cargo doc --workspace` (cargo issue 6313): the gate then fails at random with missing files.
+
 ## The login gate in CI
 
 Every `cerulion` command runs under an account, in every build. CI machines have
