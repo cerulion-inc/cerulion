@@ -6631,7 +6631,13 @@ mod fire_follower_tests {
             "a failed poll waits {:?} before the next, not one interval",
             FollowTiming::PRODUCTION.retry
         );
+        let closing = Instant::now();
         followers.close();
+        assert!(
+            closing.elapsed() < Duration::from_secs(1),
+            "close cut the retry wait short: {:?}",
+            closing.elapsed()
+        );
     }
 
     /// A netd that greets as protocol v9, the last one without `query_fires`,
