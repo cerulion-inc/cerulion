@@ -169,7 +169,11 @@ pub struct FireTap {
     slots: Box<[Slot]>,
     head: AtomicU64,
     lease_until_ns: AtomicU64,
-    armed_since_ns: Mutex<u64>,
+    /// Start of the interval `lease_until_ns` belongs to. Only a reader holding
+    /// `arming` writes it, and only before the deadline that starts a new
+    /// interval.
+    armed_since_ns: AtomicU64,
+    arming: Mutex<()>,
     lease_ns: u64,
     in_tick: Box<[Arc<AtomicU64>]>,
     clock: Arc<dyn Clock>,
@@ -228,7 +232,8 @@ impl FireTap {
             slots: (0..config.capacity).map(|_| Slot::default()).collect(),
             head: AtomicU64::new(0),
             lease_until_ns: AtomicU64::new(0),
-            armed_since_ns: Mutex::new(0),
+            armed_since_ns: AtomicU64::new(0),
+            arming: Mutex::new(()),
             lease_ns,
             in_tick: in_tick.into_boxed_slice(),
             clock,
@@ -247,14 +252,16 @@ impl FireTap {
             return Some(now);
         }
         // A reader's concurrent extension must not be cleared by this expiry.
-        // Every nonzero deadline is a reader's clock read plus `lease_ns`, and
-        // a re-arm reports that read as `armed_since_ns`, so a tick that read
-        // the clock before it stays out of that lease.
+        // The acquire sees the start a re-arm publishes before its deadline, so
+        // a tick that read the clock before the current interval began stays
+        // out of it, and any extension of an unbroken interval admits the tick.
         match self
             .lease_until_ns
-            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Acquire)
         {
-            Err(extended) if now < extended && now >= extended.saturating_sub(self.lease_ns) => {
+            Err(extended)
+                if now < extended && now >= self.armed_since_ns.load(Ordering::Relaxed) =>
+            {
                 Some(now)
             }
             _ => None,
@@ -333,32 +340,31 @@ impl FireTap {
     /// A pending, unsuperseded claim ends the page without advancing its cursor.
     /// A zero limit arms the lease without consuming any sequence or loss.
     pub fn serve(&self, cursor: Cursor, max: usize) -> FireBatch {
-        let mut since = self
-            .armed_since_ns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let arming = self.arming.lock().unwrap_or_else(|e| e.into_inner());
         let mut old = self.lease_until_ns.load(Ordering::Relaxed);
         // The clock is read after `old` and before the CAS: an expiry that
         // clears `old` in between fails the CAS and forces a later read, and a
         // tick this CAS admits reads its clock after the CAS.
         let now_ns = loop {
             let now_ns = self.clock.now_ns();
+            if old == 0 || old <= now_ns {
+                // Published before the deadline, so an expiry that sees the
+                // new deadline also sees that the interval restarted here.
+                self.armed_since_ns.store(now_ns, Ordering::Relaxed);
+            }
             let until = old.max(now_ns.saturating_add(self.lease_ns));
             match self.lease_until_ns.compare_exchange(
                 old,
                 until,
-                Ordering::Relaxed,
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break now_ns,
                 Err(actual) => old = actual,
             }
         };
-        if old == 0 || old <= now_ns {
-            *since = now_ns;
-        }
-        let armed_since_ns = *since;
-        drop(since);
+        let armed_since_ns = self.armed_since_ns.load(Ordering::Relaxed);
+        drop(arming);
         let head = self.assigned();
         let mut batch = FireBatch {
             now_ns,
@@ -471,13 +477,19 @@ mod tests {
         (tap, clock)
     }
 
+    /// Bounds every wait on a paused thread, so a broken handshake fails the
+    /// test instead of hanging it.
+    const PAUSE_LIMIT: Duration = Duration::from_secs(20);
+
+    /// Resumes exactly one paused clock read.
+    type Gate = std::sync::mpsc::SyncSender<()>;
+
     struct PausingClock {
         now: AtomicU64,
         pause: std::sync::atomic::AtomicBool,
         skip: AtomicU64,
         late: std::sync::atomic::AtomicBool,
-        arrived: std::sync::mpsc::SyncSender<()>,
-        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+        arrived: std::sync::mpsc::Sender<Option<Gate>>,
     }
     impl Clock for PausingClock {
         fn now_ns(&self) -> u64 {
@@ -489,8 +501,13 @@ mod tests {
                     .is_err()
                 && self.pause.swap(false, Ordering::Relaxed)
             {
-                self.arrived.send(()).unwrap();
-                self.resume.lock().unwrap().recv().unwrap();
+                // A gate per paused read: two paused threads can never take
+                // each other's resume, whatever order they announce in.
+                let (gate, resume) = std::sync::mpsc::sync_channel(1);
+                self.arrived.send(Some(gate)).unwrap();
+                resume
+                    .recv_timeout(PAUSE_LIMIT)
+                    .expect("a paused clock read was never resumed");
                 if self.late.load(Ordering::Relaxed) {
                     return self.now.load(Ordering::Relaxed);
                 }
@@ -500,23 +517,21 @@ mod tests {
     }
 
     /// Once `pause` is set, the clock passes `skip` reads, then the next read
-    /// blocks until the returned sender releases it. That read returns the time
-    /// from before the block, or from after it when `late` is set.
+    /// announces its own gate and blocks until the test opens it. That read
+    /// returns the time from before the block, or from after it when `late` is
+    /// set.
     fn pausing_tap() -> (
         FireTap,
         Arc<PausingClock>,
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<Option<Gate>>,
     ) {
-        let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
-        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
         let clock = Arc::new(PausingClock {
             now: AtomicU64::new(0),
             pause: std::sync::atomic::AtomicBool::new(false),
             skip: AtomicU64::new(0),
             late: std::sync::atomic::AtomicBool::new(false),
             arrived: arrived_tx,
-            resume: Mutex::new(resume_rx),
         });
         let tap = FireTap::new(
             FireTapConfig {
@@ -527,7 +542,15 @@ mod tests {
             vec![],
             clock.clone(),
         );
-        (tap, clock, arrived_rx, resume_tx)
+        (tap, clock, arrived_rx)
+    }
+
+    /// The gate of the next clock read that pauses.
+    fn paused(arrived: &std::sync::mpsc::Receiver<Option<Gate>>) -> Gate {
+        arrived
+            .recv_timeout(PAUSE_LIMIT)
+            .expect("no clock read paused")
+            .expect("the caller returned without a paused clock read")
     }
 
     fn body(id: u64) -> FireBody {
@@ -804,7 +827,7 @@ mod tests {
             scope.spawn(move || {
                 tap_ref.push_with(body(0), |seq| {
                     claimed_tx.send(seq).unwrap();
-                    resume_rx.recv().unwrap();
+                    resume_rx.recv_timeout(PAUSE_LIMIT).unwrap();
                 })
             });
             let claimed = claimed_rx.recv().unwrap();
@@ -982,16 +1005,16 @@ mod tests {
 
     #[test]
     fn expiry_cannot_erase_a_concurrent_reader_extension() {
-        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        let (tap, clock, arrived) = pausing_tap();
         tap.serve(Cursor::Now, 0);
         clock.now.store(100, Ordering::Relaxed);
         clock.pause.store(true, Ordering::Relaxed);
         std::thread::scope(|scope| {
             let expiry = scope.spawn(|| tap.armed_now());
-            arrived_rx.recv().unwrap();
+            let expiry_gate = paused(&arrived);
             clock.now.store(150, Ordering::Relaxed);
             let extension = tap.serve(Cursor::Now, 0);
-            resume_tx.send(()).unwrap();
+            expiry_gate.send(()).unwrap();
             assert_eq!(
                 expiry.join().unwrap(),
                 None,
@@ -1007,21 +1030,21 @@ mod tests {
 
     #[test]
     fn a_tick_that_sees_its_lease_end_during_a_live_extension_joins_it() {
-        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        let (tap, clock, arrived) = pausing_tap();
         tap.serve(Cursor::Now, 0);
         clock.now.store(95, Ordering::Relaxed);
         clock.pause.store(true, Ordering::Relaxed);
         std::thread::scope(|scope| {
             let reader = scope.spawn(|| tap.serve(Cursor::Now, 0));
-            arrived_rx.recv().unwrap();
+            let reader_gate = paused(&arrived);
             clock.now.store(100, Ordering::Relaxed);
             clock.pause.store(true, Ordering::Relaxed);
             let tick = scope.spawn(|| tap.armed_now());
-            arrived_rx.recv().unwrap();
+            let tick_gate = paused(&arrived);
             // The reader read 95 before the lease ended at 100; it extends first.
-            resume_tx.send(()).unwrap();
+            reader_gate.send(()).unwrap();
             let extension = reader.join().unwrap();
-            resume_tx.send(()).unwrap();
+            tick_gate.send(()).unwrap();
             assert_eq!(tick.join().unwrap(), Some(100));
             assert_eq!(extension.armed_since_ns, 0);
         });
@@ -1032,18 +1055,58 @@ mod tests {
     }
 
     #[test]
+    fn a_tick_inside_a_continuously_extended_lease_is_admitted() {
+        let (tap, clock, arrived) = pausing_tap();
+        tap.serve(Cursor::Now, 0);
+        clock.now.store(95, Ordering::Relaxed);
+        clock.pause.store(true, Ordering::Relaxed);
+        let (tick, later) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| tap.serve(Cursor::Now, 0));
+            let reader_gate = paused(&arrived);
+            clock.now.store(100, Ordering::Relaxed);
+            clock.pause.store(true, Ordering::Relaxed);
+            let tick = scope.spawn(|| tap.armed_now());
+            let tick_gate = paused(&arrived);
+            reader_gate.send(()).unwrap();
+            assert_eq!(reader.join().unwrap().armed_since_ns, 0);
+            clock.now.store(150, Ordering::Relaxed);
+            let later = tap.serve(Cursor::Now, 0);
+            tick_gate.send(()).unwrap();
+            (tick.join().unwrap(), later)
+        });
+        assert_eq!(
+            later.armed_since_ns, 0,
+            "readers at 95 and 150 extended the lease from 100 to 250 without a gap"
+        );
+        assert_eq!(
+            tick,
+            Some(100),
+            "the tick at 100 lies inside the lease armed since 0"
+        );
+        tap.push(body(100));
+        let page = tap.serve(Cursor::After(0), 512);
+        assert_eq!((page.next, page.lost, page.records.len()), (1, 0, 1));
+        assert_eq!(page.records[0].at_ns, 100);
+        assert_body(&page.records[0]);
+        clock.now.store(249, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), Some(249));
+        clock.now.store(250, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), None);
+    }
+
+    #[test]
     fn a_tick_that_read_an_ended_lease_cannot_join_a_later_one() {
-        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        let (tap, clock, arrived) = pausing_tap();
         tap.serve(Cursor::Now, 0);
         clock.now.store(150, Ordering::Relaxed);
         clock.pause.store(true, Ordering::Relaxed);
         let (stale, rearm) = std::thread::scope(|scope| {
             let stale = scope.spawn(|| tap.armed_now());
-            arrived_rx.recv().unwrap();
+            let stale_gate = paused(&arrived);
             assert_eq!(tap.armed_now(), None, "another tick ends the lease");
             clock.now.store(160, Ordering::Relaxed);
             let rearm = tap.serve(Cursor::Now, 0);
-            resume_tx.send(()).unwrap();
+            stale_gate.send(()).unwrap();
             (stale.join().unwrap(), rearm)
         });
         assert_eq!(rearm.armed_since_ns, 160);
@@ -1055,17 +1118,17 @@ mod tests {
 
     #[test]
     fn rearming_after_a_refused_tick_starts_the_interval_after_it() {
-        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        let (tap, clock, arrived) = pausing_tap();
         tap.serve(Cursor::Now, 0);
         clock.now.store(99, Ordering::Relaxed);
         clock.pause.store(true, Ordering::Relaxed);
         let (refused, rearm) = std::thread::scope(|scope| {
             let reader = scope.spawn(|| tap.serve(Cursor::After(0), 512));
-            arrived_rx.recv().unwrap();
+            let reader_gate = paused(&arrived);
             clock.now.store(105, Ordering::Relaxed);
             let refused = tap.armed_now();
             tap.push(body(105));
-            resume_tx.send(()).unwrap();
+            reader_gate.send(()).unwrap();
             (refused, reader.join().unwrap())
         });
         assert_eq!(refused, None, "the lease ended at 100");
@@ -1087,7 +1150,7 @@ mod tests {
 
     #[test]
     fn a_tick_admitted_while_the_reader_arms_lies_inside_the_lease_it_reports() {
-        let (tap, clock, arrived_rx, resume_tx) = pausing_tap();
+        let (tap, clock, arrived) = pausing_tap();
         // Any reader clock read after the first one comes after its arm CAS.
         clock.skip.store(1, Ordering::Relaxed);
         clock.late.store(true, Ordering::Relaxed);
@@ -1096,20 +1159,23 @@ mod tests {
         let (admitted, arm) = std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
                 let batch = tap.serve(Cursor::Now, 0);
-                done.send(()).unwrap();
+                done.send(None).unwrap();
                 batch
             });
-            arrived_rx.recv().unwrap();
-            // Still set only if the reader returned without a second read.
-            let paused = !clock.pause.swap(false, Ordering::Relaxed);
+            // No gate: the reader returned without a second read, so `pause`
+            // is still set.
+            let reader_gate = arrived
+                .recv_timeout(PAUSE_LIMIT)
+                .expect("the reader neither paused nor returned");
+            clock.pause.store(false, Ordering::Relaxed);
             clock.now.store(10, Ordering::Relaxed);
             let admitted = tap.armed_now();
             if let Some(at_ns) = admitted {
                 tap.push(body(at_ns));
             }
             clock.now.store(20, Ordering::Relaxed);
-            if paused {
-                resume_tx.send(()).unwrap();
+            if let Some(gate) = reader_gate {
+                gate.send(()).unwrap();
             }
             (admitted, reader.join().unwrap())
         });
