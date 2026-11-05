@@ -5,22 +5,33 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerulion_bagd::{run_bagd, BagdConfig, BagdSummary, RecordedTopic, RECORDED_TOPIC_FORMAT};
 use cerulion_cli_engine::graph_cmd::{cdylib_name, resolve_recorded_topics};
+use cerulion_cli_engine::run_dir::{
+    render_hosted_run_manifest, EndpointPort, FireTelemetryDecl, HostedRunSpec, RunEndpoint,
+};
 use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
 use cerulion_core::dynamic::{FrameWalker, SchemaSet, WireLayout};
+use cerulion_core::fire_tap::{
+    FireTap, FireTapConfig, FireTapStats, FIRE_TAP_DEFAULT_CAPACITY, FIRE_TAP_DEFAULT_LEASE,
+};
 use cerulion_core::graph::{
     parse_graph, resolve_ingress_schema_hash, resolve_output_topic, DylibNodeEntry, GraphConfig,
-    GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords,
+    GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords, RunTopology,
+};
+use cerulion_core::transport::cerulion_q::{
+    format_run_id, RunEntry, RunEntryState, FIRES_WIRE_VERSION,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
     TopicSchema,
 };
-use cerulion_core::transport::network::NetworkConfig;
+use cerulion_core::transport::hosted_runs::{HostedRun, HostedRunGuard};
+use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
+use cerulion_core::transport::run_registry::mint_run_id;
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
     TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, SUBSCRIBER_MAX_BORROWED_HELD,
@@ -300,6 +311,78 @@ impl Serialize for NodeFailures {
     }
 }
 
+/// The node fire telemetry of the run this runtime describes to desks.
+///
+/// Read while the run is hosted: [`Self::stats`] and the status JSON read the
+/// run's fire tap at the time of the read, so `armed` turns false once the
+/// lease of the last desk read runs out. A clone keeps the stats as they were
+/// when cloned, so a cloned [`Status`] is a snapshot. `None` while no run is
+/// hosted: before a start, after `stop`, and for a start with no graph or
+/// with no `listen` endpoint and no `connect` locator.
+#[derive(Default)]
+pub struct FireTelemetry {
+    source: TelemetrySource,
+}
+
+enum TelemetrySource {
+    /// The tap the graph's tick callbacks write.
+    Live(Arc<FireTap>),
+    /// Fixed stats: none while no run is hosted, or the stats a clone read.
+    Snapshot(Option<FireTapStats>),
+}
+
+impl Default for TelemetrySource {
+    fn default() -> Self {
+        Self::Snapshot(None)
+    }
+}
+
+impl FireTelemetry {
+    fn live(tap: Arc<FireTap>) -> Self {
+        Self {
+            source: TelemetrySource::Live(tap),
+        }
+    }
+
+    /// Whether a desk's `fires` lease is live, how many fires the tap
+    /// recorded while armed (lost ones included) and how many it holds.
+    pub fn stats(&self) -> Option<FireTapStats> {
+        match &self.source {
+            TelemetrySource::Live(tap) => Some(tap.stats()),
+            TelemetrySource::Snapshot(stats) => *stats,
+        }
+    }
+}
+
+impl Clone for FireTelemetry {
+    fn clone(&self) -> Self {
+        Self {
+            source: TelemetrySource::Snapshot(self.stats()),
+        }
+    }
+}
+
+impl PartialEq for FireTelemetry {
+    fn eq(&self, other: &Self) -> bool {
+        // Two reads of one live view could straddle a lease expiry.
+        std::ptr::eq(self, other) || self.stats() == other.stats()
+    }
+}
+
+impl Eq for FireTelemetry {}
+
+impl std::fmt::Debug for FireTelemetry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.stats().fmt(formatter)
+    }
+}
+
+impl Serialize for FireTelemetry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.stats().serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// The recorder totals written by a completed runtime.
 pub struct RecorderSummary {
@@ -352,6 +435,9 @@ pub struct Status {
     /// The remote plane this start serves; `None` when it hosts none or the
     /// plane stopped.
     pub remote: Option<RemoteStatus>,
+    /// The node fire telemetry of the run this start describes to desks;
+    /// `null` in the JSON when it describes none.
+    pub fire_telemetry: FireTelemetry,
 }
 
 impl Status {
@@ -372,6 +458,7 @@ impl Status {
             last_error: None,
             node_failures: NodeFailures::default(),
             remote: None,
+            fire_telemetry: FireTelemetry::default(),
         }
     }
 }
@@ -427,6 +514,12 @@ pub struct EmbeddedRuntime {
 /// teardown in [`Run::shutdown`] (also run by `Drop`, so a panic mid-build
 /// tears down too) stops whatever was filled in a safe order.
 struct Run {
+    /// The run as desks read it: hosted by the commit, withdrawn first by
+    /// the teardown, so the run stops being described before anything it
+    /// describes goes down.
+    hosted: Option<HostedRunGuard>,
+    /// What the commit hosts, made with the graph.
+    hosted_plan: Option<HostedRunPlan>,
     /// The remote plane: bound by the build, served by the commit, stopped
     /// first by the teardown.
     remote: Option<HostedPlane>,
@@ -452,6 +545,39 @@ struct GraphWorker {
     running: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     thread: JoinHandle<Result<(), String>>,
+}
+
+/// The fire tap of a hosted run: the newest fires it holds, and how long
+/// one desk read keeps it recording.
+const FIRE_TAP_CONFIG: FireTapConfig = FireTapConfig {
+    capacity: FIRE_TAP_DEFAULT_CAPACITY,
+    lease: FIRE_TAP_DEFAULT_LEASE,
+};
+
+/// The endpoint id of the app that embeds the runtime, in a hosted run's
+/// `run.json`.
+const APP_ENDPOINT: &str = "app";
+
+/// A built graph's run, as the commit hosts it. Only a start that owns the
+/// gateway makes one: the gateway's query surface serves it.
+struct HostedRunPlan {
+    run_id: u128,
+    /// Read after the fire tap went in, which sets each node's
+    /// `reports_writes`.
+    topology: RunTopology,
+    fire_tap: Arc<FireTap>,
+    /// Cleared by the graph thread when it exits for any reason.
+    live: Arc<AtomicBool>,
+}
+
+/// Held by the graph thread: on any exit of the thread, an unwind included,
+/// it clears the hosted run's `live` flag, so desks read the run as ending.
+struct ClearOnExit(Arc<AtomicBool>);
+
+impl Drop for ClearOnExit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 struct GatewayWorker {
@@ -728,8 +854,9 @@ impl EmbeddedRuntime {
         // recorder active behind the refusal.
         if let Some(mut run) = self.run.take() {
             let (_summary, teardown_error) = run.shutdown();
-            // The plane is stopped, even when the new config is refused below.
-            lock_status(&self.status).remote = None;
+            // The plane is stopped and the run withdrawn, even when the new
+            // config is refused below.
+            clear_served(&self.status);
             if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
@@ -763,6 +890,7 @@ impl EmbeddedRuntime {
             status.last_error = None;
             status.node_failures = NodeFailures::default();
             status.remote = None;
+            status.fire_telemetry = FireTelemetry::default();
         }
         let planned = install_iceoryx_config(&self.files_dir)
             .and_then(|()| self.plan_start(config))
@@ -978,7 +1106,7 @@ impl EmbeddedRuntime {
             return Ok(None);
         };
         let (summary, error) = run.shutdown();
-        lock_status(&self.status).remote = None;
+        clear_served(&self.status);
         // A teardown error keeps Failed: the stopped state must mean every
         // resource actually released, not that the teardown was attempted.
         match &error {
@@ -1440,7 +1568,7 @@ impl Drop for EmbeddedRuntime {
         };
         set_state(&self.status, RuntimeState::Stopping);
         let (summary, error) = run.shutdown();
-        lock_status(&self.status).remote = None;
+        clear_served(&self.status);
         match error {
             None => {
                 set_state(&self.status, RuntimeState::Stopped);
@@ -1457,6 +1585,8 @@ impl Drop for EmbeddedRuntime {
 impl Run {
     fn empty(manager: Arc<TransportManager>) -> Self {
         Self {
+            hosted: None,
+            hosted_plan: None,
             remote: None,
             graph: None,
             gateway: None,
@@ -1474,6 +1604,8 @@ impl Run {
     /// caller can store the summary in status BEFORE propagating the error.
     /// Idempotent: each step empties what it stopped.
     fn shutdown(&mut self) -> (Option<RecorderSummary>, Option<EmbedError>) {
+        // Withdraw the run first: no desk reads a run that is going down.
+        drop(self.hosted.take());
         // Close LAN access before any join: a join that blocks must not
         // leave an open gateway serving LAN peers. Only the gateway owner
         // may: a runtime with no gateway sharing the manager leaves the owner's
@@ -1666,6 +1798,18 @@ fn build_into(
         // `--trace-limit`, so the trace of a graph that runs for days stops
         // growing.
         graph_runtime.set_trace_limit(cerulion_cli_engine::graph_cmd::PRODUCTION_TRACE_LIMIT);
+        // A start that owns the gateway describes its run to desks. The tap
+        // goes in before the topology is read: installing it sets each
+        // node's `reports_writes`.
+        if plan.gateway.is_some() {
+            let fire_tap = graph_runtime.install_fire_tap(FIRE_TAP_CONFIG);
+            run.hosted_plan = Some(HostedRunPlan {
+                run_id: mint_run_id(),
+                topology: graph_runtime.run_topology(),
+                fire_tap,
+                live: Arc::new(AtomicBool::new(true)),
+            });
+        }
         graph_runtime.set_live_transport(Arc::clone(&manager));
         // The graph thread takes the runtime: status keeps this reader.
         lock_status(status).node_failures =
@@ -1775,6 +1919,10 @@ fn build_into(
         let thread_gate = Arc::clone(&run.commit_gate);
         #[cfg(any(test, feature = "test-helpers"))]
         let graph_exit = plan.graph_exit.take();
+        let live = run
+            .hosted_plan
+            .as_ref()
+            .map(|hosted| ClearOnExit(Arc::clone(&hosted.live)));
         let thread = thread::Builder::new()
             .name("cerulion-graph".to_string())
             .spawn(move || {
@@ -1792,6 +1940,7 @@ fn build_into(
                 }))
                 .map(|result| result.map_err(|error| error.to_string()))
                 .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
+                drop(live);
                 {
                     let _commit = lock_gate(&thread_gate);
                     record_graph_exit(&thread_status, &thread_running, &result);
@@ -1910,6 +2059,11 @@ fn commit(
             let network = run.manager.network().ok_or_else(|| {
                 EmbedError::Network("the gateway's transport manager has no network".to_string())
             })?;
+            // Hosted before LAN access opens, so the first desk the posture
+            // lets in reads the run.
+            if let (Some(hosted), Some(graph)) = (&run.hosted_plan, &plan.graph) {
+                run.hosted = host_run(network, plan, &graph.config, gateway, hosted);
+            }
             network.set_lan_access(gateway.lan_access);
             if gateway.lan_access == LanAccess::Open {
                 // Read AFTER the posture opened: a topic registered before
@@ -1950,6 +2104,10 @@ fn commit(
             .as_ref()
             .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
         status.remote = remote;
+        status.fire_telemetry = match (&run.hosted, &run.hosted_plan) {
+            (Some(_), Some(hosted)) => FireTelemetry::live(Arc::clone(&hosted.fire_tap)),
+            _ => FireTelemetry::default(),
+        };
     }
     // Another publisher in the process may send such a topic, so it is
     // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
@@ -1993,6 +2151,120 @@ fn commit(
         }
     }
     Ok(())
+}
+
+/// Host `hosted` on `network`, whose query surface serves it to desks under
+/// the gateway's posture. A run that cannot be described keeps running
+/// undescribed: the description serves desks and never stops the app's
+/// graph.
+fn host_run(
+    network: &NetworkManager,
+    plan: &StartPlan,
+    graph: &GraphConfig,
+    gateway: &GatewayStartPlan,
+    hosted: &HostedRunPlan,
+) -> Option<HostedRunGuard> {
+    match hosted_run_entry(plan, graph, gateway, hosted, wall_clock_ns()) {
+        Ok(entry) => Some(network.hosted_runs().host(
+            hosted.run_id,
+            HostedRun {
+                entry,
+                live: Arc::clone(&hosted.live),
+                fires: Some(Arc::clone(&hosted.fire_tap)),
+            },
+        )),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the run is not described to desks: the runs verb does not list it and it \
+                 serves no fires"
+            );
+            None
+        }
+    }
+}
+
+/// The entry the `runs` verb serves for `hosted`: the graph's name and its
+/// effective `graph.yaml`, and a `run.json` with the app's endpoint, the
+/// built topology and the fire telemetry the run serves.
+fn hosted_run_entry(
+    plan: &StartPlan,
+    graph: &GraphConfig,
+    gateway: &GatewayStartPlan,
+    hosted: &HostedRunPlan,
+    started_at_ns: u64,
+) -> Result<RunEntry, EmbedError> {
+    let graph_yaml = effective_graph_yaml(graph)?;
+    let endpoints = [RunEndpoint {
+        id: APP_ENDPOINT.to_string(),
+        publishes: plan
+            .publishes
+            .iter()
+            .map(|publish| EndpointPort {
+                topic: publish.topic.clone(),
+                schema: publish.schema.clone(),
+            })
+            .collect(),
+        subscribes: plan
+            .subscribes
+            .iter()
+            .map(|subscribe| EndpointPort {
+                topic: subscribe.topic.clone(),
+                schema: subscribe.schema.clone(),
+            })
+            .collect(),
+    }];
+    let run_json = render_hosted_run_manifest(&HostedRunSpec {
+        run_id: hosted.run_id,
+        graph_name: graph.identity(),
+        run_started_at_ns: started_at_ns,
+        pid: std::process::id(),
+        lan_access: gateway.lan_access.as_str(),
+        endpoints: &endpoints,
+        topology: &hosted.topology,
+        fires: Some(FireTelemetryDecl {
+            version: FIRES_WIRE_VERSION,
+            capacity: hosted.fire_tap.stats().capacity,
+            lease_ms: u64::try_from(FIRE_TAP_CONFIG.lease.as_millis()).unwrap_or(u64::MAX),
+        }),
+    });
+    // Not minted through `RunEntry::new`: `host` checks the entry again and
+    // serves one that fails a served-entry check (an artifact above the
+    // served cap) as an undescribable run with the reason, so a desk learns
+    // why the run has no description.
+    Ok(RunEntry {
+        run_id: format_run_id(hosted.run_id),
+        graph_name: graph.identity().to_string(),
+        run_started_at_ns: started_at_ns,
+        state: RunEntryState::Live,
+        graph_yaml,
+        run_json: String::from_utf8_lossy(&run_json).into_owned(),
+    })
+}
+
+/// The graph config the runtime built from, as the `graph.yaml` a hosted
+/// run serves: the render a `graph run --record` bag embeds.
+#[cfg(unix)]
+fn effective_graph_yaml(graph: &GraphConfig) -> Result<String, EmbedError> {
+    cerulion_cli_engine::graph_cmd::render_effective_graph_yaml(graph)
+        .map_err(|error| EmbedError::Graph(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn effective_graph_yaml(_graph: &GraphConfig) -> Result<String, EmbedError> {
+    Err(EmbedError::Graph(
+        "describing a hosted run is only available on Unix".to_string(),
+    ))
+}
+
+/// Wall-clock ns since the Unix epoch, the base a run's start time is
+/// served in; 0 for a clock set before the epoch.
+fn wall_clock_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 fn create_publishers(
@@ -2447,6 +2719,14 @@ fn worker_settled(ready: &AtomicBool, thread: &JoinHandle<Result<(), String>>) -
 
 fn lock_status(status: &Arc<Mutex<Status>>) -> MutexGuard<'_, Status> {
     status.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Clear what a run that went down no longer serves: its remote plane and
+/// its fire telemetry.
+fn clear_served(status: &Arc<Mutex<Status>>) {
+    let mut status = lock_status(status);
+    status.remote = None;
+    status.fire_telemetry = FireTelemetry::default();
 }
 
 fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
