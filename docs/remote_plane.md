@@ -44,22 +44,37 @@ access can:
 - read the per-topic counters (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
-A desk cannot write a topic on the robot or send it teleop commands over the
-remote plane. No verb on `cerulion/wire/2` takes a frame from the desk, and the
-robot never reads a data stream from the desk. The `teleop` and `deploy` verbs
+A desk cannot write a topic on the robot or send it teleop commands over
+`cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
+never reads a data stream from the desk. The `teleop` and `deploy` verbs
 are classified but have no handler. The ops protocol (`cerulion/ops/1`) does run
 the verbs the robot has registered, such as `inventory`, `log-tail`, `restart`
-and `engage-estop`, for a desk with the access each one needs; none of them
-carries topic data. The only desk to robot topic
-path today is LAN ingress (an `ingress:` block in a graph), which proves no
-identity per peer and is closed when `CERULION_LAN_ACCESS=paired`.
+and `engage-estop`, for a desk with the access each one needs. Four more, the
+act verbs, work on the robot's own shared memory; with `--robot`,
+`cerulion topic pub`, `service call` and `topic snapshot` call `topic-publish`,
+`service-call` and `topic-snapshot`:
+
+- With the teleoperate capability (`CAP_TELEOP`) and at least the operator
+  role, `topic-publish` publishes a message on a robot topic and
+  `service-call` calls a robot service once. Both are refused while the
+  robot's e-stop is engaged, and one already running stops when it engages.
+  They check the e-stop, not the control lease, so the deadman does not cover
+  them. `topic-publish` refuses a topic under the reserved `/__cerulion`
+  namespace.
+- With observe access, `topic-snapshot` reads the newest frame of a camera
+  topic as a JPEG and `topic-echo-once` reads the newest message of a topic,
+  decoded.
+
+The only other desk to robot topic path today is LAN ingress (an `ingress:`
+block in a graph), which proves no identity per peer and is closed when
+`CERULION_LAN_ACCESS=paired`.
 
 ## The deadman: a quiet operator loses the lease
 
-Actuation is held by a control lease, and the holder must renew it inside the
-deadman window. Miss the window and the deadman fires, putting the robot into
-its safe frame, so an operator who goes silent, for any reason, is designed not
-to leave a robot moving.
+Actuation through a teleop handler is held by a control lease, and the holder
+must renew it inside the deadman window. Miss the window and the deadman fires,
+putting the robot into its safe frame, so an operator who goes silent, for any
+reason, is designed not to leave a robot moving.
 
 The window ships at **500 ms**
 (`LEASE_DEADMAN_WINDOW_MS_ROBOT_CONFIRM`, `crates/cerud/src/constants.rs`).
