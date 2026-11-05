@@ -13,6 +13,7 @@
 //! | `CERULION_ACCOUNTD_SUPABASE_AUDIENCE` | `authenticated` | Accepted Supabase JWT audience |
 //! | `CERULION_ACCOUNTD_SUPABASE_JWKS_URL` | `<issuer>/.well-known/jwks.json` | Supabase signing-key endpoint |
 //! | `CERULION_ACCOUNTD_SUPABASE_JWT_SECRET` | — | Optional legacy HS256 secret |
+//! | `CERULION_ACCOUNTD_REFRESH_REUSE_WINDOW_S` | `60` | Seconds (0 to 300; `0` disables) a rotated refresh token is still accepted once, returning the pair its rotation issued |
 //!
 //! **Note:** the CA is **dev-provisioned** (an in-process root ceremony) — the
 //! production air-gapped M-of-N root ceremony + loading only the rotatable
@@ -23,8 +24,9 @@
 use std::sync::Arc;
 
 use cerulion_accountd::{
-    default_verification_base_uri, AppState, Clock, LoggingEmailSender, OAuthConfig, ProviderCreds,
-    ServiceConfig, SupabaseConfig, UnconfiguredResolver, DEFAULT_BIND,
+    default_verification_base_uri, parse_refresh_reuse_window, AppState, Clock, LoggingEmailSender,
+    OAuthConfig, ProviderCreds, ServiceConfig, SupabaseConfig, UnconfiguredResolver, DEFAULT_BIND,
+    REFRESH_REUSE_WINDOW_ENV,
 };
 
 fn provider_creds(prefix: &str) -> Option<ProviderCreds> {
@@ -59,7 +61,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let listening_on = listener.local_addr()?;
 
+    let refresh_reuse_window_ns = match std::env::var(REFRESH_REUSE_WINDOW_ENV) {
+        Ok(value) => parse_refresh_reuse_window(Some(&value))?,
+        Err(std::env::VarError::NotPresent) => parse_refresh_reuse_window(None)?,
+        Err(e) => return Err(format!("{REFRESH_REUSE_WINDOW_ENV}: {e}").into()),
+    };
     let config = ServiceConfig {
+        refresh_reuse_window_ns,
         verification_base_uri: std::env::var("CERULION_ACCOUNTD_VERIFICATION_BASE_URI")
             .unwrap_or_else(|_| default_verification_base_uri(&listening_on.to_string())),
         oauth: OAuthConfig {

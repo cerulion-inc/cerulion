@@ -694,6 +694,12 @@ network:
         "B's consumer of the external egress topic must observe the outside publisher's \
          payload bit-for-bit ({ORACLE:?})"
     );
+    // The egress sender counts a frame after its put returns, which can be
+    // after B has the frame; wait (bounded) for the count.
+    let counted = Instant::now() + Duration::from_secs(5);
+    while gateway_a.forwarded_count(&listed) == 0 && Instant::now() < counted {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         gateway_a.forwarded_count(&listed) > 0,
         "A's gateway forwarded the listed topic's frames"

@@ -5451,8 +5451,11 @@ fn replayed_frame_count(
 ///
 /// Shared by [`classify_topics`] and the resume resolver so the two cannot
 /// disagree about which topics a replay RE-EXECUTES — the set the lossy
-/// refusal and the sequence-seed ladder are both scoped to.
-fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
+/// refusal and the sequence-seed ladder are both scoped to. `graph run
+/// --record` classifies a recording's outside topics by it too
+/// (`graph_cmd::external_consumers`), so the recording and the replay agree on
+/// which topics come from outside the graph.
+pub(crate) fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
     let mut produced: Vec<String> = Vec::new();
     for node in &config.nodes {
         for output in &node.outputs {
