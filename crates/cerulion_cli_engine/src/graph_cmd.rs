@@ -16278,14 +16278,22 @@ fn resolve_recording_paths(record_dir: &Path, graph_name: &str, now: Duration) -
 ///
 /// # Examples
 ///
-/// ```
-/// use cerulion_cli_engine::graph_cmd::render_effective_graph_yaml;
-/// use cerulion_core::graph::parse_graph;
+/// Render `graphs/lobby.yaml` of the workspace at `workspace_dir`, read by
+/// name the way every `cerulion graph` verb reads it:
 ///
-/// let yaml = "name: lobby\nprefix: lobby\nnodes:\n  - {id: beat, type: lobby_beat}\n";
-/// let config = parse_graph(yaml)?;
-/// let rendered = render_effective_graph_yaml(&config)?;
-/// assert_eq!(parse_graph(&rendered)?.identity(), "lobby");
+/// ```
+/// use cerulion_cli_engine::graph_cmd::{graph_read, render_effective_graph_yaml};
+/// use cerulion_cli_engine::workspace::CerulionWorkspace;
+/// # use cerulion_cli_engine::{graph_cmd::graph_create, workspace::workspace_create};
+/// # let tmp = tempfile::tempdir()?;
+/// # let created = workspace_create(tmp.path(), "lobby_ws")?;
+/// # graph_create(&created.graphs_dir, "lobby", Some("lobby"))?;
+/// # let workspace_dir = created.root;
+///
+/// let workspace = CerulionWorkspace::discover(&workspace_dir)?;
+/// let config = graph_read(&workspace.graphs_dir, "lobby")?;
+/// let graph_yaml = render_effective_graph_yaml(&config)?;
+/// assert_eq!(graph_yaml, "prefix: lobby\nnodes: []\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[cfg(unix)]
@@ -26825,6 +26833,52 @@ nodes:
             render_effective_graph_yaml(&back).expect("render again"),
             rendered
         );
+    }
+
+    /// AGENTS.md: rustdoc shows a graph only as a workspace `graphs/*.yaml`
+    /// read by name; a graph built in code is for tests only. Rustdoc is
+    /// published, so a reader copies its examples into application code.
+    #[test]
+    fn rustdoc_examples_read_graphs_from_the_workspace_not_from_code() {
+        let mut fence: Option<bool> = None;
+        let mut example_lines = Vec::new();
+        for line in include_str!("graph_cmd.rs").lines() {
+            let trimmed = line.trim_start();
+            let Some(doc) = trimmed
+                .strip_prefix("///")
+                .or_else(|| trimmed.strip_prefix("//!"))
+            else {
+                continue;
+            };
+            let doc = doc.trim();
+            if let Some(info) = doc.strip_prefix("```") {
+                fence = match fence {
+                    Some(_) => None,
+                    None => Some(!matches!(info.trim(), "text" | "yaml" | "json" | "console")),
+                };
+                continue;
+            }
+            if fence == Some(true) {
+                example_lines.push(doc);
+            }
+        }
+
+        assert!(
+            example_lines
+                .iter()
+                .any(|l| l.contains("graph_read(") && !l.starts_with('#')),
+            "the public renderer's example must show reading `graphs/<name>.yaml` by name"
+        );
+        for banned in ["parse_graph", "GraphConfig {", "GraphRuntime"] {
+            let hits: Vec<&&str> = example_lines
+                .iter()
+                .filter(|l| l.contains(banned))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "a rustdoc example builds a graph in code with `{banned}`: {hits:?}"
+            );
+        }
     }
 
     /// The rendered attachment is SCRATCH: it must be cleaned up like every other

@@ -679,9 +679,10 @@ from its tick is not listed.
 `fire_telemetry` reports the node tick recording of the run the app
 describes to desks (see
 [What a desk reads about the app's graph](#what-a-desk-reads-about-the-apps-graph)).
-It is `null` when the app describes no run: before a start, after `stop`,
-for a start with no graph or with an empty `listen` and `connect`, and for a
-run the runtime could not describe, which logs a warning. Otherwise it is an
+It is `null` when no run serves its ticks: before a start, after `stop`, for
+a start with no graph or with an empty `listen` and `connect`, and for a run
+the runtime describes to no desk or names undescribable, which logs a
+warning. Otherwise it is an
 object: `armed` is true while a desk's `fires` requests keep the recording
 on, `recorded` counts the ticks recorded while armed, lost ones included,
 and `capacity` is the number of ticks the runtime keeps:
@@ -838,7 +839,10 @@ builds no gateway, so the list has no effect and the start logs a warning.
 
 A start with a graph and a non-empty `listen` or `connect` describes the
 graph to desks. The gateway answers two read-only requests about it, under
-the same `lan_access` posture as the catalog:
+the same `lan_access` posture as the catalog. A gateway with no topic to
+serve and an `egress` list (no graph output, no `publish` topic) answers no
+request at all, unless an earlier start in the app process already did, so
+such a start describes no run and logs a warning.
 
 - `runs` lists the graph as one run: a run id, which each start mints anew;
   the graph's `name:`, or `unnamed` when the YAML has none; the graph YAML
@@ -846,19 +850,24 @@ the same `lan_access` posture as the catalog:
   app's `publish` and `subscribe` topics as the endpoint `app`, each node's
   trigger, inputs and outputs, and the size and lease of the tick recording.
   When the graph ends on its own (state `finished`), the run is listed as
-  `ending` until `stop`.
+  `ending` until `stop`. A run whose graph YAML or `run.json` is above
+  256 KiB is not listed: `runs` names it under `undescribable` with the
+  reason.
 - `fires` returns the node ticks of a listed run after the point the desk
   names: for each tick, the node, what triggered it, when it started, how
   long it ran and which outputs it wrote. The runtime records ticks only
   while a desk asks. A request turns the recording on, it stops 5 s after
-  the last request, and the newest 4096 ticks are kept.
+  the last request, and the newest 4096 ticks are kept. For a run named
+  `undescribable` it answers `not_served`.
 
 Under `open`, any host that reaches the gateway can read the graph YAML, the
 `run.json` and the node ticks, and can turn the recording on. Like the
 catalog, the description names topics that `egress` keeps on the device.
 Under `paired` both requests are refused and the recording stays off.
-`stop` withdraws the run before LAN access closes: a desk then reads no
-run, and a `fires` request for the old run id is answered `unknown_run`.
+`stop` withdraws the run and closes LAN access, so a desk's `runs` and
+`fires` requests are then refused. After another `open` start, the old run
+is no longer listed and a `fires` request for its id is answered
+`unknown_run`.
 
 ### Let a LAN peer publish into the graph
 

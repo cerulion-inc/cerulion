@@ -1839,7 +1839,8 @@ pub enum GraphAction {
         #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
         /// The run to read: its run id or its graph name. Without it, the one
-        /// run that serves fire telemetry.
+        /// run that serves fire telemetry. Only a run id chooses while a robot
+        /// asked may host a run its answer does not name.
         #[arg(long, value_name = "RUN")]
         run: Option<String>,
         /// Read until Ctrl+C.

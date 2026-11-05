@@ -23,7 +23,7 @@ use cerulion_core::graph::{
     GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords, RunTopology,
 };
 use cerulion_core::transport::cerulion_q::{
-    format_run_id, RunEntry, RunEntryState, FIRES_WIRE_VERSION,
+    format_run_id, RunEntry, RunEntryError, RunEntryState, FIRES_WIRE_VERSION,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
@@ -31,7 +31,7 @@ use cerulion_core::transport::gateway::{
 };
 use cerulion_core::transport::hosted_runs::{HostedRun, HostedRunGuard};
 use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
-use cerulion_core::transport::run_registry::mint_run_id;
+use cerulion_core::transport::run_registry::{mint_run_id, RunState};
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
     TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, SUBSCRIBER_MAX_BORROWED_HELD,
@@ -316,9 +316,11 @@ impl Serialize for NodeFailures {
 /// Read while the run is hosted: [`Self::stats`] and the status JSON read the
 /// run's fire tap at the time of the read, so `armed` turns false once the
 /// lease of the last desk read runs out. A clone keeps the stats as they were
-/// when cloned, so a cloned [`Status`] is a snapshot. `None` while no run is
-/// hosted: before a start, after `stop`, and for a start with no graph or
-/// with no `listen` endpoint and no `connect` locator.
+/// when cloned, so a cloned [`Status`] is a snapshot. `None` while no run
+/// serves fires: before a start, after `stop`, for a start with no graph or
+/// with no `listen` endpoint and no `connect` locator, for a start whose
+/// gateway answers no request, and for a run the `runs` verb names
+/// undescribable.
 #[derive(Default)]
 pub struct FireTelemetry {
     source: TelemetrySource,
@@ -517,7 +519,7 @@ struct Run {
     /// The run as desks read it: hosted by the commit, withdrawn first by
     /// the teardown, so the run stops being described before anything it
     /// describes goes down.
-    hosted: Option<HostedRunGuard>,
+    hosted: Option<HostedRunHold>,
     /// What the commit hosts, made with the graph.
     hosted_plan: Option<HostedRunPlan>,
     /// The remote plane: bound by the build, served by the commit, stopped
@@ -568,6 +570,14 @@ struct HostedRunPlan {
     fire_tap: Arc<FireTap>,
     /// Cleared by the graph thread when it exits for any reason.
     live: Arc<AtomicBool>,
+}
+
+/// A run the commit hosted. Dropping it withdraws the run.
+struct HostedRunHold {
+    _guard: HostedRunGuard,
+    /// The tap the `fires` verb serves; `None` for a run the `runs` verb
+    /// names undescribable, which serves no fires.
+    fires: Option<Arc<FireTap>>,
 }
 
 /// Held by the graph thread: on any exit of the thread, an unwind included,
@@ -847,8 +857,9 @@ impl EmbeddedRuntime {
         self.graph_exit = Some(Box::new(hook));
     }
 
-    /// TEST SEAM: the id of the run this runtime describes to desks, as the
-    /// `runs` verb serves it; `None` while it describes none.
+    /// TEST SEAM: the id of the run this runtime hosts for desks, as the
+    /// `runs` verb serves it, listed or named undescribable; `None` while it
+    /// hosts none.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn hosted_run_id_for_test(&self) -> Option<String> {
@@ -2102,10 +2113,11 @@ fn commit(
             .as_ref()
             .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
         status.remote = remote;
-        status.fire_telemetry = match (&run.hosted, &run.hosted_plan) {
-            (Some(_), Some(hosted)) => FireTelemetry::live(Arc::clone(&hosted.fire_tap)),
-            _ => FireTelemetry::default(),
-        };
+        status.fire_telemetry = run
+            .hosted
+            .as_ref()
+            .and_then(|hosted| hosted.fires.clone())
+            .map_or_else(FireTelemetry::default, FireTelemetry::live);
     }
     // Another publisher in the process may send such a topic, so it is
     // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
@@ -2161,25 +2173,66 @@ fn host_run(
     graph: &GraphConfig,
     gateway: &GatewayStartPlan,
     hosted: &HostedRunPlan,
-) -> Option<HostedRunGuard> {
-    match hosted_run_entry(plan, graph, gateway, hosted, wall_clock_ns()) {
-        Ok(entry) => Some(network.hosted_runs().host(
-            hosted.run_id,
-            HostedRun {
-                entry,
-                live: Arc::clone(&hosted.live),
-                fires: Some(Arc::clone(&hosted.fire_tap)),
-            },
-        )),
+) -> Option<HostedRunHold> {
+    // Only a declared query surface serves a hosted run. A gateway with no
+    // topic to serve and an egress list declares none, so unless an earlier
+    // gateway of the process declared it, no desk could read the run.
+    if !network.has_query_surface() {
+        tracing::warn!(
+            "the run is not described to desks: the gateway answers no request, as a first \
+             gateway with no graph output, no publish topic and an egress list does"
+        );
+        return None;
+    }
+    let entry = match hosted_run_entry(plan, graph, gateway, hosted, wall_clock_ns()) {
+        Ok(entry) => entry,
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 "the run is not described to desks: the runs verb does not list it and it \
                  serves no fires"
             );
+            return None;
+        }
+    };
+    // A desk reads fires by the topology in the run's `run.json`, so a run
+    // the `runs` verb names undescribable serves none.
+    let fires = match served_entry_check(hosted.run_id, &entry) {
+        Ok(()) => Some(Arc::clone(&hosted.fire_tap)),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the runs verb names the run undescribable: it serves no fires"
+            );
             None
         }
-    }
+    };
+    let guard = network.hosted_runs().host(
+        hosted.run_id,
+        HostedRun {
+            entry,
+            live: Arc::clone(&hosted.live),
+            fires: fires.clone(),
+        },
+    );
+    Some(HostedRunHold {
+        _guard: guard,
+        fires,
+    })
+}
+
+/// The checks [`HostedRuns::host`](cerulion_core::transport::hosted_runs::HostedRuns::host)
+/// runs on `entry`: a failure names the run undescribable.
+fn served_entry_check(run_id: u128, entry: &RunEntry) -> Result<(), RunEntryError> {
+    RunEntry::new(
+        run_id,
+        entry.graph_name.as_str(),
+        entry.run_started_at_ns,
+        RunState::Live,
+        entry.graph_yaml.as_str(),
+        entry.run_json.as_str(),
+    )
+    .map(drop)
 }
 
 /// The entry the `runs` verb serves for `hosted`: the graph's name and its

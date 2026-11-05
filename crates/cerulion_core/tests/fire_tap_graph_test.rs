@@ -572,10 +572,11 @@ nodes:
 const STEADY: u16 = 0;
 const FRAGILE: u16 = 1;
 
-/// Install the tap (probe 1), arm it, and step 3 times.
-fn run_with_probe_panic(panic_on: u64) -> (GraphRuntime, Vec<Shape>) {
+/// Install the tap (probe 1), arm it, and step 3 times. `probes` counts the
+/// fragile node's probes.
+fn run_with_probe_panic(panic_on: u64, probes: Arc<AtomicU64>) -> (GraphRuntime, Vec<Shape>) {
     let steady = ClosureNodeEntry::new(period_info(&["a"]), |ctx| publish(ctx, "a", 1.0));
-    let fragile = ProbedSource::new(Arc::default(), Some(panic_on));
+    let fragile = ProbedSource::new(probes, Some(panic_on));
     let mut runtime = build(
         STEADY_AND_FRAGILE,
         vec![("steady", Box::new(steady)), ("fragile", Box::new(fragile))],
@@ -590,7 +591,7 @@ fn run_with_probe_panic(panic_on: u64) -> (GraphRuntime, Vec<Shape>) {
 
 #[test]
 fn a_panic_in_the_count_probe_before_a_tick_is_that_node_s_tick_panic() {
-    let (runtime, fires) = run_with_probe_panic(2);
+    let (runtime, fires) = run_with_probe_panic(2, Arc::default());
     assert_eq!(
         runtime.node_tick_panics(),
         vec![("fragile".to_string(), PROBE_PANIC.to_string())]
@@ -608,7 +609,7 @@ fn a_panic_in_the_count_probe_before_a_tick_is_that_node_s_tick_panic() {
 
 #[test]
 fn a_panic_in_the_count_probe_after_a_tick_records_a_panicked_fire() {
-    let (runtime, fires) = run_with_probe_panic(3);
+    let (runtime, fires) = run_with_probe_panic(3, Arc::default());
     assert_eq!(
         runtime.node_tick_panics(),
         vec![("fragile".to_string(), PROBE_PANIC.to_string())]
@@ -628,6 +629,40 @@ fn a_panic_in_the_count_probe_after_a_tick_records_a_panicked_fire() {
             (ms(3), STEADY, PERIOD, NONE, 0b1),
         ],
         "the fragile node's one fire is a panic; it does not fire again"
+    );
+}
+
+#[test]
+fn a_panic_in_the_count_probe_at_install_reports_no_writes_and_the_node_keeps_ticking() {
+    let probes = Arc::new(AtomicU64::new(0));
+    let (runtime, fires) = run_with_probe_panic(1, Arc::clone(&probes));
+    let reports: Vec<(String, bool)> = runtime
+        .run_topology()
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.reports_writes))
+        .collect();
+    assert_eq!(
+        reports,
+        vec![("steady".to_string(), true), ("fragile".to_string(), false)]
+    );
+    assert_eq!(runtime.node_tick_panics(), vec![]);
+    assert_eq!(
+        fires,
+        vec![
+            (ms(1), STEADY, PERIOD, NONE, 0b1),
+            (ms(1), FRAGILE, PERIOD, FireFlags::WROTE_UNKNOWN, 0),
+            (ms(2), STEADY, PERIOD, NONE, 0b1),
+            (ms(2), FRAGILE, PERIOD, FireFlags::WROTE_UNKNOWN, 0),
+            (ms(3), STEADY, PERIOD, NONE, 0b1),
+            (ms(3), FRAGILE, PERIOD, FireFlags::WROTE_UNKNOWN, 0),
+        ],
+        "the install probe's panic poisons nothing: both nodes keep ticking"
+    );
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        1,
+        "an entry that reports no writes at install is not asked again"
     );
 }
 
