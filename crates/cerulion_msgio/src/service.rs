@@ -295,7 +295,12 @@ pub fn service_call_gated(
         servers_before.min(client.server_count()),
     )?;
     if let Some(note) = &skipped {
-        tracing::warn!(service = %req.service, reached, "{note}");
+        tracing::warn!(
+            service = %req.service,
+            reached,
+            note = %note,
+            "the request did not reach every server: a request queue was full"
+        );
     }
     let skipped = skipped.map(|note| format!(". {note}")).unwrap_or_default();
     let mut response: Option<Vec<u8>> = None;
