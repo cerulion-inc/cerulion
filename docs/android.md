@@ -302,6 +302,13 @@ error code 5; `start` still returns `OK` because it only queues the start, and
 that names the type and the linked types. `status` lists the linked types in
 `linked_nodes`.
 
+Give every output a node declares (each `#[output]` field) an entry with its
+`schema:` under that node's `outputs:` in the graph YAML: the graph creates a
+publisher only for a listed output. A node that declares an output the graph
+does not list fails the start with error code 5: `status` reports `state`
+`failed` with `last_error.code` 5 and a message that names the node and the
+output, so the graph never reports running while the node cannot publish.
+
 The runtime keeps a record of each node fire in memory, and keeps only the
 newest 100 000 fires, the same default as `cerulion graph run --trace-limit`.
 An older fire drops out when a new one arrives, so a graph that runs for days

@@ -164,6 +164,48 @@ fn run_once(runtime: &mut EmbeddedRuntime, files_dir: &Path, prefix: &str, file:
     );
 }
 
+/// The relay declares the output `echo`. A graph that lists the relay's
+/// input and no `outputs:` cannot publish it, so the start fails with the
+/// graph code, the node and the output named, and the status shows the same
+/// error; the graph never reports running.
+fn an_output_the_graph_does_not_list_fails_the_start(runtime: &mut EmbeddedRuntime, prefix: &str) {
+    let unlisted_prefix = format!("{prefix}_unlisted");
+    let graph = format!(
+        "prefix: {unlisted_prefix}
+nodes:
+  - id: source
+    type: test_node_macro_period_cdylib
+    outputs:
+      - name: cmd
+        schema: {VECTOR3}
+  - id: relay
+    type: test_node_macro_relay_rlib
+    inputs:
+      - name: cmd
+        source: source/cmd
+"
+    );
+    let error = runtime
+        .start(&json!({"graph_yaml": graph}).to_string())
+        .expect_err("a node output the graph does not list must fail the start");
+    assert_eq!(error.code(), codes::GRAPH);
+    let message = error.to_string();
+    assert_eq!(
+        message,
+        "node 'relay' output 'echo': the node declares this output and the graph does not list \
+         it, so the node has no publisher for it; add `- name: echo` with its `schema:` under \
+         the node's `outputs:`"
+    );
+    let status = runtime.status_handle().lock().unwrap().clone();
+    assert_eq!(status.state, RuntimeState::Failed, "{status:?}");
+    let last_error = status
+        .last_error
+        .as_ref()
+        .expect("a failed start records its error");
+    assert_eq!(last_error.code, codes::GRAPH, "{status:?}");
+    assert_eq!(last_error.message, message, "{status:?}");
+}
+
 #[test]
 fn linked_nodes_run_record_restart_and_refuse_unlinked_types() {
     assert_eq!(
@@ -249,6 +291,8 @@ fn linked_nodes_run_record_restart_and_refuse_unlinked_types() {
     );
     assert_relay_counts_up(&relay_frames_live(&format!("/{prefix}/relay/echo"), 3));
     runtime.stop().expect("stop the late-type graph");
+
+    an_output_the_graph_does_not_list_fails_the_start(&mut runtime, &prefix);
 
     // Under the in-process transport a graph with native nodes refuses
     // node_lib_dir: nodes cannot be loaded from separate libraries there.
