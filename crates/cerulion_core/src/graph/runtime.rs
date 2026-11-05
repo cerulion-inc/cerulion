@@ -3123,10 +3123,17 @@ struct FireStart<'t> {
     counted: bool,
 }
 
+/// The installed fire tap and, per recorded node, whether that node's entry
+/// reported its commit counts at install. A tick asks only those entries.
+struct FireInstall {
+    tap: Arc<FireTap>,
+    reports_writes: Box<[bool]>,
+}
+
 /// One node's fire recording, moved into its tick callback at build. It
 /// reads no clock and asks the entry nothing until a reader arms the tap.
 struct FireSite {
-    tap: Arc<OnceLock<Arc<FireTap>>>,
+    tap: Arc<OnceLock<FireInstall>>,
     node: Option<u16>,
     cause: FireCause,
     flags: u8,
@@ -3150,7 +3157,7 @@ impl FireCounts {
 
 impl FireSite {
     fn new(
-        tap: Arc<OnceLock<Arc<FireTap>>>,
+        tap: Arc<OnceLock<FireInstall>>,
         index: usize,
         trigger: &TopologyTrigger,
         outputs: usize,
@@ -3181,11 +3188,12 @@ impl FireSite {
     #[inline]
     fn start(&self, counts: &mut FireCounts, entry: &dyn NodeEntry) -> Option<FireStart<'_>> {
         let node = self.node?;
-        let tap = self.tap.get()?;
-        let at_ns = tap.armed_now()?;
-        let counted = entry.output_commit_counts(&mut counts.before);
+        let installed = self.tap.get()?;
+        let at_ns = installed.tap.armed_now()?;
+        let counted = installed.reports_writes.get(usize::from(node)) == Some(&true)
+            && entry.output_commit_counts(&mut counts.before);
         Some(FireStart {
-            tap,
+            tap: &installed.tap,
             node,
             at_ns,
             started: Instant::now(),
@@ -3273,7 +3281,7 @@ pub struct GraphRuntime {
     handles: IndexMap<String, NodeHandle>,
     topology_nodes: Vec<TopologyNode>,
     /// Empty until [`Self::install_fire_tap`]; every tick callback holds a clone.
-    fire_tap: Arc<OnceLock<Arc<FireTap>>>,
+    fire_tap: Arc<OnceLock<FireInstall>>,
     /// The gating clock, which also stamps each node's in-tick marker.
     fire_clock: Arc<dyn Clock>,
     /// Per capture-time Sync node, its trigger topics and the per-input
@@ -5321,7 +5329,7 @@ impl GraphRuntime {
         let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
-        let fire_tap: Arc<OnceLock<Arc<FireTap>>> = Arc::new(OnceLock::new());
+        let fire_tap: Arc<OnceLock<FireInstall>> = Arc::new(OnceLock::new());
         // Exit-3 widening: one shared PANIC-CLASS failure record per
         // node (first reason wins), written by the tick callback at the catch
         // site / on the structural FFI variant, read post-run via
@@ -17741,22 +17749,38 @@ impl GraphRuntime {
     /// Record `node` is the index into [`Self::run_topology`]'s nodes, and the
     /// tap's `in_tick` reads each node's in-tick marker. Installing also asks
     /// every entry whether it can report its output commits, which
-    /// `run_topology` then reports as `reports_writes`. Ticks record nothing
+    /// `run_topology` then reports as `reports_writes`. An entry that reports
+    /// no writes here, its probe panicking included, is not asked again: its
+    /// fires carry `WROTE_UNKNOWN` and it keeps ticking. Ticks record nothing
     /// until a reader arms the tap with [`FireTap::serve`].
     // hot-path-alloc-ok-fn: cold: a run host installs telemetry once, outside node execution
     pub fn install_fire_tap(&mut self, config: FireTapConfig) -> Arc<FireTap> {
-        if let Some(tap) = self.fire_tap.get() {
-            return Arc::clone(tap);
+        if let Some(installed) = self.fire_tap.get() {
+            return Arc::clone(&installed.tap);
         }
         let mut counts = Vec::new();
         for node in &mut self.topology_nodes {
             counts.clear();
             counts.resize(node.outputs.len(), 0);
-            node.reports_writes = self.nodes.get(&node.id).is_some_and(|entry| {
-                entry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .output_commit_counts(&mut counts)
+            let Some(entry) = self.nodes.get(&node.id) else {
+                node.reports_writes = false;
+                continue;
+            };
+            // The guard lives outside the catch, so a probe panic poisons
+            // nothing and the node's tick callback still takes its lock.
+            let entry = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                entry.output_commit_counts(&mut counts)
+            }));
+            node.reports_writes = probed.unwrap_or_else(|payload| {
+                tracing::warn!(
+                    node_id = %node.id,
+                    error = %panic_payload_msg(payload.as_ref()),
+                    "node's output commit-count probe panicked; it reports no writes"
+                );
+                false
             });
         }
         let recorded = self.topology_nodes.len().min(FIRE_NODE_LIMIT);
@@ -17767,14 +17791,19 @@ impl GraphRuntime {
                 None => Arc::new(AtomicU64::new(0)),
             })
             .collect();
-        let tap = Arc::new(FireTap::new(
-            config,
-            recorded as u16,
-            in_tick,
-            Arc::clone(&self.fire_clock),
-        ));
-        let installed = self.fire_tap.get_or_init(|| tap);
-        Arc::clone(installed)
+        let installed = FireInstall {
+            tap: Arc::new(FireTap::new(
+                config,
+                recorded as u16,
+                in_tick,
+                Arc::clone(&self.fire_clock),
+            )),
+            reports_writes: self.topology_nodes[..recorded]
+                .iter()
+                .map(|node| node.reports_writes)
+                .collect(),
+        };
+        Arc::clone(&self.fire_tap.get_or_init(|| installed).tap)
     }
 
     /// Shutdown the graph runtime.
