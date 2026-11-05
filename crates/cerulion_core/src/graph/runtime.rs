@@ -20,14 +20,15 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
 use crate::barrier::{MappedBarrier, WaitOutcome};
 use crate::clock::{Clock, VirtualClock};
 use crate::error::{InertReason, TransportError, TransportResult};
+use crate::fire_tap::{FireBody, FireCause, FireFlags, FireTap, FireTapConfig};
 use crate::read_outcome::{FireBurstBound, ProducerAnnotation, StageBurstBound, SyncTriggerShape};
 // Gated with its only consumer, `read_outcome_stage_capacities` — see that
 // Now a PRODUCTION type — the manifest writer's row shape.
@@ -3088,11 +3089,138 @@ struct LivePaceAnchor {
     gating_ns: u64,
 }
 
+/// Nodes a fire tap can index: record `node` is a `u16` and so is the tap's
+/// node count. Nodes past it run unrecorded.
+const FIRE_NODE_LIMIT: usize = u16::MAX as usize;
+
+/// How a recorded tick ended.
+enum TickOutcome {
+    Ok,
+    Err,
+    Panicked,
+}
+
+impl TickOutcome {
+    fn of(result: &std::thread::Result<TransportResult<()>>) -> Self {
+        match result {
+            Ok(Ok(())) => Self::Ok,
+            // A node library catches its own panic and returns this variant.
+            Ok(Err(TransportError::NodeTickPanicked { .. })) | Err(_) => Self::Panicked,
+            Ok(Err(_)) => Self::Err,
+        }
+    }
+}
+
+/// An armed tick's start, taken before the tick runs.
+struct FireStart {
+    at_ns: u64,
+    started: Instant,
+    counted: bool,
+}
+
+/// One node's fire recording, moved into its tick callback at build. It
+/// reads no clock and touches no counter until a reader arms the tap.
+struct FireSite {
+    tap: Arc<OnceLock<Arc<FireTap>>>,
+    node: Option<u16>,
+    cause: FireCause,
+    flags: u8,
+    before: Box<[u32]>,
+    after: Box<[u32]>,
+}
+
+impl FireSite {
+    // hot-path-alloc-ok-fn: cold: graph build sizes each node's two count buffers once
+    fn new(
+        tap: Arc<OnceLock<Arc<FireTap>>>,
+        index: usize,
+        trigger: &TopologyTrigger,
+        outputs: usize,
+    ) -> Self {
+        let mut flags = 0;
+        if matches!(
+            trigger,
+            TopologyTrigger::Data {
+                ambiguous: true,
+                ..
+            }
+        ) {
+            flags |= FireFlags::TRIGGER_AMBIGUOUS;
+        }
+        if outputs > 64 {
+            flags |= FireFlags::WROTE_TRUNCATED;
+        }
+        Self {
+            tap,
+            node: (index < FIRE_NODE_LIMIT).then_some(index as u16),
+            cause: FireCause::try_from(trigger.cause()).unwrap_or(FireCause::Unknown),
+            flags,
+            before: vec![0; outputs].into_boxed_slice(),
+            after: vec![0; outputs].into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn start(&mut self, entry: &dyn NodeEntry) -> Option<FireStart> {
+        self.node?;
+        let at_ns = self.tap.get()?.armed_now()?;
+        let counted = entry.output_commit_counts(&mut self.before);
+        Some(FireStart {
+            at_ns,
+            started: Instant::now(),
+            counted,
+        })
+    }
+
+    fn record(&mut self, start: FireStart, entry: &dyn NodeEntry, outcome: TickOutcome) {
+        let elapsed = start.started.elapsed();
+        let (Some(tap), Some(node)) = (self.tap.get(), self.node) else {
+            return;
+        };
+        let mut flags = self.flags
+            | match outcome {
+                TickOutcome::Ok => 0,
+                TickOutcome::Err => FireFlags::TICK_ERROR,
+                TickOutcome::Panicked => FireFlags::PANICKED,
+            };
+        let dur_ns = match u32::try_from(elapsed.as_nanos()) {
+            Ok(dur_ns) => dur_ns,
+            Err(_) => {
+                flags |= FireFlags::DURATION_SATURATED;
+                u32::MAX
+            }
+        };
+        let mut wrote = 0_u64;
+        if start.counted && entry.output_commit_counts(&mut self.after) {
+            let pairs = self.before.iter().zip(self.after.iter()).take(64);
+            for (bit, (before, after)) in pairs.enumerate() {
+                if before != after {
+                    wrote |= 1 << bit;
+                }
+            }
+        } else {
+            flags |= FireFlags::WROTE_UNKNOWN;
+        }
+        tap.push(FireBody {
+            at_ns: start.at_ns,
+            dur_ns,
+            node,
+            cause: self.cause,
+            flags: FireFlags(flags),
+            wrote,
+        });
+    }
+}
+
 pub struct GraphRuntime {
     config: GraphConfig,
     scheduler: Scheduler,
     handles: IndexMap<String, NodeHandle>,
     topology_nodes: Vec<TopologyNode>,
+    /// Empty until [`Self::install_fire_tap`]; every tick callback holds a clone.
+    fire_tap: Arc<OnceLock<Arc<FireTap>>>,
+    /// The gating clock, which also stamps each node's in-tick marker.
+    fire_clock: Arc<dyn Clock>,
     /// Per capture-time Sync node, its trigger topics and the per-input
     /// capture states its sync ops share. Read only by
     /// [`Self::restore_sync_input_timestamps`], which seeds each input's
@@ -5138,6 +5266,7 @@ impl GraphRuntime {
         let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
+        let fire_tap: Arc<OnceLock<Arc<FireTap>>> = Arc::new(OnceLock::new());
         // Exit-3 widening: one shared PANIC-CLASS failure record per
         // node (first reason wins), written by the tick callback at the catch
         // site / on the structural FFI variant, read post-run via
@@ -8255,6 +8384,68 @@ impl GraphRuntime {
             // lines up is a plain value.
             let node_death_for_callback = Arc::clone(&node_death);
             let mut node_death_reported = false;
+            // Trigger policy comes from the macro side only — graph
+            // YAML no longer carries a `policy:` block.
+            // When a cdylib declares no `MacroPolicy`,
+            // the runtime falls back to `Data` (fires on any input
+            // arrival), which is a defensible default for ad-hoc
+            // closure-only graphs but worth surfacing at warn-level
+            // so operators notice unintended triggering on unrelated
+            // input deliveries. The
+            // `validate_no_silent_data_trigger` check already rejects the
+            // worst combo (silent never-fire with a
+            // `#[input(trigger)]` field).
+            let policy = match macro_policy {
+                Some(macro_p) => {
+                    tracing::debug!(node_id = %node_def.id, ?macro_p, "using macro-declared policy");
+                    macro_policy_to_trigger(
+                        macro_p,
+                        &node_def.id,
+                        &node_def.inputs,
+                        &entry_info.input_meta,
+                        &config.prefix,
+                    )
+                }
+                None => {
+                    tracing::warn!(
+                        node_id = %node_def.id,
+                        "no macro-declared policy; defaulting to Data trigger \
+                         (fires on any input arrival). Add a macro attribute \
+                         (`period_ms`, `sync_window_ms`, `unbounded_sync`, \
+                         `external`) or an `#[input(trigger)]` field to \
+                         silence this warning."
+                    );
+                    TriggerPolicy::Data
+                }
+            };
+            let trigger = match &policy {
+                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
+                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+                },
+                TriggerPolicy::Data => {
+                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
+                    let topics = match data_trigger_topic {
+                        Some(topic) => vec![topic],
+                        None => topology_inputs
+                            .iter()
+                            .map(|port| port.topic.clone())
+                            .collect(),
+                    };
+                    TopologyTrigger::Data { topics, ambiguous }
+                }
+                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
+                    topics: inputs.clone(),
+                    window_ns: window
+                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
+                },
+                TriggerPolicy::External => TopologyTrigger::External,
+            };
+            let mut fire = FireSite::new(
+                Arc::clone(&fire_tap),
+                topology_nodes.len(),
+                &trigger,
+                node_def.outputs.len(),
+            );
             let callback = Box::new(move || match entry_for_callback.lock() {
                 Ok(mut e) => {
                     // Catch the unwind to RECORD the panic reason
@@ -8269,8 +8460,12 @@ impl GraphRuntime {
                     // AssertUnwindSafe: the payload is resumed immediately —
                     // any torn `&mut` state unwinds exactly as it did without
                     // the intermediate catch.
+                    let fire_start = fire.start(&**e);
                     let result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
+                    if let Some(fire_start) = fire_start {
+                        fire.record(fire_start, &**e, TickOutcome::of(&result));
+                    }
                     match result {
                         Err(payload) => {
                             record_first_reason(
@@ -8438,62 +8633,6 @@ impl GraphRuntime {
                 }
             });
 
-            // Trigger policy comes from the macro side only — graph
-            // YAML no longer carries a `policy:` block.
-            // When a cdylib declares no `MacroPolicy`,
-            // the runtime falls back to `Data` (fires on any input
-            // arrival), which is a defensible default for ad-hoc
-            // closure-only graphs but worth surfacing at warn-level
-            // so operators notice unintended triggering on unrelated
-            // input deliveries. The
-            // `validate_no_silent_data_trigger` check already rejects the
-            // worst combo (silent never-fire with a
-            // `#[input(trigger)]` field).
-            let policy = match macro_policy {
-                Some(macro_p) => {
-                    tracing::debug!(node_id = %node_def.id, ?macro_p, "using macro-declared policy");
-                    macro_policy_to_trigger(
-                        macro_p,
-                        &node_def.id,
-                        &node_def.inputs,
-                        &entry_info.input_meta,
-                        &config.prefix,
-                    )
-                }
-                None => {
-                    tracing::warn!(
-                        node_id = %node_def.id,
-                        "no macro-declared policy; defaulting to Data trigger \
-                         (fires on any input arrival). Add a macro attribute \
-                         (`period_ms`, `sync_window_ms`, `unbounded_sync`, \
-                         `external`) or an `#[input(trigger)]` field to \
-                         silence this warning."
-                    );
-                    TriggerPolicy::Data
-                }
-            };
-            let trigger = match &policy {
-                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
-                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
-                },
-                TriggerPolicy::Data => {
-                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
-                    let topics = match data_trigger_topic {
-                        Some(topic) => vec![topic],
-                        None => topology_inputs
-                            .iter()
-                            .map(|port| port.topic.clone())
-                            .collect(),
-                    };
-                    TopologyTrigger::Data { topics, ambiguous }
-                }
-                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
-                    topics: inputs.clone(),
-                    window_ns: window
-                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
-                },
-                TriggerPolicy::External => TopologyTrigger::External,
-            };
             topology_nodes.push(TopologyNode {
                 id: node_def.id.clone(),
                 node_type: node_def.node_type.clone(),
@@ -9301,6 +9440,8 @@ impl GraphRuntime {
             scheduler,
             handles,
             topology_nodes,
+            fire_tap,
+            fire_clock: clock_dyn,
             sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
@@ -17530,6 +17671,48 @@ impl GraphRuntime {
             version: RUN_TOPOLOGY_VERSION,
             nodes: self.topology_nodes.clone(),
         }
+    }
+
+    /// Install this runtime's fire tap and return it. Later calls return the
+    /// first tap and ignore `config`.
+    ///
+    /// Record `node` is the index into [`Self::run_topology`]'s nodes, and the
+    /// tap's `in_tick` reads each node's in-tick marker. Installing also asks
+    /// every entry whether it can report its output commits, which
+    /// `run_topology` then reports as `reports_writes`. Ticks record nothing
+    /// until a reader arms the tap with [`FireTap::serve`].
+    // hot-path-alloc-ok-fn: cold: a run host installs telemetry once, outside node execution
+    pub fn install_fire_tap(&mut self, config: FireTapConfig) -> Arc<FireTap> {
+        if let Some(tap) = self.fire_tap.get() {
+            return Arc::clone(tap);
+        }
+        let mut counts = Vec::new();
+        for node in &mut self.topology_nodes {
+            counts.clear();
+            counts.resize(node.outputs.len(), 0);
+            node.reports_writes = self.nodes.get(&node.id).is_some_and(|entry| {
+                entry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .output_commit_counts(&mut counts)
+            });
+        }
+        let recorded = self.topology_nodes.len().min(FIRE_NODE_LIMIT);
+        let in_tick = self.topology_nodes[..recorded]
+            .iter()
+            .map(|node| match self.handles.get(&node.id) {
+                Some(handle) => handle.in_tick_marker(),
+                None => Arc::new(AtomicU64::new(0)),
+            })
+            .collect();
+        let tap = Arc::new(FireTap::new(
+            config,
+            recorded as u16,
+            in_tick,
+            Arc::clone(&self.fire_clock),
+        ));
+        let installed = self.fire_tap.get_or_init(|| tap);
+        Arc::clone(installed)
     }
 
     /// Shutdown the graph runtime.
