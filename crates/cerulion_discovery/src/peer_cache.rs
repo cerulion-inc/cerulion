@@ -82,9 +82,10 @@ pub const PEER_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// on READ, which is not redundant: the writer only bounds files WE wrote, while a
 /// hand-edited, restored, or foreign `peers.json` reaches the reader unbounded —
 /// and every surviving row becomes a candidate that `cerulion-netd`'s boot fold
-/// hands to `probe_reachable_locators`, i.e. one detached DNS+connect thread each.
-/// Capping on read bounds that per boot. A well-formed cache is at or under the
-/// cap, so this is a no-op for every file the writer produced.
+/// hands to `probe_reachable_locators`, i.e. one detached DNS+connect thread each
+/// (more for a host name that resolves to several addresses). Capping on read
+/// bounds that per boot. A well-formed cache is at or under the cap, so this is
+/// a no-op for every file the writer produced.
 pub const MAX_CACHED_PEERS: usize = 32;
 
 /// Per-rung budget handed to the cached-peer rung (a fast local file read).
