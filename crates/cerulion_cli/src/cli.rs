@@ -704,7 +704,9 @@ impl Commands {
                 | GraphAction::Levels { .. }
                 | GraphAction::Partition { .. }
                 | GraphAction::Pause { .. }
-                | GraphAction::Resume { .. } => OneShot,
+                | GraphAction::Resume { .. }
+                | GraphAction::Live { .. }
+                | GraphAction::Fires { .. } => OneShot,
             },
             // `node run` is a runtime loop; every other node verb runs-and-exits.
             Commands::Node { action } => match action {
@@ -1791,6 +1793,65 @@ pub enum GraphAction {
         /// that matches exactly one live run
         run_id: String,
     },
+    /// Show what a remote robot is running: each run's nodes, their triggers
+    /// and topics, and the run's endpoints.
+    ///
+    /// Asks each robot's runs query once. A node row reads `<id>  <type>
+    /// <trigger>  → <output topics>`; an endpoint row names the topics the code
+    /// around an embedded graph publishes and subscribes. The last line of a
+    /// run says whether it serves fire telemetry, which `graph fires` reads.
+    /// Without `--connect`, the question goes through this machine's
+    /// `cerulion-netd`; with it, through a session of this command's own that
+    /// reaches only the locators given.
+    Live {
+        /// Zenoh locator of a robot's gateway to ask directly (repeatable),
+        /// for example `tcp/127.0.0.1:7683`. No discovery runs beside it.
+        #[arg(long, value_name = "LOCATOR")]
+        connect: Vec<String>,
+        /// The robot to ask, by its network name. Without it, every robot that
+        /// announces itself answers.
+        #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
+        /// Print one JSON object per line: one per run (ids, names, topics
+        /// and numbers), and one per robot that gave no readable run.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show each node fire of a remote run as it happens.
+    ///
+    /// Reads the run's nodes from one runs query, then asks the run for its
+    /// fires every 250 ms. Each row is one node tick: how long ago it started,
+    /// the node, what triggered it, how long it ran, and which output topics it
+    /// wrote. No message content is read. The robot records fires only while a
+    /// desk asks and stops 5 s after the last ask. The reading ends with the
+    /// number of fires read and the number the robot lost before this desk
+    /// read them. Without `--follow` or `--for`, it reads for 5 s. Needs
+    /// `--connect`.
+    Fires {
+        /// Zenoh locator of the robot's gateway (repeatable), for example
+        /// `tcp/127.0.0.1:7683`.
+        #[arg(long, value_name = "LOCATOR")]
+        connect: Vec<String>,
+        /// The robot to ask, by its network name. Without it, every robot that
+        /// announces itself is asked for its runs.
+        #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
+        /// The run to read: its run id or its graph name. Without it, the one
+        /// run that serves fire telemetry.
+        #[arg(long, value_name = "RUN")]
+        run: Option<String>,
+        /// Read until Ctrl+C.
+        #[arg(long, conflicts_with = "for_secs")]
+        follow: bool,
+        /// Read for SECS seconds. A robot that is not answering when they end
+        /// gets up to 3 s more to answer.
+        #[arg(long = "for", value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        for_secs: Option<u64>,
+        /// Print one JSON object per fire (ids, names, topics and numbers),
+        /// then one summary object.
+        #[arg(long)]
+        json: bool,
+    },
     /// HIDDEN: run ONE worker process of a multi-process deployment.
     ///
     /// NOT a user-facing verb. The multi-process supervisor behind
@@ -2327,6 +2388,148 @@ mod graph_pause_dispatch_tests {
     fn graph_pause_and_resume_are_one_shot_verbs() {
         for verb in ["pause", "resume"] {
             let cli = Cli::try_parse_from(["cerulion", "graph", verb, "x"]).expect("parse");
+            assert_eq!(
+                cli.command.log_verb_class(),
+                VerbLogClass::OneShot,
+                "{verb}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_live_dispatch_tests {
+    use super::*;
+
+    /// `graph live` takes repeatable locators, a robot and `--json`, all optional.
+    #[test]
+    fn graph_live_parses_its_flags() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "graph",
+            "live",
+            "--connect",
+            "tcp/127.0.0.1:17683",
+            "--connect",
+            "tcp/192.0.2.10:7683",
+            "--robot",
+            "temi",
+            "--json",
+        ])
+        .expect("all `graph live` flags must parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Live {
+                        connect,
+                        robot,
+                        json,
+                    },
+            } => {
+                assert_eq!(connect, ["tcp/127.0.0.1:17683", "tcp/192.0.2.10:7683"]);
+                assert_eq!(robot.as_deref(), Some("temi"));
+                assert!(json);
+            }
+            _ => panic!("expected Graph::Live"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "live"]).expect("bare parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Live {
+                        connect,
+                        robot,
+                        json,
+                    },
+            } => assert!(connect.is_empty() && robot.is_none() && !json),
+            _ => panic!("expected Graph::Live"),
+        }
+    }
+
+    /// `graph fires` takes `--run`, and either `--follow` or `--for SECS`.
+    #[test]
+    fn graph_fires_parses_its_flags() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "graph",
+            "fires",
+            "--connect",
+            "tcp/127.0.0.1:17683",
+            "--robot",
+            "temi",
+            "--run",
+            "0x5d1c",
+            "--for",
+            "3",
+            "--json",
+        ])
+        .expect("all `graph fires` flags must parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Fires {
+                        connect,
+                        robot,
+                        run,
+                        follow,
+                        for_secs,
+                        json,
+                    },
+            } => {
+                assert_eq!(connect, ["tcp/127.0.0.1:17683"]);
+                assert_eq!(robot.as_deref(), Some("temi"));
+                assert_eq!(run.as_deref(), Some("0x5d1c"));
+                assert!(!follow);
+                assert_eq!(for_secs, Some(3));
+                assert!(json);
+            }
+            _ => panic!("expected Graph::Fires"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "fires", "--follow"]).expect("parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Fires {
+                        follow, for_secs, ..
+                    },
+            } => assert!(follow && for_secs.is_none()),
+            _ => panic!("expected Graph::Fires"),
+        }
+    }
+
+    /// `--follow` with `--for`, a zero or negative window and a word are usage
+    /// errors before anything runs.
+    #[test]
+    fn graph_fires_refuses_contradictory_or_empty_windows() {
+        for (args, kind) in [
+            (
+                &["--follow", "--for", "3"][..],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (&["--for", "0"][..], clap::error::ErrorKind::ValueValidation),
+            (
+                &["--for", "-1"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["--for", "soon"][..],
+                clap::error::ErrorKind::ValueValidation,
+            ),
+        ] {
+            let mut argv = vec!["cerulion", "graph", "fires"];
+            argv.extend_from_slice(args);
+            let err = Cli::try_parse_from(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} must be a parse error"));
+            assert_eq!(err.kind(), kind, "{args:?}");
+        }
+    }
+
+    /// Both print their answer and exit or stream rows: quiet by default.
+    #[test]
+    fn graph_live_and_fires_are_one_shot_verbs() {
+        for verb in ["live", "fires"] {
+            let cli = Cli::try_parse_from(["cerulion", "graph", verb]).expect("parse");
             assert_eq!(
                 cli.command.log_verb_class(),
                 VerbLogClass::OneShot,
