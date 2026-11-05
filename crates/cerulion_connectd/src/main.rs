@@ -88,6 +88,13 @@ enum ConnectdCommand {
     /// Dials the robot's rcp plane with the desk device key and bridges one
     /// MCP session: newline-delimited JSON-RPC on stdin and stdout. Stdout
     /// carries only MCP messages; logs go to stderr.
+    ///
+    /// # Exit codes
+    ///
+    /// - `0` stdin reached EOF and the robot finished answering, `1` any
+    ///   other end: the robot refused this desk, revoked its access or ended
+    ///   the session, the dial failed, or a configuration error (the stderr
+    ///   line says which).
     Rcp(RcpCli),
 }
 
@@ -566,6 +573,10 @@ async fn run_rcp_command(cli: RcpCli) -> ExitCode {
     };
     match run_rcp(config, stdin_reader(), tokio::io::stdout()).await {
         Ok(()) => ExitCode::SUCCESS,
+        Err(ConnectError::Refused(reason)) => {
+            tracing::error!(%reason, "cerulion rcp: the robot refused the rcp session");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             tracing::error!(error = %e, "cerulion rcp: session failed");
             ExitCode::FAILURE

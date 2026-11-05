@@ -176,6 +176,10 @@ pub(crate) async fn serve_core(
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
     let sessions = SharedCodePairSessions::new();
+    // The daemon's e-stop lease, for the rcp plane below: the same instance the
+    // `engage-estop` and act verbs use, so its latch and its engage count are
+    // shared. A library host has none, and serves no rcp plane.
+    let estop_lease = ops_host.estop_lease();
     let ops = Arc::new(OpsServing::for_host(
         ops_host,
         shared,
@@ -206,9 +210,17 @@ pub(crate) async fn serve_core(
         wire_plane = wire_plane.with_revocation_sweep_interval(interval);
     }
     let wire = Arc::new(wire_plane);
-    // The rcp plane authorizes each MCP message against the SAME live handle.
+    // The rcp plane authorizes each MCP message against the SAME live handle,
+    // under the SAME e-stop lease as the ops verbs.
     let rcpd = rcp.as_ref().map(|link| link.addr);
-    let rcp = rcp.map(|link| Arc::new(RcpPlane::new(link, classify.shared().clone())));
+    let rcp = match (rcp, estop_lease) {
+        (Some(link), Some(lease)) => Some(Arc::new(RcpPlane::new(
+            link,
+            classify.shared().clone(),
+            lease,
+        ))),
+        _ => None,
+    };
     tracing::info!(
         endpoint_id = %endpoint.id(),
         robot = %wire.robot(),

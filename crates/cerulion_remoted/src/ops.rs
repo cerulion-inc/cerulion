@@ -70,14 +70,13 @@
 //! `ReceiptLog::open` recovers the torn tail).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cerulion_link::{accept_frame_stream, Accepted, Connection, QuicOpsStream};
 
 use cerud::authz::Authorizer;
 use cerud::error::{CerudError, CerudResult};
-use cerud::lease::ControlLease;
 use cerud::receipt::ReceiptLog;
 use cerud::server::OpsServer;
 use cerud::transport::{CallerIdentity, OpsConnection};
@@ -137,13 +136,16 @@ impl OpsServing {
     /// `lease` is the shared control lease the `engage-estop` floor engages;
     /// the e-stop verb and the act verbs share one [`EstopLease`] over it, so
     /// an engage waiting for its lock is counted where the act verbs read it.
+    /// A bare `Arc<Mutex<ControlLease>>` becomes an `EstopLease` with a count
+    /// of its own; pass a clone of an `EstopLease` to share its count with
+    /// another plane, as the daemon does with the rcp plane.
     /// `sessions` is the CPace fallback session store; `clock` is the robot's
     /// TRUSTED clock the pairing verbs verify against; `log_root` is the
     /// `log-tail` allow-list root; `receipt_path` is the audit log.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared: SharedTrust,
-        lease: Arc<Mutex<ControlLease>>,
+        lease: impl Into<EstopLease>,
         sessions: SharedCodePairSessions,
         clock: RemotedClock,
         receipt_path: &Path,
@@ -151,7 +153,9 @@ impl OpsServing {
         server_name: impl Into<String>,
     ) -> Result<Self, RemotedError> {
         Self::for_host(
-            OpsHost::Daemon { lease },
+            OpsHost::Daemon {
+                lease: lease.into(),
+            },
             shared,
             sessions,
             clock,
@@ -341,7 +345,6 @@ fn verb_registry(
             OpsHost::Daemon { lease } => {
                 // One `EstopLease` for the plane: the e-stop verb engages through
                 // it and the act verbs read its count before each send.
-                let lease = EstopLease::new(lease);
                 (
                     Box::new(RestartVerb::new()),
                     Box::new(EngageEstopVerb::new(lease.clone())),
@@ -511,9 +514,7 @@ mod verb_set_tests {
     fn an_embedded_host_registers_every_daemon_verb_name() {
         // The authorizer classifies by name before dispatch, so the refusing
         // stand-ins must carry the daemon verbs' exact names.
-        let daemon = names(OpsHost::Daemon {
-            lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
-        });
+        let daemon = names(OpsHost::daemon());
         let expected = [
             "claim",
             "cloud-access",

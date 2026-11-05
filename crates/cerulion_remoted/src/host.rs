@@ -67,6 +67,7 @@ use crate::clock::RemotedClock;
 use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
 use crate::error::RemotedError;
+use crate::estop_lease::EstopLease;
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
 use crate::rcp::RcpLink;
 use crate::wire::WirePlane;
@@ -118,8 +119,10 @@ impl KeyProvider for KeyFiles {
 
 /// Which ops verb set a plane serves, with what each set needs.
 pub(crate) enum OpsHost {
-    /// The `cerulion-remoted` daemon: every verb. `engage-estop` engages `lease`.
-    Daemon { lease: Arc<Mutex<ControlLease>> },
+    /// The `cerulion-remoted` daemon: every verb. `engage-estop` engages
+    /// `lease`, the act verbs check it, and the rcp plane engages and checks
+    /// a clone of it, so all of them share one latch and one engage count.
+    Daemon { lease: EstopLease },
     /// A library host: `restart`, `engage-estop` and the act verbs are refused
     /// by name, so it has no lease to engage.
     Embedded,
@@ -129,7 +132,16 @@ impl OpsHost {
     /// The daemon's verb set over a fresh control lease.
     pub(crate) fn daemon() -> Self {
         OpsHost::Daemon {
-            lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
+            lease: EstopLease::new(Arc::new(Mutex::new(ControlLease::with_default_window()))),
+        }
+    }
+
+    /// A clone of the daemon's e-stop lease, sharing its latch and its engage
+    /// count; `None` on a library host, which has none.
+    pub(crate) fn estop_lease(&self) -> Option<EstopLease> {
+        match self {
+            OpsHost::Daemon { lease } => Some(lease.clone()),
+            OpsHost::Embedded => None,
         }
     }
 }
@@ -426,5 +438,43 @@ impl RemotedConfig {
             key_file: self.key_file.clone(),
             store_mac_key_file: self.store_mac_key_file.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_daemon_lends_its_estop_lease_and_a_library_host_has_none() {
+        assert!(OpsHost::Embedded.estop_lease().is_none());
+        let host = OpsHost::daemon();
+        let lent = host.estop_lease().expect("the daemon has an e-stop lease");
+        let OpsHost::Daemon { lease } = &host else {
+            unreachable!("OpsHost::daemon is the daemon")
+        };
+        // An engage through the lent clone, as the rcp plane makes, waits for
+        // the lock this test holds; the daemon's own lease, which the act
+        // verbs read, must count it.
+        let held = lease.lock().unwrap();
+        let engaging = std::thread::spawn(move || {
+            lent.engage("iroh:ab");
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while !lease.engage_pending() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let counted = lease.engage_pending();
+        drop(held);
+        engaging.join().unwrap();
+        assert!(
+            counted,
+            "an engage through the lent lease is not counted on the daemon's"
+        );
+        assert!(!matches!(
+            lease.lock().unwrap().estop(),
+            cerud::lease::EstopState::Clear
+        ));
     }
 }

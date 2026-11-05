@@ -384,7 +384,9 @@ the e-stop latch (`cerud::lease::ControlLease`) is engaged; a running publish
 or call checks the latch every 10 ms and stops when it engages, a call
 stopped before its request goes out sends none, and a publish sends each
 frame, and a call its request, only while it holds the lease's lock and reads
-the latch clear. A publish is
+the latch clear. The rcp plane shares this latch: an rcp `estop` engages it,
+and while it is engaged rcp tool calls are refused (the rcp plane below). A
+publish is
 refused when its subscriber wait plus its frames at the rate exceed 90 s, and
 is stopped if it is still running 100 s after it started (a frame that takes
 longer to send than its period delays the rest). A topic under
@@ -460,7 +462,49 @@ floor every `RcpLimits::revoke_check` (`--rcp-revoke-check-ms`); a key that fail
 connection closed. Pinned end to end against a
 real rcpd by `rcp_forward_e2e_test.rs`. The desk half is `cerulion rcp`
 (`cerulion-connectd rcp`, `connectd::rcp::bridge`): stdin lines to frames,
-frames to stdout lines.
+frames to stdout lines. A robot frame that is not a JSON-RPC 2.0 message is
+never written to stdout: the accept decision of a refused key, an
+application close with `rcp::CLOSE_REVOKED` or `rcp::CLOSE_SUPERSEDED`
+(mirrored as `connectd::rcp::CLOSE_*`), and the robot ending the stream
+before stdin's EOF each end the desk process with status 1 and an error line.
+
+One e-stop latch covers both remote actuation planes: the ops plane's
+`cerud::lease::ControlLease` behind one `EstopLease` (the lease plus the
+count of e-stop engages waiting for its lock). The daemon builds it once
+(`OpsHost::daemon`); `serve_core` hands it to `OpsServing` (for
+`engage-estop` and the act verbs) and a clone to `RcpPlane`, so both planes
+share the latch and the count. A library host has no lease and serves no rcp
+plane. The session reader engages it through `EstopLease::engage` for an
+authorized `RcpClass::Estop` message right after `rcp_authorize`, before the
+upstream check and the e-stop bound, so an unreachable rcpd or a spent bound
+still leaves it engaged; a forward failure never undoes it. The engage is
+counted before it waits for the lease's lock, so an act verb sends nothing
+more once it is counted. The engager is the session's caller string. A
+direct engage writes no ops receipt; rcpd still receipts the forwarded
+`estop`. For an `RcpClass::Act` message the reader reads the count, then the
+latch under the lock (a poisoned lock reads engaged), and while an engage is
+counted or the latch is engaged answers `-32001` `refused: the robot's
+e-stop is engaged`, or for `estop_clear` (still `RcpClass::Act`) `refused:
+the robot's ops e-stop is engaged; it clears when cerulion-remoted
+restarts`. The lease guard is held only for that read or that state change,
+never across an `.await` and never with a connection, session, trust or
+receipt lock. The reader check is admission only: nothing
+on the ops side reaches rcpd, so after an ops `engage-estop` a request
+forwarded before it (one rcpd holds behind its serialized calls included)
+still runs and rcpd's own latch stays open. An rcp `estop` also closes
+rcpd's latch, which refuses the calls rcpd has accepted but not yet
+published. `ControlLease::clear_estop` has no caller, so the latch clears
+only when `cerulion-remoted` restarts; then rcpd's own latch clears through
+its `estop_clear` (`limits.estop_clear: agent`) or by deleting
+`<receipts>.estop` and restarting rcpd.
+
+When rcpd answers HTTP 404 to a request that carried its session id (rcpd
+restarted and lost the session), the request is answered `-32603` and the
+session reader stops: the queued frames drain and the stream finishes. A
+response body that ends without the response to its request (rcpd stopped
+mid-call, or a `notifications/cancelled` closed it) is answered `-32603` as
+well. A notification takes no in-flight slot, so a cancel reaches rcpd while
+every slot is taken.
 
 ## 7. The desk half: connect, pair, and the client substrate
 
@@ -733,8 +777,11 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   key file),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
   root), `rcp.token` (the local `cerulion-rcpd` bearer token, bare or one
-  `CERULION_RCP_TOKEN=<token>` line; robot setup creates it 0600 for the
-  service user), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
+  `CERULION_RCP_TOKEN=<token>` line; `cerulion-remoted` creates it at startup
+  when absent, one `CERULION_RCP_TOKEN=<64 hex>` line, mode 0600, owned by
+  the user it runs as; one its group or others can read or write is logged at
+  error, and the rcp plane answers every request with an error until only
+  its owner can read or write it), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
   `beacon_facts_test.rs`).
 

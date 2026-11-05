@@ -28,9 +28,34 @@
 //! connection closed.
 //!
 //! The e-stop takes no Observe/Act slot; its own bound is
-//! [`RcpLimits::estops_in_flight`]. Requests past either bound are
-//! answered with an error, never queued, and the reader never waits on the
-//! outbound queue: an error reply that does not fit is dropped.
+//! [`RcpLimits::estops_in_flight`]. A notification takes no slot. Requests
+//! past either bound are answered with an error, never queued, and the reader
+//! never waits on the outbound queue, except while it relays the `initialize`
+//! result, which [`RcpLimits::head_timeout`] bounds: an error reply that does
+//! not fit is dropped.
+//!
+//! ## The e-stop latch
+//!
+//! The plane obeys the robot's one e-stop latch, the
+//! `cerud::lease::ControlLease` that the ops plane's `engage-estop` engages
+//! and its act verbs check, through the same [`EstopLease`] they share. An
+//! admitted `estop` message engages that latch through
+//! [`EstopLease::engage`] before it is forwarded, so an unreachable rcpd or a
+//! spent e-stop bound still leaves it engaged, and the engage is counted
+//! before it waits for the lease's lock, so an act verb sends nothing more
+//! once it is counted. While the latch is engaged or an engage is counted,
+//! every Act message is refused with [`DENIED_CODE`] before rcpd
+//! ([`ESTOP_ENGAGED_REFUSAL`]), and `estop_clear` with
+//! [`ESTOP_CLEAR_REFUSAL`]; Session, Observe and Estop messages still pass. The latch is read when a message is admitted: a
+//! request forwarded before an ops engage still runs at rcpd, whose own latch
+//! only an `estop` message closes. The latch clears only when
+//! `cerulion-remoted` restarts. While it is clear, `estop_clear` reaches rcpd
+//! as any tool call does.
+//!
+//! A request sent with rcpd's session id that rcpd answers with HTTP `404`
+//! (rcpd restarted and no longer knows the session) is answered with
+//! [`UPSTREAM_CODE`], and the stream ends. A response body that ends without
+//! the response to its request is answered with [`UPSTREAM_CODE`] too.
 //!
 //! | Method | Class | Requirement ([`requirement`]) |
 //! |---|---|---|
@@ -51,8 +76,11 @@
 //! The file holds the token rcpd reads from `CERULION_RCP_TOKEN`, either bare
 //! or as one `CERULION_RCP_TOKEN=<token>` line, so the same file can be a
 //! systemd `EnvironmentFile=` for rcpd. The daemon runs [`ensure_token_file`]
-//! at startup through [`prepare`]; the token is read, with the same mode
-//! check, when each session opens. The link must be a loopback address.
+//! at startup through [`prepare`], which logs a failure at error and lets the
+//! daemon serve on; the token is read, with the same mode check, when each
+//! session opens, and a session that cannot read it answers every request
+//! with [`UPSTREAM_CODE`]. The link must be a loopback address: [`prepare`]
+//! refuses any other.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -60,6 +88,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use cerud::lease::EstopState;
 use cerulion_link::{accept_frame_stream, read_frame, write_frame, Connection, SendStream};
 use cerulion_pairing::format::{AccountId, Role, Scope};
 use cerulion_pairing::verify::AccessRow;
@@ -70,9 +99,10 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Map, Value};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::estop_lease::EstopLease;
 use crate::trust::{KeyAccess, SharedTrust};
 
 /// The header naming the desk's device key and account on each request to rcpd.
@@ -196,6 +226,22 @@ pub enum RcpClass {
 
 /// The name of rcpd's built-in e-stop tool.
 pub const ESTOP_TOOL: &str = "estop";
+
+/// The name of rcpd's built-in tool that clears its own e-stop latch.
+pub const ESTOP_CLEAR_TOOL: &str = "estop_clear";
+
+/// The error message of an Act message refused while the robot's e-stop
+/// latch is engaged.
+pub const ESTOP_ENGAGED_REFUSAL: &str = "refused: the robot's e-stop is engaged";
+
+/// The error message of an [`ESTOP_CLEAR_TOOL`] call refused while the
+/// robot's e-stop latch is engaged.
+pub const ESTOP_CLEAR_REFUSAL: &str =
+    "refused: the robot's ops e-stop is engaged; it clears when cerulion-remoted restarts";
+
+/// The error message of a request rcpd answered with HTTP 404 for the session
+/// id it carried.
+const SESSION_LOST: &str = "rcpd lost this MCP session (it restarted); restart this MCP server";
 
 /// What an account's scope must hold for a class: ALL of `required_caps`, and
 /// a role value <= `max_role` (a lower [`Role`] value is more privileged).
@@ -516,12 +562,15 @@ pub fn load_token(path: &Path) -> Result<String, String> {
     Ok(token.to_string())
 }
 
-/// Check `link` at daemon startup: a loopback rcpd address, and a private
-/// token file ([`ensure_token_file`]).
+/// Check `link` at daemon startup: a loopback rcpd address, then a private
+/// token file ([`ensure_token_file`]). A token file that fails the check is
+/// logged at error and is not a startup failure: the ops and wire planes
+/// serve on, and each rcp session answers its requests with
+/// [`UPSTREAM_CODE`] until the file passes.
 ///
 /// # Errors
 ///
-/// The reason the daemon refuses to start.
+/// The reason the daemon refuses to start: a non-loopback rcpd address.
 pub fn prepare(link: &RcpLink) -> Result<(), String> {
     if !link.addr.ip().is_loopback() {
         return Err(format!(
@@ -530,7 +579,14 @@ pub fn prepare(link: &RcpLink) -> Result<(), String> {
             link.addr
         ));
     }
-    ensure_token_file(&link.token_file)
+    if let Err(reason) = ensure_token_file(&link.token_file) {
+        tracing::error!(
+            %reason,
+            "cerulion_remoted: the rcp plane serves no session until the rcpd token file passes \
+             its check"
+        );
+    }
+    Ok(())
 }
 
 /// Make sure the token file at `path` exists and is private: create it when
@@ -720,6 +776,7 @@ impl RcpFlags {
 pub struct RcpPlane {
     link: RcpLink,
     shared: SharedTrust,
+    lease: EstopLease,
     connections: Mutex<HashMap<[u8; 32], Vec<LiveConnection>>>,
     next_connection: std::sync::atomic::AtomicU64,
 }
@@ -734,11 +791,15 @@ struct LiveConnection {
 
 impl RcpPlane {
     /// A plane forwarding to `link`, authorizing against `shared` (the same
-    /// live handle the accept gate reads).
-    pub fn new(link: RcpLink, shared: SharedTrust) -> Self {
+    /// live handle the accept gate reads), under the e-stop latch of `lease`:
+    /// a clone of the [`EstopLease`] the ops plane's `engage-estop` and act
+    /// verbs use, so the plane's engages are counted where the act verbs read
+    /// the count.
+    pub fn new(link: RcpLink, shared: SharedTrust, lease: EstopLease) -> Self {
         Self {
             link,
             shared,
+            lease,
             connections: Mutex::new(HashMap::new()),
             next_connection: std::sync::atomic::AtomicU64::new(0),
         }
@@ -857,6 +918,9 @@ struct Upstream {
     caller: String,
     session_id: Mutex<Option<String>>,
     protocol: Mutex<Option<String>>,
+    /// Notified when rcpd answers HTTP 404 for the session id: the reader
+    /// stops reading and the stream ends.
+    lost: Notify,
 }
 
 impl Upstream {
@@ -966,6 +1030,62 @@ fn response_id(frame: &[u8]) -> Option<Value> {
     }
 }
 
+/// Whether `message` is the response to the request `request_id`.
+fn answers(request_id: Option<&Value>, message: &[u8]) -> bool {
+    request_id.is_some_and(|id| response_id(message).as_ref() == Some(id))
+}
+
+/// Engage the e-stop latch on `lease` through [`EstopLease::engage`], naming
+/// `caller` as the engager when it was clear: the engage is counted in before
+/// it waits for the lease's lock and out after the latch is engaged and the
+/// lock released, and a poisoned lock is taken as it is.
+fn engage_estop(lease: &EstopLease, caller: &str) {
+    lease.engage(caller);
+    tracing::warn!(by = %caller, "cerulion_remoted: e-stop ENGAGED by an rcp estop");
+}
+
+/// Whether the e-stop on `lease` stops Act messages: an engage is counted
+/// (read without the lease's lock), or the latch reads engaged under the
+/// lock, which is held for that read only. A poisoned lock reads engaged.
+fn estop_engaged(lease: &EstopLease) -> bool {
+    lease.engage_pending()
+        || match lease.lock() {
+            Ok(latch) => !matches!(latch.estop(), EstopState::Clear),
+            Err(_) => true,
+        }
+}
+
+/// The refusal for the Act message `message` while the e-stop on `lease` is
+/// engaged or an engage is counted ([`estop_engaged`]), `None` while it
+/// reads clear.
+fn estop_refusal(lease: &EstopLease, message: &RcpMessage) -> Option<&'static str> {
+    if !estop_engaged(lease) {
+        return None;
+    }
+    if calls_tool(&message.canonical, ESTOP_CLEAR_TOOL) {
+        Some(ESTOP_CLEAR_REFUSAL)
+    } else {
+        Some(ESTOP_ENGAGED_REFUSAL)
+    }
+}
+
+/// Whether the canonical message `canonical` is a `tools/call` of `tool`.
+fn calls_tool(canonical: &[u8], tool: &str) -> bool {
+    serde_json::from_slice::<Value>(canonical).is_ok_and(|v| {
+        v.get("method").and_then(Value::as_str) == Some("tools/call")
+            && v.pointer("/params/name").and_then(Value::as_str) == Some(tool)
+    })
+}
+
+/// Resolves when rcpd has answered HTTP 404 for this session's id; never when
+/// the session has no upstream.
+async fn session_lost(upstream: &Result<Arc<Upstream>, String>) {
+    match upstream {
+        Ok(u) => u.lost.notified().await,
+        Err(_) => std::future::pending().await,
+    }
+}
+
 async fn serve_session(
     mut send: SendStream,
     mut recv: cerulion_link::RecvStream,
@@ -983,6 +1103,7 @@ async fn serve_session(
             caller: caller.clone(),
             session_id: Mutex::new(None),
             protocol: Mutex::new(None),
+            lost: Notify::new(),
         })
     });
     if let Err(reason) = &upstream {
@@ -1055,10 +1176,16 @@ async fn serve_session(
         // Finished tasks are reaped as the session goes, not at its end.
         while tasks.try_join_next().is_some() {}
         while streams.try_join_next().is_some() {}
-        let frame = match read_frame(&mut recv, MAX_REQUEST_FRAME).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::debug!(error = %e, "cerulion_remoted: rcp session closed by the desk");
+        let frame = tokio::select! {
+            read = read_frame(&mut recv, MAX_REQUEST_FRAME) => match read {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::debug!(error = %e, "cerulion_remoted: rcp session closed by the desk");
+                    break;
+                }
+            },
+            () = session_lost(&upstream) => {
+                tracing::warn!(%caller, "cerulion_remoted: rcpd lost the rcp stream's MCP session; the stream ends");
                 break;
             }
         };
@@ -1083,6 +1210,21 @@ async fn serve_session(
                 out.try_error(id, DENIED_CODE, &text);
             }
             continue;
+        }
+        // The e-stop latch is read and engaged here, after authorization and
+        // before the upstream check and the e-stop bound.
+        match message.class {
+            RcpClass::Estop => engage_estop(&plane.lease, &caller),
+            RcpClass::Act => {
+                if let Some(text) = estop_refusal(&plane.lease, &message) {
+                    tracing::info!(method = %message.method, %caller, "cerulion_remoted: rcp tool call refused under the e-stop");
+                    if let Some(id) = message.id {
+                        out.try_error(id, DENIED_CODE, text);
+                    }
+                    continue;
+                }
+            }
+            RcpClass::Session | RcpClass::Observe => {}
         }
         let upstream = match &upstream {
             Ok(u) => u.clone(),
@@ -1134,21 +1276,31 @@ async fn serve_session(
             // body of `initialize`) is in before the next desk message; any
             // other body is relayed by a task.
             RcpClass::Session => {
-                // A lifecycle body relayed by a task holds an in-flight slot
-                // like a request does, so a desk that stops reading cannot
-                // grow the task set.
-                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
-                    if let Some(id) = message.id {
-                        out.try_error(
-                            id,
-                            UPSTREAM_CODE,
-                            "refused: too many requests in flight on this rcp stream",
-                        );
+                // A lifecycle request's body relayed by a task holds an
+                // in-flight slot like a request does, so a desk that stops
+                // reading cannot grow the task set. A notification takes no
+                // slot: rcpd answers it 202 with no body.
+                let permit = if message.id.is_some() {
+                    match in_flight.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            if let Some(id) = message.id {
+                                out.try_error(
+                                    id,
+                                    UPSTREAM_CODE,
+                                    "refused: too many requests in flight on this rcp stream",
+                                );
+                            }
+                            continue;
+                        }
                     }
-                    continue;
+                } else {
+                    None
                 };
                 let is_initialized = message.method == "notifications/initialized";
-                if let Some(body) = forward(upstream.clone(), message, out.clone(), true).await {
+                let body = forward(upstream.clone(), message, out.clone(), true).await;
+                // A body rcpd sends for a notification is not relayed.
+                if let (Some(body), Some(permit)) = (body, permit) {
                     tasks.spawn(async move {
                         body.await;
                         drop(permit);
@@ -1235,7 +1387,10 @@ where
 /// any. For `initialize` the body is relayed before returning, so the
 /// protocol version it carries is recorded too. `inline` is true on the
 /// session reader, whose failure replies never wait for queue space (they are
-/// dropped when it is full); a spawned task waits for it.
+/// dropped when it is full), except while it relays the `initialize` result,
+/// which [`RcpLimits::head_timeout`] bounds; a spawned task waits for it. An
+/// HTTP 404 to a request that carried the session id answers it with
+/// [`UPSTREAM_CODE`] and notifies the session's `Upstream::lost`.
 async fn forward(
     upstream: Arc<Upstream>,
     message: RcpMessage,
@@ -1258,6 +1413,7 @@ async fn forward(
             }
         }
     };
+    let sent_session = upstream.session_id().is_some();
     let request = upstream
         .request(Method::POST, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
@@ -1304,6 +1460,18 @@ async fn forward(
     if status == StatusCode::ACCEPTED {
         return None;
     }
+    if status == StatusCode::NOT_FOUND && sent_session {
+        tracing::warn!("cerulion_remoted: rcpd answered HTTP 404 for the rcp stream's MCP session");
+        if let Some(id) = id.clone() {
+            if inline {
+                out.try_error(id, UPSTREAM_CODE, SESSION_LOST);
+            } else {
+                out.error(id, UPSTREAM_CODE, SESSION_LOST).await;
+            }
+        }
+        upstream.lost.notify_one();
+        return None;
+    }
     if !status.is_success() {
         fail(format!("rcpd answered HTTP {status}")).await;
         return None;
@@ -1329,8 +1497,8 @@ fn header_text(response: &Response<Incoming>, name: &str) -> Option<String> {
 
 /// Relay a response body's JSON-RPC messages to the desk, each under `class`.
 /// Records the protocol version from the initialize result before relaying
-/// it. A body that fails or outgrows the relay bound answers `request_id`
-/// with an error.
+/// it. A body that fails or outgrows the relay bound, or ends without the
+/// response to `request_id`, answers `request_id` with an error.
 async fn relay_body(
     response: Response<Incoming>,
     upstream: Arc<Upstream>,
@@ -1344,6 +1512,7 @@ async fn relay_body(
     let mut body = response.into_body();
     let mut events = SseBuffer::default();
     let mut whole: Vec<u8> = Vec::new();
+    let mut answered = false;
     let failed = loop {
         let Some(next) = body.frame().await else {
             break false;
@@ -1363,6 +1532,7 @@ async fn relay_body(
                 if is_initialize {
                     record_protocol(&upstream, request_id.as_ref(), &m);
                 }
+                answered = answered || answers(request_id.as_ref(), &m);
                 if !out.send(class, m).await {
                     return;
                 }
@@ -1376,7 +1546,7 @@ async fn relay_body(
         }
     };
     if failed {
-        if let Some(id) = request_id {
+        if let Some(id) = request_id.filter(|_| !answered) {
             out.error(
                 id,
                 UPSTREAM_CODE,
@@ -1390,7 +1560,18 @@ async fn relay_body(
         if is_initialize {
             record_protocol(&upstream, request_id.as_ref(), &whole);
         }
-        out.send(class, whole).await;
+        answered = answered || answers(request_id.as_ref(), &whole);
+        if !out.send(class, whole).await {
+            return;
+        }
+    }
+    if let Some(id) = request_id.filter(|_| !answered) {
+        out.error(
+            id,
+            UPSTREAM_CODE,
+            "rcpd ended its answer without a response",
+        )
+        .await;
     }
 }
 
@@ -1510,6 +1691,7 @@ impl SseBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerud::lease::ControlLease;
 
     fn class_of(text: &str) -> Result<RcpClass, RcpRefusal> {
         classify_message(text.as_bytes()).map(|m| m.class)
@@ -2039,6 +2221,137 @@ mod tests {
         assert_eq!(
             caller_identity(&[0xab; 32], None),
             format!("iroh:{}", "ab".repeat(32))
+        );
+    }
+
+    #[test]
+    fn the_estop_latch_refuses_act_messages_and_fails_closed_on_poison() {
+        let call = |name: &str| {
+            classify_message(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{{}}}}}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let (step, clear) = (call("arm.step"), call("estop_clear"));
+        assert_eq!(clear.class, RcpClass::Act, "estop_clear stays an Act call");
+        let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+        assert_eq!(estop_refusal(&lease, &step), None);
+        assert_eq!(estop_refusal(&lease, &clear), None);
+
+        engage_estop(&lease, "iroh:ab/account:01");
+        engage_estop(&lease, "iroh:cd");
+        assert_eq!(
+            lease.lock().unwrap().estop(),
+            &EstopState::Engaged {
+                by: "iroh:ab/account:01".into()
+            },
+            "the first engager is kept"
+        );
+        assert_eq!(
+            estop_refusal(&lease, &step),
+            Some("refused: the robot's e-stop is engaged")
+        );
+        assert_eq!(
+            estop_refusal(&lease, &clear),
+            Some(
+                "refused: the robot's ops e-stop is engaged; it clears when cerulion-remoted \
+                 restarts"
+            )
+        );
+
+        // A lock poisoned while clear reads engaged, and an engage on it
+        // still engages.
+        let poisoned = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+        let p = poisoned.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = p.lock().unwrap();
+            panic!("poison the lease");
+        })
+        .join();
+        assert!(poisoned.lease().is_poisoned());
+        assert_eq!(
+            estop_refusal(&poisoned, &step),
+            Some("refused: the robot's e-stop is engaged")
+        );
+        engage_estop(&poisoned, "iroh:ef");
+        assert!(matches!(
+            poisoned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .estop(),
+            EstopState::Engaged { .. }
+        ));
+    }
+
+    /// Polls `cond` until it holds or 10 s pass; whether it held. The poll
+    /// ends on the condition, the bound only stops a regression.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    #[test]
+    fn an_rcp_estop_is_counted_before_it_waits_for_the_lease() {
+        let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+        let held = lease.lock().unwrap();
+        let engaging = {
+            let lease = lease.clone();
+            std::thread::spawn(move || engage_estop(&lease, "iroh:ab/account:01"))
+        };
+        assert!(
+            eventually(|| lease.engage_pending()),
+            "an rcp estop waiting for the lease's lock is not counted, so an act verb \
+             would keep sending"
+        );
+        drop(held);
+        engaging.join().unwrap();
+        assert!(!lease.engage_pending(), "the engage was not counted out");
+        assert!(matches!(
+            lease.lock().unwrap().estop(),
+            EstopState::Engaged { .. }
+        ));
+    }
+
+    #[test]
+    fn act_messages_are_refused_while_an_engage_is_counted() {
+        let step = classify_message(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"arm.step","arguments":{}}}"#,
+        )
+        .unwrap();
+        let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+        // An engage counted in and waiting for the lock this test holds: the
+        // latch still reads clear under the lock.
+        let held = lease.lock().unwrap();
+        let engaging = {
+            let lease = lease.clone();
+            std::thread::spawn(move || lease.engage("ops"))
+        };
+        assert!(eventually(|| lease.engage_pending()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reading = {
+            let lease = lease.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(estop_refusal(&lease, &step));
+            })
+        };
+        // The refusal comes from the count, without the lock this test holds.
+        let refusal = rx.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        engaging.join().unwrap();
+        reading.join().unwrap();
+        assert_eq!(
+            refusal,
+            Ok(Some(ESTOP_ENGAGED_REFUSAL)),
+            "an Act message was not refused while an e-stop engage was counted"
         );
     }
 }

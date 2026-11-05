@@ -384,9 +384,12 @@ the recording names is another recording's and is left out.
 and give it the token `cerulion-remoted` uses. At startup `cerulion-remoted`
 creates `<state root>/remoted/rcp.token` when it is absent: one
 `CERULION_RCP_TOKEN=<random token>` line, mode `0600`, owned by the user
-`cerulion-remoted` runs as. It refuses to start when the file exists and is
-readable by its group or by others. The file's format is a systemd
-environment file, so rcpd's unit reads it directly:
+`cerulion-remoted` runs as. When the file exists but is not a regular file,
+or its group or others can read or write it, `cerulion-remoted` logs that at
+error and serves on: its ops and wire planes work, and every rcp request is
+answered with an error until the file is private (`chmod 600`). The file's
+format is a systemd environment file, so an rcpd systemd unit can read it
+with `EnvironmentFile=`, for example:
 
 ```ini
 [Service]
@@ -407,3 +410,38 @@ The plane's bounds and timers are flags too: `--rcp-sessions-per-connection`,
 `--rcp-connections-per-key`, `--rcp-in-flight`, `--rcp-estops-in-flight`,
 `--rcp-session-buffer-bytes`, `--rcp-revoke-check-ms`, `--rcp-head-timeout-ms`
 and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).
+
+### One e-stop for every remote path
+
+A robot reached through `cerulion-remoted` has one e-stop latch for every
+remote way to move it: the ops e-stop that `cerulion-remoted` holds. An
+`estop` call from a desk engages it before the call reaches rcpd, then rcpd
+engages its own latch as for any `estop`. The ops plane's `engage-estop`
+engages the same latch. While it is engaged:
+
+- every other tool call from a desk is refused before it reaches rcpd, with
+  error `-32001` and the message `refused: the robot's e-stop is engaged`;
+- `estop_clear` is refused too, with `refused: the robot's ops e-stop is
+  engaged; it clears when cerulion-remoted restarts`;
+- the ops act verbs `topic-publish` and `service-call` are refused;
+- `estop`, `tools/list`, the resources and the session messages still work.
+
+The ops latch is checked when a desk's message arrives. The ops plane's
+`engage-estop` does not reach rcpd: a tool call forwarded before it,
+including one rcpd holds behind the call it is running, still runs, and
+rcpd's own latch stays open. An `estop` over rcp also closes rcpd's own
+latch, which refuses the calls rcpd has accepted but not yet published (see
+[E-stop](#e-stop)).
+
+The latch clears only when `cerulion-remoted` restarts. To recover, restart
+`cerulion-remoted`, then clear rcpd's own latch if an `estop` closed it:
+`estop_clear` under `limits.estop_clear: agent`, or deleting
+`<receipts>.estop` and restarting rcpd. While the ops latch is clear,
+`estop_clear` reaches rcpd like any other tool call. Clients that talk to
+rcpd directly, over stdio or its own HTTP listener, see only rcpd's latch.
+
+When rcpd restarts, it forgets every MCP session. The next request on a
+desk's session is answered with error `-32603` (`rcpd lost this MCP session
+(it restarted); restart this MCP server`), the robot ends the session, and
+`cerulion rcp` exits with status 1. Restarting the MCP server in the MCP
+client opens a new session.

@@ -13,9 +13,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cerud::client::OpsClient;
 use cerulion_link::{
     accept_one, alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame,
-    write_frame, Endpoint, EndpointAddr, EndpointConfig, EndpointId, RelayConfig,
+    write_frame, Endpoint, EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream, RelayConfig,
 };
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
@@ -374,20 +375,73 @@ async fn run_accepts_a_store_bound_to_this_device() {
     assert_eq!(token.len(), 64);
 }
 
-/// `run` refuses to start over a group- or world-readable rcpd token file.
+/// A group-readable rcpd token file does not stop `run`: the ops plane
+/// answers a paired desk, and the file is left as it was.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn run_refuses_a_shared_rcp_token_file() {
+async fn run_serves_the_ops_plane_over_a_shared_rcp_token_file() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let secret = [222u8; 32];
     let ep = disabled_endpoint(secret).await;
-    let real_id = *ep.id().as_bytes();
+    let robot_id = ep.id();
     drop(ep);
-    let cfg = write_state(dir.path(), secret, real_id);
+    let cfg = write_state(dir.path(), secret, *robot_id.as_bytes());
+    let desk = disabled_endpoint([223u8; 32]).await;
+    let mut index = DeviceAccountIndex::new().with_path(cfg.index_file.clone());
+    index.bind(PublicKey(*desk.id().as_bytes()), OWNER);
+    index.save(WIRING_MAC_KEY).unwrap();
     std::fs::write(&cfg.rcp.token_file, "CERULION_RCP_TOKEN=abc\n").unwrap();
-    std::fs::set_permissions(&cfg.rcp.token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let result = bounded("run(shared token)", run(cfg, async {})).await;
-    let err = result.expect_err("a shared token file refuses the start");
-    assert!(err.to_string().contains("chmod 600"), "{err}");
+    std::fs::set_permissions(&cfg.rcp.token_file, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let facts_file = cfg.beacon_facts_file.clone();
+    let token_file = cfg.rcp.token_file.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut daemon = tokio::spawn(run(cfg, async {
+        let _ = stopped.await;
+    }));
+    // `run` writes the beacon facts once its endpoint is bound.
+    let port = bounded("the daemon binds", async {
+        loop {
+            tokio::select! {
+                ended = &mut daemon => panic!("run ended before serving: {ended:?}"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            if let Ok(facts) = cerulion_remoted::BeaconFacts::load(&facts_file) {
+                break facts.iroh_port;
+            }
+        }
+    })
+    .await;
+    // The published port is the first bound socket's; dial it on both
+    // loopback families.
+    let addr = direct_addr(
+        robot_id,
+        [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        ],
+    );
+    let conn = bounded("dial ops", dial(&desk, addr, alpn::OPS))
+        .await
+        .expect("dial ops");
+    let (send, recv) = bounded("open ops stream", open_frame_stream(&conn))
+        .await
+        .expect("open ops stream");
+    let inventory = bounded(
+        "inventory",
+        tokio::task::spawn_blocking(move || {
+            let mut client =
+                OpsClient::connect_current(QuicOpsStream::new(send, recv)).expect("handshake");
+            client.call("inventory", serde_json::json!({}))
+        }),
+    )
+    .await
+    .expect("ops task");
+    assert!(inventory.is_ok(), "the ops plane answers: {inventory:?}");
+    conn.close(0u32.into(), b"done");
+    let _ = stop.send(());
+    let result = bounded("run stops", daemon).await.expect("daemon task");
+    assert!(result.is_ok(), "{result:?}");
+    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "the token file is left as it was");
 }

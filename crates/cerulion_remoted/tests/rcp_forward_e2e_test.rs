@@ -15,13 +15,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cerud::client::OpsClient;
+use cerud::lease::{ControlLease, EstopState};
+use cerud::verbs::VerbHandler;
+use cerud::CerudError;
 use cerulion_core::message::ShmMessage;
 use cerulion_core::wire::MaxSliceLen;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
     alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame, write_frame,
-    Connection, Endpoint, EndpointAddr, EndpointConfig, EndpointId, RecvStream, RelayConfig,
-    SendStream,
+    Connection, Endpoint, EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream, RecvStream,
+    RelayConfig, SendStream,
 };
 use cerulion_pairing::format::{
     AccessListEpoch, AccountId, DeviceCert, Grant, IntermediateCert, PrincipalKind, PublicKey,
@@ -30,12 +34,16 @@ use cerulion_pairing::format::{
 use cerulion_pairing::verify::{PairingPresentation, TrustStore};
 use cerulion_rcpd::http::{BearerToken, HttpServer};
 use cerulion_rcpd::journal::Journal;
-use cerulion_rcpd::manifest::RcpManifest;
-use cerulion_rcpd::observer::GraphSource;
+use cerulion_rcpd::manifest::{RcpManifest, StateResource};
+use cerulion_rcpd::observer::{GraphFeed, GraphSource};
 use cerulion_rcpd::server::RcpServer;
 use cerulion_rcpd::tools::{ReceiptLock, ToolHost};
-use cerulion_remoted::rcp::{RcpLimits, RcpLink, RcpPlane, DENIED_CODE, INVALID_REQUEST_CODE};
-use cerulion_remoted::{DeviceAccountIndex, PairingAuthorizer, RemotedClock, SharedTrust};
+use cerulion_remoted::act_verbs::TopicPublishVerb;
+use cerulion_remoted::rcp::{RcpLimits, RcpLink, RcpPlane};
+use cerulion_remoted::{
+    serve_endpoint, DeviceAccountIndex, EstopLease, PairingAuthorizer, RemotedClock, RemotedConfig,
+    SharedTrust,
+};
 use ed25519_dalek::SigningKey;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::{json, Value};
@@ -155,6 +163,12 @@ fn presentation(seed: u8, account: AccountId, scope: Scope) -> PairingPresentati
 /// A claimed robot whose store is bound to `robot_key`, with the OPERATOR and
 /// VIEWER desks paired, on a fixed clock at `T_NOW`.
 fn robot_trust(dir: &Path, robot_key: [u8; 32]) -> SharedTrust {
+    let (store, index) = robot_store(dir, robot_key);
+    SharedTrust::new_with_clock(store, index, MAC_KEY.to_vec(), RemotedClock::fixed(T_NOW))
+}
+
+/// The store and device index of [`robot_trust`].
+fn robot_store(dir: &Path, robot_key: [u8; 32]) -> (TrustStore, DeviceAccountIndex) {
     let root_set = RootSet::new(vec![pk(&sk(1))], 1).unwrap();
     let mut store = TrustStore::provision(ROBOT_ID, PublicKey(robot_key), root_set, CHASSIS, T_NOW)
         .unwrap()
@@ -169,7 +183,7 @@ fn robot_trust(dir: &Path, robot_key: [u8; 32]) -> SharedTrust {
     }
     store.save(MAC_KEY).unwrap();
     index.save(MAC_KEY).unwrap();
-    SharedTrust::new_with_clock(store, index, MAC_KEY.to_vec(), RemotedClock::fixed(T_NOW))
+    (store, index)
 }
 
 fn loopback_addr(id: EndpointId, bound: &[SocketAddr]) -> EndpointAddr {
@@ -231,6 +245,7 @@ fn spawn_graph(
             for call in batch {
                 seen.lock().unwrap().push(call.clone());
                 if call["tool"] == json!("arm.mute")
+                    || call["tool"] == json!("arm.hold")
                     || (call["tool"] == json!("estop") && call["args"]["reason"] == json!("hold"))
                 {
                     continue;
@@ -248,13 +263,44 @@ fn spawn_graph(
     handle
 }
 
+/// A real rcpd serving `host` over bearer HTTP on `addr`.
+struct Rcpd {
+    host: Arc<ToolHost>,
+    feed: GraphFeed,
+    state: Vec<StateResource>,
+}
+
+impl Rcpd {
+    /// Bind `addr` and serve until the returned sender fires or drops.
+    async fn serve(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>), cerulion_rcpd::RcpdError> {
+        let (feed, host, state) = (self.feed.clone(), self.host.clone(), self.state.clone());
+        let token = BearerToken::from_env_value(Some(TOKEN.into())).unwrap();
+        let http = HttpServer::bind_serving(addr, token, move || {
+            RcpServer::with_tools(feed.clone(), host.clone(), state.clone())
+        })
+        .await?;
+        let bound = http.local_addr().unwrap();
+        let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(http.serve(async {
+            let _ = rx.await;
+        }));
+        Ok((bound, stop))
+    }
+}
+
 struct Fixture {
     robot: Endpoint,
     trust: SharedTrust,
+    lease: EstopLease,
     receipts: std::path::PathBuf,
     seen: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
     graph: Option<std::thread::JoinHandle<()>>,
+    rcpd: Rcpd,
+    rcpd_addr: SocketAddr,
     stop_serving: Option<tokio::sync::oneshot::Sender<()>>,
     stop_rcpd: Option<tokio::sync::oneshot::Sender<()>>,
     _dir: tempfile::TempDir,
@@ -262,6 +308,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_limits(|_| {}).await
+    }
+
+    /// The fixture with the plane's limits adjusted by `adjust`.
+    async fn with_limits(adjust: impl FnOnce(&mut RcpLimits)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("rcp_e2e_{}_{n}", std::process::id());
@@ -289,6 +340,11 @@ tools:
     description: never answered
     safety_class: reversible
     timeout_ms: 3000
+    input_schema: {{ type: object, properties: {{}} }}
+  - name: arm.hold
+    description: never answered, held up to 60 s
+    safety_class: reversible
+    timeout_ms: 60000
     input_schema: {{ type: object, properties: {{}} }}
 "
         );
@@ -321,19 +377,15 @@ tools:
         let host = Arc::new(
             ToolHost::open(loaded.tools.clone(), journal, latch, &receipts, lock).expect("host"),
         );
-        let feed = GraphSource::new(mgr, loaded.identity.clone()).feed();
-        let state = loaded.state.clone();
-        let token = BearerToken::from_env_value(Some(TOKEN.into())).unwrap();
-        let http = HttpServer::bind_serving("127.0.0.1:0".parse().unwrap(), token, move || {
-            RcpServer::with_tools(feed.clone(), host.clone(), state.clone())
-        })
-        .await
-        .expect("rcpd binds");
-        let rcpd_addr = http.local_addr().unwrap();
-        let (stop_rcpd, rcpd_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(http.serve(async {
-            let _ = rcpd_rx.await;
-        }));
+        let rcpd = Rcpd {
+            host,
+            feed: GraphSource::new(mgr, loaded.identity.clone()).feed(),
+            state: loaded.state.clone(),
+        };
+        let (rcpd_addr, stop_rcpd) = rcpd
+            .serve("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("rcpd binds");
 
         // The robot: one endpoint, the rcp plane over the live trust state.
         let token_file = dir.path().join("rcp.token");
@@ -350,7 +402,9 @@ tools:
         link.addr = rcpd_addr;
         link.token_file = token_file;
         link.limits.revoke_check = QUIET_REVOKE_CHECK;
-        let plane = Arc::new(RcpPlane::new(link, trust.clone()));
+        adjust(&mut link.limits);
+        let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+        let plane = Arc::new(RcpPlane::new(link, trust.clone(), lease.clone()));
         let (stop_serving, serve_rx) = tokio::sync::oneshot::channel::<()>();
         let serving_endpoint = robot.clone();
         tokio::spawn(async move {
@@ -370,10 +424,13 @@ tools:
         Fixture {
             robot,
             trust,
+            lease,
             receipts,
             seen,
             stop,
             graph: Some(graph),
+            rcpd,
+            rcpd_addr,
             stop_serving: Some(stop_serving),
             stop_rcpd: Some(stop_rcpd),
             _dir: dir,
@@ -398,6 +455,45 @@ tools:
             send,
             recv,
         }
+    }
+
+    /// Stop rcpd: it stops accepting and ends every response stream it has
+    /// open.
+    fn stop_rcpd(&mut self) {
+        let _ = self.stop_rcpd.take().expect("rcpd is serving").send(());
+    }
+
+    /// Serve a fresh rcpd (a new session table, the same tool host) on the
+    /// address and token of the stopped one.
+    async fn restart_rcpd(&mut self) {
+        let addr = self.rcpd_addr;
+        let rcpd = &self.rcpd;
+        let stop = bounded("rcpd binds its address again", async {
+            loop {
+                match rcpd.serve(addr).await {
+                    Ok((_, stop)) => break stop,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await;
+        self.stop_rcpd = Some(stop);
+    }
+
+    /// Wait until the stand-in graph has seen a call of `tool`.
+    async fn graph_sees(&self, tool: &str) {
+        bounded("the graph sees the call", async {
+            while !self
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c["tool"] == json!(tool))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
     }
 
     fn receipt_callers(&self) -> Vec<(String, String)> {
@@ -514,7 +610,14 @@ async fn operator_with_teleop_calls_a_tool_under_its_own_identity() {
         .collect();
     assert_eq!(
         names,
-        ["arm.step", "arm.slow", "arm.mute", "estop", "estop_clear"]
+        [
+            "arm.step",
+            "arm.slow",
+            "arm.mute",
+            "arm.hold",
+            "estop",
+            "estop_clear"
+        ]
     );
     let r = s.call_step(3).await;
     let text = r["result"]["content"][0]["text"]
@@ -564,7 +667,7 @@ async fn viewer_reads_resources_but_its_tool_call_never_reaches_rcpd() {
     assert!(serde_json::from_str::<Value>(doc).is_ok(), "graph is JSON");
 
     let r = s.call_step(4).await;
-    assert!(denied(&r, DENIED_CODE), "viewer tools/call: {r}");
+    assert!(denied(&r, -32001), "viewer tools/call: {r}");
     assert!(
         r["error"]["message"]
             .as_str()
@@ -588,7 +691,7 @@ async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
     let mut s = f.session(VIEWER.0).await;
     s.initialize().await;
     let r = s.call_step(2).await;
-    assert!(denied(&r, DENIED_CODE), "viewer arm.step: {r}");
+    assert!(denied(&r, -32001), "viewer arm.step: {r}");
     // Clearing is not under the e-stop floor: it is a tool like any other.
     let r = s
         .request(
@@ -597,7 +700,7 @@ async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
             json!({ "name": cerulion_rcpd::tools::ESTOP_CLEAR_TOOL, "arguments": {} }),
         )
         .await;
-    assert!(denied(&r, DENIED_CODE), "viewer estop_clear: {r}");
+    assert!(denied(&r, -32001), "viewer estop_clear: {r}");
     let r = s
         .request(
             3,
@@ -654,14 +757,14 @@ async fn malformed_bodies_are_denied_and_the_session_continues() {
     ] {
         s.send_raw(bad).await;
         let r = s.reply(&Value::Null).await;
-        assert!(denied(&r, INVALID_REQUEST_CODE), "{r}");
+        assert!(denied(&r, -32600), "{r}");
     }
     s.send_raw(br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"arguments":{}}}"#)
         .await;
-    assert!(denied(&s.reply(&json!(8)).await, INVALID_REQUEST_CODE));
+    assert!(denied(&s.reply(&json!(8)).await, -32600));
     s.send_raw(br#"{"jsonrpc":"2.0","id":9,"method":"prompts/list","params":{}}"#)
         .await;
-    assert!(denied(&s.reply(&json!(9)).await, INVALID_REQUEST_CODE));
+    assert!(denied(&s.reply(&json!(9)).await, -32600));
     let again = s
         .request(
             11,
@@ -670,10 +773,7 @@ async fn malformed_bodies_are_denied_and_the_session_continues() {
                     "clientInfo": { "name": "again", "version": "0" } }),
         )
         .await;
-    assert!(
-        denied(&again, INVALID_REQUEST_CODE),
-        "one initialize per stream: {again}"
-    );
+    assert!(denied(&again, -32600), "one initialize per stream: {again}");
     let pong = s.request(10, "ping", json!({})).await;
     assert!(
         pong.get("result").is_some(),
@@ -725,6 +825,10 @@ fn the_default_rcpd_address_matches_rcpd() {
         cerulion_remoted::rcp::ESTOP_TOOL,
         cerulion_rcpd::tools::ESTOP_TOOL
     );
+    assert_eq!(
+        cerulion_remoted::rcp::ESTOP_CLEAR_TOOL,
+        cerulion_rcpd::tools::ESTOP_CLEAR_TOOL
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -744,15 +848,11 @@ async fn the_estop_never_waits_behind_full_request_slots() {
     let busy = s.request(4, "ping", json!({})).await;
     assert_eq!(
         busy["error"]["code"],
-        json!(cerulion_remoted::rcp::UPSTREAM_CODE),
+        json!(-32603),
         "a lifecycle body takes a slot too: {busy}"
     );
     let over = s.call_step(2).await;
-    assert_eq!(
-        over["error"]["code"],
-        json!(cerulion_remoted::rcp::UPSTREAM_CODE),
-        "{over}"
-    );
+    assert_eq!(over["error"]["code"], json!(-32603), "{over}");
     let started = std::time::Instant::now();
     let r = s
         .request(3, "tools/call", json!({ "name": "estop", "arguments": {} }))
@@ -801,7 +901,7 @@ async fn a_reply_is_withheld_when_the_scope_loses_its_class_mid_call() {
     let r = s.reply(&json!(2)).await;
     assert_eq!(
         r["error"]["code"],
-        json!(DENIED_CODE),
+        json!(-32001),
         "the result was withheld: {r}"
     );
     // The session itself stays: the account is still on the access list.
@@ -896,13 +996,319 @@ async fn estops_in_flight_are_bounded_and_the_excess_answered_at_once() {
             json!({ "name": "estop", "arguments": { "reason": "hold" } }),
         )
         .await;
-    assert_eq!(
-        over["error"]["code"],
-        json!(cerulion_remoted::rcp::UPSTREAM_CODE),
-        "{over}"
-    );
+    assert_eq!(over["error"]["code"], json!(-32603), "{over}");
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "answered at once"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
+    let mut f = Fixture::new().await;
+    let mut s = f.session(OPERATOR.0).await;
+    s.initialize().await;
+    let first = s.call_step(2).await;
+    assert!(first.get("result").is_some(), "{first}");
+    let held = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                       "params": { "name": "arm.hold", "arguments": {} } });
+    s.send_raw(held.to_string().as_bytes()).await;
+    f.graph_sees("arm.hold").await;
+    // rcpd stops with the call in flight: its answer ends without a response.
+    f.stop_rcpd();
+    let r = s.reply(&json!(3)).await;
+    assert_eq!(r["error"]["code"], json!(-32603), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!("rcpd ended its answer without a response"),
+        "{r}"
+    );
+    // A fresh rcpd on the same address and token does not know the session:
+    // the next request, the e-stop included, is answered and the stream ends.
+    f.restart_rcpd().await;
+    let r = s
+        .request(4, "tools/call", json!({ "name": "estop", "arguments": {} }))
+        .await;
+    assert_eq!(r["error"]["code"], json!(-32603), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!("rcpd lost this MCP session (it restarted); restart this MCP server"),
+        "{r}"
+    );
+    let next = bounded("the stream ends", read_frame(&mut s.recv, 1 << 20)).await;
+    assert!(next.is_err(), "the robot ended the stream: {next:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_reaches_rcpd_while_every_request_slot_is_taken() {
+    let f = Fixture::with_limits(|l| l.in_flight = 1).await;
+    let mut s = f.session(OPERATOR.0).await;
+    s.initialize().await;
+    // The one slot: a call the graph holds for up to 60 s.
+    let held = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": { "name": "arm.hold", "arguments": {} } });
+    s.send_raw(held.to_string().as_bytes()).await;
+    f.graph_sees("arm.hold").await;
+    let cancel = json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                         "params": { "requestId": 2, "reason": "rcp e2e" } });
+    s.send_raw(cancel.to_string().as_bytes()).await;
+    // rcpd ends the cancelled call's response stream, which frees the slot.
+    let r = s.reply(&json!(2)).await;
+    assert_eq!(
+        r["error"]["message"],
+        json!("rcpd ended its answer without a response"),
+        "{r}"
+    );
+    let pong = bounded("a request is admitted again", async {
+        for id in 3.. {
+            let r = s.request(id, "ping", json!({})).await;
+            if r.get("result").is_some() {
+                return r;
+            }
+            assert_eq!(
+                r["error"]["message"],
+                json!("refused: too many requests in flight on this rcp stream"),
+                "{r}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        unreachable!()
+    })
+    .await;
+    assert!(pong.get("result").is_some(), "{pong}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engaged_ops_estop_refuses_rcp_tool_calls_but_not_the_estop() {
+    let f = Fixture::new().await;
+    let mut s = f.session(OPERATOR.0).await;
+    s.initialize().await;
+    // The ops plane's engage-estop engages this lease, as its verb does.
+    f.lease.engage("iroh:ops-desk");
+    assert_eq!(
+        f.lease.lock().unwrap().estop(),
+        &EstopState::Engaged {
+            by: "iroh:ops-desk".into()
+        }
+    );
+    let r = s.call_step(2).await;
+    assert_eq!(r["error"]["code"], json!(-32001), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!("refused: the robot's e-stop is engaged"),
+        "{r}"
+    );
+    let r = s
+        .request(
+            3,
+            "tools/call",
+            json!({ "name": "estop_clear", "arguments": {} }),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], json!(-32001), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!(
+            "refused: the robot's ops e-stop is engaged; it clears when cerulion-remoted restarts"
+        ),
+        "{r}"
+    );
+    // Reading and the e-stop still pass.
+    let listed = s.request(4, "tools/list", json!({})).await;
+    assert!(listed["result"]["tools"].is_array(), "{listed}");
+    let r = s
+        .request(5, "tools/call", json!({ "name": "estop", "arguments": {} }))
+        .await;
+    let text = r["result"]["content"][0]["text"]
+        .as_str()
+        .expect("estop body");
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap()["estopped"],
+        json!(true),
+        "{r}"
+    );
+    let caller = expected_caller(OPERATOR.0, OPERATOR.1);
+    assert_eq!(
+        f.receipt_callers(),
+        [
+            ("estop".to_string(), caller.clone()),
+            ("estop".to_string(), caller)
+        ],
+        "only the estop reached rcpd's tools"
+    );
+    let seen = f.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "only the estop reached the graph: {seen:?}");
+    assert_eq!(seen[0]["tool"], json!("estop"));
+    assert_eq!(
+        f.lease.lock().unwrap().estop(),
+        &EstopState::Engaged {
+            by: "iroh:ops-desk".into()
+        },
+        "the first engager is kept"
+    );
+}
+
+/// `topic-publish` on `lease` with a type no robot knows: past the e-stop
+/// check it fails on the type lookup, before any shared memory is opened.
+fn publish_unknown_type(lease: &EstopLease) -> String {
+    let args = json!({ "topic": "/rcp_e2e/latch", "type": "nope_msgs/msg/Nope", "message": {} });
+    match TopicPublishVerb::new(lease.clone()).execute(&args) {
+        Err(CerudError::Verb(m)) => m,
+        other => panic!("expected a verb error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_rcp_estop_engages_the_latch_the_ops_act_verbs_obey() {
+    let f = Fixture::new().await;
+    let before = publish_unknown_type(&f.lease);
+    assert!(
+        before.starts_with("usage: unknown message type"),
+        "clear: {before}"
+    );
+    let mut viewer = f.session(VIEWER.0).await;
+    viewer.initialize().await;
+    let r = viewer
+        .request(2, "tools/call", json!({ "name": "estop", "arguments": {} }))
+        .await;
+    let text = r["result"]["content"][0]["text"]
+        .as_str()
+        .expect("estop body");
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap()["estopped"],
+        json!(true),
+        "{r}"
+    );
+    // The answer came back, so the plane engaged the latch before forwarding.
+    assert_eq!(
+        f.lease.lock().unwrap().estop(),
+        &EstopState::Engaged {
+            by: expected_caller(VIEWER.0, VIEWER.1)
+        }
+    );
+    assert_eq!(
+        publish_unknown_type(&f.lease),
+        "unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+    );
+    let mut op = f.session(OPERATOR.0).await;
+    op.initialize().await;
+    let r = op.call_step(3).await;
+    assert_eq!(
+        r["error"]["message"],
+        json!("refused: the robot's e-stop is engaged"),
+        "{r}"
+    );
+}
+
+/// One ops call on its own connection from `desk` to `addr`.
+async fn ops_call(
+    desk: &Endpoint,
+    addr: EndpointAddr,
+    verb: &'static str,
+    args: Value,
+) -> Result<Value, CerudError> {
+    let conn = bounded("dial ops", dial(desk, addr, alpn::OPS))
+        .await
+        .expect("dial ops");
+    let (send, recv) = bounded("open ops stream", open_frame_stream(&conn))
+        .await
+        .expect("open ops stream");
+    let result = bounded(
+        "ops call",
+        tokio::task::spawn_blocking(move || {
+            let mut client =
+                OpsClient::connect_current(QuicOpsStream::new(send, recv)).expect("handshake");
+            client.call(verb, args)
+        }),
+    )
+    .await
+    .expect("ops task");
+    conn.close(0u32.into(), b"done");
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_engages_the_ops_latch_from_an_rcp_estop_with_rcpd_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot = endpoint(ROBOT_SEED).await;
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+    let (store, index) = robot_store(dir.path(), *robot.id().as_bytes());
+    // No rcp.token and no rcpd: every rcp request is answered "not reachable".
+    std::fs::create_dir_all(dir.path().join("remoted")).unwrap();
+    let config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    std::fs::create_dir_all(&config.log_root).unwrap();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rcp_e2e_daemon_{}_{n}", std::process::id()),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("isolated transport");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = robot.clone();
+    let daemon = tokio::spawn(async move {
+        serve_endpoint(
+            &config,
+            store,
+            index,
+            MAC_KEY.to_vec(),
+            &serving,
+            RemotedClock::fixed(T_NOW),
+            None,
+            Some(manager),
+            async {
+                let _ = stopped.await;
+            },
+        )
+        .await
+    });
+    let desk = endpoint(OPERATOR.0).await;
+    let args = json!({ "topic": "/rcp_e2e/latch", "type": "nope_msgs/msg/Nope", "message": {} });
+    let remote_message = |r: Result<Value, CerudError>| match r {
+        Err(CerudError::Remote { kind, message }) if kind == "verb_error" => message,
+        other => panic!("expected the verb's error, got {other:?}"),
+    };
+    let before =
+        remote_message(ops_call(&desk, robot_addr.clone(), "topic-publish", args.clone()).await);
+    assert!(
+        before.starts_with("verb error: usage: unknown message type"),
+        "clear: {before}"
+    );
+
+    let conn = bounded("dial rcp", dial(&desk, robot_addr.clone(), alpn::RCP))
+        .await
+        .expect("dial rcp");
+    let (mut send, mut recv) = bounded("open rcp stream", open_frame_stream(&conn))
+        .await
+        .expect("open rcp stream");
+    let estop = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": "estop", "arguments": {} } });
+    bounded(
+        "estop",
+        write_frame(&mut send, estop.to_string().as_bytes()),
+    )
+    .await
+    .expect("write");
+    let frame = bounded("estop answer", read_frame(&mut recv, 1 << 20))
+        .await
+        .expect("an answer");
+    let r: Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(r["id"], json!(1), "{r}");
+    assert_eq!(r["error"]["code"], json!(-32603), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!("rcpd is not reachable on this robot"),
+        "{r}"
+    );
+
+    let after = remote_message(ops_call(&desk, robot_addr, "topic-publish", args).await);
+    assert_eq!(
+        after,
+        "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+    );
+    let _ = stop.send(());
+    let served = bounded("daemon stops", daemon).await.expect("daemon task");
+    assert!(served.is_ok(), "{served:?}");
 }
