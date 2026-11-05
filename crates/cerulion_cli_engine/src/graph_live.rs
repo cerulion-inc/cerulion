@@ -11,12 +11,14 @@
 //! A run's `run.json` is read through [`RunView`], which ignores keys it does
 //! not know, so this desk reads the manifest of a robot newer than itself.
 //! Every string a robot sends is neutralized before it is printed: names,
-//! ids and topics through `sanitize_display`, free text (a refusal, or why an
-//! answer cannot be read) through `sanitize_refusal_reason`, which also
-//! bounds it.
-//! `--json` output carries the raw values, escaped by the JSON encoder.
+//! ids and topics through `sanitize_display`, cut at [`DISPLAY_LIMIT`]
+//! characters, and free text (a refusal, or why an answer cannot be read)
+//! through `sanitize_refusal_reason`, which also bounds it.
+//! `--json` output carries the whole values; each character a terminal acts
+//! on is written as a `\u` escape, so a line reads the same value back.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,14 +27,14 @@ use std::time::{Duration, Instant};
 use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
 use cerulion_core::graph::RUN_TOPOLOGY_VERSION;
 use cerulion_core::transport::cerulion_q::{
-    decode_fires_reply, parse_run_id, FiresAnswer, FiresOutcome, FiresReply, RunEntry,
-    RunsCompleteness, RunsReply, FIRES_WIRE_VERSION, MAX_FIRES_PER_REPLY,
+    gather_fires_answer, parse_run_id, FiresAnswer, FiresOutcome, RunEntry, RunsCompleteness,
+    RunsReply, FIRES_WIRE_VERSION, MAX_FIRES_PER_REPLY,
 };
 use cerulion_core::transport::discovery::RunsHarvest;
 use serde::Deserialize;
 
 use crate::error::{CliError, CliResult};
-use crate::topic_cmd::{sanitize_display, sanitize_refusal_reason};
+use crate::topic_cmd::{is_terminal_hostile, sanitize_display, sanitize_refusal_reason};
 
 /// How often `graph fires` asks the run for new fires.
 pub const FIRES_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -218,9 +220,36 @@ pub fn parse_run_json(run_json: &str) -> Result<RunView, String> {
 // Rendering.
 // ---------------------------------------------------------------------------
 
-/// A name, id or topic a robot sent, safe to print on a terminal.
+/// The most characters of one robot name, id or topic a terminal shows.
+pub const DISPLAY_LIMIT: usize = 120;
+
+/// A name, id or topic a robot sent, safe to print on a terminal: cut at
+/// [`DISPLAY_LIMIT`] characters with a `…` marker.
 fn clean(text: &str) -> String {
-    sanitize_display(text)
+    let mut chars = text.chars();
+    let mut shown = sanitize_display(&chars.by_ref().take(DISPLAY_LIMIT).collect::<String>());
+    if chars.next().is_some() {
+        shown.push('\u{2026}');
+    }
+    shown
+}
+
+/// One `--json` line: `value` as JSON, with each character a terminal acts
+/// on written as a `\u` escape. Those characters appear only inside JSON
+/// strings, so the line parses to the same value.
+fn json_line(value: &serde_json::Value) -> String {
+    let encoded = value.to_string();
+    let mut line = String::with_capacity(encoded.len());
+    for c in encoded.chars() {
+        if is_terminal_hostile(c) {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                let _ = write!(line, "\\u{unit:04x}");
+            }
+        } else {
+            line.push(c);
+        }
+    }
+    line
 }
 
 fn width<I: IntoIterator<Item = usize>>(lengths: I) -> usize {
@@ -578,29 +607,58 @@ fn wrote_label(node: Option<&NodeView>, rec: &FireRecord) -> String {
 /// Render one fire as a text row. `robot_now_ns` is the robot's clock when it
 /// served the fire, so the row shows the fire's age without a clock sync.
 pub fn render_fire_row(topology: &TopologyView, robot_now_ns: u64, rec: &FireRecord) -> String {
-    let node = topology.nodes.get(usize::from(rec.node));
-    let iw = width(topology.nodes.iter().map(|n| clean(&n.id).chars().count()));
-    let cw = width(
-        topology
-            .nodes
-            .iter()
-            .map(|n| trigger_label(&n.trigger).chars().count()),
-    );
-    let id = node.map_or_else(|| format!("node {}", rec.node), |n| clean(&n.id));
-    let mut row = format!(
-        "{:>9} ago  {id:<iw$}  {:<cw$}  {:>9}  wrote {}",
-        age_label(robot_now_ns, rec.at_ns),
-        cause_label(node, rec),
-        duration_label(rec),
-        wrote_label(node, rec),
-    );
-    if has_flag(rec, FireFlags::PANICKED) {
-        row.push_str("  panicked");
+    FireRows::new(topology).render(robot_now_ns, rec)
+}
+
+/// The fire rows of one topology: the node ids and the column widths,
+/// computed once for a whole reading.
+struct FireRows<'a> {
+    topology: &'a TopologyView,
+    ids: Vec<String>,
+    id_width: usize,
+    cause_width: usize,
+}
+
+impl<'a> FireRows<'a> {
+    fn new(topology: &'a TopologyView) -> Self {
+        let ids: Vec<String> = topology.nodes.iter().map(|n| clean(&n.id)).collect();
+        Self {
+            topology,
+            id_width: width(ids.iter().map(|id| id.chars().count())),
+            cause_width: width(
+                topology
+                    .nodes
+                    .iter()
+                    .map(|n| trigger_label(&n.trigger).chars().count()),
+            ),
+            ids,
+        }
     }
-    if has_flag(rec, FireFlags::TICK_ERROR) {
-        row.push_str("  tick error");
+
+    fn render(&self, robot_now_ns: u64, rec: &FireRecord) -> String {
+        let index = usize::from(rec.node);
+        let node = self.topology.nodes.get(index);
+        let id = self
+            .ids
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("node {}", rec.node));
+        let (iw, cw) = (self.id_width, self.cause_width);
+        let mut row = format!(
+            "{:>9} ago  {id:<iw$}  {:<cw$}  {:>9}  wrote {}",
+            age_label(robot_now_ns, rec.at_ns),
+            cause_label(node, rec),
+            duration_label(rec),
+            wrote_label(node, rec),
+        );
+        if has_flag(rec, FireFlags::PANICKED) {
+            row.push_str("  panicked");
+        }
+        if has_flag(rec, FireFlags::TICK_ERROR) {
+            row.push_str("  tick error");
+        }
+        row
     }
-    row
 }
 
 fn trigger_json(trigger: &TriggerView) -> serde_json::Value {
@@ -877,9 +935,12 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
         .collect();
     if all.is_empty() {
         if harvest.replies.is_empty() {
-            return refuse(
-                "no robot answered the runs query, so there is no run to read".to_string(),
-            );
+            let text = if harvest.unusable.is_empty() && harvest.silent.is_empty() {
+                "no robot answered the runs query, so there is no run to read"
+            } else {
+                "no robot gave a readable runs answer, so there is no run to read"
+            };
+            return refuse(text.to_string());
         }
         let reasons: Vec<String> = harvest.replies.iter().map(no_run_reason).collect();
         return refuse(format!("no run to read: {}", reasons.join("; ")));
@@ -973,48 +1034,6 @@ impl FireStream {
     }
 }
 
-/// One answer to a `fires` request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FiresPoll {
-    /// The robot answered.
-    Reply(FiresReply),
-    /// Nothing came back.
-    Silent,
-    /// Something came back that this desk cannot use.
-    Unusable {
-        /// Why, in operator-readable text.
-        reason: String,
-    },
-}
-
-impl From<FiresAnswer> for FiresPoll {
-    fn from(answer: FiresAnswer) -> Self {
-        match answer {
-            FiresAnswer::Reply { reply } => FiresPoll::Reply(reply),
-            FiresAnswer::Silent => FiresPoll::Silent,
-            FiresAnswer::Unusable { reason } => FiresPoll::Unusable { reason },
-        }
-    }
-}
-
-/// Classify the payloads one `fires` request gathered: the first that
-/// decodes wins; else the last decode error; else silence.
-pub fn classify_fires(payloads: &[Vec<u8>]) -> FiresPoll {
-    let mut last_error = None;
-    for payload in payloads {
-        match decode_fires_reply(payload) {
-            Ok(reply) => return FiresPoll::Reply(reply),
-            Err(e) => last_error = Some(e),
-        }
-    }
-    match last_error {
-        Some(e) => FiresPoll::Unusable {
-            reason: e.to_string(),
-        },
-        None => FiresPoll::Silent,
-    }
-}
-
 /// Where `runs` answers come from.
 pub trait RunsSource {
     /// Ask `robot`, or every robot that announces itself, for its runs. A
@@ -1026,7 +1045,7 @@ pub trait RunsSource {
 pub trait FiresSource {
     /// Ask `robot` for the fires of `run_id` after `after`. An error means
     /// this desk could not ask, and says nothing about the robot.
-    fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresPoll>;
+    fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresAnswer>;
 }
 
 /// Time as `graph fires` sees it, so a test can drive the loop.
@@ -1110,7 +1129,7 @@ fn write_fires_summary(
             "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             "end": end.name(),
         });
-        return writeln!(out, "{summary}");
+        return writeln!(out, "{}", json_line(&summary));
     }
     let tail = match end {
         FiresEnd::RunEnded => "the run ended".to_string(),
@@ -1135,6 +1154,8 @@ fn write_fires_summary(
 
 /// Read the fires of `run` from `source` until `window` elapses (`None`:
 /// until `running` clears), writing one row per fire and then the totals.
+/// The window and the totals' time start at the first ask, whatever time
+/// `pacer` spent before this call.
 ///
 /// The window ends the reading only after an answered ask. A robot that is
 /// not answering when the window ends gets the rest of its silence limit, so
@@ -1149,9 +1170,12 @@ pub fn follow_fires(
     out: &mut dyn Write,
 ) -> CliResult<(FireStream, FiresEnd)> {
     let topology = run.view.topology.clone().unwrap_or_default();
+    let rows = FireRows::new(&topology);
     let mut stream = FireStream::default();
     let mut silent_since: Option<Duration> = None;
     let mut answered = false;
+    let begun = pacer.elapsed();
+    let reading_for = |pacer: &dyn Pacer| pacer.elapsed().saturating_sub(begun);
     if !json {
         writeln!(
             out,
@@ -1178,7 +1202,7 @@ pub fn follow_fires(
                 FIRES_SILENCE_LIMIT.as_secs()
             ));
         }
-        if silent_since.is_none() && window.is_some_and(|w| pacer.elapsed() >= w) {
+        if silent_since.is_none() && window.is_some_and(|w| reading_for(pacer) >= w) {
             break FiresEnd::Window;
         }
         let mut read_on = false;
@@ -1187,14 +1211,14 @@ pub fn follow_fires(
             Err(e) => break FiresEnd::Failed(e.to_string()),
         };
         match poll {
-            FiresPoll::Reply(reply) if reply.run_id != run.run_id => {
+            FiresAnswer::Reply { reply } if reply.run_id != run.run_id => {
                 break FiresEnd::Failed(format!(
                     "the robot answered about run {}, not {}",
                     clean(&reply.run_id),
                     clean(&run.run_id)
                 ));
             }
-            FiresPoll::Reply(reply) => {
+            FiresAnswer::Reply { reply } => {
                 silent_since = None;
                 answered = true;
                 match reply.outcome {
@@ -1208,9 +1232,9 @@ pub fn follow_fires(
                         let (fresh, full) = stream.absorb(next, lost, &fires);
                         for rec in &fresh {
                             if json {
-                                writeln!(out, "{}", fire_json(run, now_ns, rec))?;
+                                writeln!(out, "{}", json_line(&fire_json(run, now_ns, rec)))?;
                             } else {
-                                writeln!(out, "{}", render_fire_row(&topology, now_ns, rec))?;
+                                writeln!(out, "{}", rows.render(now_ns, rec))?;
                             }
                         }
                         out.flush()?;
@@ -1231,10 +1255,10 @@ pub fn follow_fires(
                     }
                 }
             }
-            FiresPoll::Silent => {
+            FiresAnswer::Silent => {
                 silent_since.get_or_insert(pacer.elapsed());
             }
-            FiresPoll::Unusable { reason } => {
+            FiresAnswer::Unusable { reason } => {
                 break FiresEnd::Failed(format!(
                     "the robot's fires answer cannot be read ({})",
                     sanitize_refusal_reason(&reason)
@@ -1245,7 +1269,7 @@ pub fn follow_fires(
             pacer.sleep(FIRES_POLL_INTERVAL);
         }
     };
-    write_fires_summary(out, run, &stream, &end, pacer.elapsed(), json)?;
+    write_fires_summary(out, run, &stream, &end, reading_for(pacer), json)?;
     out.flush()?;
     match end {
         FiresEnd::Failed(reason) => Err(CliError::Validation(reason)),
@@ -1395,19 +1419,22 @@ impl RunsSource for ZenohPlane {
 }
 
 impl FiresSource for ZenohPlane {
-    fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresPoll> {
+    fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresAnswer> {
         let session = self
             .manager
             .session()
             .map_err(|e| CliError::Validation(format!("the session closed: {e}")))?;
-        Ok(classify_fires(
-            &cerulion_core::transport::discovery::query_robot_fires(
-                session,
-                robot,
-                run_id,
-                after,
-                FIRES_GET_WINDOW,
-            ),
+        let payloads = cerulion_core::transport::discovery::query_robot_fires(
+            session,
+            robot,
+            run_id,
+            after,
+            FIRES_GET_WINDOW,
+        );
+        Ok(gather_fires_answer(
+            robot,
+            run_id,
+            payloads.iter().map(Vec::as_slice),
         ))
     }
 }
@@ -1463,16 +1490,13 @@ impl RunsSource for NetdPlane {
 
 #[cfg(unix)]
 impl FiresSource for NetdPlane {
-    fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresPoll> {
-        self.client
-            .query_fires(robot, run_id, after)
-            .map(FiresPoll::from)
-            .map_err(|e| {
-                CliError::Validation(format!(
-                    "cerulion-netd could not answer the fires query: {}",
-                    clean(&e.to_string())
-                ))
-            })
+    fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresAnswer> {
+        self.client.query_fires(robot, run_id, after).map_err(|e| {
+            CliError::Validation(format!(
+                "cerulion-netd could not answer the fires query: {}",
+                sanitize_refusal_reason(&e.to_string())
+            ))
+        })
     }
 }
 
@@ -1493,7 +1517,8 @@ fn netd_harvest(
 ) -> CliResult<RunsHarvest> {
     let answer = client.query_runs(robot).map_err(|e| {
         CliError::Validation(format!(
-            "cerulion-netd could not answer the runs query: {e}"
+            "cerulion-netd could not answer the runs query: {}",
+            sanitize_refusal_reason(&e.to_string())
         ))
     })?;
     Ok(RunsHarvest {
@@ -1532,7 +1557,7 @@ fn fires_plane(target: &RemoteTarget) -> CliResult<Box<dyn FiresPlane>> {
     }
     #[cfg(unix)]
     {
-        Ok(Box::new(NetdPlane::open()?.serving_fires()?))
+        fires_through_netd(NetdPlane::open()?)
     }
     #[cfg(not(unix))]
     {
@@ -1540,16 +1565,32 @@ fn fires_plane(target: &RemoteTarget) -> CliResult<Box<dyn FiresPlane>> {
     }
 }
 
+/// The netd plane `graph fires` reads through: a daemon too old for the
+/// fires query is refused before anything is asked.
+#[cfg(unix)]
+fn fires_through_netd(plane: NetdPlane) -> CliResult<Box<dyn FiresPlane>> {
+    Ok(Box::new(plane.serving_fires()?))
+}
+
 /// `cerulion graph live`.
 pub fn graph_live(target: &RemoteTarget, json: bool) -> CliResult<()> {
-    let mut source = runs_source(target)?;
+    live_on_terminal(runs_source(target)?.as_mut(), target, json)
+}
+
+/// [`show_live`] on this process's stdout and stderr. Neither is locked
+/// across the ask: a source logs to stderr from the threads it joins.
+fn live_on_terminal(
+    source: &mut dyn RunsSource,
+    target: &RemoteTarget,
+    json: bool,
+) -> CliResult<()> {
     show_live(
-        source.as_mut(),
+        source,
         target,
         json,
         &AtomicBool::new(true),
-        &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
     )
 }
 
@@ -1567,7 +1608,7 @@ pub fn show_live(
     let unanswered = render_unanswered(&harvest);
     if json {
         for object in live_json(&harvest) {
-            writeln!(out, "{object}")?;
+            writeln!(out, "{}", json_line(&object))?;
         }
         write!(err, "{unanswered}")?;
     } else {
@@ -1645,15 +1686,25 @@ pub fn graph_fires(
         window: fires_window(follow, for_secs)?,
         json,
     };
-    let mut plane = fires_plane(target)?;
+    fires_on_terminal(fires_plane(target)?.as_mut(), target, &reading, &running)
+}
+
+/// [`show_fires`] on this process's stdout and stderr, neither locked across
+/// an ask (see [`live_on_terminal`]).
+fn fires_on_terminal(
+    plane: &mut dyn FiresPlane,
+    target: &RemoteTarget,
+    reading: &FiresReading<'_>,
+    running: &AtomicBool,
+) -> CliResult<()> {
     show_fires(
-        plane.as_mut(),
+        plane,
         target,
-        &reading,
-        &running,
+        reading,
+        running,
         &mut WallPacer::start(),
-        &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
     )
 }
 
@@ -1709,7 +1760,7 @@ fn utc_time(ns: u64) -> String {
 mod tests {
     use super::*;
     use cerulion_core::transport::cerulion_q::{
-        format_run_id, RunEntryState, UndescribableRun, UnusableRunsAnswer,
+        format_run_id, FiresReply, RunEntryState, UndescribableRun, UnusableRunsAnswer,
     };
 
     const TEMI_RUN_ID: u128 = 0x5d1c;
@@ -2534,6 +2585,23 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
             err(&RunsHarvest::default(), None),
             "no robot answered the runs query, so there is no run to read"
         );
+        let unread = RunsHarvest {
+            unusable: vec![UnusableRunsAnswer {
+                robot: "hostile".to_string(),
+                reason: "unknown runs wire version 2".to_string(),
+            }],
+            ..RunsHarvest::default()
+        };
+        let quiet = RunsHarvest {
+            silent: vec!["quiet".to_string()],
+            ..RunsHarvest::default()
+        };
+        for no_reply in [&unread, &quiet] {
+            assert_eq!(
+                err(no_reply, None),
+                "no robot gave a readable runs answer, so there is no run to read"
+            );
+        }
         let two = harvest(vec![reply(
             "temi",
             vec![temi_entry(), run_entry(0xbeef, "other", TEMI_RUN_JSON)],
@@ -2642,28 +2710,6 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
         assert!(read_on);
     }
 
-    // ---- classify_fires ----------------------------------------------------
-
-    /// The first answer that decodes wins; an answer that does not decode is
-    /// unusable; no answer is silence.
-    #[test]
-    fn classify_fires_takes_the_first_readable_answer() {
-        use cerulion_core::transport::cerulion_q::encode_fires_reply;
-        let good = FiresReply::new("temi", TEMI_RUN_ID, FiresOutcome::NotServed);
-        let skewed = br#"{"version":2,"robot":"temi","run_id":"0x00000000000000000000000000005d1c","outcome":{"kind":"not_served"}}"#.to_vec();
-        assert_eq!(
-            classify_fires(&[skewed.clone(), encode_fires_reply(&good)]),
-            FiresPoll::Reply(good)
-        );
-        assert_eq!(
-            classify_fires(&[skewed]),
-            FiresPoll::Unusable {
-                reason: "unknown fires wire version 2 (this binary supports 1)".to_string()
-            }
-        );
-        assert_eq!(classify_fires(&[]), FiresPoll::Silent);
-    }
-
     // ---- follow_fires ------------------------------------------------------
 
     struct FakePacer {
@@ -2683,13 +2729,18 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
 
     /// Answers each request from a script; records the cursors it was asked.
     struct ScriptedFires {
-        answers: std::collections::VecDeque<FiresPoll>,
+        answers: std::collections::VecDeque<FiresAnswer>,
         asked: Vec<Option<u64>>,
-        then: FiresPoll,
+        then: FiresAnswer,
     }
 
     impl FiresSource for ScriptedFires {
-        fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresPoll> {
+        fn fires(
+            &mut self,
+            robot: &str,
+            run_id: &str,
+            after: Option<u64>,
+        ) -> CliResult<FiresAnswer> {
             assert_eq!(
                 (robot, run_id),
                 ("temi", "0x00000000000000000000000000005d1c")
@@ -2702,22 +2753,24 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
         }
     }
 
-    fn served(now_ns: u64, next: u64, lost: u64, fires: Vec<FireRecord>) -> FiresPoll {
-        FiresPoll::Reply(FiresReply::new(
-            "temi",
-            TEMI_RUN_ID,
-            FiresOutcome::Served {
-                now_ns,
-                armed_since_ns: 1_000,
-                next,
-                lost,
-                in_tick: Vec::new(),
-                fires,
-            },
-        ))
+    fn served(now_ns: u64, next: u64, lost: u64, fires: Vec<FireRecord>) -> FiresAnswer {
+        FiresAnswer::Reply {
+            reply: FiresReply::new(
+                "temi",
+                TEMI_RUN_ID,
+                FiresOutcome::Served {
+                    now_ns,
+                    armed_since_ns: 1_000,
+                    next,
+                    lost,
+                    in_tick: Vec::new(),
+                    fires,
+                },
+            ),
+        }
     }
 
-    fn scripted(answers: Vec<FiresPoll>, then: FiresPoll) -> ScriptedFires {
+    fn scripted(answers: Vec<FiresAnswer>, then: FiresAnswer) -> ScriptedFires {
         ScriptedFires {
             answers: answers.into(),
             asked: Vec::new(),
@@ -2850,11 +2903,9 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     /// The run ends: the reading stops with the totals and no error.
     #[test]
     fn follow_fires_stops_when_the_run_ends() {
-        let ended = FiresPoll::Reply(FiresReply::new(
-            "temi",
-            TEMI_RUN_ID,
-            FiresOutcome::UnknownRun,
-        ));
+        let ended = FiresAnswer::Reply {
+            reply: FiresReply::new("temi", TEMI_RUN_ID, FiresOutcome::UnknownRun),
+        };
         let mut source = scripted(
             vec![served(1, 0, 0, Vec::new()), served(1, 0, 0, Vec::new())],
             ended,
@@ -2873,33 +2924,35 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     /// Every way the reading fails: the totals still print, then the error.
     #[test]
     fn follow_fires_fails_with_the_reason_after_the_totals() {
-        let cases: Vec<(FiresPoll, &str)> = vec![
+        let cases: Vec<(FiresAnswer, &str)> = vec![
             (
-                FiresPoll::Reply(FiresReply::new(
-                    "temi",
-                    TEMI_RUN_ID,
-                    FiresOutcome::NotServed,
-                )),
+                FiresAnswer::Reply {
+                    reply: FiresReply::new("temi", TEMI_RUN_ID, FiresOutcome::NotServed),
+                },
                 "the robot serves no fire telemetry for run 0x00000000000000000000000000005d1c",
             ),
             (
-                FiresPoll::Reply(FiresReply::new(
-                    "temi",
-                    TEMI_RUN_ID,
-                    FiresOutcome::Refused {
-                        reason: "paired\u{1b}[2J".to_string(),
-                    },
-                )),
+                FiresAnswer::Reply {
+                    reply: FiresReply::new(
+                        "temi",
+                        TEMI_RUN_ID,
+                        FiresOutcome::Refused {
+                            reason: "paired\u{1b}[2J".to_string(),
+                        },
+                    ),
+                },
                 "the robot refused the fires query (paired?[2J)",
             ),
             (
-                FiresPoll::Unusable {
+                FiresAnswer::Unusable {
                     reason: "unknown fires wire version 2".to_string(),
                 },
                 "the robot's fires answer cannot be read (unknown fires wire version 2)",
             ),
             (
-                FiresPoll::Reply(FiresReply::new("temi", 0xbeef, FiresOutcome::NotServed)),
+                FiresAnswer::Reply {
+                    reply: FiresReply::new("temi", 0xbeef, FiresOutcome::NotServed),
+                },
                 "the robot answered about run 0x0000000000000000000000000000beef, not \
                  0x00000000000000000000000000005d1c",
             ),
@@ -2918,7 +2971,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     /// A robot that stops answering is given up on after the silence limit.
     #[test]
     fn follow_fires_gives_up_on_a_silent_robot() {
-        let mut source = scripted(vec![served(1, 0, 0, Vec::new())], FiresPoll::Silent);
+        let mut source = scripted(vec![served(1, 0, 0, Vec::new())], FiresAnswer::Silent);
         let (result, _, pacer) = follow(&mut source, None, false);
         match result {
             Err(CliError::Validation(text)) => {
@@ -3081,13 +3134,15 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         assert!(render_live(&undescribable).ends_with(&format!("cannot be described ({shown})\n")));
         let mut source = scripted(
             vec![served(1, 0, 0, Vec::new())],
-            FiresPoll::Reply(FiresReply::new(
-                "temi",
-                TEMI_RUN_ID,
-                FiresOutcome::Refused {
-                    reason: forged.to_string(),
-                },
-            )),
+            FiresAnswer::Reply {
+                reply: FiresReply::new(
+                    "temi",
+                    TEMI_RUN_ID,
+                    FiresOutcome::Refused {
+                        reason: forged.to_string(),
+                    },
+                ),
+            },
         );
         match follow(&mut source, None, false).0 {
             Err(CliError::Validation(text)) => {
@@ -3098,25 +3153,67 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     }
 
     /// The characters a hostile robot puts in every string it sends: an
-    /// escape, BEL and a C1 control, the bidi and format controls that
-    /// reorder or hide text, and the Unicode line and paragraph separators.
-    const HOSTILE_CHARS: [char; 14] = [
-        '\u{1b}', '\u{7}', '\u{85}', '\u{061C}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}',
-        '\u{202A}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2068}', '\u{2069}',
+    /// escape, NUL, BEL, DEL and the C1 controls that open a terminal
+    /// sequence, the bidi and format controls that reorder, hide or join
+    /// text, and the Unicode line and paragraph separators.
+    const HOSTILE_CHARS: [char; 24] = [
+        '\u{1b}',
+        '\u{0}',
+        '\u{7}',
+        '\u{7f}',
+        '\u{85}',
+        '\u{9b}',
+        '\u{9d}',
+        '\u{ad}',
+        '\u{061C}',
+        '\u{200B}',
+        '\u{200D}',
+        '\u{200E}',
+        '\u{200F}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{202A}',
+        '\u{202D}',
+        '\u{202E}',
+        '\u{2060}',
+        '\u{2066}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{FEFF}',
+        '\u{E0041}',
     ];
-    const HOSTILE: &str = "x\u{1b}[2J\u{7}\u{85}\u{061C}\u{200E}\u{200F}\u{2028}\u{2029}\u{202A}\
-                           \u{202D}\u{202E}\u{2066}\u{2068}\u{2069}y";
-    /// [`HOSTILE`] as a JSON string body.
-    const HOSTILE_JSON: &str = r"x\u001b[2J\u0007\u0085\u061c\u200e\u200f\u2028\u2029\u202a\u202d\u202e\u2066\u2068\u2069y";
+    /// Every [`HOSTILE_CHARS`] character once: the escape opens a screen
+    /// clear, and the others follow it.
+    const HOSTILE: &str =
+        "x\u{1b}[2J\u{0}\u{7}\u{7f}\u{85}\u{9b}\u{9d}\u{ad}\u{061C}\u{200B}\u{200D}\
+                           \u{200E}\u{200F}\u{2028}\u{2029}\u{202A}\u{202D}\u{202E}\u{2060}\u{2066}\
+                           \u{2068}\u{2069}\u{FEFF}\u{E0041}y";
 
-    /// The temi `run.json` with [`HOSTILE`] in every node id and type,
-    /// every topic, the endpoint id and the host.
+    /// [`HOSTILE`] as a JSON string body.
+    fn hostile_json() -> String {
+        let quoted = serde_json::to_string(HOSTILE).expect("a string serializes");
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
+    /// The temi `run.json` with a sync node that also reads an input outside
+    /// its trigger, and [`HOSTILE`] in every node id and type, every topic,
+    /// the endpoint id and the host.
     fn hostile_run_json() -> String {
+        let hostile = hostile_json();
         TEMI_RUN_JSON
-            .replace("\"/temi/", &format!("\"/{HOSTILE_JSON}/"))
-            .replace("\"id\": \"", &format!("\"id\": \"{HOSTILE_JSON}"))
-            .replace("\"type\": \"", &format!("\"type\": \"{HOSTILE_JSON}"))
-            .replace("\"embedded\"", &format!("\"{HOSTILE_JSON}\""))
+            .replace(
+                r#""outputs": [], "reports_writes": true}"#,
+                r#""outputs": [], "reports_writes": true},
+      {"id": "fuse", "type": "temi_fuse",
+       "trigger": {"kind": "sync", "topics": ["/temi/in", "/temi/chunks"], "window_ns": 5000000},
+       "inputs": [{"name": "in", "topic": "/temi/in"}, {"name": "chunks", "topic": "/temi/chunks"},
+                  {"name": "mood", "topic": "/temi/mood"}],
+       "outputs": [], "reports_writes": true}"#,
+            )
+            .replace("\"/temi/", &format!("\"/{hostile}/"))
+            .replace("\"id\": \"", &format!("\"id\": \"{hostile}"))
+            .replace("\"type\": \"", &format!("\"type\": \"{hostile}"))
+            .replace("\"embedded\"", &format!("\"{hostile}\""))
     }
 
     fn assert_neutralized(text: &str) {
@@ -3125,7 +3222,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     }
 
     /// Answers each `fires` request from a list.
-    struct Replay(std::collections::VecDeque<FiresPoll>);
+    struct Replay(std::collections::VecDeque<FiresAnswer>);
 
     impl FiresSource for Replay {
         fn fires(
@@ -3133,14 +3230,14 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             _robot: &str,
             _run_id: &str,
             _after: Option<u64>,
-        ) -> CliResult<FiresPoll> {
-            Ok(self.0.pop_front().unwrap_or(FiresPoll::Silent))
+        ) -> CliResult<FiresAnswer> {
+            Ok(self.0.pop_front().unwrap_or(FiresAnswer::Silent))
         }
     }
 
     fn follow_replay(
         run: &SelectedRun,
-        answers: Vec<FiresPoll>,
+        answers: Vec<FiresAnswer>,
         json: bool,
     ) -> (CliResult<(FireStream, FiresEnd)>, String) {
         let mut pacer = FakePacer {
@@ -3161,14 +3258,23 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     }
 
     /// Every string a robot sends (its robot id, run ids, graph names, node
-    /// ids and types, topics, host and endpoint ids, its refusal and
-    /// undescribable reasons, and why its answers cannot be read) reaches the
-    /// terminal with no escape, line separator or bidi control left in it.
-    /// `--json` keeps the raw value, escaped by the JSON encoder.
+    /// ids and types, trigger and input topics, host and endpoint ids, its
+    /// refusal and undescribable reasons, and why its answers cannot be read)
+    /// reaches the terminal with no control, line separator, bidi or format
+    /// character left in it. `--json` keeps the value, and writes each of
+    /// those characters as a `\u` escape.
     #[test]
     fn no_robot_string_reaches_the_terminal_with_a_control_left_in_it() {
-        let as_name = format!("x\u{FFFD}[2J{}y", "\u{FFFD}".repeat(13));
-        let as_reason = format!("x?[2J{}y", "?".repeat(13));
+        assert_eq!(
+            HOSTILE
+                .chars()
+                .filter(|c| HOSTILE_CHARS.contains(c))
+                .count(),
+            HOSTILE_CHARS.len()
+        );
+        let tail = HOSTILE_CHARS.len() - 1;
+        let as_name = format!("x\u{FFFD}[2J{}y", "\u{FFFD}".repeat(tail));
+        let as_reason = format!("x?[2J{}y", "?".repeat(tail));
         let run_json = hostile_run_json();
         let view = parse_run_json(&run_json).expect("the hostile run.json reads");
         let nodes = &view.topology.as_ref().expect("a topology").nodes;
@@ -3217,50 +3323,53 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         }
 
         let run = select_run(&h, None).expect("the one run that serves fires");
-        let page = |fires: Vec<FireRecord>| {
-            FiresPoll::Reply(FiresReply {
+        let page = |fires: Vec<FireRecord>| FiresAnswer::Reply {
+            reply: FiresReply {
                 version: FIRES_WIRE_VERSION,
                 robot: HOSTILE.to_string(),
                 run_id: run.run_id.clone(),
                 outcome: FiresOutcome::Served {
                     now_ns: 9_000_000,
                     armed_since_ns: 0,
-                    next: 4,
+                    next: 5,
                     lost: 0,
                     in_tick: Vec::new(),
                     fires,
                 },
-            })
+            },
         };
         let rows = vec![
             fire(1, 1_000_000, 38_000, 0, FireCause::Period, 0, 0b1),
             fire(2, 2_000_000, 412_000, 1, FireCause::Data, 0, 0b11),
             fire(3, 3_000_000, 95_000, 2, FireCause::Data, 0, 0b1),
             fire(4, 4_000_000, 21_000, 3, FireCause::Data, 0, 0),
+            fire(5, 5_000_000, 10_000, 4, FireCause::Sync, 0, 0),
         ];
-        let hostile_reply = |outcome| {
-            FiresPoll::Reply(FiresReply {
+        let hostile_reply = |outcome| FiresAnswer::Reply {
+            reply: FiresReply {
                 version: FIRES_WIRE_VERSION,
                 robot: HOSTILE.to_string(),
                 run_id: run.run_id.clone(),
                 outcome,
-            })
+            },
         };
         let endings = [
             hostile_reply(FiresOutcome::Refused {
                 reason: HOSTILE.to_string(),
             }),
-            FiresPoll::Unusable {
+            FiresAnswer::Unusable {
                 reason: HOSTILE.to_string(),
             },
-            FiresPoll::Reply(FiresReply {
-                run_id: format!("0x9{HOSTILE}"),
-                ..FiresReply::new(HOSTILE, 9, FiresOutcome::UnknownRun)
-            }),
+            FiresAnswer::Reply {
+                reply: FiresReply {
+                    run_id: format!("0x9{HOSTILE}"),
+                    ..FiresReply::new(HOSTILE, 9, FiresOutcome::UnknownRun)
+                },
+            },
         ];
         for ending in endings {
             let (result, text) = follow_replay(&run, vec![page(rows.clone()), ending], false);
-            assert_eq!(text.lines().count(), 6, "{text}");
+            assert_eq!(text.lines().count(), 7, "{text}");
             shown.push(text);
             match result {
                 Err(CliError::Validation(reason)) => shown.push(reason),
@@ -3275,6 +3384,13 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         )));
         assert!(shown[0].contains(&format!("  {as_name}logic ")));
         assert!(shown[0].contains(&format!("→ /{as_name}/logic/edge, /{as_name}/logic/pulse")));
+        assert!(shown[0].contains(&format!(
+            "  on all of: /{as_name}/in, /{as_name}/chunks within 5 ms  → (no outputs)  \
+             (also reads /{as_name}/mood)\n"
+        )));
+        assert!(shown.iter().any(|text| text.contains(&format!(
+            " ago  {as_name}fuse     on all of: /{as_name}/in, /{as_name}/chunks within 5 ms  "
+        ))));
         assert!(shown[0].ends_with(&format!(
             "robot {as_name} · run {as_name}: cannot be described ({as_reason})\n"
         )));
@@ -3286,14 +3402,32 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             "the robot's fires answer cannot be read ({as_reason})"
         ))));
 
-        for object in live_json(&h) {
-            let line = object.to_string();
-            assert!(!line.contains(['\u{1b}', '\u{7}']), "{line}");
-            let back: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
-            assert_eq!(back, object);
-            assert_eq!(back["robot"], HOSTILE);
-        }
-        let first = &live_json(&h)[0];
+        let target = RemoteTarget {
+            connect: Vec::new(),
+            robot: Some("temi".to_string()),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        show_live(
+            &mut CannedRuns(h.clone()),
+            &target,
+            true,
+            &AtomicBool::new(true),
+            &mut out,
+            &mut err,
+        )
+        .expect("a readable answer");
+        let out = String::from_utf8(out).unwrap();
+        let objects: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| {
+                assert_neutralized(line);
+                serde_json::from_str(line).expect("valid JSON")
+            })
+            .collect();
+        assert_eq!(objects, live_json(&h));
+        assert_neutralized(&String::from_utf8(err).unwrap());
+        let first = &objects[0];
+        assert_eq!(first["robot"], HOSTILE);
         assert_eq!(first["graph_name"], HOSTILE);
         assert_eq!(first["nodes"][1]["id"], format!("{HOSTILE}logic"));
         assert_eq!(
@@ -3304,16 +3438,121 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         let fires: Vec<serde_json::Value> = text
             .lines()
             .map(|line| {
-                assert!(!line.contains(['\u{1b}', '\u{7}']), "{line}");
+                assert_neutralized(line);
                 serde_json::from_str(line).expect("valid JSON")
             })
             .collect();
+        assert_eq!(fires.len(), 6);
+        assert_eq!(fires[5]["robot"], HOSTILE);
         assert_eq!(fires[1]["node_id"], format!("{HOSTILE}logic"));
         assert_eq!(
             fires[1]["wrote_topics"][1],
             format!("/{HOSTILE}/logic/pulse")
         );
         assert_eq!(fires[1]["trigger_topics"][0], format!("/{HOSTILE}/in"));
+    }
+
+    /// Why a run's `run.json` does not read can quote the robot's own text,
+    /// so it is cut at 200 characters, with no control left in it, in
+    /// `graph live` and in the refusal of `graph fires --run`.
+    #[test]
+    fn a_run_json_that_does_not_read_is_named_in_bounded_text() {
+        let quoted = format!("{}{HOSTILE}", "z".repeat(300));
+        let entry = RunEntry {
+            run_json: format!(
+                "{{\"topology\": {}}}",
+                serde_json::to_string(&quoted).unwrap()
+            ),
+            ..temi_entry()
+        };
+        let shown = render_live(&reply("temi", vec![entry.clone()]));
+        assert_neutralized(&shown);
+        let prefix = "  run.json does not read (";
+        let line = shown
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no run.json line in {shown}"));
+        assert_eq!(line.chars().count(), prefix.len() + 200 + 2, "{line}");
+        assert!(line.ends_with("z\u{2026})"), "{line}");
+
+        match select_run(&harvest(vec![reply("temi", vec![entry])]), Some("temi")) {
+            Err(CliError::Validation(text)) => {
+                assert_neutralized(&text);
+                let prefix = "run 0x00000000000000000000000000005d1c (graph temi on robot temi): \
+                              its run.json does not read (";
+                assert!(text.starts_with(prefix), "{text}");
+                assert_eq!(text.chars().count(), prefix.len() + 200 + 2, "{text}");
+                assert!(text.ends_with("z\u{2026})"), "{text}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A robot name, id or topic longer than the display limit is cut with a
+    /// marker on the terminal, so one long string cannot flood it or widen
+    /// every fire row. `--json` keeps the whole value.
+    #[test]
+    fn a_long_robot_string_is_cut_on_the_terminal() {
+        let cut = |c: &str| format!("{}\u{2026}", c.repeat(DISPLAY_LIMIT));
+        let mut topology = temi_topology();
+        topology.nodes[0].id = "n".repeat(20_000);
+        let now = 88_123_456_789;
+        let beat = render_fire_row(
+            &topology,
+            now,
+            &fire(5120, 88_011_456_789, 38_211, 0, FireCause::Period, 0, 0b1),
+        );
+        assert!(
+            beat.starts_with(&format!("  0.112 s ago  {}  every 1 s  ", cut("n"))),
+            "{beat}"
+        );
+        let logic = render_fire_row(
+            &topology,
+            now,
+            &fire(5121, 88_123_000_000, 412_003, 1, FireCause::Data, 0, 0b01),
+        );
+        assert_eq!(
+            logic,
+            format!(
+                "  0.000 s ago  {:<w$}  on /temi/in             412 µs  wrote /temi/logic/edge",
+                "logic",
+                w = DISPLAY_LIMIT + 1
+            )
+        );
+
+        let entry = RunEntry {
+            graph_name: "g".repeat(300_000),
+            ..temi_entry()
+        };
+        let answered = reply("temi", vec![entry]);
+        let shown = render_live(&answered);
+        assert!(
+            shown.starts_with(&format!(
+                "robot temi · run 0x00000000000000000000000000005d1c · graph {} · live",
+                cut("g")
+            )),
+            "{}",
+            shown.chars().take(200).collect::<String>()
+        );
+        let longest = shown.lines().map(|l| l.chars().count()).max();
+        assert!(longest < Some(2 * DISPLAY_LIMIT), "{longest:?}");
+        let objects = live_json(&harvest(vec![answered.clone()]));
+        assert_eq!(
+            objects[0]["graph_name"].as_str().map(str::len),
+            Some(300_000)
+        );
+
+        let run = select_run(&harvest(vec![answered]), None).expect("the temi run");
+        let (_, text) = follow_replay(&run, Vec::new(), false);
+        let header = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            header,
+            format!(
+                "fires of run 0x00000000000000000000000000005d1c (graph {}) on robot temi; the \
+                 robot records while this desk asks",
+                cut("g")
+            )
+        );
     }
 
     /// A run whose fire telemetry or topology is a version this desk does
@@ -3399,7 +3638,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     #[test]
     fn a_window_ends_only_after_an_answered_ask() {
         for window in [Duration::from_secs(1), Duration::from_secs(3)] {
-            let mut source = scripted(Vec::new(), FiresPoll::Silent);
+            let mut source = scripted(Vec::new(), FiresAnswer::Silent);
             let (result, out, pacer) = follow(&mut source, Some(window), false);
             match result {
                 Err(CliError::Validation(text)) => {
@@ -3411,7 +3650,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             assert!(out.ends_with("0 fires in 3.0 s · 0 lost · the robot stops recording 5 s after the last ask\n"), "{out}");
         }
 
-        let mut source = scripted(vec![served(1, 0, 0, Vec::new())], FiresPoll::Silent);
+        let mut source = scripted(vec![served(1, 0, 0, Vec::new())], FiresAnswer::Silent);
         match follow(&mut source, Some(Duration::from_secs(3)), true).0 {
             Err(CliError::Validation(text)) => {
                 assert_eq!(text, "the robot stopped answering the fires query for 3 s")
@@ -3421,7 +3660,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
 
         let quiet = || served(1, 0, 0, Vec::new());
         let mut source = scripted(
-            vec![quiet(), quiet(), quiet(), FiresPoll::Silent, quiet()],
+            vec![quiet(), quiet(), quiet(), FiresAnswer::Silent, quiet()],
             quiet(),
         );
         let (result, _, pacer) = follow(&mut source, Some(Duration::from_secs(1)), false);
@@ -3439,7 +3678,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     fn an_answer_resets_the_silence_limit() {
         let mut answers = Vec::new();
         for _ in 0..3 {
-            answers.extend(std::iter::repeat_with(|| FiresPoll::Silent).take(10));
+            answers.extend(std::iter::repeat_with(|| FiresAnswer::Silent).take(10));
             answers.push(served(1, 0, 0, Vec::new()));
         }
         let mut source = scripted(answers, served(1, 0, 0, Vec::new()));
@@ -3687,6 +3926,163 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         }
     }
 
+    /// A runs source that asks on a worker thread and joins it, as the zenoh
+    /// plane asks each robot. The worker writes to stderr the way a log line
+    /// does, which takes the process's stderr lock.
+    struct LoggingRuns;
+
+    impl RunsSource for LoggingRuns {
+        fn runs(&mut self, _robot: Option<&str>, _running: &AtomicBool) -> CliResult<RunsHarvest> {
+            std::thread::scope(|s| s.spawn(|| std::io::stderr().write_all(b"")).join())
+                .expect("the worker finishes")?;
+            Ok(RunsHarvest::default())
+        }
+    }
+
+    /// `graph live` holds no lock on stdout or stderr while it asks, so a
+    /// source that logs from a thread it joins cannot hang the command.
+    #[test]
+    fn graph_live_holds_no_terminal_lock_while_it_asks() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let target = RemoteTarget {
+                connect: Vec::new(),
+                robot: Some("temi".to_string()),
+            };
+            let _ = done.send(live_on_terminal(&mut LoggingRuns, &target, false).is_err());
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "graph live did not finish: it waits for a worker that waits for stderr"
+        );
+    }
+
+    impl FiresSource for LoggingRuns {
+        fn fires(
+            &mut self,
+            _robot: &str,
+            _run_id: &str,
+            _after: Option<u64>,
+        ) -> CliResult<FiresAnswer> {
+            Ok(FiresAnswer::Silent)
+        }
+    }
+
+    /// `graph fires` holds no lock on stdout or stderr while it asks either.
+    #[test]
+    fn graph_fires_holds_no_terminal_lock_while_it_asks() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let target = RemoteTarget {
+                connect: Vec::new(),
+                robot: Some("temi".to_string()),
+            };
+            let reading = FiresReading {
+                run: None,
+                window: Some(Duration::from_secs(1)),
+                json: false,
+            };
+            let running = AtomicBool::new(true);
+            let result = fires_on_terminal(&mut LoggingRuns, &target, &reading, &running);
+            let _ = done.send(result.is_err());
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "graph fires did not finish: it waits for a worker that waits for stderr"
+        );
+    }
+
+    /// The clock a reading runs on, shared with a plane whose runs ask takes
+    /// time on it.
+    #[derive(Clone, Default)]
+    struct SharedClock(std::rc::Rc<std::cell::Cell<Duration>>);
+
+    impl Pacer for SharedClock {
+        fn elapsed(&self) -> Duration {
+            self.0.get()
+        }
+        fn sleep(&mut self, d: Duration) {
+            self.0.set(self.0.get() + d);
+        }
+    }
+
+    /// A plane whose runs ask takes 2.5 s on its clock and answers the temi
+    /// run, and whose fires answers come from a script.
+    struct SlowRunsPlane {
+        clock: SharedClock,
+        fires: ScriptedFires,
+    }
+
+    impl RunsSource for SlowRunsPlane {
+        fn runs(&mut self, _robot: Option<&str>, _running: &AtomicBool) -> CliResult<RunsHarvest> {
+            self.clock.sleep(Duration::from_millis(2_500));
+            Ok(harvest(vec![reply("temi", vec![temi_entry()])]))
+        }
+    }
+
+    impl FiresSource for SlowRunsPlane {
+        fn fires(
+            &mut self,
+            robot: &str,
+            run_id: &str,
+            after: Option<u64>,
+        ) -> CliResult<FiresAnswer> {
+            self.fires.fires(robot, run_id, after)
+        }
+    }
+
+    /// `--for` reads that long from the first fires ask: a runs answer that
+    /// takes as long as the window neither ends the reading before it asks
+    /// nor shortens it.
+    #[test]
+    fn the_reading_window_starts_at_the_first_fires_ask() {
+        let clock = SharedClock::default();
+        let mut plane = SlowRunsPlane {
+            clock: clock.clone(),
+            fires: scripted(
+                vec![served(
+                    2_250_000_000,
+                    5121,
+                    0,
+                    vec![
+                        fire(5120, 2_138_000_000, 38_211, 0, FireCause::Period, 0, 1),
+                        fire(5121, 2_200_000_000, 412_003, 1, FireCause::Data, 0, 1),
+                    ],
+                )],
+                served(2_500_000_000, 5121, 0, Vec::new()),
+            ),
+        };
+        let target = RemoteTarget {
+            connect: Vec::new(),
+            robot: Some("temi".to_string()),
+        };
+        let reading = FiresReading {
+            run: None,
+            window: Some(Duration::from_secs(2)),
+            json: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        show_fires(
+            &mut plane,
+            &target,
+            &reading,
+            &AtomicBool::new(true),
+            &mut clock.clone(),
+            &mut out,
+            &mut err,
+        )
+        .expect("a reading that ends with its window");
+        assert_eq!(plane.fires.asked.len(), 8, "one ask every 250 ms for 2 s");
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out.lines().last(),
+            Some("2 fires in 2.0 s · 0 lost · the robot stops recording 5 s after the last ask"),
+            "{out}"
+        );
+    }
+
     /// Without `--connect`, `graph live` reads one runs answer from
     /// `cerulion-netd`: here a fake daemon on a socket of its own.
     #[cfg(unix)]
@@ -3805,15 +4201,10 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         })
     }
 
-    /// netd's fires answer carrying `poll`.
+    /// netd's fires answer carrying `answer`.
     #[cfg(unix)]
-    fn netd_fires(poll: FiresPoll) -> NetdAnswer {
-        use cerulion_netd::protocol::{FiresAnswer, FiresQueryResponse, Response};
-        let answer = match poll {
-            FiresPoll::Reply(reply) => FiresAnswer::Reply { reply },
-            FiresPoll::Silent => FiresAnswer::Silent,
-            FiresPoll::Unusable { reason } => FiresAnswer::Unusable { reason },
-        };
+    fn netd_fires(answer: FiresAnswer) -> NetdAnswer {
+        use cerulion_netd::protocol::{FiresQueryResponse, Response};
         Box::new(move |id| Response::FiresQuery(FiresQueryResponse { id, answer }))
     }
 
@@ -3869,12 +4260,10 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                         fire(5121, 2_200_000_000, 412_003, 1, FireCause::Data, 0, 1),
                     ],
                 )),
-                netd_fires(FiresPoll::Silent),
-                netd_fires(FiresPoll::Reply(FiresReply::new(
-                    "temi",
-                    TEMI_RUN_ID,
-                    FiresOutcome::UnknownRun,
-                ))),
+                netd_fires(FiresAnswer::Silent),
+                netd_fires(FiresAnswer::Reply {
+                    reply: FiresReply::new("temi", TEMI_RUN_ID, FiresOutcome::UnknownRun),
+                }),
             ],
         );
         let mut plane = NetdPlane::over(client)
@@ -3923,7 +4312,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
     #[test]
     fn graph_fires_refuses_a_netd_too_old_for_fires_before_asking_anything() {
         let (_dir, client, daemon) = fake_netd(9, vec![Box::new(netd_runs)]);
-        match NetdPlane::over(client).serving_fires() {
+        match fires_through_netd(NetdPlane::over(client)) {
             Err(CliError::Validation(text)) => assert_eq!(
                 text,
                 "the cerulion-netd on this machine speaks protocol 9, and reading fires through \
@@ -3969,6 +4358,141 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                 && totals
                     .ends_with(" s · 0 lost · the robot stops recording 5 s after the last ask"),
             "{out}"
+        );
+    }
+
+    /// What `cerulion-netd` says when it cannot answer is shown with no
+    /// control left in it and cut at 200 characters, for the runs query and
+    /// for the fires query.
+    #[cfg(unix)]
+    #[test]
+    fn a_netd_error_is_shown_neutralized_and_bounded() {
+        use cerulion_netd::protocol::{Response, PROTOCOL_VERSION};
+        let failing = || -> NetdAnswer {
+            Box::new(|id| {
+                Response::error(
+                    Some(id),
+                    format!("{HOSTILE}{}", "e".repeat(300)),
+                    None,
+                    None,
+                )
+            })
+        };
+        let (_dir, client, daemon) =
+            fake_netd(PROTOCOL_VERSION, vec![Box::new(netd_runs), failing()]);
+        let mut plane = fires_through_netd(NetdPlane::over(client))
+            .expect("a daemon at this protocol serves fires");
+        let (result, _, _) = read_fires(plane.as_mut());
+        drop(plane);
+        assert_eq!(daemon.join().expect("the daemon ends").len(), 2);
+        let fires_error = match result {
+            Err(CliError::Validation(text)) => text,
+            other => panic!("expected the netd failure, got {other:?}"),
+        };
+
+        let (_dir, client, daemon) = fake_netd(PROTOCOL_VERSION, vec![failing()]);
+        let mut plane = NetdPlane::over(client);
+        let runs_error = match plane.runs(Some("temi"), &AtomicBool::new(true)) {
+            Err(CliError::Validation(text)) => text,
+            other => panic!("expected the netd failure, got {other:?}"),
+        };
+        drop(plane);
+        assert_eq!(daemon.join().expect("the daemon ends").len(), 1);
+
+        for (text, prefix) in [
+            (
+                fires_error,
+                "cerulion-netd could not answer the fires query: ",
+            ),
+            (
+                runs_error,
+                "cerulion-netd could not answer the runs query: ",
+            ),
+        ] {
+            assert_neutralized(&text);
+            assert!(
+                text.starts_with(&format!("{prefix}cerulion-netd error: x?[2J")),
+                "{text}"
+            );
+            assert_eq!(text.chars().count(), prefix.len() + 201, "{text}");
+            assert!(text.ends_with("e\u{2026}"), "{text}");
+        }
+    }
+
+    /// A robot on loopback that answers every `fires` GET with one payload.
+    struct FiresRobot {
+        locator: String,
+        _session: zenoh::Session,
+    }
+
+    impl FiresRobot {
+        fn answering(payload: Vec<u8>) -> Self {
+            use zenoh::Wait;
+            for attempt in 1..=3 {
+                let locator = closed_locator();
+                let mut config = zenoh::Config::default();
+                config.insert_json5("mode", "\"peer\"").expect("mode");
+                config
+                    .insert_json5("listen/endpoints", &format!("[\"{locator}\"]"))
+                    .expect("listen");
+                config
+                    .insert_json5("scouting/multicast/enabled", "false")
+                    .expect("scouting");
+                let session = match zenoh::open(config).wait() {
+                    Ok(session) => session,
+                    Err(e) => {
+                        eprintln!("attempt {attempt}: the robot did not open on {locator}: {e}");
+                        continue;
+                    }
+                };
+                let payload = payload.clone();
+                session
+                    .declare_queryable("cerulion_q/temi/fires/**")
+                    .callback(move |query| {
+                        let _ = query
+                            .reply(query.key_expr().clone(), payload.clone())
+                            .wait();
+                    })
+                    .background()
+                    .wait()
+                    .expect("the fires queryable");
+                return Self {
+                    locator,
+                    _session: session,
+                };
+            }
+            panic!("the robot did not open in 3 attempts");
+        }
+    }
+
+    /// `graph fires --connect` reads a robot's fires answer through the same
+    /// fold as `cerulion-netd`: an answer about another run cannot be read,
+    /// for the reason netd gives.
+    #[test]
+    fn the_connect_path_folds_a_fires_answer_as_cerulion_netd_does() {
+        use cerulion_core::transport::cerulion_q::{encode_fires_reply, gather_fires_answer};
+        let asked = format_run_id(TEMI_RUN_ID);
+        let about_another =
+            encode_fires_reply(&FiresReply::new("temi", 0xb, FiresOutcome::NotServed));
+        let robot = FiresRobot::answering(about_another.clone());
+        let mut plane =
+            ZenohPlane::open(std::slice::from_ref(&robot.locator)).expect("the desk session opens");
+        let answer = (0..20)
+            .map(|_| plane.fires("temi", &asked, None).expect("the desk asks"))
+            .find(|answer| *answer != FiresAnswer::Silent)
+            .expect("the robot answers within 20 asks");
+        assert_eq!(
+            answer,
+            gather_fires_answer("temi", &asked, [about_another.as_slice()])
+        );
+        assert_eq!(
+            answer,
+            FiresAnswer::Unusable {
+                reason: format!(
+                    "the robot answered about run {} when asked about run {asked}",
+                    format_run_id(0xb)
+                )
+            }
         );
     }
 

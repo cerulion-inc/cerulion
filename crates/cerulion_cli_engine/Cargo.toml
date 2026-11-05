@@ -300,3 +300,15 @@ cerulion_bag = { workspace = true, features = ["test-helpers"] }
 # from `cerulion_cli_engine`'s integration tests. See
 # `reference_tracing_test_no_env_filter.md`.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# A robot on loopback that answers the `fires` GET with bytes a real gateway
+# never sends, so a test reads what `graph fires --connect` makes of them.
+# Same version and features as cerulion_core's zenoh, so the build graph does
+# not change.
+zenoh = { version = "1.10.1", default-features = false, features = [
+    "transport_tcp",
+    "transport_quic",
+    "transport_quic_datagram",
+    "transport_udp",
+    "transport_tls",
+    "unstable",
+] }
