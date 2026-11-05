@@ -10633,8 +10633,9 @@ fn supervisor_precreate_error(
 }
 
 /// For `--single-process`: put every native node in one process group when
-/// that process splits into more than one executor unit, and say so. Returns
-/// whether it did. A non-real time source, the lockstep execution mode, a
+/// that process splits into more than one executor unit, and say so, with what
+/// the flag opts out of (the auto-partition default, or the declared
+/// `process_groups:`). Returns whether it did. A non-real time source, the lockstep execution mode, a
 /// non-Unix host or a graph that is one unit keeps the single-process
 /// monolith (one level loop).
 fn single_process_hosts_units(
@@ -10696,11 +10697,24 @@ fn single_process_hosts_units(
     if !units.plan.splits_any() {
         return Ok(false);
     }
-    tracing::info!(
-        graph = %config.identity(),
-        units = units.plan.units.get(&host).map_or(0, Vec::len),
-        "--single-process: every node runs in one worker process, on its executor units"
-    );
+    // A graph that splits never reaches the monolith arm of the deployment
+    // match, which announces the opt-out, so this line carries it.
+    let unit_count = units.plan.units.get(&host).map_or(0, Vec::len);
+    if config.has_process_groups() {
+        tracing::info!(
+            graph = %config.identity(),
+            units = unit_count,
+            "--single-process: every node runs in one worker process, on its executor units, \
+             despite `process_groups:` (the declared groups are not executed)"
+        );
+    } else {
+        tracing::info!(
+            graph = %config.identity(),
+            units = unit_count,
+            "--single-process: every node runs in one worker process, on its executor units (no \
+             `process_groups:` in the graph; the multi-process auto-partition default is skipped)"
+        );
+    }
     *config = one;
     Ok(true)
 }
