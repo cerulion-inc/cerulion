@@ -16275,6 +16275,19 @@ fn resolve_recording_paths(record_dir: &Path, graph_name: &str, now: Duration) -
 /// # Errors
 ///
 /// [`CliError::Validation`] when `serde_yaml` cannot serialize the config.
+///
+/// # Examples
+///
+/// ```
+/// use cerulion_cli_engine::graph_cmd::render_effective_graph_yaml;
+/// use cerulion_core::graph::parse_graph;
+///
+/// let yaml = "name: lobby\nprefix: lobby\nnodes:\n  - {id: beat, type: lobby_beat}\n";
+/// let config = parse_graph(yaml)?;
+/// let rendered = render_effective_graph_yaml(&config)?;
+/// assert_eq!(parse_graph(&rendered)?.identity(), "lobby");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[cfg(unix)]
 pub fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
     serde_yaml::to_string(config).map_err(|e| {
@@ -26757,9 +26770,10 @@ nodes:
         );
     }
 
-    /// A hosted run serves this render as its `graph.yaml`, and a desk reads it
-    /// with `parse_graph`: the graph's `name:` (its identity on a stemless
-    /// parse), prefix and wiring come back, and a second render is identical.
+    /// A hosted run serves this render as its `graph.yaml`, so a reader that
+    /// re-parses it with `parse_graph` gets the same graph: its `name:` (the
+    /// identity on a stemless parse), prefix and wiring come back, and a
+    /// second render is identical.
     #[cfg(unix)]
     #[test]
     fn the_effective_graph_yaml_round_trips_parse_graph_with_its_name() {

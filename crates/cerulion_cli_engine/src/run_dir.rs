@@ -1859,7 +1859,9 @@ pub struct HostedRunSpec<'a> {
     pub lan_access: &'a str,
     /// The run's non-node participants.
     pub endpoints: &'a [RunEndpoint],
-    /// The built runtime's topology, nodes in fire-record index order.
+    /// The built runtime's topology, nodes in fire-record index order. Take it
+    /// after `GraphRuntime::install_fire_tap`: the install sets each node's
+    /// `reports_writes`, so an earlier snapshot says false for every node.
     pub topology: &'a RunTopology,
     /// `None` when the run serves no fire telemetry; the manifest then has no
     /// `telemetry` key.
@@ -3970,6 +3972,28 @@ mod tests {
         assert_eq!(
             doc["topology"],
             serde_json::json!({"version": 1, "nodes": []})
+        );
+    }
+
+    /// `telemetry` carries each of the host's own three fires numbers, never a
+    /// default, and the manifest's own `version` stays the run.json version.
+    #[test]
+    fn a_hosted_manifest_declares_the_fire_telemetry_the_host_gives() {
+        let topology = lobby_topology();
+        let fires = FireTelemetryDecl {
+            version: 7,
+            capacity: 64,
+            lease_ms: 1234,
+        };
+        let doc = hosted_doc(&hosted_spec(&[], &topology, Some(fires)));
+        assert_eq!(
+            doc["telemetry"],
+            serde_json::json!({"fires": {"version": 7, "capacity": 64, "lease_ms": 1234}})
+        );
+        assert_eq!(
+            doc["version"],
+            serde_json::json!(1),
+            "the manifest version stays the run.json version"
         );
     }
 
