@@ -3032,13 +3032,18 @@ mod schema_serving_handles_tests {
 
 #[cfg(test)]
 mod hosted_runs_tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use zenoh::Wait;
+
     use super::{GatewayEgressPolicy, GatewayPlan, GatewayRuntime};
+    use crate::clock::VirtualClock;
+    use crate::fire_tap::{FireBody, FireCause, FireFlags, FireRecord, FireTap, FireTapConfig};
     use crate::transport::cerulion_q::{
-        RunEntry, RunEntryState, RunsCompleteness, RunsGatherOutcome, RunsReply,
+        decode_fires_reply, fires_selector, FiresOutcome, FiresReply, RunEntry, RunEntryState,
+        RunsCompleteness, RunsGatherOutcome, RunsReply,
     };
     use crate::transport::demand_authorizer::LanAccess;
     use crate::transport::discovery::query_robot_runs;
@@ -3135,6 +3140,7 @@ mod hosted_runs_tests {
             HostedRun {
                 entry,
                 live: Arc::new(AtomicBool::new(true)),
+                fires: None,
             },
         );
         let served = gateway.runs_serve_for_test(ROBOT);
@@ -3174,6 +3180,7 @@ mod hosted_runs_tests {
             HostedRun {
                 entry,
                 live: Arc::new(AtomicBool::new(true)),
+                fires: None,
             },
         );
         let desk = NetworkManager::new(NetworkConfig {
@@ -3215,6 +3222,137 @@ mod hosted_runs_tests {
                 error: None,
             },
             "a withdrawn run leaves the settled empty answer of an idle machine"
+        );
+    }
+
+    /// GET `fires` over the wire until a decoded reply satisfies `done`. Every
+    /// reply must arrive on the key the GET asked on.
+    fn fires_until(
+        session: &zenoh::Session,
+        run_id: &str,
+        after: Option<u64>,
+        done: impl Fn(&FiresReply) -> bool,
+    ) -> FiresReply {
+        let selector = fires_selector(ROBOT, run_id, after);
+        let deadline = Instant::now() + WIRE_CEILING;
+        let mut last = String::from("no GET issued");
+        while Instant::now() < deadline {
+            match session
+                .get(&selector)
+                .timeout(Duration::from_millis(500))
+                .wait()
+            {
+                Ok(replies) => {
+                    while let Ok(reply) = replies.recv() {
+                        match reply.into_result() {
+                            Ok(sample) => {
+                                assert_eq!(sample.key_expr().as_str(), selector);
+                                match decode_fires_reply(&sample.payload().to_bytes()) {
+                                    Ok(reply) if done(&reply) => return reply,
+                                    other => last = format!("{other:?}"),
+                                }
+                            }
+                            Err(error) => last = format!("an error reply: {error:?}"),
+                        }
+                    }
+                }
+                Err(error) => last = format!("the GET failed: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no matching fires reply over the wire within {WIRE_CEILING:?}; last {last}");
+    }
+
+    #[test]
+    fn a_desk_get_over_loopback_reads_the_fires_of_the_run_hosted_on_the_gateways_network() {
+        let (manager, _gateway, port) = listening_gateway();
+        let network = manager.network().expect("a configured network");
+        network.set_lan_access(LanAccess::Open);
+        let clock = Arc::new(VirtualClock::new());
+        clock.set(1_000);
+        let tap = Arc::new(FireTap::new(
+            FireTapConfig {
+                capacity: 64,
+                lease: Duration::from_secs(5),
+            },
+            2,
+            vec![Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))],
+            clock,
+        ));
+        let entry = RunEntry::new(
+            0x7e43,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+        let guard = network.hosted_runs().host(
+            0x7e43,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+                fires: Some(Arc::clone(&tap)),
+            },
+        );
+        let desk = NetworkManager::new(NetworkConfig {
+            connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+            ..NetworkConfig::default()
+        });
+        let session = desk.session().expect("desk session connects");
+        let run_id = "0x00000000000000000000000000007e43";
+        let served = |next, fires| FiresReply {
+            version: 1,
+            robot: ROBOT.to_string(),
+            run_id: run_id.to_string(),
+            outcome: FiresOutcome::Served {
+                now_ns: 1_000,
+                armed_since_ns: 1_000,
+                next,
+                lost: 0,
+                in_tick: Vec::new(),
+                fires,
+            },
+        };
+
+        assert_eq!(
+            fires_until(session, run_id, None, |_| true),
+            served(0, Vec::new())
+        );
+        assert!(tap.stats().armed, "the GET armed the tap");
+
+        tap.push(FireBody {
+            at_ns: 1_100,
+            dur_ns: 500,
+            node: 1,
+            cause: FireCause::Data,
+            flags: FireFlags(0),
+            wrote: 0b1,
+        });
+        assert_eq!(
+            fires_until(session, run_id, Some(0), |_| true),
+            served(
+                1,
+                vec![FireRecord {
+                    seq: 1,
+                    at_ns: 1_100,
+                    dur_ns: 500,
+                    node: 1,
+                    cause: FireCause::Data,
+                    flags: FireFlags(0),
+                    wrote: 0b1,
+                }]
+            )
+        );
+
+        drop(guard);
+        let gone = fires_until(session, run_id, Some(1), |reply| {
+            reply.outcome == FiresOutcome::UnknownRun
+        });
+        assert_eq!(
+            gone.run_id, run_id,
+            "a withdrawn run is unknown to the next GET"
         );
     }
 }
