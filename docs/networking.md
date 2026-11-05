@@ -168,7 +168,10 @@ daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
 parse), opening no discovery session of their own. `cerulion viz --robot`
 refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
 `CERULION_VIZD_NETWORK=off`, and `cerulion pair` refuses under
-`CERULION_NETWORK`.
+`CERULION_NETWORK`. `cerulion graph live` and `cerulion graph fires` refuse
+under `CERULION_NETWORK` or `CERULION_NETD_NETWORK=off` before they contact
+`cerulion-netd` or a `--connect` locator, so no runs or fires query reaches a
+robot and no robot starts recording fires.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and
