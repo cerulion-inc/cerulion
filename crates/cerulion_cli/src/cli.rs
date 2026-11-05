@@ -1843,7 +1843,8 @@ pub enum GraphAction {
         /// Read until Ctrl+C.
         #[arg(long, conflicts_with = "for_secs")]
         follow: bool,
-        /// Read for SECS seconds.
+        /// Read for SECS seconds. A robot that is not answering when they end
+        /// gets up to 3 s more to answer.
         #[arg(long = "for", value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         for_secs: Option<u64>,
         /// Print one JSON object per fire (ids, names, topics and numbers),

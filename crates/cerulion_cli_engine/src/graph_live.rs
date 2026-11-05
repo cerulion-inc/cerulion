@@ -13,12 +13,14 @@
 //! Every string a robot sends passes through the terminal sanitizer before
 //! it is printed.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
+use cerulion_core::graph::RUN_TOPOLOGY_VERSION;
 use cerulion_core::transport::cerulion_q::{
     decode_fires_reply, parse_run_id, FiresOutcome, FiresReply, RunEntry, RunsCompleteness,
     RunsReply, FIRES_WIRE_VERSION, MAX_FIRES_PER_REPLY,
@@ -27,7 +29,7 @@ use cerulion_core::transport::discovery::RunsHarvest;
 use serde::Deserialize;
 
 use crate::error::{CliError, CliResult};
-use crate::topic_cmd::sanitize_display;
+use crate::topic_cmd::{sanitize_display, sanitize_refusal_reason};
 
 /// How often `graph fires` asks the run for new fires.
 pub const FIRES_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -316,7 +318,7 @@ pub fn render_live(reply: &RunsReply) -> String {
     if let Some(reason) = &reply.error {
         return format!(
             "robot {robot}: refused the runs query ({})\n",
-            clean(reason)
+            sanitize_refusal_reason(reason)
         );
     }
     let mut out = reply
@@ -348,7 +350,7 @@ pub fn render_live(reply: &RunsReply) -> String {
         out.push_str(&format!(
             "robot {robot} · run {}: cannot be described ({})\n",
             clean(&run.run_id),
-            clean(&run.reason)
+            sanitize_refusal_reason(&run.reason)
         ));
     }
     out
@@ -377,11 +379,26 @@ fn render_run(robot: &str, entry: &RunEntry) -> String {
         }
     };
     out.push_str(&render_nodes(view.topology.as_ref(), &view.endpoints));
+    if let Some(version) = unknown_topology_version(&view) {
+        out.push_str(&format!(
+            "  the node rows follow topology version {version}, and this cerulion reads version \
+             {RUN_TOPOLOGY_VERSION}, so they can be wrong; update cerulion on this machine\n"
+        ));
+    }
     out.push_str(&format!(
         "  fire telemetry: {}\n",
         telemetry_label(&view.telemetry)
     ));
     out
+}
+
+/// The run's topology version when this desk does not read it. A new version
+/// can change what a node index or a write bit means.
+fn unknown_topology_version(view: &RunView) -> Option<u32> {
+    view.topology
+        .as_ref()
+        .map(|t| t.version)
+        .filter(|version| *version != RUN_TOPOLOGY_VERSION)
 }
 
 fn render_nodes(topology: Option<&TopologyView>, endpoints: &[EndpointView]) -> String {
@@ -602,8 +619,12 @@ fn ports_json(ports: &[PortView]) -> serde_json::Value {
         .collect()
 }
 
+/// A run object. A `run.json` that does not read gives `run_json_readable:
+/// false` and nulls, so it is not taken for a run whose host reports no nodes.
 fn run_object(robot: &str, entry: &RunEntry) -> serde_json::Value {
-    let view = parse_run_json(&entry.run_json).unwrap_or_default();
+    let view = parse_run_json(&entry.run_json);
+    let readable = view.is_ok();
+    let view = view.unwrap_or_default();
     let nodes = view.topology.as_ref().map(|t| {
         t.nodes
             .iter()
@@ -621,20 +642,21 @@ fn run_object(robot: &str, entry: &RunEntry) -> serde_json::Value {
             })
             .collect::<Vec<_>>()
     });
-    let endpoints: Vec<serde_json::Value> = view
-        .endpoints
-        .iter()
-        .map(|e| {
-            let topics = |ports: &[EndpointPortView]| {
-                ports.iter().map(|p| p.topic.clone()).collect::<Vec<_>>()
-            };
-            serde_json::json!({
-                "id": e.id,
-                "publishes": topics(&e.publishes),
-                "subscribes": topics(&e.subscribes),
+    let endpoints: Option<Vec<serde_json::Value>> = readable.then(|| {
+        view.endpoints
+            .iter()
+            .map(|e| {
+                let topics = |ports: &[EndpointPortView]| {
+                    ports.iter().map(|p| p.topic.clone()).collect::<Vec<_>>()
+                };
+                serde_json::json!({
+                    "id": e.id,
+                    "publishes": topics(&e.publishes),
+                    "subscribes": topics(&e.subscribes),
+                })
             })
-        })
-        .collect();
+            .collect()
+    });
     let fires = view.telemetry.fires.as_ref().map(|f| {
         serde_json::json!({"version": f.version, "capacity": f.capacity, "lease_ms": f.lease_ms})
     });
@@ -645,7 +667,9 @@ fn run_object(robot: &str, entry: &RunEntry) -> serde_json::Value {
         "graph_name": entry.graph_name,
         "state": entry.state,
         "run_started_at_ns": entry.run_started_at_ns,
+        "run_json_readable": readable,
         "host": view.host,
+        "topology_version": view.topology.as_ref().map(|t| t.version),
         "nodes": nodes,
         "endpoints": endpoints,
         "fires": fires,
@@ -767,24 +791,71 @@ fn readable_fires_run(robot: &str, entry: &RunEntry) -> CliResult<SelectedRun> {
             ))
         }
     };
-    match &view.telemetry.fires {
-        None => refuse(format!(
+    match (&view.telemetry.fires, unknown_topology_version(&view)) {
+        (None, _) => refuse(format!(
             "run {} serves no fire telemetry",
             describe_run(robot, entry)
         )),
-        Some(decl) if decl.version != FIRES_WIRE_VERSION => refuse(format!(
+        (Some(decl), _) if decl.version != FIRES_WIRE_VERSION => refuse(format!(
             "run {} serves fire telemetry version {}, and this cerulion reads version \
              {FIRES_WIRE_VERSION}; update cerulion on this machine",
             describe_run(robot, entry),
             decl.version
         )),
-        Some(_) => Ok(SelectedRun {
+        (Some(_), Some(version)) => refuse(format!(
+            "run {} describes its nodes in topology version {version}, and this cerulion \
+             reads version {RUN_TOPOLOGY_VERSION}; update cerulion on this machine",
+            describe_run(robot, entry)
+        )),
+        (Some(_), None) => Ok(SelectedRun {
             robot: robot.to_string(),
             run_id: entry.run_id.clone(),
             graph_name: entry.graph_name.clone(),
             view,
         }),
     }
+}
+
+/// Why one robot's answer gave no run: it refused, its answer is
+/// incomplete, or it has no live run. Each run it cannot describe is named.
+fn no_run_reason(reply: &RunsReply) -> String {
+    let robot = clean(&reply.robot);
+    let mut reason = match (&reply.error, reply.completeness) {
+        (Some(refusal), _) => format!(
+            "robot {robot} refused the runs query ({})",
+            sanitize_refusal_reason(refusal)
+        ),
+        (
+            None,
+            RunsCompleteness::Incomplete {
+                live_writers,
+                writers_heard,
+            },
+        ) => format!(
+            "robot {robot} named no runs ({})",
+            incomplete_note(live_writers, writers_heard)
+        ),
+        (None, RunsCompleteness::Settled) => format!("no run is live on robot {robot}"),
+    };
+    for run in &reply.undescribable {
+        reason.push_str(&format!(
+            "; robot {robot} cannot describe run {} ({})",
+            clean(&run.run_id),
+            sanitize_refusal_reason(&run.reason)
+        ));
+    }
+    reason
+}
+
+/// The robots that refused the runs query, as a suffix for a refusal that
+/// lists the runs of the others.
+fn refusals_note(harvest: &RunsHarvest) -> String {
+    harvest
+        .replies
+        .iter()
+        .filter(|reply| reply.error.is_some())
+        .map(|reply| format!("; {}", no_run_reason(reply)))
+        .collect()
 }
 
 /// Choose the run `graph fires` reads. `run` is a run id or a graph name;
@@ -803,11 +874,8 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
                 "no robot answered the runs query, so there is no run to read".to_string(),
             );
         }
-        let robots: Vec<String> = harvest.replies.iter().map(|r| clean(&r.robot)).collect();
-        return refuse(format!(
-            "no run to read: no run is live on {}",
-            robots.join(", ")
-        ));
+        let reasons: Vec<String> = harvest.replies.iter().map(no_run_reason).collect();
+        return refuse(format!("no run to read: {}", reasons.join("; ")));
     }
     let Some(text) = run else {
         let capable: Vec<(&str, &RunEntry)> = all
@@ -817,8 +885,9 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
             .collect();
         return match capable.as_slice() {
             [] => refuse(format!(
-                "no run serves fire telemetry; the runs are: {}",
-                list_runs(&all)
+                "no run serves fire telemetry; the runs are: {}{}",
+                list_runs(&all),
+                refusals_note(harvest)
             )),
             [(robot, entry)] => readable_fires_run(robot, entry),
             many => refuse(format!(
@@ -838,9 +907,10 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
         .collect();
     match matches.as_slice() {
         [] => refuse(format!(
-            "no run matches --run {}; the runs are: {}",
+            "no run matches --run {}; the runs are: {}{}",
             clean(text),
-            list_runs(&all)
+            list_runs(&all),
+            refusals_note(harvest)
         )),
         [(robot, entry)] => readable_fires_run(robot, entry),
         many => refuse(format!(
@@ -930,8 +1000,9 @@ pub fn classify_fires(payloads: &[Vec<u8>]) -> FiresPoll {
 
 /// Where `runs` answers come from.
 pub trait RunsSource {
-    /// Ask `robot`, or every robot that announces itself, for its runs.
-    fn runs(&mut self, robot: Option<&str>) -> CliResult<RunsHarvest>;
+    /// Ask `robot`, or every robot that announces itself, for its runs. A
+    /// source that waits for a first answer stops when `running` clears.
+    fn runs(&mut self, robot: Option<&str>, running: &AtomicBool) -> CliResult<RunsHarvest>;
 }
 
 /// Where `fires` answers come from.
@@ -1046,6 +1117,10 @@ fn write_fires_summary(
 
 /// Read the fires of `run` from `source` until `window` elapses (`None`:
 /// until `running` clears), writing one row per fire and then the totals.
+///
+/// The window ends the reading only after an answered ask. A robot that is
+/// not answering when the window ends gets the rest of its silence limit, so
+/// a short window never reports a silent robot as a clean reading.
 pub fn follow_fires(
     source: &mut dyn FiresSource,
     run: &SelectedRun,
@@ -1058,6 +1133,7 @@ pub fn follow_fires(
     let topology = run.view.topology.clone().unwrap_or_default();
     let mut stream = FireStream::default();
     let mut silent_since: Option<Duration> = None;
+    let mut answered = false;
     if !json {
         writeln!(
             out,
@@ -1071,7 +1147,20 @@ pub fn follow_fires(
         if !running.load(Ordering::Relaxed) {
             break FiresEnd::Interrupted;
         }
-        if window.is_some_and(|w| pacer.elapsed() >= w) {
+        if silent_since
+            .is_some_and(|since| pacer.elapsed().saturating_sub(since) >= FIRES_SILENCE_LIMIT)
+        {
+            break FiresEnd::Failed(format!(
+                "the robot {} the fires query for {} s",
+                if answered {
+                    "stopped answering"
+                } else {
+                    "did not answer"
+                },
+                FIRES_SILENCE_LIMIT.as_secs()
+            ));
+        }
+        if silent_since.is_none() && window.is_some_and(|w| pacer.elapsed() >= w) {
             break FiresEnd::Window;
         }
         let mut read_on = false;
@@ -1085,6 +1174,7 @@ pub fn follow_fires(
             }
             FiresPoll::Reply(reply) => {
                 silent_since = None;
+                answered = true;
                 match reply.outcome {
                     FiresOutcome::Served {
                         now_ns,
@@ -1114,19 +1204,13 @@ pub fn follow_fires(
                     FiresOutcome::Refused { reason } => {
                         break FiresEnd::Failed(format!(
                             "the robot refused the fires query ({})",
-                            clean(&reason)
+                            sanitize_refusal_reason(&reason)
                         ));
                     }
                 }
             }
             FiresPoll::Silent => {
-                let since = *silent_since.get_or_insert(pacer.elapsed());
-                if pacer.elapsed().saturating_sub(since) >= FIRES_SILENCE_LIMIT {
-                    break FiresEnd::Failed(format!(
-                        "the robot stopped answering the fires query for {} s",
-                        FIRES_SILENCE_LIMIT.as_secs()
-                    ));
-                }
+                silent_since.get_or_insert(pacer.elapsed());
             }
             FiresPoll::Unusable { reason } => {
                 break FiresEnd::Failed(format!(
@@ -1151,6 +1235,77 @@ pub fn follow_fires(
 // Where the answers come from.
 // ---------------------------------------------------------------------------
 
+/// The `--connect` locators a session dials: those in `reachable`, in the
+/// order given. zenoh tries the locators one by one under a 1 s bound for
+/// all of them, so one that does not accept a connection would make the
+/// open fail and lose every other robot. A malformed locator, or a list with
+/// no reachable locator, is refused with the remedy.
+fn connect_set(connect: &[String], reachable: &HashSet<String>) -> CliResult<Vec<String>> {
+    use crate::discovery_ladder::{locator_is_syntactically_valid, EXPLICIT_PROBE_TIMEOUT};
+    let malformed: Vec<String> = connect
+        .iter()
+        .filter(|locator| !locator_is_syntactically_valid(locator))
+        .map(|locator| clean(locator))
+        .collect();
+    if !malformed.is_empty() {
+        return Err(CliError::Validation(format!(
+            "malformed --connect locator {}; a locator has the form tcp/<host>:<port>, for \
+             example tcp/127.0.0.1:7683",
+            malformed.join(", ")
+        )));
+    }
+    let (kept, skipped): (Vec<String>, Vec<String>) = connect
+        .iter()
+        .cloned()
+        .partition(|locator| reachable.contains(locator));
+    let wait = interval_label(u64::try_from(EXPLICIT_PROBE_TIMEOUT.as_nanos()).unwrap_or(u64::MAX));
+    if kept.is_empty() {
+        let named: Vec<String> = connect.iter().map(|locator| clean(locator)).collect();
+        return Err(CliError::Validation(format!(
+            "nothing accepted a connection at {} within {wait}; check that the robot listens \
+             there (a robot reached through adb needs its port forwarded, for example adb \
+             forward tcp:17683 tcp:7683)",
+            named.join(", ")
+        )));
+    }
+    for locator in &skipped {
+        tracing::warn!(
+            locator = %clean(locator),
+            "--connect locator did not accept a connection within {wait}; asking the other \
+             locators only"
+        );
+    }
+    Ok(kept)
+}
+
+/// Ask until a robot answers, an answer is final, or the first-contact
+/// budget is spent. A cleared `running` ends the wait with an error; an
+/// error from `ask` is returned at once, never retried.
+fn first_contact(
+    mut ask: impl FnMut() -> CliResult<RunsHarvest>,
+    running: &AtomicBool,
+    pacer: &mut dyn Pacer,
+) -> CliResult<RunsHarvest> {
+    let interrupted =
+        || CliError::Validation("interrupted while asking for runs; nothing was read".to_string());
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            return Err(interrupted());
+        }
+        let harvest = ask()?;
+        if !harvest.replies.is_empty()
+            || harvest.is_terminal()
+            || pacer.elapsed() >= FIRST_CONTACT_BUDGET
+        {
+            return Ok(harvest);
+        }
+        if !running.load(Ordering::Relaxed) {
+            return Err(interrupted());
+        }
+        pacer.sleep(FIRST_CONTACT_RETRY);
+    }
+}
+
 /// A zenoh session of this command's own, connected to the given locators
 /// only: no scouting, so it reaches exactly the robots named.
 pub struct ZenohPlane {
@@ -1158,11 +1313,17 @@ pub struct ZenohPlane {
 }
 
 impl ZenohPlane {
-    /// Open the session. The connect phase is bounded.
+    /// Open the session to the locators that accept a connection. The
+    /// connect phase is bounded.
     pub fn open(connect: &[String]) -> CliResult<Self> {
         use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
+        let reachable = crate::discovery_ladder::probe_reachable_locators(
+            connect,
+            crate::discovery_ladder::EXPLICIT_PROBE_TIMEOUT,
+        );
+        let connect = connect_set(connect, &reachable)?;
         let manager = NetworkManager::new(NetworkConfig {
-            connect_endpoints: connect.to_vec(),
+            connect_endpoints: connect.clone(),
             listen_endpoints: Vec::new(),
             multicast_scouting: false,
             gossip_scouting: false,
@@ -1171,8 +1332,7 @@ impl ZenohPlane {
         });
         manager.session().map_err(|e| {
             CliError::Validation(format!(
-                "could not open a session to {}: {e}; a locator has the form \
-                 tcp/<host>:<port>, for example tcp/127.0.0.1:7683",
+                "could not open a session to {}: {e}",
                 connect.join(", ")
             ))
         })?;
@@ -1181,42 +1341,34 @@ impl ZenohPlane {
 }
 
 impl RunsSource for ZenohPlane {
-    fn runs(&mut self, robot: Option<&str>) -> CliResult<RunsHarvest> {
+    fn runs(&mut self, robot: Option<&str>, running: &AtomicBool) -> CliResult<RunsHarvest> {
         use cerulion_core::transport::discovery::{query_announce_entries, query_robot_runs_all};
         let session = self
             .manager
             .session()
             .map_err(|e| CliError::Validation(format!("the session closed: {e}")))?;
-        let started = Instant::now();
-        loop {
+        let ask = || -> CliResult<RunsHarvest> {
             let robots: Vec<String> = match robot {
                 Some(robot) => vec![robot.to_string()],
-                None => match query_announce_entries(session, ANNOUNCE_WINDOW) {
-                    Ok(entries) => entries
-                        .into_iter()
-                        .map(|(robot, _)| robot)
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "announce harvest failed; retrying");
-                        Vec::new()
-                    }
-                },
+                None => query_announce_entries(session, ANNOUNCE_WINDOW)
+                    .map_err(|e| {
+                        CliError::Validation(format!(
+                            "could not ask which robots announce themselves: {e}"
+                        ))
+                    })?
+                    .into_iter()
+                    .map(|(robot, _)| robot)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             };
-            let harvest = if robots.is_empty() {
+            Ok(if robots.is_empty() {
                 RunsHarvest::default()
             } else {
                 query_robot_runs_all(session, &robots, RUNS_GET_WINDOW)
-            };
-            if !harvest.replies.is_empty()
-                || harvest.is_terminal()
-                || started.elapsed() >= FIRST_CONTACT_BUDGET
-            {
-                return Ok(harvest);
-            }
-            std::thread::sleep(FIRST_CONTACT_RETRY);
-        }
+            })
+        };
+        first_contact(ask, running, &mut WallPacer::start())
     }
 }
 
@@ -1245,33 +1397,42 @@ pub struct NetdRuns;
 
 impl RunsSource for NetdRuns {
     #[cfg(unix)]
-    fn runs(&mut self, robot: Option<&str>) -> CliResult<RunsHarvest> {
+    fn runs(&mut self, robot: Option<&str>, _running: &AtomicBool) -> CliResult<RunsHarvest> {
         let mut client = cerulion_netd::NetdClient::connect_or_spawn().map_err(|e| {
             CliError::Validation(format!(
                 "could not reach cerulion-netd to ask for runs: {e}; pass --connect LOCATOR \
                  to ask the robot directly"
             ))
         })?;
-        let answer = client.query_runs(robot).map_err(|e| {
-            CliError::Validation(format!(
-                "cerulion-netd could not answer the runs query: {e}"
-            ))
-        })?;
-        Ok(RunsHarvest {
-            replies: answer.replies,
-            unusable: answer.unusable,
-            silent: answer.silent,
-        })
+        netd_harvest(&mut client, robot)
     }
 
     #[cfg(not(unix))]
-    fn runs(&mut self, _robot: Option<&str>) -> CliResult<RunsHarvest> {
+    fn runs(&mut self, _robot: Option<&str>, _running: &AtomicBool) -> CliResult<RunsHarvest> {
         Err(CliError::Validation(
             "asking for runs without --connect needs cerulion-netd, which runs on Unix only; \
              pass --connect LOCATOR to ask the robot directly"
                 .to_string(),
         ))
     }
+}
+
+/// One `runs` query through a connected `cerulion-netd`.
+#[cfg(unix)]
+fn netd_harvest(
+    client: &mut cerulion_netd::NetdClient,
+    robot: Option<&str>,
+) -> CliResult<RunsHarvest> {
+    let answer = client.query_runs(robot).map_err(|e| {
+        CliError::Validation(format!(
+            "cerulion-netd could not answer the runs query: {e}"
+        ))
+    })?;
+    Ok(RunsHarvest {
+        replies: answer.replies,
+        unusable: answer.unusable,
+        silent: answer.silent,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,20 +1449,40 @@ fn runs_source(target: &RemoteTarget) -> CliResult<Box<dyn RunsSource>> {
 
 /// `cerulion graph live`.
 pub fn graph_live(target: &RemoteTarget, json: bool) -> CliResult<()> {
-    let harvest = runs_source(target)?.runs(target.robot.as_deref())?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let mut source = runs_source(target)?;
+    show_live(
+        source.as_mut(),
+        target,
+        json,
+        &AtomicBool::new(true),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+/// Ask `source` once and write what `graph live` shows: the runs to `out`,
+/// and in `--json` mode the robots with no reply to `err`.
+pub fn show_live(
+    source: &mut dyn RunsSource,
+    target: &RemoteTarget,
+    json: bool,
+    running: &AtomicBool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> CliResult<()> {
+    let harvest = source.runs(target.robot.as_deref(), running)?;
     let unanswered = render_unanswered(&harvest);
     if json {
         for object in live_json(&harvest) {
             writeln!(out, "{object}")?;
         }
-        write!(std::io::stderr(), "{unanswered}")?;
+        write!(err, "{unanswered}")?;
     } else {
         let blocks: Vec<String> = harvest.replies.iter().map(render_live).collect();
         write!(out, "{}{unanswered}", blocks.join("\n"))?;
     }
     out.flush()?;
+    err.flush()?;
     live_outcome(&harvest, target)
 }
 
@@ -1359,7 +1540,7 @@ pub fn graph_fires(
         return Err(fires_needs_netd_protocol_10());
     }
     let mut plane = ZenohPlane::open(&target.connect)?;
-    let harvest = plane.runs(target.robot.as_deref())?;
+    let harvest = plane.runs(target.robot.as_deref(), &running)?;
     write!(std::io::stderr(), "{}", render_unanswered(&harvest))?;
     let selected = select_run(&harvest, run)?;
     let stdout = std::io::stdout();
@@ -2133,10 +2314,14 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
                 "nodes",
                 "robot",
                 "run_id",
+                "run_json_readable",
                 "run_started_at_ns",
-                "state"
+                "state",
+                "topology_version"
             ]
         );
+        assert_eq!(run["run_json_readable"], true);
+        assert_eq!(run["topology_version"], 1);
         assert_eq!(
             run["nodes"][1],
             serde_json::json!({
@@ -2587,7 +2772,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                         reason: "paired\u{1b}[2J".to_string(),
                     },
                 )),
-                "the robot refused the fires query (paired\u{FFFD}[2J)",
+                "the robot refused the fires query (paired?[2J)",
             ),
             (
                 FiresPoll::Unusable {
@@ -2696,6 +2881,535 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         assert_eq!(utc_time(TEMI_STARTED_NS), "2025-11-04 14:02:11 UTC");
         assert_eq!(utc_time(951_782_400_000_000_000), "2000-02-29 00:00:00 UTC");
         assert_eq!(utc_time(u64::MAX), "2554-07-21 23:34:33 UTC");
+    }
+
+    // ---- why no run, robot text, versions ---------------------------------
+
+    /// A robot that refused, or whose answer is incomplete, is named with
+    /// what it said, not as a robot with no live run.
+    #[test]
+    fn select_run_names_why_each_robot_gave_no_run() {
+        let err = |h: &RunsHarvest, run: Option<&str>| match select_run(h, run) {
+            Err(CliError::Validation(text)) => text,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let mut refused = reply("temi", Vec::new());
+        refused.error = Some("not authorized".to_string());
+        refused.completeness = RunsCompleteness::not_established();
+        let mut incomplete = reply("c", Vec::new());
+        incomplete.completeness = RunsCompleteness::Incomplete {
+            live_writers: 2,
+            writers_heard: 1,
+        };
+        let mut undescribable = reply("d", Vec::new());
+        undescribable.completeness = RunsCompleteness::not_established();
+        undescribable.undescribable = vec![UndescribableRun {
+            run_id: format_run_id(9),
+            reason: "graph.yaml unreadable".to_string(),
+        }];
+        assert_eq!(
+            err(&harvest(vec![refused.clone()]), None),
+            "no run to read: robot temi refused the runs query (not authorized)"
+        );
+        assert_eq!(
+            err(
+                &harvest(vec![incomplete, undescribable, reply("idle", Vec::new())]),
+                None
+            ),
+            "no run to read: robot c named no runs (the answer is incomplete: 1 of 2 runs \
+             answered in time); robot d named no runs (the answer is incomplete); robot d cannot \
+             describe run 0x00000000000000000000000000000009 (graph.yaml unreadable); no run is \
+             live on robot idle"
+        );
+        let beside = harvest(vec![
+            reply("desk", vec![run_entry(1, "perception", "{\"version\":1}")]),
+            refused,
+        ]);
+        assert_eq!(
+            err(&beside, None),
+            "no run serves fire telemetry; the runs are: \
+             0x00000000000000000000000000000001 (graph perception on robot desk); \
+             robot temi refused the runs query (not authorized)"
+        );
+        assert_eq!(
+            err(&beside, Some("temi")),
+            "no run matches --run temi; the runs are: \
+             0x00000000000000000000000000000001 (graph perception on robot desk); \
+             robot temi refused the runs query (not authorized)"
+        );
+    }
+
+    /// Free text a robot sends (a refusal, a reason it cannot describe a run)
+    /// cannot start a new line or reorder the terminal's text, and is cut at
+    /// 200 characters.
+    #[test]
+    fn a_robots_free_text_cannot_forge_a_line_or_reorder_the_text() {
+        let forged = "denied\u{2028}error: forged \u{202E}txet";
+        let shown = "denied?error: forged ?txet";
+        let mut refused = reply("a", Vec::new());
+        refused.error = Some(forged.to_string());
+        refused.completeness = RunsCompleteness::not_established();
+        assert_eq!(
+            render_live(&refused),
+            format!("robot a: refused the runs query ({shown})\n")
+        );
+        match select_run(&harvest(vec![refused.clone()]), None) {
+            Err(CliError::Validation(text)) => assert_eq!(
+                text,
+                format!("no run to read: robot a refused the runs query ({shown})")
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        refused.error = Some("x".repeat(300));
+        assert_eq!(
+            render_live(&refused),
+            format!(
+                "robot a: refused the runs query ({}\u{2026})\n",
+                "x".repeat(200)
+            )
+        );
+        let mut undescribable = reply("d", Vec::new());
+        undescribable.completeness = RunsCompleteness::not_established();
+        undescribable.undescribable = vec![UndescribableRun {
+            run_id: format_run_id(9),
+            reason: forged.to_string(),
+        }];
+        assert!(render_live(&undescribable).ends_with(&format!("cannot be described ({shown})\n")));
+        let mut source = scripted(
+            vec![served(1, 0, 0, Vec::new())],
+            FiresPoll::Reply(FiresReply::new(
+                "temi",
+                TEMI_RUN_ID,
+                FiresOutcome::Refused {
+                    reason: forged.to_string(),
+                },
+            )),
+        );
+        match follow(&mut source, None, false).0 {
+            Err(CliError::Validation(text)) => {
+                assert_eq!(text, format!("the robot refused the fires query ({shown})"))
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+    }
+
+    /// A run whose fire telemetry or topology is a version this desk does
+    /// not read says so, and is not read as version 1.
+    #[test]
+    fn a_newer_telemetry_or_topology_version_is_named_not_read_as_version_1() {
+        let fires_v2 = TEMI_RUN_JSON.replace("\"version\": 1}}", "\"version\": 2}}");
+        let text = render_live(&reply(
+            "temi",
+            vec![run_entry(TEMI_RUN_ID, "temi", &fires_v2)],
+        ));
+        assert!(
+            text.ends_with("  fire telemetry: version 2 (this cerulion reads version 1)\n"),
+            "{text}"
+        );
+
+        let mut doc: serde_json::Value = serde_json::from_str(TEMI_RUN_JSON).unwrap();
+        doc["topology"]["version"] = serde_json::json!(2);
+        let entry = run_entry(TEMI_RUN_ID, "temi", &doc.to_string());
+        let text = render_live(&reply("temi", vec![entry.clone()]));
+        assert!(
+            text.ends_with(
+                "  the node rows follow topology version 2, and this cerulion reads version 1, \
+                 so they can be wrong; update cerulion on this machine\n\
+                 \x20 fire telemetry: available (v1, ring 4096, lease 5 s)\n"
+            ),
+            "{text}"
+        );
+        match select_run(&harvest(vec![reply("temi", vec![entry.clone()])]), None) {
+            Err(CliError::Validation(text)) => assert_eq!(
+                text,
+                "run 0x00000000000000000000000000005d1c (graph temi on robot temi) describes \
+                 its nodes in topology version 2, and this cerulion reads version 1; update \
+                 cerulion on this machine"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let objects = live_json(&harvest(vec![reply("temi", vec![entry])]));
+        assert_eq!(objects[0]["topology_version"], 2);
+    }
+
+    /// `graph live --json` marks a run whose `run.json` does not read, so it
+    /// is not taken for a run whose host reports no nodes.
+    #[test]
+    fn live_json_marks_a_run_json_that_does_not_read() {
+        let broken = live_json(&harvest(vec![reply(
+            "f",
+            vec![run_entry(2, "x", "not json")],
+        )]));
+        assert_eq!(broken[0]["kind"], "run");
+        assert_eq!(broken[0]["run_json_readable"], false);
+        for key in ["host", "topology_version", "nodes", "endpoints", "fires"] {
+            assert_eq!(broken[0][key], serde_json::Value::Null, "{key}");
+        }
+        let desktop = live_json(&harvest(vec![reply(
+            "e",
+            vec![run_entry(1, "perception", "{\"version\":1}")],
+        )]));
+        assert_eq!(desktop[0]["run_json_readable"], true);
+        assert_eq!(desktop[0]["nodes"], serde_json::Value::Null);
+        assert_eq!(desktop[0]["endpoints"], serde_json::json!([]));
+    }
+
+    // ---- the reading window and silence ----------------------------------
+
+    /// `--for N` reads N seconds, no flag reads the default, `--follow`
+    /// reads until Ctrl+C.
+    #[test]
+    fn the_reading_window_is_the_given_seconds_the_default_or_until_ctrl_c() {
+        assert!(matches!(fires_window(true, None), Ok(None)));
+        assert!(matches!(
+            fires_window(false, Some(3)),
+            Ok(Some(w)) if w == Duration::from_secs(3)
+        ));
+        assert!(matches!(
+            fires_window(false, None),
+            Ok(Some(w)) if w == Duration::from_secs(DEFAULT_FIRES_SECS)
+        ));
+    }
+
+    /// A window of 3 s or less never ends as a clean reading while the robot
+    /// is not answering: the robot gets the rest of its silence limit.
+    #[test]
+    fn a_window_ends_only_after_an_answered_ask() {
+        for window in [Duration::from_secs(1), Duration::from_secs(3)] {
+            let mut source = scripted(Vec::new(), FiresPoll::Silent);
+            let (result, out, pacer) = follow(&mut source, Some(window), false);
+            match result {
+                Err(CliError::Validation(text)) => {
+                    assert_eq!(text, "the robot did not answer the fires query for 3 s")
+                }
+                other => panic!("{window:?}: expected the silence error, got {other:?}"),
+            }
+            assert_eq!(pacer.now, FIRES_SILENCE_LIMIT);
+            assert!(out.ends_with("0 fires in 3.0 s · 0 lost · the robot stops recording 5 s after the last ask\n"), "{out}");
+        }
+
+        let mut source = scripted(vec![served(1, 0, 0, Vec::new())], FiresPoll::Silent);
+        match follow(&mut source, Some(Duration::from_secs(3)), true).0 {
+            Err(CliError::Validation(text)) => {
+                assert_eq!(text, "the robot stopped answering the fires query for 3 s")
+            }
+            other => panic!("expected the silence error, got {other:?}"),
+        }
+
+        let quiet = || served(1, 0, 0, Vec::new());
+        let mut source = scripted(
+            vec![quiet(), quiet(), quiet(), FiresPoll::Silent, quiet()],
+            quiet(),
+        );
+        let (result, _, pacer) = follow(&mut source, Some(Duration::from_secs(1)), false);
+        assert_eq!(
+            result.expect("a missed ask, then an answer").1,
+            FiresEnd::Window
+        );
+        assert_eq!(source.asked.len(), 5, "one ask past the window, answered");
+        assert_eq!(pacer.now, Duration::from_millis(1250));
+    }
+
+    /// An answer resets the silence limit: a robot that misses asks, but
+    /// never for 3 s in a row, is read until the window ends.
+    #[test]
+    fn an_answer_resets_the_silence_limit() {
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            answers.extend(std::iter::repeat_with(|| FiresPoll::Silent).take(10));
+            answers.push(served(1, 0, 0, Vec::new()));
+        }
+        let mut source = scripted(answers, served(1, 0, 0, Vec::new()));
+        let (result, _, _) = follow(&mut source, Some(Duration::from_secs(8)), false);
+        assert_eq!(
+            result.expect("never 3 s without an answer").1,
+            FiresEnd::Window
+        );
+    }
+
+    /// A page that repeats a fire already shown prints only the new fires.
+    #[test]
+    fn follow_fires_prints_only_the_fires_not_shown_before() {
+        let first = fire(1, 1_000, 10, 0, FireCause::Period, 0, 1);
+        let second = fire(2, 2_000, 10, 0, FireCause::Period, 0, 1);
+        let mut source = scripted(
+            vec![
+                served(3_000, 1, 0, vec![first]),
+                served(3_000, 2, 0, vec![first, second]),
+            ],
+            served(3_000, 2, 0, Vec::new()),
+        );
+        let (result, out, _) = follow(&mut source, Some(Duration::from_millis(500)), true);
+        assert_eq!(result.expect("clean").0.fires, 2);
+        let seqs: Vec<u64> = out
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|object| object["kind"] == "fire")
+            .map(|object| object["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, [1, 2]);
+    }
+
+    // ---- reaching the robot ----------------------------------------------
+
+    /// A loopback locator where nothing listens.
+    fn closed_locator() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("an ephemeral loopback port")
+            .port();
+        format!("tcp/127.0.0.1:{port}")
+    }
+
+    /// A locator where nothing listens is skipped beside one that answers,
+    /// and named at once when it is the only one; a malformed locator is
+    /// refused before any connection.
+    #[test]
+    fn the_session_dials_only_locators_that_accept_a_connection() {
+        let closed = closed_locator();
+        let started = Instant::now();
+        match ZenohPlane::open(std::slice::from_ref(&closed)) {
+            Err(CliError::Validation(text)) => assert_eq!(
+                text,
+                format!(
+                    "nothing accepted a connection at {closed} within 1 s; check that the robot \
+                     listens there (a robot reached through adb needs its port forwarded, for \
+                     example adb forward tcp:17683 tcp:7683)"
+                )
+            ),
+            Err(other) => panic!("expected the locator error, got {other}"),
+            Ok(_) => panic!("a closed port opens no session"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let open = "tcp/127.0.0.1:7683".to_string();
+        let reachable: HashSet<String> = [open.clone()].into();
+        for order in [
+            [closed.clone(), open.clone()],
+            [open.clone(), closed.clone()],
+        ] {
+            assert_eq!(
+                connect_set(&order, &reachable).expect("one reachable"),
+                [open.as_str()]
+            );
+        }
+        match connect_set(&["127.0.0.1:7683".to_string(), open], &reachable) {
+            Err(CliError::Validation(text)) => assert_eq!(
+                text,
+                "malformed --connect locator 127.0.0.1:7683; a locator has the form \
+                 tcp/<host>:<port>, for example tcp/127.0.0.1:7683"
+            ),
+            other => panic!("expected the syntax error, got {other:?}"),
+        }
+    }
+
+    /// The first-contact wait stops when Ctrl+C clears the flag, returns an
+    /// error at once, and asks again only while nobody answered.
+    #[test]
+    fn the_first_contact_wait_stops_on_ctrl_c_and_never_retries_an_error() {
+        let pacer = || FakePacer {
+            now: Duration::ZERO,
+            sleeps: 0,
+        };
+        let message = |result: CliResult<RunsHarvest>| match result {
+            Err(CliError::Validation(text)) => text,
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        const INTERRUPTED: &str = "interrupted while asking for runs; nothing was read";
+
+        let stopped = AtomicBool::new(false);
+        let mut asked = 0;
+        let result = first_contact(
+            || {
+                asked += 1;
+                Ok(RunsHarvest::default())
+            },
+            &stopped,
+            &mut pacer(),
+        );
+        assert_eq!((message(result).as_str(), asked), (INTERRUPTED, 0));
+
+        let running = AtomicBool::new(true);
+        let mut asked = 0;
+        let mut p = pacer();
+        let result = first_contact(
+            || {
+                asked += 1;
+                Err(CliError::Validation("announce failed".to_string()))
+            },
+            &running,
+            &mut p,
+        );
+        assert_eq!(
+            (message(result).as_str(), asked, p.sleeps),
+            ("announce failed", 1, 0)
+        );
+
+        let mut asked = 0;
+        let result = first_contact(
+            || {
+                asked += 1;
+                running.store(false, Ordering::Relaxed);
+                Ok(RunsHarvest::default())
+            },
+            &running,
+            &mut pacer(),
+        );
+        assert_eq!((message(result).as_str(), asked), (INTERRUPTED, 1));
+
+        let running = AtomicBool::new(true);
+        let mut asked = 0;
+        let mut p = pacer();
+        let result = first_contact(
+            || {
+                asked += 1;
+                Ok(RunsHarvest::default())
+            },
+            &running,
+            &mut p,
+        );
+        assert!(result.expect("an empty harvest").replies.is_empty());
+        assert_eq!((asked, p.now), (21, FIRST_CONTACT_BUDGET));
+
+        let mut asked = 0;
+        let mut p = pacer();
+        let result = first_contact(
+            || {
+                asked += 1;
+                Ok(if asked < 3 {
+                    RunsHarvest::default()
+                } else {
+                    harvest(vec![reply("temi", Vec::new())])
+                })
+            },
+            &running,
+            &mut p,
+        );
+        assert_eq!(
+            (result.expect("a reply").replies.len(), asked, p.sleeps),
+            (1, 3, 2)
+        );
+    }
+
+    /// A `runs` source that gives one canned harvest.
+    struct CannedRuns(RunsHarvest);
+
+    impl RunsSource for CannedRuns {
+        fn runs(&mut self, robot: Option<&str>, _running: &AtomicBool) -> CliResult<RunsHarvest> {
+            assert_eq!(robot, Some("temi"));
+            Ok(self.0.clone())
+        }
+    }
+
+    /// `graph live` writes the runs to stdout, and in `--json` mode the
+    /// robots that gave no reply to stderr.
+    #[test]
+    fn graph_live_writes_the_runs_and_the_robots_that_did_not_answer() {
+        let target = RemoteTarget {
+            connect: Vec::new(),
+            robot: Some("temi".to_string()),
+        };
+        let canned = RunsHarvest {
+            replies: vec![reply("temi", vec![temi_entry()])],
+            unusable: Vec::new(),
+            silent: vec!["quiet".to_string()],
+        };
+        let running = AtomicBool::new(true);
+        let show = |harvest: &RunsHarvest, json: bool| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let result = show_live(
+                &mut CannedRuns(harvest.clone()),
+                &target,
+                json,
+                &running,
+                &mut out,
+                &mut err,
+            );
+            (
+                result,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+
+        let (result, out, err) = show(&canned, false);
+        result.expect("a readable answer");
+        assert_eq!(
+            out,
+            format!(
+                "{}{}",
+                render_live(&canned.replies[0]),
+                render_unanswered(&canned)
+            )
+        );
+        assert_eq!(err, "");
+
+        let (result, out, err) = show(&canned, true);
+        result.expect("a readable answer");
+        let objects: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect();
+        assert_eq!(objects, live_json(&canned));
+        assert_eq!(err, render_unanswered(&canned));
+
+        match show(&RunsHarvest::default(), false).0 {
+            Err(CliError::Validation(text)) => {
+                assert_eq!(
+                    text,
+                    "no robot answered the runs query through cerulion-netd"
+                )
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// Without `--connect`, `graph live` reads one runs answer from
+    /// `cerulion-netd`: here a fake daemon on a socket of its own.
+    #[cfg(unix)]
+    #[test]
+    fn graph_live_reads_the_runs_through_cerulion_netd() {
+        use cerulion_netd::protocol::{DiscoveryState, Hello, Response, RunsQueryResponse};
+        use std::io::{BufRead, BufReader};
+
+        let dir = tempfile::Builder::new()
+            .prefix("graph-live")
+            .tempdir_in("/tmp")
+            .expect("a socket directory");
+        let socket = dir.path().join("netd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the client connects");
+            let mut writer = stream.try_clone().expect("a second handle");
+            writeln!(writer, "{}", serde_json::to_string(&Hello::new()).unwrap()).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .expect("one request");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("JSON");
+            let response = Response::RunsQuery(RunsQueryResponse {
+                id: request["id"].as_u64().expect("an id"),
+                run_replies: vec![reply("temi", vec![temi_entry()])],
+                unusable: vec![UnusableRunsAnswer {
+                    robot: "old".to_string(),
+                    reason: "unknown runs wire version 2".to_string(),
+                }],
+                silent: vec!["quiet".to_string()],
+                discovery: DiscoveryState::Settled,
+                plane_unsettled_ms: None,
+            });
+            writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            request
+        });
+        let mut client =
+            cerulion_netd::NetdClient::connect_existing_at(socket).expect("the daemon greets");
+        let answer = netd_harvest(&mut client, Some("temi")).expect("one answer");
+        let request = daemon.join().expect("the daemon answers");
+        assert_eq!(request["method"], "query_runs");
+        assert_eq!(request["robot"], "temi");
+        assert_eq!(answer.replies, [reply("temi", vec![temi_entry()])]);
+        assert_eq!(answer.unusable[0].robot, "old");
+        assert_eq!(answer.silent, ["quiet"]);
     }
 
     // ---- over the wire -----------------------------------------------------
@@ -2851,12 +3565,15 @@ nodes:
             json_out: String,
         }
 
+        /// The desk names a closed port before the robot's locator: the
+        /// session skips the closed one and still reaches the robot.
         fn desk(locator: String) -> DeskReport {
-            let mut plane = ZenohPlane::open(&[locator]).expect("the desk session opens");
-            let harvest = plane.runs(None).expect("the runs query runs");
+            let mut plane = ZenohPlane::open(&[closed_locator(), locator])
+                .expect("the desk session opens to the reachable locator");
+            let running = AtomicBool::new(true);
+            let harvest = plane.runs(None, &running).expect("the runs query runs");
             let live: String = harvest.replies.iter().map(render_live).collect();
             let selected = select_run(&harvest, None).expect("the hosted run serves fires");
-            let running = AtomicBool::new(true);
             let mut text_out = Vec::new();
             let text = follow_fires(
                 &mut plane,
