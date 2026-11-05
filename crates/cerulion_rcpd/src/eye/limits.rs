@@ -322,6 +322,20 @@ mod tests {
         MAX_IN_FLIGHT, TIMEOUT_MS,
     };
 
+    /// A 640 x 480 header padded to exactly `total` bytes.
+    fn jpeg_of_len(total: usize) -> Vec<u8> {
+        let mut padding = total - jpeg_header_for_test(640, 480, 0).len();
+        loop {
+            let out = jpeg_header_for_test(640, 480, padding);
+            match out.len().checked_sub(total) {
+                Some(0) => return out,
+                // Each padding segment adds a 4-byte marker and length.
+                Some(over) => padding -= over,
+                None => panic!("no padding gives {total} bytes"),
+            }
+        }
+    }
+
     #[test]
     fn the_limits_are_the_ones_the_account_service_issues_with_a_key() {
         // The `limits` object of the key endpoint's 200 response.
@@ -403,11 +417,12 @@ mod tests {
             check_image(&jpeg_header_for_test(279, 480, 0)),
             Err(ShapeRefusal::TooSmall)
         );
-        let big = jpeg_header_for_test(640, 480, 200_001);
-        assert_eq!(check_image(&big), Err(ShapeRefusal::TooManyBytes));
-        let edge = jpeg_header_for_test(640, 480, 200_000 - 40);
-        assert!(edge.len() <= 200_000, "{}", edge.len());
+        let edge = jpeg_of_len(MAX_IMAGE_BYTES);
+        assert_eq!(edge.len(), 200_000);
         assert!(check_image(&edge).is_ok());
+        let over = jpeg_of_len(MAX_IMAGE_BYTES + 1);
+        assert_eq!(over.len(), 200_001);
+        assert_eq!(check_image(&over), Err(ShapeRefusal::TooManyBytes));
         assert_eq!(
             check_image(b"\x89PNG\r\n\x1a\n...."),
             Err(ShapeRefusal::NotJpeg)

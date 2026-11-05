@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The eye's admission rules and its HTTP client against a local stand-in
 //! route: every failure in the design's table gives Jev absent with its code,
-//! a late answer is dropped, another model is `wrong_model`, and the robot's
-//! own limits refuse before any request is sent.
+//! a late answer is dropped, a timed-out request keeps its in-flight slot
+//! until its late reply, another model is `wrong_model`, and the robot's own
+//! limits refuse before any request is sent.
 
 mod eye_common;
 
@@ -52,7 +53,8 @@ fn ask(id: u64, case: u64, seq: u32, deadline_ms: u64) -> String {
 }
 
 /// Admit `text` now; when it yields a request, send it and return the
-/// answer the gate gets and, later, a late answer if one came.
+/// answer the gate gets and, later, a late answer if one came. Each report
+/// is taken as the eye thread takes it ([`Completed::taken_at`]).
 async fn look(core: &mut EyeCore, client: &Arc<JevClient>, text: &str) -> (Answer, Option<Answer>) {
     let now = Instant::now();
     match core.admit(text, now, now, &frames()) {
@@ -62,11 +64,16 @@ async fn look(core: &mut EyeCore, client: &Arc<JevClient>, text: &str) -> (Answe
             request(Arc::clone(client), *dispatch, tx).await;
             let mut answer = None;
             let mut late = None;
-            while let Ok(done) = rx.try_recv() {
+            let taken: Vec<Completed> = rx
+                .try_iter()
+                .flat_map(|done| done.taken_at(Instant::now()))
+                .collect();
+            for done in taken {
                 match done {
                     Completed::Answer {
                         answer: a,
                         retry_after,
+                        ..
                     } => {
                         let _ =
                             core.note(a.outcome, retry_after, Instant::now(), SystemTime::now());
@@ -230,6 +237,124 @@ async fn a_late_answer_is_dropped_and_the_gate_sees_a_timeout() {
     assert_eq!(late.outcome, Outcome::Ok, "it would have been an answer");
     assert!(started.elapsed() >= Duration::from_millis(600));
     assert_eq!(answer.request_sha256, late.request_sha256);
+}
+
+/// The next report on `rx`, waiting at most 10 s.
+async fn next(rx: &mpsc::Receiver<Completed>) -> Completed {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(done) = rx.try_recv() {
+            return done;
+        }
+        assert!(Instant::now() < deadline, "no report within 10 s");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_request_keeps_its_in_flight_slot_until_its_late_reply() {
+    let stub = Stub::start(scripted).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, client) = core(dir.path(), &stub.base_url());
+    let store = frames();
+    let now = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    let mut tasks = Vec::new();
+    // Two requests whose replies take 600 ms, against a 200 ms deadline.
+    for id in 1..=2 {
+        let Admit::Send(dispatch) = core.admit(&ask(id, 13, 1, 200), now, now, &store) else {
+            panic!("request {id} is sent");
+        };
+        tasks.push(tokio::spawn(request(
+            Arc::clone(&client),
+            *dispatch,
+            tx.clone(),
+        )));
+    }
+    drop(tx);
+    for _ in 0..2 {
+        let Completed::Answer { answer, .. } = next(&rx).await else {
+            panic!("each ask is answered first");
+        };
+        assert_eq!(answer.outcome, Outcome::Timeout, "{answer:?}");
+    }
+    // Both have timed out and are still on the network: a third is
+    // throttled for the in-flight limit.
+    assert_eq!(core.in_flight().count(), 2);
+    let later = Instant::now();
+    let Admit::Answer(third) = core.admit(&ask(3, 0, 1, 1_500), later, later, &store) else {
+        panic!("the third request must be refused");
+    };
+    assert_eq!(
+        (third.outcome, third.detail.as_deref()),
+        (Outcome::Throttled, Some("in_flight"))
+    );
+    for _ in 0..2 {
+        let Completed::Late { answer, .. } = next(&rx).await else {
+            panic!("the late reply follows its timeout");
+        };
+        assert_eq!(answer.outcome, Outcome::Ok, "{answer:?}");
+    }
+    for task in tasks {
+        task.await.expect("request task");
+    }
+    // The late replies freed both slots.
+    assert_eq!(core.in_flight().count(), 0);
+    let after = Instant::now();
+    assert!(matches!(
+        core.admit(&ask(4, 0, 1, 1_500), after, after, &store),
+        Admit::Send(_)
+    ));
+    assert_eq!(stub.count(), 2, "only the two slow requests were sent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_taken_at_its_deadline_is_a_timeout_and_the_reply_is_late() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _client) = core(dir.path(), "http://127.0.0.1:9/api/v1");
+    let now = Instant::now();
+    let Admit::Send(dispatch) = core.admit(&ask(1, 0, 1, 200), now, now, &frames()) else {
+        panic!("the request is sent");
+    };
+    let mut reply = dispatch.prepared.answer(Outcome::Ok, None, Some(5));
+    reply.model_answered = Some(String::from(ANSWERED_MODEL));
+    reply.answers = Some(json!({ "edge_visible": { "type": "noul", "noul": 0.93 } }));
+    let report = |deadline| Completed::Answer {
+        answer: Box::new(reply.clone()),
+        retry_after: None,
+        deadline: Some(deadline),
+    };
+    let deadline = dispatch.deadline;
+    // Taken before the deadline: published as is.
+    let before = report(deadline).taken_at(deadline - Duration::from_millis(1));
+    let [Completed::Answer { answer, .. }] = before.as_slice() else {
+        panic!("{before:?}");
+    };
+    assert_eq!(**answer, reply);
+    // Taken at the deadline: the ask's answer is `timeout`, the reply late.
+    let at = report(deadline).taken_at(deadline);
+    let [Completed::Answer {
+        answer: timeout,
+        deadline: None,
+        ..
+    }, Completed::Late { answer: late, .. }] = at.as_slice()
+    else {
+        panic!("{at:?}");
+    };
+    assert_eq!(
+        (timeout.outcome, timeout.detail.as_deref()),
+        (Outcome::Timeout, Some("deadline"))
+    );
+    assert!(timeout.answers.is_none() && timeout.model_answered.is_none());
+    assert_eq!(timeout.request_sha256, reply.request_sha256);
+    assert_eq!(**late, reply);
+    // The `timeout` answer given at the deadline is never turned again.
+    let given = Completed::Answer {
+        answer: Box::new((**timeout).clone()),
+        retry_after: None,
+        deadline: None,
+    };
+    assert_eq!(given.taken_at(deadline + Duration::from_secs(1)).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

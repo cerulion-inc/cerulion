@@ -264,8 +264,9 @@ request carrying that frame unchanged, the set's text and the numbers, and
 publishes one answer frame per ask on the answer topic with an `outcome`:
 `ok`, or one of `disabled`, `no_credential`, `unavailable`, `timeout`,
 `rate_limited`, `quota`, `throttled`, `refused`, `wrong_model`, `malformed`,
-`not_visible` and `not_recorded`, each meaning Jev is absent. An answer later
-than its deadline is receipted `late` and never published. The frame records
+`not_visible` and `not_recorded`, each meaning Jev is absent. A reply the
+daemon takes up at or after its deadline is receipted `late` and never
+published, and the ask is answered `timeout`. The frame records
 the questions, the state, the model asked and the model that answered, and
 the SHA-256 of the image and of the request body; never the image bytes or
 the key. Every answer frame carries `"provenance": "third_party"`, so a
@@ -309,6 +310,7 @@ The answer topic has no producer inside the graph, so a recording replays
 the answers as recorded and nothing calls Jev. A replayed ask gets a
 recorded answer only when its text is the text that answer was given for;
 any other ask gets `not_recorded`. `--verify-bag` checks that every answer
-in a recording has its receipt, names an ask the recording holds, and,
+in a recording has its receipt, names an ask the recording holds and carries
+the SHA-256 of that ask's text, and,
 where the recording holds the frame, that the image and request digests
 recompute from it and the recorded model, state and questions.

@@ -447,9 +447,10 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         .iter()
         .all(|s| holds_key(s.header("authorization").unwrap_or("").as_bytes())));
 
-    // Resim: no route at all; the recorded answers stand in for Jev.
+    // Resim: the recorded answers stand in for Jev. The stand-in route stays
+    // up, so a request from the resim would be counted.
     let requests = stub.count();
-    drop(stub);
+    assert_eq!(requests, 7, "the live run sent seven requests");
     let reader = cerulion_bag::BagReader::open(&bag).expect("read bag");
     let asks = string_frames(&reader, &jev.ask_topic).expect("asks");
     assert_eq!(asks.len(), live.len());
@@ -494,7 +495,8 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         Some(live[0].1.as_str()),
         "the recorded ask still gets its answer"
     );
-    assert_eq!(requests, 7, "the resim made no request");
+    assert_eq!(stub.count(), requests, "the resim made no request");
+    drop(stub);
 
     // `--verify-bag` joins every answer to its receipt and recomputes the
     // requests from the recorded frames.
@@ -701,4 +703,34 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         report.requests_checked, 6,
         "the request without a state was not checked"
     );
+
+    // An answer edited onto another ask's text no longer matches the
+    // recorded ask with its id; its receipt still joins.
+    let mut done = false;
+    let moved_ask: Vec<Recorded> = recorded
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            let field = b"\"ask_sha256\":\"";
+            if !done && r.topic == jev.answer_topic {
+                if let Some(at) = r.frame.windows(field.len()).position(|w| w == field) {
+                    let hex = &mut r.frame[at + field.len()];
+                    *hex = if *hex == b'0' { b'1' } else { b'0' };
+                    done = true;
+                }
+            }
+            r
+        })
+        .collect();
+    assert!(done, "the first answer carries ask_sha256");
+    let edited = dir.path().join("moved-ask.mcap");
+    write_bag(&edited, &moved_ask, &schemas);
+    let report = verify_bag(&edited, &receipts, &topics).expect("verify");
+    assert_eq!(report.joined, live.len());
+    let mismatched = report
+        .problems
+        .iter()
+        .filter(|p| p.contains("is the digest of no recorded ask"))
+        .count();
+    assert_eq!(mismatched, 1, "{:?}", report.problems);
 }

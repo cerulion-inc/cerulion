@@ -8,7 +8,8 @@
 //!    receipt's `args_digest` is the answer's `request_sha256` (or its
 //!    `ask_sha256` when no request was sent) and its outcome is the answer's.
 //!    One receipt joins one answer.
-//! 3. Every answer names an ask the recording holds.
+//! 3. Every answer names an ask the recording holds, and its `ask_sha256`
+//!    is the SHA-256 of a recorded ask with that `ask_id`.
 //! 4. Every `late` receipt follows a `timeout` answer with the same request.
 //! 5. Where the recording holds the frame an answer sent, the image's
 //!    SHA-256 and the request body's SHA-256 recompute from the frame and
@@ -119,10 +120,14 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
     };
     report.asks = asks.len();
     report.answers = answers.len();
-    let mut asked: BTreeMap<String, usize> = BTreeMap::new();
+    // The SHA-256 of each recorded ask, by `ask_id`.
+    let mut asked: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (_, text) in &asks {
         if let Some(id) = crate::eye::answer::ask_id_of(text) {
-            *asked.entry(id.to_string()).or_default() += 1;
+            asked
+                .entry(id.to_string())
+                .or_default()
+                .push(sha256_hex(text.as_bytes()));
         }
     }
     let mut answered: BTreeMap<String, usize> = BTreeMap::new();
@@ -160,10 +165,18 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
             }
         }
         *answered.entry(id.to_string()).or_default() += 1;
-        if !asked.contains_key(&id.to_string()) {
-            report
+        match asked.get(&id.to_string()) {
+            None => report
                 .problems
-                .push(format!("answer to ask {id} has no ask in the recording"));
+                .push(format!("answer to ask {id} has no ask in the recording")),
+            Some(digests) => {
+                let ask_sha256 = answer.get("ask_sha256").and_then(Value::as_str);
+                if !ask_sha256.is_some_and(|d| digests.iter().any(|a| a == d)) {
+                    report.problems.push(format!(
+                        "answer to ask {id}: its ask_sha256 is the digest of no recorded ask with that id"
+                    ));
+                }
+            }
         }
         check_request(&answer, &images, &mut report);
     }
@@ -178,7 +191,11 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
     }
     report.unanswered = asked
         .iter()
-        .map(|(id, n)| n.saturating_sub(*answered.get(id).unwrap_or(&0)))
+        .map(|(id, digests)| {
+            digests
+                .len()
+                .saturating_sub(*answered.get(id).unwrap_or(&0))
+        })
         .sum();
     Ok(report)
 }

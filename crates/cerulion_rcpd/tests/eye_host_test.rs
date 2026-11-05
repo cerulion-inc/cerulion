@@ -13,7 +13,7 @@
 mod eye_common;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -209,13 +209,19 @@ fn manager(tag: &str) -> Arc<TransportManager> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted_answers() {
     let logs = install_logs();
-    let notice_before_request = Arc::new(AtomicBool::new(false));
-    let seen_notice = Arc::clone(&notice_before_request);
+    // Whether the notice was in the logs when the FIRST request reached the
+    // route; later requests leave it as the first one set it.
+    let notice_at_first_request: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let seen_notice = Arc::clone(&notice_at_first_request);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let script_requests = Arc::clone(&requests);
     let script_logs = logs.clone();
     let stub = Stub::start(move |_| {
-        if script_logs.text().contains(NOTICE) {
-            seen_notice.store(true, Ordering::SeqCst);
-        }
+        script_requests.fetch_add(1, Ordering::SeqCst);
+        seen_notice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| script_logs.text().contains(NOTICE));
         Reply::ok(good_body(ANSWERED_MODEL, 0.93, 0.68))
     })
     .await;
@@ -254,6 +260,7 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
     let gate_receipts = receipts.clone();
     let gate_key = key.clone();
     let gate_sink = sink.clone();
+    let gate_requests = Arc::clone(&requests);
     let gate = std::thread::spawn(move || {
         let mut gate = Gate::open(&gate_mgr, &gate_jev);
         let seq = gate.publish_frame();
@@ -308,6 +315,11 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         // The owner places the key: the next look sends, after the notice.
         cerulion_rcpd::eye::credential::write_credential(&gate_key, eye_common::TEST_KEY)
             .expect("key");
+        assert_eq!(
+            gate_requests.load(Ordering::SeqCst),
+            0,
+            "ask 2 makes the run's first request"
+        );
         let seq = gate.publish_frame();
         gate.ask(2, seq);
         let second = gate.answer(2, Duration::from_secs(5)).expect("answer 2");
@@ -338,8 +350,11 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         text.contains("dropped an ask over the ask bound"),
         "the flood was logged"
     );
-    assert!(
-        notice_before_request.load(Ordering::SeqCst),
+    assert_eq!(
+        *notice_at_first_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        Some(true),
         "the notice was logged before the first request reached the route"
     );
     assert_eq!(text.matches(NOTICE).count(), 1, "one notice line: {text}");

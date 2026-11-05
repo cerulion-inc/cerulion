@@ -163,11 +163,13 @@ pub fn notice_line(host: &str) -> String {
     format!(
         "RCP checks wrist-camera frames with Jev ({route}) before a press, so those frames \
          leave this robot; turn it off with `cerulion-rcpd jev off` (details: \
-         https://cerulion.com/jev)"
+         https://github.com/cerulion-inc/cerulion/blob/main/docs/rcp.md#jev-the-gates-second-eye)"
     )
 }
 
-/// What to print at start, if anything: `(warn, line)`.
+/// What to print at start, if anything: `(warn, line)`. The data notice is
+/// logged at warn, the once-only line included, so a warn filter still shows
+/// it; the line that Jev waits for `jev on` is logged at info.
 pub fn startup_notice(
     state_dir: &Path,
     level: NoticeLevel,
@@ -196,7 +198,7 @@ pub fn startup_notice(
             {
                 tracing::debug!(error = %e, "notice marker not written");
             }
-            Some((false, notice_line(host)))
+            Some((true, notice_line(host)))
         }
     }
 }
@@ -323,8 +325,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = startup_notice(dir.path(), NoticeLevel::Quiet, true, "openrouter.ai");
         let (warn, line) = first.expect("printed once");
-        assert!(!warn);
+        assert!(warn, "the once-only line is logged at warn");
         assert!(line.contains("cerulion-rcpd jev off"), "{line}");
+        assert!(
+            line.contains("docs/rcp.md#jev-the-gates-second-eye"),
+            "{line}"
+        );
         assert!(line.contains("through OpenRouter"), "{line}");
         assert!(
             !line

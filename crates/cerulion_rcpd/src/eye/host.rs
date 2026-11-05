@@ -27,7 +27,9 @@
 //! It stays on the network (and in the in-flight count) until
 //! [`limits::LATE_GRACE`] after the ask arrived; a reply in that window is
 //! logged as late with a `late` receipt and never published, and at its end
-//! the request is cancelled.
+//! the request is cancelled. A reply the thread takes from the channel at or
+//! after its deadline is handled the same way ([`Completed::taken_at`]): the
+//! ask is answered `timeout` and the reply is receipted `late`.
 //!
 //! The data notice is checked at spawn and again before the first request
 //! of the run leaves the robot, so a key placed after the daemon started
@@ -260,6 +262,11 @@ pub enum Completed {
         answer: Box<Answer>,
         /// How long the route asked to wait.
         retry_after: Option<Duration>,
+        /// For an answer from a reply, the ask's deadline: taken at or after
+        /// it, the answer is `timeout` and the reply late
+        /// ([`Completed::taken_at`]). `None` for the `timeout` answer given
+        /// at the deadline.
+        deadline: Option<Instant>,
     },
     /// A reply after the deadline: logged, receipted `late`, not published.
     /// A 429 or spend-limit reply still holds requests back.
@@ -274,6 +281,33 @@ pub enum Completed {
         /// The ask's id.
         ask_id: Value,
     },
+}
+
+impl Completed {
+    /// What the eye thread acts on when it takes this report at `now`. An
+    /// answer from a reply taken at or after its deadline becomes the ask's
+    /// `timeout` answer, followed by the reply as [`Completed::Late`]; any
+    /// other report is itself.
+    pub fn taken_at(self, now: Instant) -> Vec<Self> {
+        match self {
+            Self::Answer {
+                answer,
+                retry_after,
+                deadline: Some(deadline),
+            } if now >= deadline => vec![
+                Self::Answer {
+                    answer: Box::new(answer.timed_out()),
+                    retry_after: None,
+                    deadline: None,
+                },
+                Self::Late {
+                    answer,
+                    retry_after,
+                },
+            ],
+            other => vec![other],
+        }
+    }
 }
 
 /// The admission rules, without the transport.
@@ -503,8 +537,9 @@ impl EyeCore {
     }
 }
 
-/// Send one request and report on `done`: the answer by the deadline or a
-/// `timeout` at it, then a late reply or an abandonment.
+/// Send one request and report on `done`: the reply's answer with the
+/// deadline, or a `timeout` at the deadline followed by a late reply or an
+/// abandonment.
 pub async fn request(client: Arc<JevClient>, dispatch: Dispatch, done: mpsc::Sender<Completed>) {
     let Dispatch {
         prepared,
@@ -522,20 +557,14 @@ pub async fn request(client: Arc<JevClient>, dispatch: Dispatch, done: mpsc::Sen
             let latency = millis(received.elapsed());
             let retry_after = reply.as_ref().ok().filter(|r| r.status == 429).and_then(|r| r.retry_after);
             let answer = classify(&prepared, reply.as_ref().map_err(|e| *e), latency);
-            if Instant::now() < deadline {
-                let _ = done.send(Completed::Answer { answer: Box::new(answer), retry_after });
-            } else {
-                // The reply was taken at or after the deadline (both were
-                // ready at once): `timeout` is published and the reply is late.
-                let timeout = prepared.answer(Outcome::Timeout, Some("deadline"), Some(latency));
-                let _ = done.send(Completed::Answer { answer: Box::new(timeout), retry_after: None });
-                let _ = done.send(Completed::Late { answer: Box::new(answer), retry_after });
-            }
+            // When both branches are ready, `select!` may take this one after
+            // the deadline; `Completed::taken_at` answers it `timeout`.
+            let _ = done.send(Completed::Answer { answer: Box::new(answer), retry_after, deadline: Some(deadline) });
         }
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             let latency = millis(received.elapsed());
             let timeout = prepared.answer(Outcome::Timeout, Some("deadline"), Some(latency));
-            let _ = done.send(Completed::Answer { answer: Box::new(timeout), retry_after: None });
+            let _ = done.send(Completed::Answer { answer: Box::new(timeout), retry_after: None, deadline: None });
             let left = limits::LATE_GRACE.saturating_sub(received.elapsed());
             match tokio::time::timeout(left, &mut call).await {
                 Ok(reply) => {
@@ -851,14 +880,13 @@ impl EyeLoop {
                 Admit::Wait => waiting.push_back((text, received)),
                 Admit::Send(dispatch) => {
                     any = true;
-                    self.counters_today().looks += 1;
-                    match &self.client {
+                    match self.client.as_ref().map(Arc::clone) {
                         Some(client) => {
+                            self.counters_today().looks += 1;
                             if !self.notice_given {
                                 give_notice(self.core.settings(), true);
                                 self.notice_given = true;
                             }
-                            let client = Arc::clone(client);
                             let done = self.done_tx.clone();
                             self.runtime.spawn(request(client, *dispatch, done));
                         }
@@ -883,10 +911,17 @@ impl EyeLoop {
     }
 
     fn completed(&mut self, done: Completed) {
+        for done in done.taken_at(Instant::now()) {
+            self.settle(done);
+        }
+    }
+
+    fn settle(&mut self, done: Completed) {
         match done {
             Completed::Answer {
                 answer,
                 retry_after,
+                ..
             } => {
                 let held = self.core.note(
                     answer.outcome,
@@ -1028,7 +1063,19 @@ impl EyeLoop {
 
 #[cfg(test)]
 mod tests {
-    use super::client_for;
+    use super::{client_for, FrameStore};
+    use crate::eye::limits::MAX_IMAGE_BYTES;
+
+    #[test]
+    fn a_frame_of_exactly_the_byte_limit_is_held_and_one_byte_more_is_not() {
+        let mut store = FrameStore::default();
+        store.push(1, &vec![0x20_u8; MAX_IMAGE_BYTES]);
+        store.push(2, &vec![0x20_u8; MAX_IMAGE_BYTES + 1]);
+        let held = store.get(1).expect("frame 1");
+        assert_eq!(held.data.as_ref().map(Vec::len), Ok(200_000));
+        let over = store.get(2).expect("frame 2");
+        assert_eq!(over.data, Err(200_001));
+    }
 
     #[test]
     fn a_client_that_cannot_be_built_leaves_the_eye_without_one() {

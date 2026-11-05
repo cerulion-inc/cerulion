@@ -139,6 +139,20 @@ impl Answer {
         self.request_sha256.as_deref().unwrap_or(&self.ask_sha256)
     }
 
+    /// The `timeout` frame for the same ask and request: what the reply
+    /// answered (`model_answered`, `answers`, `usage`) is left out, and
+    /// `latency_ms` stays the reply's.
+    pub fn timed_out(&self) -> Self {
+        Self {
+            outcome: Outcome::Timeout,
+            detail: Some(String::from("deadline")),
+            model_answered: None,
+            answers: None,
+            usage: None,
+            ..self.clone()
+        }
+    }
+
     /// The receipt outcome: `ok`, or an error carrying the code.
     pub fn receipt_outcome(&self) -> cerud::receipt::ReceiptOutcome {
         match self.outcome {

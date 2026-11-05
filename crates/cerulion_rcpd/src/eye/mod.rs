@@ -27,9 +27,10 @@
 //! the frame on its own topic, so the request can be checked against it.
 //!
 //! The answer topic has no producer inside the graph, so a replay re-injects
-//! it as recorded and nothing calls the network; [`replay`] serves recorded
-//! answers by `ask_id` and answers an ask it never saw with `not_recorded`.
-//! [`verify`] joins a recording's answers to the receipt log.
+//! it as recorded and nothing calls the network; [`replay`] serves a recorded
+//! answer by `ask_id` and the ask text (`ask_sha256`), and answers any other
+//! ask with `not_recorded`. [`verify`] joins a recording's answers to the
+//! receipt log and to the recorded asks.
 //!
 //! The gate reads an answer through [`verdict::Look`]: `Agree`, `Disagree`
 //! or `Absent(outcome)`. There is no default and no conversion to `bool`, so
