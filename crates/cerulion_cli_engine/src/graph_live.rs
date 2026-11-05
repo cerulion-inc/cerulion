@@ -745,8 +745,9 @@ fn robot_object(robot: &str, status: &str) -> serde_json::Value {
     serde_json::json!({"kind": "robot", "robot": robot, "status": status})
 }
 
-/// One `graph live --json` object per run, and one per robot with no
-/// readable run. Only ids, names, topics and numbers.
+/// One `graph live --json` object per run, one per robot with no readable
+/// run, and an `incomplete` one after the runs of a robot whose answer may
+/// not name every run. Only ids, names, topics and numbers.
 pub fn live_json(harvest: &RunsHarvest) -> Vec<serde_json::Value> {
     let mut runs = Vec::new();
     let mut robots = Vec::new();
@@ -756,13 +757,18 @@ pub fn live_json(harvest: &RunsHarvest) -> Vec<serde_json::Value> {
             continue;
         }
         runs.extend(reply.runs.iter().map(|e| run_object(&reply.robot, e)));
-        if reply.runs.is_empty() {
-            let status = if reply.completeness.is_settled() {
-                "no_runs"
-            } else {
-                "incomplete"
-            };
-            robots.push(robot_object(&reply.robot, status));
+        if names_every_run(reply) {
+            if reply.runs.is_empty() {
+                robots.push(robot_object(&reply.robot, "no_runs"));
+            }
+        } else {
+            let mut robot = robot_object(&reply.robot, "incomplete");
+            robot["undescribable"] = reply
+                .undescribable
+                .iter()
+                .map(|run| serde_json::Value::from(run.run_id.as_str()))
+                .collect();
+            robots.push(robot);
         }
     }
     robots.extend(
@@ -902,31 +908,89 @@ fn no_run_reason(reply: &RunsReply) -> String {
         ),
         (None, RunsCompleteness::Settled) => format!("no run is live on robot {robot}"),
     };
-    for run in &reply.undescribable {
-        reason.push_str(&format!(
-            "; robot {robot} cannot describe run {} ({})",
-            clean(&run.run_id),
-            sanitize_refusal_reason(&run.reason)
-        ));
-    }
+    reason.push_str(&undescribable_note(&robot, reply));
     reason
 }
 
-/// The robots that refused the runs query, as a suffix for a refusal that
-/// lists the runs of the others.
-fn refusals_note(harvest: &RunsHarvest) -> String {
-    harvest
-        .replies
+fn undescribable_note(robot: &str, reply: &RunsReply) -> String {
+    reply
+        .undescribable
         .iter()
-        .filter(|reply| reply.error.is_some())
-        .map(|reply| format!("; {}", no_run_reason(reply)))
+        .map(|run| {
+            format!(
+                "; robot {robot} cannot describe run {} ({})",
+                clean(&run.run_id),
+                sanitize_refusal_reason(&run.reason)
+            )
+        })
         .collect()
 }
 
+/// A served, settled answer with every run described: the robot hosts no
+/// run it does not name.
+fn names_every_run(reply: &RunsReply) -> bool {
+    reply.error.is_none() && reply.completeness.is_settled() && reply.undescribable.is_empty()
+}
+
+/// Why the harvest may not name every run of the robots asked: one entry
+/// per robot that refused, gave an incomplete answer, gave an answer this
+/// desk cannot read, or did not answer.
+fn unnamed_runs(harvest: &RunsHarvest) -> Vec<String> {
+    let mut gaps: Vec<String> = harvest
+        .replies
+        .iter()
+        .filter(|reply| !names_every_run(reply))
+        .map(|reply| {
+            if reply.error.is_some() || reply.runs.is_empty() {
+                return no_run_reason(reply);
+            }
+            let robot = clean(&reply.robot);
+            let (live_writers, writers_heard) = match reply.completeness {
+                RunsCompleteness::Incomplete {
+                    live_writers,
+                    writers_heard,
+                } => (live_writers, writers_heard),
+                RunsCompleteness::Settled => (0, 0),
+            };
+            format!(
+                "robot {robot} may have more runs ({}){}",
+                incomplete_note(live_writers, writers_heard),
+                undescribable_note(&robot, reply)
+            )
+        })
+        .collect();
+    gaps.extend(unanswered(harvest));
+    gaps
+}
+
+/// The robots asked that gave no reply: one entry per robot whose answer
+/// this desk cannot read, then one per robot that did not answer.
+fn unanswered(harvest: &RunsHarvest) -> Vec<String> {
+    let unusable = harvest.unusable.iter().map(|answer| {
+        format!(
+            "robot {} answered the runs query with something this desk cannot read ({})",
+            clean(&answer.robot),
+            sanitize_refusal_reason(&answer.reason)
+        )
+    });
+    let silent = harvest
+        .silent
+        .iter()
+        .map(|robot| format!("robot {} did not answer the runs query", clean(robot)));
+    unusable.chain(silent).collect()
+}
+
+fn gaps_note(gaps: &[String]) -> String {
+    gaps.iter().map(|gap| format!("; {gap}")).collect()
+}
+
 /// Choose the run `graph fires` reads. `run` is a run id or a graph name;
-/// without it, the one run that serves fire telemetry.
+/// without it, the one run that serves fire telemetry. Only a run id
+/// chooses while a robot asked may host a run the harvest does not name.
 pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<SelectedRun> {
     let refuse = |text: String| Err(CliError::Validation(text));
+    let gaps = unnamed_runs(harvest);
+    let heard = if gaps.is_empty() { "" } else { " heard" };
     let all: Vec<(&str, &RunEntry)> = harvest
         .replies
         .iter()
@@ -942,7 +1006,8 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
             };
             return refuse(text.to_string());
         }
-        let reasons: Vec<String> = harvest.replies.iter().map(no_run_reason).collect();
+        let mut reasons: Vec<String> = harvest.replies.iter().map(no_run_reason).collect();
+        reasons.extend(unanswered(harvest));
         return refuse(format!("no run to read: {}", reasons.join("; ")));
     }
     let Some(text) = run else {
@@ -953,9 +1018,15 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
             .collect();
         return match capable.as_slice() {
             [] => refuse(format!(
-                "no run serves fire telemetry; the runs are: {}{}",
+                "no run{heard} serves fire telemetry; the runs{heard} are: {}{}",
                 list_runs(&all),
-                refusals_note(harvest)
+                gaps_note(&gaps)
+            )),
+            [(robot, entry)] if !gaps.is_empty() => refuse(format!(
+                "run {} is the only run heard that serves fire telemetry, and the answer may \
+                 not name every run; pass --run with its id to read it{}",
+                describe_run(robot, entry),
+                gaps_note(&gaps)
             )),
             [(robot, entry)] => readable_fires_run(robot, entry),
             many => refuse(format!(
@@ -975,11 +1046,22 @@ pub fn select_run(harvest: &RunsHarvest, run: Option<&str>) -> CliResult<Selecte
         .collect();
     match matches.as_slice() {
         [] => refuse(format!(
-            "no run matches --run {}; the runs are: {}{}",
+            "no run{heard} matches --run {}; the runs{heard} are: {}{}",
             clean(text),
             list_runs(&all),
-            refusals_note(harvest)
+            gaps_note(&gaps)
         )),
+        [(robot, entry)]
+            if !gaps.is_empty() && (id.is_none() || parse_run_id(&entry.run_id) != id) =>
+        {
+            refuse(format!(
+                "--run {} names run {} by its graph name, and the answer may not name every \
+                 run; pass --run with its id to read it{}",
+                clean(text),
+                describe_run(robot, entry),
+                gaps_note(&gaps)
+            ))
+        }
         [(robot, entry)] => readable_fires_run(robot, entry),
         many => refuse(format!(
             "--run {} matches {} runs; pass a run id: {}",
@@ -2441,6 +2523,43 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
         }
     }
 
+    /// A robot that named some runs and may have more gets an `incomplete`
+    /// object after its runs, so a partial answer does not read as a full
+    /// one. `undescribable` holds the ids of the runs it could not describe.
+    #[test]
+    fn live_json_marks_an_answer_that_may_not_name_every_run() {
+        let mut partial = reply("temi", vec![temi_entry()]);
+        partial.completeness = RunsCompleteness::Incomplete {
+            live_writers: 3,
+            writers_heard: 2,
+        };
+        partial.undescribable = vec![UndescribableRun {
+            run_id: format_run_id(9),
+            reason: "graph.yaml unreadable".to_string(),
+        }];
+        let mut quiet = reply("c", Vec::new());
+        quiet.completeness = RunsCompleteness::Incomplete {
+            live_writers: 2,
+            writers_heard: 1,
+        };
+        let objects = live_json(&harvest(vec![partial, quiet]));
+        assert_eq!(objects.len(), 3);
+        assert_eq!(objects[0]["kind"], "run");
+        assert_eq!(objects[0]["run_id"], format_run_id(TEMI_RUN_ID));
+        assert_eq!(
+            objects[1..],
+            [
+                serde_json::json!({"kind": "robot", "robot": "temi", "status": "incomplete",
+                    "undescribable": [format_run_id(9)]}),
+                serde_json::json!({"kind": "robot", "robot": "c", "status": "incomplete",
+                    "undescribable": []}),
+            ]
+        );
+        for (i, object) in objects.iter().enumerate() {
+            assert_only_ids_names_topics_and_numbers(object, &format!("object {i}"));
+        }
+    }
+
     // ---- select_run --------------------------------------------------------
 
     fn run_entry(run_id: u128, graph: &str, run_json: &str) -> RunEntry {
@@ -3022,15 +3141,123 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         ]);
         assert_eq!(
             err(&beside, None),
-            "no run serves fire telemetry; the runs are: \
+            "no run heard serves fire telemetry; the runs heard are: \
              0x00000000000000000000000000000001 (graph perception on robot desk); \
              robot temi refused the runs query (not authorized)"
         );
         assert_eq!(
             err(&beside, Some("temi")),
-            "no run matches --run temi; the runs are: \
+            "no run heard matches --run temi; the runs heard are: \
              0x00000000000000000000000000000001 (graph perception on robot desk); \
              robot temi refused the runs query (not authorized)"
+        );
+    }
+
+    /// When a robot asked may host a run this answer does not name, neither
+    /// the one run heard that serves fires nor a graph name is a unique
+    /// choice: the refusal names the run, its id and every gap. A run id
+    /// still reads the run it names.
+    #[test]
+    fn select_run_needs_a_run_id_when_the_answer_may_not_name_every_run() {
+        let err = |h: &RunsHarvest, run: Option<&str>| match select_run(h, run) {
+            Err(CliError::Validation(text)) => text,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let temi = "0x00000000000000000000000000005d1c (graph temi on robot temi)";
+        let mut partial = reply("temi", vec![temi_entry()]);
+        partial.completeness = RunsCompleteness::Incomplete {
+            live_writers: 2,
+            writers_heard: 1,
+        };
+        let partial = harvest(vec![partial]);
+        let gap = "robot temi may have more runs (the answer is incomplete: 1 of 2 runs \
+                   answered in time)";
+        assert_eq!(
+            err(&partial, None),
+            format!(
+                "run {temi} is the only run heard that serves fire telemetry, and the answer \
+                 may not name every run; pass --run with its id to read it; {gap}"
+            )
+        );
+        assert_eq!(
+            err(&partial, Some("temi")),
+            format!(
+                "--run temi names run {temi} by its graph name, and the answer may not name \
+                 every run; pass --run with its id to read it; {gap}"
+            )
+        );
+        for id in ["0x00000000000000000000000000005d1c", "5d1c"] {
+            assert_eq!(
+                select_run(&partial, Some(id)).expect(id),
+                temi_run(),
+                "{id}"
+            );
+        }
+
+        let mut undescribable = reply("temi", vec![temi_entry()]);
+        undescribable.completeness = RunsCompleteness::not_established();
+        undescribable.undescribable = vec![UndescribableRun {
+            run_id: format_run_id(9),
+            reason: "graph.yaml unreadable".to_string(),
+        }];
+        let mut refused = reply("guarded", Vec::new());
+        refused.error = Some("not authorized".to_string());
+        refused.completeness = RunsCompleteness::not_established();
+        let full = || reply("temi", vec![temi_entry()]);
+        for (h, gaps) in [
+            (
+                harvest(vec![undescribable]),
+                "robot temi may have more runs (the answer is incomplete); robot temi cannot \
+                 describe run 0x00000000000000000000000000000009 (graph.yaml unreadable)",
+            ),
+            (
+                harvest(vec![full(), refused]),
+                "robot guarded refused the runs query (not authorized)",
+            ),
+            (
+                RunsHarvest {
+                    replies: vec![full()],
+                    unusable: vec![UnusableRunsAnswer {
+                        robot: "old".to_string(),
+                        reason: "unknown runs wire version 2".to_string(),
+                    }],
+                    silent: vec!["quiet".to_string()],
+                },
+                "robot old answered the runs query with something this desk cannot read \
+                 (unknown runs wire version 2); robot quiet did not answer the runs query",
+            ),
+        ] {
+            assert_eq!(
+                err(&h, None),
+                format!(
+                    "run {temi} is the only run heard that serves fire telemetry, and the \
+                     answer may not name every run; pass --run with its id to read it; {gaps}"
+                )
+            );
+            assert_eq!(select_run(&h, Some("5d1c")).expect("by id"), temi_run());
+        }
+
+        let mut quiet = reply("c", Vec::new());
+        quiet.completeness = RunsCompleteness::Incomplete {
+            live_writers: 2,
+            writers_heard: 1,
+        };
+        assert_eq!(
+            err(&harvest(vec![full(), quiet]), Some("nope")),
+            format!(
+                "no run heard matches --run nope; the runs heard are: {temi}; robot c named no \
+                 runs (the answer is incomplete: 1 of 2 runs answered in time)"
+            )
+        );
+        let idle_and_quiet = RunsHarvest {
+            replies: vec![reply("idle", Vec::new())],
+            silent: vec!["quiet".to_string()],
+            ..RunsHarvest::default()
+        };
+        assert_eq!(
+            err(&idle_and_quiet, None),
+            "no run to read: no run is live on robot idle; robot quiet did not answer the runs \
+             query"
         );
     }
 
@@ -3246,14 +3473,19 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         );
         let mut twice = answered.clone();
         twice.runs.push(entry.clone());
-        for (asked, run) in [(&h, Some("none")), (&harvest(vec![twice]), None)] {
+        for (asked, run) in [
+            (&h, Some("none")),
+            (&h, None),
+            (&harvest(vec![twice]), None),
+        ] {
             match select_run(asked, run) {
                 Err(CliError::Validation(text)) => shown.push(text),
                 other => panic!("expected a refusal, got {other:?}"),
             }
         }
 
-        let run = select_run(&h, None).expect("the one run that serves fires");
+        let run = select_run(&harvest(vec![reply(HOSTILE, vec![entry.clone()])]), None)
+            .expect("the one run that serves fires");
         let page = |fires: Vec<FireRecord>| {
             FiresPoll::Reply(FiresReply {
                 version: FIRES_WIRE_VERSION,
