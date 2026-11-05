@@ -234,22 +234,53 @@ pub fn tcp_port_open(addr: SocketAddr, timeout: Duration) -> bool {
     TcpStream::connect_timeout(&addr, timeout.max(Duration::from_millis(1))).is_ok()
 }
 
-/// Parse + resolve a zenoh locator (`tcp/host:port`) and probe its FIRST
-/// resolved address. Unparseable or unresolvable ⇒ `false` (unreachable — it
-/// could never be connected anyway). The blocking DNS resolve is bounded only
-/// by this running inside a per-candidate thread under the batch deadline.
+/// Parse + resolve a zenoh locator (`tcp/host:port`) and probe EVERY resolved
+/// address; reachable when any one accepts. Unparseable or unresolvable ⇒
+/// `false` (unreachable — it could never be connected anyway). The blocking
+/// DNS resolve is bounded only by this running inside a per-candidate thread
+/// under the batch deadline.
 fn probe_locator(locator: &str, timeout: Duration) -> bool {
     let Some((host, port)) = parse_locator_host_port(locator) else {
         return false;
     };
     match (host, port).to_socket_addrs() {
-        Ok(mut addrs) => addrs.next().is_some_and(|a| tcp_port_open(a, timeout)),
+        Ok(addrs) => any_address_accepts(addrs.collect(), timeout),
         Err(_) => false,
     }
 }
 
+/// Does any of `addrs` accept a TCP connection within `timeout`? A name can
+/// resolve first to an address the robot does not serve (IPv6 ahead of the
+/// IPv4 it listens on), so every address is probed, and concurrently: one
+/// that swallows the SYN must not spend the time a later one needs. A single
+/// address (every IP-literal locator) is probed on the calling thread.
+fn any_address_accepts(addrs: Vec<SocketAddr>, timeout: Duration) -> bool {
+    match addrs.as_slice() {
+        [] => false,
+        [only] => tcp_port_open(*only, timeout),
+        _ => {
+            let (tx, rx) = mpsc::channel::<()>();
+            for addr in addrs {
+                let tx = tx.clone();
+                let _ = thread::Builder::new()
+                    .name("discovery-probe-addr".to_string())
+                    .spawn(move || {
+                        if tcp_port_open(addr, timeout) {
+                            let _ = tx.send(());
+                        }
+                    });
+            }
+            drop(tx);
+            // Every sender is bounded by `timeout`, so this returns by then:
+            // at the first accept, or when every probe has failed.
+            rx.recv().is_ok()
+        }
+    }
+}
+
 /// Probe every locator in `locators` CONCURRENTLY (one detached thread each,
-/// per-probe `timeout`) and return the set that accepted a TCP connection.
+/// and one more per address of a name that resolves to several; per-probe
+/// `timeout`) and return the set that accepted a TCP connection.
 /// Detached (not joined) so one hung DNS resolve can't exceed the bound; the
 /// collector stops at `timeout + a small slack`. An empty input is an empty set
 /// (no probing, and — load-bearing for the netd fold — no wall cost at all).
@@ -518,6 +549,74 @@ mod tests {
              collector deadline (took {:?})",
             start.elapsed()
         );
+    }
+
+    /// A port on this host that nothing listens on: bound, read, released.
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        listener.local_addr().expect("local addr").port()
+    }
+
+    /// A robot that listens on IPv4 only, reached through a name that
+    /// resolves first to IPv6: the refused `[::1]` must not hide the
+    /// `127.0.0.1` that accepts.
+    #[test]
+    fn a_later_resolved_address_that_accepts_keeps_the_locator() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let addrs = vec![
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ];
+        assert!(any_address_accepts(addrs, LADDER_PROBE_TIMEOUT));
+    }
+
+    /// The same case at the public filter, through a real resolver:
+    /// `localhost` resolves to `::1` and `127.0.0.1` (on macOS `::1` comes
+    /// first), and only `127.0.0.1` listens.
+    #[test]
+    fn a_name_whose_ipv4_address_alone_listens_is_reachable() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let locator = format!("tcp/localhost:{port}");
+        let reachable =
+            probe_reachable_locators(std::slice::from_ref(&locator), LADDER_PROBE_TIMEOUT);
+        assert_eq!(reachable, HashSet::from([locator]));
+    }
+
+    /// A first address that swallows the SYN (TEST-NET-1, RFC 5737, never
+    /// answers) must not spend the time the address that accepts needs: the
+    /// verdict comes inside the one budget, not after it.
+    #[test]
+    fn a_first_address_that_never_answers_does_not_spend_the_budget() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let addrs = vec![
+            SocketAddr::from(([192, 0, 2, 1], port)),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ];
+        let start = Instant::now();
+        assert!(any_address_accepts(addrs, EXPLICIT_PROBE_TIMEOUT));
+        assert!(
+            start.elapsed() < EXPLICIT_PROBE_TIMEOUT,
+            "the accepting address answered only after the silent one used the \
+             whole budget ({:?})",
+            start.elapsed()
+        );
+    }
+
+    /// No address that accepts, or no address at all: unreachable.
+    #[test]
+    fn a_locator_with_no_accepting_address_is_unreachable() {
+        let port = closed_loopback_port();
+        let refused = vec![
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ];
+        assert!(!any_address_accepts(refused, LADDER_PROBE_TIMEOUT));
+        assert!(!any_address_accepts(Vec::new(), LADDER_PROBE_TIMEOUT));
+        let locator = format!("tcp/localhost:{port}");
+        assert!(probe_reachable_locators(&[locator], LADDER_PROBE_TIMEOUT).is_empty());
     }
 
     #[test]
