@@ -1212,6 +1212,12 @@ impl GatewayRuntime {
         let run_source = RunSource {
             iox_config: Arc::new(manager.iox_config()),
             gather_window: RUN_GATHER_WINDOW,
+            // The manager's own slot, so a run hosted on this process's network
+            // manager is served by whichever construction latched the surface.
+            hosted: manager
+                .network()
+                .expect("network present (checked above)")
+                .hosted_runs(),
         };
         // Keep test-only clones BEFORE the sources move into the query
         // surface (the seams reconstruct the exact serve decision the callback runs).
@@ -3023,3 +3029,80 @@ mod schema_serving_handles_tests {
 // Pure GatewayPlan tests (validate + serde round-trip) live in
 // `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
 // schema-serving replacement contract test stays local to access the private maps.
+
+#[cfg(test)]
+mod hosted_runs_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use super::{GatewayEgressPolicy, GatewayPlan, GatewayRuntime};
+    use crate::transport::cerulion_q::{RunEntry, RunEntryState};
+    use crate::transport::hosted_runs::HostedRun;
+    use crate::transport::network::NetworkConfig;
+    use crate::transport::run_registry::RunState;
+    use crate::transport::{TransportConfig, TransportManager};
+
+    const ROBOT: &str = "hostgw";
+
+    #[test]
+    fn a_gateway_serves_the_runs_hosted_on_its_managers_network() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("hostgw_{}", std::process::id()),
+                network: Some(NetworkConfig {
+                    robot_identity: Some(ROBOT.to_string()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("init gateway manager");
+        let hosted = manager
+            .network()
+            .expect("a configured network")
+            .hosted_runs();
+        let gateway = GatewayRuntime::new(
+            manager,
+            GatewayPlan {
+                egress_policy: GatewayEgressPolicy::AllowAll,
+                announce: Vec::new(),
+                ingress: Vec::new(),
+            },
+        )
+        .expect("gateway boot");
+        let entry = RunEntry::new(
+            0x7e41,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+
+        let guard = hosted.host(
+            0x7e41,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let served = gateway.runs_serve_for_test(ROBOT);
+        assert_eq!(
+            served
+                .runs
+                .iter()
+                .map(|e| (e.run_id.as_str(), e.graph_name.as_str(), e.state))
+                .collect::<Vec<_>>(),
+            vec![(
+                "0x00000000000000000000000000007e41",
+                "temi",
+                RunEntryState::Live
+            )]
+        );
+
+        drop(guard);
+        assert!(gateway.runs_serve_for_test(ROBOT).runs.is_empty());
+    }
+}
