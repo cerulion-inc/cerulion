@@ -457,6 +457,7 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion connect::robot",
         "cerulion graph levels::name",
         "cerulion graph partition::name",
+        "cerulion graph plan::name",
         "cerulion graph profile::name",
         "cerulion graph run::name",
         "cerulion graph validate::name",

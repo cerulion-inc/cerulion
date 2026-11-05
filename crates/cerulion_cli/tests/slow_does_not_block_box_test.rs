@@ -16,11 +16,11 @@
 //! Every leg's window must also measure something before any rate is
 //! compared (`read_identity::check_fire_window`): a fire in each of its four
 //! equal parts, and a fire-count floor. A full-rate leg (BASELINE, and SLOW in
-//! another process) needs half the fires its reference rate gives over the
-//! window (the 1 kHz pacer for BASELINE, the measured baseline rate for SLOW);
-//! a leg that slows the fast node (CONTROL, SLOW in one process) needs
-//! [`SLOWED_MIN_FIRES`]. An empty or stalled leg fails `RI_HARNESS:`, so it
-//! never reads as "cut" or "held".
+//! either arm) needs half the fires its reference rate gives over the window
+//! (the 1 kHz pacer for BASELINE, the measured baseline rate for SLOW); the
+//! leg that slows the fast node (CONTROL) needs [`SLOWED_MIN_FIRES`]. An
+//! empty or stalled leg fails `RI_HARNESS:`, so it never reads as "cut" or
+//! "held".
 //!
 //! ## The arms
 //!
@@ -35,11 +35,11 @@
 //!   3. SLOW, `slow` sleeping 50 ms on the default `drop_oldest` input. It must
 //!      keep at least 90% of the baseline rate and a P99 within
 //!      `2 x baseline + 1 ms`.
-//! * `a_slow_node_in_the_same_process_holds_the_fast_node_today`: the same
-//!   graph under `--single-process`, BASELINE then SLOW. Nodes that share a
-//!   process run on one level-by-level step loop, so a 50 ms tick holds every
-//!   node of the process; the arm asserts that coupling (SLOW at most half the
-//!   baseline rate).
+//! * `a_slow_node_in_the_same_process_does_not_slow_the_fast_node`: the same
+//!   graph under `--single-process`, BASELINE then SLOW. The one process runs
+//!   its nodes in executor units (`pace` publishes two topics, so `fast` and
+//!   `slow` each start a unit of their own on their own thread), and the SLOW
+//!   leg must meet the first arm's bound.
 //!
 //! Each leg prints one line:
 //!
@@ -186,7 +186,7 @@ fn run_leg(ws: &Workspace, arm: &str, leg: &str, slow: Slow, single_process: boo
         ("g_slow", vec!["slow"]),
     ];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
-    let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+    let dir = scaffold_dir::ScaffoldDir::new("slow_nb_leg");
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
     let extra: &[&str] = if single_process {
@@ -279,18 +279,32 @@ fn a_slow_node_in_another_process_does_not_slow_the_fast_node() {
 #[test]
 #[ignore = "needs a quiet Linux host: timing"]
 #[serial]
-fn a_slow_node_in_the_same_process_holds_the_fast_node_today() {
+fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
     const ARM: &str = "same_process";
     let ws = &read_identity::workspace();
     let base = run_leg(ws, ARM, "baseline", Slow::DropOldest(0), true);
     assert_baseline_measured(ARM, &base);
     let slow = run_leg(ws, ARM, "slow", Slow::DropOldest(SLOW_SLEEP_US), true);
-    require_window(ARM, "slow", &slow, SLOWED_MIN_FIRES);
+    require_window(ARM, "slow", &slow, full_rate_floor(&slow, base.rate_hz));
     assert!(
-        slow.rate_hz <= base.rate_hz * 0.5,
-        "the slow node did not hold the fast node in one process ({:.1} Hz against a {:.1} Hz \
-         baseline): nodes in one process do not share one step loop",
+        slow.edges_ok,
+        "the fast node did not fire across the whole window beside a slow node in the same \
+         process (it started late or stalled)"
+    );
+    assert!(
+        slow.rate_hz >= base.rate_hz * 0.9,
+        "a slow node in the same process cut the fast node's rate: {:.1} Hz against a {:.1} Hz \
+         baseline",
         slow.rate_hz,
         base.rate_hz
+    );
+    let bound = base.p99_ns * 2 + 1_000_000;
+    assert!(
+        slow.p99_ns <= bound,
+        "a slow node in the same process raised the fast node's latency p99 to {} us (baseline \
+         {} us, bound {} us)",
+        slow.p99_ns / 1000,
+        base.p99_ns / 1000,
+        bound / 1000
     );
 }

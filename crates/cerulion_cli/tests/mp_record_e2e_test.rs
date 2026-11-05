@@ -8,9 +8,11 @@
 //! itself fans the SIGINT out to its workers), and pin the multi-process bag
 //! contracts:
 //!
-//! 1. **mp happy path** — exit 0; ONE finalized bag; per-rank manifests
-//!    (`rank0` = `[ticker,relay]`, `rank1` = `[sink]`, the `rank4294967295`
-//!    departure sentinel = `[]`); every trace record's `reserved` ∈ {0,1} with
+//! 1. **mp happy path**: exit 0; ONE finalized bag; one rank per executor
+//!    unit with its manifest (lockstep: `rank0` = `[ticker,relay]`, `rank1` =
+//!    `[sink]`; a free run with no profile splits `p0` into `p0.ticker` and
+//!    `p0.relay`: `[ticker]`, `[relay]`, `[sink]`), the `rank4294967295`
+//!    departure sentinel = `[]`; every trace record's `reserved` is a unit's rank, with
 //!    NO departure records (happy path); per-rank STEP-BOUNDARY streams
 //!    0-based gap-free + non-decreasing with fire ≤ boundary per step; the
 //!    cross-rank boundary AGREEMENT (equal `fire_time_ns` per shared step —
@@ -25,9 +27,10 @@
 //!    ids), no rank-1, no departure sentinel, every `reserved` == 0.
 //! 3. **`--time-source virtual` still rejected** — subprocess-level validator
 //!    pin (exit nonzero naming the live-clock requirement).
-//! 4. **Departure path** — SIGKILL the rank-1 worker under
+//! 4. **Departure path**: SIGKILL the `p1` worker under
 //!    `--peer-loss continue`: exit 0 (degraded), the bag carries kind-2
-//!    departure record(s) with `reserved` == u32::MAX + `node_idx` == 1, the
+//!    departure record(s) with `reserved` == u32::MAX + `node_idx` == p1's
+//!    rank (1 under lockstep, 2 on a free run), the
 //!    survivor out-steps the dead rank, the sentinel manifest stays `[]`, and
 //!    EVERY ring name (the SIGKILLed worker's included) is swept.
 //! 5. **Killed bagd** — SIGKILL the bagd grandchild
@@ -121,6 +124,34 @@ impl RecordMode {
             Self::FreeRun | Self::Default => true,
         }
     }
+
+    /// The executor units `mpdemo` runs under this arm, in rank order, each with
+    /// the nodes it runs (one bag rank per unit). The lockstep opt-out runs one
+    /// level loop per process; a free run executes each process in executor
+    /// units, and with no profile every data-triggered node is a unit of its
+    /// own, so `p0` records two ranks.
+    fn recorded_units(self) -> Vec<(&'static str, Vec<String>)> {
+        let nodes = |ids: &[&str]| ids.iter().map(|s| (*s).to_string()).collect();
+        match self {
+            Self::Lockstep => vec![
+                ("p0", nodes(&["ticker", "relay"])),
+                ("p1", nodes(&["sink"])),
+            ],
+            Self::FreeRun | Self::Default => vec![
+                ("p0.ticker", nodes(&["ticker"])),
+                ("p0.relay", nodes(&["relay"])),
+                ("p1", nodes(&["sink"])),
+            ],
+        }
+    }
+
+    /// The rank `p1`'s only unit records under this arm.
+    fn p1_rank(self) -> u32 {
+        self.recorded_units()
+            .iter()
+            .position(|(unit, _)| *unit == "p1")
+            .expect("p1 is a unit of its own") as u32
+    }
 }
 
 fn mp_record_contracts_under_signal(
@@ -160,13 +191,14 @@ fn mp_record_contracts_under_signal(
     // premise. A mid-run read sees only flushed chunks, so this is a lower
     // bound on the finalized bag — late, never early.
     let ticker_topic = format!("/{prefix}/ticker/cmd");
+    let units = mode.recorded_units();
+    let n_ranks = units.len() as u32;
     wait_for_bag_state(
         &bag,
-        "both ranks' boundary streams and the ticker's frames",
+        "every rank's boundary stream and the ticker's frames",
         RECORDED_WINDOW_TIMEOUT,
         |snap| {
-            snap.boundaries_for_rank(0) >= RECORDED_WINDOW_BOUNDARIES
-                && snap.boundaries_for_rank(1) >= RECORDED_WINDOW_BOUNDARIES
+            (0..n_ranks).all(|rank| snap.boundaries_for_rank(rank) >= RECORDED_WINDOW_BOUNDARIES)
                 && snap.frames_on(&ticker_topic) > 0
         },
     );
@@ -202,9 +234,14 @@ fn mp_record_contracts_under_signal(
     // worker breadcrumb is the anti-vacuity premise for the per-worker pins
     // below (workers inherit the supervisor's redirected stderr).
     assert_eq!(
-        log.matches("worker build path resolved").count(),
+        log.matches("spawned worker process").count(),
         2,
-        "both workers log their resolved build path to the shared stderr; log was:\n{log}"
+        "one worker process per process group; log was:\n{log}"
+    );
+    assert_eq!(
+        log.matches("worker build path resolved").count(),
+        units.len(),
+        "every unit logs its resolved build path to the shared stderr; log was:\n{log}"
     );
     match mode {
         RecordMode::Lockstep => {
@@ -229,8 +266,8 @@ fn mp_record_contracts_under_signal(
             );
             assert_eq!(
                 log.matches("no barrier cohort to leave").count(),
-                2,
-                "both free-run workers exit with no cohort to leave; log was:\n{log}"
+                units.len(),
+                "every free-run unit exits with no cohort to leave; log was:\n{log}"
             );
             assert_eq!(
                 log.matches("worker left the barrier cohort").count(),
@@ -240,14 +277,14 @@ fn mp_record_contracts_under_signal(
             assert_eq!(
                 log.matches("gating clock epoch armed for the live loop")
                     .count(),
-                2,
-                "both free-run recording workers arm the shared epoch; log was:\n{log}"
+                units.len(),
+                "every free-run recording unit arms the shared epoch; log was:\n{log}"
             );
             assert_eq!(
                 log.matches("gating clock placed at the live loop's epoch")
                     .count(),
-                2,
-                "…and both place it at their live-loop anchor; log was:\n{log}"
+                units.len(),
+                "and every unit places it at its live-loop anchor; log was:\n{log}"
             );
         }
     }
@@ -296,20 +333,20 @@ fn mp_record_contracts_under_signal(
         "the bag's coordination stamp follows the resolved execution mode: {recorder}"
     );
 
-    // (b) per-rank manifests + the departure sentinel manifest.
-    let (r0, ids0) = read_manifest(&reader, 0).expect("rank0 manifest present");
-    assert_eq!(r0, 0);
-    assert_eq!(
-        ids0,
-        vec!["ticker".to_string(), "relay".to_string()],
-        "rank-0 manifest = p0's subgraph node ids in config order"
-    );
-    let (r1, ids1) = read_manifest(&reader, 1).expect("rank1 manifest present");
-    assert_eq!(r1, 1);
-    assert_eq!(
-        ids1,
-        vec!["sink".to_string()],
-        "rank-1 manifest = p1's subgraph node ids"
+    // (b) per-rank manifests (one per unit, its node ids in config order),
+    // no rank past the last unit, and the departure sentinel manifest.
+    for (rank, (unit, nodes)) in units.iter().enumerate() {
+        let (r, ids) = read_manifest(&reader, rank as u32)
+            .unwrap_or_else(|| panic!("rank{rank} manifest present"));
+        assert_eq!(r, rank as u64);
+        assert_eq!(
+            &ids, nodes,
+            "rank-{rank} manifest = unit {unit}'s subgraph node ids in config order"
+        );
+    }
+    assert!(
+        read_manifest(&reader, n_ranks).is_none(),
+        "one rank per unit and no more"
     );
     let (rd, idsd) =
         read_manifest(&reader, DEPARTURE_SENTINEL).expect("departure sentinel manifest present");
@@ -319,14 +356,15 @@ fn mp_record_contracts_under_signal(
         "the departure ring's manifest is EMPTY (node_idx carries a worker rank)"
     );
 
-    // (c) every record's provenance ∈ {0, 1}; NO departures on the happy path.
+    // (c) every record's provenance is a unit's rank; NO departures on the
+    // happy path.
     let trace = reader.scheduler_trace().expect("scheduler_trace");
     assert!(!trace.is_empty(), "the mp bag must carry trace records");
     for r in &trace {
         assert!(
-            r.reserved == 0 || r.reserved == 1,
-            "happy path: every record's bagd-stamped rank must be 0 or 1, got {} \
-             (u32::MAX would be departure provenance)",
+            r.reserved < n_ranks,
+            "happy path: every record's bagd-stamped rank must be a unit's rank (below \
+             {n_ranks}), got {} (u32::MAX would be departure provenance)",
             r.reserved
         );
         assert_ne!(
@@ -337,8 +375,8 @@ fn mp_record_contracts_under_signal(
     let ranks = by_rank(&trace);
     assert_eq!(
         ranks.keys().copied().collect::<Vec<_>>(),
-        vec![0, 1],
-        "both workers' rings must reach the bag"
+        (0..n_ranks).collect::<Vec<_>>(),
+        "every unit's ring must reach the bag"
     );
 
     // (d) per-rank STEP-BOUNDARY streams: 0-based gap-free steps,
@@ -445,7 +483,11 @@ fn mp_record_contracts_under_signal(
 
     // (f) per-rank FIRE records resolve through THEIR rank's manifest to
     // exactly that group's nodes.
-    let manifests: BTreeMap<u32, Vec<String>> = [(0u32, ids0), (1u32, ids1)].into();
+    let manifests: BTreeMap<u32, Vec<String>> = units
+        .iter()
+        .enumerate()
+        .map(|(rank, (_, nodes))| (rank as u32, nodes.clone()))
+        .collect();
     for (&rank, records) in &ranks {
         let ids = &manifests[&rank];
         let mut fired: Vec<&str> = Vec::new();
@@ -465,7 +507,7 @@ fn mp_record_contracts_under_signal(
         }
         assert!(
             !fired.is_empty(),
-            "rank {rank} must record at least one fire (rank 1 firing proves \
+            "rank {rank} must record at least one fire (the sink's rank firing proves \
              CROSS-GROUP data flow reached the sink)"
         );
         for name in &fired {
@@ -510,8 +552,8 @@ fn mp_record_contracts_under_signal(
     for r in &kind6 {
         let rank = r.rank();
         assert!(
-            rank == 0 || rank == 1,
-            "kind-6 rank stamp must be a worker rank, got {rank}"
+            rank < n_ranks,
+            "kind-6 rank stamp must be a unit's rank, got {rank}"
         );
         let manifest = raw_manifest(rank);
         let node_ids: Vec<&str> = manifest["node_ids"]
@@ -537,12 +579,18 @@ fn mp_record_contracts_under_signal(
         );
     }
     // The manifest attachment JSON carries the `inputs` key with a NON-empty
-    // list for the consumer nodes (relay on rank 0, sink on rank 1) — the
-    // offline resolver bagd stamps from the ring's input section.
-    for (rank, consumer) in [(0u32, "relay"), (1u32, "sink")] {
+    // list for the consumer nodes (relay and sink, on the ranks of their
+    // units): the offline resolver bagd stamps from the ring's input section.
+    let consumers = units.iter().enumerate().flat_map(|(rank, (_, nodes))| {
+        nodes
+            .iter()
+            .filter(|n| *n == "relay" || *n == "sink")
+            .map(move |n| (rank as u32, n.clone()))
+    });
+    for (rank, consumer) in consumers {
         let manifest = raw_manifest(rank);
         assert_eq!(
-            manifest["inputs"][consumer],
+            manifest["inputs"][consumer.as_str()],
             serde_json::json!(["trigger_in"]),
             "rank-{rank} manifest `inputs` must name {consumer}'s wired input"
         );
@@ -707,12 +755,13 @@ fn mp_graph_record_with_virtual_clock_rejected() {
 }
 
 /// (4) The DEPARTURE path, e2e (the no-inert-shipping
-/// class): SIGKILL the rank-1 (sink) worker mid-run under
+/// class): SIGKILL the `p1` (sink) worker mid-run under
 /// `--peer-loss continue` → the run continues DEGRADED and exits 0 on Ctrl-C,
 /// and the bag carries the departure evidence:
 /// - ≥1 `RECORD_TYPE_DEPARTURE` record, `reserved` == u32::MAX (the departure
-///   ring's header rank, bagd-stamped) and `node_idx` == 1 (the killed
-///   worker's plan rank);
+///   ring's header rank, bagd-stamped) and `node_idx` == the killed
+///   worker's plan rank (1 under lockstep; 2 on a free run, where `p0`
+///   records a rank per executor unit);
 /// - the SURVIVING rank-0 stream kept going past the kill — under LOCKSTEP its
 ///   boundary stream runs strictly longer than the dead rank's (the barrier
 ///   couples them, so rank 0's lead is the post-kill window); under FREE-RUN the
@@ -754,6 +803,10 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
+    // `p1`'s rank: 1 under lockstep, 2 on a free run, where `p0` records one
+    // rank per executor unit (`p0.ticker`, `p0.relay`).
+    let killed = mode.p1_rank();
+    let n_ranks = mode.recorded_units().len() as u32;
 
     let recordings = tmp.path().join("recordings");
     let bag = wait_for_bag(&recordings, Duration::from_secs(90)).unwrap_or_else(|| {
@@ -763,16 +816,15 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
             read_file(&stderr_path)
         )
     });
-    // A healthy pre-kill window so BOTH ranks bank fires + boundaries — waited
-    // for on the evidence itself, so the kill lands only once both ranks really
-    // have a recorded stream to compare afterwards.
+    // A healthy pre-kill window so EVERY rank banks fires + boundaries, waited
+    // for on the evidence itself, so the kill lands only once every rank really
+    // has a recorded stream to compare afterwards.
     wait_for_bag_state(
         &bag,
-        "both ranks' pre-kill boundary streams",
+        "every rank's pre-kill boundary stream",
         RECORDED_WINDOW_TIMEOUT,
         |snap| {
-            snap.boundaries_for_rank(0) >= RECORDED_WINDOW_BOUNDARIES
-                && snap.boundaries_for_rank(1) >= RECORDED_WINDOW_BOUNDARIES
+            (0..n_ranks).all(|rank| snap.boundaries_for_rank(rank) >= RECORDED_WINDOW_BOUNDARIES)
         },
     );
 
@@ -896,8 +948,8 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
             "departure provenance is the departure ring's u32::MAX header rank"
         );
         assert_eq!(
-            d.node_idx, 1,
-            "the departure names the killed worker's plan rank (p1 = rank 1)"
+            d.node_idx, killed,
+            "the departure names the killed worker's plan rank (p1 = rank {killed})"
         );
     }
     // Only the departure ring may carry u32::MAX provenance.
@@ -924,7 +976,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
             .max()
             .unwrap_or_else(|| panic!("rank {rank} must carry boundary records"))
     };
-    let (last0, last1) = (last_boundary_step(0), last_boundary_step(1));
+    let (last0, last1) = (last_boundary_step(0), last_boundary_step(killed));
     // Printed on EVERY run, pass or fail: these numbers are the whole diagnosis
     // for this arm. Run with `--nocapture` to see the `[prefix/Mode]` line.
     eprintln!("[{prefix}/{mode:?}] last0={last0} last1={last1} growths={growths}");
@@ -937,8 +989,8 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
         // CONSTRUCTION, and a tie is a real finding.
         RecordMode::Lockstep => assert!(
             last0 > last1,
-            "the surviving rank 0 must out-step the killed rank 1 in the FINALIZED bag \
-             (rank0 last step {last0} vs rank1 {last1}) — the recorder flushed \
+            "the surviving rank 0 must out-step the killed rank {killed} in the FINALIZED bag \
+             (rank0 last step {last0} vs rank{killed} {last1}); the recorder flushed \
              {growths} time(s) after the kill, so post-kill records DID reach the bag; \
              a tie here is a scheduling finding, not a recording one"
         ),
@@ -984,7 +1036,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
                 survivor_after.len() >= 2,
                 "free-run: the SURVIVOR (rank 0) must have at least two step boundaries \
                  stamped AFTER the kill in the FINALIZED bag — found {} (kill_ns={kill_ns}, \
-                 rank0 last step {last0}, rank1 last step {last1}, {growths} post-kill file \
+                 rank0 last step {last0}, rank{killed} last step {last1}, {growths} post-kill file \
                  growth(s)). Zero means rank 0's trace ring stopped reaching the bag when \
                  its peer died; one can be a record already in flight.",
                 survivor_after.len()
@@ -995,7 +1047,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
             assert!(
                 last1 > 0,
                 "free-run: the killed rank must have banked boundaries before it died \
-                 (rank1 last step {last1})"
+                 (rank{killed} last step {last1})"
             );
         }
     }

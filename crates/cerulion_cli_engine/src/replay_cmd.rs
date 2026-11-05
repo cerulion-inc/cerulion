@@ -1472,12 +1472,12 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
     // fill has nothing to fill. It still fires for an older bag, recorded
     // from a graph file with no `prefix:` line, which replays only on a host
     // whose hostname matches the recorder's — re-record to fix.
-    let mut config = cerulion_core::graph::parse_graph(graph_yaml).map_err(|e| {
-        ReplayError::BagInvalidAttachment {
-            name: GRAPH_ATTACHMENT.to_string(),
-            reason: describe_graph_attachment_parse_failure(&e.to_string()),
-        }
-    })?;
+    let mut config =
+        cerulion_core::graph::parse_recorded_graph(graph_yaml, &bag.display().to_string())
+            .map_err(|e| ReplayError::BagInvalidAttachment {
+                name: GRAPH_ATTACHMENT.to_string(),
+                reason: describe_graph_attachment_parse_failure(&e.to_string()),
+            })?;
     cerulion_core::graph::validate_graph(&config).map_err(|e| {
         ReplayError::BagInvalidAttachment {
             name: GRAPH_ATTACHMENT.to_string(),
