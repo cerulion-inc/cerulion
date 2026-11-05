@@ -590,18 +590,20 @@ pub enum Request {
     ///
     /// The first `activity` for a `(robot, run_id)` starts a follower that asks
     /// the robot for that run's fires four times a second, on its own netd
-    /// connection. Every `activity` for the same run extends the follower by
-    /// three seconds, so a controller that stops asking stops the follower three
-    /// seconds later, and the robot stops recording five seconds after that. At
-    /// most four runs are followed at once; a fifth evicts the run asked about
-    /// least recently.
+    /// connection. Every `activity` for the same run keeps the follower until
+    /// three seconds after that ask, so a controller that stops asking stops the
+    /// follower three seconds later, and the robot stops recording five seconds
+    /// after that. At most four runs are followed at once: a fifth is answered
+    /// `degraded` while all four are still asked about, and takes the place of
+    /// one whose three seconds have run out.
     ///
     /// Like every handler, it never waits: the answer is what the follower holds
     /// this instant (`starting` before its first reply).
     Activity {
         /// Correlation id echoed in the response.
         id: u64,
-        /// The robot hosting the run, as its `runs` row names it.
+        /// The robot hosting the run, as its `runs` row names it: one name, with
+        /// no `/`, `*`, `$`, `?` or `#`, and not an `account:` route.
         robot: String,
         /// The run, in the canonical `0x` + 32 lowercase hex form its `runs`
         /// row carries.
@@ -1306,14 +1308,21 @@ pub struct ActivityResponse {
     /// What the follower's newest poll learned.
     pub state: ActivityState,
     /// The last fire sequence this answer accounts for, inclusive. Pass it as
-    /// the next request's `after`.
+    /// the next request's `after`. `fires`, `lost` and `skipped` together
+    /// account for every sequence in `(after, next]` the follower followed (an
+    /// `after` before the follow began, or none, counts from its start).
     pub next: u64,
-    /// Sequences in `(after, next]` this answer does not carry: lost on the
-    /// robot, aged out of this daemon's log, or older than the newest
-    /// [`crate::activity::MAX_ACTIVITY_FIRES`]. Counted only over the span the
-    /// follower has followed.
+    /// Fires in that span the robot dropped before the follower read them.
     pub lost: u64,
-    /// The span the per-node counts and durations cover, in milliseconds.
+    /// Fires in that span the follower read but this answer leaves out: past
+    /// the newest [`crate::activity::MAX_ACTIVITY_FIRES`], or older than the
+    /// [`crate::activity::ACTIVITY_LOG_CAPACITY`] fires this daemon keeps per
+    /// run. A robot loss older than those is counted here too.
+    pub skipped: u64,
+    /// The span the per-node counts and durations cover, in milliseconds: five
+    /// seconds, or less once the run fired more in that span than this daemon
+    /// keeps. A follow younger than the span holds fires only since its first
+    /// poll.
     pub window_ms: u32,
     /// The nodes inside a tick at the newest poll, in topology order.
     pub in_tick: Vec<InTick>,
@@ -1375,7 +1384,7 @@ pub struct InTick {
 pub struct NodeActivity {
     /// Index into the run's `topology.nodes`.
     pub node: u16,
-    /// Fires inside the window.
+    /// Fires inside `window_ms`.
     pub fires: u32,
     /// Age of the newest fire the log holds, inside the window or not. `null`
     /// for a node seen only inside a tick.
@@ -4651,6 +4660,7 @@ mod tests {
                 },
                 next: 5123,
                 lost: 0,
+                skipped: 0,
                 window_ms: 5000,
                 in_tick: vec![InTick { node: 2, ms: 356.0 }],
                 nodes: vec![NodeActivity {
@@ -4682,7 +4692,7 @@ mod tests {
                 concat!(
                     r#"{{"id":7,"ok":true,"activity":{{"robot":"temi","run_id":"{run}","#,
                     r#""state":{{"kind":"live","armed_since_ms_ago":31840.5}},"next":5123,"lost":0,"#,
-                    r#""window_ms":5000,"in_tick":[{{"node":2,"ms":356.0}}],"#,
+                    r#""skipped":0,"window_ms":5000,"in_tick":[{{"node":2,"ms":356.0}}],"#,
                     r#""nodes":[{{"node":0,"fires":5,"last_ms_ago":412.0,"dur_p50_ns":38211,"#,
                     r#""dur_max_ns":61002,"panics":0,"errors":0,"last_cause":1,"last_wrote":1,"#,
                     r#""last_flags":0}}],"#,

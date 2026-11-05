@@ -21,8 +21,19 @@
 //!
 //! A page's `next` is the last sequence it accounts for, and the follower passes
 //! it unchanged as the next GET's cursor. An answer keeps the same rule for its
-//! controller: the fires it carries plus its `lost` account for every sequence
-//! in `(after, next]` the follower followed.
+//! controller: the fires it carries, its `lost` and its `skipped` account for
+//! every sequence in `(after, next]` the follower followed.
+//!
+//! # Lost is the robot's, skipped is the desk's
+//!
+//! A sequence the follower never received was lost on the robot: the robot
+//! accounts for every sequence up to a page's `next`, and the follower asks with
+//! its own cursor, so a gap is the robot's `lost`. Each held fire carries the
+//! robot's losses before it, which lets an answer count the losses inside its
+//! span. A sequence the follower received but the answer leaves out (past the
+//! newest [`MAX_ACTIVITY_FIRES`], or dropped from the log) is `skipped`. A loss
+//! older than every fire the log holds can no longer be told apart from a
+//! dropped fire, so it is counted as skipped.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -38,13 +49,14 @@ pub const ACTIVITY_LOG_CAPACITY: usize = 2048;
 /// The most fires one `activity` answer carries (the newest ones).
 pub const MAX_ACTIVITY_FIRES: usize = 256;
 
-/// One fire as the log keeps it: the robot's age of it at the serve, and the
-/// desk instant the page arrived.
+/// One fire as the log keeps it: the robot's age of it at the serve, the
+/// desk instant the page arrived, and the robot's losses before it.
 #[derive(Debug, Clone, Copy)]
 struct Held {
     record: FireRecord,
     age_at_fetch_ns: u64,
     fetched_at: Instant,
+    lost_before: u64,
 }
 
 /// What the newest served page said about the robot's tap, aged like a fire.
@@ -65,6 +77,10 @@ pub struct ActivityLog {
     served: Option<Served>,
     origin: Option<u64>,
     cursor: Option<u64>,
+    /// The robot's losses in `(origin, cursor]`.
+    lost: u64,
+    /// The newest fire dropped from the log: its sequence and `lost_before`.
+    dropped: Option<(u64, u64)>,
 }
 
 impl ActivityLog {
@@ -78,6 +94,8 @@ impl ActivityLog {
             served: None,
             origin: None,
             cursor: None,
+            lost: 0,
+            dropped: None,
         }
     }
 
@@ -106,16 +124,24 @@ impl ActivityLog {
                     if self.cursor.is_some_and(|cursor| record.seq <= cursor) {
                         continue;
                     }
+                    self.lost += record
+                        .seq
+                        .saturating_sub(self.accounted())
+                        .saturating_sub(1);
                     if self.ring.len() == ACTIVITY_LOG_CAPACITY {
-                        self.ring.pop_front();
+                        if let Some(dropped) = self.ring.pop_front() {
+                            self.dropped = Some((dropped.record.seq, dropped.lost_before));
+                        }
                     }
                     self.ring.push_back(Held {
                         record: *record,
                         age_at_fetch_ns: now_ns.saturating_sub(record.at_ns),
                         fetched_at,
+                        lost_before: self.lost,
                     });
                     self.cursor = Some(record.seq);
                 }
+                self.lost += next.saturating_sub(self.accounted());
                 self.cursor = Some(self.cursor.map_or(*next, |cursor| cursor.max(*next)));
                 self.served = Some(Served {
                     armed_age_ns: now_ns.saturating_sub(*armed_since_ns),
@@ -158,7 +184,7 @@ impl ActivityLog {
             (state, _) => state.clone(),
         };
         let asked = after.unwrap_or(0);
-        let (next, lost, fires) = match (self.cursor, self.origin) {
+        let (next, lost, skipped, fires) = match (self.cursor, self.origin) {
             (Some(cursor), Some(origin)) if asked.max(origin) < cursor => {
                 let floor = asked.max(origin);
                 let fires: Vec<FireSeen> = self
@@ -169,10 +195,14 @@ impl ActivityLog {
                     .take(MAX_ACTIVITY_FIRES)
                     .map(|held| seen(held, now))
                     .collect();
-                (cursor, cursor - floor - fires.len() as u64, fires)
+                let lost = self.lost.saturating_sub(self.lost_through(floor, origin));
+                let skipped = (cursor - floor)
+                    .saturating_sub(fires.len() as u64)
+                    .saturating_sub(lost);
+                (cursor, lost, skipped, fires)
             }
-            (Some(cursor), _) => (cursor.max(asked), 0, Vec::new()),
-            (None, _) => (asked, 0, Vec::new()),
+            (Some(cursor), _) => (cursor.max(asked), 0, 0, Vec::new()),
+            (None, _) => (asked, 0, 0, Vec::new()),
         };
         let in_tick: Vec<InTick> = self
             .served
@@ -190,10 +220,43 @@ impl ActivityLog {
             state,
             next,
             lost,
-            window_ms: u32::try_from(window.as_millis()).unwrap_or(u32::MAX),
+            skipped,
+            window_ms: u32::try_from(self.covered(now, window).as_millis()).unwrap_or(u32::MAX),
             nodes: self.nodes(&in_tick, now, window),
             in_tick,
             fires,
+        }
+    }
+
+    /// The last sequence the log accounts for: its cursor, or before the first
+    /// fire its origin.
+    fn accounted(&self) -> u64 {
+        self.cursor.or(self.origin).unwrap_or(0)
+    }
+
+    /// The robot's losses in `(origin, seq]`. Every sequence between two held
+    /// fires, or after the newest one, was lost, because the log drops only its
+    /// oldest fires. Below the oldest held fire only the dropped one's count is
+    /// known, so a loss there reads as skipped (see the module docs).
+    fn lost_through(&self, seq: u64, origin: u64) -> u64 {
+        let held = self.ring.partition_point(|held| held.record.seq <= seq);
+        let (base, lost_before) = match held.checked_sub(1) {
+            Some(newest) => (self.ring[newest].record.seq, self.ring[newest].lost_before),
+            None => self.dropped.unwrap_or((origin, 0)),
+        };
+        lost_before + seq.saturating_sub(base)
+    }
+
+    /// The span the per-node statistics cover: `window`, or, once the log has
+    /// dropped a fire, no further back than the oldest fire it still holds.
+    fn covered(&self, now: Instant, window: Duration) -> Duration {
+        match (self.dropped, self.ring.front()) {
+            (Some(_), Some(oldest)) => window.min(Duration::from_nanos(aged(
+                oldest.age_at_fetch_ns,
+                oldest.fetched_at,
+                now,
+            ))),
+            _ => window,
         }
     }
 
@@ -345,6 +408,7 @@ mod tests {
                 state: ActivityState::Starting,
                 next: 0,
                 lost: 0,
+                skipped: 0,
                 window_ms: 5000,
                 in_tick: vec![],
                 nodes: vec![],
@@ -479,13 +543,25 @@ mod tests {
         );
         log.absorb(&page, t0);
         let answer = log.answer(Some(5119), t0, WINDOW);
-        assert_eq!((seqs(&answer), answer.lost), (vec![5124, 5120], 3));
+        assert_eq!(
+            (seqs(&answer), answer.lost, answer.skipped),
+            (vec![5124, 5120], 3, 0)
+        );
         let resumed = log.answer(Some(5120), t0, WINDOW);
-        assert_eq!((seqs(&resumed), resumed.lost), (vec![5124], 3));
+        assert_eq!(
+            (seqs(&resumed), resumed.lost, resumed.skipped),
+            (vec![5124], 3, 0)
+        );
+        let inside_the_gap = log.answer(Some(5122), t0, WINDOW);
+        assert_eq!(
+            (seqs(&inside_the_gap), inside_the_gap.lost),
+            (vec![5124], 1),
+            "only 5123 of the robot's losses is after 5122"
+        );
         let current = log.answer(Some(5124), t0, WINDOW);
         assert_eq!(
-            (seqs(&current), current.lost, current.next),
-            (vec![], 0, 5124)
+            (seqs(&current), current.lost, current.skipped, current.next),
+            (vec![], 0, 0, 5124)
         );
     }
 
@@ -541,7 +617,11 @@ mod tests {
                     0,
                 ),
                 fire(5122, now_ns - 4000 * MS, 30, 0, FireCause::Period),
-                fire(5123, now_ns - 3000 * MS, 10, 0, FireCause::Period),
+                flagged(
+                    fire(5123, now_ns - 3000 * MS, 10, 0, FireCause::Period),
+                    FireFlags::PANICKED,
+                    0,
+                ),
                 flagged(
                     fire(5124, now_ns - 2000 * MS, 20, 0, FireCause::Period),
                     FireFlags::PANICKED,
@@ -570,7 +650,7 @@ mod tests {
                     last_ms_ago: Some(1000.0),
                     dur_p50_ns: Some(20),
                     dur_max_ns: Some(40),
-                    panics: 1,
+                    panics: 2,
                     errors: 1,
                     last_cause: Some(1),
                     last_wrote: Some(0b01),
@@ -674,15 +754,109 @@ mod tests {
             first = last + 1;
         }
         let answer = log.answer(Some(5119), t0, WINDOW);
-        assert_eq!(answer.next, 5119 + total);
-        assert_eq!(answer.fires.len(), MAX_ACTIVITY_FIRES);
-        assert_eq!(answer.fires[0].seq, 5119 + total);
+        assert_eq!(answer.next, 7219);
+        assert_eq!(answer.fires.len(), 256);
+        assert_eq!(answer.fires[0].seq, 7219);
+        assert_eq!(answer.fires[255].seq, 6964);
         assert_eq!(
-            answer.fires[MAX_ACTIVITY_FIRES - 1].seq,
-            5119 + total - MAX_ACTIVITY_FIRES as u64 + 1
+            (answer.lost, answer.skipped),
+            (0, 1844),
+            "the robot lost nothing: vizd left out 2100 - 256 fires"
         );
-        assert_eq!(answer.lost, total - MAX_ACTIVITY_FIRES as u64);
-        assert_eq!(answer.nodes[0].fires, ACTIVITY_LOG_CAPACITY as u32);
+        assert_eq!(answer.nodes[0].fires, 2048);
+        assert_eq!(
+            answer.window_ms, 100,
+            "the counts cover only back to the oldest fire the log still holds"
+        );
+    }
+
+    #[test]
+    fn the_robots_losses_and_the_fires_vizd_leaves_out_are_counted_apart() {
+        let t0 = Instant::now();
+        let mut log = ActivityLog::new("temi", RUN_TEXT);
+        from_now(&mut log, t0);
+        let fires = |seqs: std::ops::RangeInclusive<u64>| -> Vec<FireRecord> {
+            seqs.map(|seq| fire(seq, 88_400 * MS, 10, 0, FireCause::Period))
+                .collect()
+        };
+        log.absorb(
+            &served(
+                88_500 * MS,
+                87_900 * MS,
+                5134,
+                5,
+                vec![],
+                fires(5120..=5129),
+            ),
+            t0,
+        );
+        log.absorb(
+            &served(
+                88_500 * MS,
+                87_900 * MS,
+                5434,
+                0,
+                vec![],
+                fires(5135..=5434),
+            ),
+            t0,
+        );
+        for after in [Some(5119), None] {
+            let answer = log.answer(after, t0, WINDOW);
+            assert_eq!(answer.next, 5434, "{after:?}");
+            assert_eq!(answer.fires.len(), 256, "{after:?}");
+            assert_eq!(answer.fires[255].seq, 5179, "{after:?}");
+            assert_eq!(
+                (answer.lost, answer.skipped),
+                (5, 54),
+                "{after:?}: the robot lost 5130..=5134; vizd left out 5120..=5129 and 5135..=5178"
+            );
+        }
+        let past_the_loss = log.answer(Some(5134), t0, WINDOW);
+        assert_eq!((past_the_loss.lost, past_the_loss.skipped), (0, 44));
+    }
+
+    #[test]
+    fn a_robot_loss_older_than_the_log_is_counted_as_skipped() {
+        let t0 = Instant::now();
+        let mut log = ActivityLog::new("temi", RUN_TEXT);
+        from_now(&mut log, t0);
+        log.absorb(
+            &served(
+                88_500 * MS,
+                87_900 * MS,
+                5124,
+                4,
+                vec![],
+                vec![fire(5124, 88_400 * MS, 10, 0, FireCause::Period)],
+            ),
+            t0,
+        );
+        let mut first = 5125;
+        while first <= 7172 {
+            let last = (first + 511).min(7172);
+            log.absorb(
+                &served(
+                    88_500 * MS,
+                    87_900 * MS,
+                    last,
+                    0,
+                    vec![],
+                    (first..=last)
+                        .map(|seq| fire(seq, 88_400 * MS, 10, 0, FireCause::Period))
+                        .collect(),
+                ),
+                t0,
+            );
+            first = last + 1;
+        }
+        let answer = log.answer(Some(5119), t0, WINDOW);
+        assert_eq!(answer.next, 7172);
+        assert_eq!(
+            (answer.fires.len(), answer.lost, answer.skipped),
+            (256, 0, 1797),
+            "5120..=5123 were lost before 5124, which the log no longer holds"
+        );
     }
 
     #[test]

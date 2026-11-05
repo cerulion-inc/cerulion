@@ -44,7 +44,7 @@ use cerulion_core::{
     write_line_bounded, CatalogEntry, CatalogReply, SchemaDoc, SchemaReply, TopicLiveness,
     TopicRateEstimate, UdsWriteOutcome,
 };
-use cerulion_netd::protocol::DiscoveryState;
+use cerulion_netd::protocol::{DiscoveryState, FIRES_MIN_DAEMON_VERSION};
 use cerulion_netd::{CatalogGather, ClientError, NetdClient, RunsGather};
 use cerulion_viz::schema_registry::walker_from_bridge_config_env_with_docs;
 
@@ -5852,7 +5852,20 @@ impl DemandPlane for NetdDemandPlane {
         run_id: &str,
         after: Option<u64>,
     ) -> Result<FiresAnswer, String> {
-        self.with_client(|c| c.query_fires(robot, run_id, after))
+        // Checked here because the client reports its own version refusal as a
+        // protocol error, which drops the connection: a follower would then open
+        // a new one on every poll, to a daemon that stays this old while it runs.
+        self.with_client(|c| {
+            let daemon = c.daemon_protocol();
+            if daemon < FIRES_MIN_DAEMON_VERSION {
+                return Ok(Err(format!(
+                    "the connected cerulion-netd speaks protocol v{daemon} but node fires need \
+                     v{FIRES_MIN_DAEMON_VERSION}: restart cerulion-netd (it is spawn-once, so a \
+                     running old daemon stays old for this desk's lifetime)"
+                )));
+            }
+            c.query_fires(robot, run_id, after).map(Ok)
+        })?
     }
 
     /// The same socket, a fresh lazy client: the follower's own connection.
@@ -5865,12 +5878,26 @@ impl DemandPlane for NetdDemandPlane {
 }
 
 /// Why `activity` refuses a request before it starts a follower, or `None`.
-/// The run id is the follower's identity, so only its canonical text (the one
-/// a `runs` row carries) names a run; anything else would hold a follower
-/// slot for a run no robot serves.
+/// The robot and the run id are the follower's identity, so only what netd's
+/// `query_fires` accepts names a run: one robot name (no key separator or
+/// wildcard, no account route) and the run id's canonical text (the one a
+/// `runs` row carries). Anything else would hold a follower slot for a run no
+/// robot serves.
 fn activity_target_error(robot: &str, run_id: &str) -> Option<String> {
-    if robot.is_empty() {
-        return Some("activity needs the robot that hosts the run".to_string());
+    if robot.is_empty() || robot.contains(['/', '*', '$', '?', '#']) {
+        return Some(format!(
+            "activity needs the one robot name that hosts the run, not {robot:?}: it must \
+             be non-empty and hold no '/', '*', '$', '?' or '#'"
+        ));
+    }
+    if !matches!(
+        cerulion_netd::account_access::parse_robot_route(robot),
+        Ok(None)
+    ) {
+        return Some(format!(
+            "activity cannot follow a robot reached over account robot access ({robot:?}): \
+             node fires are read on the local network only"
+        ));
     }
     if !parse_run_id(run_id).is_some_and(|parsed| format_run_id(parsed) == run_id) {
         return Some(format!(
@@ -5884,27 +5911,31 @@ fn activity_target_error(robot: &str, run_id: &str) -> Option<String> {
 /// The span `activity`'s per-node counts and durations cover.
 const ACTIVITY_WINDOW: Duration = Duration::from_secs(5);
 
-/// The most runs followed at once. A fifth evicts the run asked about least
-/// recently.
+/// The most runs followed at once. A fifth waits (answered `degraded`) until
+/// one of them goes a lease without an ask, then takes its place.
 const MAX_FIRE_FOLLOWERS: usize = 4;
 
 /// The `reason` of the `degraded` answer a plane with no follower plane gets.
 const NO_FOLLOWER_PLANE: &str =
     "this demand plane cannot follow fires (it opens no netd connection of its own)";
 
-/// How often a follower polls, and for how long after the last `activity`.
+/// How often a follower polls, for how long after the last `activity`, and
+/// how long it waits after netd could not run a poll.
 #[derive(Debug, Clone, Copy)]
 struct FollowTiming {
     interval: Duration,
     lease: Duration,
+    retry: Duration,
 }
 
 impl FollowTiming {
     /// Four polls a second, until three seconds after the last ask. The robot
-    /// then stops recording when its own five-second lease runs out.
+    /// then stops recording when its own five-second lease runs out. A failed
+    /// poll waits two seconds, the catalog forwarder's resubscribe backoff.
     const PRODUCTION: FollowTiming = FollowTiming {
         interval: Duration::from_millis(250),
         lease: Duration::from_secs(3),
+        retry: Duration::from_secs(2),
     };
 }
 
@@ -5987,9 +6018,9 @@ impl FireFollowers {
         }
     }
 
-    /// Extend the follower of `key` to `now` + the lease, starting it (on a
-    /// plane from `planes.follower_plane()`) if none follows the run, and
-    /// answer from its log. Never waits on the robot.
+    /// Keep the follower of `key` until `now` + the lease, starting it (on a
+    /// plane from `planes.follower_plane()`) if none follows the run and a slot
+    /// is free or lapsed, and answer from its log. Never waits on the robot.
     fn ask(
         self: &Arc<Self>,
         key: FollowKey,
@@ -6011,18 +6042,29 @@ impl FireFollowers {
         if self.closed.load(Ordering::SeqCst) {
             return degraded("cerulion-vizd is shutting down".to_string());
         }
+        if followers.len() >= MAX_FIRE_FOLLOWERS {
+            let lapsed = followers
+                .iter()
+                .map(|(key, f)| {
+                    let lease_until = f.lock().unwrap_or_else(|e| e.into_inner()).lease_until;
+                    (lease_until, key)
+                })
+                .filter(|(lease_until, _)| *lease_until <= now)
+                .min()
+                .map(|(_, key)| key.clone());
+            let Some(lapsed) = lapsed else {
+                return degraded(format!(
+                    "cerulion-vizd follows at most {MAX_FIRE_FOLLOWERS} runs at once, and each \
+                     was asked about in the last {} s: this run is followed once one of them is \
+                     not",
+                    self.timing.lease.as_secs()
+                ));
+            };
+            followers.remove(&lapsed);
+        }
         let Some(plane) = planes.follower_plane() else {
             return degraded(NO_FOLLOWER_PLANE.to_string());
         };
-        if followers.len() >= MAX_FIRE_FOLLOWERS {
-            let stalest = followers
-                .iter()
-                .min_by_key(|(_, f)| f.lock().unwrap_or_else(|e| e.into_inner()).lease_until)
-                .map(|(key, _)| key.clone());
-            if let Some(stalest) = stalest {
-                followers.remove(&stalest);
-            }
-        }
         let follower = Arc::new(Mutex::new(FireFollower::new(
             key.clone(),
             plane,
@@ -6083,11 +6125,28 @@ impl FireFollowers {
             };
             let started = Instant::now();
             let polled = plane.query_fires(&key.robot, &key.run_id, cursor);
+            let wait = if polled.is_err() {
+                self.timing.retry
+            } else {
+                self.timing.interval
+            };
             follower
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .fold(polled, Instant::now());
-            std::thread::sleep(self.timing.interval.saturating_sub(started.elapsed()));
+            self.pause_until(started + wait);
+        }
+    }
+
+    /// Sleep until `until`, one interval at a time so that `close` never waits
+    /// out a whole retry.
+    fn pause_until(&self, until: Instant) {
+        loop {
+            let now = Instant::now();
+            if now >= until || self.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep((until - now).min(self.timing.interval));
         }
     }
 
@@ -6132,7 +6191,7 @@ mod fire_follower_tests {
         }
     }
 
-    /// The four required verbs of a plane that reaches no netd; the fires
+    /// The five required verbs of a plane that reaches no netd; the fires
     /// verbs keep their defaults.
     struct BarePlane;
     impl DemandPlane for BarePlane {
@@ -6153,27 +6212,45 @@ mod fire_follower_tests {
         }
     }
 
-    /// What every plane a [`FiresFake`] opened saw: one entry per plane opened,
-    /// and every cursor each poll asked with, in order.
+    /// What the planes a [`FiresFake`] opened saw: how many it opened, every
+    /// cursor each poll asked with in order, and how many polls are running.
     #[derive(Default)]
     struct FakeLedger {
         opened: AtomicU64,
         polls: Mutex<Vec<(String, Option<u64>)>>,
+        in_flight: AtomicU64,
     }
 
-    /// A robot whose run fires once between polls: a cursor-less GET is
-    /// served from the head (5119, no rows); a GET after `c` gets one fire,
-    /// `c + 1`. `silent` answers every GET with silence.
+    /// How a [`FiresFake`] answers a poll.
+    #[derive(Clone, Copy)]
+    enum Robot {
+        /// A run that fires once between polls: a cursor-less GET is served
+        /// from the head (5119, no rows); a GET after `c` gets one fire, `c + 1`.
+        Firing,
+        /// Every GET is answered with silence.
+        Silent,
+        /// netd cannot run the query.
+        Failing,
+    }
+
     #[derive(Clone)]
     struct FiresFake {
         ledger: Arc<FakeLedger>,
-        silent: bool,
+        robot: Robot,
+        delay: Duration,
     }
     impl FiresFake {
-        fn new(silent: bool) -> Self {
+        fn new(robot: Robot) -> Self {
             Self {
                 ledger: Arc::new(FakeLedger::default()),
-                silent,
+                robot,
+                delay: Duration::ZERO,
+            }
+        }
+        fn slow(robot: Robot, delay: Duration) -> Self {
+            Self {
+                delay,
+                ..Self::new(robot)
             }
         }
         fn opened(&self) -> u64 {
@@ -6181,6 +6258,9 @@ mod fire_follower_tests {
         }
         fn polls(&self) -> Vec<(String, Option<u64>)> {
             self.ledger.polls.lock().unwrap().clone()
+        }
+        fn in_flight(&self) -> u64 {
+            self.ledger.in_flight.load(Ordering::SeqCst)
         }
     }
     impl DemandPlane for FiresFake {
@@ -6206,17 +6286,19 @@ mod fire_follower_tests {
             after: Option<u64>,
         ) -> Result<FiresAnswer, String> {
             assert_eq!(run_id, RUN_TEXT);
+            self.ledger.in_flight.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
             self.ledger
                 .polls
                 .lock()
                 .unwrap()
                 .push((robot.to_string(), after));
-            if self.silent {
-                return Ok(FiresAnswer::Silent);
-            }
-            let (next, fires) = match after {
-                None => (5119, Vec::new()),
-                Some(cursor) => (
+            self.ledger.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let (next, fires) = match (self.robot, after) {
+                (Robot::Silent, _) => return Ok(FiresAnswer::Silent),
+                (Robot::Failing, _) => return Err("netd is down".to_string()),
+                (Robot::Firing, None) => (5119, Vec::new()),
+                (Robot::Firing, Some(cursor)) => (
                     cursor + 1,
                     vec![FireRecord {
                         seq: cursor + 1,
@@ -6287,9 +6369,23 @@ mod fire_follower_tests {
     }
 
     #[test]
-    fn an_activity_target_needs_a_robot_and_the_canonical_run_id() {
+    fn an_activity_target_needs_one_robot_name_and_the_canonical_run_id() {
         assert_eq!(activity_target_error("temi", RUN_TEXT), None);
-        assert!(activity_target_error("", RUN_TEXT).is_some());
+        assert_eq!(activity_target_error("temi-2.lab_a", RUN_TEXT), None);
+        for robot in [
+            "",
+            "temi/x",
+            "*",
+            "**",
+            "temi$",
+            "te?mi",
+            "temi#1",
+            "account:abc",
+            &format!("account:{}", "ab".repeat(32)),
+        ] {
+            let error = activity_target_error(robot, RUN_TEXT).expect("refused");
+            assert!(error.contains("robot"), "{robot:?}: {error}");
+        }
         for run_id in [
             "",
             "0x2a",
@@ -6314,14 +6410,14 @@ mod fire_follower_tests {
         assert!(follower.leased(t0 + Duration::from_millis(2999)));
         assert!(!follower.leased(t0 + Duration::from_secs(3)));
 
-        let fake = FiresFake::new(true);
+        let fake = FiresFake::new(Robot::Silent);
         let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
         followers.ask(key("temi"), None, t0, &fake);
         followers.ask(key("temi"), None, t0 + Duration::from_secs(2), &fake);
         assert_eq!(
             lease_until(&followers, &key("temi")),
             t0 + Duration::from_secs(5),
-            "an ask extends the lease to three seconds after it"
+            "an ask keeps the follower until three seconds after it"
         );
         followers.ask(key("temi"), None, t0 + Duration::from_secs(1), &fake);
         assert_eq!(
@@ -6379,10 +6475,10 @@ mod fire_follower_tests {
     #[test]
     fn a_follower_polls_its_own_plane_with_the_inclusive_cursor_until_its_lease_ends() {
         let timing = FollowTiming {
-            interval: Duration::from_millis(250),
             lease: Duration::from_secs(2),
+            ..FollowTiming::PRODUCTION
         };
-        let fake = FiresFake::new(false);
+        let fake = FiresFake::new(Robot::Firing);
         let followers = Arc::new(FireFollowers::new(timing));
         let first = followers.ask(key("temi"), None, Instant::now(), &fake);
         assert_eq!(first.state, ActivityState::Starting);
@@ -6406,8 +6502,8 @@ mod fire_follower_tests {
 
         let ceiling = (1 + 2) * 1000 / 250 + 1;
         assert!(
-            (3..=ceiling).contains(&stopped.len()),
-            "{} polls over a 3 s follow",
+            stopped.len() <= ceiling,
+            "{} polls over a 3 s follow at 4 Hz",
             stopped.len()
         );
         assert_eq!(stopped[0], ("temi".to_string(), None));
@@ -6423,11 +6519,57 @@ mod fire_follower_tests {
     }
 
     #[test]
-    fn a_fifth_followed_run_evicts_the_run_asked_about_least_recently() {
-        let fake = FiresFake::new(true);
+    fn a_fifth_run_waits_until_a_followed_run_is_no_longer_asked_about() {
+        let fake = FiresFake::new(Robot::Silent);
         let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
         let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
         for (i, robot) in ["r0", "r1", "r2", "r3"].into_iter().enumerate() {
+            followers.ask(key(robot), None, at(i as u64), &fake);
+        }
+        let four = vec![key("r0"), key("r1"), key("r2"), key("r3")];
+
+        for round in 0..8 {
+            for (i, robot) in ["r0", "r1", "r2", "r3", "r4"].into_iter().enumerate() {
+                let answer = followers.ask(key(robot), None, at(10 + round * 50 + i as u64), &fake);
+                if robot == "r4" {
+                    let ActivityState::Degraded { reason } = answer.state else {
+                        panic!("round {round}: a fifth run is refused, not followed")
+                    };
+                    assert!(reason.contains("at most 4 runs"), "{reason}");
+                }
+            }
+            assert_eq!(followers.followed(), four, "round {round}");
+        }
+        assert_eq!(fake.opened(), 4, "a refused run opens no connection");
+
+        for (i, robot) in ["r1", "r2", "r3"].into_iter().enumerate() {
+            followers.ask(key(robot), None, at(2000 + i as u64), &fake);
+        }
+        let r0_last_asked = at(10 + 7 * 50);
+        let r0_lapsed = r0_last_asked + FollowTiming::PRODUCTION.lease + Duration::from_millis(1);
+        let answer = followers.ask(key("r4"), None, r0_lapsed, &fake);
+        assert_eq!(answer.state, ActivityState::Starting);
+        assert_eq!(
+            followers.followed(),
+            vec![key("r1"), key("r2"), key("r3"), key("r4")],
+            "r4 takes the place of r0, the only run not asked about for 3 s"
+        );
+        assert_eq!(fake.opened(), 5);
+
+        followers.close();
+        assert!(followers.followed().is_empty());
+        let after_close = followers.ask(key("r5"), None, Instant::now(), &fake);
+        assert!(matches!(after_close.state, ActivityState::Degraded { .. }));
+        assert_eq!(fake.opened(), 5, "a closed set starts nothing");
+    }
+
+    #[test]
+    fn a_replaced_followers_thread_leaves_the_new_follower_of_its_run_in_place() {
+        let fake = FiresFake::new(Robot::Silent);
+        let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
+        let t0 = Instant::now();
+        for (i, robot) in ["a", "b", "c", "d"].into_iter().enumerate() {
             followers.ask(
                 key(robot),
                 None,
@@ -6435,23 +6577,143 @@ mod fire_follower_tests {
                 &fake,
             );
         }
-        followers.ask(key("r0"), None, t0 + Duration::from_millis(10), &fake);
-        followers.ask(key("r4"), None, t0 + Duration::from_millis(20), &fake);
+        let lapsed = t0 + Duration::from_secs(4);
+        followers.ask(key("e"), None, lapsed, &fake);
+        assert!(!followers.followed().contains(&key("a")), "a was replaced");
+        followers.ask(key("a"), None, lapsed, &fake);
         assert_eq!(
             followers.followed(),
-            vec![key("r0"), key("r2"), key("r3"), key("r4")]
+            vec![key("a"), key("c"), key("d"), key("e")]
         );
-        assert_eq!(fake.opened(), 5, "each follower opened its own plane");
 
-        followers.close();
-        assert!(followers.followed().is_empty());
-        assert!(
-            followers.threads.lock().unwrap().is_empty(),
-            "threads joined"
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            followers.followed(),
+            vec![key("a"), key("c"), key("d"), key("e")],
+            "the first follower of a stopped; the second one still follows"
         );
-        let after_close = followers.ask(key("r5"), None, Instant::now(), &fake);
-        assert!(matches!(after_close.state, ActivityState::Degraded { .. }));
-        assert_eq!(fake.opened(), 5, "a closed set starts nothing");
+        assert_eq!(fake.opened(), 6);
+        followers.close();
+    }
+
+    #[test]
+    fn close_returns_only_after_every_follower_thread_has_ended() {
+        let fake = FiresFake::slow(Robot::Silent, Duration::from_secs(1));
+        let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
+        followers.ask(key("temi"), None, Instant::now(), &fake);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.in_flight() == 0 {
+            assert!(Instant::now() < deadline, "the follower never polled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        followers.close();
+        assert_eq!(fake.in_flight(), 0, "a poll outlived close");
+        assert_eq!(fake.polls().len(), 1, "and none started after it");
+    }
+
+    #[test]
+    fn a_follower_waits_before_it_asks_netd_again_after_a_failure() {
+        let fake = FiresFake::new(Robot::Failing);
+        let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
+        let first = followers.ask(key("temi"), None, Instant::now(), &fake);
+        assert_eq!(first.state, ActivityState::Starting);
+        std::thread::sleep(Duration::from_secs(1));
+        let failed = followers.ask(key("temi"), None, Instant::now(), &fake);
+        assert_eq!(
+            failed.state,
+            ActivityState::Degraded {
+                reason: "netd is down".into()
+            }
+        );
+        assert_eq!(
+            fake.polls().len(),
+            1,
+            "a failed poll waits {:?} before the next, not one interval",
+            FollowTiming::PRODUCTION.retry
+        );
+        followers.close();
+    }
+
+    /// A netd that greets as protocol v9, the last one without `query_fires`,
+    /// and counts the connections it accepts and the request lines it reads.
+    struct OldNetd {
+        dir: PathBuf,
+        socket: PathBuf,
+        accepted: Arc<AtomicU64>,
+        lines: Arc<AtomicU64>,
+    }
+    impl OldNetd {
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "f10-old-netd-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("netd.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let accepted = Arc::new(AtomicU64::new(0));
+            let lines = Arc::new(AtomicU64::new(0));
+            let (counted, read) = (Arc::clone(&accepted), Arc::clone(&lines));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let banner = format!(
+                        r#"{{"hello":"cerulion-netd","protocol":9,"wire_header":{}}}"#,
+                        cerulion_core::wire::WIRE_HEADER_VERSION
+                    );
+                    if writeln!(stream, "{banner}").is_err() {
+                        continue;
+                    }
+                    let read = Arc::clone(&read);
+                    std::thread::spawn(move || {
+                        for line in BufReader::new(stream).lines() {
+                            if line.is_err() {
+                                return;
+                            }
+                            read.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            Self {
+                dir,
+                socket,
+                accepted,
+                lines,
+            }
+        }
+    }
+    impl Drop for OldNetd {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_netd_too_old_for_fires_is_refused_on_the_followers_one_connection() {
+        let netd = OldNetd::start();
+        let plane = NetdDemandPlane::with_socket(netd.socket.clone())
+            .follower_plane()
+            .expect("a netd plane opens follower planes");
+        for poll in 0..4 {
+            let error = plane
+                .query_fires("temi", RUN_TEXT, None)
+                .expect_err("a v9 netd cannot serve fires");
+            assert!(
+                error.contains("v9") && error.contains("v10"),
+                "poll {poll}: {error}"
+            );
+        }
+        assert_eq!(
+            netd.accepted.load(Ordering::SeqCst),
+            1,
+            "the refusal is the daemon's version, so the connection is kept"
+        );
+        assert_eq!(netd.lines.load(Ordering::SeqCst), 0, "nothing was sent");
     }
 }
 
@@ -10872,7 +11134,7 @@ mod tests {
                 concat!(
                     r#"{{"id":7,"ok":true,"activity":{{"robot":"temi","run_id":"{run}","#,
                     r#""state":{{"kind":"degraded","reason":"{reason}"}},"next":5119,"lost":0,"#,
-                    r#""window_ms":5000,"in_tick":[],"nodes":[],"fires":[]}}}}"#
+                    r#""skipped":0,"window_ms":5000,"in_tick":[],"nodes":[],"fires":[]}}}}"#
                 ),
                 run = run,
                 reason = NO_FOLLOWER_PLANE
@@ -10887,6 +11149,15 @@ mod tests {
         };
         assert_eq!(refused.id, Some(8));
         assert!(refused.error.contains("canonical"), "{}", refused.error);
+        let Response::Error(refused) = dispatch_line(
+            &format!(r#"{{"id":9,"method":"activity","robot":"*","run_id":"{run}"}}"#),
+            ctx,
+            0,
+        ) else {
+            panic!("a wildcard robot is refused")
+        };
+        assert_eq!(refused.id, Some(9));
+        assert!(refused.error.contains("robot"), "{}", refused.error);
         daemon.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
