@@ -42,7 +42,6 @@
 // `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -560,9 +559,11 @@ fn stopping_the_process_instead_of_pausing_it_leaves_the_gap() {
 /// worker processes is held, and every node's recorded stream is contiguous across
 /// the pause.
 ///
-/// Each unit runs its own live loop and takes the pause on its own, and one process
-/// can host several units, so the units a worker reports starting are the ones that
-/// must each log the hold and the resume, once.
+/// Each unit runs its own live loop and takes the pause on its own. The workspace
+/// has no profile, so nothing merges: p0 runs the ticker and the relay as two
+/// units (`p0.ticker`, `p0.relay`) and p1 runs the sink as one (`p1`). The
+/// expected units are written out here, not read from the run's log, so a run
+/// whose p0 starts one unit fails this arm.
 #[test]
 #[serial]
 fn a_pause_holds_every_worker_of_a_free_run_deployment() {
@@ -572,17 +573,12 @@ fn a_pause_holds_every_worker_of_a_free_run_deployment() {
 
     pause_hold_resume(&run, &ticker, PAUSE, &[]);
     let log = strip_ansi(&run.stop());
-    let units = fields_of(&log, "worker live loop starting", "group");
-    let processes: BTreeSet<&str> = units
-        .iter()
-        .map(|unit| unit.split('.').next().unwrap_or(unit))
-        .collect();
     assert_eq!(
-        processes,
-        BTreeSet::from(["p0", "p1"]),
-        "both worker processes start their units; log was:\n{log}"
+        fields_of(&log, "worker live loop starting", "group"),
+        ["p0.relay", "p0.ticker", "p1"],
+        "p0 starts two units and p1 one; log was:\n{log}"
     );
-    let unit_graphs: Vec<String> = units.iter().map(|unit| format!("mpdemo_{unit}")).collect();
+    let unit_graphs = ["mpdemo_p0.relay", "mpdemo_p0.ticker", "mpdemo_p1"];
     assert_eq!(
         fields_of(&log, "run paused at a step boundary", "graph"),
         unit_graphs,
