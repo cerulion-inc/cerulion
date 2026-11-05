@@ -45,8 +45,11 @@ pub enum TopologyTrigger {
         interval_ns: u64,
     },
     Data {
+        /// The declared trigger input's topic. Empty for the default Data
+        /// policy, which fires only when the host signals the node.
         topics: Vec<String>,
-        /// True when the default Data policy has more than one possible input.
+        /// True when the default Data policy has more than one input, so a
+        /// host-signaled fire cannot name the input it served.
         ambiguous: bool,
     },
     Sync {
@@ -87,6 +90,7 @@ mod tests {
     use crate::clock::VirtualClock;
     use crate::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy};
     use crate::graph::{parse_graph, ClosureNodeEntry, GraphRuntime, NodeEntry, NodeInfo};
+    use crate::wire::WireHeader;
     use indexmap::IndexMap;
     use serde_json::json;
     use std::sync::Arc;
@@ -235,16 +239,11 @@ nodes:
 
     #[test]
     fn run_topology_marks_only_multi_input_default_data_as_ambiguous() {
-        for (inputs, topics, ambiguous) in [
-            ("[]", vec![], false),
-            (
-                "[{name: z, source: /external/z}]",
-                vec!["/external/z"],
-                false,
-            ),
+        for (inputs, ambiguous) in [
+            ("[]", false),
+            ("[{name: z, source: /external/z}]", false),
             (
                 "[{name: z, source: /external/z}, {name: a, source: /external/a}]",
-                vec!["/external/z", "/external/a"],
                 true,
             ),
         ] {
@@ -271,11 +270,104 @@ nodes:
             assert_eq!(
                 runtime.run_topology().nodes[0].trigger,
                 TopologyTrigger::Data {
-                    topics: topics.into_iter().map(String::from).collect(),
+                    topics: vec![],
                     ambiguous,
                 }
             );
         }
+    }
+
+    #[test]
+    fn run_topology_lists_only_input_topics_whose_arrival_fires_the_node() {
+        const FANOUT: &str = r#"
+prefix: robot
+nodes:
+  - id: camera
+    type: frame_source
+    outputs:
+      - {name: frame, schema: std_msgs/UInt64, topic: /camera/frame}
+  - id: declared
+    type: declared_trigger
+    inputs:
+      - {name: event, source: /camera/frame}
+  - id: fallback
+    type: default_data
+    inputs:
+      - {name: event, source: /camera/frame}
+"#;
+        let camera = ClosureNodeEntry::new(
+            NodeInfo::from_names(vec![], vec!["frame".into()])
+                .with_policy(MacroPolicy::Period { period_ms: 1 }),
+            |ctx| {
+                let mut frame = [0_u8; WireHeader::SIZE + 8];
+                let mut header = WireHeader::new(0, 0, 0);
+                header.total_size = frame.len() as u32;
+                header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+                ctx.publisher_mut("frame")
+                    .expect("frame is wired")
+                    .publish_raw(&frame)
+                    .map(drop)
+            },
+        );
+        let declared = ClosureNodeEntry::new(
+            NodeInfo::with_meta(vec![meta("event", true)], vec![]).with_policy(
+                MacroPolicy::DataTrigger {
+                    input_name: "event".into(),
+                },
+            ),
+            |_| Ok(()),
+        );
+        let fallback =
+            ClosureNodeEntry::new(NodeInfo::from_names(vec!["event".into()], vec![]), |_| {
+                Ok(())
+            });
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("camera".into(), Box::new(camera));
+        factories.insert("declared".into(), Box::new(declared));
+        factories.insert("fallback".into(), Box::new(fallback));
+        let mut runtime = GraphRuntime::build_for_test(
+            parse_graph(FANOUT).unwrap(),
+            factories,
+            Arc::new(VirtualClock::new()),
+            8,
+        )
+        .unwrap();
+        let fires = |runtime: &GraphRuntime, id: &str| {
+            runtime.node_handle(id).expect("node is built").fire_count()
+        };
+
+        for _ in 0..3 {
+            runtime.step(Duration::from_millis(1));
+        }
+        assert_eq!(fires(&runtime, "camera"), 3);
+        assert!(fires(&runtime, "declared") > 0);
+        assert_eq!(fires(&runtime, "fallback"), 0);
+        runtime.signal_data("fallback").unwrap();
+        runtime.step(Duration::from_millis(1));
+        assert_eq!(fires(&runtime, "fallback"), 1);
+
+        let topology = runtime.run_topology();
+        assert_eq!(
+            topology.nodes[1].trigger,
+            TopologyTrigger::Data {
+                topics: vec!["/camera/frame".into()],
+                ambiguous: false,
+            }
+        );
+        assert_eq!(
+            topology.nodes[2].trigger,
+            TopologyTrigger::Data {
+                topics: vec![],
+                ambiguous: false,
+            }
+        );
+        assert_eq!(
+            topology.nodes[2].inputs,
+            vec![TopologyPort {
+                name: "event".into(),
+                topic: "/camera/frame".into(),
+            }]
+        );
     }
 
     #[test]
