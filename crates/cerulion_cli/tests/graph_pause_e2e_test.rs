@@ -11,12 +11,13 @@
 //!    fraction of the pause, not the pause), and no two frames land on top of each
 //!    other when the run resumes (the burst that follows a stopped process). The
 //!    frame count also stands still for the whole hold.
-//! 2. **The counter-test: stopping the process does leave the gap.** The same run,
-//!    with `SIGSTOP` and `SIGCONT` in place of the verbs, records a gap about as
-//!    long as the stop. It is what makes the assertion above able to fail.
-//! 3. **Every process of a multi-process run is held**, free-run (the default) and
-//!    lockstep, and the lockstep run is not poisoned by a pause longer than its
-//!    five-second boundary timeout.
+//! 2. **The counter-test: stopping the run's processes does leave the gap.** The
+//!    same run, with `SIGSTOP` and `SIGCONT` sent to every process of the run in
+//!    place of the verbs, records a gap about as long as the stop. It is what
+//!    makes the assertion above able to fail.
+//! 3. **Every executor unit of every process of a multi-process run is held**,
+//!    free-run (the default) and lockstep, and the lockstep run is not poisoned by
+//!    a pause longer than its five-second boundary timeout.
 //! 4. **The state is reported.** `run.json` carries `"paused": true` while the run
 //!    is held and `"paused": false` after, and a repeat of a verb succeeds and says
 //!    "already".
@@ -41,6 +42,7 @@
 // `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -149,6 +151,76 @@ fn spacing(bag: &Path, topic: &str) -> Spacing {
         max_gap_ns: gaps.iter().copied().max().expect("gaps"),
         coincident_pairs: gaps.iter().filter(|g| **g <= BURST_GAP_NS).count(),
     }
+}
+
+/// `s` with ANSI CSI escape sequences removed: a styled `key=value` field opens
+/// with an escape, so its key is found only once the escapes are gone.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI: ESC '[', parameter and intermediate bytes, then a final byte in
+        // 0x40..=0x7e. Anything else after ESC is dropped with the ESC.
+        if chars.next() == Some('[') {
+            for f in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&f) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `key=` field of every line of `log` that carries `needle`, sorted. `log`
+/// is plain text (see [`strip_ansi`]).
+fn fields_of(log: &str, needle: &str, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = log
+        .lines()
+        .filter(|line| line.contains(needle))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+        })
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out
+}
+
+/// The scheduler state letter of `pid` (`R`, `S`, `T`...), read from
+/// `/proc/<pid>/stat`; `None` once the process is gone.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ...`: the command name may hold spaces and parentheses,
+    // so the state is the first field after the LAST `)`.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
+/// Send `sig` to every process of the run. `graph run` leads its own process
+/// group (the harness spawns it as a group leader) and the worker processes it
+/// spawns join that group, so the signal reaches the nodes whichever process runs
+/// them; bagd leads a group of its own and keeps recording.
+fn signal_run_processes(run: &Recorded, sig: libc::c_int) {
+    let pgid = run.guard.id();
+    assert!(pgid > 1, "refusing to signal process group {pgid}");
+    // SAFETY: killpg(2) on the run's own process group; no memory is touched.
+    let rc = unsafe { libc::killpg(pgid as libc::pid_t, sig) };
+    assert_eq!(
+        rc,
+        0,
+        "killpg({pgid}, {sig}): {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// Reaps the bagd THIS run started, whatever point the run reached. bagd runs in its
@@ -433,6 +505,11 @@ fn a_pause_leaves_no_gap_and_no_burst_in_a_single_process_recording() {
 /// Arm 2: the counter-test. `SIGSTOP` and `SIGCONT` in place of the verbs leave the
 /// gap the verbs exist to remove. Without this arm, arm 1's assertion could pass
 /// for a reason that has nothing to do with the pause.
+///
+/// The stop goes to every process of the run, as a terminal's job-control stop
+/// does: a `--single-process` run on the real clock whose nodes split into
+/// executor units runs them all in one worker process beside `graph run`, so
+/// stopping `graph run` alone leaves the nodes stepping.
 #[test]
 #[serial]
 fn stopping_the_process_instead_of_pausing_it_leaves_the_gap() {
@@ -440,10 +517,26 @@ fn stopping_the_process_instead_of_pausing_it_leaves_the_gap() {
     let mut run = Recorded::start(prefix, &["--single-process"], SpawnExecutionMode::Default);
     let topic = format!("/{prefix}/ticker/cmd");
 
-    let pid = run.guard.id();
-    send_signal(pid, libc::SIGSTOP);
+    let mut stopped = vec![run.guard.id()];
+    stopped.extend_from_slice(run.guard.note_workers());
+    signal_run_processes(&run, libc::SIGSTOP);
+    // Every process the nodes can run in is stopped before the hold is timed
+    // (read from `/proc`, so on Linux).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cfg!(target_os = "linux") && stopped.iter().any(|pid| process_state(*pid) != Some('T')) {
+        assert!(
+            Instant::now() < deadline,
+            "SIGSTOP to the run's process group must stop every process of the run, but \
+             the states of {stopped:?} are {:?}",
+            stopped
+                .iter()
+                .map(|p| process_state(*p))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     std::thread::sleep(PAUSE);
-    send_signal(pid, libc::SIGCONT);
+    signal_run_processes(&run, libc::SIGCONT);
     let before = run.frames_on(&topic);
     wait_for_bag_state(
         &run.bag,
@@ -454,17 +547,22 @@ fn stopping_the_process_instead_of_pausing_it_leaves_the_gap() {
     run.stop();
 
     let s = spacing(&run.bag, &topic);
-    eprintln!("SIGSTOP spacing: {s:?}");
+    eprintln!("SIGSTOP spacing (processes stopped: {stopped:?}): {s:?}");
     assert!(
         s.max_gap_ns >= 4_500_000_000,
-        "stopping the process for five seconds must show as a gap of about five seconds in the \
-         recording (that is the fault a pause removes), got {} ms; {s:?}",
+        "stopping the run's processes {stopped:?} for five seconds must show as a gap of about \
+         five seconds in the recording (that is the fault a pause removes), got {} ms; {s:?}",
         s.max_gap_ns / 1_000_000
     );
 }
 
-/// Arm 3: a multi-process run on the free-run default. Every worker is held, and every
-/// worker's recorded stream is contiguous across the pause.
+/// Arm 3: a multi-process run on the free-run default. Every executor unit of both
+/// worker processes is held, and every node's recorded stream is contiguous across
+/// the pause.
+///
+/// Each unit runs its own live loop and takes the pause on its own, and one process
+/// can host several units, so the units a worker reports starting are the ones that
+/// must each log the hold and the resume, once.
 #[test]
 #[serial]
 fn a_pause_holds_every_worker_of_a_free_run_deployment() {
@@ -473,16 +571,27 @@ fn a_pause_holds_every_worker_of_a_free_run_deployment() {
     let ticker = format!("/{prefix}/ticker/cmd");
 
     pause_hold_resume(&run, &ticker, PAUSE, &[]);
-    let log = run.stop();
+    let log = strip_ansi(&run.stop());
+    let units = fields_of(&log, "worker live loop starting", "group");
+    let processes: BTreeSet<&str> = units
+        .iter()
+        .map(|unit| unit.split('.').next().unwrap_or(unit))
+        .collect();
     assert_eq!(
-        log.matches("run paused at a step boundary").count(),
-        2,
-        "BOTH workers hold; log was:\n{log}"
+        processes,
+        BTreeSet::from(["p0", "p1"]),
+        "both worker processes start their units; log was:\n{log}"
+    );
+    let unit_graphs: Vec<String> = units.iter().map(|unit| format!("mpdemo_{unit}")).collect();
+    assert_eq!(
+        fields_of(&log, "run paused at a step boundary", "graph"),
+        unit_graphs,
+        "EVERY unit of BOTH workers holds, once; log was:\n{log}"
     );
     assert_eq!(
-        log.matches("run resumed").count(),
-        2,
-        "BOTH workers resume; log was:\n{log}"
+        fields_of(&log, "run resumed", "graph"),
+        unit_graphs,
+        "EVERY unit of BOTH workers resumes, once; log was:\n{log}"
     );
     for node in ["ticker", "relay", "sink"] {
         let s = run.assert_no_gap_no_burst(&format!("/{prefix}/{node}/cmd"));
