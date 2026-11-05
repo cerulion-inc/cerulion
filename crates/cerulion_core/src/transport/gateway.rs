@@ -3034,15 +3034,72 @@ mod schema_serving_handles_tests {
 mod hosted_runs_tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use super::{GatewayEgressPolicy, GatewayPlan, GatewayRuntime};
-    use crate::transport::cerulion_q::{RunEntry, RunEntryState};
+    use crate::transport::cerulion_q::{
+        RunEntry, RunEntryState, RunsCompleteness, RunsGatherOutcome, RunsReply,
+    };
+    use crate::transport::demand_authorizer::LanAccess;
+    use crate::transport::discovery::query_robot_runs;
     use crate::transport::hosted_runs::HostedRun;
-    use crate::transport::network::NetworkConfig;
+    use crate::transport::network::{NetworkConfig, NetworkManager};
     use crate::transport::run_registry::RunState;
     use crate::transport::{TransportConfig, TransportManager};
 
     const ROBOT: &str = "hostgw";
+    const WIRE_CEILING: Duration = Duration::from_secs(20);
+
+    fn allow_all_plan() -> GatewayPlan {
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowAll,
+            announce: Vec::new(),
+            ingress: Vec::new(),
+        }
+    }
+
+    /// A gateway listening on a probed loopback port, with the manager it runs
+    /// on. Retried, because another process can take the probed port first.
+    fn listening_gateway() -> (Arc<TransportManager>, GatewayRuntime, u16) {
+        for attempt in 0..3 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("an ephemeral loopback port")
+                .port();
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("hostgw_wire_{}_{attempt}", std::process::id()),
+                    network: Some(NetworkConfig {
+                        listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                        robot_identity: Some(ROBOT.to_string()),
+                        ..NetworkConfig::default()
+                    }),
+                    ..Default::default()
+                },
+                crate::testing::iceoryx_test_config(),
+            )
+            .expect("init gateway manager");
+            match GatewayRuntime::new(Arc::clone(&manager), allow_all_plan()) {
+                Ok(gateway) => return (manager, gateway, port),
+                Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
+            }
+        }
+        panic!("could not boot a listening gateway in 3 attempts");
+    }
+
+    /// GET `runs` over the wire until a decoded reply satisfies `done`.
+    fn runs_until(session: &zenoh::Session, done: impl Fn(&RunsReply) -> bool) -> RunsReply {
+        let deadline = Instant::now() + WIRE_CEILING;
+        let mut last = String::from("no GET issued");
+        while Instant::now() < deadline {
+            match query_robot_runs(session, ROBOT, Duration::from_millis(500)) {
+                RunsGatherOutcome::Decoded(reply) if done(&reply) => return reply,
+                other => last = format!("{other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no matching runs reply over the wire within {WIRE_CEILING:?}; last {last}");
+    }
 
     #[test]
     fn a_gateway_serves_the_runs_hosted_on_its_managers_network() {
@@ -3062,15 +3119,7 @@ mod hosted_runs_tests {
             .network()
             .expect("a configured network")
             .hosted_runs();
-        let gateway = GatewayRuntime::new(
-            manager,
-            GatewayPlan {
-                egress_policy: GatewayEgressPolicy::AllowAll,
-                announce: Vec::new(),
-                ingress: Vec::new(),
-            },
-        )
-        .expect("gateway boot");
+        let gateway = GatewayRuntime::new(manager, allow_all_plan()).expect("gateway boot");
         let entry = RunEntry::new(
             0x7e41,
             "temi",
@@ -3104,5 +3153,68 @@ mod hosted_runs_tests {
 
         drop(guard);
         assert!(gateway.runs_serve_for_test(ROBOT).runs.is_empty());
+    }
+
+    #[test]
+    fn a_desk_get_over_loopback_reads_the_run_hosted_on_the_gateways_network() {
+        let (manager, _gateway, port) = listening_gateway();
+        let network = manager.network().expect("a configured network");
+        network.set_lan_access(LanAccess::Open);
+        let entry = RunEntry::new(
+            0x7e42,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+        let guard = network.hosted_runs().host(
+            0x7e42,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let desk = NetworkManager::new(NetworkConfig {
+            connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+            ..NetworkConfig::default()
+        });
+        let session = desk.session().expect("desk session connects");
+
+        let reply = runs_until(session, |reply| !reply.runs.is_empty());
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: vec![RunEntry {
+                    run_id: "0x00000000000000000000000000007e42".to_string(),
+                    graph_name: "temi".to_string(),
+                    run_started_at_ns: 42,
+                    state: RunEntryState::Live,
+                    graph_yaml: "name: temi\n".to_string(),
+                    run_json: "{\"version\":1}\n".to_string(),
+                }],
+                completeness: RunsCompleteness::Settled,
+                undescribable: Vec::new(),
+                error: None,
+            }
+        );
+
+        drop(guard);
+        let reply = runs_until(session, |reply| reply.runs.is_empty());
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: Vec::new(),
+                completeness: RunsCompleteness::Settled,
+                undescribable: Vec::new(),
+                error: None,
+            },
+            "a withdrawn run leaves the settled empty answer of an idle machine"
+        );
     }
 }
