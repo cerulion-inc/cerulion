@@ -42,7 +42,7 @@ use super::discovery::{
 };
 use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use super::gateway::is_reserved_topic;
-use super::hosted_runs::HostedRuns;
+use super::hosted_runs::{HostedRuns, HostedServe};
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
 use super::run_registry;
@@ -2317,13 +2317,16 @@ fn handle_runs_verb(
 ///    windowed LISTEN that expired with live writers unheard produces the SAME
 ///    empty list a genuinely idle machine produces, and only the verdict tells
 ///    them apart (the same lesson the discovery marker and the checked mirror
-///    gather taught). Hosted runs do not change the verdict: the host knows them
-///    exactly.
+///    gather taught). A served hosted run does not change the verdict: the host
+///    knows it exactly.
 ///
 /// Runs whose directory could not be read are SKIPPED with a named reason (see
 /// [`run_artifacts::collect_run_entries`]) rather than served as entries carrying
 /// empty documents - and each skip is logged, because a run present in the
-/// registry and absent from the answer is otherwise an unexplained hole.
+/// registry and absent from the answer is otherwise an unexplained hole. A hosted
+/// entry that fails the served-entry checks is named the same way (see
+/// [`HostedRuns::host`]), and either kind of withheld run demotes a settled
+/// verdict, because the list is then a strict subset.
 fn runs_serve_decision(
     runs: &RunSource,
     authorizer: &dyn DemandAuthorizer,
@@ -2362,35 +2365,50 @@ fn runs_serve_decision(
             None
         }
     };
-    assemble_runs_reply(robot, gathered, runs.hosted.entries())
+    assemble_runs_reply(robot, gathered, runs.hosted.served())
 }
 
 /// Build an authorized runs reply from the registry's answer (`None` when the
-/// gather could not run) and the hosted entries, through the ONE reply builder.
-/// Its `run_id` dedup is the only dedup, so a hosted run that is also gathered is
-/// served once; on a tie the gathered entry, supplied first, survives.
+/// gather could not run) and what the host serves from memory, through the ONE
+/// reply builder.
+///
+/// One run id carries one verdict, because a desk refuses the whole reply
+/// otherwise. The builder's `run_id` dedup is the only dedup of entries, so a
+/// hosted run that is also gathered is served once; on a tie the gathered entry,
+/// supplied first, survives. A run that either side describes is served and is
+/// not also named undescribable, and a run that both sides withhold is named
+/// once, with the gathered reason.
 fn assemble_runs_reply(
     robot: &str,
     gathered: Option<(run_artifacts::RunFold, cerulion_q::RunsCompleteness)>,
-    hosted: Vec<cerulion_q::RunEntry>,
+    hosted: HostedServe,
 ) -> cerulion_q::RunsReply {
-    match gathered {
-        Some((fold, completeness)) => cerulion_q::build_runs_reply(
-            robot,
-            fold.entries.into_iter().chain(hosted),
+    let (gathered_entries, gathered_withheld, completeness) = match gathered {
+        Some((fold, completeness)) => (
+            fold.entries,
             fold.skipped
                 .iter()
                 .map(run_artifacts::SkippedRun::to_wire)
                 .collect(),
             completeness,
         ),
-        None => cerulion_q::build_runs_reply(
-            robot,
-            hosted,
+        None => (
+            Vec::new(),
             Vec::new(),
             cerulion_q::RunsCompleteness::not_established(),
         ),
-    }
+    };
+    let entries: Vec<cerulion_q::RunEntry> =
+        gathered_entries.into_iter().chain(hosted.entries).collect();
+    // hot-path-alloc-ok: cold, one set of run ids per remote runs GET on the
+    // control plane.
+    let mut named: BTreeSet<String> = entries.iter().map(|e| e.run_id.clone()).collect();
+    let undescribable = gathered_withheld
+        .into_iter()
+        .chain(hosted.undescribable)
+        .filter(|withheld| named.insert(withheld.run_id.clone()))
+        .collect();
+    cerulion_q::build_runs_reply(robot, entries, undescribable, completeness)
 }
 
 /// The shared, thread-safe source the `catalog` verb reads to build a
@@ -2533,7 +2551,7 @@ pub struct SchemaSource {
 /// serves `demand`, so a runs GET delays a concurrent demand GET by its own
 /// duration.
 ///
-/// Cheap to clone (one `Arc` + a `Duration`), mirroring [`CatalogSource`].
+/// Cheap to clone (two `Arc`s + a `Duration`), mirroring [`CatalogSource`].
 #[derive(Clone)]
 pub struct RunSource {
     /// The gateway host's own iceoryx2 namespace - the one its
@@ -8032,8 +8050,8 @@ mod tests {
 mod hosted_runs_serve_tests {
     use super::*;
     use crate::transport::cerulion_q::{
-        decode_runs_reply, encode_runs_reply, RunEntry, RunEntryState, RunsCompleteness,
-        RunsGatherOutcome, RunsReply, UndescribableRun,
+        decode_runs_reply, encode_runs_reply, RunEntry, RunEntryState, RunsCompleteness, RunsReply,
+        UndescribableRun,
     };
     use crate::transport::hosted_runs::{HostedRun, HostedRunGuard};
     use crate::transport::run_artifacts::{RunFold, SkippedRun};
@@ -8044,12 +8062,20 @@ mod hosted_runs_serve_tests {
     const ROBOT: &str = "temi";
     const RUN: u128 = 0x5d1c_0000_0000_0000_0000_0000_0000_9e02;
     const RUN_TEXT: &str = "0x5d1c0000000000000000000000009e02";
+    const BAD_RUN: u128 = 0x0bad;
+    const BAD_RUN_TEXT: &str = "0x00000000000000000000000000000bad";
     const STARTED_AT_NS: u64 = 1_762_264_931_000_000_000;
     const GRAPH_YAML: &str = "name: temi\nprefix: temi\n";
     const RUN_JSON: &str = "{\"version\":1,\"host\":\"embedded\"}\n";
     const IDLE_LEGACY_BYTES: &str =
         r#"{"version":1,"robot":"temi","runs":[],"completeness":{"kind":"settled"}}"#;
     const HEARD_CEILING: Duration = Duration::from_secs(10);
+    /// Set to the parent test's process id in the child it spawns, so a value
+    /// inherited from a shell never takes the child arm.
+    const GATHERED_CHILD_ENV: &str = "CERULION_HOSTED_RUNS_GATHERED_CHILD";
+    const GATHERED_CHILD_DONE: &str = "<<<gathered child done>>>";
+    const GATHERED_YAML: &str = "# gathered\nname: perception\nprefix: /percep\n";
+    const GATHERED_JSON: &str = "{\"version\":1,\"graph_name\":\"perception\"}\n";
 
     struct DenyAll;
     impl DemandAuthorizer for DenyAll {
@@ -8091,6 +8117,44 @@ mod hosted_runs_serve_tests {
         (guard, flag)
     }
 
+    fn bad_hosted_run() -> HostedRun {
+        HostedRun {
+            entry: RunEntry {
+                run_id: BAD_RUN_TEXT.to_string(),
+                graph_name: "temi".to_string(),
+                run_started_at_ns: STARTED_AT_NS,
+                state: RunEntryState::Live,
+                graph_yaml: String::new(),
+                run_json: RUN_JSON.to_string(),
+            },
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn withheld(run_id_text: &str, reason: &str) -> UndescribableRun {
+        UndescribableRun {
+            run_id: run_id_text.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Serve through the decision until `done` holds, or panic with the last
+    /// reply once [`HEARD_CEILING`] passes.
+    fn serve_until(source: &RunSource, done: impl Fn(&RunsReply) -> bool) -> RunsReply {
+        let deadline = Instant::now() + HEARD_CEILING;
+        loop {
+            let reply = runs_serve_decision_for_test(source, &AllowAllAuthorizer, ROBOT);
+            if done(&reply) {
+                return reply;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no matching runs reply within {HEARD_CEILING:?}; last {reply:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn expected_hosted(state: RunEntryState) -> RunEntry {
         RunEntry {
             run_id: RUN_TEXT.to_string(),
@@ -8125,6 +8189,13 @@ mod hosted_runs_serve_tests {
         .expect("a well-formed entry")
     }
 
+    fn hosted_entries(entries: Vec<RunEntry>) -> HostedServe {
+        HostedServe {
+            entries,
+            undescribable: Vec::new(),
+        }
+    }
+
     fn bytes(reply: &RunsReply) -> String {
         String::from_utf8(encode_runs_reply(reply)).expect("runs replies are JSON text")
     }
@@ -8154,7 +8225,11 @@ mod hosted_runs_serve_tests {
             }],
         };
 
-        let reply = assemble_runs_reply(ROBOT, Some((fold, RunsCompleteness::Settled)), Vec::new());
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            HostedServe::default(),
+        );
 
         assert_eq!(
             bytes(&reply),
@@ -8315,7 +8390,7 @@ mod hosted_runs_serve_tests {
             let reply = assemble_runs_reply(
                 ROBOT,
                 Some((fold(gathered_at), RunsCompleteness::Settled)),
-                vec![entry_named("hosted", hosted_at)],
+                hosted_entries(vec![entry_named("hosted", hosted_at)]),
             );
             assert_eq!(reply.runs.len(), 1, "one run id, one served entry");
             reply.runs[0].graph_name.clone()
@@ -8332,7 +8407,11 @@ mod hosted_runs_serve_tests {
 
     #[test]
     fn a_reply_with_no_gather_serves_only_the_hosted_entries_as_not_established() {
-        let reply = assemble_runs_reply(ROBOT, None, vec![entry_named("temi", STARTED_AT_NS)]);
+        let reply = assemble_runs_reply(
+            ROBOT,
+            None,
+            hosted_entries(vec![entry_named("temi", STARTED_AT_NS)]),
+        );
         assert_eq!(
             reply,
             served_reply(
@@ -8355,7 +8434,7 @@ mod hosted_runs_serve_tests {
         let reply = assemble_runs_reply(
             ROBOT,
             Some((fold, RunsCompleteness::Settled)),
-            vec![entry_named("temi", STARTED_AT_NS)],
+            hosted_entries(vec![entry_named("temi", STARTED_AT_NS)]),
         );
         assert_eq!(
             reply,
@@ -8373,6 +8452,33 @@ mod hosted_runs_serve_tests {
     }
 
     #[test]
+    fn a_hosted_entry_new_would_refuse_is_named_undescribable_and_the_desk_still_decodes_the_reply()
+    {
+        let source = idle_source();
+        let (_good_guard, _live_good) = host(&source, true);
+        let _bad_guard = source.hosted.host(BAD_RUN, bad_hosted_run());
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                BAD_RUN_TEXT,
+                "the hosted entry carries an empty graph.yaml",
+            )],
+            ..served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established(),
+            )
+        };
+        assert_eq!(reply, expected);
+        assert_eq!(
+            decode_runs_reply(&encode_runs_reply(&reply)),
+            Ok(expected),
+            "one bad hosted entry must not make the desk refuse the whole reply"
+        );
+    }
+
+    #[test]
     fn every_hosted_runs_handle_of_a_manager_is_the_same_set() {
         let manager = NetworkManager::new(NetworkConfig::default());
         let source = RunSource {
@@ -8381,78 +8487,203 @@ mod hosted_runs_serve_tests {
         };
         let (guard, _live) = host(&source, true);
         assert_eq!(
-            manager.hosted_runs().entries(),
+            manager.hosted_runs().served().entries,
             vec![expected_hosted(RunEntryState::Live)]
         );
         drop(guard);
-        assert!(manager.hosted_runs().entries().is_empty());
+        assert!(manager.hosted_runs().served().entries.is_empty());
     }
 
     #[test]
-    fn a_desk_runs_get_over_loopback_sees_the_hosted_run() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("an ephemeral loopback port")
-            .port();
-        let locator = format!("tcp/127.0.0.1:{port}");
-        let robot = NetworkManager::new(NetworkConfig {
-            listen_endpoints: vec![locator.clone()],
-            robot_identity: Some(ROBOT.to_string()),
-            ..NetworkConfig::default()
-        });
-        robot.set_lan_access(LanAccess::Open);
-        robot.session().expect("robot session listens on loopback");
-        let source = RunSource {
-            hosted: robot.hosted_runs(),
-            ..idle_source()
-        };
-        robot
-            .start_query_surface(
-                Arc::new(TopicBridgeManager::new()),
-                Arc::new(GetDemandState::default()),
-                CatalogSource {
-                    hashes: Arc::new(Mutex::new(HashMap::new())),
-                    boot_topics: Arc::new(Mutex::new(HashSet::new())),
-                    topic_schemas: Arc::new(Mutex::new(HashMap::new())),
-                    hash_names: Arc::new(Mutex::new(HashMap::new())),
-                    snapshot_lock: Arc::new(Mutex::new(())),
-                    producer_probe: None,
-                    liveness: None,
-                    liveness_clock: None,
-                },
-                SchemaSource::default(),
-                source.clone(),
-            )
-            .expect("query surface");
+    fn a_hosted_run_whose_gathered_twin_is_withheld_is_served_once_as_the_hosted_entry() {
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
         let (_guard, _live) = host(&source, true);
-        let desk = NetworkManager::new(NetworkConfig {
-            connect_endpoints: vec![locator],
-            ..NetworkConfig::default()
-        });
-        let session = desk.session().expect("desk session connects");
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: RUN,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 1,
+                state: RunState::Live,
+                graph_name: "temi".to_string(),
+                run_dir: "/nonexistent/unreachable".to_string(),
+            },
+        )
+        .expect("publish a live registry writer");
 
-        let deadline = Instant::now() + HEARD_CEILING;
-        let mut last = String::from("no GET issued");
-        while Instant::now() < deadline {
-            match super::super::discovery::query_robot_runs(
-                session,
-                ROBOT,
-                Duration::from_millis(500),
-            ) {
-                RunsGatherOutcome::Decoded(reply) => {
-                    assert_eq!(
-                        reply,
-                        served_reply(
-                            vec![expected_hosted(RunEntryState::Live)],
-                            RunsCompleteness::Settled
-                        )
-                    );
-                    return;
-                }
-                other => last = format!("{other:?}"),
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        // Settled only once the gather heard the writer; an unheard live writer
+        // answers incomplete.
+        let reply = serve_until(&source, |reply| reply.completeness.is_settled());
+
+        let expected = served_reply(
+            vec![expected_hosted(RunEntryState::Live)],
+            RunsCompleteness::Settled,
+        );
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    #[test]
+    fn a_run_both_sides_withhold_is_named_once_with_the_gathered_reason() {
+        let fold = RunFold {
+            entries: Vec::new(),
+            skipped: vec![SkippedRun {
+                run_id: RUN,
+                run_dir: "/runs/temi".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            HostedServe {
+                entries: Vec::new(),
+                undescribable: vec![withheld(
+                    RUN_TEXT,
+                    "the hosted entry carries an empty graph.yaml",
+                )],
+            },
+        );
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                RUN_TEXT,
+                "run directory holds no readable graph.yaml",
+            )],
+            ..served_reply(Vec::new(), RunsCompleteness::not_established())
+        };
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    #[test]
+    fn a_withheld_hosted_run_whose_gathered_twin_is_described_is_served_as_the_gathered_entry() {
+        let gathered = entry_named("gathered", STARTED_AT_NS);
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((
+                RunFold {
+                    entries: vec![gathered.clone()],
+                    skipped: Vec::new(),
+                },
+                RunsCompleteness::Settled,
+            )),
+            HostedServe {
+                entries: Vec::new(),
+                undescribable: vec![withheld(
+                    RUN_TEXT,
+                    "the hosted entry carries an empty graph.yaml",
+                )],
+            },
+        );
+        let expected = served_reply(vec![gathered], RunsCompleteness::Settled);
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    /// The fold reads `CERULION_HOME` at serve time, so the arm that needs a
+    /// readable run directory runs in a child process with its own environment;
+    /// setting the variable here would race every other test in this binary.
+    #[cfg(unix)]
+    #[test]
+    fn through_the_decision_a_gathered_run_is_served_beside_the_hosted_runs_and_deduped_once() {
+        let parent = std::os::unix::process::parent_id().to_string();
+        if std::env::var_os(GATHERED_CHILD_ENV).is_some_and(|v| v == parent.as_str()) {
+            gathered_beside_hosted_in_this_process();
+            println!("{GATHERED_CHILD_DONE}");
+            return;
         }
-        panic!("the desk never decoded a runs reply within {HEARD_CEILING:?}; last {last}");
+        let home_dir = tempfile::tempdir().expect("a temp CERULION_HOME");
+        let home = std::fs::canonicalize(home_dir.path()).expect("canonicalize CERULION_HOME");
+        std::fs::create_dir_all(home.join("runs")).expect("the runs root");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "transport::network::hosted_runs_serve_tests::\
+                 through_the_decision_a_gathered_run_is_served_beside_the_hosted_runs_and_deduped_once",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(GATHERED_CHILD_ENV, std::process::id().to_string())
+            .env("CERULION_HOME", &home)
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(GATHERED_CHILD_DONE),
+            "the child failed or never ran its arm ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn gathered_beside_hosted_in_this_process() {
+        let run_dir = run_registry::run_dir_root()
+            .expect("the child's CERULION_HOME")
+            .join("perception");
+        std::fs::create_dir_all(&run_dir).expect("the run directory");
+        std::fs::write(run_dir.join(run_artifacts::GRAPH_YAML_FILE), GATHERED_YAML)
+            .expect("write graph.yaml");
+        std::fs::write(run_dir.join(run_artifacts::RUN_JSON_FILE), GATHERED_JSON)
+            .expect("write run.json");
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: RUN,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 20,
+                state: RunState::Live,
+                graph_name: "perception".to_string(),
+                run_dir: run_dir.to_string_lossy().into_owned(),
+            },
+        )
+        .expect("publish a live registry writer");
+        let host_twin = |started_at_ns| {
+            source.hosted.host(
+                RUN,
+                HostedRun {
+                    entry: entry_named("hosted", started_at_ns),
+                    live: Arc::new(AtomicBool::new(true)),
+                },
+            )
+        };
+        let gathered = RunEntry {
+            run_id: RUN_TEXT.to_string(),
+            graph_name: "perception".to_string(),
+            run_started_at_ns: 20,
+            state: RunEntryState::Live,
+            graph_yaml: GATHERED_YAML.to_string(),
+            run_json: GATHERED_JSON.to_string(),
+        };
+
+        let bad = source.hosted.host(BAD_RUN, bad_hosted_run());
+        let _earlier_twin = host_twin(10);
+        let reply = serve_until(&source, |reply| {
+            reply.runs.iter().any(|e| e.graph_name == "perception")
+        });
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                BAD_RUN_TEXT,
+                "the hosted entry carries an empty graph.yaml",
+            )],
+            ..served_reply(vec![gathered], RunsCompleteness::not_established())
+        };
+        assert_eq!(
+            reply, expected,
+            "the gathered run started later, so it survives its hosted twin, and the bad \
+             hosted entry hides nothing"
+        );
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+
+        drop(bad);
+        let _later_twin = host_twin(30);
+        let reply = serve_until(&source, |reply| reply.completeness.is_settled());
+        assert_eq!(
+            reply,
+            served_reply(vec![entry_named("hosted", 30)], RunsCompleteness::Settled),
+            "the hosted twin started later, so it survives the gathered run"
+        );
     }
 }
