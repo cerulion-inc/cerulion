@@ -234,11 +234,11 @@ pub fn tcp_port_open(addr: SocketAddr, timeout: Duration) -> bool {
     TcpStream::connect_timeout(&addr, timeout.max(Duration::from_millis(1))).is_ok()
 }
 
-/// Parse + resolve a zenoh locator (`tcp/host:port`) and probe EVERY resolved
-/// address; reachable when any one accepts. Unparseable or unresolvable ⇒
-/// `false` (unreachable — it could never be connected anyway). The blocking
-/// DNS resolve is bounded only by this running inside a per-candidate thread
-/// under the batch deadline.
+/// Parse + resolve a zenoh locator (`tcp/host:port`) and probe the resolved
+/// addresses that [`addresses_to_probe`] keeps; reachable when any one
+/// accepts. Unparseable or unresolvable ⇒ `false` (unreachable — it could
+/// never be connected anyway). The blocking DNS resolve is bounded only by
+/// this running inside a per-candidate thread under the batch deadline.
 fn probe_locator(locator: &str, timeout: Duration) -> bool {
     let Some((host, port)) = parse_locator_host_port(locator) else {
         return false;
@@ -249,23 +249,59 @@ fn probe_locator(locator: &str, timeout: Duration) -> bool {
     }
 }
 
+/// The most resolved addresses one locator's probe touches, and so the most
+/// `discovery-probe-addr` threads one locator spawns. The resolver answer is
+/// not ours to bound (a hostile or misconfigured name can return hundreds of
+/// addresses), and without this cap one such name would defeat the row cap
+/// the probe fan-out relies on (`peer_cache::MAX_CACHED_PEERS`). Eight holds
+/// a dual-stack host's first IPv6 and first IPv4 address with room for more
+/// of each.
+const MAX_ADDRS_PER_LOCATOR: usize = 8;
+
+/// The addresses of one resolver answer that get probed: at most
+/// [`MAX_ADDRS_PER_LOCATOR`]. The first address of each family leads, so a
+/// long run of one family cannot crowd out the other (a robot that listens
+/// on IPv4 only, behind a name that resolves first to many IPv6 addresses);
+/// the rest follow in resolver order. Pure.
+fn addresses_to_probe(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    if addrs.len() > MAX_ADDRS_PER_LOCATOR {
+        let head_is_v6 = addrs[0].is_ipv6();
+        if let Some(other) = addrs.iter().position(|a| a.is_ipv6() != head_is_v6) {
+            addrs[1..=other].rotate_right(1);
+        }
+        addrs.truncate(MAX_ADDRS_PER_LOCATOR);
+    }
+    addrs
+}
+
 /// Does any of `addrs` accept a TCP connection within `timeout`? A name can
 /// resolve first to an address the robot does not serve (IPv6 ahead of the
-/// IPv4 it listens on), so every address is probed, and concurrently: one
-/// that swallows the SYN must not spend the time a later one needs. A single
-/// address (every IP-literal locator) is probed on the calling thread.
+/// IPv4 it listens on), so every address [`addresses_to_probe`] keeps is
+/// probed, and concurrently: one that swallows the SYN must not spend the
+/// time a later one needs. A single address (every IP-literal locator) is
+/// probed on the calling thread.
 fn any_address_accepts(addrs: Vec<SocketAddr>, timeout: Duration) -> bool {
+    any_address_accepts_with(addrs, timeout, tcp_port_open)
+}
+
+/// [`any_address_accepts`] with the per-address probe injected.
+fn any_address_accepts_with<P>(addrs: Vec<SocketAddr>, timeout: Duration, probe: P) -> bool
+where
+    P: Fn(SocketAddr, Duration) -> bool + Clone + Send + 'static,
+{
+    let addrs = addresses_to_probe(addrs);
     match addrs.as_slice() {
         [] => false,
-        [only] => tcp_port_open(*only, timeout),
+        [only] => probe(*only, timeout),
         _ => {
             let (tx, rx) = mpsc::channel::<()>();
             for addr in addrs {
                 let tx = tx.clone();
+                let probe = probe.clone();
                 let _ = thread::Builder::new()
                     .name("discovery-probe-addr".to_string())
                     .spawn(move || {
-                        if tcp_port_open(addr, timeout) {
+                        if probe(addr, timeout) {
                             let _ = tx.send(());
                         }
                     });
@@ -279,8 +315,9 @@ fn any_address_accepts(addrs: Vec<SocketAddr>, timeout: Duration) -> bool {
 }
 
 /// Probe every locator in `locators` CONCURRENTLY (one detached thread each,
-/// and one more per address of a name that resolves to several; per-probe
-/// `timeout`) and return the set that accepted a TCP connection.
+/// plus at most `MAX_ADDRS_PER_LOCATOR` (8) more for a name that resolves to
+/// several addresses; per-probe `timeout`) and return the set that accepted a
+/// TCP connection.
 /// Detached (not joined) so one hung DNS resolve can't exceed the bound; the
 /// collector stops at `timeout + a small slack`. An empty input is an empty set
 /// (no probing, and — load-bearing for the netd fold — no wall cost at all).
@@ -601,6 +638,63 @@ mod tests {
             start.elapsed() < EXPLICIT_PROBE_TIMEOUT,
             "the accepting address answered only after the silent one used the \
              whole budget ({:?})",
+            start.elapsed()
+        );
+    }
+
+    /// A resolver answer is outside our control: a name that resolves to
+    /// forty addresses must cost at most `MAX_ADDRS_PER_LOCATOR` probes (one
+    /// thread each), and the cap must keep the first address of BOTH families
+    /// whichever comes first, then the rest in resolver order.
+    #[test]
+    fn a_name_that_resolves_to_many_addresses_probes_at_most_the_cap() {
+        let v6 = |i: u16| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i], 7683));
+        let v4 = |i: u8| SocketAddr::from(([192, 0, 2, i], 7683));
+        let v6_first: Vec<SocketAddr> = (1..=20).map(v6).chain((1..=20).map(v4)).collect();
+        let v4_first: Vec<SocketAddr> = (1..=20).map(v4).chain((1..=20).map(v6)).collect();
+        let cases = [
+            (
+                v6_first,
+                vec![v6(1), v4(1), v6(2), v6(3), v6(4), v6(5), v6(6), v6(7)],
+            ),
+            (
+                v4_first,
+                vec![v4(1), v6(1), v4(2), v4(3), v4(4), v4(5), v4(6), v4(7)],
+            ),
+        ];
+        for (answer, expected) in cases {
+            let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = std::sync::Arc::clone(&probed);
+            let accepted = any_address_accepts_with(answer, LADDER_PROBE_TIMEOUT, move |a, _| {
+                record.lock().expect("probe record").push(a);
+                false
+            });
+            assert!(!accepted);
+            let probed = probed.lock().expect("probe record");
+            assert_eq!(probed.len(), MAX_ADDRS_PER_LOCATOR);
+            assert_eq!(
+                probed.iter().copied().collect::<HashSet<_>>(),
+                expected.into_iter().collect::<HashSet<_>>()
+            );
+        }
+    }
+
+    /// A robot that serves IPv4 only, behind a name whose answer leads with
+    /// more IPv6 addresses (RFC 3849 documentation prefix, never answers)
+    /// than the cap: the IPv4 address still gets probed, inside the budget.
+    #[test]
+    fn a_v6_first_name_with_its_listening_v4_past_the_cap_is_reachable() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let mut addrs: Vec<SocketAddr> = (1..=20)
+            .map(|i| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i], port)))
+            .collect();
+        addrs.push(SocketAddr::from(([127, 0, 0, 1], port)));
+        let start = Instant::now();
+        assert!(any_address_accepts(addrs, EXPLICIT_PROBE_TIMEOUT));
+        assert!(
+            start.elapsed() < EXPLICIT_PROBE_TIMEOUT,
+            "the accepting IPv4 address answered only after the budget ({:?})",
             start.elapsed()
         );
     }
