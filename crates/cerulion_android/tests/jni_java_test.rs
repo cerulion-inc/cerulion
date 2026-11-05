@@ -105,6 +105,13 @@ poll-null-out=3
 poll-null-topic=3
 poll-overflow=0 {\"data\":\"b\"}, 0 {\"data\":\"\u{e7}\"}, 15
 subscribed={\"/jni/heartbeat\":{\"polled\":3,\"dropped\":1,\"undecodable\":0}}
+publish-stamped=0
+publish-stamped-negative=3
+publish-stamped-ahead=3
+publish-stamped-null=3
+publish-stamped-ahead-oversized=3
+poll-stamped=0 {\"data\":\"stamped\"}
+poll-stamped-empty=15
 stop=0 state=stopped
 start-graph=0 state=running nodes=3
 poll-graph=0 {\"data\":2}

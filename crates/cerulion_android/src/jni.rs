@@ -6,7 +6,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::strings::JNIString;
-use jni::sys::{jint, jstring};
+use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 
 use crate::error::codes;
@@ -50,40 +50,66 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublish(
     topic: JString,
     json: JString,
 ) -> jint {
+    guarded_code(|| publish(&mut env, &topic, &json, None))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublishStamped(
+    mut env: JNIEnv,
+    _class: JClass,
+    topic: JString,
+    json: JString,
+    stamp_ns: jlong,
+) -> jint {
     guarded_code(|| {
-        let topic = match java_string(&mut env, &topic) {
-            Ok(value) => value,
-            Err(code) => return code,
-        };
-        // `GetStringLength` below dereferences `json` raw; a null message
-        // must return the invalid-argument code, not crash the app.
-        if json.is_null() {
+        // A stamp is nanoseconds on the runtime clock's base, so a negative
+        // one names no time.
+        let Ok(stamp_ns) = u64::try_from(stamp_ns) else {
             return codes::INVALID_ARGUMENT;
-        }
-        // Refuse an oversized message before `java_string` copies it: each
-        // UTF-16 unit is at least one UTF-8 byte, so a UTF-16 length over the
-        // publisher's JSON limit can never encode. The host runs this check
-        // and the publish under one runtime lock, so the limit is the active
-        // run's limit (a stop or restart cannot land in between), and only
-        // when the publish could proceed (BUSY, BAD_STATE and the
-        // unknown-topic code come first). The exact byte check in
-        // `encode_json` still applies after conversion.
-        crate::host::publish_prepared(&topic, |limit| {
-            // SAFETY: `env` is the live JNIEnv for this call and `json` is a
-            // local ref from its arguments.
-            let utf16_len = unsafe {
-                let raw = env.get_raw();
-                let get_length = (**raw)
-                    .GetStringLength
-                    .expect("GetStringLength is in JNI 1.0");
-                get_length(raw, json.as_raw())
-            };
-            if utf16_len < 0 || utf16_len as usize > limit {
-                return Err(codes::ENCODE);
-            }
-            java_string(&mut env, &json)
-        })
+        };
+        publish(&mut env, &topic, &json, Some(stamp_ns))
     })
+}
+
+/// Publish `json` on `topic`, stamped `stamp_ns` or, when it is `None`, with
+/// the runtime clock's time.
+fn publish(env: &mut JNIEnv, topic: &JString, json: &JString, stamp_ns: Option<u64>) -> jint {
+    let topic = match java_string(env, topic) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    // `GetStringLength` below dereferences `json` raw; a null message
+    // must return the invalid-argument code, not crash the app.
+    if json.is_null() {
+        return codes::INVALID_ARGUMENT;
+    }
+    // Refuse an oversized message before `java_string` copies it: each
+    // UTF-16 unit is at least one UTF-8 byte, so a UTF-16 length over the
+    // publisher's JSON limit can never encode. The host runs this check
+    // and the publish under one runtime lock, so the limit is the active
+    // run's limit (a stop or restart cannot land in between), and only
+    // when the publish could proceed (BUSY, BAD_STATE and the
+    // unknown-topic code come first). The exact byte check in
+    // `encode_json` still applies after conversion.
+    let prepare = |limit: usize| {
+        // SAFETY: `env` is the live JNIEnv for this call and `json` is a
+        // local ref from its arguments.
+        let utf16_len = unsafe {
+            let raw = env.get_raw();
+            let get_length = (**raw)
+                .GetStringLength
+                .expect("GetStringLength is in JNI 1.0");
+            get_length(raw, json.as_raw())
+        };
+        if utf16_len < 0 || utf16_len as usize > limit {
+            return Err(codes::ENCODE);
+        }
+        java_string(env, json)
+    };
+    match stamp_ns {
+        None => crate::host::publish_prepared(&topic, prepare),
+        Some(stamp_ns) => crate::host::publish_stamped_prepared(&topic, stamp_ns, prepare),
+    }
 }
 
 #[no_mangle]
