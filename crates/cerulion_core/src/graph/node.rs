@@ -1804,6 +1804,10 @@ impl NodeContext {
     /// Write each publisher's [`AnyPublisher::committed_frames`] into `out`, in
     /// the graph's `outputs:` order. Returns `false`, leaving `out` unchanged,
     /// when `out.len()` is not this node's output count.
+    ///
+    /// Only a loaned proxy's commit moves a count. A frame sent with
+    /// [`AnyPublisher::publish_raw`] carries its caller's own wire sequence and
+    /// moves none, so the fire tap does not see that write.
     pub fn output_commit_counts(&self, out: &mut [u32]) -> bool {
         if out.len() != self.publishers.len() {
             return false;

@@ -3093,6 +3093,9 @@ struct LivePaceAnchor {
 /// node count. Nodes past it run unrecorded.
 const FIRE_NODE_LIMIT: usize = u16::MAX as usize;
 
+/// What the tick callback's `catch_unwind` around `NodeEntry::tick` returns.
+type TickResult = std::thread::Result<TransportResult<()>>;
+
 /// How a recorded tick ended.
 enum TickOutcome {
     Ok,
@@ -3101,7 +3104,7 @@ enum TickOutcome {
 }
 
 impl TickOutcome {
-    fn of(result: &std::thread::Result<TransportResult<()>>) -> Self {
+    fn of(result: &TickResult) -> Self {
         match result {
             Ok(Ok(())) => Self::Ok,
             // A node library catches its own panic and returns this variant.
@@ -3111,26 +3114,41 @@ impl TickOutcome {
     }
 }
 
-/// An armed tick's start, taken before the tick runs.
-struct FireStart {
+/// An armed tick, started before the tick runs, with the tap that admitted it.
+struct FireStart<'t> {
+    tap: &'t FireTap,
+    node: u16,
     at_ns: u64,
     started: Instant,
     counted: bool,
 }
 
 /// One node's fire recording, moved into its tick callback at build. It
-/// reads no clock and touches no counter until a reader arms the tap.
+/// reads no clock and asks the entry nothing until a reader arms the tap.
 struct FireSite {
     tap: Arc<OnceLock<Arc<FireTap>>>,
     node: Option<u16>,
     cause: FireCause,
     flags: u8,
+}
+
+/// One node's output commit counts around a recorded tick.
+struct FireCounts {
     before: Box<[u32]>,
     after: Box<[u32]>,
 }
 
-impl FireSite {
+impl FireCounts {
     // hot-path-alloc-ok-fn: cold: graph build sizes each node's two count buffers once
+    fn new(outputs: usize) -> Self {
+        Self {
+            before: vec![0; outputs].into_boxed_slice(),
+            after: vec![0; outputs].into_boxed_slice(),
+        }
+    }
+}
+
+impl FireSite {
     fn new(
         tap: Arc<OnceLock<Arc<FireTap>>>,
         index: usize,
@@ -3155,28 +3173,65 @@ impl FireSite {
             node: (index < FIRE_NODE_LIMIT).then_some(index as u16),
             cause: FireCause::try_from(trigger.cause()).unwrap_or(FireCause::Unknown),
             flags,
-            before: vec![0; outputs].into_boxed_slice(),
-            after: vec![0; outputs].into_boxed_slice(),
         }
     }
 
+    /// `None` while disarmed. The commit-count probe is entry code, so the
+    /// caller runs this inside the tick's `catch_unwind`.
     #[inline]
-    fn start(&mut self, entry: &dyn NodeEntry) -> Option<FireStart> {
-        self.node?;
-        let at_ns = self.tap.get()?.armed_now()?;
-        let counted = entry.output_commit_counts(&mut self.before);
+    fn start(&self, counts: &mut FireCounts, entry: &dyn NodeEntry) -> Option<FireStart<'_>> {
+        let node = self.node?;
+        let tap = self.tap.get()?;
+        let at_ns = tap.armed_now()?;
+        let counted = entry.output_commit_counts(&mut counts.before);
         Some(FireStart {
+            tap,
+            node,
             at_ns,
             started: Instant::now(),
             counted,
         })
     }
 
-    fn record(&mut self, start: FireStart, entry: &dyn NodeEntry, outcome: TickOutcome) {
+    /// Record `start`'s tick and return its result. A panic in the after
+    /// count is entry code panicking in this callback, so it becomes the
+    /// tick's panic unless the tick already panicked.
+    fn record(
+        &self,
+        start: FireStart<'_>,
+        counts: &mut FireCounts,
+        entry: &dyn NodeEntry,
+        result: TickResult,
+    ) -> TickResult {
         let elapsed = start.started.elapsed();
-        let (Some(tap), Some(node)) = (self.tap.get(), self.node) else {
-            return;
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start.counted && entry.output_commit_counts(&mut counts.after)
+        }));
+        let (counted, result) = match probed {
+            Ok(counted) => (counted, result),
+            Err(payload) => (false, result.and(Err(payload))),
         };
+        let writes = counted.then_some((&*counts.before, &*counts.after));
+        start.tap.push(self.body(
+            start.node,
+            start.at_ns,
+            elapsed,
+            TickOutcome::of(&result),
+            writes,
+        ));
+        result
+    }
+
+    /// The record of one armed tick. `writes` holds the commit counts before
+    /// and after it, `None` when the entry could not report them.
+    fn body(
+        &self,
+        node: u16,
+        at_ns: u64,
+        elapsed: Duration,
+        outcome: TickOutcome,
+        writes: Option<(&[u32], &[u32])>,
+    ) -> FireBody {
         let mut flags = self.flags
             | match outcome {
                 TickOutcome::Ok => 0,
@@ -3191,24 +3246,24 @@ impl FireSite {
             }
         };
         let mut wrote = 0_u64;
-        if start.counted && entry.output_commit_counts(&mut self.after) {
-            let pairs = self.before.iter().zip(self.after.iter()).take(64);
-            for (bit, (before, after)) in pairs.enumerate() {
-                if before != after {
-                    wrote |= 1 << bit;
+        match writes {
+            Some((before, after)) => {
+                for (bit, (before, after)) in before.iter().zip(after).take(64).enumerate() {
+                    if before != after {
+                        wrote |= 1 << bit;
+                    }
                 }
             }
-        } else {
-            flags |= FireFlags::WROTE_UNKNOWN;
+            None => flags |= FireFlags::WROTE_UNKNOWN,
         }
-        tap.push(FireBody {
-            at_ns: start.at_ns,
+        FireBody {
+            at_ns,
             dur_ns,
             node,
             cause: self.cause,
             flags: FireFlags(flags),
             wrote,
-        });
+        }
     }
 }
 
@@ -8440,12 +8495,13 @@ impl GraphRuntime {
                 },
                 TriggerPolicy::External => TopologyTrigger::External,
             };
-            let mut fire = FireSite::new(
+            let fire = FireSite::new(
                 Arc::clone(&fire_tap),
                 topology_nodes.len(),
                 &trigger,
                 node_def.outputs.len(),
             );
+            let mut fire_counts = FireCounts::new(node_def.outputs.len());
             let callback = Box::new(move || match entry_for_callback.lock() {
                 Ok(mut e) => {
                     // Catch the unwind to RECORD the panic reason
@@ -8460,12 +8516,18 @@ impl GraphRuntime {
                     // AssertUnwindSafe: the payload is resumed immediately —
                     // any torn `&mut` state unwinds exactly as it did without
                     // the intermediate catch.
-                    let fire_start = fire.start(&**e);
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
-                    if let Some(fire_start) = fire_start {
-                        fire.record(fire_start, &**e, TickOutcome::of(&result));
-                    }
+                    // The fire tap's commit-count probes are entry code too:
+                    // they run under this catch or `FireSite::record`'s, so a
+                    // probe panic takes the panic arm below.
+                    let mut fire_start = None;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fire_start = fire.start(&mut fire_counts, &**e);
+                        e.tick()
+                    }));
+                    let result = match fire_start {
+                        Some(start) => fire.record(start, &mut fire_counts, &**e, result),
+                        None => result,
+                    };
                     match result {
                         Err(payload) => {
                             record_first_reason(
@@ -20966,5 +21028,86 @@ mod tests {
         // `GraphRuntime::block_credits`.
         assert_eq!(compose_probe(false, true, true), (false, false));
         assert_eq!(compose_probe(false, true, false), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod fire_site_tests {
+    use super::{FireSite, TickOutcome, TopologyTrigger};
+    use crate::fire_tap::{FireBody, FireCause, FireFlags};
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+
+    /// `u32::MAX` nanoseconds, the longest duration a record holds exactly.
+    const DUR_MAX_NS: u32 = 4_294_967_295;
+
+    fn period_site(outputs: usize) -> FireSite {
+        FireSite::new(
+            Arc::new(OnceLock::new()),
+            2,
+            &TopologyTrigger::Period {
+                interval_ns: 1_000_000,
+            },
+            outputs,
+        )
+    }
+
+    fn body(elapsed: Duration, outcome: TickOutcome, writes: Option<(&[u32], &[u32])>) -> FireBody {
+        period_site(writes.map_or(0, |(before, _)| before.len()))
+            .body(2, 7, elapsed, outcome, writes)
+    }
+
+    fn writes<'a>(before: &'a [u32], after: &'a [u32]) -> Option<(&'a [u32], &'a [u32])> {
+        Some((before, after))
+    }
+
+    #[test]
+    fn a_tick_past_the_duration_column_saturates_and_says_so() {
+        let fits = body(
+            Duration::from_nanos(4_294_967_295),
+            TickOutcome::Ok,
+            writes(&[0], &[0]),
+        );
+        assert_eq!((fits.dur_ns, fits.flags.0), (DUR_MAX_NS, 0));
+
+        let over = body(
+            Duration::from_nanos(4_294_967_296),
+            TickOutcome::Ok,
+            writes(&[0], &[0]),
+        );
+        assert_eq!(
+            (over.dur_ns, over.flags.0),
+            (DUR_MAX_NS, FireFlags::DURATION_SATURATED)
+        );
+
+        let hour = body(Duration::from_secs(3600), TickOutcome::Panicked, None);
+        assert_eq!(
+            (hour.dur_ns, hour.flags.0, hour.wrote),
+            (
+                DUR_MAX_NS,
+                FireFlags::DURATION_SATURATED | FireFlags::PANICKED | FireFlags::WROTE_UNKNOWN,
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn each_changed_count_sets_its_output_bit() {
+        let fire = body(
+            Duration::from_nanos(10),
+            TickOutcome::Err,
+            writes(&[4, 9, 0], &[5, 9, 2]),
+        );
+        assert_eq!(
+            (
+                fire.at_ns,
+                fire.dur_ns,
+                fire.node,
+                fire.cause,
+                fire.flags.0,
+                fire.wrote
+            ),
+            (7, 10, 2, FireCause::Period, FireFlags::TICK_ERROR, 0b101)
+        );
     }
 }

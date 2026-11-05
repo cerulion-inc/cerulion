@@ -6,7 +6,15 @@
 //! root) under a `VirtualClock`, so the binary is parallel-safe:
 //!
 //! ```bash
-//! cargo test -p cerulion_core --test fire_tap_graph_test -- --nocapture
+//! cargo test -p cerulion_core --test fire_tap_graph_test
+//! ```
+//!
+//! The overhead test prints the armed and disarmed cost per step. Those
+//! numbers compare only when nothing else runs beside it, so read them from
+//! a run of that test alone:
+//!
+//! ```bash
+//! cargo test -p cerulion_core --test fire_tap_graph_test overhead -- --nocapture
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,7 +175,9 @@ fn read_all(tap: &FireTap) -> FireBatch {
 }
 
 /// The replay-stable columns of a record: everything but `dur_ns`.
-fn shape(record: &FireRecord) -> (u64, u16, FireCause, u8, u64) {
+type Shape = (u64, u16, FireCause, u8, u64);
+
+fn shape(record: &FireRecord) -> Shape {
     (
         record.at_ns,
         record.node,
@@ -177,7 +187,7 @@ fn shape(record: &FireRecord) -> (u64, u16, FireCause, u8, u64) {
     )
 }
 
-fn shapes(batch: &FireBatch) -> Vec<(u64, u16, FireCause, u8, u64)> {
+fn shapes(batch: &FireBatch) -> Vec<Shape> {
     batch.records.iter().map(shape).collect()
 }
 
@@ -463,6 +473,164 @@ fn entry_without_commit_counts_records_wrote_unknown() {
     );
 }
 
+/// The text every `ProbedSource` probe panic carries.
+const PROBE_PANIC: &str = "the commit-count probe panics by design";
+
+/// A period source that owns its context and counts each commit-count
+/// probe. Probe number `panic_on` (from 1) panics instead.
+struct ProbedSource {
+    context: Option<NodeContext>,
+    probes: Arc<AtomicU64>,
+    panic_on: Option<u64>,
+}
+
+impl ProbedSource {
+    fn new(probes: Arc<AtomicU64>, panic_on: Option<u64>) -> Self {
+        Self {
+            context: None,
+            probes,
+            panic_on,
+        }
+    }
+}
+
+impl NodeEntry for ProbedSource {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        Ok(period_info(&["a"]))
+    }
+
+    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        self.context = Some(context);
+        Ok(())
+    }
+
+    fn tick(&mut self) -> TransportResult<()> {
+        publish(self.context.as_mut().expect("initialized"), "a", 1.0)
+    }
+
+    fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+        let probe = self.probes.fetch_add(1, Ordering::Relaxed) + 1;
+        if Some(probe) == self.panic_on {
+            panic!("{PROBE_PANIC}");
+        }
+        self.context
+            .as_ref()
+            .is_some_and(|ctx| ctx.output_commit_counts(out))
+    }
+}
+
+#[test]
+fn disarmed_ticks_never_ask_the_entry_for_commit_counts() {
+    let probes = Arc::new(AtomicU64::new(0));
+    let mut runtime = build(
+        SOURCE_ONLY,
+        vec![(
+            "source",
+            Box::new(ProbedSource::new(Arc::clone(&probes), None)),
+        )],
+    );
+    let tap = runtime.install_fire_tap(config(Duration::from_secs(5)));
+    assert!(runtime.run_topology().nodes[0].reports_writes);
+    assert_eq!(probes.load(Ordering::Relaxed), 1, "install probes once");
+
+    steps(&mut runtime, 5);
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        1,
+        "a disarmed tick asks the entry nothing"
+    );
+    assert_eq!(tap.stats().recorded, 0);
+
+    arm(&tap);
+    steps(&mut runtime, 2);
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        5,
+        "an armed tick asks once before and once after"
+    );
+    assert_eq!(
+        shapes(&read_all(&tap)),
+        vec![(ms(6), 0, PERIOD, NONE, 0b1), (ms(7), 0, PERIOD, NONE, 0b1)]
+    );
+}
+
+/// Two period sources on one level. They can fire on two threads, so the
+/// tests below compare records sorted by time and node.
+const STEADY_AND_FRAGILE: &str = r#"
+prefix: fires
+nodes:
+  - id: steady
+    type: source
+    outputs:
+      - {name: a, schema: geometry_msgs/Vector3}
+  - id: fragile
+    type: probed_source
+    outputs:
+      - {name: a, schema: geometry_msgs/Vector3}
+"#;
+
+const STEADY: u16 = 0;
+const FRAGILE: u16 = 1;
+
+/// Install the tap (probe 1), arm it, and step 3 times.
+fn run_with_probe_panic(panic_on: u64) -> (GraphRuntime, Vec<Shape>) {
+    let steady = ClosureNodeEntry::new(period_info(&["a"]), |ctx| publish(ctx, "a", 1.0));
+    let fragile = ProbedSource::new(Arc::default(), Some(panic_on));
+    let mut runtime = build(
+        STEADY_AND_FRAGILE,
+        vec![("steady", Box::new(steady)), ("fragile", Box::new(fragile))],
+    );
+    let tap = runtime.install_fire_tap(config(Duration::from_secs(5)));
+    arm(&tap);
+    steps(&mut runtime, 3);
+    let mut fires = shapes(&read_all(&tap));
+    fires.sort_by_key(|&(at_ns, node, ..)| (at_ns, node));
+    (runtime, fires)
+}
+
+#[test]
+fn a_panic_in_the_count_probe_before_a_tick_is_that_node_s_tick_panic() {
+    let (runtime, fires) = run_with_probe_panic(2);
+    assert_eq!(
+        runtime.node_tick_panics(),
+        vec![("fragile".to_string(), PROBE_PANIC.to_string())]
+    );
+    assert_eq!(
+        fires,
+        vec![
+            (ms(1), STEADY, PERIOD, NONE, 0b1),
+            (ms(2), STEADY, PERIOD, NONE, 0b1),
+            (ms(3), STEADY, PERIOD, NONE, 0b1),
+        ],
+        "the fragile node never ticked and is dead; the steady node keeps recording"
+    );
+}
+
+#[test]
+fn a_panic_in_the_count_probe_after_a_tick_records_a_panicked_fire() {
+    let (runtime, fires) = run_with_probe_panic(3);
+    assert_eq!(
+        runtime.node_tick_panics(),
+        vec![("fragile".to_string(), PROBE_PANIC.to_string())]
+    );
+    assert_eq!(
+        fires,
+        vec![
+            (ms(1), STEADY, PERIOD, NONE, 0b1),
+            (
+                ms(1),
+                FRAGILE,
+                PERIOD,
+                FireFlags::PANICKED | FireFlags::WROTE_UNKNOWN,
+                0
+            ),
+            (ms(2), STEADY, PERIOD, NONE, 0b1),
+            (ms(3), STEADY, PERIOD, NONE, 0b1),
+        ],
+        "the fragile node's one fire is a panic; it does not fire again"
+    );
+}
+
 #[test]
 fn run_topology_reports_writes_only_after_the_tap_probes_entries() {
     let mut runtime = alternating_graph();
@@ -706,8 +874,9 @@ nodes:
 #[test]
 fn overhead_of_100k_relay_ticks_armed_versus_disarmed_is_printed() {
     const TICKS: usize = 100_000;
+    const ROUNDS: usize = 3;
     let relay_ticks = Arc::new(AtomicU64::new(0));
-    let time_run = |armed: bool| {
+    let time_run = |armed: bool, ticks: usize| {
         let relay = relay(Arc::clone(&relay_ticks));
         let source = ClosureNodeEntry::new(period_info(&["a"]), |ctx| publish(ctx, "a", 1.0));
         let mut runtime = build(
@@ -723,24 +892,40 @@ fn overhead_of_100k_relay_ticks_armed_versus_disarmed_is_printed() {
         }
         let before = relay_ticks.load(Ordering::Relaxed);
         let started = Instant::now();
-        steps(&mut runtime, TICKS);
+        steps(&mut runtime, ticks);
         let elapsed = started.elapsed();
         assert_eq!(
             relay_ticks.load(Ordering::Relaxed) - before,
-            TICKS as u64,
+            ticks as u64,
             "one relay tick per step"
         );
         assert_eq!(
             tap.stats().recorded,
-            if armed { 2 * TICKS as u64 } else { 0 }
+            if armed { 2 * ticks as u64 } else { 0 }
         );
         elapsed
     };
-    let disarmed = time_run(false);
-    let armed = time_run(true);
+    // A first run pays one-time costs, so each posture warms once. The
+    // postures then alternate which goes first, and each keeps its fastest
+    // round, so neither one owns the quiet or the noisy part of the run.
+    time_run(false, TICKS / 10);
+    time_run(true, TICKS / 10);
+    let (mut disarmed, mut armed) = (Duration::MAX, Duration::MAX);
+    for round in 0..ROUNDS {
+        let order = if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for posture in order {
+            let elapsed = time_run(posture, TICKS);
+            let best = if posture { &mut armed } else { &mut disarmed };
+            *best = (*best).min(elapsed);
+        }
+    }
     eprintln!(
-        "fire tap overhead over {TICKS} steps (one source and one relay tick each): \
-         disarmed {:?} per step, armed {:?} per step",
+        "fire tap overhead over {TICKS} steps (one source and one relay tick each), \
+         fastest of {ROUNDS} alternating rounds: disarmed {:?} per step, armed {:?} per step",
         disarmed / TICKS as u32,
         armed / TICKS as u32
     );
