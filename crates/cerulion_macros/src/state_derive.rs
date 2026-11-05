@@ -98,6 +98,13 @@
 //! parameter. Naming the obligation only at its USES (three consts, the probe,
 //! capture, read, restore) is the natural way to write this and it is worse.
 //!
+//! The crate root inside each per-field predicate comes from
+//! `crate_root::root_at(<the type's span>)`, not from `crate_root::root()`.
+//! `quote_spanned!` re-spans only its own tokens, so an interpolated
+//! call-site root would start the trait path with call-site tokens, and rustc
+//! then reports the unsatisfied bound at the `#[derive(..)]` or
+//! `#[cerulion_node]` attribute instead of at the field.
+//!
 //! **MEASURED against THIS emission** — deleting the
 //! predicate and letting the body's uses speak — on
 //! `tests/ui/type_error/state_derive_uncapturable_field.rs`:
@@ -158,6 +165,7 @@
 //! reversible one. Measured cost today: zero — the tree contains no generic
 //! node structs.
 
+use crate::crate_root;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote, quote_spanned};
 use syn::spanned::Spanned;
@@ -265,12 +273,13 @@ fn classify<'a>(field: &'a Field) -> Result<Classified<'a>, syn::Error> {
 /// "successfully" against a node that no longer captures that field — the
 /// silent-divergence class the shape exists to prevent.
 fn escape_shape(escape: Escape) -> TokenStream {
+    let __cer_root = crate_root::root();
     let marker = match escape {
         Escape::Reconstruct => "cerulion::reconstruct",
         Escape::Serde => "cerulion::serde",
         _ => unreachable!("only escaped fields carry an escape shape"),
     };
-    quote! { ::cerulion_core::state::StateShape::of(#marker).finish() }
+    quote! { #__cer_root::state::StateShape::of(#marker).finish() }
 }
 
 /// The ONE text both redundant-derive detectors emit.
@@ -544,6 +553,7 @@ fn emit_impl(
     read_body: TokenStream,
     restore_body: Option<TokenStream>,
 ) -> TokenStream {
+    let __cer_root = crate_root::root();
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
@@ -552,7 +562,7 @@ fn emit_impl(
     // nothing is (a prototype measured that as silent state loss).
     let param_predicates = input.generics.type_params().map(|tp| {
         let id = &tp.ident;
-        quote! { #id: ::cerulion_core::state::CerulionState }
+        quote! { #id: #__cer_root::state::CerulionState }
     });
 
     let existing = where_clause.map(|w| {
@@ -564,8 +574,8 @@ fn emit_impl(
         quote! {
             fn cer_restore(
                 &mut self,
-                src: &mut ::cerulion_core::state::StateCursor<'_>,
-            ) -> ::std::result::Result<(), ::cerulion_core::state::StateError> {
+                src: &mut #__cer_root::state::StateCursor<'_>,
+            ) -> ::std::result::Result<(), #__cer_root::state::StateError> {
                 #body
             }
         }
@@ -573,7 +583,7 @@ fn emit_impl(
 
     quote! {
         #[automatically_derived]
-        impl #impl_generics ::cerulion_core::state::CerulionState for #name #ty_generics
+        impl #impl_generics #__cer_root::state::CerulionState for #name #ty_generics
         where
             #(#extra_predicates,)*
             #(#param_predicates,)*
@@ -589,14 +599,14 @@ fn emit_impl(
 
             fn cer_capture(
                 &self,
-                out: &mut dyn ::cerulion_core::state::StateSink,
-            ) -> ::std::result::Result<(), ::cerulion_core::state::StateError> {
+                out: &mut dyn #__cer_root::state::StateSink,
+            ) -> ::std::result::Result<(), #__cer_root::state::StateError> {
                 #capture_body
             }
 
             fn cer_read(
-                src: &mut ::cerulion_core::state::StateCursor<'_>,
-            ) -> ::std::result::Result<Self, ::cerulion_core::state::StateError> {
+                src: &mut #__cer_root::state::StateCursor<'_>,
+            ) -> ::std::result::Result<Self, #__cer_root::state::StateError> {
                 #read_body
             }
 
@@ -630,6 +640,7 @@ fn expand_fields(
     named: &[&Field],
     target: Target,
 ) -> Result<TokenStream, syn::Error> {
+    let __cer_root = crate_root::root();
     let named = named.iter().copied();
     let name_str = input.ident.to_string();
     let mut predicates = Vec::new();
@@ -653,28 +664,27 @@ fn expand_fields(
 
         match c.escape {
             Escape::Captured => {
+                let bound_root = crate_root::root_at(ty.span());
                 predicates.push(quote_spanned! {ty.span()=>
-                    #ty: ::cerulion_core::state::CerulionState
+                    #ty: #bound_root::state::CerulionState
                 });
                 shape_terms.push(quote! {
-                    .field(#fname, <#ty as ::cerulion_core::state::CerulionState>::STATE_SHAPE)
+                    .field(#fname, <#ty as #__cer_root::state::CerulionState>::STATE_SHAPE)
                 });
                 inline_terms
-                    .push(quote! { <#ty as ::cerulion_core::state::CerulionState>::INLINE_SAFE });
-                min_terms.push(
-                    quote! { <#ty as ::cerulion_core::state::CerulionState>::MIN_ENCODED_BYTES },
-                );
-                probe_terms.push(
-                    quote! { ::cerulion_core::state::CerulionState::cer_probe(&self.#ident) },
-                );
+                    .push(quote! { <#ty as #__cer_root::state::CerulionState>::INLINE_SAFE });
+                min_terms
+                    .push(quote! { <#ty as #__cer_root::state::CerulionState>::MIN_ENCODED_BYTES });
+                probe_terms
+                    .push(quote! { #__cer_root::state::CerulionState::cer_probe(&self.#ident) });
                 capture_stmts.push(quote! {
-                    ::cerulion_core::state::CerulionState::cer_capture(&self.#ident, out)?;
+                    #__cer_root::state::CerulionState::cer_capture(&self.#ident, out)?;
                 });
                 restore_stmts.push(quote! {
-                    ::cerulion_core::state::CerulionState::cer_restore(&mut self.#ident, src)?;
+                    #__cer_root::state::CerulionState::cer_restore(&mut self.#ident, src)?;
                 });
                 read_inits.push(quote! {
-                    #ident: <#ty as ::cerulion_core::state::CerulionState>::cer_read(src)?
+                    #ident: <#ty as #__cer_root::state::CerulionState>::cer_read(src)?
                 });
             }
             Escape::Reconstruct => {
@@ -686,11 +696,12 @@ fn expand_fields(
                 // INLINE_SAFE.
             }
             Escape::Serde => {
+                let bound_root = crate_root::root_at(ty.span());
                 predicates.push(quote_spanned! {ty.span()=>
-                    #ty: ::cerulion_core::serde::Serialize
+                    #ty: #bound_root::serde::Serialize
                 });
                 predicates.push(quote_spanned! {ty.span()=>
-                    #ty: ::cerulion_core::serde::de::DeserializeOwned
+                    #ty: #bound_root::serde::de::DeserializeOwned
                 });
                 let marker = escape_shape(Escape::Serde);
                 shape_terms.push(quote! { .field(#fname, #marker) });
@@ -700,13 +711,13 @@ fn expand_fields(
                 inline_terms.push(quote! { false });
                 min_terms.push(quote! { 4usize });
                 capture_stmts.push(quote! {
-                    ::cerulion_core::state::capture_serde_field(&self.#ident, #fname, out)?;
+                    #__cer_root::state::capture_serde_field(&self.#ident, #fname, out)?;
                 });
                 restore_stmts.push(quote! {
-                    self.#ident = ::cerulion_core::state::read_serde_field(src, #fname)?;
+                    self.#ident = #__cer_root::state::read_serde_field(src, #fname)?;
                 });
                 read_inits.push(quote! {
-                    #ident: ::cerulion_core::state::read_serde_field(src, #fname)?
+                    #ident: #__cer_root::state::read_serde_field(src, #fname)?
                 });
             }
             Escape::Unordered => {
@@ -717,49 +728,49 @@ fn expand_fields(
                     container,
                 } = &plan;
                 for arg in args {
+                    let bound_root = crate_root::root_at(arg.span());
                     predicates.push(quote_spanned! {arg.span()=>
-                        #arg: ::cerulion_core::state::CerulionState
+                        #arg: #bound_root::state::CerulionState
                     });
                 }
                 let element_shapes = args.iter().map(|a| {
-                    quote! { .element(<#a as ::cerulion_core::state::CerulionState>::STATE_SHAPE) }
+                    quote! { .element(<#a as #__cer_root::state::CerulionState>::STATE_SHAPE) }
                 });
                 shape_terms.push(quote! {
                     .field(
                         #fname,
-                        ::cerulion_core::state::StateShape::of("cerulion::unordered")
+                        #__cer_root::state::StateShape::of("cerulion::unordered")
                             #(#element_shapes)*
                             .finish(),
                     )
                 });
                 for arg in args {
-                    inline_terms.push(
-                        quote! { <#arg as ::cerulion_core::state::CerulionState>::INLINE_SAFE },
-                    );
+                    inline_terms
+                        .push(quote! { <#arg as #__cer_root::state::CerulionState>::INLINE_SAFE });
                 }
                 min_terms.push(quote! { 4usize });
                 probe_terms.push(match kind {
                     UnorderedKind::Map => {
-                        quote! { ::cerulion_core::state::probe_unordered_map(self.#ident.iter()) }
+                        quote! { #__cer_root::state::probe_unordered_map(self.#ident.iter()) }
                     }
                     UnorderedKind::Set => {
-                        quote! { ::cerulion_core::state::probe_unordered_set(self.#ident.iter()) }
+                        quote! { #__cer_root::state::probe_unordered_set(self.#ident.iter()) }
                     }
                 });
                 match kind {
                     UnorderedKind::Map => {
                         capture_stmts.push(quote! {
-                            ::cerulion_core::state::capture_unordered_map(
+                            #__cer_root::state::capture_unordered_map(
                                 self.#ident.len(), self.#ident.iter(), out)?;
                         });
                         let build = quote! {{
                             let __cer_entries =
-                                ::cerulion_core::state::read_unordered_entries(src)?;
+                                #__cer_root::state::read_unordered_entries(src)?;
                             let mut __cer_out = <#ty as ::std::default::Default>::default();
                             for (__cer_k, __cer_v) in __cer_entries {
                                 if __cer_out.insert(__cer_k, __cer_v).is_some() {
                                     return ::std::result::Result::Err(
-                                        ::cerulion_core::state::StateError::DuplicateEntry {
+                                        #__cer_root::state::StateError::DuplicateEntry {
                                             type_name: #container,
                                         },
                                     );
@@ -772,17 +783,17 @@ fn expand_fields(
                     }
                     UnorderedKind::Set => {
                         capture_stmts.push(quote! {
-                            ::cerulion_core::state::capture_unordered_set(
+                            #__cer_root::state::capture_unordered_set(
                                 self.#ident.len(), self.#ident.iter(), out)?;
                         });
                         let build = quote! {{
                             let __cer_elements =
-                                ::cerulion_core::state::read_unordered_elements(src)?;
+                                #__cer_root::state::read_unordered_elements(src)?;
                             let mut __cer_out = <#ty as ::std::default::Default>::default();
                             for __cer_e in __cer_elements {
                                 if !__cer_out.insert(__cer_e) {
                                     return ::std::result::Result::Err(
-                                        ::cerulion_core::state::StateError::DuplicateEntry {
+                                        #__cer_root::state::StateError::DuplicateEntry {
                                             type_name: #container,
                                         },
                                     );
@@ -802,7 +813,7 @@ fn expand_fields(
     }
 
     let shape = quote! {
-        ::cerulion_core::state::StateShape::of(#name_str)
+        #__cer_root::state::StateShape::of(#name_str)
             #(#shape_terms)*
             .finish()
     };
@@ -816,7 +827,7 @@ fn expand_fields(
     // per cadence — which would be worse than the cost the design exists to
     // avoid.
     let probe_body = quote! {
-        if <Self as ::cerulion_core::state::CerulionState>::INLINE_SAFE {
+        if <Self as #__cer_root::state::CerulionState>::INLINE_SAFE {
             return true;
         }
         true #( && #probe_terms )*
@@ -854,7 +865,7 @@ fn expand_fields(
         quote! {
             let _ = src;
             ::std::result::Result::Err(
-                ::cerulion_core::state::StateError::Unrestorable {
+                #__cer_root::state::StateError::Unrestorable {
                     type_name: #name_str,
                 },
             )
@@ -1115,6 +1126,7 @@ fn variant_escape_refusal(escape: Escape) -> String {
 }
 
 fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream, syn::Error> {
+    let __cer_root = crate_root::root();
     let name = &input.ident;
     let name_str = name.to_string();
 
@@ -1167,11 +1179,12 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
             // a single `CerulionState` use anywhere in the emission raises its
             // own obligation and prints the misleading note as a second block
             // (MEASURED: switching all uses is what takes the count to one).
+            let bound_root = crate_root::root_at(ty.span());
             predicates.push(quote_spanned! {ty.span()=>
-                #ty: ::cerulion_core::state::CerulionVariantMember
+                #ty: #bound_root::state::CerulionVariantMember
             });
             inline_terms.push(
-                quote! { <#ty as ::cerulion_core::state::CerulionVariantMember>::VARIANT_INLINE_SAFE },
+                quote! { <#ty as #__cer_root::state::CerulionVariantMember>::VARIANT_INLINE_SAFE },
             );
         }
 
@@ -1199,12 +1212,16 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
                 .named
                 .iter()
                 .map(|f| {
-                    let fname = f.ident.as_ref().expect("named fields carry an ident").to_string();
+                    let fname = f
+                        .ident
+                        .as_ref()
+                        .expect("named fields carry an ident")
+                        .to_string();
                     let ty = &f.ty;
                     quote! {
                         .field(
                             #fname,
-                            <#ty as ::cerulion_core::state::CerulionVariantMember>::VARIANT_STATE_SHAPE,
+                            <#ty as #__cer_root::state::CerulionVariantMember>::VARIANT_STATE_SHAPE,
                         )
                     }
                 })
@@ -1214,7 +1231,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
                 .map(|ty| {
                     quote! {
                         .element(
-                            <#ty as ::cerulion_core::state::CerulionVariantMember>::VARIANT_STATE_SHAPE,
+                            <#ty as #__cer_root::state::CerulionVariantMember>::VARIANT_STATE_SHAPE,
                         )
                     }
                 })
@@ -1224,7 +1241,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
         variant_shapes.push(quote! {
             .field(
                 #vname,
-                ::cerulion_core::state::StateShape::of(#vname)
+                #__cer_root::state::StateShape::of(#vname)
                     #(#member_shapes)*
                     .count(#arity)
                     .finish(),
@@ -1246,14 +1263,14 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
                 let reads = unnamed.unnamed.iter().map(|f| {
                     let ty = &f.ty;
                     quote! {
-                        <#ty as ::cerulion_core::state::CerulionVariantMember>::variant_cer_read(src)?
+                        <#ty as #__cer_root::state::CerulionVariantMember>::variant_cer_read(src)?
                     }
                 });
                 capture_arms.push(quote! {
                     Self::#vident( #(#binds),* ) => {
                         out.write(&[#tag])?;
                         #(
-                            ::cerulion_core::state::CerulionVariantMember::variant_cer_capture(
+                            #__cer_root::state::CerulionVariantMember::variant_cer_capture(
                                 #binds, out,
                             )?;
                         )*
@@ -1262,7 +1279,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
                 probe_arms.push(quote! {
                     Self::#vident( #(#binds),* ) => {
                         true #(
-                            && ::cerulion_core::state::CerulionVariantMember::variant_cer_probe(
+                            && #__cer_root::state::CerulionVariantMember::variant_cer_probe(
                                 #binds,
                             )
                         )*
@@ -1282,14 +1299,14 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
                     let id = f.ident.as_ref().expect("named");
                     let ty = &f.ty;
                     quote! {
-                        #id: <#ty as ::cerulion_core::state::CerulionVariantMember>::variant_cer_read(src)?
+                        #id: <#ty as #__cer_root::state::CerulionVariantMember>::variant_cer_read(src)?
                     }
                 });
                 capture_arms.push(quote! {
                     Self::#vident { #(#idents),* } => {
                         out.write(&[#tag])?;
                         #(
-                            ::cerulion_core::state::CerulionVariantMember::variant_cer_capture(
+                            #__cer_root::state::CerulionVariantMember::variant_cer_capture(
                                 #idents, out,
                             )?;
                         )*
@@ -1298,7 +1315,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
                 probe_arms.push(quote! {
                     Self::#vident { #(#idents),* } => {
                         true #(
-                            && ::cerulion_core::state::CerulionVariantMember::variant_cer_probe(
+                            && #__cer_root::state::CerulionVariantMember::variant_cer_probe(
                                 #idents,
                             )
                         )*
@@ -1313,7 +1330,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
 
     let variant_count = data.variants.len();
     let shape = quote! {
-        ::cerulion_core::state::StateShape::of(#name_str)
+        #__cer_root::state::StateShape::of(#name_str)
             #(#variant_shapes)*
             .count(#variant_count)
             .finish()
@@ -1327,7 +1344,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
         quote! { true }
     } else {
         quote! {
-            if <Self as ::cerulion_core::state::CerulionState>::INLINE_SAFE {
+            if <Self as #__cer_root::state::CerulionState>::INLINE_SAFE {
                 return true;
             }
             match self { #(#probe_arms,)* }
@@ -1338,7 +1355,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
         quote! {
             let _ = out;
             ::std::result::Result::Err(
-                ::cerulion_core::state::StateError::Unrestorable { type_name: #name_str },
+                #__cer_root::state::StateError::Unrestorable { type_name: #name_str },
             )
         }
     } else {
@@ -1353,7 +1370,7 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream,
         match __cer_tag {
             #(#read_arms,)*
             __cer_other => ::std::result::Result::Err(
-                ::cerulion_core::state::StateError::InvalidTag {
+                #__cer_root::state::StateError::InvalidTag {
                     type_name: #name_str,
                     tag: __cer_other,
                 },

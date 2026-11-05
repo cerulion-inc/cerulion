@@ -98,6 +98,12 @@ ignore = [
     # drop it on its own at the verified pins. Re-audit on every YAML or zenoh
     # dependency bump; remove this ignore when both sides have moved.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml 0.9.34 (cerulion_core, cerulion_cli_engine, cerulion_viz, cerulion_cli tests, zenoh-config 1.10.1): unmaintained-class, no vulnerability, no upgrade at verified pins" },
+    # pin-utils is UNMAINTAINED-class (RUSTSEC-2026-0441), not a vulnerability:
+    # `std::pin::pin!` replaces its `pin_mut!`. It reaches us only through
+    # cerulion-ros2-client 0.10.1, which lists it as a direct dependency of the
+    # cerulion_dds ROS 2 path, so the workspace cannot drop it on its own.
+    # Remove this ignore when cerulion-ros2-client drops the dependency.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 via cerulion_dds -> cerulion-ros2-client 0.10.1: unmaintained-class, no vulnerability, no replacement at the verified pin" },
 ]
 
 # -----------------------------------------------------------------------------

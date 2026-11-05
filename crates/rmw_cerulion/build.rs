@@ -113,6 +113,7 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 /// | `message_info_sequence_numbers` | Humble | `rmw_message_info_t` growth |
 /// | `discovery_options` | Iron | embedded in `rmw_init_options_t` |
 /// | `matched_events` | Iron | matched/incompatible-type events |
+/// | `durability_best_available` | Iron | `RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE` (best-available QoS policies) |
 /// | `message_lost_event` | Galactic | `RMW_EVENT_MESSAGE_LOST` |
 /// | `event_type_max` | Lyrical | `RMW_EVENT_TYPE_MAX` sentinel |
 /// | `type_hash` | Iron | typesupport type-hash trio (RIHS) |
@@ -123,7 +124,7 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 ///
 /// Token-choice rule: each token appears in the bindgen output IFF the
 /// capability's type/field/constant exists in the sourced headers (all
-/// 18 verified present in the vendored rolling snapshot, and absent
+/// 19 verified present in the vendored rolling snapshot, and absent
 /// per-era in the downloaded foxy/humble/jazzy/lyrical branch headers).
 /// Substring matching is deliberate — `discovery_options` matching
 /// `rmw_discovery_options_t` AND the `rmw_init_options_s` field is the
@@ -146,6 +147,10 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ),
     ("discovery_options", "discovery_options"),
     ("matched_events", "RMW_EVENT_SUBSCRIPTION_MATCHED"),
+    (
+        "durability_best_available",
+        "RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE",
+    ),
     ("message_lost_event", "RMW_EVENT_MESSAGE_LOST"),
     ("event_type_max", "RMW_EVENT_TYPE_MAX"),
     ("type_hash", "get_type_hash_func"),
