@@ -869,31 +869,23 @@ fn a_volatile_publisher_reports_the_zero_it_retains_and_stays_quiet() {
     }
 }
 
-/// **The OPENED-SERVICE case.** A
-/// publisher does not always get the history it asked for: iceoryx2's
-/// open-time verification on `.history_size(N)` is AT-LEAST (existing < required
-/// fails), so a request of 5 attaches happily to a service already created at
-/// 16 — and the port it hands back is sized from the SERVICE's static config
-/// (`iceoryx2-0.9.1/src/port/publisher.rs`: `Queue::new(static_config
-/// .history_size)`), not from the request. The publisher then really retains
-/// 16. Reporting the request would understate what late joiners receive, which
-/// is the exact inversion of the principle these arms pin.
+/// **The OPENED-SERVICE case.** A TRANSIENT_LOCAL depth-5 publisher attaches
+/// to a service another publisher created at history 16 (iceoryx2's open
+/// verification on `.history_size(N)` is at-least), so its port retains 16
+/// frames. Every rmw endpoint now creates its topic at history 16 (issue 617),
+/// so this is the ordinary shape, not an edge. What a late joiner receives is
+/// its OWN history request: a TRANSIENT_LOCAL depth-5 subscription asks for 5
+/// and receives 5, and the publisher reports its clamped depth, 5. This arm
+/// used to require 16 for both; it changed when subscriptions began asking
+/// iceoryx2 for their own depth, which is DDS durability: a reader takes up to
+/// its own depth of retained samples.
 ///
-/// Reachable, and this arm builds the shape it comes from: a deeper publisher
-/// created the service and DIED (its port dropped, its slot free) while a
-/// subscriber holds the service open — a restart onto a live topic. The rmw
-/// publisher that attaches next asked for 5.
-///
-/// The oracle is BEHAVIORAL and independent of the reported number: a late
-/// joiner is drained and its frame count is what "really retains" MEANS. The
-/// arm asserts the count first (so a transport change makes it fail as a
-/// measurement, not as a mystifying constant), then requires endpoint info to
-/// agree with it. Asserting `> SHALLOW` as well is what stops the pair being
-/// satisfied by a build where both numbers are 5.
+/// The oracle is still BEHAVIORAL: the late joiner is drained first and its
+/// frame count is asserted, then endpoint info must agree with it.
 #[test]
 #[traced_test]
 #[serial]
-fn a_publisher_that_opened_a_deeper_service_reports_the_depth_it_really_retains() {
+fn a_publisher_on_a_deeper_service_reports_its_depth_and_a_matching_late_joiner_takes_that_many() {
     unsafe {
         const DEEP: usize = 16;
         const SHALLOW: usize = 5;
@@ -995,14 +987,9 @@ fn a_publisher_that_opened_a_deeper_service_reports_the_depth_it_really_retains(
         }
         let retained = received.len();
         assert_eq!(
-            retained, DEEP,
-            "the port is sized from the SERVICE's history ({DEEP}), not the request \
-             ({SHALLOW}) — a late joiner really receives {DEEP} frames"
-        );
-        assert!(
-            retained > SHALLOW,
-            "the measured retention must EXCEED the request, or this arm cannot tell \
-             a truthful report from an echo of the ask"
+            retained, SHALLOW,
+            "the service retains {DEEP}, but a TRANSIENT_LOCAL depth-{SHALLOW} late \
+             joiner asks for {SHALLOW} and receives {SHALLOW}"
         );
 
         // (5) Endpoint info must agree with the measurement.
@@ -1016,9 +1003,8 @@ fn a_publisher_that_opened_a_deeper_service_reports_the_depth_it_really_retains(
         assert_eq!(
             (*arr.info_array).qos_profile.depth,
             retained,
-            "endpoint info must report the depth this publisher REALLY retains \
-             ({retained}, measured above), not the {SHALLOW} it requested — reporting \
-             the request understates what late joiners receive (Principle #3)"
+            "endpoint info reports the publisher's clamped depth ({SHALLOW}), which is \
+             what the matching late joiner measurably received ({retained})"
         );
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
@@ -1028,37 +1014,21 @@ fn a_publisher_that_opened_a_deeper_service_reports_the_depth_it_really_retains(
     }
 }
 
-/// **The VOLATILE-on-a-deeper-service case.** One could
-/// argue a VOLATILE publisher that attaches to a service someone created with
-/// native history must still report 0, because 0 is "the promised" retention.
+/// **The VOLATILE-on-a-deeper-service case.** A VOLATILE publisher that
+/// attaches to a service created with native history retains frames in its
+/// port, because iceoryx2 sizes the port from the service. Every rmw endpoint
+/// now creates its topic at history 16 (issue 617), so every VOLATILE
+/// publisher does. A VOLATILE late joiner asks iceoryx2 for no history and
+/// receives none, and the publisher reports 0. This arm used to require the
+/// late joiner to receive all 16 and the report to say 16; it changed when
+/// subscriptions began asking for their own history, which is DDS durability:
+/// a VOLATILE reader takes no retained samples.
 ///
-/// MEASURED, and it is not: such a publisher really does deliver its retained
-/// frames to a late joiner. Every gate on the Cerulion side suppresses the
-/// SentHistory *wake*, never the *delivery* — `deliver_history` runs
-/// `update_connections()` (which is what pushes the frames) BEFORE the
-/// `history_size == 0` early return, the rmw pump (`runtime::
-/// pump_publisher_events`) calls it on every registered publisher with no
-/// `has_history()` gate, and iceoryx2's own history queue exists whenever the
-/// SERVICE's static history is nonzero (`port/publisher.rs`: `Queue::new(
-/// static_config.history_size)`), so every `send` pushes into it.
-///
-/// So reporting 0 here would be the report-vs-reality divergence that
-/// #3810891438 was raised to fix, pointed the other way: the row would promise
-/// a late joiner nothing while the transport hands it a full backlog. This arm
-/// exists so that claim is a MEASUREMENT rather than an argument — it counts
-/// the frames first and only then asserts what endpoint info must say.
-///
-/// A FRESH VOLATILE publisher still reports 0, because iceoryx2's own default
-/// `publisher_history_size` is 0 and Cerulion arms `.history_size()` only for a
-/// nonzero request — pinned by
-/// [`a_volatile_publisher_reports_the_zero_it_retains_and_stays_quiet`],
-/// which is the arm that owns the decided VOLATILE value. The two together say
-/// the rule precisely: VOLATILE reports the retention it HAS, which is normally
-/// zero and is not zero when it inherited a deeper service.
+/// The frames are counted first, then endpoint info must agree with them.
 #[test]
 #[traced_test]
 #[serial]
-fn a_volatile_publisher_on_a_deeper_service_reports_what_it_really_delivers() {
+fn a_volatile_publisher_on_a_deeper_service_reports_zero_and_a_volatile_late_joiner_takes_none() {
     unsafe {
         const DEEP: usize = 16;
         const ASKED: usize = 10; // rclcpp's default depth, VOLATILE
@@ -1154,19 +1124,13 @@ fn a_volatile_publisher_on_a_deeper_service_reports_what_it_really_delivers() {
         }
         let delivered = received.len();
 
-        // THE MEASUREMENT. A VOLATILE request did not make the retention zero:
-        // the service's history queue is what the port got, and it delivered.
+        // THE MEASUREMENT. The publisher's port retains the service's
+        // history, but a VOLATILE late joiner asks for none.
         assert_eq!(
-            delivered, DEEP,
-            "a VOLATILE publisher that INHERITED a depth-{DEEP} service really \
-             delivers its backlog to a late joiner — if this ever measures 0, the \
-             delivery IS gated on the request after all and endpoint info should \
-             report 0 here"
+            delivered, 0,
+            "a VOLATILE late joiner of a depth-{DEEP} service receives no retained \
+             frames, because it asks iceoryx2 for none"
         );
-
-        // ...so reporting 0 would promise a late joiner nothing while the
-        // transport hands it {DEEP} frames — the same report-vs-reality
-        // divergence #3810891438 fixed, pointed the other way.
         let mut allocator = malloc_allocator();
         let mut arr: ffi::rmw_topic_endpoint_info_array_t = std::mem::zeroed();
         assert_eq!(
@@ -1177,8 +1141,8 @@ fn a_volatile_publisher_on_a_deeper_service_reports_what_it_really_delivers() {
         assert_eq!(
             (*arr.info_array).qos_profile.depth,
             delivered,
-            "endpoint info must report the {delivered} frames a late joiner MEASURABLY \
-             receives, not the 0 a VOLATILE request would suggest"
+            "endpoint info reports 0 for a VOLATILE publisher, which is what the \
+             VOLATILE late joiner measurably received ({delivered})"
         );
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);

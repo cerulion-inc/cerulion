@@ -94,6 +94,48 @@ pub fn data_service_specifier() -> TransportResult<AttributeSpecifier> {
     specifier_for(WIRE_HEADER_VERSION)
 }
 
+/// The attribute key a data service is created with when its history comes
+/// from a create-leg history floor (`TopicServiceConfig::create_history_floor`)
+/// rather than from a creator that retains frames for late joiners. Its value
+/// is the floor in decimal.
+pub const HISTORY_FLOOR_ATTRIBUTE_KEY: &str = "cerulion.history_floor";
+
+/// `specifier` plus [`HISTORY_FLOOR_ATTRIBUTE_KEY`] stating `floor`.
+// hot-path-alloc-ok-fn: cold, one attribute per service create, never per frame.
+pub fn with_history_floor(
+    specifier: AttributeSpecifier,
+    floor: usize,
+) -> TransportResult<AttributeSpecifier> {
+    let key = HISTORY_FLOOR_ATTRIBUTE_KEY
+        .try_into()
+        .map_err(|e| TransportError::Internal {
+            reason: format!("history floor attribute key: {e:?}"),
+        })?;
+    let text = floor.to_string();
+    let value = text
+        .as_str()
+        .try_into()
+        .map_err(|e| TransportError::Internal {
+            reason: format!("history floor attribute value '{text}': {e:?}"),
+        })?;
+    specifier
+        .define(&key, &value)
+        .map_err(|e| TransportError::Internal {
+            reason: format!("history floor attribute: {e:?}"),
+        })
+}
+
+/// Whether an opened data service was created with a history floor
+/// ([`HISTORY_FLOOR_ATTRIBUTE_KEY`]): its history then holds whatever every
+/// publisher sent, VOLATILE ones included, so a subscriber that asks for no
+/// particular history must ask for none.
+pub fn history_is_floor(attributes: &AttributeSet) -> bool {
+    match HISTORY_FLOOR_ATTRIBUTE_KEY.try_into() {
+        Ok(key) => attributes.number_of_key_values(&key) > 0,
+        Err(_) => false,
+    }
+}
+
 /// [`verifier_for`] at this build's [`WIRE_HEADER_VERSION`], for a raw
 /// iceoryx2 opener (see [`verifier_for`]).
 pub fn data_service_verifier() -> TransportResult<AttributeVerifier> {

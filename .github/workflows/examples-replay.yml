@@ -111,7 +111,7 @@ jobs:
       # outgrows ubuntu-latest's free disk alongside the restored cache.
       # Reclaim ~25 GB of preinstalled SDKs the build never uses; macOS has ample disk.
       - name: Free disk space
-        if: steps.present.outputs.present == 'true' && runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (steps.present.outputs.present == 'true' && runner.os == 'Linux')
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /

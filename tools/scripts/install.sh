@@ -1762,10 +1762,41 @@ EOF
         done
         [ "$signal_ready_seen" -eq 1 ] ||
             die "self-test: $signal install did not reach its in-progress state"
+        # The stub writes its own pid as the first line of the pid file before
+        # it creates the ready file, so that line names the held child here.
+        # It is read before the signal is sent: the install's rollback moves
+        # the old `cerulion` back through the same stub, and that run rewrites
+        # the file with its own pid.
+        signal_held_pid=$(sed -n 1p "$signal_child_pid")
+        case "$signal_held_pid" in
+        '' | *[!0-9]*)
+            die "self-test: $signal install recorded no held child pid"
+            ;;
+        esac
         kill "-$signal" "$signal_pid"
-        sleep 1
+        # The install acts on the signal by terminating its foreground child,
+        # the held stub. Wait for that child to end, up to the same ceiling as
+        # the ready wait, instead of releasing the hold after a fixed delay.
+        # The release is needed either way, because the rollback's `mv` also
+        # holds on the stub. `is_running_pid` reads the process state, so a
+        # reaped or zombie child counts as ended.
+        signal_attempt=0
+        while [ "$signal_attempt" -lt 100 ] && is_running_pid "$signal_held_pid"; do
+            signal_attempt=$((signal_attempt + 1))
+            sleep 1
+        done
+        signal_acted=1
+        is_running_pid "$signal_held_pid" && signal_acted=0
         : > "$signal_release"
+        if [ "$signal_acted" -eq 0 ]; then
+            wait "$signal_pid" || :
+            printf '%s\n' "--- $signal install output" >&2
+            cat "$signal_dir/output" "$signal_dir/error" >&2 2>/dev/null || :
+            die "self-test: $signal install did not act on the signal within $signal_attempt s"
+        fi
         if wait "$signal_pid"; then
+            printf '%s\n' "--- $signal install output" >&2
+            cat "$signal_dir/output" "$signal_dir/error" >&2 2>/dev/null || :
             die "self-test: $signal install unexpectedly succeeded"
         else
             signal_status=$?
@@ -1775,8 +1806,11 @@ EOF
         INT) signal_expected_status=130 ;;
         TERM) signal_expected_status=143 ;;
         esac
-        [ "$signal_status" -eq "$signal_expected_status" ] ||
+        if [ "$signal_status" -ne "$signal_expected_status" ]; then
+            printf '%s\n' "--- $signal install output" >&2
+            cat "$signal_dir/output" "$signal_dir/error" >&2 2>/dev/null || :
             die "self-test: $signal install returned status $signal_status, expected $signal_expected_status"
+        fi
         if has_descendant "$signal_pid"; then
             die "self-test: $signal install left a descendant process running"
         fi

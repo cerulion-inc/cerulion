@@ -188,6 +188,21 @@ pub struct ResimFacts<'a> {
     /// so a refusal can state the shortfall — "1 of 2" — rather than merely that
     /// one exists.
     pub trace_rings_declared: usize,
+    /// **Ranks that carried a step boundary into the capture and keep none**,
+    /// ascending, while another rank keeps one.
+    ///
+    /// A recorder-only fact, like [`trace_gap`](Self::trace_gap): the capture's
+    /// end cut removes a rank's final step when no next boundary proves it
+    /// finished, and the trim removes its steps before the anchor, so a rank can
+    /// be left with no record in the bag at all while the frames its removed
+    /// step published are still there. Nothing in the bag says that rank
+    /// existed in the trace, and a covered range folded over the ranks that
+    /// kept a boundary holds those frames with no boundary of their rank to
+    /// match them against.
+    ///
+    /// Empty when no rank keeps a boundary: that capture is
+    /// [`ResimGap::NoBoundary`].
+    pub ranks_without_a_kept_step: &'a [u32],
     /// **Declared trace rings this recorder has NO READER for**.
     ///
     /// A recorder-only fact, like [`trace_gap`](Self::trace_gap) and for the same
@@ -397,6 +412,18 @@ pub enum ResimGap {
     /// The trace carries records but no step boundary — resim's
     /// `BagNoStepBoundaries`.
     NoBoundary,
+    /// Some rank carried a step boundary into the capture and keeps none, while
+    /// another rank keeps one. See [`ResimFacts::ranks_without_a_kept_step`].
+    ///
+    /// Under free run the replayer refuses such a bag as `RecordingInconsistent`
+    /// when that rank's frames fall inside the covered range. The recorder
+    /// declines it in either mode, because the bag carries no record of the
+    /// rank's removed steps and no reader can tell the capture is short of that
+    /// rank; the recorder is the party that knows it.
+    RankWithoutCompleteStep {
+        /// The ranks with no complete step in the capture, ascending.
+        ranks: Vec<u32>,
+    },
     /// Several state rings, so a record's `node_idx` names a different node in
     /// each — resim's `MultiRingAmbiguous`.
     MultiRing {
@@ -700,6 +727,16 @@ impl ResimGap {
                  — a peer worker was lost mid-run. Replaying a fault-degraded recording is not \
                  supported yet; the frames and the state are in the bag and readable"
             ),
+            Self::RankWithoutCompleteStep { ranks } => format!(
+                "this capture's trace holds no complete step for rank(s) {ranks:?}, though each \
+                 carried a step boundary: the capture removed each such rank's last step because \
+                 no next boundary proved it finished, with any step tied to its gating-clock \
+                 target, and any earlier step it kept preceded the anchor, if there is one. The \
+                 frames those steps published are in the bag, and a resume matches a rank's \
+                 frames against that rank's own boundaries, so a replay of this capture can \
+                 refuse it as inconsistent. The frames, the state and the other ranks' trace are \
+                 in the bag and readable"
+            ),
             Self::NoBoundary => "this capture's trace carries no step-boundary record, so nothing \
                                  says which step a resume would begin at. The frames and the \
                                  state are in the bag and readable"
@@ -810,7 +847,9 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// 0: the constructor's state IS the state, so no anchor is needed and none is
 /// looked for. A capture whose window happens to reach the run's own first step
 /// is therefore resimmable with no checkpoint at all, and refusing it for a
-/// missing anchor would be refusing a bag resim would accept.
+/// missing anchor would be refusing a bag resim would accept. The one refusal
+/// it still takes there is a rank left with no complete step
+/// ([`ResimGap::RankWithoutCompleteStep`]), which no anchor would repair.
 pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     // 1. `BagNoSchedulerTrace` — the first thing `run_replay` refuses on.
     if facts.trace_records == 0 {
@@ -936,9 +975,24 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     let Some(first_recorded_step) = facts.first_recorded_step else {
         return Err(ResimGap::NoBoundary);
     };
+    // 4b. A rank with no complete step, the recorder's own observation (see
+    //     the field). Asked after the boundary arm, so a capture whose
+    //     authoritative rank kept no boundary still names `NoBoundary` as the
+    //     replay does. A from-start capture asks it here, where it would
+    //     otherwise be accepted; a resumed one asks it last (below), after every
+    //     gate the replay's anchor read refuses on first.
+    let rank_without_a_step = || -> Result<(), ResimGap> {
+        if facts.ranks_without_a_kept_step.is_empty() {
+            Ok(())
+        } else {
+            Err(ResimGap::RankWithoutCompleteStep {
+                ranks: facts.ranks_without_a_kept_step.to_vec(),
+            })
+        }
+    };
     if first_recorded_step == 0 {
         // FromStart — see the doc comment. No anchor is consulted.
-        return Ok(());
+        return rank_without_a_step();
     }
     // 5. `MultiRingAmbiguous`. A property of the MANIFEST, so it is asked before
     //    anything about a particular step's records — the same ordering
@@ -993,10 +1047,11 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
         first_recorded_step,
         facts: facts.anchor_facts,
     })
-    .map(|_| ())
     .map_err(|refusal| ResimGap::AnchorIncomplete {
         detail: refusal.to_string(),
-    })
+    })?;
+    // 8. The resumed half of 4b.
+    rank_without_a_step()
 }
 
 #[cfg(test)]
@@ -1038,6 +1093,9 @@ mod tests {
             // the partial-trace gate is inert unless an arm says otherwise.
             trace_rings_declared: 1,
             trace_rings_unreadable: 0,
+            // Every rank kept a step, so the rank arm is inert unless an arm
+            // says otherwise.
+            ranks_without_a_kept_step: &[],
             state_rings_declared: 1,
             ranks_missing: &[],
             // A run whose rings were DISCOVERED, which is what every
@@ -1134,6 +1192,8 @@ mod tests {
             // partial-trace gate does not preempt the no-trace one.
             trace_rings_declared: 2,
             trace_rings_unreadable: 1,
+            // A rank left without a step, hostile as well.
+            ranks_without_a_kept_step: &[1],
             state_rings_declared: 4,
             ranks_missing: &[],
             // Hostile here too: a run that swept no rank space is the shape
@@ -1194,6 +1254,8 @@ mod tests {
             first_record_refusal: Some(TraceRecordRefusal::Fault(TraceRecordFault::ZeroedRecord)),
             departure_records: 3,
             first_recorded_step: None,
+            // A rank left without a step, hostile as well.
+            ranks_without_a_kept_step: &[1],
             state_rings_declared: 4,
             ranks_missing: &[],
             // Hostile here too: a run that swept no rank space is the shape
@@ -2197,6 +2259,73 @@ mod tests {
         assert_eq!(judge_resimmable(&ok), Ok(()));
     }
 
+    /// A rank the capture left with no complete step refuses, from start and
+    /// resumed alike, once some boundary exists, and after the anchor gates on
+    /// a resumed capture.
+    #[test]
+    fn a_rank_without_a_complete_step_refuses_after_the_boundary_arm() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let missing = [1u32];
+        for first in [0, 41] {
+            let facts = ResimFacts {
+                first_recorded_step: Some(first),
+                ranks_without_a_kept_step: &missing,
+                ..healthy(&nodes, &anchors)
+            };
+            assert_eq!(
+                judge_resimmable(&facts),
+                Err(ResimGap::RankWithoutCompleteStep { ranks: vec![1] }),
+                "first recorded step {first}"
+            );
+            assert_eq!(
+                judge_resimmable(&ResimFacts {
+                    ranks_without_a_kept_step: &[],
+                    ..facts.clone()
+                }),
+                Ok(()),
+                "the control: the same facts with every rank kept, step {first}"
+            );
+        }
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                first_recorded_step: None,
+                ranks_without_a_kept_step: &missing,
+                ..healthy(&nodes, &anchors)
+            }),
+            Err(ResimGap::NoBoundary),
+            "with no authoritative boundary the boundary arm answers first"
+        );
+        // A resumed capture asks it after the anchor gates the replay's anchor
+        // read refuses on first.
+        assert!(
+            matches!(
+                judge_resimmable(&ResimFacts {
+                    state_rings_declared: 2,
+                    ranks_without_a_kept_step: &missing,
+                    ..healthy(&nodes, &anchors)
+                }),
+                Err(ResimGap::MultiRing { .. })
+            ),
+            "the ring ambiguity is named first on a resumed capture"
+        );
+        assert!(
+            matches!(
+                judge_resimmable(&ResimFacts {
+                    ranks_without_a_kept_step: &missing,
+                    ..healthy(&nodes, &[])
+                }),
+                Err(ResimGap::AnchorIncomplete { .. })
+            ),
+            "an incomplete anchor is named first on a resumed capture"
+        );
+        let reason = ResimGap::RankWithoutCompleteStep { ranks: vec![1] }.reason();
+        assert!(
+            reason.contains("rank(s) [1]") && reason.contains("no complete step"),
+            "{reason}"
+        );
+    }
+
     /// Every reason is a SENTENCE an operator can act on, and no two arms render
     /// the same one — a reader who cannot tell two gaps apart cannot fix either.
     #[test]
@@ -2213,6 +2342,7 @@ mod tests {
             },
             ResimGap::FaultReplay { departures: 1 },
             ResimGap::NoBoundary,
+            ResimGap::RankWithoutCompleteStep { ranks: vec![1] },
             ResimGap::MultiRing {
                 rings: 2,
                 ranks_missing: Vec::new(),
