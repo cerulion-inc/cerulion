@@ -2987,11 +2987,13 @@ impl cerulion_netd::query::QueryPlane for FiringRunQueryPlane {
     }
 }
 
-#[test]
-fn activity_follows_a_hosted_run_through_netd_on_a_connection_of_its_own() {
-    const RUN: &str = "0x5d1c00000000000000000000000f9e02";
+const ACTIVITY_RUN: &str = "0x5d1c00000000000000000000000f9e02";
+
+/// An in-process netd serving [`FiringRunQueryPlane`]: the netd, its socket,
+/// its temp dir and the count of fires GETs it served.
+fn firing_run_netd(tag: &str) -> (RunningNetd, PathBuf, PathBuf, Arc<AtomicU32>) {
     let gets = Arc::new(AtomicU32::new(0));
-    let netd_dir = std::env::temp_dir().join(format!("netd_activity_{}", std::process::id()));
+    let netd_dir = std::env::temp_dir().join(format!("netd_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&netd_dir).expect("mk netd tempdir");
     let netd_sock = netd_dir.join("netd.sock");
     let netd = netd_daemon::start_with_planes(
@@ -3008,12 +3010,19 @@ fn activity_follows_a_hosted_run_through_netd_on_a_connection_of_its_own() {
         },
     )
     .expect("in-process netd starts");
+    (netd, netd_sock, netd_dir, gets)
+}
+
+#[test]
+fn activity_follows_a_hosted_run_through_netd_on_a_connection_of_its_own() {
+    const RUN: &str = ACTIVITY_RUN;
+    let (netd, netd_sock, netd_dir, gets) = firing_run_netd("activity");
     let (worker, _flush, _storage) = memory_worker("activity");
     let (socket, dir) = temp_socket("activity");
     let mut daemon = start_with_demand_plane(
         socket.clone(),
         DEFAULT_POLL_INTERVAL,
-        isolated_transport("vizd_activity"),
+        isolated_transport_with_network("vizd_activity"),
         worker,
         builtin_walker(),
         None,
@@ -3090,6 +3099,51 @@ fn activity_follows_a_hosted_run_through_netd_on_a_connection_of_its_own() {
         gets.load(Ordering::SeqCst),
         stopped,
         "no GET after the follow ended"
+    );
+
+    daemon.shutdown();
+    drop(netd);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&netd_dir);
+}
+
+/// `CERULION_VIZD_NETWORK=off` keeps vizd from reaching a robot, and netd's
+/// network is its own, so a LOCAL-ONLY vizd refuses `activity` itself.
+#[test]
+fn a_local_only_daemon_refuses_activity_and_asks_netd_for_no_fires() {
+    let (netd, netd_sock, netd_dir, gets) = firing_run_netd("activity_local");
+    let (worker, _flush, _storage) = memory_worker("activity_local");
+    let (socket, dir) = temp_socket("activity_local");
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        isolated_transport("vizd_activity_local"),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::new(NetdDemandPlane::with_socket(netd_sock)),
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    for id in [1, 2] {
+        let reply = client.request(&format!(
+            r#"{{"id":{id},"method":"activity","robot":"temi","run_id":"{ACTIVITY_RUN}"}}"#
+        ));
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(reply["id"], id, "{reply}");
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("CERULION_VIZD_NETWORK=off") && error.contains("LOCAL-ONLY"),
+            "the refusal names the kill switch: {reply}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(gets.load(Ordering::SeqCst), 0, "no fires GET reached netd");
+    assert_eq!(
+        netd.active_connections(),
+        0,
+        "no follower opened a netd connection"
     );
 
     daemon.shutdown();

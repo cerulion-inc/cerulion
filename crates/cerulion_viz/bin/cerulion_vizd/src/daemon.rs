@@ -1816,6 +1816,19 @@ impl Ctx {
         if let Some(error) = activity_target_error(&robot, &run_id) {
             return Response::error(Some(id), error, None);
         }
+        // netd's network is its own, so a LOCAL-ONLY vizd refuses here, as
+        // remote attach does (its guard 2a).
+        if self.manager.network().is_none() {
+            return Response::error(
+                Some(id),
+                format!(
+                    "activity for run {run_id} on robot '{robot}' needs a network-configured \
+                     daemon, but this cerulion-vizd is LOCAL-ONLY (CERULION_VIZD_NETWORK=off), \
+                     so it follows no robot's fires: restart it with its network default"
+                ),
+                None,
+            );
+        }
         let activity = self.fires.ask(
             FollowKey { robot, run_id },
             after,
@@ -11104,7 +11117,7 @@ mod tests {
                 node_name: "activity_dispatch".to_string(),
                 clock: Arc::new(VirtualClock::new()),
                 subscriber_buffer_size: 16,
-                network: None,
+                network: Some(cerulion_core::transport::network::NetworkConfig::default()),
             },
             cerulion_core::testing::iceoryx_test_config(),
         )

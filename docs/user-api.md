@@ -3335,7 +3335,9 @@ is read. `{"id":1,"method":"activity","robot":"temi","run_id":"0x5d1c00000000000
 returns `{"id":1,"ok":true,"activity":{...}}`. `robot` is one robot name as the
 run's `runs` row gives it (no `/`, `*`, `$`, `?` or `#`, and not an `account:`
 route) and `run_id` is the run id as that row gives it (`0x` and 32 lowercase
-hex digits); anything else is refused with an error. The first `activity` for a
+hex digits); anything else is refused with an error. A LOCAL-ONLY daemon
+(`CERULION_VIZD_NETWORK=off`) refuses every `activity` with an error and asks
+no robot, even when `cerulion-netd` has its network on. The first `activity` for a
 run starts a follower that asks the robot for the run's fires four times a
 second, through `cerulion-netd` (protocol 10 or newer) on a connection of its
 own, and answers `starting`, so ask a few times a second. Each `activity` keeps

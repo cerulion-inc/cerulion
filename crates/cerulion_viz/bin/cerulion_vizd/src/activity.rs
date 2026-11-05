@@ -81,6 +81,9 @@ pub struct ActivityLog {
     lost: u64,
     /// The newest fire dropped from the log: its sequence and `lost_before`.
     dropped: Option<(u64, u64)>,
+    /// The dropped fire that started last: its age at its fetch and the fetch
+    /// instant. Every fire that started after it is still held.
+    latest_dropped_start: Option<(u64, Instant)>,
 }
 
 impl ActivityLog {
@@ -96,6 +99,7 @@ impl ActivityLog {
             cursor: None,
             lost: 0,
             dropped: None,
+            latest_dropped_start: None,
         }
     }
 
@@ -131,6 +135,7 @@ impl ActivityLog {
                     if self.ring.len() == ACTIVITY_LOG_CAPACITY {
                         if let Some(dropped) = self.ring.pop_front() {
                             self.dropped = Some((dropped.record.seq, dropped.lost_before));
+                            self.note_dropped_start(&dropped, fetched_at);
                         }
                     }
                     self.ring.push_back(Held {
@@ -204,6 +209,7 @@ impl ActivityLog {
             (Some(cursor), _) => (cursor.max(asked), 0, 0, Vec::new()),
             (None, _) => (asked, 0, 0, Vec::new()),
         };
+        let covered = self.covered(now, window);
         let in_tick: Vec<InTick> = self
             .served
             .iter()
@@ -221,8 +227,8 @@ impl ActivityLog {
             next,
             lost,
             skipped,
-            window_ms: u32::try_from(self.covered(now, window).as_millis()).unwrap_or(u32::MAX),
-            nodes: self.nodes(&in_tick, now, window),
+            window_ms: u32::try_from(covered.as_millis()).unwrap_or(u32::MAX),
+            nodes: self.nodes(&in_tick, now, covered),
             in_tick,
             fires,
         }
@@ -247,16 +253,28 @@ impl ActivityLog {
         lost_before + seq.saturating_sub(base)
     }
 
+    /// Keep `dropped`'s start if it is the latest start of a dropped fire.
+    fn note_dropped_start(&mut self, dropped: &Held, fetched_at: Instant) {
+        let age = aged(dropped.age_at_fetch_ns, dropped.fetched_at, fetched_at);
+        if self
+            .latest_dropped_start
+            .is_none_or(|(kept, kept_at)| age < aged(kept, kept_at, fetched_at))
+        {
+            self.latest_dropped_start = Some((dropped.age_at_fetch_ns, dropped.fetched_at));
+        }
+    }
+
     /// The span the per-node statistics cover: `window`, or, once the log has
-    /// dropped a fire, no further back than the oldest fire it still holds.
+    /// dropped a fire, no further back than the latest start of a dropped fire.
+    /// A sequence is taken when a tick ends, so the oldest fire held is not
+    /// always the oldest start held, and a dropped fire can have started after
+    /// a held one.
     fn covered(&self, now: Instant, window: Duration) -> Duration {
-        match (self.dropped, self.ring.front()) {
-            (Some(_), Some(oldest)) => window.min(Duration::from_nanos(aged(
-                oldest.age_at_fetch_ns,
-                oldest.fetched_at,
-                now,
-            ))),
-            _ => window,
+        match self.latest_dropped_start {
+            Some((age_at_fetch_ns, fetched_at)) => {
+                window.min(Duration::from_nanos(aged(age_at_fetch_ns, fetched_at, now)))
+            }
+            None => window,
         }
     }
 
@@ -766,8 +784,55 @@ mod tests {
         assert_eq!(answer.nodes[0].fires, 2048);
         assert_eq!(
             answer.window_ms, 100,
-            "the counts cover only back to the oldest fire the log still holds"
+            "the counts cover only back to the latest start of a fire the log dropped"
         );
+    }
+
+    /// A fire's sequence is taken when its tick ends, but its age counts from
+    /// the tick's start, so the log's order is not the order of the ages.
+    #[test]
+    fn once_the_log_drops_fires_the_counts_cover_only_the_span_it_still_holds_whole() {
+        let t0 = Instant::now();
+        let mut log = ActivityLog::new("temi", RUN_TEXT);
+        from_now(&mut log, t0);
+        let now_ns = 100_000 * MS;
+        let mut fires = vec![
+            fire(5120, now_ns - 2000 * MS, 10, 1, FireCause::Data),
+            fire(5121, now_ns - 800 * MS, 10, 1, FireCause::Data),
+        ];
+        fires.extend(
+            (5122..=7167).map(|seq| fire(seq, now_ns - 1000 * MS, 10, 0, FireCause::Period)),
+        );
+        fires.push(fire(7168, now_ns - 3000 * MS, 20, 2, FireCause::Sync));
+        fires.push(fire(7169, now_ns - 500 * MS, 30, 0, FireCause::Period));
+        let mut first = 0;
+        while first < fires.len() {
+            let page: Vec<FireRecord> = fires[first..(first + 512).min(fires.len())].to_vec();
+            let next = page.last().map(|f| f.seq).unwrap_or_default();
+            log.absorb(&served(now_ns, 90_000 * MS, next, 0, vec![], page), t0);
+            first += 512;
+        }
+
+        let answer = log.answer(Some(5119), t0, WINDOW);
+        assert_eq!(
+            answer.window_ms, 800,
+            "5121 started 800 ms ago and was dropped: an older span may miss fires"
+        );
+        let counted: Vec<(u16, u32, Option<u32>)> = answer
+            .nodes
+            .iter()
+            .map(|n| (n.node, n.fires, n.dur_max_ns))
+            .collect();
+        assert_eq!(
+            counted,
+            vec![(0, 1, Some(30)), (2, 0, None)],
+            "only 7169 started inside the 800 ms; 7168 started 3 s ago and finished last"
+        );
+        assert_eq!(answer.nodes[1].last_ms_ago, Some(3000.0));
+
+        let later = log.answer(Some(5119), t0 + Duration::from_millis(300), WINDOW);
+        assert_eq!(later.window_ms, 1100, "the span ages with desk time");
+        assert_eq!(later.nodes[0].fires, 1);
     }
 
     #[test]
