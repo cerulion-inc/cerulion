@@ -408,7 +408,7 @@ fn next_call_sequence() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     let below = |last: i64| (i64::MAX - since_epoch).min(last - 1);
     let last = LAST
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(below(last))
         })
         .unwrap_or_else(|last| last);
