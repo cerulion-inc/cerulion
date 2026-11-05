@@ -1324,32 +1324,36 @@ fn connect_set(connect: &[String], reachable: &HashSet<String>) -> CliResult<Vec
     Ok(kept)
 }
 
-/// Ask until a robot answers, an answer is final, or the first-contact
-/// budget is spent. A cleared `running` ends the wait with an error; an
-/// error from `ask` is returned at once, never retried.
-fn first_contact(
-    mut ask: impl FnMut() -> CliResult<RunsHarvest>,
+/// Ask until `answered` holds for the answer, or the first-contact budget
+/// is spent. A cleared `running` ends the wait with an error; an error from
+/// `ask` is returned at once, never retried.
+fn first_contact<T>(
+    mut ask: impl FnMut() -> CliResult<T>,
+    answered: impl Fn(&T) -> bool,
     running: &AtomicBool,
     pacer: &mut dyn Pacer,
-) -> CliResult<RunsHarvest> {
+) -> CliResult<T> {
     let interrupted =
         || CliError::Validation("interrupted while asking for runs; nothing was read".to_string());
     loop {
         if !running.load(Ordering::Relaxed) {
             return Err(interrupted());
         }
-        let harvest = ask()?;
-        if !harvest.replies.is_empty()
-            || harvest.is_terminal()
-            || pacer.elapsed() >= FIRST_CONTACT_BUDGET
-        {
-            return Ok(harvest);
+        let answer = ask()?;
+        if answered(&answer) || pacer.elapsed() >= FIRST_CONTACT_BUDGET {
+            return Ok(answer);
         }
         if !running.load(Ordering::Relaxed) {
             return Err(interrupted());
         }
         pacer.sleep(FIRST_CONTACT_RETRY);
     }
+}
+
+/// Whether a robot answered: a reply, or an answer a retry would read again
+/// unchanged.
+fn reached_a_robot(harvest: &RunsHarvest) -> bool {
+    !harvest.replies.is_empty() || harvest.is_terminal()
 }
 
 /// A zenoh session of this command's own, connected to the given locators
@@ -1414,7 +1418,7 @@ impl RunsSource for ZenohPlane {
                 query_robot_runs_all(session, &robots, RUNS_GET_WINDOW)
             })
         };
-        first_contact(ask, running, &mut WallPacer::start())
+        first_contact(ask, reached_a_robot, running, &mut WallPacer::start())
     }
 }
 
@@ -1483,8 +1487,18 @@ impl NetdPlane {
 
 #[cfg(unix)]
 impl RunsSource for NetdPlane {
-    fn runs(&mut self, robot: Option<&str>, _running: &AtomicBool) -> CliResult<RunsHarvest> {
-        netd_harvest(&mut self.client, robot)
+    fn runs(&mut self, robot: Option<&str>, running: &AtomicBool) -> CliResult<RunsHarvest> {
+        let gather = first_contact(
+            || netd_gather(&mut self.client, robot),
+            netd_contact_made,
+            running,
+            &mut WallPacer::start(),
+        )?;
+        Ok(RunsHarvest {
+            replies: gather.replies,
+            unusable: gather.unusable,
+            silent: gather.silent,
+        })
     }
 }
 
@@ -1511,21 +1525,33 @@ fn netd_is_unix_only(what: &str) -> CliError {
 
 /// One `runs` query through a connected `cerulion-netd`.
 #[cfg(unix)]
-fn netd_harvest(
+fn netd_gather(
     client: &mut cerulion_netd::NetdClient,
     robot: Option<&str>,
-) -> CliResult<RunsHarvest> {
-    let answer = client.query_runs(robot).map_err(|e| {
+) -> CliResult<cerulion_netd::query::RunsGather> {
+    client.query_runs_with_discovery(robot).map_err(|e| {
         CliError::Validation(format!(
             "cerulion-netd could not answer the runs query: {}",
             sanitize_refusal_reason(&e.to_string())
         ))
-    })?;
-    Ok(RunsHarvest {
-        replies: answer.replies,
-        unusable: answer.unusable,
-        silent: answer.silent,
     })
+}
+
+/// Whether a netd runs answer ends the first-contact wait. netd's own
+/// cold-start grace is shorter than a robot can take to appear, so an empty
+/// answer is asked again while netd has reached no robot yet. A netd plane
+/// that has already gone the whole budget without one is not waited on
+/// again: first contact belongs to the daemon, not to this command (see
+/// `cerulion_netd::convergence`).
+#[cfg(unix)]
+fn netd_contact_made(gather: &cerulion_netd::query::RunsGather) -> bool {
+    use cerulion_netd::protocol::DiscoveryState;
+    !gather.replies.is_empty()
+        || !gather.unusable.is_empty()
+        || gather.discovery == DiscoveryState::Settled
+        || gather
+            .unsettled_for
+            .is_some_and(|age| age >= FIRST_CONTACT_BUDGET)
 }
 
 // ---------------------------------------------------------------------------
@@ -3786,6 +3812,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                 asked += 1;
                 Ok(RunsHarvest::default())
             },
+            reached_a_robot,
             &stopped,
             &mut pacer(),
         );
@@ -3799,6 +3826,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                 asked += 1;
                 Err(CliError::Validation("announce failed".to_string()))
             },
+            reached_a_robot,
             &running,
             &mut p,
         );
@@ -3814,6 +3842,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                 running.store(false, Ordering::Relaxed);
                 Ok(RunsHarvest::default())
             },
+            reached_a_robot,
             &running,
             &mut pacer(),
         );
@@ -3827,6 +3856,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                 asked += 1;
                 Ok(RunsHarvest::default())
             },
+            reached_a_robot,
             &running,
             &mut p,
         );
@@ -3844,6 +3874,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                     harvest(vec![reply("temi", Vec::new())])
                 })
             },
+            reached_a_robot,
             &running,
             &mut p,
         );
@@ -4120,9 +4151,11 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
             request
         });
-        let mut client =
+        let client =
             cerulion_netd::NetdClient::connect_existing_at(socket).expect("the daemon greets");
-        let answer = netd_harvest(&mut client, Some("temi")).expect("one answer");
+        let answer = NetdPlane::over(client)
+            .runs(Some("temi"), &AtomicBool::new(true))
+            .expect("one answer");
         let request = daemon.join().expect("the daemon answers");
         assert_eq!(request["method"], "query_runs");
         assert_eq!(request["robot"], "temi");
@@ -4416,6 +4449,113 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             );
             assert_eq!(text.chars().count(), prefix.len() + 201, "{text}");
             assert!(text.ends_with("e\u{2026}"), "{text}");
+        }
+    }
+
+    /// An empty runs answer from netd, under `discovery`, from a plane that
+    /// has gone `plane_unsettled_ms` without settling.
+    #[cfg(unix)]
+    fn netd_no_runs(
+        discovery: cerulion_netd::protocol::DiscoveryState,
+        plane_unsettled_ms: Option<u64>,
+    ) -> NetdAnswer {
+        use cerulion_netd::protocol::{Response, RunsQueryResponse};
+        Box::new(move |id| {
+            Response::RunsQuery(RunsQueryResponse {
+                id,
+                run_replies: Vec::new(),
+                unusable: Vec::new(),
+                silent: Vec::new(),
+                discovery,
+                plane_unsettled_ms,
+            })
+        })
+    }
+
+    /// A robot that appears after netd's cold-start grace is still read:
+    /// while netd has reached no robot, its empty runs answer is asked again.
+    #[cfg(unix)]
+    #[test]
+    fn netd_runs_are_asked_again_while_netd_has_reached_no_robot() {
+        use cerulion_netd::protocol::{DiscoveryState, PROTOCOL_VERSION};
+        let (_dir, client, daemon) = fake_netd(
+            PROTOCOL_VERSION,
+            vec![
+                netd_no_runs(DiscoveryState::NotConverged, Some(2_500)),
+                Box::new(netd_runs),
+            ],
+        );
+        let mut plane = NetdPlane::over(client);
+        let harvest = plane
+            .runs(Some("temi"), &AtomicBool::new(true))
+            .expect("the second answer");
+        drop(plane);
+        assert_eq!(daemon.join().expect("the daemon ends").len(), 2);
+        assert_eq!(harvest.replies, [reply("temi", vec![temi_entry()])]);
+    }
+
+    /// A netd that is asked while Ctrl+C is down is asked nothing.
+    #[cfg(unix)]
+    #[test]
+    fn netd_runs_are_not_asked_after_ctrl_c() {
+        let (_dir, client, daemon) =
+            fake_netd(cerulion_netd::protocol::PROTOCOL_VERSION, Vec::new());
+        let mut plane = NetdPlane::over(client);
+        match plane.runs(Some("temi"), &AtomicBool::new(false)) {
+            Err(CliError::Validation(text)) => {
+                assert_eq!(text, "interrupted while asking for runs; nothing was read")
+            }
+            other => panic!("expected the interruption, got {other:?}"),
+        }
+        drop(plane);
+        assert_eq!(
+            daemon.join().expect("the daemon ends"),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    /// Which netd runs answers end the first-contact wait: a reply, an
+    /// unusable answer, a netd that has reached a robot before, or a netd
+    /// whose plane has already gone the whole budget without one.
+    #[cfg(unix)]
+    #[test]
+    fn a_netd_runs_answer_ends_the_wait_only_when_asking_again_cannot_help() {
+        use cerulion_netd::protocol::DiscoveryState::{NotConverged, Settled};
+        use cerulion_netd::query::RunsGather;
+        let gather = |replies: Vec<RunsReply>,
+                      unusable: Vec<UnusableRunsAnswer>,
+                      discovery,
+                      unsettled_ms: Option<u64>| RunsGather {
+            replies,
+            unusable,
+            silent: vec!["temi".to_string()],
+            discovery,
+            unsettled_for: unsettled_ms.map(Duration::from_millis),
+        };
+        let budget_ms = u64::try_from(FIRST_CONTACT_BUDGET.as_millis()).unwrap();
+        let unusable = || {
+            vec![UnusableRunsAnswer {
+                robot: "old".to_string(),
+                reason: "unknown runs wire version 2".to_string(),
+            }]
+        };
+        let temi = || vec![reply("temi", vec![temi_entry()])];
+        let oracle = [
+            (gather(temi(), Vec::new(), NotConverged, Some(0)), true),
+            (gather(Vec::new(), unusable(), NotConverged, Some(0)), true),
+            (gather(Vec::new(), Vec::new(), Settled, None), true),
+            (
+                gather(Vec::new(), Vec::new(), NotConverged, Some(budget_ms)),
+                true,
+            ),
+            (
+                gather(Vec::new(), Vec::new(), NotConverged, Some(budget_ms - 1)),
+                false,
+            ),
+            (gather(Vec::new(), Vec::new(), NotConverged, None), false),
+        ];
+        for (answer, ends) in oracle {
+            assert_eq!(netd_contact_made(&answer), ends, "{answer:?}");
         }
     }
 
