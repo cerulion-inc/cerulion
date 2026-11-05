@@ -9,7 +9,9 @@
 //! [`EyeAnswer::parse`] reads an answer frame for the ask frame the gate
 //! published: a frame whose `ask_sha256` is not the SHA-256 of that ask's
 //! text answers another ask (another frame, question set or numbers under
-//! the same `ask_id`) and reads as `not_recorded`. [`Look::compare`] reads
+//! the same `ask_id`) and reads as `not_recorded`. [`EyeAnswer::for_image`]
+//! does the same for an `ok` answer whose `image_sha256` is not the SHA-256
+//! of the frame the gate holds. [`Look::compare`] reads
 //! Jev's measurement out of an answer, compares it with the gate's other
 //! measurement against a tolerance, and gives `Absent` for every answer
 //! whose outcome is not `ok`, and for an `ok` answer that lacks the
@@ -257,6 +259,23 @@ impl EyeAnswer {
         })
     }
 
+    /// This answer read against the JPEG bytes `image` of the frame the gate
+    /// holds for its ask: an `ok` answer whose `image_sha256` is missing or is
+    /// not the SHA-256 of `image` reads as `not_recorded` with no answers.
+    /// `bag play` re-publishes a recording's answer frames byte for byte, and
+    /// ask ids and frame sequence numbers restart with each run, so a
+    /// recorded answer can carry a live gate's exact ask text while naming
+    /// another frame's image.
+    #[must_use]
+    pub fn for_image(mut self, image: &[u8]) -> Self {
+        let own = self.image_sha256.as_deref() == Some(sha256_hex(image).as_str());
+        if self.outcome == Outcome::Ok && !own {
+            self.outcome = Outcome::NotRecorded;
+            self.answers = None;
+        }
+        self
+    }
+
     /// The answer to the question named `question`, when Jev answered.
     pub fn answer(&self, question: &str) -> Option<&Value> {
         if self.outcome != Outcome::Ok {
@@ -339,6 +358,9 @@ mod tests {
 
     const ASK: &str = r#"{"ask_id":1,"question_set":"press_gate","frame":{"topic":"/wrist/image","seq":412},"deadline_ms":1500}"#;
 
+    /// The JPEG bytes of the frame [`ASK`] names.
+    const IMAGE: &[u8] = b"the wrist frame's JPEG bytes";
+
     /// An answer frame to [`ASK`] with `outcome`.
     fn frame(outcome: &str) -> String {
         json!({
@@ -346,6 +368,7 @@ mod tests {
             "outcome": outcome,
             "frame": { "topic": "/wrist/image", "seq": 412 },
             "ask_sha256": sha256_hex(ASK.as_bytes()),
+            "image_sha256": sha256_hex(IMAGE),
             "image": { "width": 640, "height": 480 },
             "answers": {
                 "edge_visible": { "type": "noul", "noul": 0.93 },
@@ -450,5 +473,33 @@ mod tests {
             Look::compare(&read, rim, 326.4, 100.0),
             Look::Absent(Outcome::NotRecorded)
         );
+    }
+
+    #[test]
+    fn an_answer_for_another_image_is_not_recorded() {
+        let rim = |a: &EyeAnswer| a.box_edge_px("rim", BoxEdge::Bottom);
+        // The gate's own frame: the answer reads as given.
+        let own = answer("ok").for_image(IMAGE);
+        assert_eq!(own.outcome(), Outcome::Ok);
+        assert_eq!(Look::compare(&own, rim, 326.4, 8.0), Look::Agree);
+        // The same ask text, another frame's bytes: a recorded answer played
+        // beside a live gate whose ask id and frame seq restarted.
+        let other = answer("ok").for_image(b"another wrist frame");
+        assert_eq!(other.outcome(), Outcome::NotRecorded);
+        assert_eq!(other.answer("rim"), None);
+        assert_eq!(
+            Look::compare(&other, rim, 326.4, 100.0),
+            Look::Absent(Outcome::NotRecorded)
+        );
+        // No image digest answers no image.
+        let mut bare: serde_json::Value = serde_json::from_str(&frame("ok")).expect("json");
+        bare.as_object_mut().expect("object").remove("image_sha256");
+        let read = EyeAnswer::parse(&bare.to_string(), ASK)
+            .expect("parse")
+            .for_image(IMAGE);
+        assert_eq!(read.outcome(), Outcome::NotRecorded);
+        // An absent answer keeps its reason.
+        let off = answer("disabled").for_image(b"another wrist frame");
+        assert_eq!(off.outcome(), Outcome::Disabled);
     }
 }

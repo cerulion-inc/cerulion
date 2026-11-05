@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A running eye beside a played recording. `bag play --resim` publishes the
-//! graph's asks stamped by its replay clock at the recorded times, and
-//! `bag play` re-publishes recorded frames byte for byte, wire timestamp
-//! included, on the topics the eye reads. Each such ask is stale against the
-//! eye's clock: with Jev on or off it gets no request, no answer frame and
-//! no receipt, and one log line. A played wrist frame is not held, so it is
-//! never sent for a live ask. A live ask beside them is still answered.
+//! graph's asks and wrist frames from a transport whose node name begins
+//! `cerulion_replay_`, stamped by its replay clock at the recorded times, and
+//! `bag play` re-publishes recorded frames byte for byte from the node
+//! `cerulion_bag_play`, on the topics the eye reads. The eye tells them by
+//! their publisher's node, so however their stamps fall against the host
+//! clock (an hour back, an hour ahead, or a replay clock sweeping through
+//! now as an unpaced resim does), a played ask gets no request, no answer
+//! frame and no receipt with Jev on or off, and a played frame is never
+//! held. A live ask beside them is answered, and so is a live gate whose
+//! clock runs 2 s behind the host's, as a run resumed after a pause stamps.
 //!
 //! One test per binary: it installs the process's log subscriber.
 
@@ -18,11 +22,12 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::message::ShmMessage;
 use cerulion_core::wire::MaxSliceLen;
-use cerulion_core::{TransportConfig, TransportManager, VirtualClock, WireHeader};
+use cerulion_core::{Clock, TransportConfig, TransportManager, VirtualClock, WireHeader};
 use cerulion_rcpd::eye::config::JevConfig;
 use cerulion_rcpd::eye::host::{EyeHost, EyeSettings};
 use cerulion_rcpd::eye::limits::jpeg_header_for_test;
-use cerulion_rcpd::eye::switch::write_switch;
+use cerulion_rcpd::eye::source::{BAG_PLAY_NODE, RESIM_NODE_PREFIX};
+use cerulion_rcpd::eye::switch::{read_status, write_switch};
 use cerulion_rcpd::eye::verdict::Outcome;
 use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
@@ -70,11 +75,24 @@ fn install_logs() -> Logs {
     logs
 }
 
-/// What the eye logs for each stale ask.
-const STALE: &str = "dropped a stale ask";
+/// What the eye logs for each played ask it drops.
+const PLAYED: &str = "dropped an ask from a replay or an unnamed publisher";
+
+/// What the eye logs once for each replay publisher it names.
+const REPLAY_PUBLISHER: &str = "a replay publishes on an eye topic";
 
 /// Long enough for the eye's loop to read everything published before it.
 const SETTLE: Duration = Duration::from_millis(300);
+
+/// The host's clock less a fixed lag: a run's clock after a pause of that
+/// length.
+struct Behind(u64);
+
+impl Clock for Behind {
+    fn now_ns(&self) -> u64 {
+        cerulion_core::real_ns().saturating_sub(self.0)
+    }
+}
 
 /// A publisher of wrist frames and asks; it lives on the thread that made it.
 struct Asker {
@@ -202,6 +220,17 @@ impl Answers {
     }
 }
 
+/// Wait until the status file in `state_dir` counts `n` asks dropped from
+/// a replay, so a replay leaves only after the eye has read and named it.
+fn wait_replayed(state_dir: &Path, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let counted = || read_status(state_dir).map_or(0, |s| s.replay_asks_today);
+    while counted() < n as u64 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(counted(), n as u64, "the asks dropped from a replay so far");
+}
+
 /// The eye receipts in the log at `path`.
 fn eye_receipts(path: &Path) -> usize {
     cerud::receipt::read_all(path)
@@ -235,13 +264,14 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
     let receipts = state_dir.join("receipts.jsonl");
     let settings =
         EyeSettings::resolve(&loaded.eyes, dir.path(), &state_dir, None).expect("settings");
-    // One shared-memory root for the eye, the live gate, the resim and the
-    // player, each a transport of its own stamping by its own clock.
+    // One shared-memory root for the eye, the live gates, the resim and the
+    // player, each a transport of its own under its own node name, stamping
+    // by its own clock.
     let root = cerulion_core::testing::iceoryx_test_config();
-    let manager = |tag: &str, clock: Arc<dyn cerulion_core::Clock>| {
+    let manager = |name: String, clock: Arc<dyn Clock>| {
         TransportManager::init_for_test(
             TransportConfig {
-                node_name: format!("rcpd_eye_played_{tag}_{}", std::process::id()),
+                node_name: name,
                 clock,
                 ..Default::default()
             },
@@ -249,22 +279,36 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         )
         .expect("transport")
     };
-    let live_clock: Arc<dyn cerulion_core::Clock> = Arc::new(cerulion_core::RealClock);
+    let pid = std::process::id();
+    let live_clock: Arc<dyn Clock> = Arc::new(cerulion_core::RealClock);
     let replay_clock = Arc::new(VirtualClock::new());
-    let eye_mgr = manager("eye", Arc::clone(&live_clock));
-    let live_mgr = manager("live", Arc::clone(&live_clock));
-    let resim_mgr = manager(
-        "resim",
-        Arc::clone(&replay_clock) as Arc<dyn cerulion_core::Clock>,
+    let eye_mgr = manager(
+        format!("rcpd_eye_played_eye_{pid}"),
+        Arc::clone(&live_clock),
     );
-    let player_mgr = manager("play", live_clock);
+    let live_mgr = manager(
+        format!("rcpd_eye_played_live_{pid}"),
+        Arc::clone(&live_clock),
+    );
+    let paused_mgr = manager(
+        format!("rcpd_eye_played_paused_{pid}"),
+        Arc::new(Behind(2_000_000_000)),
+    );
+    let resim_mgr = manager(
+        format!("{RESIM_NODE_PREFIX}played_{pid}"),
+        Arc::clone(&replay_clock) as Arc<dyn Clock>,
+    );
+    let player_mgr = manager(BAG_PLAY_NODE.to_owned(), live_clock);
     let sink = ReceiptSink::open(&receipts).expect("receipts");
     let eye =
         EyeHost::spawn(eye_mgr, settings, sink, tokio::runtime::Handle::current()).expect("eye");
 
+    let gate_state = state_dir.clone();
     let gate = std::thread::spawn(move || {
+        let state_dir = gate_state;
         let hour = 3_600_000_000_000_u64;
         let sent = || requests.load(Ordering::SeqCst);
+        let mut played = 0_usize;
         let mut live = Asker::open(&live_mgr, &jev);
         let mut answers = Answers {
             sub: live_mgr
@@ -289,30 +333,62 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
             answers.outcome(6, Duration::from_secs(5)),
             Some(Outcome::Ok)
         );
-        let recorded_at = Instant::now();
         let recorded_frames = frame_tap.take();
         let recorded_asks = ask_tap.take();
         assert_eq!((recorded_frames.len(), recorded_asks.len()), (1, 2));
         assert_eq!((sent(), eye_receipts(&receipts)), (2, 2));
 
-        // A resim: the graph's asks stamped by the replay clock at recorded
-        // times, an hour before this host's clock and an hour after it (a
-        // recording from another boot), with re-injected wrist frames. The
-        // played asks name the live frame the eye holds, so only their wire
-        // time keeps them off the route.
+        // An unpaced resim: its replay clock sweeps the recording's span at
+        // 10x, from 10 s behind this host's clock to 5 s ahead, so it passes
+        // through now. Every played ask names the live frame the eye holds,
+        // so only its publisher keeps it off the route. A live ask is made
+        // as the sweep crosses now.
         let mut resim = Asker::open(&resim_mgr, &jev);
-        let mut played = Vec::new();
-        replay_clock.set(cerulion_core::real_ns().saturating_sub(hour));
-        for _ in 0..3 {
-            played.push(resim.publish_frame());
+        let mut last_played_seq = 0;
+        let start = cerulion_core::real_ns() - 10_000_000_000;
+        let t0 = Instant::now();
+        let mut nearest_ms = i128::MAX;
+        let mut live_asked = false;
+        for id in 1_000_u64.. {
+            let elapsed = u64::try_from(t0.elapsed().as_nanos()).expect("ns");
+            let stamp = start + 10 * elapsed;
+            let from_now_ms =
+                (i128::from(stamp) - i128::from(cerulion_core::real_ns())) / 1_000_000;
+            if from_now_ms > 5_000 {
+                break;
+            }
+            replay_clock.set(stamp);
+            last_played_seq = resim.publish_frame();
+            resim.ask(id, held);
+            played += 1;
+            nearest_ms = nearest_ms.min(from_now_ms.abs());
+            if from_now_ms >= 0 && !live_asked {
+                live.ask(9, held);
+                live_asked = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        let swept = played;
+        assert!(swept >= 10, "the sweep played {swept} asks");
+        // At least one played ask carries a stamp within 1 s of the host
+        // clock, as a live ask's would.
+        assert!(
+            nearest_ms <= 1_000,
+            "the played ask nearest the host clock was stamped {nearest_ms} ms from it"
+        );
+        assert_eq!(
+            answers.outcome(9, Duration::from_secs(5)),
+            Some(Outcome::Ok),
+            "the live ask made during the sweep"
+        );
+        // The same resim stamping an hour back and an hour ahead.
+        replay_clock.set(cerulion_core::real_ns().saturating_sub(hour));
         resim.ask(101, held);
         resim.ask(102, held);
         replay_clock.set(cerulion_core::real_ns() + hour);
-        played.push(resim.publish_frame());
         resim.ask(103, held);
         resim.ask(104, held);
-        // The eye reads the played asks before the live one.
+        played += 4;
         std::thread::sleep(SETTLE);
         live.ask(2, held);
         assert_eq!(
@@ -321,32 +397,25 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         );
         // The played frames were not held: a live ask for a sequence number
         // only the resim published waits for it and is refused.
-        let only_played = played
-            .iter()
-            .copied()
-            .find(|seq| *seq != held)
-            .expect("a sequence number the live gate never published");
-        live.ask(5, only_played);
+        assert!(last_played_seq > held);
+        live.ask(5, last_played_seq);
         assert_eq!(
             answers.outcome(5, Duration::from_secs(5)),
             Some(Outcome::Refused)
         );
         std::thread::sleep(SETTLE);
-        for id in 101..=104 {
+        for id in (1_000..1_000 + swept as u64).chain(101..=104) {
             assert_eq!(answers.count(id), 0, "played ask {id} was answered");
         }
-        assert_eq!(sent(), 3, "only the live asks reached the route");
-        assert_eq!(eye_receipts(&receipts), 4, "no receipt for a played ask");
+        assert_eq!(sent(), 4, "only the live asks reached the route");
+        assert_eq!(eye_receipts(&receipts), 5, "no receipt for a played ask");
+        wait_replayed(&state_dir, played);
         drop(resim);
 
-        // `bag play`: the recorded frame and asks byte for byte, once the
-        // recorded asks are older than their deadline.
-        let past_deadline = Duration::from_millis(1_600);
-        if let Some(wait) = past_deadline.checked_sub(recorded_at.elapsed()) {
-            std::thread::sleep(wait);
-        }
+        // `bag play`: the recorded frame and asks byte for byte, at once.
         let mut player = Asker::open(&player_mgr, &jev);
         player.play(&recorded_frames, &recorded_asks);
+        played += recorded_asks.len();
         std::thread::sleep(SETTLE);
         let held = live.publish_frame();
         live.ask(3, held);
@@ -358,18 +427,47 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         for id in [1, 6] {
             assert_eq!(answers.count(id), 1, "recorded ask {id} was answered again");
         }
-        assert_eq!(sent(), 4, "only the live asks reached the route");
-        assert_eq!(eye_receipts(&receipts), 5, "no receipt for a played ask");
+        assert_eq!(sent(), 5, "only the live asks reached the route");
+        assert_eq!(eye_receipts(&receipts), 6, "no receipt for a played ask");
+        wait_replayed(&state_dir, played);
         drop(player);
 
+        // A live gate whose clock runs 2 s behind the host's, as a run's clock
+        // does after a 2 s pause: its frame is held and its ask answered with
+        // its whole deadline. Its third frame has a sequence number no other
+        // live gate has used.
+        let mut paused = Asker::open(&paused_mgr, &jev);
+        let mut resumed_seq = 0;
+        for _ in 0..3 {
+            resumed_seq = paused.publish_frame();
+        }
+        assert!(resumed_seq > held);
+        paused.ask(7, resumed_seq);
+        assert_eq!(
+            answers.outcome(7, Duration::from_secs(5)),
+            Some(Outcome::Ok),
+            "a resumed run's ask"
+        );
+        assert_eq!(sent(), 6);
+        assert_eq!(eye_receipts(&receipts), 7);
+        drop(paused);
+
         // Jev off: a live ask is answered `disabled` at once, a played one
-        // not at all.
+        // not at all. A topic takes two publishers at once here, so each
+        // replay leaves before the next one starts, once the eye has read it.
         write_switch(&state_dir, false).expect("off");
         let mut resim = Asker::open(&resim_mgr, &jev);
         replay_clock.set(cerulion_core::real_ns().saturating_sub(hour));
         resim.ask(201, held);
         resim.ask(202, held);
-        std::thread::sleep(SETTLE);
+        played += 2;
+        wait_replayed(&state_dir, played);
+        drop(resim);
+        let mut player = Asker::open(&player_mgr, &jev);
+        player.play(&[], &recorded_asks);
+        played += recorded_asks.len();
+        wait_replayed(&state_dir, played);
+        drop(player);
         live.ask(4, held);
         assert_eq!(
             answers.outcome(4, Duration::from_secs(5)),
@@ -379,26 +477,50 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         for id in [201, 202] {
             assert_eq!(answers.count(id), 0, "played ask {id} was answered");
         }
-        assert_eq!(sent(), 4, "nothing reached the route while off");
-        assert_eq!(eye_receipts(&receipts), 6, "no receipt for a played ask");
+        for id in [1, 6] {
+            assert_eq!(answers.count(id), 1, "recorded ask {id} was answered again");
+        }
+        assert_eq!(sent(), 6, "nothing reached the route while off");
+        assert_eq!(eye_receipts(&receipts), 8, "no receipt for a played ask");
+        played
     });
-    tokio::task::spawn_blocking(move || gate.join())
+    let played = tokio::task::spawn_blocking(move || gate.join())
         .await
         .expect("join")
         .expect("gate");
     drop(eye);
-    assert_eq!(stub.count(), 4, "the route saw only the live asks");
+    assert_eq!(stub.count(), 6, "the route saw only the live asks");
 
+    // The status file counts the played asks it dropped.
+    let status = read_status(&state_dir).expect("status");
+    assert_eq!(status.replay_asks_today, played as u64, "{status:?}");
+    assert_eq!(status.dropped_asks_today, 0, "{status:?}");
+    assert_eq!(status.asks_today, 8, "{status:?}");
+    assert_eq!(status.looks_today, 6, "{status:?}");
+
+    // One line per played ask, loud on the first and each decade only: a
+    // live ask between played ones does not make the next one loud again.
     let text = logs.text();
-    let lines: Vec<&str> = text.lines().filter(|l| l.contains(STALE)).collect();
-    assert_eq!(lines.len(), 8, "one line per played ask: {text}");
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(PLAYED)).collect();
+    assert_eq!(lines.len(), played, "one line per played ask");
+    let decades = 1 + usize::from(played >= 10) + usize::from(played >= 100);
     assert_eq!(
         lines.iter().filter(|l| l.contains("WARN")).count(),
-        3,
-        "loud once per run of played asks, then counted: {text}"
+        decades,
+        "loud on the first and each decade: {played} played"
+    );
+    let named: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(REPLAY_PUBLISHER))
+        .collect();
+    assert!(
+        named.len() >= 2
+            && named.iter().all(|l| l.contains("WARN")
+                && (l.contains(RESIM_NODE_PREFIX) || l.contains(BAG_PLAY_NODE))),
+        "each replay publisher named once at warn: {named:?}"
     );
     assert!(
-        text.contains("dropped a wrist frame stamped outside this host's clock"),
-        "the played frames were logged: {text}"
+        text.contains("dropped a wrist frame from a replay or an unnamed publisher"),
+        "the played frames were dropped"
     );
 }

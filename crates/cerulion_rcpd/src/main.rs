@@ -307,18 +307,25 @@ fn jev(
             println!("credential: {}", now.credential);
             println!("route: {}", now.route);
             println!("model: {}", now.model);
-            let (asks, looks, limit, last) = counted.map_or((0, 0, false, None), |s| {
+            let (asks, looks, limit, last) = counted.as_ref().map_or((0, 0, false, None), |s| {
                 (
                     s.asks_today,
                     s.looks_today,
                     s.limit_reached_today,
-                    s.last_outcome,
+                    s.last_outcome.clone(),
                 )
             });
+            let (replayed, dropped) = counted
+                .as_ref()
+                .map_or((0, 0), |s| (s.replay_asks_today, s.dropped_asks_today));
             println!(
                 "today ({} UTC): {asks} asks, {looks} looks, limit reached: {}",
                 now.day,
                 if limit { "yes" } else { "no" }
+            );
+            println!(
+                "dropped today: {replayed} asks from a replay, {dropped} over the ask bound \
+                 or from an unnamed publisher"
             );
             println!("last outcome: {}", last.as_deref().unwrap_or("none"));
             ExitCode::SUCCESS

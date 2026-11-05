@@ -313,16 +313,27 @@ pub(crate) fn decode_string(payload: &[u8]) -> Result<String, String> {
 pub(crate) fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
     drain_stamped_strings(subscriber, topic)
         .into_iter()
-        .map(|(text, _)| text)
+        .map(|frame| frame.text)
         .collect()
 }
 
-/// Decode every frame queued on `subscriber`, oldest first, each with the
-/// wire timestamp (`timestamp_ns`) its publisher stamped.
+/// One decoded `std_msgs/String` frame with its wire metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct StampedString {
+    /// The text.
+    pub(crate) text: String,
+    /// The wire timestamp (`timestamp_ns`) its publisher stamped.
+    pub(crate) wire_ns: u64,
+    /// Its publisher's id ([`cerulion_core::ReceivedMessage::origin`]).
+    pub(crate) origin: u128,
+}
+
+/// Decode every frame queued on `subscriber`, oldest first, each with its
+/// wire timestamp and its publisher's id.
 pub(crate) fn drain_stamped_strings(
     subscriber: &CerulionSubscriber,
     topic: &str,
-) -> Vec<(String, u64)> {
+) -> Vec<StampedString> {
     let mut out = Vec::new();
     let read = subscriber.try_receive(|message| {
         if message.header().schema_hash != RosString::SCHEMA_HASH {
@@ -330,7 +341,11 @@ pub(crate) fn drain_stamped_strings(
             return;
         }
         match decode_string(message.payload()) {
-            Ok(text) => out.push((text, message.header().timestamp_ns)),
+            Ok(text) => out.push(StampedString {
+                text,
+                wire_ns: message.header().timestamp_ns,
+                origin: message.origin(),
+            }),
             Err(reason) => tracing::warn!(topic, %reason, "dropped a malformed frame"),
         }
     });

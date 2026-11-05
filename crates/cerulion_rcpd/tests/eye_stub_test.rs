@@ -15,7 +15,9 @@ use base64::Engine as _;
 use cerulion_rcpd::eye::answer::Answer;
 use cerulion_rcpd::eye::client::{sha256_hex, JevClient};
 use cerulion_rcpd::eye::config::EyesConfig;
-use cerulion_rcpd::eye::host::{request, Admit, Completed, EyeCore, EyeSettings, FrameStore};
+use cerulion_rcpd::eye::host::{
+    ask_sent, request, Admit, Completed, EyeCore, EyeSettings, FrameStore,
+};
 use cerulion_rcpd::eye::limits::jpeg_header_for_test;
 use cerulion_rcpd::eye::switch::write_switch;
 use cerulion_rcpd::eye::verdict::{BoxEdge, EyeAnswer, Look, Outcome};
@@ -530,42 +532,48 @@ async fn off_no_key_a_bad_ask_and_a_bad_frame_never_reach_the_network() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_deadline_runs_from_the_asks_wire_time() {
+async fn the_deadline_is_the_budget_from_the_wire_time_inside_the_window_else_from_the_read() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut core, _client) = core(dir.path(), "http://127.0.0.1:9/api/v1");
     let now = Instant::now();
-    let second = Duration::from_secs(1);
-    // Published a second before the eye read it, with 1.5 s to answer.
-    let Admit::Send(dispatch) = core.admit(&ask(1, 0, 1, 1_500), now - second, now, now, &frames())
-    else {
+    let now_ns = 9_000_000_000_000_u64;
+    let budget = Duration::from_millis(1_500);
+    let ms = |n: u64| Duration::from_millis(n);
+    let behind = |n: u64| now_ns - n * 1_000_000;
+    // Stamped 200 ms before the eye read it: due 1.5 s after the stamp.
+    let sent = ask_sent(behind(200), now_ns, now);
+    let Admit::Send(dispatch) = core.admit(&ask(1, 0, 1, 1_500), sent, now, now, &frames()) else {
         panic!("the request is sent");
     };
-    assert_eq!(
-        dispatch.deadline,
-        now - second + Duration::from_millis(1_500)
-    );
+    assert_eq!(dispatch.deadline, now - ms(200) + budget);
     assert_eq!(dispatch.received, now);
-    // Stale: at or past its own deadline from its wire time, or no wire time.
-    let fresh = ask(2, 0, 1, 1_500);
-    assert!(!core.stale(&fresh, Some(now - second), now));
-    assert!(core.stale(&fresh, Some(now - Duration::from_millis(1_500)), now));
-    assert!(core.stale(&fresh, None, now));
-    let short = ask(3, 0, 1, 200);
-    assert!(core.stale(&short, Some(now - Duration::from_millis(300)), now));
-    // A deadline above `timeout_ms` is held to it.
-    let long = ask(4, 0, 1, 60_000);
-    assert!(core.stale(&long, Some(now - Duration::from_secs(2)), now));
-    // Without an `eyes.jev` section the budget is the default timeout.
-    let unconfigured = EyeCore::new(
-        Arc::new(
-            EyeSettings::resolve(&EyesConfig::default(), dir.path(), dir.path(), None)
-                .expect("settings"),
-        ),
-        now,
+    // Each dispatch holds an in-flight slot until it is dropped.
+    drop(dispatch);
+    // Stamped 2 s behind, as a run resumed after a pause or a virtual clock
+    // stamps: the whole budget from the read.
+    let sent = ask_sent(behind(2_000), now_ns, now);
+    let Admit::Send(dispatch) = core.admit(&ask(2, 0, 1, 1_500), sent, now, now, &frames()) else {
+        panic!("the request is sent");
+    };
+    assert_eq!(dispatch.deadline, now + budget);
+    drop(dispatch);
+    // Stamped ahead: from the read.
+    let sent = ask_sent(now_ns + 5_000_000_000, now_ns, now);
+    let Admit::Send(dispatch) = core.admit(&ask(3, 0, 1, 1_500), sent, now, now, &frames()) else {
+        panic!("the request is sent");
+    };
+    assert_eq!(dispatch.deadline, now + budget);
+    drop(dispatch);
+    // A live ask read after its own short deadline is answered `timeout`,
+    // with no request.
+    let sent = ask_sent(behind(200), now_ns, now);
+    let Admit::Answer(late) = core.admit(&ask(4, 0, 1, 150), sent, now, now, &frames()) else {
+        panic!("answered at once");
+    };
+    assert_eq!(
+        (late.outcome, late.detail.as_deref()),
+        (Outcome::Timeout, Some("deadline_before_send"))
     );
-    let bare = r#"{"ask_id":"a1"}"#;
-    assert!(!unconfigured.stale(bare, Some(now - second), now));
-    assert!(unconfigured.stale(bare, Some(now - Duration::from_secs(2)), now));
 }
 
 #[test]

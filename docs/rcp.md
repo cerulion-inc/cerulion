@@ -271,7 +271,11 @@ A node asks with one `std_msgs/String` frame on the ask topic:
 `{"ask_id": 7, "question_set": "press_gate", "frame": {"topic": "/wrist/image", "seq": 412}, "deadline_ms": 1500, "numbers": {"jaw_gap_mm": 3.5}}`.
 `seq` is the wire sequence number of a frame on the frame topic; the daemon
 keeps the newest 8 and waits up to 100 ms for one not yet seen. The deadline
-runs from the ask frame's wire timestamp. It sends one
+runs from the ask frame's wire timestamp when that stamp is at most 250 ms
+behind the host's monotonic clock, and from when the daemon reads the ask
+otherwise, so a run resumed after a pause, a graph on a virtual or external
+time source and an ask mirrored from another machine keep their whole
+deadline. It sends one
 request carrying that frame unchanged, the set's text and the numbers, and
 publishes one answer frame per ask on the answer topic with an `outcome`:
 `ok`, or one of `disabled`, `no_credential`, `unavailable`, `timeout`,
@@ -292,13 +296,17 @@ published, and compares Jev's reading with its own through `Look::compare`,
 which gives `Agree`, `Disagree` or `Absent(outcome)`. An answer frame whose
 `ask_sha256` is not the SHA-256 of that text was given for another ask, such
 as another frame under a reused `ask_id`, and reads as `not_recorded`.
-`EyeAnswer::image_sha256` gives the SHA-256 of the image sent, to check
-against the bytes of the frame the gate holds.
+A gate that holds the frame passes its JPEG bytes to
+`EyeAnswer::for_image`: an `ok` answer whose `image_sha256` is not their
+SHA-256 reads as `not_recorded`. `bag play` re-publishes a recording's
+answer frames byte for byte, and ask ids and frame sequence numbers restart
+with each run, so a recorded answer can carry a live gate's exact ask text
+while naming another frame.
 
 The daemon answers at most 20 asks at once and 10 a second after that,
 whatever the outcome; an ask over that bound gets no answer and no receipt,
 so the asking node's own deadline makes Jev absent; the first drop is
-logged, and later ones are counted.
+logged, and later ones are counted, in the log and in `jev status`.
 The eye's receipts share the receipt log, and its lock, with the tools and
 the e-stop.
 
@@ -317,7 +325,8 @@ key is on file and the switch is not off:
 
 - `cerulion-rcpd jev off` stops requests with the next ask (`disabled`);
   `jev on` turns it back on; `jev status` prints on or off, the route, the
-  model, today's asks and looks (UTC) and the last outcome.
+  model, today's asks, looks and asks dropped unanswered (UTC) and the last
+  outcome.
 - The first time Jev is on, at start or before the first request of a run
   (a key placed while the daemon runs), the daemon logs one line saying that
   wrist frames leave the robot and how to turn Jev off. A region whose law
@@ -333,16 +342,18 @@ their recorded steps, whatever the re-executed graph asks, and makes no Jev
 request itself. A gate that reads them with its own ask text sees an answer
 given for another ask text as `not_recorded`, and `--resim all --verify`
 reports a changed ask as a divergence on the ask topic. A running daemon's
-eye reads the same topics, and `bag play` and `bag play --resim` publish a
-recording's asks and wrist frames with their recorded wire timestamps. The
-eye reads each ask's wire timestamp against the host's monotonic clock, the
-clock a live graph stamps its frames with: an ask older than its deadline,
-or more than 1 s ahead, gets no request, no answer and no receipt, with Jev
-on or off, and the first is logged and later ones counted. A wrist frame
-more than 1.5 s behind that clock or 1 s ahead is not held, so a played
-frame is never sent. The same rule drops the asks of a graph on a virtual
-or external time source, and of a run after a pause longer than the
-deadline, as the run clock stands still while the run is paused.
+eye reads the same topics, and tells a played recording by where its frames
+come from: `bag play` publishes from the transport node `cerulion_bag_play`
+and `bag play --resim` from `cerulion_replay_` and the recording's identity.
+An ask from either gets no request, no answer and no receipt, with Jev on
+or off, and a wrist frame from either is never held, whatever their wire
+timestamps say, so an unpaced resim whose replay clock passes the host's
+time is dropped as surely as a recording from another boot. So are an ask
+and a frame whose publisher's node cannot be named. The first such ask is
+logged, later ones are counted, and `jev status` reports them. A live graph
+whose own node name takes one of those forms (a graph named `bag_play`, one
+whose name begins `replay_`, or a multi-process graph named `replay`) reads
+as a replay, and the log names the node.
 `--verify-bag` checks that every answer in a recording has its receipt,
 names an ask the recording holds and carries the SHA-256 of that ask's
 text, and, where the recording holds the frame, that the image and request

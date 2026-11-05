@@ -8,9 +8,11 @@
 //!   Without the file, Jev is on unless the region's notice level is
 //!   `opt_in`.
 //! - `jev.notice` marks that the quiet notice line was printed.
-//! - `jev.status.json` is rewritten after every answer: on or off, route,
-//!   pinned model, the last outcome, today's asks and looks (UTC), and
-//!   whether a limit was reached today. `cerulion-rcpd jev status` reads it.
+//! - `jev.status.json` is rewritten after every answer, and at most every
+//!   250 ms while asks are dropped unanswered: on or off, route, pinned
+//!   model, the last outcome, today's asks and looks (UTC), the asks dropped
+//!   from a replay and the other asks dropped unanswered, and whether a
+//!   limit was reached today. `cerulion-rcpd jev status` reads it.
 //!
 //! The notice level comes from [`REGION_NOTICE`], a table of region codes;
 //! a region it does not list, and no region at all, is `quiet`. `quiet`
@@ -224,6 +226,13 @@ pub struct JevStatus {
     pub asks_today: u64,
     /// Requests sent today.
     pub looks_today: u64,
+    /// Asks from a replay today: no request, no answer, no receipt.
+    #[serde(default)]
+    pub replay_asks_today: u64,
+    /// Asks dropped today over the ask bound or from a publisher whose node
+    /// cannot be named: no answer, no receipt.
+    #[serde(default)]
+    pub dropped_asks_today: u64,
     /// Whether a rate, in-flight or spend limit was met today.
     pub limit_reached_today: bool,
     /// The newest answer's outcome.
