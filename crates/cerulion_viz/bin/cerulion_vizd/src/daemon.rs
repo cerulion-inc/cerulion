@@ -5944,7 +5944,8 @@ struct FollowTiming {
 impl FollowTiming {
     /// Four polls a second, until three seconds after the last ask. The robot
     /// then stops recording when its own five-second lease runs out. A failed
-    /// poll waits two seconds, the catalog forwarder's resubscribe backoff.
+    /// poll waits two seconds after it returns, the catalog forwarder's
+    /// resubscribe backoff.
     const PRODUCTION: FollowTiming = FollowTiming {
         interval: Duration::from_millis(250),
         lease: Duration::from_secs(3),
@@ -6138,16 +6139,19 @@ impl FireFollowers {
             };
             let started = Instant::now();
             let polled = plane.query_fires(&key.robot, &key.run_id, cursor);
-            let wait = if polled.is_err() {
-                self.timing.retry
+            let fetched_at = Instant::now();
+            // A failure can take netd's whole timeout, so the retry delay
+            // counts from its return, not from the poll's start.
+            let next_poll = if polled.is_err() {
+                fetched_at + self.timing.retry
             } else {
-                self.timing.interval
+                started + self.timing.interval
             };
             follower
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .fold(polled, Instant::now());
-            self.pause_until(started + wait);
+                .fold(polled, fetched_at);
+            self.pause_until(next_poll);
         }
     }
 
@@ -6226,11 +6230,13 @@ mod fire_follower_tests {
     }
 
     /// What the planes a [`FiresFake`] opened saw: how many it opened, every
-    /// cursor each poll asked with in order, and how many polls are running.
+    /// cursor each poll asked with in order, when each poll started and
+    /// returned, and how many polls are running.
     #[derive(Default)]
     struct FakeLedger {
         opened: AtomicU64,
         polls: Mutex<Vec<(String, Option<u64>)>>,
+        spans: Mutex<Vec<(Instant, Instant)>>,
         in_flight: AtomicU64,
     }
 
@@ -6272,6 +6278,9 @@ mod fire_follower_tests {
         fn polls(&self) -> Vec<(String, Option<u64>)> {
             self.ledger.polls.lock().unwrap().clone()
         }
+        fn spans(&self) -> Vec<(Instant, Instant)> {
+            self.ledger.spans.lock().unwrap().clone()
+        }
         fn in_flight(&self) -> u64 {
             self.ledger.in_flight.load(Ordering::SeqCst)
         }
@@ -6300,12 +6309,18 @@ mod fire_follower_tests {
         ) -> Result<FiresAnswer, String> {
             assert_eq!(run_id, RUN_TEXT);
             self.ledger.in_flight.fetch_add(1, Ordering::SeqCst);
+            let started = Instant::now();
             std::thread::sleep(self.delay);
             self.ledger
                 .polls
                 .lock()
                 .unwrap()
                 .push((robot.to_string(), after));
+            self.ledger
+                .spans
+                .lock()
+                .unwrap()
+                .push((started, Instant::now()));
             self.ledger.in_flight.fetch_sub(1, Ordering::SeqCst);
             let (next, fires) = match (self.robot, after) {
                 (Robot::Silent, _) => return Ok(FiresAnswer::Silent),
@@ -6650,6 +6665,32 @@ mod fire_follower_tests {
             closing.elapsed() < Duration::from_secs(1),
             "close cut the retry wait short: {:?}",
             closing.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_failure_slower_than_the_retry_delay_still_waits_it_after_returning() {
+        let timing = FollowTiming {
+            interval: Duration::from_millis(50),
+            lease: Duration::from_secs(30),
+            retry: Duration::from_millis(400),
+        };
+        let fake = FiresFake::slow(Robot::Failing, Duration::from_millis(600));
+        let followers = Arc::new(FireFollowers::new(timing));
+        followers.ask(key("temi"), None, Instant::now(), &fake);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.spans().len() < 2 {
+            assert!(Instant::now() < deadline, "the follower never polled twice");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        followers.close();
+        let spans = fake.spans();
+        let ((_, failed), (next, _)) = (spans[0], spans[1]);
+        assert!(
+            next.duration_since(failed) >= timing.retry,
+            "the next poll started {:?} after the 600 ms failure returned, not the {:?} retry",
+            next.duration_since(failed),
+            timing.retry
         );
     }
 
