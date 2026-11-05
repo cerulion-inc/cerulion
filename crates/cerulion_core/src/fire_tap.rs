@@ -1,0 +1,922 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Bounded, lease-armed node-fire metadata. No payload bytes enter this ring.
+//!
+//! Producers make one slot-claim attempt and never wait for another producer or
+//! a reader. Overwritten, superseded and contended records count as loss. Each
+//! slot occupies 40 bytes; the returned record remains 32 bytes.
+
+use crate::clock::Clock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Default number of retained fire slots.
+pub const FIRE_TAP_DEFAULT_CAPACITY: usize = 4096;
+/// How long a reader keeps recording enabled after a request.
+pub const FIRE_TAP_DEFAULT_LEASE: Duration = Duration::from_secs(5);
+/// Maximum records examined by one read, excluding a bulk overwrite gap.
+pub const FIRE_SERVE_MAX: usize = 512;
+const LAST_SEQ: u64 = (u64::MAX - 2) / 2;
+
+/// Ring bounds fixed at construction.
+#[derive(Debug, Clone, Copy)]
+pub struct FireTapConfig {
+    /// Power of two in the inclusive range 64..=65536.
+    pub capacity: usize,
+    /// Nonzero lease representable as a u64 number of nanoseconds.
+    pub lease: Duration,
+}
+impl Default for FireTapConfig {
+    fn default() -> Self {
+        Self {
+            capacity: FIRE_TAP_DEFAULT_CAPACITY,
+            lease: FIRE_TAP_DEFAULT_LEASE,
+        }
+    }
+}
+
+/// Resolved trigger policy. Value 2 is reserved for catch-up.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireCause {
+    /// No known trigger policy.
+    Unknown = 0,
+    /// Periodic trigger.
+    Period = 1,
+    /// Input arrival trigger.
+    Data = 3,
+    /// Synchronized input trigger.
+    Sync = 4,
+    /// External trigger.
+    External = 5,
+}
+impl From<u8> for FireCause {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::Period,
+            3 => Self::Data,
+            4 => Self::Sync,
+            5 => Self::External,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Tick outcome and attribution bits.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FireFlags(pub u8);
+impl FireFlags {
+    /// The tick panicked.
+    pub const PANICKED: u8 = 0x01;
+    /// The tick returned an error.
+    pub const TICK_ERROR: u8 = 0x02;
+    /// Output commits could not be observed.
+    pub const WROTE_UNKNOWN: u8 = 0x04;
+    /// Outputs beyond the 64-bit mask exist.
+    pub const WROTE_TRUNCATED: u8 = 0x08;
+    /// Wall duration exceeded u32 nanoseconds.
+    pub const DURATION_SATURATED: u8 = 0x10;
+    /// More than one input could have triggered the tick.
+    pub const TRIGGER_AMBIGUOUS: u8 = 0x20;
+}
+
+/// One fire, with field order matching the version-one wire row.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FireRecord {
+    /// Tap-wide sequence, starting at 1.
+    pub seq: u64,
+    /// Tick start on the injected runtime clock.
+    pub at_ns: u64,
+    /// Saturated tick wall duration in nanoseconds.
+    pub dur_ns: u32,
+    /// Index into the run topology's node array.
+    pub node: u16,
+    /// Resolved trigger policy.
+    pub cause: FireCause,
+    /// Outcome and attribution bits.
+    pub flags: FireFlags,
+    /// Bit k indicates a commit on output k.
+    pub wrote: u64,
+}
+
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "crate-private producer surface consumed by graph tick instrumentation"
+)]
+pub(crate) struct FireBody {
+    pub at_ns: u64,
+    pub dur_ns: u32,
+    pub node: u16,
+    pub cause: FireCause,
+    pub flags: FireFlags,
+    pub wrote: u64,
+}
+
+/// Where a reader resumes. Independent readers hold independent cursors.
+#[derive(Debug, Clone, Copy)]
+pub enum Cursor {
+    /// Start after all sequences claimed at this request's snapshot.
+    Now,
+    /// Resume strictly after this sequence (0 starts at the first record).
+    After(u64),
+}
+
+/// A cursor page. `records.len() + lost == next - after` for an After request.
+#[derive(Debug)]
+pub struct FireBatch {
+    /// Runtime clock at the request.
+    pub now_ns: u64,
+    /// Runtime clock when the current lease interval began.
+    pub armed_since_ns: u64,
+    /// Last sequence accounted for; pass it to `Cursor::After` unchanged.
+    pub next: u64,
+    /// Overwritten, superseded or contended records in this page's range.
+    pub lost: u64,
+    /// Node indices and nonzero tick-start timestamps, in topology order.
+    pub in_tick: Vec<(u16, u64)>,
+    /// Complete records in strictly increasing sequence order.
+    pub records: Vec<FireRecord>,
+}
+
+/// Current recording state.
+#[derive(Debug, serde::Serialize)]
+pub struct FireTapStats {
+    /// Whether the reader lease is currently live.
+    pub armed: bool,
+    /// Sequences claimed while armed, including records subsequently lost.
+    pub recorded: u64,
+    /// Number of allocated slots.
+    pub capacity: usize,
+}
+
+/// Bounded multi-producer, multi-reader fire telemetry.
+///
+/// Only readers serialize lease-epoch bookkeeping. Producers never acquire
+/// that mutex, allocate, read a clock, or retry a slot claim. All slot words are
+/// sequentially consistent: equal committed stamps surrounding the three data
+/// loads exclude any intervening writer. The claim CAS excludes overlapping
+/// writers even when a producer is lapped while paused.
+pub struct FireTap {
+    slots: Box<[Slot]>,
+    head: AtomicU64,
+    lease_until_ns: AtomicU64,
+    armed_since_ns: Mutex<u64>,
+    lease_ns: u64,
+    in_tick: Box<[Arc<AtomicU64>]>,
+    clock: Arc<dyn Clock>,
+}
+
+#[derive(Default)]
+struct Slot {
+    stamp: AtomicU64,
+    at_ns: AtomicU64,
+    packed: AtomicU64,
+    wrote: AtomicU64,
+    // A dropped claim cannot write the stamp owned by a paused writer. Its
+    // completion watermark lets readers account for that hole without waiting.
+    settled: AtomicU64,
+}
+
+impl FireTap {
+    #[allow(
+        dead_code,
+        reason = "crate-private constructor consumed by graph tap installation"
+    )]
+    pub(crate) fn new(
+        config: FireTapConfig,
+        node_count: u16,
+        in_tick: Vec<Arc<AtomicU64>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        assert!(
+            config.capacity.is_power_of_two() && (64..=65536).contains(&config.capacity),
+            "fire capacity must be a power of two in 64..=65536"
+        );
+        assert_eq!(
+            in_tick.len(),
+            usize::from(node_count),
+            "one in-tick atomic per node"
+        );
+        let lease_ns =
+            u64::try_from(config.lease.as_nanos()).expect("fire lease exceeds u64 nanoseconds");
+        assert_ne!(lease_ns, 0, "fire lease must be nonzero");
+        Self {
+            slots: (0..config.capacity).map(|_| Slot::default()).collect(),
+            head: AtomicU64::new(0),
+            lease_until_ns: AtomicU64::new(0),
+            armed_since_ns: Mutex::new(0),
+            lease_ns,
+            in_tick: in_tick.into_boxed_slice(),
+            clock,
+        }
+    }
+
+    /// The unarmed fast path is one relaxed load and no clock call.
+    #[inline]
+    pub(crate) fn armed_now(&self) -> Option<u64> {
+        let until = self.lease_until_ns.load(Ordering::Relaxed);
+        if until == 0 {
+            return None;
+        }
+        let now = self.clock.now_ns();
+        if now < until {
+            return Some(now);
+        }
+        // A reader's concurrent extension must not be cleared by this expiry.
+        match self
+            .lease_until_ns
+            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Err(extended) if now < extended => Some(now),
+            _ => None,
+        }
+    }
+
+    /// Call after `armed_now` admitted a tick. No clock read is needed again;
+    /// a lease explicitly cleared during that tick suppresses its record.
+    #[allow(
+        dead_code,
+        reason = "crate-private producer consumed by graph tick instrumentation"
+    )]
+    pub(crate) fn push(&self, body: FireBody) {
+        self.push_with(body, |_| {});
+    }
+
+    #[inline]
+    #[allow(
+        dead_code,
+        reason = "shared producer path with a deterministic test scheduling seam"
+    )]
+    fn push_with(&self, body: FireBody, after_claim: impl FnOnce(u64)) {
+        if self.lease_until_ns.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        // Relaxed suffices: head assigns identities, never publishes data. The
+        // theoretical exhaustion case freezes instead of recycling stamp values.
+        let previous = self
+            .head
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |head| {
+                (head < LAST_SEQ).then_some(head + 1)
+            });
+        let Ok(previous) = previous else {
+            return;
+        };
+        let seq = previous + 1;
+        let slot = &self.slots[((seq - 1) as usize) & (self.slots.len() - 1)];
+        let stamp = slot.stamp.load(Ordering::SeqCst);
+        let writing = 2 * seq + 1;
+        if stamp & 1 != 0
+            || stamp >= writing
+            || slot
+                .stamp
+                .compare_exchange(stamp, writing, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            slot.settled.fetch_max(seq, Ordering::Release);
+            return;
+        }
+        after_claim(seq);
+        slot.at_ns.store(body.at_ns, Ordering::SeqCst);
+        let packed = u64::from(body.dur_ns)
+            | (u64::from(body.node) << 32)
+            | ((body.cause as u64) << 48)
+            | (u64::from(body.flags.0) << 56);
+        slot.packed.store(packed, Ordering::SeqCst);
+        slot.wrote.store(body.wrote, Ordering::SeqCst);
+        slot.stamp.store(writing + 1, Ordering::SeqCst);
+        slot.settled.fetch_max(seq, Ordering::Release);
+    }
+
+    /// Arm or extend the lease, then return a bounded page after `cursor`.
+    /// A pending, unsuperseded claim ends the page without advancing its cursor.
+    /// A zero limit arms the lease without consuming any sequence or loss.
+    pub fn serve(&self, cursor: Cursor, max: usize) -> FireBatch {
+        let mut since = self
+            .armed_since_ns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now_ns = self.clock.now_ns();
+        let mut old = self.lease_until_ns.load(Ordering::Relaxed);
+        loop {
+            let until = old.max(now_ns.saturating_add(self.lease_ns));
+            match self.lease_until_ns.compare_exchange_weak(
+                old,
+                until,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    if old == 0 || old <= now_ns {
+                        *since = now_ns;
+                    }
+                    break;
+                }
+                Err(actual) => old = actual,
+            }
+        }
+        let armed_since_ns = *since;
+        drop(since);
+        let head = self.head.load(Ordering::Relaxed);
+        let mut batch = FireBatch {
+            now_ns,
+            armed_since_ns,
+            next: match cursor {
+                Cursor::Now => head,
+                Cursor::After(seq) => seq,
+            },
+            lost: 0,
+            in_tick: self
+                .in_tick
+                .iter()
+                .enumerate()
+                .filter_map(|(node, since)| {
+                    let since = since.load(Ordering::Acquire);
+                    (since != 0).then_some((node as u16, since))
+                })
+                .collect(),
+            records: Vec::with_capacity(max.min(FIRE_SERVE_MAX)),
+        };
+        let max = max.min(FIRE_SERVE_MAX);
+        if max == 0 || batch.next >= head {
+            return batch;
+        }
+        let floor = head.saturating_sub(self.slots.len() as u64);
+        if batch.next < floor {
+            batch.lost = floor - batch.next;
+            batch.next = floor;
+        }
+        for _ in 0..max {
+            if batch.next >= head {
+                break;
+            }
+            let seq = batch.next + 1;
+            let slot = &self.slots[((seq - 1) as usize) & (self.slots.len() - 1)];
+            // Acquire BEFORE the stamp: observing a completed claim must also
+            // observe its commit, not misclassify a stale stamp as dropped.
+            let settled = slot.settled.load(Ordering::Acquire);
+            let stamp = slot.stamp.load(Ordering::SeqCst);
+            let committed = 2 * seq + 2;
+            if stamp == committed {
+                let at_ns = slot.at_ns.load(Ordering::SeqCst);
+                let packed = slot.packed.load(Ordering::SeqCst);
+                let wrote = slot.wrote.load(Ordering::SeqCst);
+                if slot.stamp.load(Ordering::SeqCst) == committed {
+                    batch.records.push(FireRecord {
+                        seq,
+                        at_ns,
+                        dur_ns: packed as u32,
+                        node: (packed >> 32) as u16,
+                        cause: FireCause::from((packed >> 48) as u8),
+                        flags: FireFlags((packed >> 56) as u8),
+                        wrote,
+                    });
+                } else {
+                    batch.lost += 1;
+                }
+            } else if stamp > committed || settled >= seq {
+                batch.lost += 1;
+            } else {
+                break;
+            }
+            batch.next = seq;
+        }
+        batch
+    }
+
+    /// Sample lease state and the number of assigned sequences.
+    pub fn stats(&self) -> FireTapStats {
+        FireTapStats {
+            armed: self.armed_now().is_some(),
+            recorded: self.head.load(Ordering::Relaxed),
+            capacity: self.slots.len(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Clock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct CountingClock {
+        now: AtomicU64,
+        reads: AtomicU64,
+    }
+    impl Clock for CountingClock {
+        fn now_ns(&self) -> u64 {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.now.load(Ordering::Relaxed)
+        }
+    }
+
+    fn tap(capacity: usize) -> (FireTap, Arc<CountingClock>) {
+        let clock = Arc::new(CountingClock::default());
+        let tap = FireTap::new(
+            FireTapConfig {
+                capacity,
+                lease: Duration::from_nanos(100),
+            },
+            4,
+            (0..4).map(|_| Arc::new(AtomicU64::new(0))).collect(),
+            clock.clone(),
+        );
+        (tap, clock)
+    }
+
+    fn body(id: u64) -> FireBody {
+        FireBody {
+            at_ns: id,
+            dur_ns: (id as u32) ^ 0xa55a1234,
+            node: (id % 4) as u16,
+            cause: FireCause::Data,
+            flags: FireFlags(FireFlags::TICK_ERROR | FireFlags::WROTE_TRUNCATED),
+            wrote: !id,
+        }
+    }
+
+    fn assert_body(record: &FireRecord) {
+        assert_eq!(record.dur_ns, (record.at_ns as u32) ^ 0xa55a1234);
+        assert_eq!(record.node, (record.at_ns % 4) as u16);
+        assert_eq!(record.cause, FireCause::Data);
+        assert_eq!(record.flags.0, 0x0a);
+        assert_eq!(record.wrote, !record.at_ns);
+    }
+
+    #[test]
+    fn lease_arms_extends_expires_and_disarmed_reads_no_clock() {
+        let (tap, clock) = tap(64);
+        assert_eq!(tap.armed_now(), None);
+        tap.push(body(0));
+        assert_eq!(clock.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(tap.stats().recorded, 0);
+        let initial = tap.serve(Cursor::Now, 512);
+        assert_eq!(initial.next, 0);
+        assert_eq!(initial.armed_since_ns, 0);
+        assert_eq!(tap.armed_now(), Some(0));
+        clock.now.store(99, Ordering::Relaxed);
+        tap.serve(Cursor::After(0), 512);
+        clock.now.store(100, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), Some(100));
+        clock.now.store(199, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), None);
+        let reads = clock.reads.load(Ordering::Relaxed);
+        tap.push(body(1));
+        assert_eq!(tap.armed_now(), None);
+        assert_eq!(clock.reads.load(Ordering::Relaxed), reads);
+        assert_eq!(tap.stats().recorded, 0);
+        clock.now.store(200, Ordering::Relaxed);
+        assert_eq!(tap.serve(Cursor::Now, 0).armed_since_ns, 200);
+    }
+
+    #[test]
+    fn overwrite_loss_and_inclusive_cursor_are_exact() {
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 512);
+        for id in 0..100 {
+            tap.push(body(id));
+        }
+        let batch = tap.serve(Cursor::After(0), 512);
+        assert_eq!(batch.lost, 36);
+        assert_eq!(batch.next, 100);
+        assert_eq!(batch.records.len(), 64);
+        for (id, record) in (36..100).zip(&batch.records) {
+            assert_eq!(record.seq, id + 1);
+            assert_eq!(record.at_ns, id);
+            assert_body(record);
+        }
+        let again = tap.serve(Cursor::After(0), 512);
+        assert_eq!(again.records, batch.records);
+        assert!(tap.serve(Cursor::After(batch.next), 512).records.is_empty());
+        assert!(tap.serve(Cursor::Now, 512).records.is_empty());
+    }
+
+    #[test]
+    fn page_limit_zero_and_future_cursor_do_not_skip_records() {
+        let (tap, _) = tap(1024);
+        tap.serve(Cursor::Now, 0);
+        for id in 0..600 {
+            tap.push(body(id));
+        }
+        let zero = tap.serve(Cursor::After(0), 0);
+        assert_eq!(zero.next, 0);
+        assert_eq!(zero.lost, 0);
+        let page = tap.serve(Cursor::After(0), usize::MAX);
+        assert_eq!(page.records.len(), 512);
+        assert_eq!(page.next, 512);
+        let tail = tap.serve(Cursor::After(page.next), 512);
+        assert_eq!(tail.records.len(), 88);
+        assert_eq!(tail.next, 600);
+        let future = tap.serve(Cursor::After(u64::MAX), 512);
+        assert!(future.records.is_empty());
+        assert_eq!(future.next, u64::MAX);
+    }
+
+    #[test]
+    fn in_tick_reports_only_nonzero_nodes() {
+        let (tap, _) = tap(64);
+        tap.in_tick[2].store(42, Ordering::Release);
+        assert_eq!(tap.serve(Cursor::Now, 0).in_tick, vec![(2, 42)]);
+        tap.in_tick[2].store(0, Ordering::Release);
+        assert!(tap.serve(Cursor::Now, 0).in_tick.is_empty());
+    }
+
+    #[test]
+    fn pack_round_trip_and_record_size() {
+        assert_eq!(std::mem::size_of::<FireRecord>(), 32);
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        for cause in [
+            FireCause::Unknown,
+            FireCause::Period,
+            FireCause::Data,
+            FireCause::Sync,
+            FireCause::External,
+        ] {
+            tap.push(FireBody {
+                at_ns: u64::MAX,
+                dur_ns: u32::MAX,
+                node: 3,
+                cause,
+                flags: FireFlags(0xff),
+                wrote: u64::MAX,
+            });
+        }
+        let batch = tap.serve(Cursor::After(0), 512);
+        assert_eq!(batch.records.len(), 5);
+        for (record, cause) in batch.records.iter().zip([0, 1, 3, 4, 5]) {
+            assert_eq!(record.at_ns, u64::MAX);
+            assert_eq!(record.dur_ns, u32::MAX);
+            assert_eq!(record.node, 3);
+            assert_eq!(record.cause as u8, cause);
+            assert_eq!(record.flags.0, 0xff);
+            assert_eq!(record.wrote, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn four_producers_two_readers_one_million_pushes() {
+        const TOTAL: u64 = 1_000_000;
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let barrier = Barrier::new(6);
+        let oracle: Vec<_> = (0..TOTAL).map(|_| AtomicU64::new(u64::MAX)).collect();
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let mut cursor = 0;
+                        let mut served = 0;
+                        let mut lost = 0;
+                        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                        while cursor < TOTAL {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "reader stuck at {cursor}"
+                            );
+                            let batch = tap.serve(Cursor::After(cursor), 23);
+                            assert_eq!(
+                                batch.records.len() as u64 + batch.lost,
+                                batch.next - cursor
+                            );
+                            let mut previous = cursor;
+                            for record in &batch.records {
+                                assert!(record.seq > previous);
+                                assert!(record.at_ns < TOTAL);
+                                assert_body(record);
+                                assert_eq!(
+                                    record.at_ns,
+                                    oracle[record.seq as usize - 1].load(Ordering::Relaxed)
+                                );
+                                previous = record.seq;
+                            }
+                            served += batch.records.len() as u64;
+                            lost += batch.lost;
+                            cursor = batch.next;
+                            std::thread::yield_now();
+                        }
+                        assert_eq!(served + lost, TOTAL);
+                        assert!(served > 0);
+                        (served, lost)
+                    })
+                })
+                .collect();
+            let tap = &tap;
+            let barrier = &barrier;
+            let oracle = &oracle;
+            let producers: Vec<_> = (0..4)
+                .map(|producer| {
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for id in (producer..TOTAL).step_by(4) {
+                            tap.push_with(body(id), |seq| {
+                                oracle[seq as usize - 1].store(id, Ordering::Relaxed)
+                            });
+                            if id % 256 < 4 {
+                                std::thread::yield_now();
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for producer in producers {
+                producer.join().unwrap();
+            }
+            for reader in readers {
+                let (served, lost) = reader.join().unwrap();
+                eprintln!("fire_tap stress: served={served}, lost={lost}, total={TOTAL}");
+            }
+        });
+        assert_eq!(tap.stats().recorded, TOTAL);
+    }
+    #[test]
+    fn pending_claim_stops_then_lapped_dropped_tail_is_accounted() {
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (pending, lapped) = std::thread::scope(|scope| {
+            let tap_ref = &tap;
+            scope.spawn(move || {
+                tap_ref.push_with(body(0), |seq| {
+                    claimed_tx.send(seq).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+            });
+            let claimed = claimed_rx.recv().unwrap();
+            tap.push(body(1));
+            let pending = tap.serve(Cursor::After(0), 512);
+            for id in 2..65 {
+                tap.push(body(id));
+            }
+            let lapped = tap.serve(Cursor::After(0), 512);
+            resume_tx.send(()).unwrap();
+            assert_eq!(claimed, 1);
+            (pending, lapped)
+        });
+        assert_eq!(
+            (pending.next, pending.lost, pending.records.len()),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (lapped.next, lapped.lost, lapped.records.len()),
+            (65, 2, 63)
+        );
+        for (id, record) in (1..64).zip(&lapped.records) {
+            assert_eq!(record.seq, id + 1);
+            assert_eq!(record.at_ns, id);
+            assert_body(record);
+        }
+        assert!(tap.serve(Cursor::After(65), 512).records.is_empty());
+        tap.push(body(65));
+        let next = tap.serve(Cursor::After(65), 512);
+        assert_eq!(next.records[0].at_ns, 65);
+        assert_eq!(next.next, 66);
+        assert_eq!(next.lost, 0);
+    }
+
+    #[test]
+    fn eight_producers_forced_wraparound_never_tear_or_stall() {
+        const EACH: u64 = 10_000;
+        const TOTAL: u64 = 1 + 7 * EACH;
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let oracle: Vec<_> = (0..TOTAL).map(|_| AtomicU64::new(u64::MAX)).collect();
+        let barrier = Barrier::new(9);
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let tap = &tap;
+            let oracle = &oracle;
+            let barrier = &barrier;
+            let stalled = scope.spawn(move || {
+                tap.push_with(body(0), |seq| {
+                    oracle[seq as usize - 1].store(0, Ordering::Relaxed);
+                    claimed_tx.send(seq).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+            });
+            assert_eq!(claimed_rx.recv().unwrap(), 1);
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let mut cursor = 0;
+                        let mut served = 0;
+                        let mut lost = 0;
+                        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                        while cursor < TOTAL {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "dropped sequence stalled reader at {cursor}"
+                            );
+                            let batch = tap.serve(Cursor::After(cursor), 31);
+                            assert_eq!(
+                                batch.records.len() as u64 + batch.lost,
+                                batch.next - cursor
+                            );
+                            let mut previous = cursor;
+                            for record in &batch.records {
+                                assert!(record.seq > previous);
+                                assert_eq!(
+                                    record.at_ns,
+                                    oracle[record.seq as usize - 1].load(Ordering::Relaxed)
+                                );
+                                assert_body(record);
+                                previous = record.seq;
+                            }
+                            served += batch.records.len() as u64;
+                            lost += batch.lost;
+                            cursor = batch.next;
+                            std::thread::yield_now();
+                        }
+                        assert_eq!(served + lost, TOTAL);
+                        assert!(lost > 0);
+                        eprintln!(
+                            "fire_tap forced lapping: served={served}, lost={lost}, total={TOTAL}"
+                        );
+                    })
+                })
+                .collect();
+            let producers: Vec<_> = (0..7)
+                .map(|producer| {
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for id in (1 + producer * EACH)..(1 + (producer + 1) * EACH) {
+                            tap.push_with(body(id), |seq| {
+                                oracle[seq as usize - 1].store(id, Ordering::Relaxed)
+                            });
+                            if id % 256 < 4 {
+                                std::thread::yield_now();
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for producer in producers {
+                producer.join().unwrap();
+            }
+            // Always release the paused producer even if a reader assertion fails.
+            let results: Vec<_> = readers.into_iter().map(|reader| reader.join()).collect();
+            resume_tx.send(()).unwrap();
+            stalled.join().unwrap();
+            for result in results {
+                result.unwrap();
+            }
+        });
+        assert_eq!(tap.stats().recorded, TOTAL);
+    }
+
+    #[test]
+    fn configuration_rejects_invalid_bounds_and_matches_default() {
+        let defaults = FireTapConfig::default();
+        assert_eq!(defaults.capacity, 4096);
+        assert_eq!(defaults.lease, Duration::from_secs(5));
+        assert_eq!(std::mem::size_of::<Slot>(), 40);
+        for capacity in [0, 1, 63, 65, 131072] {
+            assert!(std::panic::catch_unwind(|| tap(capacity)).is_err());
+        }
+        for lease in [Duration::ZERO, Duration::MAX] {
+            assert!(std::panic::catch_unwind(|| FireTap::new(
+                FireTapConfig {
+                    capacity: 64,
+                    lease
+                },
+                0,
+                vec![],
+                Arc::new(CountingClock::default())
+            ))
+            .is_err());
+        }
+        assert!(std::panic::catch_unwind(|| FireTap::new(
+            defaults,
+            1,
+            vec![],
+            Arc::new(CountingClock::default())
+        ))
+        .is_err());
+        assert_eq!(tap(65536).0.stats().capacity, 65536);
+    }
+
+    #[test]
+    fn expiry_cannot_erase_a_concurrent_reader_extension() {
+        struct PausingClock {
+            now: AtomicU64,
+            pause: std::sync::atomic::AtomicBool,
+            arrived: std::sync::mpsc::SyncSender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Clock for PausingClock {
+            fn now_ns(&self) -> u64 {
+                let now = self.now.load(Ordering::Relaxed);
+                if self.pause.swap(false, Ordering::Relaxed) {
+                    self.arrived.send(()).unwrap();
+                    self.resume.lock().unwrap().recv().unwrap();
+                }
+                now
+            }
+        }
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let clock = Arc::new(PausingClock {
+            now: AtomicU64::new(0),
+            pause: std::sync::atomic::AtomicBool::new(false),
+            arrived: arrived_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        let tap = FireTap::new(
+            FireTapConfig {
+                capacity: 64,
+                lease: Duration::from_nanos(100),
+            },
+            0,
+            vec![],
+            clock.clone(),
+        );
+        tap.serve(Cursor::Now, 0);
+        clock.now.store(100, Ordering::Relaxed);
+        clock.pause.store(true, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            let expiry = scope.spawn(|| tap.armed_now());
+            arrived_rx.recv().unwrap();
+            clock.now.store(150, Ordering::Relaxed);
+            let extension = tap.serve(Cursor::Now, 0);
+            resume_tx.send(()).unwrap();
+            assert_eq!(expiry.join().unwrap(), Some(100));
+            assert_eq!(extension.armed_since_ns, 150);
+        });
+        clock.now.store(249, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), Some(249));
+        clock.now.store(250, Ordering::Relaxed);
+        assert_eq!(tap.armed_now(), None);
+    }
+
+    #[test]
+    fn sequence_exhaustion_freezes_without_stamp_reuse() {
+        let (tap, _) = tap(64);
+        tap.head.store(LAST_SEQ - 1, Ordering::Relaxed);
+        tap.serve(Cursor::Now, 0);
+        tap.push(body(7));
+        tap.push(body(8));
+        let batch = tap.serve(Cursor::After(LAST_SEQ - 1), 512);
+        assert_eq!(batch.next, LAST_SEQ);
+        assert_eq!(batch.lost, 0);
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].at_ns, 7);
+        assert_eq!(tap.stats().recorded, LAST_SEQ);
+    }
+
+    thread_local! {
+        static ALLOCATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    struct CountingAllocator;
+
+    // SAFETY: every allocation is delegated unchanged to System; the counter is
+    // const-initialized TLS without allocation or a destructor.
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| {
+                if let Some(value) = count.get() {
+                    count.set(Some(value + 1));
+                }
+            });
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    #[test]
+    fn push_allocates_nothing_and_reads_no_clock() {
+        let (tap, clock) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let reads = clock.reads.load(Ordering::Relaxed);
+        ALLOCATIONS.set(Some(0));
+        for id in 0..10_000 {
+            tap.push(body(id));
+        }
+        let allocations = ALLOCATIONS.replace(None).unwrap();
+        assert_eq!(allocations, 0);
+        assert_eq!(clock.reads.load(Ordering::Relaxed), reads);
+        assert_eq!(tap.stats().recorded, 10_000);
+
+        ALLOCATIONS.set(Some(0));
+        std::hint::black_box(Box::new(7_u64));
+        let allocations = ALLOCATIONS.replace(None).unwrap();
+        assert_eq!(allocations, 1, "allocation counter positive control");
+        ALLOCATIONS.set(Some(0));
+        assert_eq!(ALLOCATIONS.replace(None), Some(0));
+    }
+}
