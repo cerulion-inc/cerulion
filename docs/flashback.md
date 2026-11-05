@@ -52,10 +52,13 @@ provisions the scheduler-trace rings**, whether or not you asked it to record.
 Requiring `--record` in advance would be exactly backwards, because the runs
 you most want to re-run are the ones nobody expected to go wrong.
 
-Some run shapes mint no ring: a single-process run, `cerulion ros2 attach`,
-`cerulion node run`, or a virtual or external time source. They still take
-captures, and those captures are frames-only. Each capture records which of the
-two it is; see [Limitations](#limitations).
+Some run shapes mint no ring: a single-process run of a graph that is one
+executor unit, `cerulion ros2 attach`, `cerulion node run`, or a virtual or
+external time source. They still take captures, and those captures are
+frames-only. A `--single-process` run of a graph whose nodes split into several
+units runs them in one worker process, which mints the rings like any
+multi-process run and takes no checkpoints, since it hosts several units. Each
+capture records which of the two it is; see [Limitations](#limitations).
 
 ---
 
@@ -148,6 +151,17 @@ trace rings held nothing yet because its nodes had not fired inside the window,
 or that the capture's trace retention hit its byte ceiling
 (`CERULION_FLASHBACK_TRACE_MAX_MB`, 64 MiB).
 
+A capture's trace ends at the last step each rank finished recording: a step
+is kept only when the trace also holds that rank's next step boundary, so a
+capture taken while a step was running never holds an output whose read record
+it lacks. A step that shares the final step's gating-clock target is removed
+with it, because their frames carry one stamp. `handoff.trace_end_cut` says how
+many steps this removed. Their frames stay in the bag at their own step's
+target, after the covered range (`anchor.resim_covered_through_ns`), and
+`bag play --resim --verify` reports them as trailing rather than comparing
+them. A capture that leaves some rank with no complete step while another rank
+keeps one is not resimmable, and `anchor.resimmable_reason` names the rank.
+
 ---
 
 ## Watching a live run from outside
@@ -238,10 +252,11 @@ things, and neither is a spelling of the other.
 recording carries the scheduler trace that makes it re-executable.
 
 On the shapes that mint no ring anyway it is **not** a no-op, and the launch
-line says which it is. On `--single-process`, `ros2 attach`, `node run` and
-`--time-source external` it still stops the window recorder, so the run takes
-no captures. Two shapes are true no-ops. A `--time-source virtual` MONOLITH
-starts no recorder either way (though a `virtual` run of a `process_groups:`
+line says which it is. On a `--single-process` run of a graph that is one
+executor unit, `ros2 attach`, `node run` and `--time-source external` it still
+stops the window recorder, so the run takes no captures. Two shapes are true
+no-ops. A `--time-source virtual` MONOLITH starts no recorder either way
+(though a `virtual` run of a `process_groups:`
 graph still goes multi-process, and the supervisor's recorder gate has no clock
 term, so there the flag bites like anywhere else). And on a NON-UNIX build the
 recorder and the run directory are compiled out and `cerulion flashback` refuses
@@ -304,17 +319,21 @@ treat the convergence *rate* as unmeasured.
 
 ## Limitations
 
-**Single-process runs take captures that cannot be re-run.** A monolith shape
-(`--single-process`, `cerulion ros2 attach`, `cerulion node run`, or
-`--time-source external`) mints no trace ring, deliberately: its gating clock
-is wall-driven, so a trace taken there would carry step boundaries a resim
+**A single-process monolith takes captures that cannot be re-run.** A monolith
+shape (`--single-process` on a graph that is one executor unit,
+`cerulion ros2 attach`, `cerulion node run`, or `--time-source external`) mints
+no trace ring, deliberately: its gating clock is wall-driven, so a trace taken
+there would carry step boundaries a resim
 cannot re-advance to, and the capture would claim to be re-runnable when it is
 not. Such a capture says, in its own words, that it holds no trace.
 (A `--time-source virtual` MONOLITH is different again: it starts
 no window recorder, so it takes no captures rather than un-runnable ones. A
 partitioned graph under `virtual` still routes to the supervisor and does take
-them.) A `--single-process --record` run is the one monolith exception that DOES
-create a rank-0 ring: its recorder is handed both the ring and the window.
+them.) A `--single-process --record` run of a graph that is one executor unit
+is the one monolith exception that DOES create a rank-0 ring: its recorder is
+handed both the ring and the window. A `--single-process` run of a graph whose
+nodes split into several executor units is not a monolith: its one worker
+process mints the rings like any multi-process run.
 
 **A capture taken on a machine with other live topics may be refused by
 `--resim`.** A capture records what is LIVE, and it does not

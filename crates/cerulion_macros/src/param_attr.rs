@@ -31,6 +31,7 @@
 //! / `__cer_apply_params` methods on the user struct that write the resolved
 //! values into the fields before the node's `init` runs.
 
+use crate::crate_root;
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::quote;
 use syn::ext::IdentExt;
@@ -251,7 +252,8 @@ impl ParamLit {
     /// The literal as a `ParamValue` expression of the canonical variant
     /// for `kind`: unsigned kinds carry `UInt`, signed kinds `Int`.
     fn param_value_tokens(&self, kind: ParamKind) -> TokenStream {
-        let root = quote! { ::cerulion_core::graph::params::ParamValue };
+        let __cer_root = crate_root::root();
+        let root = quote! { #__cer_root::graph::params::ParamValue };
         match self {
             Self::Bool(b) => quote! { #root::Bool(#b) },
             Self::Str(s) => quote! { #root::Str(::std::string::String::from(#s)) },
@@ -665,6 +667,7 @@ pub fn validate_params_are_not_ports(
 
 /// `ParamSpec` expressions for the in-process `NodeInfo::with_params(vec![..])`.
 pub fn gen_spec_exprs(params: &[ParamAttr]) -> Vec<TokenStream> {
+    let __cer_root = crate_root::root();
     params
         .iter()
         .map(|p| {
@@ -685,9 +688,9 @@ pub fn gen_spec_exprs(params: &[ParamAttr]) -> Vec<TokenStream> {
                 None => quote! { ::std::option::Option::None },
             };
             quote! {
-                ::cerulion_core::graph::params::ParamSpec {
+                #__cer_root::graph::params::ParamSpec {
                     name: ::std::string::String::from(#name),
-                    ty: ::cerulion_core::graph::params::ParamType::#variant,
+                    ty: #__cer_root::graph::params::ParamType::#variant,
                     default: #default,
                     min: #min,
                     max: #max,
@@ -773,6 +776,7 @@ pub fn gen_apply_impl(
     where_clause: Option<&syn::WhereClause>,
     params: &[ParamAttr],
 ) -> TokenStream {
+    let __cer_root = crate_root::root();
     let default_writes: Vec<TokenStream> = params
         .iter()
         .map(|p| {
@@ -790,7 +794,7 @@ pub fn gen_apply_impl(
             let ty_name = p.kind.as_str();
             quote! {
                 #name => {
-                    self.#field = <#ty as ::cerulion_core::graph::params::FromParamValue>
+                    self.#field = <#ty as #__cer_root::graph::params::FromParamValue>
                         ::from_param_value(__cer_value)
                         .ok_or_else(|| ::std::format!(
                             "param '{}' expects {}, got {}", #name, #ty_name, __cer_value,
@@ -799,7 +803,7 @@ pub fn gen_apply_impl(
             }
         })
         .collect();
-    let root = quote! { ::cerulion_core::graph::params::ParamValue };
+    let root = quote! { #__cer_root::graph::params::ParamValue };
     let snapshot_entries: Vec<TokenStream> = params
         .iter()
         .map(|p| {
@@ -866,7 +870,7 @@ pub fn gen_apply_impl(
             /// right after the graph's values are written: the values the
             /// node must hold for the whole run.
             #[doc(hidden)]
-            pub fn __cer_param_values(&self) -> ::cerulion_core::graph::params::ParamValues {
+            pub fn __cer_param_values(&self) -> #__cer_root::graph::params::ParamValues {
                 [#(#snapshot_entries),*].into_iter().collect()
             }
 
@@ -880,7 +884,7 @@ pub fn gen_apply_impl(
             #[allow(unused_variables)]
             pub fn __cer_changed_param(
                 &self,
-                __cer_at_init: &::cerulion_core::graph::params::ParamValues,
+                __cer_at_init: &#__cer_root::graph::params::ParamValues,
             ) -> ::std::option::Option<&'static str> {
                 #(#change_checks)*
                 ::std::option::Option::None
@@ -899,7 +903,7 @@ pub fn gen_apply_impl(
             #[doc(hidden)]
             pub fn __cer_apply_params(
                 &mut self,
-                __cer_values: &::cerulion_core::graph::params::ParamValues,
+                __cer_values: &#__cer_root::graph::params::ParamValues,
             ) -> ::std::result::Result<(), ::std::string::String> {
                 for (__cer_name, __cer_value) in __cer_values {
                     match __cer_name.as_str() {

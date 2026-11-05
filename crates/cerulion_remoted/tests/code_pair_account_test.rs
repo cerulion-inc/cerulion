@@ -160,7 +160,7 @@ fn guest_cannot_name_owner_and_a_later_strong_owner_pair_cannot_elevate_guest() 
         KeyAccess::Unpaired
     );
     let store = fixture.store();
-    let row = store.is_allowed(&OWNER, NOW).unwrap();
+    let row = store.account_access(&OWNER, NOW).unwrap();
     assert_eq!(row.scope, Scope::OWNER_FULL);
     assert_eq!(row.source, PairingSource::Claim);
 
@@ -176,7 +176,7 @@ fn guest_cannot_name_owner_and_a_later_strong_owner_pair_cannot_elevate_guest() 
     );
     assert_eq!(fixture.binding(4), Some(guest));
     assert_eq!(
-        fixture.store().is_allowed(&guest, NOW).unwrap().scope,
+        fixture.store().account_access(&guest, NOW).unwrap().scope,
         Scope::CODE_PAIR_DEFAULT
     );
 
@@ -223,7 +223,7 @@ fn bare_cloud_account_and_other_devices_confirmation_cannot_enroll_a_guest() {
         .is_err());
     assert_eq!(fixture.binding(4), None);
     assert_eq!(fixture.binding(7), None);
-    assert!(fixture.store().is_allowed(&cloud, NOW).is_none());
+    assert!(fixture.store().account_access(&cloud, NOW).is_none());
 }
 
 #[test]
@@ -250,6 +250,6 @@ fn self_account_still_requires_authenticated_caller_and_valid_code_confirmation(
     assert_eq!(fixture.binding(4), None);
     assert!(fixture
         .store()
-        .is_allowed(&AccountId(public(4).0), NOW)
+        .account_access(&AccountId(public(4).0), NOW)
         .is_none());
 }

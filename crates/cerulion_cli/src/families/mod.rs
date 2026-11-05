@@ -27,10 +27,11 @@ use std::process::ExitCode;
 
 use clap::{ArgMatches, Command, CommandFactory};
 
-use cerulion_cli_engine::error::{render_user_error, CliResult};
+use cerulion_cli_engine::error::{render_user_error, CliError, CliResult};
 
 use crate::cli::{Cli, VerbLogClass};
 
+mod doctor;
 mod nested;
 mod schema;
 
@@ -63,7 +64,7 @@ pub(crate) trait VerbFamily: Sync {
 }
 
 /// Every registered family. Adding a family is one line here.
-pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema];
+pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema, &doctor::Doctor];
 
 /// Why a set of families cannot be registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +126,10 @@ pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", render_user_error(&e));
+            // The worker process already printed this verdict's `Error:` line.
+            if !matches!(e, CliError::WorkerNodeFatalAnnounced) {
+                eprintln!("Error: {}", render_user_error(&e));
+            }
             ExitCode::from(crate::cli_error_exit_code(&e))
         }
     }

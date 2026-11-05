@@ -48,6 +48,7 @@ use rmw_cerulion::heaphook::{
     HookApi, TestHookGuard, RC_ERR_ALREADY_ARMED, RC_ERR_NOT_ARMED, RC_OK,
 };
 use rmw_cerulion::runtime::PublisherData;
+use rmw_cerulion::test_seams::capture_output_hash;
 use rmw_cerulion::*;
 
 const ROS_TYPE_FLOAT: u8 = 1;
@@ -630,6 +631,67 @@ fn windowed_borrow_adopts_the_fill_and_publishes_zero_copy() {
         );
         assert_eq!(payload2, expected2, "second frame vs its own hand oracle");
         assert_eq!((*pdata).borrow_adopted_count(), 2);
+    }
+}
+
+/// Delivery log / replay compare a publish by the hash of its body. A
+/// windowed frame ships dead gap bytes (here an allocation inside the window
+/// that the fill does not own) and places the payload where the fill left
+/// it, so the hash is taken over the message's packed encoding: two zero-copy
+/// publishes of one message with different gap contents, and a copying
+/// publish of it, capture one hash.
+#[test]
+#[serial]
+fn a_windowed_publish_is_hashed_by_its_message_not_its_gap_bytes() {
+    reset_fake();
+    let _hook = TestHookGuard::install(fake_hook_api());
+    unsafe {
+        let (publisher, subscription, pdata) = setup_pair("hash");
+        let ranges = [1.5f32, -2.25, 3.0];
+        let frame_id = "lidar_link";
+        let mut hashes = Vec::new();
+        for garbage in [0xABu8, 0x5C] {
+            let mut msg: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                rmw_borrow_loaned_message(publisher, ts_ptr(), &mut msg),
+                RMW_RET_OK
+            );
+            let junk = fake_bump(48, 16).expect("the incidental allocation fits the window");
+            std::ptr::write_bytes(junk as *mut u8, garbage, 48);
+            fill_adopted(msg, -0.75, &ranges, frame_id);
+            let (ret, hash) = capture_output_hash(|| {
+                rmw_publish_loaned_message(publisher, msg, std::ptr::null_mut())
+            });
+            assert_eq!(ret, RMW_RET_OK);
+            let (_, payload) = take_raw(subscription);
+            assert!(
+                payload.windows(48).any(|w| w.iter().all(|&b| b == garbage)),
+                "the frame ships the gap bytes (the case under test)"
+            );
+            hashes.push(hash.expect("a windowed publish captures its body"));
+        }
+        assert_eq!(
+            (*pdata).borrow_adopted_count(),
+            2,
+            "both publishes were zero copy"
+        );
+        let mut plain: CScanish = std::mem::zeroed();
+        let plain_ptr = &mut plain as *mut CScanish as *mut c_void;
+        fill_escaped(plain_ptr, -0.75, &ranges, frame_id);
+        let (ret, copied) =
+            capture_output_hash(|| rmw_publish(publisher, plain_ptr, std::ptr::null_mut()));
+        assert_eq!(ret, RMW_RET_OK);
+        let _ = take_raw(subscription);
+        scanish_fini(plain_ptr);
+        let copied = copied.expect("a copying publish captures its body");
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the gap contents do not change the hash"
+        );
+        assert_eq!(
+            hashes[0], copied,
+            "a windowed publish hashes what a copying publish of the message sends"
+        );
     }
 }
 
