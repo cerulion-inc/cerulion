@@ -168,7 +168,7 @@ fn decide(answer: &str, ask: &str) -> String {
         326.0,
         8.0,
     );
-    format!("{} {look:?}", parsed.ask_id)
+    format!("{} {look:?}", parsed.ask_id())
 }
 
 /// The ask frame `ask` with its frame's `seq` one higher: the same id,
@@ -248,7 +248,7 @@ impl Gate {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
+async fn the_eye_records_answers_that_serve_back_and_verify_byte_for_byte() {
     let logs = install_logs();
     let stub = Stub::start(scripted).await;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -352,7 +352,7 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         .map(|(ask, a)| {
             EyeAnswer::parse(a, ask)
                 .expect("parse")
-                .outcome
+                .outcome()
                 .as_str()
                 .to_owned()
         })

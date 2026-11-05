@@ -57,7 +57,7 @@ fn ask(id: u64, case: u64, seq: u32, deadline_ms: u64) -> String {
 /// is taken as the eye thread takes it ([`Completed::taken_at`]).
 async fn look(core: &mut EyeCore, client: &Arc<JevClient>, text: &str) -> (Answer, Option<Answer>) {
     let now = Instant::now();
-    match core.admit(text, now, now, &frames()) {
+    match core.admit(text, now, now, now, &frames()) {
         Admit::Answer(answer) => (*answer, None),
         Admit::Send(dispatch) => {
             let (tx, rx) = mpsc::channel();
@@ -264,7 +264,7 @@ async fn a_timed_out_request_keeps_its_in_flight_slot_until_its_late_reply() {
     let mut tasks = Vec::new();
     // Two requests whose replies take 600 ms, against a 200 ms deadline.
     for id in 1..=2 {
-        let Admit::Send(dispatch) = core.admit(&ask(id, 13, 1, 200), now, now, &store) else {
+        let Admit::Send(dispatch) = core.admit(&ask(id, 13, 1, 200), now, now, now, &store) else {
             panic!("request {id} is sent");
         };
         tasks.push(tokio::spawn(request(
@@ -284,7 +284,7 @@ async fn a_timed_out_request_keeps_its_in_flight_slot_until_its_late_reply() {
     // throttled for the in-flight limit.
     assert_eq!(core.in_flight().count(), 2);
     let later = Instant::now();
-    let Admit::Answer(third) = core.admit(&ask(3, 0, 1, 1_500), later, later, &store) else {
+    let Admit::Answer(third) = core.admit(&ask(3, 0, 1, 1_500), later, later, later, &store) else {
         panic!("the third request must be refused");
     };
     assert_eq!(
@@ -304,7 +304,7 @@ async fn a_timed_out_request_keeps_its_in_flight_slot_until_its_late_reply() {
     assert_eq!(core.in_flight().count(), 0);
     let after = Instant::now();
     assert!(matches!(
-        core.admit(&ask(4, 0, 1, 1_500), after, after, &store),
+        core.admit(&ask(4, 0, 1, 1_500), after, after, after, &store),
         Admit::Send(_)
     ));
     assert_eq!(stub.count(), 2, "only the two slow requests were sent");
@@ -315,7 +315,7 @@ async fn a_reply_taken_at_its_deadline_is_a_timeout_and_the_reply_is_late() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut core, _client) = core(dir.path(), "http://127.0.0.1:9/api/v1");
     let now = Instant::now();
-    let Admit::Send(dispatch) = core.admit(&ask(1, 0, 1, 200), now, now, &frames()) else {
+    let Admit::Send(dispatch) = core.admit(&ask(1, 0, 1, 200), now, now, now, &frames()) else {
         panic!("the request is sent");
     };
     let mut reply = dispatch.prepared.answer(Outcome::Ok, None, Some(5));
@@ -400,7 +400,7 @@ async fn a_spend_limit_holds_every_look_until_midnight_utc() {
     let store = frames();
     let after = now + Duration::from_secs(2);
     assert!(matches!(
-        fresh.admit(&ask(3, 0, 1, 1_500), after, after, &store),
+        fresh.admit(&ask(3, 0, 1, 1_500), after, after, after, &store),
         Admit::Send(_)
     ));
 }
@@ -413,10 +413,10 @@ async fn the_rate_and_in_flight_limits_refuse_before_any_request() {
     let now = Instant::now();
     let store = frames();
     // Two requests held in flight: the third is throttled.
-    let first = core.admit(&ask(1, 0, 1, 1_500), now, now, &store);
-    let second = core.admit(&ask(2, 0, 1, 1_500), now, now, &store);
+    let first = core.admit(&ask(1, 0, 1, 1_500), now, now, now, &store);
+    let second = core.admit(&ask(2, 0, 1, 1_500), now, now, now, &store);
     assert!(matches!(first, Admit::Send(_)) && matches!(second, Admit::Send(_)));
-    let Admit::Answer(third) = core.admit(&ask(3, 0, 1, 1_500), now, now, &store) else {
+    let Admit::Answer(third) = core.admit(&ask(3, 0, 1, 1_500), now, now, now, &store) else {
         panic!("the third request must be refused");
     };
     assert_eq!(
@@ -428,7 +428,7 @@ async fn the_rate_and_in_flight_limits_refuse_before_any_request() {
     let mut sent = 2;
     let mut throttled = None;
     for id in 10..30 {
-        match core.admit(&ask(id, 0, 1, 1_500), now, now, &store) {
+        match core.admit(&ask(id, 0, 1, 1_500), now, now, now, &store) {
             Admit::Send(dispatch) => {
                 sent += 1;
                 drop(dispatch);
@@ -451,7 +451,7 @@ async fn the_rate_and_in_flight_limits_refuse_before_any_request() {
     let more = (40..60)
         .take_while(|id| {
             matches!(
-                core.admit(&ask(*id, 0, 1, 1_500), later, later, &store),
+                core.admit(&ask(*id, 0, 1, 1_500), later, later, later, &store),
                 Admit::Send(_)
             )
         })
@@ -473,29 +473,29 @@ async fn off_no_key_a_bad_ask_and_a_bad_frame_never_reach_the_network() {
     };
     // A frame larger than 640 x 480.
     assert_eq!(
-        answer(core.admit(&ask(1, 0, 2, 1_500), now, now, &store)),
+        answer(core.admit(&ask(1, 0, 2, 1_500), now, now, now, &store)),
         (Outcome::Refused, String::from("image_too_large"))
     );
     // A frame not held: wait, then refuse.
     assert!(matches!(
-        core.admit(&ask(2, 0, 7, 1_500), now, now, &store),
+        core.admit(&ask(2, 0, 7, 1_500), now, now, now, &store),
         Admit::Wait
     ));
     let later = now + Duration::from_millis(150);
     assert_eq!(
-        answer(core.admit(&ask(2, 0, 7, 1_500), now, later, &store)),
+        answer(core.admit(&ask(2, 0, 7, 1_500), now, now, later, &store)),
         (Outcome::Refused, String::from("frame_not_held"))
     );
     // A free-form ask.
     let prompt = json!({ "ask_id": 3, "question_set": "press", "frame": { "topic": "/stub/wrist/image", "seq": 1 }, "prompt": "describe the room" });
     assert_eq!(
-        answer(core.admit(&prompt.to_string(), now, now, &store)),
+        answer(core.admit(&prompt.to_string(), now, now, now, &store)),
         (Outcome::Malformed, String::from("unknown_key"))
     );
     // An ask past its deadline.
     let stale = now - Duration::from_secs(2);
     assert_eq!(
-        answer(core.admit(&ask(4, 0, 1, 1_500), stale, now, &store)).0,
+        answer(core.admit(&ask(4, 0, 1, 1_500), stale, stale, now, &store)).0,
         Outcome::Timeout
     );
     // The key file readable by others.
@@ -505,7 +505,7 @@ async fn off_no_key_a_bad_ask_and_a_bad_frame_never_reach_the_network() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert_eq!(
-            answer(core.admit(&ask(5, 0, 1, 1_500), now, now, &store)),
+            answer(core.admit(&ask(5, 0, 1, 1_500), now, now, now, &store)),
             (Outcome::NoCredential, String::from("credential_mode"))
         );
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod");
@@ -513,20 +513,59 @@ async fn off_no_key_a_bad_ask_and_a_bad_frame_never_reach_the_network() {
     // No key at all.
     std::fs::remove_file(&key).expect("remove key");
     assert_eq!(
-        answer(core.admit(&ask(6, 0, 1, 1_500), now, now, &store)),
+        answer(core.admit(&ask(6, 0, 1, 1_500), now, now, now, &store)),
         (Outcome::NoCredential, String::from("credential_missing"))
     );
     eye_common::key_file(dir.path());
     // The owner's switch off.
     write_switch(dir.path(), false).expect("off");
     assert_eq!(
-        answer(core.admit(&ask(7, 0, 1, 1_500), now, now, &store)),
+        answer(core.admit(&ask(7, 0, 1, 1_500), now, now, now, &store)),
         (Outcome::Disabled, String::from("switched_off"))
     );
     write_switch(dir.path(), true).expect("on");
     assert_eq!(stub.count(), 0, "nothing reached the network");
     let (answer, _) = look(&mut core, &client, &ask(8, 0, 1, 1_500)).await;
     assert_eq!(answer.outcome, Outcome::Ok, "back on: {answer:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_deadline_runs_from_the_asks_wire_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _client) = core(dir.path(), "http://127.0.0.1:9/api/v1");
+    let now = Instant::now();
+    let second = Duration::from_secs(1);
+    // Published a second before the eye read it, with 1.5 s to answer.
+    let Admit::Send(dispatch) = core.admit(&ask(1, 0, 1, 1_500), now - second, now, now, &frames())
+    else {
+        panic!("the request is sent");
+    };
+    assert_eq!(
+        dispatch.deadline,
+        now - second + Duration::from_millis(1_500)
+    );
+    assert_eq!(dispatch.received, now);
+    // Stale: at or past its own deadline from its wire time, or no wire time.
+    let fresh = ask(2, 0, 1, 1_500);
+    assert!(!core.stale(&fresh, Some(now - second), now));
+    assert!(core.stale(&fresh, Some(now - Duration::from_millis(1_500)), now));
+    assert!(core.stale(&fresh, None, now));
+    let short = ask(3, 0, 1, 200);
+    assert!(core.stale(&short, Some(now - Duration::from_millis(300)), now));
+    // A deadline above `timeout_ms` is held to it.
+    let long = ask(4, 0, 1, 60_000);
+    assert!(core.stale(&long, Some(now - Duration::from_secs(2)), now));
+    // Without an `eyes.jev` section the budget is the default timeout.
+    let unconfigured = EyeCore::new(
+        Arc::new(
+            EyeSettings::resolve(&EyesConfig::default(), dir.path(), dir.path(), None)
+                .expect("settings"),
+        ),
+        now,
+    );
+    let bare = r#"{"ask_id":"a1"}"#;
+    assert!(!unconfigured.stale(bare, Some(now - second), now));
+    assert!(unconfigured.stale(bare, Some(now - Duration::from_secs(2)), now));
 }
 
 #[test]
@@ -536,12 +575,12 @@ fn without_an_eyes_section_every_ask_is_disabled() {
         .expect("settings");
     let mut core = EyeCore::new(Arc::new(settings), Instant::now());
     let now = Instant::now();
-    match core.admit(r#"{"ask_id":"a1"}"#, now, now, &FrameStore::default()) {
+    match core.admit(r#"{"ask_id":"a1"}"#, now, now, now, &FrameStore::default()) {
         Admit::Answer(answer) => assert_eq!(answer.outcome, Outcome::Disabled),
         other => panic!("{other:?}"),
     }
     assert!(matches!(
-        core.admit("{}", now, now, &FrameStore::default()),
+        core.admit("{}", now, now, now, &FrameStore::default()),
         Admit::Drop(_)
     ));
 }

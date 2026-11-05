@@ -13,9 +13,24 @@
 //! eye writes; an ask over it is dropped unanswered and unreceipted, and
 //! the gate's own deadline makes Jev absent.
 //!
+//! An ask's deadline runs from its wire timestamp, read against
+//! [`cerulion_core::real_ns`], the host's monotonic clock that a live graph
+//! stamps its frames with ([`ask_sent`]). An ask already past its deadline
+//! when the thread reads it, or stamped more than [`MAX_WIRE_LEAD`] ahead of
+//! that clock, is stale ([`EyeCore::stale`]): it gets no request, no answer
+//! and no receipt, and is logged once, then counted. A wrist frame stamped
+//! more than [`limits::TIMEOUT_MS`] behind that clock or [`MAX_WIRE_LEAD`]
+//! ahead when the thread reads it is not held ([`frame_fresh`]).
+//! `cerulion bag play` and `bag play --resim` publish asks and frames with
+//! their recorded wire timestamps, so a played recording's asks are stale
+//! here and its frames are never sent. So are the asks of a graph whose
+//! clock does not follow the host's: a virtual or external time source, or a
+//! run after a pause longer than the deadline, as the run clock stands still
+//! while the run is paused.
+//!
 //! Each pass of its loop, it keeps the newest [`FRAMES_HELD`] frames, reads
-//! every ask in arrival order, drops the asks over the ask bound
-//! ([`EyeCore::intake`]) and hands each other ask to [`EyeCore::admit`], which
+//! every ask in arrival order, drops the stale asks and the asks over the ask
+//! bound ([`EyeCore::intake`]) and hands each other ask to [`EyeCore::admit`], which
 //! answers at once (off, no key, a bad ask, a frame that breaks the shape, a
 //! limit) or yields a request. A request runs as a task on the daemon's
 //! runtime and reports back over a channel; the thread writes the receipt,
@@ -25,7 +40,7 @@
 //!
 //! A request that misses its deadline is answered `timeout` at the deadline.
 //! It stays on the network (and in the in-flight count) until
-//! [`limits::LATE_GRACE`] after the ask arrived; a reply in that window is
+//! [`limits::LATE_GRACE`] after the thread read the ask; a reply in that window is
 //! logged as late with a `late` receipt and never published, and at its end
 //! the request is cancelled. A reply the thread takes from the channel at or
 //! after its deadline is handled the same way ([`Completed::taken_at`]): the
@@ -62,7 +77,7 @@ use crate::eye::limits::{self, check_image, InFlight, InFlightGuard, TokenBucket
 use crate::eye::switch::{self, JevStatus, NoticeLevel, REGION_NOTICE};
 use crate::eye::verdict::Outcome;
 use crate::eye::{EYE_CALLER, JEV_VERB};
-use crate::journal::drain_strings;
+use crate::journal::drain_stamped_strings;
 use crate::tools::ReceiptSink;
 use crate::RcpdError;
 
@@ -86,6 +101,43 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How long the loop sleeps when nothing happened.
 const IDLE: Duration = Duration::from_millis(1);
+
+/// How far an ask's wire timestamp may run ahead of the eye's clock and
+/// still be read as now; further ahead, the ask is stale.
+pub const MAX_WIRE_LEAD: Duration = Duration::from_secs(1);
+
+/// When an ask stamped `wire_ns` was published, on the `Instant` clock:
+/// `now` less the ask's age by its wire timestamp against `now_ns`, the
+/// [`cerulion_core::real_ns`] reading taken with `now`. A wire time at most
+/// [`MAX_WIRE_LEAD`] ahead of `now_ns` reads as `now`. `None` for one
+/// further ahead, or older than the `Instant` clock reaches: such an ask is
+/// stale.
+pub fn ask_sent(wire_ns: u64, now_ns: u64, now: Instant) -> Option<Instant> {
+    match now_ns.checked_sub(wire_ns) {
+        Some(age) => now.checked_sub(Duration::from_nanos(age)),
+        None => (Duration::from_nanos(wire_ns - now_ns) <= MAX_WIRE_LEAD).then_some(now),
+    }
+}
+
+/// Whether a wrist frame stamped `wire_ns` is held when the thread reads it
+/// at `now_ns` ([`cerulion_core::real_ns`]): at most [`limits::TIMEOUT_MS`]
+/// behind and at most [`MAX_WIRE_LEAD`] ahead. A frame `bag play` or a resim
+/// publishes with its recorded wire timestamp is not held, so it is never
+/// sent for an ask.
+pub fn frame_fresh(wire_ns: u64, now_ns: u64) -> bool {
+    match now_ns.checked_sub(wire_ns) {
+        Some(age) => Duration::from_nanos(age) <= Duration::from_millis(limits::TIMEOUT_MS),
+        None => Duration::from_nanos(wire_ns - now_ns) <= MAX_WIRE_LEAD,
+    }
+}
+
+/// One ask the thread has read and not yet settled.
+#[derive(Debug, Clone)]
+struct Pending {
+    text: String,
+    sent: Instant,
+    received: Instant,
+}
 
 /// The eye's configuration, resolved against the filesystem.
 #[derive(Debug, Clone)]
@@ -234,9 +286,9 @@ pub struct Dispatch {
     pub key: Credential,
     /// The in-flight slot, held until the request leaves the network.
     pub guard: InFlightGuard,
-    /// When the ask arrived.
+    /// When the thread read the ask.
     pub received: Instant,
-    /// When the ask's answer is due.
+    /// When the ask's answer is due: its wire time plus its budget.
     pub deadline: Instant,
 }
 
@@ -359,6 +411,35 @@ impl EyeCore {
         &self.in_flight
     }
 
+    /// The time an ask with `deadline_ms` has from its wire time: its own
+    /// deadline, at most the configured `timeout_ms` ([`limits::TIMEOUT_MS`]
+    /// without an `eyes.jev` section).
+    fn budget(&self, deadline_ms: Option<u64>) -> Duration {
+        let cap = self
+            .settings
+            .jev
+            .as_ref()
+            .map_or(limits::TIMEOUT_MS, |j| j.timeout_ms);
+        Duration::from_millis(deadline_ms.unwrap_or(cap).min(cap))
+    }
+
+    /// Whether the ask frame `text`, published at `sent` ([`ask_sent`]) and
+    /// read at `received`, is stale: `sent` is `None`, or `received` is at
+    /// or past its deadline, `sent` plus its budget. The budget comes from
+    /// the ask's `deadline_ms` when that is a positive integer. A stale ask
+    /// gets no request, no answer and no receipt, whether Jev is on, off or
+    /// unconfigured.
+    pub fn stale(&self, text: &str, sent: Option<Instant>, received: Instant) -> bool {
+        let Some(sent) = sent else {
+            return true;
+        };
+        let deadline_ms = serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|v| v.get("deadline_ms").and_then(Value::as_u64))
+            .filter(|ms| *ms > 0);
+        received >= sent + self.budget(deadline_ms)
+    }
+
     /// Whether an ask arriving at `now` is within the ask bound: a bucket of
     /// [`limits::ASK_BURST`] refilled at [`limits::ASKS_PER_SECOND`]. An ask
     /// outside it gets no answer and no receipt.
@@ -416,16 +497,20 @@ impl EyeCore {
         })
     }
 
-    /// Decide what to do with the ask frame `text`, which arrived at
-    /// `received`, at `now`, with `frames` held. Checks run in this order,
-    /// all before any network call: the ask's id; the switch (`disabled`);
-    /// the ask's shape (`malformed`); the key (`no_credential`); a 429
-    /// backoff (`rate_limited`); a spend-limit hold (`quota`); the deadline
-    /// (`timeout`); the frame (wait, then `refused`); the image and token
-    /// shape (`refused`); the in-flight and rate limits (`throttled`).
+    /// Decide what to do with the ask frame `text`, published at `sent`
+    /// ([`ask_sent`]) and read at `received`, at `now`, with `frames` held.
+    /// The thread drops a stale ask ([`Self::stale`]) before this. The
+    /// deadline is `sent` plus the ask's budget, and the frame wait runs from
+    /// `received`. Checks run in this order, all before any network call: the
+    /// ask's id; the switch (`disabled`); the ask's shape (`malformed`); the
+    /// key (`no_credential`); a 429 backoff (`rate_limited`); a spend-limit
+    /// hold (`quota`); the deadline (`timeout`); the frame (wait, then
+    /// `refused`); the image and token shape (`refused`); the in-flight and
+    /// rate limits (`throttled`).
     pub fn admit(
         &mut self,
         text: &str,
+        sent: Instant,
         received: Instant,
         now: Instant,
         frames: &FrameStore,
@@ -468,11 +553,7 @@ impl EyeCore {
         if self.quota_until.is_some_and(|until| now < until) {
             return answer(Outcome::Quota, "daily_limit");
         }
-        let budget = ask
-            .deadline_ms
-            .unwrap_or(config.timeout_ms)
-            .min(config.timeout_ms);
-        let deadline = received + Duration::from_millis(budget);
+        let deadline = sent + self.budget(ask.deadline_ms);
         if now >= deadline {
             return answer(Outcome::Timeout, "deadline_before_send");
         }
@@ -639,7 +720,7 @@ struct EyeLoop {
     receipts: ReceiptSink,
     runtime: tokio::runtime::Handle,
     store: FrameStore,
-    pending: VecDeque<(String, Instant)>,
+    pending: VecDeque<Pending>,
     done_tx: mpsc::Sender<Completed>,
     done_rx: mpsc::Receiver<Completed>,
     counters: Counters,
@@ -651,6 +732,10 @@ struct EyeLoop {
     /// Asks dropped over the ask bound: loud once, then counted, until an
     /// ask is within it.
     ask_flood: FailureRegimeLatch,
+    /// Asks dropped as stale: loud once, then counted, until an ask is not.
+    stale_asks: FailureRegimeLatch,
+    /// Wrist frames dropped for their wire time: loud once, then counted.
+    stale_frames: FailureRegimeLatch,
     /// Whether this run's data notice was checked with Jev on.
     notice_given: bool,
     /// The release the route last answered as.
@@ -770,6 +855,8 @@ impl EyeHost {
                     frame_failures: FailureRegimeLatch::new(),
                     absent_answers: FailureRegimeLatch::new(),
                     ask_flood: FailureRegimeLatch::new(),
+                    stale_asks: FailureRegimeLatch::new(),
+                    stale_frames: FailureRegimeLatch::new(),
                     notice_given,
                     release: None,
                 };
@@ -794,13 +881,34 @@ impl EyeLoop {
         while !stop.load(Ordering::SeqCst) {
             let mut busy = self.read_frames();
             let now = Instant::now();
-            for text in drain_strings(&self.ports.asks, &self.core.settings().ask_topic) {
+            let now_ns = cerulion_core::real_ns();
+            for (text, wire_ns) in
+                drain_stamped_strings(&self.ports.asks, &self.core.settings().ask_topic)
+            {
                 busy = true;
+                let sent = ask_sent(wire_ns, now_ns, now);
+                if self.core.stale(&text, sent, now) {
+                    log_failure(
+                        &mut self.stale_asks,
+                        "dropped a stale ask",
+                        "its wire time is past its deadline or ahead of this host's clock: \
+                         no request, no answer, no receipt",
+                    );
+                    continue;
+                }
+                if let Some(suppressed) = self.stale_asks.on_success() {
+                    tracing::info!(suppressed, "asks within their deadline again");
+                }
+                let Some(sent) = sent else { continue };
                 if self.core.intake(now) {
                     if let Some(suppressed) = self.ask_flood.on_success() {
                         tracing::info!(suppressed, "asks within the ask bound again");
                     }
-                    self.pending.push_back((text, now));
+                    self.pending.push_back(Pending {
+                        text,
+                        sent,
+                        received: now,
+                    });
                 } else {
                     log_failure(
                         &mut self.ask_flood,
@@ -826,6 +934,8 @@ impl EyeLoop {
         };
         let store = &mut self.store;
         let latch = &mut self.frame_failures;
+        let stale = &mut self.stale_frames;
+        let now_ns = cerulion_core::real_ns();
         let mut any = false;
         let read = frames.try_receive(|message| {
             any = true;
@@ -834,6 +944,14 @@ impl EyeLoop {
             };
             if message.header().schema_hash != CompressedImage::SCHEMA_HASH {
                 dropped(latch, "not sensor_msgs/CompressedImage");
+                return;
+            }
+            if !frame_fresh(message.header().timestamp_ns, now_ns) {
+                log_failure(
+                    stale,
+                    "dropped a wrist frame stamped outside this host's clock",
+                    "not held, never sent",
+                );
                 return;
             }
             let payload = message.payload();
@@ -868,16 +986,19 @@ impl EyeLoop {
     fn admit_pending(&mut self) -> bool {
         let mut any = false;
         let mut waiting = VecDeque::new();
-        while let Some((text, received)) = self.pending.pop_front() {
-            match self
-                .core
-                .admit(&text, received, Instant::now(), &self.store)
-            {
+        while let Some(ask) = self.pending.pop_front() {
+            match self.core.admit(
+                &ask.text,
+                ask.sent,
+                ask.received,
+                Instant::now(),
+                &self.store,
+            ) {
                 Admit::Answer(answer) => {
                     self.finish(*answer);
                     any = true;
                 }
-                Admit::Wait => waiting.push_back((text, received)),
+                Admit::Wait => waiting.push_back(ask),
                 Admit::Send(dispatch) => {
                     any = true;
                     match self.client.as_ref().map(Arc::clone) {
@@ -1063,8 +1184,45 @@ impl EyeLoop {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_for, FrameStore};
-    use crate::eye::limits::MAX_IMAGE_BYTES;
+    use std::time::{Duration, Instant};
+
+    use super::{ask_sent, client_for, frame_fresh, FrameStore, MAX_WIRE_LEAD};
+    use crate::eye::limits::{MAX_IMAGE_BYTES, TIMEOUT_MS};
+
+    #[test]
+    fn an_asks_wire_time_maps_onto_the_instant_clock() {
+        let now = Instant::now();
+        let now_ns = 5_000_000_000_000;
+        let lead = u64::try_from(MAX_WIRE_LEAD.as_nanos()).expect("lead");
+        // Stamped 300 ms ago.
+        assert_eq!(
+            ask_sent(now_ns - 300_000_000, now_ns, now),
+            Some(now - Duration::from_millis(300))
+        );
+        assert_eq!(ask_sent(now_ns, now_ns, now), Some(now));
+        // Ahead by at most the lead reads as now; further ahead, never.
+        assert_eq!(ask_sent(now_ns + lead, now_ns, now), Some(now));
+        assert_eq!(ask_sent(now_ns + lead + 1, now_ns, now), None);
+        // An hour old: an hour before now.
+        let hour = Duration::from_secs(3_600);
+        assert_eq!(
+            ask_sent(now_ns - 3_600_000_000_000, now_ns, now),
+            now.checked_sub(hour)
+        );
+    }
+
+    #[test]
+    fn a_frame_is_held_only_within_the_timeout_behind_and_the_lead_ahead() {
+        let now_ns = 5_000_000_000_000;
+        let timeout = TIMEOUT_MS * 1_000_000;
+        let lead = u64::try_from(MAX_WIRE_LEAD.as_nanos()).expect("lead");
+        assert!(frame_fresh(now_ns, now_ns));
+        assert!(frame_fresh(now_ns - timeout, now_ns));
+        assert!(!frame_fresh(now_ns - timeout - 1, now_ns));
+        assert!(frame_fresh(now_ns + lead, now_ns));
+        assert!(!frame_fresh(now_ns + lead + 1, now_ns));
+        assert!(!frame_fresh(0, now_ns));
+    }
 
     #[test]
     fn a_frame_of_exactly_the_byte_limit_is_held_and_one_byte_more_is_not() {

@@ -39,7 +39,10 @@
 //! `cerulion bag play --resim` re-injects the recorded answer frames at
 //! their recorded steps, whatever the re-executed graph asks; a gate whose
 //! ask changed reads the re-injected answer as `not_recorded`. A running
-//! daemon's eye reads the same topics and takes played asks as live ones.
+//! daemon's eye reads the same topics; a played ask and a played wrist
+//! frame carry their recorded wire timestamps, so the eye drops the ask with
+//! no request, no answer and no receipt, and never holds the frame
+//! ([`host`]).
 //! [`replay`] serves a recorded answer by `ask_id` and the ask text
 //! (`ask_sha256`), and answers any other ask with `not_recorded`. [`verify`]
 //! joins a recording's answers to the receipt log and to the recorded asks.

@@ -270,7 +270,8 @@ eyes:
 A node asks with one `std_msgs/String` frame on the ask topic:
 `{"ask_id": 7, "question_set": "press_gate", "frame": {"topic": "/wrist/image", "seq": 412}, "deadline_ms": 1500, "numbers": {"jaw_gap_mm": 3.5}}`.
 `seq` is the wire sequence number of a frame on the frame topic; the daemon
-keeps the newest 8 and waits up to 100 ms for one not yet seen. It sends one
+keeps the newest 8 and waits up to 100 ms for one not yet seen. The deadline
+runs from the ask frame's wire timestamp. It sends one
 request carrying that frame unchanged, the set's text and the numbers, and
 publishes one answer frame per ask on the answer topic with an `outcome`:
 `ok`, or one of `disabled`, `no_credential`, `unavailable`, `timeout`,
@@ -285,12 +286,14 @@ training or labelling export can leave Jev's output out. A receipt
 (`eye.jev`, caller `rcp-eye`) is written before each answer is published,
 and an answer whose receipt cannot be written is not published.
 
-A gate reads an answer frame with `EyeAnswer::parse(answer, ask)`, passing
-the exact text of the ask frame it published, and compares Jev's reading
-with its own through `Look::compare`, which gives `Agree`, `Disagree` or
-`Absent(outcome)`. An answer frame whose `ask_sha256` is not the SHA-256 of
-that text was given for another ask, such as another frame under a reused
-`ask_id`, and reads as `not_recorded`.
+A gate picks the answer frames for an ask by its `ask_id`, reads each with
+`EyeAnswer::parse(answer, ask)`, passing the exact text of the ask frame it
+published, and compares Jev's reading with its own through `Look::compare`,
+which gives `Agree`, `Disagree` or `Absent(outcome)`. An answer frame whose
+`ask_sha256` is not the SHA-256 of that text was given for another ask, such
+as another frame under a reused `ask_id`, and reads as `not_recorded`.
+`EyeAnswer::image_sha256` gives the SHA-256 of the image sent, to check
+against the bytes of the frame the gate holds.
 
 The daemon answers at most 20 asks at once and 10 a second after that,
 whatever the outcome; an ask over that bound gets no answer and no receipt,
@@ -330,9 +333,16 @@ their recorded steps, whatever the re-executed graph asks, and makes no Jev
 request itself. A gate that reads them with its own ask text sees an answer
 given for another ask text as `not_recorded`, and `--resim all --verify`
 reports a changed ask as a divergence on the ask topic. A running daemon's
-eye reads the same topics, so on a host where the daemon serves an eye,
-play or resim a recording with `cerulion-rcpd jev off` or with the daemon
-stopped; otherwise the eye takes the played asks as live ones.
+eye reads the same topics, and `bag play` and `bag play --resim` publish a
+recording's asks and wrist frames with their recorded wire timestamps. The
+eye reads each ask's wire timestamp against the host's monotonic clock, the
+clock a live graph stamps its frames with: an ask older than its deadline,
+or more than 1 s ahead, gets no request, no answer and no receipt, with Jev
+on or off, and the first is logged and later ones counted. A wrist frame
+more than 1.5 s behind that clock or 1 s ahead is not held, so a played
+frame is never sent. The same rule drops the asks of a graph on a virtual
+or external time source, and of a run after a pause longer than the
+deadline, as the run clock stands still while the run is paused.
 `--verify-bag` checks that every answer in a recording has its receipt,
 names an ask the recording holds and carries the SHA-256 of that ask's
 text, and, where the recording holds the frame, that the image and request

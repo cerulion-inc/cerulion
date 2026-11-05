@@ -311,6 +311,18 @@ pub(crate) fn decode_string(payload: &[u8]) -> Result<String, String> {
 
 /// Decode every frame queued on `subscriber`, oldest first.
 pub(crate) fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
+    drain_stamped_strings(subscriber, topic)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// Decode every frame queued on `subscriber`, oldest first, each with the
+/// wire timestamp (`timestamp_ns`) its publisher stamped.
+pub(crate) fn drain_stamped_strings(
+    subscriber: &CerulionSubscriber,
+    topic: &str,
+) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     let read = subscriber.try_receive(|message| {
         if message.header().schema_hash != RosString::SCHEMA_HASH {
@@ -318,7 +330,7 @@ pub(crate) fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec
             return;
         }
         match decode_string(message.payload()) {
-            Ok(text) => out.push(text),
+            Ok(text) => out.push((text, message.header().timestamp_ns)),
             Err(reason) => tracing::warn!(topic, %reason, "dropped a malformed frame"),
         }
     });

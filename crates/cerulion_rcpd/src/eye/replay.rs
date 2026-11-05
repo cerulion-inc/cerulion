@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(recorded.answer(ask_1).as_deref(), Some(second.as_str()));
         let third = recorded.answer(ask_1).expect("answer");
         assert_eq!(
-            EyeAnswer::parse(&third, ask_1).expect("parse").outcome,
+            EyeAnswer::parse(&third, ask_1).expect("parse").outcome(),
             Outcome::NotRecorded
         );
         assert_eq!(recorded.answer(ask_b).as_deref(), Some(other.as_str()));
@@ -264,7 +264,7 @@ mod tests {
         let mut recorded = RecordedAnswers::new([recorded_answer.clone()]);
         let given = recorded.answer(resim).expect("answer");
         let parsed = EyeAnswer::parse(&given, resim).expect("parse");
-        assert_eq!(parsed.outcome, Outcome::NotRecorded);
+        assert_eq!(parsed.outcome(), Outcome::NotRecorded);
         assert_eq!(
             Look::compare(&parsed, |_| Some(1.0), 1.0, 8.0),
             Look::Absent(Outcome::NotRecorded),

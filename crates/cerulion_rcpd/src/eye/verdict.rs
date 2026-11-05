@@ -151,28 +151,55 @@ impl BoxEdge {
     }
 }
 
-/// One answer frame, parsed for the ask frame a gate published.
+/// One answer frame, parsed for the ask frame a gate published. Its fields
+/// are read through methods, so [`EyeAnswer::parse`] is the only way to
+/// make one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EyeAnswer {
-    /// The ask this answers, as the ask wrote it.
-    pub ask_id: Value,
-    /// What happened to this ask: `not_recorded` when the frame answers
-    /// another ask text.
-    pub outcome: Outcome,
-    /// The SHA-256 of the ask text the frame answers, as the frame carries
-    /// it.
-    pub ask_sha256: Option<String>,
-    /// The frame the answered ask named.
-    pub frame: Option<FrameRef>,
-    /// The answers by question name; `None` unless Jev answered this ask.
-    pub answers: Option<Map<String, Value>>,
-    /// The frame's width in pixels, when a frame was read.
-    pub image_width: Option<u32>,
-    /// The frame's height in pixels, when a frame was read.
-    pub image_height: Option<u32>,
+    ask_id: Value,
+    outcome: Outcome,
+    ask_sha256: Option<String>,
+    frame: Option<FrameRef>,
+    image_sha256: Option<String>,
+    answers: Option<Map<String, Value>>,
+    image_width: Option<u32>,
+    image_height: Option<u32>,
 }
 
 impl EyeAnswer {
+    /// The ask this answers, as the ask wrote it.
+    pub fn ask_id(&self) -> &Value {
+        &self.ask_id
+    }
+
+    /// What happened to this ask: `not_recorded` when the frame answers
+    /// another ask text.
+    pub fn outcome(&self) -> Outcome {
+        self.outcome
+    }
+
+    /// The SHA-256 of the ask text the frame answers, as the frame carries
+    /// it.
+    pub fn ask_sha256(&self) -> Option<&str> {
+        self.ask_sha256.as_deref()
+    }
+
+    /// The frame the answered ask named, as the frame carries it.
+    pub fn frame(&self) -> Option<&FrameRef> {
+        self.frame.as_ref()
+    }
+
+    /// The SHA-256 of the image bytes sent, as the frame carries it, so a
+    /// gate can check it against the bytes of the frame it holds.
+    pub fn image_sha256(&self) -> Option<&str> {
+        self.image_sha256.as_deref()
+    }
+
+    /// The frame's width and height in pixels, when a frame was read.
+    pub fn image_size(&self) -> Option<(u32, u32)> {
+        self.image_width.zip(self.image_height)
+    }
+
     /// Parse the answer frame `text` for the ask frame `ask_text`, the exact
     /// text the gate published. A frame whose `ask_sha256` is missing or is
     /// not the SHA-256 of `ask_text` reads as `not_recorded` with no
@@ -216,6 +243,10 @@ impl EyeAnswer {
             outcome,
             ask_sha256,
             frame: frame_ref(value.get("frame")),
+            image_sha256: value
+                .get("image_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             answers: value
                 .get("answers")
                 .and_then(Value::as_object)
