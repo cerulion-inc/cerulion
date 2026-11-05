@@ -15986,9 +15986,9 @@ impl GraphRuntime {
         let calls_now = Arc::clone(&calls.calls);
         #[cfg(feature = "oracle-mutants")]
         let skip_dequeue = calls.skip_dequeue_mutant;
-        let range_after = range.clone();
+        let std::ops::Range { start, end } = range;
         let mut timestamps = std::mem::take(&mut self.drain_timestamps);
-        for call in &calls_now[range] {
+        for call in &calls_now[start..end] {
             #[cfg(feature = "oracle-mutants")]
             {
                 if skip_dequeue {
@@ -16017,7 +16017,7 @@ impl GraphRuntime {
         // drain froze. A frame a publisher outside the graph puts on a
         // member's queue after that member's drain loses its wake event here,
         // and the member's next call, one per step, drains it.
-        for call in &calls_now[range_after] {
+        for call in &calls_now[start..end] {
             if let DrainSource::Unified { listener_idx } =
                 self.data_trigger_bindings[call.binding].drain
             {
