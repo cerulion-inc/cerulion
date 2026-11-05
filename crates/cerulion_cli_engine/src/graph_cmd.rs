@@ -23649,6 +23649,122 @@ process_groups:
         }
     }
 
+    /// `--single-process` on a graph that splits into executor units leaves
+    /// the monolith arm of the deployment match, so the opt-out that arm
+    /// announces (the auto-partition default skipped, or the declared groups
+    /// not executed) is announced where the units are hosted instead.
+    ///
+    /// The case: a 100 ms source feeding a data-triggered sink, no profile, so
+    /// two units. Written with no `process_groups:`, then with a declared split
+    /// the run does not execute, then with the sink `isolate: false` (one unit,
+    /// which stays the monolith and says nothing here).
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_single_process_run_of_several_units_announces_what_it_opts_out_of() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "spu_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "sink",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct SinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: spu
+prefix: spu
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: sink
+    inputs:
+      - name: inp
+        source: src/out
+";
+        let host_all = |config: &GraphConfig| -> Vec<(String, Vec<String>)> {
+            config
+                .process_groups
+                .iter()
+                .map(|(g, ns)| (g.clone(), ns.clone()))
+                .collect()
+        };
+        let one_process = vec![(
+            "spu".to_string(),
+            vec!["src".to_string(), "sink".to_string()],
+        )];
+
+        let mut unpartitioned = cerulion_core::graph::parse_graph_raw(yaml).unwrap();
+        let split =
+            single_process_hosts_units(&ws.root, &mut unpartitioned, TimeSource::Real, None)
+                .unwrap();
+        assert!(split, "two units: the run hosts them in one worker process");
+        assert_eq!(host_all(&unpartitioned), one_process);
+        assert!(
+            logs_contain(
+                "on its executor units (no `process_groups:` in the graph; the multi-process \
+                 auto-partition default is skipped)"
+            ),
+            "an unpartitioned graph's opt-out names the skipped auto-partition default"
+        );
+
+        let mut declared = cerulion_core::graph::parse_graph_raw(&format!(
+            "{yaml}process_groups:\n  a: [src]\n  b: [sink]\n"
+        ))
+        .unwrap();
+        assert!(
+            single_process_hosts_units(&ws.root, &mut declared, TimeSource::Real, None).unwrap()
+        );
+        assert_eq!(host_all(&declared), one_process);
+        assert!(
+            logs_contain(
+                "on its executor units, despite `process_groups:` (the declared groups are not \
+                 executed)"
+            ),
+            "a declared split the run does not execute is named"
+        );
+
+        let mut one_unit = cerulion_core::graph::parse_graph_raw(
+            &yaml.replace("    type: sink\n", "    type: sink\n    isolate: false\n"),
+        )
+        .unwrap();
+        assert!(
+            !single_process_hosts_units(&ws.root, &mut one_unit, TimeSource::Real, None).unwrap(),
+            "one unit: the monolith arm runs it and announces the opt-out itself"
+        );
+        assert!(
+            one_unit.process_groups.is_empty(),
+            "the monolith keeps the graph as written"
+        );
+    }
+
     /// What `graph run --record` hands the recorder is what
     /// arms live-topic discovery, and nothing pinned it.
     ///
