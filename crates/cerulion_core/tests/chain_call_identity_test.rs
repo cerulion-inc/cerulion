@@ -32,6 +32,14 @@
 //! latest value after the member's level, members that skip a frame, and
 //! steps that carry several period fires.
 //!
+//! A second graph pins the unit boundary: `src -> mid -> far` is one chain in
+//! one level loop, and with `far` declaring `isolate: true` the executor-unit
+//! derivation puts it in a unit of its own. Each unit runs its own runtime over
+//! its own subgraph, where `far` reads the absolute topic `mid` publishes, so
+//! the chain call stays inside the first unit and the hop between the units is
+//! a queued one that carries every frame, with every node firing at the steps
+//! and times the queued run of the whole graph fires it.
+//!
 //! ```bash
 //! cargo test -p cerulion_core --test chain_call_identity_test -- --test-threads=1
 //! ```
@@ -40,10 +48,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cerulion_core::clock::VirtualClock;
-use cerulion_core::graph::node::NodeEntry;
-use cerulion_core::graph::{parse_graph, validate_graph, GraphRuntime, FUSE_CHAINS_ENV};
+use cerulion_core::graph::chain::{census_chains, ChainBar, Colocation};
+use cerulion_core::graph::node::{NodeEntry, NodeInfo};
+use cerulion_core::graph::topology::GraphTopology;
+use cerulion_core::graph::{
+    build_trigger_edges, derive_units, parse_graph, resolve_levels, resolve_source, validate_graph,
+    Boundary, GraphConfig, GraphRuntime, UnitGraph, FUSE_CHAINS_ENV,
+};
 use cerulion_core::prelude::*;
 use cerulion_core::scheduler::{MergedReadOutcome, TraceEntry};
+use cerulion_core::transport::{TransportConfig, TransportManager};
 use indexmap::IndexMap;
 use native_ros2_messages::std_msgs::Int32;
 use serial_test::serial;
@@ -673,6 +687,341 @@ fn an_unset_seam_makes_no_chain_call() {
     let n = runtime.trace().len();
     assert!(n >= 50 * 10, "the graph must run; {n} fires in 50 steps");
     assert_eq!(runtime.chain_calls_made(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A chain split across two executor units.
+//
+// `src -> mid -> far`, with no profile: the nodes of the process form one unit
+// apart from each node that declares `isolate: true`. `far` declares it, so it
+// runs in a unit of its own and `src` and `mid` share the other. In one level
+// loop the census chains all three.
+// ---------------------------------------------------------------------------
+
+relay!(MidRelay, "mid");
+sink!(FarSink, "far");
+
+const SPLIT_GRAPH: &str = r#"
+prefix: test/chain_unit_split
+nodes:
+  - id: src
+    type: count
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: mid
+    type: relay
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: far
+    type: sink
+    isolate: true
+    inputs:
+      - name: inp
+        source: mid/out
+"#;
+
+fn split_factories(members: &[String]) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let mut f: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    for id in members {
+        let entry: Box<dyn NodeEntry> = match id.as_str() {
+            "src" => Box::new(CountEntry::new()),
+            "mid" => Box::new(MidRelayEntry::new()),
+            "far" => Box::new(FarSinkEntry::new()),
+            other => panic!("no node {other} in the split graph"),
+        };
+        f.insert(id.clone(), entry);
+    }
+    f
+}
+
+fn split_graph() -> GraphConfig {
+    let config = parse_graph(SPLIT_GRAPH).expect("the split graph must parse");
+    validate_graph(&config).expect("the split graph must validate");
+    config
+}
+
+fn node_ids(config: &GraphConfig) -> Vec<String> {
+    config.native_nodes().map(|n| n.id.clone()).collect()
+}
+
+fn split_infos(config: &GraphConfig) -> IndexMap<String, NodeInfo> {
+    split_factories(&node_ids(config))
+        .iter()
+        .map(|(id, e)| (id.clone(), e.info().expect("a macro node has its info")))
+        .collect()
+}
+
+/// `members` of `config` as one unit's runtime builds them: the other nodes
+/// dropped, and an input whose producer is in another unit rewritten to the
+/// absolute topic that producer publishes, as the CLI's worker subgraph
+/// (`subgraph_for`) rewrites a cross-unit edge.
+fn unit_subgraph(config: &GraphConfig, members: &[String]) -> GraphConfig {
+    let mut sub = config.clone();
+    sub.nodes.retain(|n| members.contains(&n.id));
+    let produced: Vec<String> = sub
+        .nodes
+        .iter()
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(|o| resolve_source(&config.prefix, &format!("{}/{}", n.id, o.name)))
+        })
+        .collect();
+    for node in &mut sub.nodes {
+        for input in &mut node.inputs {
+            let resolved = resolve_source(&config.prefix, &input.source);
+            if !produced.contains(&resolved) {
+                input.source = resolved;
+            }
+        }
+    }
+    sub
+}
+
+/// One unit's transport over the shared isolated root `ix`.
+///
+/// The first unit owns `mid/out` and holds no consumer of it, so it gives the
+/// service the buffer ceiling of this transport default; `far`'s unit opens
+/// that service as a subscriber of depth `DEFAULT_CONSUMER_DEPTH` (10), which
+/// 16 covers and 8 would not.
+fn split_manager(
+    name: String,
+    ix: iceoryx2::config::Config,
+    clock: Arc<VirtualClock>,
+) -> Arc<TransportManager> {
+    TransportManager::init_for_test(
+        TransportConfig {
+            node_name: name,
+            clock,
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        ix,
+    )
+    .expect("an isolated transport must open")
+}
+
+/// One graph's runtimes stepped together: each runtime's chain-call count,
+/// every frame each node read, and every runtime's fire trace.
+struct SplitRun {
+    calls: Vec<u64>,
+    frames: Vec<(&'static str, i32)>,
+    trace: Vec<TraceRow>,
+}
+
+/// Build one runtime per unit, in unit order, over one isolated shared-memory
+/// root, and step each through the same clock deltas, the units of one step in
+/// unit order.
+fn run_units(units: &[Vec<String>], fused: bool) -> SplitRun {
+    FRAMES.lock().expect("not poisoned").clear();
+    let config = split_graph();
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let mut runtimes: Vec<(GraphRuntime, Arc<TransportManager>)> = Vec::new();
+    for (i, members) in units.iter().enumerate() {
+        let _env = FuseEnv::set(if fused { "1" } else { "0" });
+        let clock = Arc::new(VirtualClock::new());
+        let mgr = split_manager(
+            format!("chain_unit_split_{i}"),
+            ix.clone(),
+            Arc::clone(&clock),
+        );
+        let mut runtime = GraphRuntime::build(
+            unit_subgraph(&config, members),
+            split_factories(members),
+            &mgr,
+            clock,
+        )
+        .expect("a unit's runtime must build");
+        runtime.set_trace_limit(usize::MAX);
+        runtimes.push((runtime, mgr));
+    }
+    for i in 0..STEPS {
+        let delta = Duration::from_millis(DELTAS_MS[i % DELTAS_MS.len()]);
+        for (runtime, _) in &mut runtimes {
+            runtime.step(delta);
+        }
+    }
+    let calls = runtimes.iter().map(|(r, _)| r.chain_calls_made()).collect();
+    let trace = runtimes
+        .iter_mut()
+        .flat_map(|(r, _)| trace_rows(r.trace()))
+        .collect();
+    for (runtime, mgr) in runtimes {
+        runtime.shutdown();
+        drop(mgr);
+    }
+    let frames = std::mem::take(&mut *FRAMES.lock().expect("not poisoned"));
+    SplitRun {
+        calls,
+        frames,
+        trace,
+    }
+}
+
+/// One node's fires: step, fire time and the discard bit of each, in order.
+/// The level is left out: a unit's runtime levels its own subgraph, where
+/// `far` sits on the unit's first level.
+fn fires_of(trace: &[TraceRow], node: &str) -> Vec<(u64, u64, bool)> {
+    trace
+        .iter()
+        .filter(|r| r.0 == node)
+        .map(|r| (r.1, r.2, r.4))
+        .collect()
+}
+
+fn stream(frames: &[(&'static str, i32)], tag: &str) -> Vec<i32> {
+    frames
+        .iter()
+        .filter(|(t, _)| *t == tag)
+        .map(|(_, v)| *v)
+        .collect()
+}
+
+#[test]
+#[serial]
+fn a_chain_split_across_two_executor_units_keeps_the_queued_hop_between_them() {
+    let config = split_graph();
+    let infos = split_infos(&config);
+    let topology = GraphTopology::build(&config, &infos).expect("the split graph's topology");
+    let trigger_edges = build_trigger_edges(&config, &infos);
+    let all = node_ids(&config);
+
+    // The derivation the CLI plans units with, without a profile: `src` and
+    // `mid` form one unit, and `far` starts a unit of its own for its
+    // `isolate: true`.
+    let graph = UnitGraph::from_graph(&config, &infos, &topology, &trigger_edges);
+    let units = derive_units("host", &all, &graph, None);
+    let members: Vec<Vec<String>> = units.iter().map(|u| u.nodes.clone()).collect();
+    assert_eq!(
+        members,
+        vec![
+            vec!["src".to_string(), "mid".to_string()],
+            vec!["far".to_string()]
+        ],
+        "the units of the split graph"
+    );
+    assert_eq!(
+        units[0].boundaries,
+        vec![("src".to_string(), Boundary::NoProfile)],
+        "src starts the unit of the nodes that do not declare `isolate: true`"
+    );
+    assert_eq!(
+        units[1].boundaries,
+        vec![("far".to_string(), Boundary::Isolated)],
+        "far starts its unit for its `isolate: true`"
+    );
+
+    // In one level loop the census chains all three nodes.
+    let levels = resolve_levels(&config, &topology, &trigger_edges).expect("levels");
+    let census = census_chains(
+        &config,
+        &infos,
+        &topology,
+        &trigger_edges,
+        &levels,
+        Colocation::SingleProcess,
+    );
+    let chains: Vec<Vec<String>> = census.chains().iter().map(|c| c.nodes.clone()).collect();
+    assert_eq!(chains, vec![all.clone()], "one chain in one level loop");
+
+    // In far's own unit the edge from mid has no producer in the build, so it
+    // is no chain link.
+    let far_unit = unit_subgraph(&config, &members[1]);
+    assert_eq!(
+        far_unit.nodes[0].inputs[0].source,
+        "/test/chain_unit_split/mid/out"
+    );
+    let far_infos = infos_of(&far_unit, &infos);
+    let far_topology = GraphTopology::build(&far_unit, &far_infos).expect("far's topology");
+    let far_triggers = build_trigger_edges(&far_unit, &far_infos);
+    let far_levels = resolve_levels(&far_unit, &far_topology, &far_triggers).expect("far's levels");
+    let far_census = census_chains(
+        &far_unit,
+        &far_infos,
+        &far_topology,
+        &far_triggers,
+        &far_levels,
+        Colocation::SingleProcess,
+    );
+    assert!(far_census.chains().is_empty(), "far's unit holds no chain");
+    let far_edge = far_census
+        .edges()
+        .iter()
+        .find(|e| e.consumer == "far")
+        .expect("far's census judges its trigger edge");
+    assert_eq!(far_edge.bar, Some(ChainBar::NoInGraphProducer));
+
+    let queued = run_units(std::slice::from_ref(&all), false);
+    let one_loop = run_units(std::slice::from_ref(&all), true);
+    let split = run_units(&members, true);
+    assert_eq!(queued.calls, vec![0], "the queued run makes no chain call");
+    assert_eq!(
+        one_loop.calls,
+        vec![(STEPS * 2) as u64],
+        "in one level loop mid and far are both called every step"
+    );
+    assert_eq!(
+        split.calls,
+        vec![STEPS as u64, 0],
+        "split, the first unit calls mid every step and the second unit calls nothing"
+    );
+
+    // The queued hop between the units carries every frame mid published, in
+    // order, as the queued run of the whole graph reads it.
+    let reference = stream(&queued.frames, "far");
+    assert!(
+        reference.len() >= STEPS,
+        "far read {} frames in {STEPS} steps",
+        reference.len()
+    );
+    for tag in ["mid", "far"] {
+        let (q, l, s) = (
+            stream(&queued.frames, tag),
+            stream(&one_loop.frames, tag),
+            stream(&split.frames, tag),
+        );
+        if let Some(d) = first_difference(&q, &l) {
+            panic!("{tag}, one level loop: {d}");
+        }
+        if let Some(d) = first_difference(&q, &s) {
+            panic!("{tag}, split across units: {d}");
+        }
+    }
+    // Every node fires at the same steps and times, with the same discard
+    // bits, in the queued run, in one level loop and split across the units.
+    for node in ["src", "mid", "far"] {
+        let (q, l, s) = (
+            fires_of(&queued.trace, node),
+            fires_of(&one_loop.trace, node),
+            fires_of(&split.trace, node),
+        );
+        assert!(
+            q.len() >= STEPS,
+            "{node} fired {} times in {STEPS} steps",
+            q.len()
+        );
+        if let Some(d) = first_difference(&q, &l) {
+            panic!("{node}'s fires, one level loop: {d}");
+        }
+        if let Some(d) = first_difference(&q, &s) {
+            panic!("{node}'s fires, split across units: {d}");
+        }
+    }
+}
+
+fn infos_of(config: &GraphConfig, all: &IndexMap<String, NodeInfo>) -> IndexMap<String, NodeInfo> {
+    node_ids(config)
+        .into_iter()
+        .map(|id| {
+            let info = all[&id].clone();
+            (id, info)
+        })
+        .collect()
 }
 
 /// The mutants: each breaks one obligation of the chain call, and the
