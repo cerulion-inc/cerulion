@@ -295,6 +295,8 @@ impl FireTap {
     /// Arm or extend the lease, then return a bounded page after `cursor`.
     /// A pending, unsuperseded claim ends the page without advancing its cursor.
     /// A zero limit arms the lease without consuming any sequence or loss.
+    /// A lost sequence takes no row of the limit, so a page with fewer rows
+    /// ended at the newest assigned sequence or at a pending claim.
     pub fn serve(&self, cursor: Cursor, max: usize) -> FireBatch {
         let mut since = self
             .armed_since_ns
@@ -355,7 +357,7 @@ impl FireTap {
             batch.lost = floor - batch.next;
             batch.next = floor;
         }
-        for _ in 0..max {
+        while batch.records.len() < max {
             if batch.next >= head {
                 break;
             }
@@ -571,6 +573,24 @@ mod tests {
         let future = tap.serve(Cursor::After(u64::MAX), 512);
         assert!(future.records.is_empty());
         assert_eq!(future.next, u64::MAX);
+    }
+
+    /// A reader reads on only after a full page, so a lost sequence must not
+    /// take a row: a short page reached the newest assigned sequence.
+    #[test]
+    fn a_lost_sequence_inside_the_page_does_not_shorten_it() {
+        let (tap, _) = tap(1024);
+        tap.serve(Cursor::Now, 0);
+        // A busy slot makes the claim of seq 1 drop it.
+        tap.slots[0].stamp.store(1, Ordering::SeqCst);
+        for id in 0..700 {
+            tap.push(body(id));
+        }
+        let page = tap.serve(Cursor::After(0), FIRE_SERVE_MAX);
+        assert_eq!((page.next, page.lost, page.records.len()), (513, 1, 512));
+        assert_eq!(page.records[0].seq, 2);
+        let tail = tap.serve(Cursor::After(page.next), FIRE_SERVE_MAX);
+        assert_eq!((tail.next, tail.lost, tail.records.len()), (700, 0, 187));
     }
 
     #[test]

@@ -1844,7 +1844,8 @@ pub fn gather_runs_outcome<'a>(replies: impl IntoIterator<Item = &'a [u8]>) -> R
 pub const FIRES_WIRE_VERSION: u32 = 1;
 
 /// The most rows one [`FiresReply`] carries. A desk that receives a full page
-/// asks again with the reply's `next` to read on.
+/// asks again with the reply's `next` to read on. A lost sequence takes no
+/// row, so a shorter page reached the newest fire the run had recorded.
 pub const MAX_FIRES_PER_REPLY: usize = FIRE_SERVE_MAX;
 
 /// The reply to a `cerulion_q/{robot}/fires/{run_id}/{after}` GET.
