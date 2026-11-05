@@ -22,18 +22,52 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerulion_android::{EmbeddedRuntime, RuntimeState, Status};
 use cerulion_core::fire_tap::{FireCause, FireFlags, FireTapStats};
-use cerulion_core::graph::{parse_graph, GraphConfig};
+use cerulion_core::graph::{parse_graph, GraphConfig, NodeContext, NodeEntry, NodeInfo};
 use cerulion_core::transport::cerulion_q::{
     decode_fires_reply, decode_runs_reply, fires_selector, parse_run_id, runs_selector,
     FiresOutcome, FiresReply, RunEntry, RunEntryState, RunsCompleteness, RunsReply,
+    UndescribableRun, MAX_RUN_ARTIFACT_LEN,
 };
+use cerulion_core::transport::TransportManager;
+use cerulion_core::TransportResult;
 use serde_json::{json, Value};
 use tempfile::tempdir;
+use test_node_macro_relay_rlib::RelayNodeEntry;
 use zenoh::Wait;
 
 cerulion_android::embed_nodes! {
     "test_node_macro_period_cdylib" => test_node_macro_period_cdylib::PeriodNodeEntry,
-    "test_node_macro_relay_rlib" => test_node_macro_relay_rlib::RelayNodeEntry,
+    "test_node_macro_relay_rlib" => RelayNodeEntry,
+    "sink" => SinkEntry,
+}
+
+/// A sink: the relay's trigger input and no output, the ports of a node that
+/// only reads what a desk sends.
+struct SinkEntry(RelayNodeEntry);
+
+impl SinkEntry {
+    fn new() -> Self {
+        Self(RelayNodeEntry::new())
+    }
+}
+
+impl NodeEntry for SinkEntry {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        let info = self.0.info()?;
+        let sink = NodeInfo::with_meta(info.input_meta().to_vec(), Vec::new());
+        Ok(match info.policy() {
+            Some(policy) => sink.with_policy(policy),
+            None => sink,
+        })
+    }
+
+    fn init(&mut self, _context: NodeContext) -> TransportResult<()> {
+        Ok(())
+    }
+
+    fn tick(&mut self) -> TransportResult<()> {
+        Ok(())
+    }
 }
 
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
@@ -42,6 +76,7 @@ const VECTOR3: &str = "geometry_msgs/Vector3";
 const APP_IN: &str = "/hosted/app/in";
 const SOURCE_CMD: &str = "/hosted/source/cmd";
 const RELAY_ECHO: &str = "/hosted/relay/echo";
+const DESK_CMD: &str = "/hosted/desk/cmd";
 
 const DESK_DIR_ENV: &str = "CERULION_HOSTED_RUN_DESK_DIR";
 const DESK_PORT_ENV: &str = "CERULION_HOSTED_RUN_DESK_PORT";
@@ -71,6 +106,30 @@ nodes:
         schema: {VECTOR3}
 "
     )
+}
+
+/// An open start whose graph only reads [`DESK_CMD`], a topic a desk
+/// publishes into the app: no graph output, no `publish` topic, and an
+/// `egress` list, so the gateway has no topic to serve.
+fn read_only_config(listen: &str) -> String {
+    json!({
+        "listen": [listen],
+        "lan_access": "open",
+        "egress": [],
+        "ingress": [DESK_CMD],
+        "graph_yaml": format!(
+            "name: read_only
+prefix: hosted
+nodes:
+  - id: sink
+    type: sink
+    inputs:
+      - name: cmd
+        source: {DESK_CMD}
+"
+        ),
+    })
+    .to_string()
 }
 
 fn config(listen: &str, lan_access: &str, graph: Option<String>) -> String {
@@ -399,6 +458,26 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     );
     assert_eq!(status_json(&runtime)["fire_telemetry"], Value::Null);
 
+    // 0. The first gateway of the process has no topic to serve and an
+    //    `egress` list, so it declares no query surface: no desk can read a
+    //    run, so the start hosts none and reports no fire telemetry.
+    runtime
+        .start(&read_only_config(&listen))
+        .expect("start the read-only graph");
+    let manager = TransportManager::get().expect("the start made the manager");
+    assert!(
+        !manager.network().expect("network").has_query_surface(),
+        "a gateway with no topic and an egress list declares no query surface"
+    );
+    assert_eq!(
+        runtime.hosted_run_id_for_test(),
+        None,
+        "a run no desk can read is not hosted"
+    );
+    assert_eq!(fire_stats(&runtime), None);
+    assert_eq!(status_json(&runtime)["fire_telemetry"], Value::Null);
+    runtime.stop().expect("stop the read-only graph");
+
     // 1. An open start with a named graph hosts one live run.
     let before = wall_clock_ns();
     runtime
@@ -529,11 +608,21 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
         asked.elapsed()
     );
 
-    // 4. Stop withdraws the run: an open start without a graph serves the
-    //    settled empty answer, and the stopped run is unknown.
+    // 4. Stop withdraws the run and closes LAN access, so both verbs refuse
+    //    the desk. An open start without a graph then serves the settled
+    //    empty answer, and the stopped run is unknown.
     runtime.stop().expect("stop the named graph");
     assert_eq!(fire_stats(&runtime), None, "a stopped run is not hosted");
     assert_eq!(runtime.hosted_run_id_for_test(), None);
+    let stopped = desk.runs_until(|reply| reply.error.is_some());
+    assert!(stopped.runs.is_empty(), "{stopped:?}");
+    let reason = stopped.error.as_deref().unwrap_or_default();
+    assert!(reason.contains("paired"), "{reason}");
+    let outcome = desk.fires(&first.run_id, Some(next)).outcome;
+    assert!(
+        matches!(&outcome, FiresOutcome::Refused { reason } if reason.contains("paired")),
+        "a stopped runtime refuses fires: {outcome:?}"
+    );
     runtime
         .start(&config(&listen, "open", None))
         .expect("start without a graph");
@@ -612,5 +701,34 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
         "a refused GET does not arm the tap"
     );
     runtime.stop().expect("stop the paired graph");
+
+    // 7. A graph.yaml above the served cap: `runs` names the run
+    //    undescribable with the reason, and with no description to read
+    //    its fires by, the run serves none and reports no fire telemetry.
+    let long_name = "x".repeat(MAX_RUN_ARTIFACT_LEN);
+    runtime
+        .start(&config(&listen, "open", Some(graph_yaml(Some(&long_name)))))
+        .expect("start the graph that is too large to describe");
+    let undescribable = runtime
+        .hosted_run_id_for_test()
+        .expect("the run is hosted, as undescribable");
+    assert_eq!(fire_stats(&runtime), None, "it serves no fires");
+    assert_eq!(status_json(&runtime)["fire_telemetry"], Value::Null);
+    let reply = desk.runs_until(|reply| reply.error.is_none() && !reply.undescribable.is_empty());
+    assert!(reply.runs.is_empty(), "{:?}", reply.runs);
+    match reply.undescribable.as_slice() {
+        [UndescribableRun { run_id, reason }] => {
+            assert_eq!(run_id, &undescribable);
+            assert!(reason.contains("graph.yaml"), "{reason}");
+        }
+        other => panic!("expected one undescribable run, got {other:?}"),
+    }
+    assert_eq!(
+        desk.fires(&undescribable, None).outcome,
+        FiresOutcome::NotServed
+    );
+    runtime
+        .stop()
+        .expect("stop the graph that is too large to describe");
     desk.quit();
 }

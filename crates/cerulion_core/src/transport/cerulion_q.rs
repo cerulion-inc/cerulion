@@ -1844,8 +1844,13 @@ pub fn gather_runs_outcome<'a>(replies: impl IntoIterator<Item = &'a [u8]>) -> R
 pub const FIRES_WIRE_VERSION: u32 = 1;
 
 /// The most rows one [`FiresReply`] carries. A desk that receives a full page
-/// asks again with the reply's `next` to read on.
+/// asks again with the reply's `next` to read on. A lost sequence takes no
+/// row, so a shorter page reached the newest fire the run had recorded.
 pub const MAX_FIRES_PER_REPLY: usize = FIRE_SERVE_MAX;
+
+/// The most `in_tick` entries a served reply names: one per node, and a node
+/// index is a `u16`.
+const MAX_IN_TICK: usize = u16::MAX as usize + 1;
 
 /// The reply to a `cerulion_q/{robot}/fires/{run_id}/{after}` GET.
 ///
@@ -1932,8 +1937,9 @@ pub enum FiresDecodeError {
     UnknownVersion { got: u32, supported: u32 },
     /// The payload parsed and carries this version, but names a state the serve
     /// side never produces: a non-canonical run id, more rows than
-    /// [`MAX_FIRES_PER_REPLY`], a cause byte no [`FireCause`] has, or sequences
-    /// that do not strictly increase inside the reply's range.
+    /// [`MAX_FIRES_PER_REPLY`], a cause byte no [`FireCause`] has, sequences
+    /// that do not strictly increase inside the reply's range, or `in_tick`
+    /// nodes that do not strictly increase.
     Invalid { reason: String },
 }
 
@@ -2068,25 +2074,76 @@ struct WireFiresReply {
     version: u32,
     robot: String,
     run_id: String,
-    outcome: WireFiresOutcome,
+    outcome: WireFiresFields,
+}
+
+/// A fires outcome object as read. A flat struct, not a tagged enum: serde
+/// buffers the whole object of a tagged enum before it reads the tag, which
+/// would hold every row of an oversized reply. A struct reads each field in
+/// place, so a [`Capped`] field holds no more than its cap.
+#[derive(Deserialize)]
+struct WireFiresFields {
+    kind: WireFiresKind,
+    now_ns: Option<u64>,
+    armed_since_ns: Option<u64>,
+    next: Option<u64>,
+    lost: Option<u64>,
+    in_tick: Option<Capped<(u16, u64), MAX_IN_TICK>>,
+    fires: Option<Capped<fire_rows::Row, MAX_FIRES_PER_REPLY>>,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+enum WireFiresKind {
+    Served,
+    UnknownRun,
+    NotServed,
+    Refused,
+}
+
+/// A fires outcome with every field its kind requires.
 enum WireFiresOutcome {
     Served {
         now_ns: u64,
         armed_since_ns: u64,
         next: u64,
         lost: u64,
-        in_tick: Vec<(u16, u64)>,
-        fires: Vec<fire_rows::Row>,
+        in_tick: Capped<(u16, u64), MAX_IN_TICK>,
+        fires: Capped<fire_rows::Row, MAX_FIRES_PER_REPLY>,
     },
     UnknownRun,
     NotServed,
     Refused {
         reason: String,
     },
+}
+
+impl TryFrom<WireFiresFields> for WireFiresOutcome {
+    type Error = FiresDecodeError;
+
+    fn try_from(fields: WireFiresFields) -> Result<Self, FiresDecodeError> {
+        fn required<T>(value: Option<T>, name: &str) -> Result<T, FiresDecodeError> {
+            value.ok_or_else(|| FiresDecodeError::Malformed {
+                detail: format!("missing field `{name}`"),
+            })
+        }
+        Ok(match fields.kind {
+            WireFiresKind::Served => WireFiresOutcome::Served {
+                now_ns: required(fields.now_ns, "now_ns")?,
+                armed_since_ns: required(fields.armed_since_ns, "armed_since_ns")?,
+                next: required(fields.next, "next")?,
+                lost: required(fields.lost, "lost")?,
+                in_tick: required(fields.in_tick, "in_tick")?,
+                fires: required(fields.fires, "fires")?,
+            },
+            WireFiresKind::UnknownRun => WireFiresOutcome::UnknownRun,
+            WireFiresKind::NotServed => WireFiresOutcome::NotServed,
+            WireFiresKind::Refused => WireFiresOutcome::Refused {
+                reason: required(fields.reason, "reason")?,
+            },
+        })
+    }
 }
 
 impl TryFrom<WireFiresReply> for FiresReply {
@@ -2099,6 +2156,7 @@ impl TryFrom<WireFiresReply> for FiresReply {
                 supported: FIRES_WIRE_VERSION,
             });
         }
+        let outcome = WireFiresOutcome::try_from(wire.outcome)?;
         if !is_canonical_run_id(&wire.run_id) {
             return Err(FiresDecodeError::Invalid {
                 reason: format!(
@@ -2107,7 +2165,7 @@ impl TryFrom<WireFiresReply> for FiresReply {
                 ),
             });
         }
-        let outcome = match wire.outcome {
+        let outcome = match outcome {
             WireFiresOutcome::Served {
                 now_ns,
                 armed_since_ns,
@@ -2120,7 +2178,7 @@ impl TryFrom<WireFiresReply> for FiresReply {
                 armed_since_ns,
                 next,
                 lost,
-                in_tick,
+                in_tick: served_in_tick(in_tick)?,
                 fires: served_records(next, lost, fires)?,
             },
             WireFiresOutcome::UnknownRun => FiresOutcome::UnknownRun,
@@ -2146,15 +2204,16 @@ impl TryFrom<WireFiresReply> for FiresReply {
 fn served_records(
     next: u64,
     lost: u64,
-    rows: Vec<fire_rows::Row>,
+    rows: Capped<fire_rows::Row, MAX_FIRES_PER_REPLY>,
 ) -> Result<Vec<FireRecord>, FiresDecodeError> {
     let invalid = |reason: String| FiresDecodeError::Invalid { reason };
-    if rows.len() > MAX_FIRES_PER_REPLY {
+    if rows.len > MAX_FIRES_PER_REPLY {
         return Err(invalid(format!(
             "{} rows, above the {MAX_FIRES_PER_REPLY}-row reply cap",
-            rows.len()
+            rows.len
         )));
     }
+    let rows = rows.held;
     let count = rows.len() as u64;
     let Some(start) = count
         .checked_add(lost)
@@ -2197,6 +2256,73 @@ fn served_records(
         records.push(record);
     }
     Ok(records)
+}
+
+/// The `in_tick` entries a served page names: at most one per node, in
+/// topology order.
+fn served_in_tick(
+    entries: Capped<(u16, u64), MAX_IN_TICK>,
+) -> Result<Vec<(u16, u64)>, FiresDecodeError> {
+    let invalid = |reason: String| FiresDecodeError::Invalid { reason };
+    if entries.len > MAX_IN_TICK {
+        return Err(invalid(format!(
+            "{} in_tick entries, above one per node ({MAX_IN_TICK})",
+            entries.len
+        )));
+    }
+    for pair in entries.held.windows(2) {
+        let ((previous, _), (node, _)) = (pair[0], pair[1]);
+        if node <= previous {
+            return Err(invalid(format!(
+                "in_tick node {node} follows node {previous}: nodes strictly increase"
+            )));
+        }
+    }
+    Ok(entries.held)
+}
+
+/// A JSON array of which the decoder holds at most `MAX` elements. It counts
+/// the rest without reading them, so an oversized reply costs the desk no more
+/// memory than a full one before the cap refuses it.
+struct Capped<T, const MAX: usize> {
+    held: Vec<T>,
+    /// Every element the array carries, held or not.
+    len: usize,
+}
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for Capped<T, MAX> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CappedVisitor<T, const MAX: usize>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de> for CappedVisitor<T, MAX> {
+            type Value = Capped<T, MAX>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut held = Vec::new();
+                while held.len() < MAX {
+                    let Some(element) = seq.next_element()? else {
+                        let len = held.len();
+                        return Ok(Capped { held, len });
+                    };
+                    held.push(element);
+                }
+                let mut len = MAX;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    len += 1;
+                }
+                Ok(Capped { held, len })
+            }
+        }
+
+        deserializer.deserialize_seq(CappedVisitor(std::marker::PhantomData))
+    }
 }
 
 /// The row form of a [`FireRecord`], whose column order the wire version pins.
@@ -4510,6 +4636,12 @@ mod tests {
             format!(
                 r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"exploded"}}}}"#
             ),
+            format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":1,"lost":0,"in_tick":[]}}}}"#
+            ),
+            format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"refused"}}}}"#
+            ),
             row("[1,1,1,0,1,0]"),
             row("[1,1,1,0,1,0,0,0]"),
             row("[1,1,4294967296,0,1,0,0]"),
@@ -4540,6 +4672,115 @@ mod tests {
             invalid(&served_seqs(513, 0, &above)),
             "513 rows, above the 512-row reply cap"
         );
+    }
+
+    fn served_json(in_tick: &str, fires: &str) -> String {
+        format!(
+            r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":512,"lost":0,"in_tick":[{in_tick}],"fires":[{fires}]}}}}"#
+        )
+    }
+
+    /// The allocations `run` makes on this thread, counted by the lib test
+    /// binary's allocator.
+    fn allocations_in(run: impl FnOnce()) -> u64 {
+        use crate::fire_tap::tests::ALLOCATIONS;
+        ALLOCATIONS.set(Some(0));
+        run();
+        ALLOCATIONS.replace(None).expect("the count was armed")
+    }
+
+    /// The decoder holds no element past a cap: it counts the rest without
+    /// reading them, so an oversized reply costs the desk no more memory than
+    /// one a single element over the cap before the cap refuses it.
+    #[test]
+    fn elements_past_a_cap_are_counted_not_held() {
+        let rows = |count: usize| -> String {
+            let rows: Vec<String> = (1..=count)
+                .map(|seq| format!("[{seq},1,1,0,1,0,0]"))
+                .collect();
+            rows.join(",")
+        };
+        let full = rows(MAX_FIRES_PER_REPLY);
+        assert_eq!(
+            decode_fires_reply(served_json("", &format!(r#"{full},"x",{{}}"#)).as_bytes()),
+            Err(FiresDecodeError::Invalid {
+                reason: "514 rows, above the 512-row reply cap".to_string(),
+            })
+        );
+        let one_over = served_json("", &rows(MAX_FIRES_PER_REPLY + 1));
+        let far_over = served_json("", &rows(MAX_FIRES_PER_REPLY + 10_000));
+        assert_eq!(
+            decode_fires_reply(far_over.as_bytes()),
+            Err(FiresDecodeError::Invalid {
+                reason: "10512 rows, above the 512-row reply cap".to_string(),
+            })
+        );
+        let one_over = allocations_in(|| drop(decode_fires_reply(one_over.as_bytes())));
+        let far_over = allocations_in(|| drop(decode_fires_reply(far_over.as_bytes())));
+        assert!(
+            far_over <= one_over,
+            "10,000 more rows past the cap made {far_over} allocations, against {one_over}"
+        );
+
+        let nodes = |count: usize| -> String {
+            let nodes: Vec<String> = (0..count).map(|node| format!("[{node},1]")).collect();
+            nodes.join(",")
+        };
+        let Ok(FiresReply {
+            outcome: FiresOutcome::Served { in_tick, .. },
+            ..
+        }) = decode_fires_reply(served_json(&nodes(65_536), "").as_bytes())
+        else {
+            panic!("one in_tick entry per node decodes");
+        };
+        assert_eq!(in_tick.len(), 65_536);
+        let far_over = served_json(&nodes(65_536 + 10_000), "");
+        assert_eq!(
+            decode_fires_reply(far_over.as_bytes()),
+            Err(FiresDecodeError::Invalid {
+                reason: "75536 in_tick entries, above one per node (65536)".to_string(),
+            })
+        );
+        let one_over = served_json(&format!(r#"{},"x""#, nodes(65_536)), "");
+        let one_over = allocations_in(|| drop(decode_fires_reply(one_over.as_bytes())));
+        let far_over = allocations_in(|| drop(decode_fires_reply(far_over.as_bytes())));
+        assert!(
+            far_over <= one_over,
+            "10,000 more in_tick entries past the cap made {far_over} allocations, against \
+             {one_over}"
+        );
+    }
+
+    #[test]
+    fn an_in_tick_list_naming_a_node_twice_or_out_of_order_is_refused() {
+        for (in_tick, reason) in [
+            (
+                "[2,5],[2,6]",
+                "in_tick node 2 follows node 2: nodes strictly increase",
+            ),
+            (
+                "[3,1],[1,1]",
+                "in_tick node 1 follows node 3: nodes strictly increase",
+            ),
+        ] {
+            let bytes = served_json(in_tick, "");
+            assert_eq!(
+                decode_fires_reply(bytes.as_bytes()),
+                Err(FiresDecodeError::Invalid {
+                    reason: reason.to_string(),
+                })
+            );
+            assert!(serde_json::from_str::<FiresReply>(&bytes).is_err());
+        }
+        let ordered = served_json("[0,7],[3,9]", "");
+        let Ok(FiresReply {
+            outcome: FiresOutcome::Served { in_tick, .. },
+            ..
+        }) = decode_fires_reply(ordered.as_bytes())
+        else {
+            panic!("nodes in topology order decode");
+        };
+        assert_eq!(in_tick, vec![(0, 7), (3, 9)]);
     }
 
     #[test]
