@@ -3347,6 +3347,120 @@ mod tests {
         }
     }
 
+    /// A v10 fake daemon over a REAL UDS closes the first connection after it
+    /// reads the first request (the idle-exit race), then answers on the second
+    /// connection with lines minted by the production `Response` serializer.
+    #[test]
+    fn query_fires_hands_back_netds_answer_and_retries_a_first_request_closed_early() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
+        use cerulion_core::transport::cerulion_q::{FiresOutcome, FiresReply};
+
+        use crate::protocol::{FiresQueryResponse, FIRES_MIN_DAEMON_VERSION};
+
+        const RUN: &str = "0x0000000000000000000000000000002a";
+        let served = FiresAnswer::Reply {
+            reply: FiresReply::new(
+                "temi",
+                0x2a,
+                FiresOutcome::Served {
+                    now_ns: 2_000,
+                    armed_since_ns: 1_000,
+                    next: 42,
+                    lost: 1,
+                    in_tick: vec![(0, 1_900)],
+                    fires: vec![FireRecord {
+                        seq: 42,
+                        at_ns: 1_500,
+                        dur_ns: 40,
+                        node: 0,
+                        cause: FireCause::Period,
+                        flags: FireFlags(0),
+                        wrote: 0b1,
+                    }],
+                },
+            ),
+        };
+        let unusable = FiresAnswer::Unusable {
+            reason: "unknown fires wire version 2 (this binary supports 1)".to_string(),
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "fires_retry_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("netd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (conns, reqs) = (Arc::clone(&connections), Arc::clone(&requests));
+        let answers = [served.clone(), unusable.clone()];
+        std::thread::spawn(move || {
+            for n in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                conns.fetch_add(1, Ordering::SeqCst);
+                let mut w = stream.try_clone().expect("clone");
+                let banner = Hello {
+                    hello: HELLO_MARKER.to_string(),
+                    protocol: FIRES_MIN_DAEMON_VERSION,
+                    wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
+                }
+                .to_json_line();
+                let _ = writeln!(w, "{banner}");
+                let _ = w.flush();
+                let lines = BufReader::new(stream).lines().map_while(Result::ok);
+                for (answer, line) in answers.iter().zip(lines) {
+                    reqs.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        break;
+                    }
+                    let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+                    assert_eq!(v["method"], "query_fires");
+                    assert_eq!(v["robot"], "temi");
+                    assert_eq!(v["run_id"], RUN);
+                    assert_eq!(v["after"], 41);
+                    let resp = Response::FiresQuery(FiresQueryResponse {
+                        id: v["id"].as_u64().expect("an id"),
+                        answer: answer.clone(),
+                    });
+                    let _ = writeln!(w, "{}", resp.to_json_line());
+                    let _ = w.flush();
+                }
+            }
+        });
+
+        let mut client = NetdClient::connect_or_spawn_at(sock).expect("connect to the daemon");
+        assert_eq!(
+            client
+                .query_fires("temi", RUN, Some(41))
+                .expect("the first request is retried on a fresh connection"),
+            served
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 2, "one reconnect");
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "sent, then resent");
+        assert_eq!(
+            client
+                .query_fires("temi", RUN, Some(41))
+                .expect("the daemon answers"),
+            unusable
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn client_baseline_min_version_is_the_v1_vocabulary() {
         // The handshake floor is the v1 demand/release/status vocabulary this consumer

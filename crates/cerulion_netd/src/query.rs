@@ -47,7 +47,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cerulion_core::transport::cerulion_q::{decode_fires_reply, UnusableRunsAnswer};
+use cerulion_core::transport::cerulion_q::{gather_fires_answer, UnusableRunsAnswer};
 use cerulion_core::transport::discovery::{
     query_announce_entries, query_robot_catalog, query_robot_catalogs, query_robot_fires,
     query_robot_runs, query_robot_runs_all, query_robot_schema, query_robot_schemas, RunsHarvest,
@@ -1255,48 +1255,11 @@ impl QueryPlane for GatewayQueryPlane {
             source: Box::new(e),
         })?;
         let payloads = query_robot_fires(session, robot, run_id, after, FIRES_GATHER_WINDOW);
-        Ok(fires_answer(
+        Ok(gather_fires_answer(
             robot,
             run_id,
             payloads.iter().map(Vec::as_slice),
         ))
-    }
-}
-
-/// Classify the reply payloads of one `fires` GET for `run_id` on `robot`.
-///
-/// The first usable reply wins and is attributed to `robot`, the key it came
-/// back on (the `RunsReply` rule). A payload that does not decode, or decodes
-/// as a reply about another run, is unusable; with no usable reply the first
-/// such reason is the answer. No payload at all is silence. Pure.
-fn fires_answer<'a>(
-    robot: &str,
-    run_id: &str,
-    payloads: impl IntoIterator<Item = &'a [u8]>,
-) -> FiresAnswer {
-    let mut unusable: Option<String> = None;
-    for bytes in payloads {
-        match decode_fires_reply(bytes) {
-            Ok(mut reply) if reply.run_id == run_id => {
-                reply.robot = robot.to_string();
-                return FiresAnswer::Reply { reply };
-            }
-            Ok(reply) => {
-                unusable.get_or_insert_with(|| {
-                    format!(
-                        "the robot answered about run {} when asked about run {run_id}",
-                        reply.run_id
-                    )
-                });
-            }
-            Err(e) => {
-                unusable.get_or_insert_with(|| e.to_string());
-            }
-        }
-    }
-    match unusable {
-        Some(reason) => FiresAnswer::Unusable { reason },
-        None => FiresAnswer::Silent,
     }
 }
 
@@ -1305,9 +1268,6 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::AtomicUsize;
-
-    use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
-    use cerulion_core::transport::cerulion_q::{encode_fires_reply, FiresOutcome, FiresReply};
 
     /// The cold-start decision against a HAND-WRITTEN verdict table. Every
     /// row states the situation in words first, so the table is an oracle rather
@@ -2328,153 +2288,6 @@ mod tests {
 
     const RUN: &str = "0x0000000000000000000000000000002a";
 
-    fn served_bytes(robot: &str, run_id: u128) -> Vec<u8> {
-        encode_fires_reply(&FiresReply::new(
-            robot,
-            run_id,
-            FiresOutcome::Served {
-                now_ns: 2_000,
-                armed_since_ns: 1_000,
-                next: 1,
-                lost: 0,
-                in_tick: vec![(0, 1_900)],
-                fires: vec![FireRecord {
-                    seq: 1,
-                    at_ns: 1_500,
-                    dur_ns: 40,
-                    node: 0,
-                    cause: FireCause::Period,
-                    flags: FireFlags(0),
-                    wrote: 0b1,
-                }],
-            },
-        ))
-    }
-
-    fn answer(payloads: &[&[u8]]) -> FiresAnswer {
-        fires_answer("temi", RUN, payloads.iter().copied())
-    }
-
-    #[test]
-    fn no_fires_payload_is_silence() {
-        assert_eq!(answer(&[]), FiresAnswer::Silent);
-    }
-
-    #[test]
-    fn a_fires_reply_is_attributed_to_the_robot_the_request_named() {
-        // The robot wrote its hostname into the reply; the answer names the key.
-        let bytes = served_bytes("orin-7", 0x2a);
-        assert_eq!(
-            answer(&[&bytes]),
-            FiresAnswer::Reply {
-                reply: FiresReply {
-                    version: 1,
-                    robot: "temi".to_string(),
-                    run_id: RUN.to_string(),
-                    outcome: FiresOutcome::Served {
-                        now_ns: 2_000,
-                        armed_since_ns: 1_000,
-                        next: 1,
-                        lost: 0,
-                        in_tick: vec![(0, 1_900)],
-                        fires: vec![FireRecord {
-                            seq: 1,
-                            at_ns: 1_500,
-                            dur_ns: 40,
-                            node: 0,
-                            cause: FireCause::Period,
-                            flags: FireFlags(0),
-                            wrote: 0b1,
-                        }],
-                    },
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn every_robot_outcome_rides_through_as_a_reply() {
-        for outcome in [
-            FiresOutcome::UnknownRun,
-            FiresOutcome::NotServed,
-            FiresOutcome::Refused {
-                reason: "LAN access is paired".to_string(),
-            },
-        ] {
-            let bytes = encode_fires_reply(&FiresReply::new("temi", 0x2a, outcome.clone()));
-            assert_eq!(
-                answer(&[&bytes]),
-                FiresAnswer::Reply {
-                    reply: FiresReply::new("temi", 0x2a, outcome),
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn a_fires_payload_this_binary_cannot_use_is_unusable_with_its_reason() {
-        let skewed = br#"{"version":2,"robot":"temi","run_id":"0x0000000000000000000000000000002a","outcome":{"kind":"not_served"}}"#;
-        assert_eq!(
-            answer(&[skewed]),
-            FiresAnswer::Unusable {
-                reason: "unknown fires wire version 2 (this binary supports 1)".to_string(),
-            }
-        );
-        match answer(&[b"not json"]) {
-            FiresAnswer::Unusable { reason } => {
-                assert!(
-                    reason.starts_with("fires reply did not parse ("),
-                    "{reason}"
-                );
-            }
-            other => panic!("expected Unusable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_fires_reply_about_another_run_is_unusable() {
-        let other = served_bytes("temi", 0x2b);
-        assert_eq!(
-            answer(&[&other]),
-            FiresAnswer::Unusable {
-                reason: "the robot answered about run 0x0000000000000000000000000000002b \
-                         when asked about run 0x0000000000000000000000000000002a"
-                    .to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn the_first_usable_fires_reply_wins_over_unusable_ones() {
-        let good = served_bytes("temi", 0x2a);
-        let other_run = served_bytes("temi", 0x2b);
-        let not_served =
-            encode_fires_reply(&FiresReply::new("temi", 0x2a, FiresOutcome::NotServed));
-        for payloads in [
-            vec![
-                b"not json".as_slice(),
-                other_run.as_slice(),
-                good.as_slice(),
-            ],
-            vec![good.as_slice(), not_served.as_slice()],
-        ] {
-            match answer(&payloads) {
-                FiresAnswer::Reply { reply } => assert!(
-                    matches!(reply.outcome, FiresOutcome::Served { next: 1, .. }),
-                    "{reply:?}"
-                ),
-                other => panic!("expected the served reply, got {other:?}"),
-            }
-        }
-        // With no usable reply, the FIRST unusable reason is the answer.
-        match answer(&[b"not json", other_run.as_slice()]) {
-            FiresAnswer::Unusable { reason } => {
-                assert!(reason.starts_with("fires reply did not parse"), "{reason}");
-            }
-            other => panic!("expected Unusable, got {other:?}"),
-        }
-    }
-
     #[test]
     fn a_plane_without_a_fires_verb_refuses_it() {
         assert!(matches!(
@@ -2499,11 +2312,6 @@ mod tests {
             Err(QueryError::NoNetwork)
         ));
     }
-
-    #[test]
-    fn the_fires_window_is_one_poll_plus_a_margin() {
-        assert_eq!(FIRES_GATHER_WINDOW, Duration::from_millis(300));
-    }
 }
 
 /// The production [`GatewayQueryPlane::query_fires`] against an in-process
@@ -2511,7 +2319,7 @@ mod tests {
 /// key over its ONE session and folds the reply.
 #[cfg(test)]
 mod gateway_fires_tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2520,7 +2328,9 @@ mod gateway_fires_tests {
     use cerulion_core::graph::node::NodeEntry;
     use cerulion_core::graph::{parse_graph, GraphRuntime};
     use cerulion_core::testing::iceoryx_test_config;
-    use cerulion_core::transport::cerulion_q::{FiresOutcome, FiresReply, RunEntry};
+    use cerulion_core::transport::cerulion_q::{
+        encode_fires_reply, FiresOutcome, FiresReply, RunEntry,
+    };
     use cerulion_core::transport::demand_authorizer::LanAccess;
     use cerulion_core::transport::hosted_runs::{HostedRun, HostedRunGuard};
     use cerulion_core::transport::network::NetworkConfig;
@@ -2529,6 +2339,8 @@ mod gateway_fires_tests {
     use cerulion_core::{
         ClosureNodeEntry, GatewayEgressPolicy, GatewayPlan, GatewayRuntime, MacroPolicy, NodeInfo,
     };
+
+    use zenoh::Wait;
 
     use super::{GatewayQueryPlane, QueryError, QueryPlane, FIRES_GATHER_WINDOW};
     use crate::protocol::FiresAnswer;
@@ -2629,11 +2441,16 @@ mod gateway_fires_tests {
 
     /// Ask until the answer is a reply (the desk session may still be
     /// connecting), and return it.
-    fn reply_within(plane: &GatewayQueryPlane, run_id: &str, after: Option<u64>) -> FiresReply {
+    fn reply_within(
+        plane: &GatewayQueryPlane,
+        robot: &str,
+        run_id: &str,
+        after: Option<u64>,
+    ) -> FiresReply {
         let deadline = Instant::now() + WIRE_CEILING;
         let mut last = String::from("no GET issued");
         while Instant::now() < deadline {
-            match plane.query_fires(ROBOT, run_id, after) {
+            match plane.query_fires(robot, run_id, after) {
                 Ok(FiresAnswer::Reply { reply }) => return reply,
                 other => last = format!("{other:?}"),
             }
@@ -2658,7 +2475,7 @@ mod gateway_fires_tests {
         let plane = desk_plane(port);
         let run = "0x0000000000000000000000000000002a";
 
-        let first = reply_within(&plane, run, None);
+        let first = reply_within(&plane, ROBOT, run, None);
         assert_eq!(first.robot, ROBOT);
         assert_eq!(first.run_id, run);
         match first.outcome {
@@ -2670,7 +2487,7 @@ mod gateway_fires_tests {
         assert!(tap.stats().armed, "the netd GET armed the robot's tap");
 
         graph.step(Duration::from_millis(1));
-        let second = reply_within(&plane, run, Some(0));
+        let second = reply_within(&plane, ROBOT, run, Some(0));
         match second.outcome {
             FiresOutcome::Served {
                 next, lost, fires, ..
@@ -2698,33 +2515,91 @@ mod gateway_fires_tests {
         let _guard = host(&robot, 0x2b, None);
         let plane = desk_plane(port);
 
-        let not_served = reply_within(&plane, "0x0000000000000000000000000000002b", None);
+        let not_served = reply_within(&plane, ROBOT, "0x0000000000000000000000000000002b", None);
         assert_eq!(not_served.outcome, FiresOutcome::NotServed);
-        let unknown = reply_within(&plane, "0x0000000000000000000000000000002c", Some(9));
+        let unknown = reply_within(&plane, ROBOT, "0x0000000000000000000000000000002c", Some(9));
         assert_eq!(unknown.outcome, FiresOutcome::UnknownRun);
 
         network.set_lan_access(LanAccess::Paired);
-        let refused = reply_within(&plane, "0x0000000000000000000000000000002b", None);
+        let refused = reply_within(&plane, ROBOT, "0x0000000000000000000000000000002b", None);
         assert!(
             matches!(refused.outcome, FiresOutcome::Refused { .. }),
             "{refused:?}"
         );
     }
 
+    /// Two runs on a robot named `late` that receives every `fires` GET: it
+    /// answers the GET about [`PROMPT_RUN`] after [`PROMPT_REPLY`] and the GET
+    /// about [`LATE_RUN`] after [`LATE_REPLY`], one each side of the window.
+    const PROMPT_RUN: &str = "0x00000000000000000000000000000001";
+    const LATE_RUN: &str = "0x00000000000000000000000000000002";
+    const PROMPT_REPLY: Duration = Duration::from_millis(100);
+    const LATE_REPLY: Duration = Duration::from_secs(1);
+
     #[test]
-    fn a_robot_that_does_not_answer_is_silent_within_one_window() {
-        let (_robot, _gateway, port) = listening_robot();
+    fn the_plane_waits_one_window_for_a_reply_and_no_longer() {
+        assert!(PROMPT_REPLY < FIRES_GATHER_WINDOW && FIRES_GATHER_WINDOW < LATE_REPLY);
+        let (robot, _gateway, port) = listening_robot();
+        let session = robot
+            .network()
+            .expect("a network")
+            .session()
+            .expect("the robot's session");
+        let late_asked = Arc::new(AtomicUsize::new(0));
+        let late_answered = Arc::new(AtomicBool::new(false));
+        let (asked, answered) = (Arc::clone(&late_asked), Arc::clone(&late_answered));
+        let _late_robot = session
+            .declare_queryable("cerulion_q/late/**")
+            .callback(move |query| {
+                let late = query.key_expr().as_str().contains(LATE_RUN);
+                let (run_id, delay) = if late {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    (0x2, LATE_REPLY)
+                } else {
+                    (0x1, PROMPT_REPLY)
+                };
+                let answered = Arc::clone(&answered);
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    let reply = FiresReply::new("late", run_id, FiresOutcome::NotServed);
+                    let _ = query
+                        .reply(query.key_expr().clone(), encode_fires_reply(&reply))
+                        .wait();
+                    if late {
+                        answered.store(true, Ordering::SeqCst);
+                    }
+                });
+            })
+            .wait()
+            .expect("declare the late robot's queryable");
         let plane = desk_plane(port);
-        let started = Instant::now();
-        let answer = plane
-            .query_fires("nobody", "0x0000000000000000000000000000002a", None)
-            .expect("the GET runs");
-        assert_eq!(answer, FiresAnswer::Silent);
-        assert!(
-            started.elapsed() < FIRES_GATHER_WINDOW + Duration::from_secs(5),
-            "one GET, no retry ladder: {:?}",
-            started.elapsed()
+
+        let prompt = reply_within(&plane, "late", PROMPT_RUN, None);
+        assert_eq!(prompt.outcome, FiresOutcome::NotServed);
+
+        assert_eq!(
+            plane
+                .query_fires("late", LATE_RUN, None)
+                .expect("the GET runs"),
+            FiresAnswer::Silent,
+            "a reply later than the window is not waited for"
         );
+        assert!(
+            within_ceiling(|| late_answered.load(Ordering::SeqCst)),
+            "the robot received the GET and answered it after the window"
+        );
+        assert_eq!(late_asked.load(Ordering::SeqCst), 1, "one GET, no retry");
+    }
+
+    fn within_ceiling(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + WIRE_CEILING;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        done()
     }
 
     #[test]

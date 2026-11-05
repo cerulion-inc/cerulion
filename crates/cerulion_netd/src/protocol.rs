@@ -21,7 +21,7 @@
 //! This module is transport-free (serde + `serde_json` only) so a future client
 //! (C3's migrated vizd / `topic echo` / connectd) can lift it verbatim.
 
-use cerulion_core::transport::cerulion_q::{FiresReply, UnusableRunsAnswer};
+use cerulion_core::transport::cerulion_q::UnusableRunsAnswer;
 use cerulion_core::{CatalogReply, GatewayPlan, LanAccess, RunsReply, SchemaReply, SchemaServing};
 use serde::{Deserialize, Serialize};
 
@@ -999,30 +999,10 @@ pub struct FiresQueryResponse {
     pub answer: FiresAnswer,
 }
 
-/// What netd learned from one `fires` GET. The three answers have three
-/// different remedies, so a consumer must not fold one into another.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FiresAnswer {
-    /// The robot answered usably. The reply's `outcome` says what it did with
-    /// the GET: served rows, did not know the run, records no fires for it,
-    /// or refused. `reply.robot` is the robot the request named.
-    Reply {
-        /// The robot's reply, validated as `decode_fires_reply` validates it.
-        reply: FiresReply,
-    },
-    /// Nothing came back within the window: the robot is unreachable, runs a
-    /// binary that predates the verb, or declares no query surface. Says
-    /// nothing about the run; the next poll may be answered.
-    Silent,
-    /// The robot answered with bytes this binary cannot use: a wire version
-    /// skew, corruption, or a reply about a different run. Asking again reads
-    /// the same bytes until the robot's binaries are rebuilt.
-    Unusable {
-        /// Why, in operator-readable text.
-        reason: String,
-    },
-}
+/// What netd learned from one `fires` GET. The core type, so netd and a desk
+/// that GETs the robot itself classify the same bytes the same way
+/// ([`cerulion_core::transport::cerulion_q::gather_fires_answer`]).
+pub use cerulion_core::transport::cerulion_q::FiresAnswer;
 
 /// A structured error response (never a panic / dropped connection).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1280,7 +1260,7 @@ impl Response {
 mod tests {
     use super::*;
     use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
-    use cerulion_core::transport::cerulion_q::FiresOutcome;
+    use cerulion_core::transport::cerulion_q::{FiresOutcome, FiresReply};
 
     #[test]
     fn hello_carries_marker_and_version() {
