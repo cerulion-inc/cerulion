@@ -832,7 +832,11 @@ def check_docs_refs(root, files):
         check_nested_wiring(read_text(root, CLI_FAMILIES_MOD) if CLI_FAMILIES_MOD in files else None)
     tree = parse_cli_tree(cli_src, family_srcs, nested_srcs)
     crate_names = sorted({f.split("/")[1] for f in files if f.startswith("crates/") and f.count("/") >= 2})
-    stale_names = crate_names + ["test_fixtures", "scripts"]
+    # The umbrella crate's directory, crates/cerulion, never sat at the root
+    # before the move, and `cerulion/` is ordinary text in docs (the
+    # `cerulion/ops/1` protocol string, topic and key names), so it is not a
+    # pre-move spelling.
+    stale_names = [n for n in crate_names if n != "cerulion"] + ["test_fixtures", "scripts"]
     stale_re = re.compile(r"(?<![\w/.-])(" + "|".join(re.escape(n) for n in stale_names) + r")/(?=[\w.])")
     user_api_re = re.compile(r"\bUSER_API\.md\b")
     for f in files:

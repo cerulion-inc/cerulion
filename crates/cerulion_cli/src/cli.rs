@@ -887,18 +887,26 @@ pub enum Ros2Action {
     /// the verb included: read THIS page with `cerulion help ros2 run`, and
     /// `ros2 run --help` for the native surface.
     ///
-    /// The one exception is `--adopt-take` given right after `run`, which is
-    /// refused. `ros2` is a Python CLI that starts the node as a further
-    /// subprocess with close_fds=True, so the heap hook this launcher hands
-    /// over as an inherited descriptor never reaches the node and every take
-    /// would be served by copy. For zero-copy plain takes, launch the node
-    /// executable directly with the hook preloaded and
+    /// The exceptions are Cerulion's own flags, given right after `run`.
+    /// `--adopt-take` is refused. `ros2` is a Python CLI that starts the node
+    /// as a further subprocess with close_fds=True, so the heap hook this
+    /// launcher hands over as an inherited descriptor never reaches the node
+    /// and every take would be served by copy. For zero-copy plain takes,
+    /// launch the node executable directly with the hook preloaded and
     /// CERULION_RMW_ADOPT_TAKE=1 (Linux/GNU only: the hook interposes glibc's
     /// malloc/free).
     ///
+    /// `--record-deliveries <DIR>` records what the process consumed, in the
+    /// order it consumed it, into `<DIR>/<exe>-<pid>.rdl.mcap`.
+    /// `--replay-deliveries <LOG>` replays that one process against its log
+    /// and writes `<LOG>.verdict.json` (identical, or the first node, topic
+    /// and window whose outputs diverged). The two exclude each other. See
+    /// docs/ros2_replay.md for what replays exactly and what is refused.
+    ///
     /// Exit codes (pre-exec failures only; a successful exec inherits ros2's
     /// own): 69 = `librmw_cerulion.so` missing or `--adopt-take` given,
-    /// 127 = `ros2` not on PATH, 1 = other. Unix-only.
+    /// 2 = a refused delivery-log flag, 127 = `ros2` not on PATH, 1 = other.
+    /// Unix-only.
     Run {
         /// Forwarded verbatim to `ros2 run` (e.g. `demo_nodes_cpp talker`);
         /// a LEADING `--adopt-take` is Cerulion's own flag, refused here
@@ -922,9 +930,15 @@ pub enum Ros2Action {
     /// the verb included: read THIS page with `cerulion help ros2 launch`, and
     /// `ros2 launch --help` for the native surface.
     ///
+    /// `--record-deliveries <DIR>` right after `launch` records every ROS 2
+    /// process the launch starts, one `<exe>-<pid>.rdl.mcap` each. There is
+    /// no replay flag here: a replay is one process, run with
+    /// `cerulion ros2 run --replay-deliveries <LOG> ...`.
+    ///
     /// Exit codes (pre-exec failures only; a successful exec inherits ros2's
     /// own): 69 = `librmw_cerulion.so` missing or `--adopt-take` given,
-    /// 127 = `ros2` not on PATH, 1 = other. Unix-only.
+    /// 2 = a refused delivery-log flag, 127 = `ros2` not on PATH, 1 = other.
+    /// Unix-only.
     Launch {
         /// Forwarded verbatim to `ros2 launch` (e.g.
         /// `demo.launch.py use_rviz:=false`, or the `pkg file.launch.py`

@@ -39,7 +39,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_expires_at_ns INTEGER NOT NULL,
     refresh_expires_at_ns INTEGER NOT NULL,
     revoked               INTEGER NOT NULL DEFAULT 0,
-    created_at_ns         INTEGER NOT NULL
+    created_at_ns         INTEGER NOT NULL,
+    -- The latest rotation, for the refresh-token reuse window: the refresh hash it
+    -- replaced, when it committed, the salt its pair was derived with, and whether
+    -- the one replay was spent. Indexed in run_migrations (db.rs).
+    prev_refresh_token_hash TEXT,
+    prev_rotated_at_ns      INTEGER,
+    reuse_salt              BLOB,
+    reuse_spent             INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS device_codes (

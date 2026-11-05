@@ -538,6 +538,33 @@ const DECLARED_SITES: &[Declared] = &[
                  job and the rerun tree is a multi-minute cold build. The count is EXACT; \
                  lowering it is the intended motion",
     },
+    // ── rmw_cerulion ─────────────────────────────────────────────────────────
+    Declared {
+        path: "rmw_cerulion/src/api/init.rs",
+        interpolation: 0,
+        pass_through: 1,
+        messages: &["{why}#fdb1d293"],
+        reason: "PASS-THROUGH: forwards the replay refusal paragraph \
+                 `replay::on_init` built, the same string `rmw_init` hands \
+                 rcl as its error state, so the string is the whole message",
+    },
+    Declared {
+        path: "rmw_cerulion/src/replay/mod.rs",
+        interpolation: 0,
+        pass_through: 4,
+        messages: &[
+            "{line}#a697ae9f",
+            "{line}#a697ae9f",
+            "{line}#a697ae9f",
+            "{why}#fdb1d293",
+        ],
+        reason: "PASS-THROUGH: `note` forwards a replay report line (the \
+                 verdict line `docs/ros2_replay.md` shows) that it writes to \
+                 fd 2 verbatim when `tracing` is unusable at exit, so the line \
+                 is the whole message at one level per arm; `refuse` forwards \
+                 the refusal paragraph `refusal_message` built, the same \
+                 string set as the rcl error state",
+    },
 ];
 
 /// The documented **Standard Fields** (`AGENTS.md`, Conventions → Logging), and for each the
