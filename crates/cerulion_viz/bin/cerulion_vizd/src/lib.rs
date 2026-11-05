@@ -50,6 +50,7 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod activity;
 pub mod daemon;
 pub mod events;
 pub mod host;
