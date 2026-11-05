@@ -24,7 +24,7 @@ use cerulion_rcpd::eye::config::JevConfig;
 use cerulion_rcpd::eye::host::{EyeHost, EyeSettings};
 use cerulion_rcpd::eye::limits::{jpeg_header_for_test, ASKS_PER_SECOND, ASK_BURST};
 use cerulion_rcpd::eye::switch::write_switch;
-use cerulion_rcpd::eye::verdict::{EyeAnswer, Outcome};
+use cerulion_rcpd::eye::verdict::Outcome;
 use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
 use cerulion_rcpd::tools::ReceiptSink;
@@ -178,12 +178,14 @@ impl Gate {
     }
 }
 
+/// The outcome and detail the eye published in an answer frame.
 fn outcome(answer: &str) -> (Outcome, Option<String>) {
-    let parsed = EyeAnswer::parse(answer).expect("answer frame");
-    let detail = serde_json::from_str::<Value>(answer).expect("json")["detail"]
+    let value = serde_json::from_str::<Value>(answer).expect("json");
+    let outcome = value["outcome"]
         .as_str()
-        .map(str::to_owned);
-    (parsed.outcome, detail)
+        .and_then(Outcome::parse)
+        .expect("a known outcome");
+    (outcome, value["detail"].as_str().map(str::to_owned))
 }
 
 /// The eye receipts in the log at `path`.

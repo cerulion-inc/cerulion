@@ -164,38 +164,36 @@ fn loopback_host(host: &url::Host<&str>) -> bool {
 
 /// The System One endpoint for `base_url`, or why it is refused: `https`
 /// anywhere, plain `http` to a loopback host only, no user info, query or
-/// fragment.
+/// fragment. A refusal names at most the URL's scheme and host, never the
+/// URL itself.
 ///
 /// # Errors
 ///
 /// The reason the URL is refused.
 pub fn endpoint(base_url: &str) -> Result<url::Url, String> {
-    let url = url::Url::parse(base_url).map_err(|e| format!("base_url {base_url:?}: {e}"))?;
+    let url = url::Url::parse(base_url).map_err(|e| format!("base_url does not parse: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(String::from("base_url must not carry user info"));
+    }
+    let scheme = url.scheme();
     let Some(host) = url.host() else {
-        return Err(format!("base_url {base_url:?} names no host"));
+        return Err(format!("base_url {scheme}: names no host"));
     };
-    match url.scheme() {
+    match scheme {
         "https" => {}
         "http" if loopback_host(&host) => {}
         "http" => {
             return Err(format!(
-                "base_url {base_url:?}: plain http is allowed to a loopback host only"
+                "base_url http://{host}: plain http is allowed to a loopback host only"
             ))
         }
-        other => {
-            return Err(format!(
-                "base_url {base_url:?}: scheme {other:?} is not https"
-            ))
-        }
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(String::from("base_url must not carry user info"));
+        other => return Err(format!("base_url {other}://{host}: scheme is not https")),
     }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(String::from("base_url must not carry a query or fragment"));
     }
     let joined = format!("{}{SYSTEM_ONE_PATH}", url.as_str().trim_end_matches('/'));
-    url::Url::parse(&joined).map_err(|e| format!("base_url {base_url:?}: {e}"))
+    url::Url::parse(&joined).map_err(|e| format!("base_url {scheme}://{host}: {e}"))
 }
 
 /// Whether `model` is pinned: not an alias (`~...` or `...latest...`).
@@ -447,6 +445,17 @@ mod tests {
         assert!(endpoint("https://user:pw@openrouter.ai/api").is_err());
         assert!(endpoint("https://openrouter.ai/api?key=x").is_err());
         assert!(endpoint("ftp://openrouter.ai").is_err());
+        for refused in [
+            "http://user:secret@openrouter.ai/api",
+            "ftp://user:secret@openrouter.ai",
+            "https://:secret@openrouter.ai/api",
+            "https://openrouter.ai/api?secret",
+            "http://openrouter.ai/secret",
+            "secret",
+        ] {
+            let why = endpoint(refused).expect_err(refused);
+            assert!(!why.contains("secret"), "{refused}: {why}");
+        }
     }
 
     #[test]

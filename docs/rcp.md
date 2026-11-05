@@ -233,7 +233,18 @@ as text. Reading one before any frame has arrived is an error.
 
 With an `eyes.jev` section, the daemon answers the graph's requests for a
 second look at a wrist-camera frame with Jev, TypeSafe's System One model,
-through OpenRouter by default. Jev reads; the graph's gate decides.
+through OpenRouter by default. Jev reads; the graph's gate decides. Jev is a
+cross-check that can only veto: a reading that disagrees with the gate's own
+measurement refuses, a reading that agrees never passes a gate by itself,
+and an absent Jev is never agreement.
+
+When Jev is on, each look sends one still frame from the wrist camera, the
+question set's text and the ask's numbers to the route: by default
+OpenRouter, which passes them to TypeSafe in the US. No robot or user id is
+in the request; the route sees the robot's network address and its key.
+Nothing else from any camera leaves the robot for Jev, and a recording of
+the frames and answers stays on the robot. TypeSafe lists where it
+processes data at https://trust.typesafe.ai/subprocessors.
 
 ```yaml
 eyes:
@@ -274,6 +285,13 @@ training or labelling export can leave Jev's output out. A receipt
 (`eye.jev`, caller `rcp-eye`) is written before each answer is published,
 and an answer whose receipt cannot be written is not published.
 
+A gate reads an answer frame with `EyeAnswer::parse(answer, ask)`, passing
+the exact text of the ask frame it published, and compares Jev's reading
+with its own through `Look::compare`, which gives `Agree`, `Disagree` or
+`Absent(outcome)`. An answer frame whose `ask_sha256` is not the SHA-256 of
+that text was given for another ask, such as another frame under a reused
+`ask_id`, and reads as `not_recorded`.
+
 The daemon answers at most 20 asks at once and 10 a second after that,
 whatever the outcome; an ask over that bound gets no answer and no receipt,
 so the asking node's own deadline makes Jev absent; the first drop is
@@ -306,11 +324,16 @@ key is on file and the switch is not off:
   daemon serves its tools without it; an HTTPS client that cannot be built
   (no system root certificates) answers every look `unavailable`.
 
-The answer topic has no producer inside the graph, so a recording replays
-the answers as recorded and nothing calls Jev. A replayed ask gets a
-recorded answer only when its text is the text that answer was given for;
-any other ask gets `not_recorded`. `--verify-bag` checks that every answer
-in a recording has its receipt, names an ask the recording holds and carries
-the SHA-256 of that ask's text, and,
-where the recording holds the frame, that the image and request digests
-recompute from it and the recorded model, state and questions.
+The answer topic has no producer inside the graph, so
+`cerulion bag play --resim all` re-injects the recorded answer frames at
+their recorded steps, whatever the re-executed graph asks, and makes no Jev
+request itself. A gate that reads them with its own ask text sees an answer
+given for another ask text as `not_recorded`, and `--resim all --verify`
+reports a changed ask as a divergence on the ask topic. A running daemon's
+eye reads the same topics, so on a host where the daemon serves an eye,
+play or resim a recording with `cerulion-rcpd jev off` or with the daemon
+stopped; otherwise the eye takes the played asks as live ones.
+`--verify-bag` checks that every answer in a recording has its receipt,
+names an ask the recording holds and carries the SHA-256 of that ask's
+text, and, where the recording holds the frame, that the image and request
+digests recompute from it and the recorded model, state and questions.

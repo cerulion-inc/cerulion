@@ -11,7 +11,10 @@
 //! answers but whose text matches none of them (another frame, question set
 //! or numbers) is a divergence: it gets `not_recorded`, the recorded
 //! answers stay, and [`RecordedAnswers::divergences`] counts it. Nothing
-//! here opens a connection.
+//! here opens a connection. `cerulion bag play --resim` does not use it: it
+//! re-injects the recorded answer frames at their recorded steps, and
+//! [`EyeAnswer::parse`](crate::eye::verdict::EyeAnswer::parse) reads one
+//! given for another ask text as `not_recorded`.
 //!
 //! A bag stores each frame as its 40-byte wire header followed by the
 //! message; [`string_frames`] and [`image_frames`] read a topic's frames
@@ -244,7 +247,7 @@ mod tests {
         assert_eq!(recorded.answer(ask_1).as_deref(), Some(second.as_str()));
         let third = recorded.answer(ask_1).expect("answer");
         assert_eq!(
-            EyeAnswer::parse(&third).expect("parse").outcome,
+            EyeAnswer::parse(&third, ask_1).expect("parse").outcome,
             Outcome::NotRecorded
         );
         assert_eq!(recorded.answer(ask_b).as_deref(), Some(other.as_str()));
@@ -260,7 +263,7 @@ mod tests {
         let recorded_answer = answered(live, "ok");
         let mut recorded = RecordedAnswers::new([recorded_answer.clone()]);
         let given = recorded.answer(resim).expect("answer");
-        let parsed = EyeAnswer::parse(&given).expect("parse");
+        let parsed = EyeAnswer::parse(&given, resim).expect("parse");
         assert_eq!(parsed.outcome, Outcome::NotRecorded);
         assert_eq!(
             Look::compare(&parsed, |_| Some(1.0), 1.0, 8.0),

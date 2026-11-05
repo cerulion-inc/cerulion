@@ -151,10 +151,11 @@ async fn every_failure_in_the_table_is_absent_with_its_code() {
         // A fresh robot per case: a quota answer holds the next ones back.
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, client) = core(dir.path(), &stub.base_url());
-        let (answer, late) = look(&mut core, &client, &ask(i as u64, case, 1, 1_500)).await;
+        let asked = ask(i as u64, case, 1, 1_500);
+        let (answer, late) = look(&mut core, &client, &asked).await;
         assert_eq!(answer.outcome, want, "case {case}: {answer:?}");
         assert!(late.is_none());
-        let parsed = EyeAnswer::parse(&answer.to_json()).expect("parse");
+        let parsed = EyeAnswer::parse(&answer.to_json(), &asked).expect("parse");
         assert_eq!(
             Look::compare(&parsed, rim, 326.4, 1_000.0),
             Look::Absent(want),
@@ -180,10 +181,11 @@ async fn an_answer_sends_the_pinned_model_one_image_and_the_images_header() {
     let stub = Stub::start(scripted).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut core, client) = core(dir.path(), &stub.base_url());
-    let (answer, _) = look(&mut core, &client, &ask(1, 0, 1, 1_500)).await;
+    let asked = ask(1, 0, 1, 1_500);
+    let (answer, _) = look(&mut core, &client, &asked).await;
     assert_eq!(answer.outcome, Outcome::Ok, "{answer:?}");
     assert_eq!(answer.model_answered.as_deref(), Some(ANSWERED_MODEL));
-    let parsed = EyeAnswer::parse(&answer.to_json()).expect("parse");
+    let parsed = EyeAnswer::parse(&answer.to_json(), &asked).expect("parse");
     let rim = |a: &EyeAnswer| a.box_edge_px("rim", BoxEdge::Bottom);
     assert_eq!(Look::compare(&parsed, rim, 326.4, 8.0), Look::Agree);
     assert_eq!(Look::compare(&parsed, rim, 360.0, 8.0), Look::Disagree);

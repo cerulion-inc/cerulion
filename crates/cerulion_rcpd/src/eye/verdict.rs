@@ -3,13 +3,22 @@
 //!
 //! [`Look`] is `Agree`, `Disagree` or `Absent(outcome)`. It has no `Default`
 //! and no conversion to `bool`, so code that wants a yes has to match
-//! `Look::Agree` by name. [`Look::compare`] reads Jev's measurement out of an
-//! answer, compares it with the gate's other measurement against a
-//! tolerance, and gives `Absent` for every answer whose outcome is not `ok`,
-//! and for an `ok` answer that lacks the reading. A model's confidence plays
-//! no part.
+//! `Look::Agree` by name. Jev can only veto: `Disagree` refuses, while
+//! `Agree` never passes a gate by itself and `Absent` is never agreement.
+//!
+//! [`EyeAnswer::parse`] reads an answer frame for the ask frame the gate
+//! published: a frame whose `ask_sha256` is not the SHA-256 of that ask's
+//! text answers another ask (another frame, question set or numbers under
+//! the same `ask_id`) and reads as `not_recorded`. [`Look::compare`] reads
+//! Jev's measurement out of an answer, compares it with the gate's other
+//! measurement against a tolerance, and gives `Absent` for every answer
+//! whose outcome is not `ok`, and for an `ok` answer that lacks the
+//! reading. A model's confidence plays no part.
 
 use serde_json::{Map, Value};
+
+use crate::eye::answer::{frame_ref, FrameRef};
+use crate::eye::client::sha256_hex;
 
 /// What happened to one ask. Every outcome but [`Outcome::Ok`] is Jev
 /// absent.
@@ -39,7 +48,8 @@ pub enum Outcome {
     Malformed,
     /// The question set's visibility Noul was below its threshold.
     NotVisible,
-    /// A replay or resim ask with no recorded answer.
+    /// No answer to this exact ask: a replay or resim ask with no recorded
+    /// answer, or an answer frame given for another ask text.
     NotRecorded,
 }
 
@@ -98,10 +108,14 @@ impl std::fmt::Display for Outcome {
 }
 
 /// What the gate makes of one look. No `Default`, no `bool`.
+///
+/// Jev is a cross-check that can only veto: `Disagree` refuses, `Agree`
+/// never passes a gate by itself, and `Absent` is never agreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum Look {
-    /// Jev's reading is within the tolerance of the gate's own.
+    /// Jev's reading is within the tolerance of the gate's own; the gate
+    /// still decides on its own measurements.
     Agree,
     /// Jev's reading is outside the tolerance; the gate refuses.
     Disagree,
@@ -137,14 +151,20 @@ impl BoxEdge {
     }
 }
 
-/// One answer frame, parsed for a gate.
+/// One answer frame, parsed for the ask frame a gate published.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EyeAnswer {
     /// The ask this answers, as the ask wrote it.
     pub ask_id: Value,
-    /// What happened.
+    /// What happened to this ask: `not_recorded` when the frame answers
+    /// another ask text.
     pub outcome: Outcome,
-    /// The answers by question name; `None` unless Jev answered.
+    /// The SHA-256 of the ask text the frame answers, as the frame carries
+    /// it.
+    pub ask_sha256: Option<String>,
+    /// The frame the answered ask named.
+    pub frame: Option<FrameRef>,
+    /// The answers by question name; `None` unless Jev answered this ask.
     pub answers: Option<Map<String, Value>>,
     /// The frame's width in pixels, when a frame was read.
     pub image_width: Option<u32>,
@@ -153,23 +173,37 @@ pub struct EyeAnswer {
 }
 
 impl EyeAnswer {
-    /// Parse an answer frame's text.
+    /// Parse the answer frame `text` for the ask frame `ask_text`, the exact
+    /// text the gate published. A frame whose `ask_sha256` is missing or is
+    /// not the SHA-256 of `ask_text` reads as `not_recorded` with no
+    /// answers, so an answer given for another frame, question set or
+    /// numbers under the same `ask_id` is never read as this ask's.
     ///
     /// # Errors
     ///
     /// Why the text is not an answer frame.
-    pub fn parse(text: &str) -> Result<Self, String> {
+    pub fn parse(text: &str, ask_text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let ask_id = value
             .get("ask_id")
             .cloned()
             .filter(|v| !v.is_null())
             .ok_or("no ask_id")?;
-        let outcome = value
+        let recorded = value
             .get("outcome")
             .and_then(Value::as_str)
             .and_then(Outcome::parse)
             .ok_or("no known outcome")?;
+        let ask_sha256 = value
+            .get("ask_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let for_this_ask = ask_sha256.as_deref() == Some(sha256_hex(ask_text.as_bytes()).as_str());
+        let outcome = if for_this_ask {
+            recorded
+        } else {
+            Outcome::NotRecorded
+        };
         let image = |key: &str| {
             value
                 .get("image")
@@ -180,7 +214,13 @@ impl EyeAnswer {
         Ok(Self {
             ask_id,
             outcome,
-            answers: value.get("answers").and_then(Value::as_object).cloned(),
+            ask_sha256,
+            frame: frame_ref(value.get("frame")),
+            answers: value
+                .get("answers")
+                .and_then(Value::as_object)
+                .filter(|_| for_this_ask)
+                .cloned(),
             image_width: image("width"),
             image_height: image("height"),
         })
@@ -226,7 +266,8 @@ impl EyeAnswer {
 impl Look {
     /// Compare Jev's reading, taken from `answer` by `reading`, with the
     /// gate's `other` measurement: within `tolerance` is [`Look::Agree`],
-    /// outside is [`Look::Disagree`]. An answer whose outcome is not `ok`
+    /// outside is [`Look::Disagree`]. An answer whose outcome is not `ok`,
+    /// including one [`EyeAnswer::parse`] found was given for another ask,
     /// is `Absent` with that outcome; an `ok` answer without the reading,
     /// or a non-finite measurement or tolerance, is `Absent(Malformed)`.
     pub fn compare(
@@ -262,18 +303,29 @@ mod tests {
     use serde_json::json;
 
     use super::{BoxEdge, EyeAnswer, Look, Outcome};
+    use crate::eye::answer::FrameRef;
+    use crate::eye::client::sha256_hex;
 
-    fn answer(outcome: &str) -> EyeAnswer {
-        let frame = json!({
+    const ASK: &str = r#"{"ask_id":1,"question_set":"press_gate","frame":{"topic":"/wrist/image","seq":412},"deadline_ms":1500}"#;
+
+    /// An answer frame to [`ASK`] with `outcome`.
+    fn frame(outcome: &str) -> String {
+        json!({
             "ask_id": 1,
             "outcome": outcome,
+            "frame": { "topic": "/wrist/image", "seq": 412 },
+            "ask_sha256": sha256_hex(ASK.as_bytes()),
             "image": { "width": 640, "height": 480 },
             "answers": {
                 "edge_visible": { "type": "noul", "noul": 0.93 },
                 "rim": { "type": "box", "box": { "top": 0.44, "bottom": 0.68, "left": 0.25, "right": 0.63 }, "confidence": 0.67 }
             }
-        });
-        EyeAnswer::parse(&frame.to_string()).expect("parse")
+        })
+        .to_string()
+    }
+
+    fn answer(outcome: &str) -> EyeAnswer {
+        EyeAnswer::parse(&frame(outcome), ASK).expect("parse")
     }
 
     #[test]
@@ -327,6 +379,45 @@ mod tests {
         assert_eq!(
             Look::compare(&ok, rim, f64::NAN, 8.0),
             Look::Absent(Outcome::Malformed)
+        );
+    }
+
+    #[test]
+    fn an_answer_given_for_another_ask_text_is_not_recorded() {
+        let rim = |a: &EyeAnswer| a.box_edge_px("rim", BoxEdge::Bottom);
+        let recorded = frame("ok");
+        // The same id, question set and deadline; only the frame differs.
+        let next_frame = ASK.replace(r#""seq":412"#, r#""seq":413"#);
+        assert_ne!(next_frame, ASK);
+        let read = EyeAnswer::parse(&recorded, &next_frame).expect("parse");
+        assert_eq!(read.outcome, Outcome::NotRecorded);
+        assert_eq!(read.answer("rim"), None);
+        assert_eq!(
+            read.frame,
+            Some(FrameRef {
+                topic: String::from("/wrist/image"),
+                seq: 412
+            }),
+            "the frame the answer was given for"
+        );
+        assert_eq!(
+            Look::compare(&read, rim, 326.4, 100.0),
+            Look::Absent(Outcome::NotRecorded)
+        );
+        let own = EyeAnswer::parse(&recorded, ASK).expect("parse");
+        assert_eq!(own.outcome, Outcome::Ok);
+        assert_eq!(
+            own.ask_sha256.as_deref(),
+            Some(sha256_hex(ASK.as_bytes()).as_str())
+        );
+        assert_eq!(Look::compare(&own, rim, 326.4, 8.0), Look::Agree);
+        // A frame without the digest answers no ask.
+        let mut bare: serde_json::Value = serde_json::from_str(&recorded).expect("json");
+        bare.as_object_mut().expect("object").remove("ask_sha256");
+        let read = EyeAnswer::parse(&bare.to_string(), ASK).expect("parse");
+        assert_eq!(
+            Look::compare(&read, rim, 326.4, 100.0),
+            Look::Absent(Outcome::NotRecorded)
         );
     }
 }

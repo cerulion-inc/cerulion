@@ -2,9 +2,11 @@
 //! The eye on the graph: a stand-in gate publishes wrist frames and asks, the
 //! `rcp-eye` thread answers them through a local stand-in route, and a tap
 //! records the three topics into a bag. Then: the bag, the receipt log, the
-//! status file and every log line hold no key bytes; a resim from the bag
-//! with no route reproduces the gate's decisions byte for byte; and
-//! `--verify-bag` joins every answer to its receipt.
+//! status file and every log line hold no key bytes; the recorded answers,
+//! served back byte for byte for the recorded asks, reproduce the gate's
+//! decisions; the recorded answer frames, read in recorded order as
+//! `bag play --resim` re-injects them, are Jev absent for a gate whose asks
+//! changed; and `--verify-bag` joins every answer to its receipt.
 //!
 //! One test per binary: it installs the process's log subscriber.
 
@@ -155,10 +157,11 @@ fn write_bag(path: &Path, frames: &[Recorded], topics: &[(String, &str, u64, usi
     writer.finalize().expect("finalize");
 }
 
-/// The gate's decision for one answer frame: Jev's rim row against the
-/// gate's own 326 px, within 8 px.
-fn decide(answer: &str) -> String {
-    let parsed = EyeAnswer::parse(answer).expect("answer frame");
+/// The gate's decision for one answer frame, read for the ask frame `ask`
+/// the gate published: Jev's rim row against the gate's own 326 px, within
+/// 8 px.
+fn decide(answer: &str, ask: &str) -> String {
+    let parsed = EyeAnswer::parse(answer, ask).expect("answer frame");
     let look = Look::compare(
         &parsed,
         |a| a.box_edge_px("rim", BoxEdge::Bottom),
@@ -166,6 +169,15 @@ fn decide(answer: &str) -> String {
         8.0,
     );
     format!("{} {look:?}", parsed.ask_id)
+}
+
+/// The ask frame `ask` with its frame's `seq` one higher: the same id,
+/// question set and numbers, about the next frame.
+fn next_frame(ask: &str) -> String {
+    let mut moved: Value = serde_json::from_str(ask).expect("ask");
+    let seq = moved["frame"]["seq"].as_u64().expect("seq");
+    moved["frame"]["seq"] = json!(seq + 1);
+    moved.to_string()
 }
 
 struct Gate {
@@ -302,20 +314,20 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
             let deadline = if case == 5 { 200 } else { 1_500 };
             let ask = gate.ask_for(id, case, seq, deadline);
             out.push((
-                ask["ask_id"].clone(),
+                ask.to_string(),
                 gate.answer(&ask["ask_id"], Duration::from_secs(5)),
             ));
         }
         // A frame never published, then one larger than 640 x 480.
         let ask = gate.ask_for(7, 0, 9_999, 1_500);
         out.push((
-            ask["ask_id"].clone(),
+            ask.to_string(),
             gate.answer(&ask["ask_id"], Duration::from_secs(5)),
         ));
         let seq = gate.publish_frame(&jpeg_header_for_test(800, 600, 1_000));
         let ask = gate.ask_for(8, 0, seq, 1_500);
         out.push((
-            ask["ask_id"].clone(),
+            ask.to_string(),
             gate.answer(&ask["ask_id"], Duration::from_secs(5)),
         ));
         // The owner turns Jev off: the next ask is disabled at once.
@@ -323,21 +335,22 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         let seq = gate.publish_frame(&good);
         let ask = gate.ask_for(9, 0, seq, 1_500);
         out.push((
-            ask["ask_id"].clone(),
+            ask.to_string(),
             gate.answer(&ask["ask_id"], Duration::from_secs(5)),
         ));
         write_switch(&gate_state, true).expect("on");
         out
     });
-    let live: Vec<(Value, String)> = tokio::task::spawn_blocking(move || gate_thread.join())
+    // (the ask frame's text as published, the answer frame)
+    let live: Vec<(String, String)> = tokio::task::spawn_blocking(move || gate_thread.join())
         .await
         .expect("join")
         .expect("gate");
 
     let outcomes: Vec<String> = live
         .iter()
-        .map(|(_, a)| {
-            EyeAnswer::parse(a)
+        .map(|(ask, a)| {
+            EyeAnswer::parse(a, ask)
                 .expect("parse")
                 .outcome
                 .as_str()
@@ -359,7 +372,7 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
             "disabled"
         ]
     );
-    let decisions: Vec<String> = live.iter().map(|(_, a)| decide(a)).collect();
+    let decisions: Vec<String> = live.iter().map(|(ask, a)| decide(a, ask)).collect();
     assert_eq!(decisions[0], "0 Agree");
     assert_eq!(decisions[1], "1 Disagree");
     for d in &decisions[2..6] {
@@ -447,13 +460,17 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         .iter()
         .all(|s| holds_key(s.header("authorization").unwrap_or("").as_bytes())));
 
-    // Resim: the recorded answers stand in for Jev. The stand-in route stays
-    // up, so a request from the resim would be counted.
-    let requests = stub.count();
-    assert_eq!(requests, 7, "the live run sent seven requests");
+    // The recorded answers served back for the recorded asks: each is the
+    // live answer byte for byte, and the gate decides as it did live.
+    assert_eq!(stub.count(), 7, "the live run sent seven requests");
+    drop(stub);
     let reader = cerulion_bag::BagReader::open(&bag).expect("read bag");
     let asks = string_frames(&reader, &jev.ask_topic).expect("asks");
-    assert_eq!(asks.len(), live.len());
+    assert_eq!(
+        asks.iter().map(|(_, ask)| ask).collect::<Vec<_>>(),
+        live.iter().map(|(ask, _)| ask).collect::<Vec<_>>(),
+        "the bag holds the asks as the gate published them"
+    );
     let mut recorded_answers = RecordedAnswers::from_bag(&bag, &jev.answer_topic).expect("answers");
     let mut replayed = Vec::new();
     for (_, ask) in &asks {
@@ -465,28 +482,31 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         live_answers,
         "the recorded answers are the live ones, byte for byte"
     );
-    let replayed_decisions: Vec<String> = replayed.iter().map(|a| decide(a)).collect();
+    let replayed_decisions: Vec<String> = replayed
+        .iter()
+        .zip(&asks)
+        .map(|(a, (_, ask))| decide(a, ask))
+        .collect();
     assert_eq!(
         serde_json::to_vec(&replayed_decisions).expect("json"),
         serde_json::to_vec(&decisions).expect("json"),
-        "resim reproduces the gate's decisions byte for byte"
+        "the recorded answers reproduce the gate's decisions byte for byte"
     );
     let unknown = r#"{"ask_id":42,"question_set":"press"}"#;
     let missing = recorded_answers.answer(unknown).expect("answer");
     assert_eq!(
-        decide(&missing),
+        decide(&missing, unknown),
         format!("42 {:?}", Look::Absent(Outcome::NotRecorded))
     );
     assert_eq!(recorded_answers.divergences(), 0);
-    // A resim that asks about another frame under a recorded id is not
-    // given the recorded answer.
+    // An ask about another frame under a recorded id is not given the
+    // recorded answer.
     let mut again = RecordedAnswers::from_bag(&bag, &jev.answer_topic).expect("answers");
     let (_, first_ask) = &asks[0];
-    let mut moved_ask: Value = serde_json::from_str(first_ask).expect("ask");
-    moved_ask["frame"]["seq"] = json!(moved_ask["frame"]["seq"].as_u64().expect("seq") + 1);
-    let diverged = again.answer(&moved_ask.to_string()).expect("answer");
+    let moved_ask = next_frame(first_ask);
+    let diverged = again.answer(&moved_ask).expect("answer");
     assert_eq!(
-        decide(&diverged),
+        decide(&diverged, &moved_ask),
         format!("0 {:?}", Look::Absent(Outcome::NotRecorded))
     );
     assert_eq!(again.divergences(), 1);
@@ -495,8 +515,36 @@ async fn the_eye_records_answers_that_resim_and_verify_byte_for_byte() {
         Some(live[0].1.as_str()),
         "the recorded ask still gets its answer"
     );
-    assert_eq!(stub.count(), requests, "the resim made no request");
-    drop(stub);
+
+    // `bag play --resim` re-injects the answer topic as recorded, one frame
+    // at each recorded step, whatever the re-executed gate asked. A gate
+    // changed to ask about the next frame under the same ids reads every
+    // re-injected answer for its own ask: Jev is absent, the recorded `ok`
+    // answers included. The unchanged gate decides as it did live.
+    let injected = string_frames(&reader, &jev.answer_topic).expect("answers");
+    assert_eq!(injected.len(), asks.len());
+    let changed: Vec<String> = injected
+        .iter()
+        .zip(&asks)
+        .map(|((_, a), (_, ask))| decide(a, &next_frame(ask)))
+        .collect();
+    let absent: Vec<String> = asks
+        .iter()
+        .map(|(_, ask)| {
+            let id = &serde_json::from_str::<Value>(ask).expect("ask")["ask_id"];
+            format!("{id} {:?}", Look::Absent(Outcome::NotRecorded))
+        })
+        .collect();
+    assert_eq!(
+        changed, absent,
+        "a changed ask never reads a recorded answer"
+    );
+    let unchanged: Vec<String> = injected
+        .iter()
+        .zip(&asks)
+        .map(|((_, a), (_, ask))| decide(a, ask))
+        .collect();
+    assert_eq!(unchanged, decisions);
 
     // `--verify-bag` joins every answer to its receipt and recomputes the
     // requests from the recorded frames.

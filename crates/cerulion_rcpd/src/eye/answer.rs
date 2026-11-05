@@ -222,7 +222,8 @@ fn valid_ask_id(id: &Value) -> bool {
     }
 }
 
-fn frame_ref(value: Option<&Value>) -> Option<FrameRef> {
+/// The `{topic, seq}` object `value` holds, when it holds one.
+pub(crate) fn frame_ref(value: Option<&Value>) -> Option<FrameRef> {
     let object = value?.as_object()?;
     if object.len() != 2 {
         return None;

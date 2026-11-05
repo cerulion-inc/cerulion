@@ -26,15 +26,23 @@
 //! SHA-256 and size, and the SHA-256 of the request body. A recording holds
 //! the frame on its own topic, so the request can be checked against it.
 //!
-//! The answer topic has no producer inside the graph, so a replay re-injects
-//! it as recorded and nothing calls the network; [`replay`] serves a recorded
-//! answer by `ask_id` and the ask text (`ask_sha256`), and answers any other
-//! ask with `not_recorded`. [`verify`] joins a recording's answers to the
-//! receipt log and to the recorded asks.
+//! The gate reads an answer frame with [`verdict::EyeAnswer::parse`], given
+//! the exact text of the ask frame it published, and compares through
+//! [`verdict::Look`]: `Agree`, `Disagree` or `Absent(outcome)`. An answer
+//! frame whose `ask_sha256` is not the SHA-256 of that text was given for
+//! another ask and reads as `not_recorded`. There is no default and no
+//! conversion to `bool`, so a missing answer cannot be read as agreement.
+//! Jev can only veto: `Disagree` refuses, and `Agree` never passes a gate
+//! by itself.
 //!
-//! The gate reads an answer through [`verdict::Look`]: `Agree`, `Disagree`
-//! or `Absent(outcome)`. There is no default and no conversion to `bool`, so
-//! a missing answer cannot be read as agreement.
+//! The answer topic has no producer inside the graph, so
+//! `cerulion bag play --resim` re-injects the recorded answer frames at
+//! their recorded steps, whatever the re-executed graph asks; a gate whose
+//! ask changed reads the re-injected answer as `not_recorded`. A running
+//! daemon's eye reads the same topics and takes played asks as live ones.
+//! [`replay`] serves a recorded answer by `ask_id` and the ask text
+//! (`ask_sha256`), and answers any other ask with `not_recorded`. [`verify`]
+//! joins a recording's answers to the receipt log and to the recorded asks.
 //!
 //! - [`config`]: the manifest's `eyes.jev` section.
 //! - [`limits`]: the v1 rate, in-flight and request shape limits.
