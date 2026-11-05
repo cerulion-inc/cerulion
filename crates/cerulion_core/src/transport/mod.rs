@@ -6062,6 +6062,35 @@ impl TransportManager {
         self.topic_port_count(topic, false)
     }
 
+    /// [`Self::topic_subscriber_count`] that tells a failed probe apart from
+    /// no subscriber: `Some(n)` when the topic's data service opened (`n`
+    /// subscribers, in every process), `Some(0)` when the service does not
+    /// exist, and `None` when the name is invalid, the service states another
+    /// wire header version, or the open fails for another reason (for
+    /// example the process is out of file descriptors).
+    pub fn topic_subscriber_count_checked(&self, topic: &str) -> Option<usize> {
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let name: ServiceName = format!("{}/data", topic).as_str().try_into().ok()?;
+        match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                None
+            }
+            Ok(service) => Some(service.dynamic_config().number_of_subscribers()),
+            Err(PublishSubscribeOpenError::DoesNotExist) => Some(0),
+            Err(e) => {
+                tracing::debug!(topic = %topic, error = %e, "subscriber count probe failed");
+                None
+            }
+        }
+    }
+
     /// Live PUBLISHER count on a topic's data service, queried from
     /// iceoryx2's dynamic config — covers ALL processes, unlike any
     /// process-local registry (`rcl_action_server_is_

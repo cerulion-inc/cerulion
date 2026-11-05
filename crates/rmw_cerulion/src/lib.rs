@@ -59,6 +59,7 @@ pub mod decode_failure_latch;
 pub mod era;
 pub mod era_check;
 pub mod ffi;
+pub mod gid;
 pub mod heaphook;
 pub mod loan_refusal_latch;
 pub mod publish_reject_latch;
