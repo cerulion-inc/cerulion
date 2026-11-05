@@ -8477,15 +8477,14 @@ impl GraphRuntime {
                     interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
                 },
                 TriggerPolicy::Data => {
+                    // Without a declared trigger input the node has no drain
+                    // binding, so no input arrival signals it; only the host's
+                    // `signal_data` does.
                     let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
-                    let topics = match data_trigger_topic {
-                        Some(topic) => vec![topic],
-                        None => topology_inputs
-                            .iter()
-                            .map(|port| port.topic.clone())
-                            .collect(),
-                    };
-                    TopologyTrigger::Data { topics, ambiguous }
+                    TopologyTrigger::Data {
+                        topics: data_trigger_topic.into_iter().collect(),
+                        ambiguous,
+                    }
                 }
                 TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
                     topics: inputs.clone(),
