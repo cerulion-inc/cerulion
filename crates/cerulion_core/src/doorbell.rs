@@ -159,9 +159,9 @@
 
 use std::io;
 use std::sync::atomic::AtomicU64;
-// The park slice the guard's kernel block is bounded by. macOS only, because
-// only there does this module own a wait.
-#[cfg(target_os = "macos")]
+// The park slice the guard's kernel block is bounded by, on the targets where
+// this module owns a wait.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 use std::time::Duration;
 
 /// Derive the POSIX SHM object name for `(ns, topic)`.
@@ -338,11 +338,46 @@ mod imp {
     use std::ffi::CString;
     use std::io;
     use std::os::raw::c_void;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::time::Duration;
 
-    /// 64 bytes — one cache line — so a topic's doorbell never false-shares with
-    /// an adjacent topic's. Only the leading `AtomicU64` is used.
+    /// 64 bytes, one cache line, so a topic's doorbell never false-shares with
+    /// an adjacent topic's. The leading [`DoorbellShared`] uses the first 16.
     const DOORBELL_BYTES: usize = 64;
+
+    /// The mapped doorbell page's head, laid out exactly as the macOS page.
+    ///
+    /// `seq` is the ring counter the CPU monitor-wait park arms on (offset 0, the
+    /// address [`Doorbell::addr`] hands out). `wake_seq` is the kernel wait/wake
+    /// word a consumer with no CPU monitor-wait primitive blocks on with
+    /// `FUTEX_WAIT`, and `parked` counts the consumers blocked on it right now:
+    /// the ringer issues `FUTEX_WAKE` only when it is non-zero, so a ring with
+    /// nobody blocked stays atomics-only. A page written by a ringer that never
+    /// bumps `wake_seq` leaves a blocked consumer to its bounded cap, which is the
+    /// recheck it would have run anyway.
+    #[repr(C)]
+    struct DoorbellShared {
+        seq: AtomicU64,
+        wake_seq: AtomicU32,
+        parked: AtomicU32,
+    }
+
+    const _: () = assert!(
+        core::mem::size_of::<DoorbellShared>() <= DOORBELL_BYTES,
+        "DoorbellShared must fit the cache line the page maps"
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(DoorbellShared, seq) == 0,
+        "seq must sit at offset 0, the address the CPU monitor-wait park arms on"
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(DoorbellShared, wake_seq) == 8,
+        "wake_seq must sit at offset 8 (4-byte aligned) as the futex word"
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(DoorbellShared, parked) == 12,
+        "parked must sit at offset 12, in the same cache line as the word it gates"
+    );
 
     /// A process-shared SHM doorbell — one cache-line-aligned `AtomicU64`.
     ///
@@ -350,8 +385,8 @@ mod imp {
     /// the name on drop) or [`Doorbell::open_unowned`] (consumer — maps only).
     #[must_use = "the doorbell is unmapped (and, if owned, shm_unlink'd) on drop — bind it to a named local for the desired scope"]
     pub struct Doorbell {
-        /// Pointer to the mapped `AtomicU64` (offset 0 of the `MAP_SHARED` page).
-        ptr: *mut AtomicU64,
+        /// Base of the `MAP_SHARED` page, read as a [`DoorbellShared`].
+        ptr: *mut DoorbellShared,
         /// The POSIX SHM object name — retained so an OWNED doorbell can
         /// `shm_unlink` it on drop.
         name: CString,
@@ -428,32 +463,139 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self {
-                ptr: addr as *mut AtomicU64,
+                ptr: addr as *mut DoorbellShared,
                 name,
                 owns_name,
             })
         }
 
-        /// Ring the doorbell — a `Release` store (`fetch_add(1)`) that wakes a
-        /// consumer parked with `UMONITOR`/`WFE` on this line.
+        fn shared(&self) -> &DoorbellShared {
+            // SAFETY: `ptr` is a live, page-aligned mapping of DOORBELL_BYTES, and
+            // DoorbellShared fits it (asserted above); every field is an atomic.
+            unsafe { &*self.ptr }
+        }
+
+        /// Ring the doorbell: a `Release` bump of `seq`, which wakes a consumer
+        /// parked with `UMONITOR`/`WFE` on this line, then a bump of the futex
+        /// word and, when a consumer is blocked on it, one `FUTEX_WAKE`.
         pub fn ring(&self) {
-            // SAFETY: `ptr` is a valid, 8-byte-aligned mapping of an `AtomicU64`.
-            let a = unsafe { &*self.ptr };
-            a.fetch_add(1, Ordering::Release);
+            let s = self.shared();
+            s.seq.fetch_add(1, Ordering::Release);
+            s.wake_seq.fetch_add(1, Ordering::Release);
+            // Orders the word bump before the `parked` read, against the parker's
+            // `parked` bump before its word read (`park_enter`): one of the two
+            // sides sees the other, so a parker never blocks on a word this ring
+            // moved without this ring seeing its claim.
+            core::sync::atomic::fence(Ordering::SeqCst);
+            if s.parked.load(Ordering::Relaxed) != 0 {
+                // SAFETY: `wake_seq` is a live, 4-byte-aligned u32 in this
+                // MAP_SHARED mapping. FUTEX_WAKE without FUTEX_PRIVATE_FLAG keys on
+                // the shared page, so a waiter in another process or on another
+                // mapping of it is woken; it reads no memory beyond the word.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        &s.wake_seq as *const AtomicU32,
+                        libc::FUTEX_WAKE,
+                        i32::MAX,
+                        std::ptr::null::<libc::timespec>(),
+                        std::ptr::null::<u32>(),
+                        0u32,
+                    );
+                }
+            }
         }
 
         /// Current ring count (`Acquire` load). The consumer snapshots this
-        /// before parking and re-checks it after, to detect a ring. RELATIVE —
+        /// before parking and re-checks it after, to detect a ring. RELATIVE:
         /// compare against a snapshot, never an absolute baseline.
         pub fn seq(&self) -> u64 {
-            // SAFETY: as `ring`.
-            let a = unsafe { &*self.ptr };
-            a.load(Ordering::Acquire)
+            self.shared().seq.load(Ordering::Acquire)
         }
 
-        /// The watched address for `UMONITOR`/`WFE` (the `AtomicU64`'s location).
+        /// The watched address for `UMONITOR`/`WFE` (the ring counter's location).
         pub fn addr(&self) -> *const AtomicU64 {
-            self.ptr as *const AtomicU64
+            &self.shared().seq as *const AtomicU64
+        }
+
+        #[cfg(test)]
+        pub fn parked_for_test(&self) -> u32 {
+            self.shared().parked.load(Ordering::Acquire)
+        }
+
+        pub(super) fn wake_seq_snapshot(&self) -> u32 {
+            self.shared().wake_seq.load(Ordering::Acquire)
+        }
+
+        /// Claim a blocked consumer on this page, ordered before the caller's
+        /// snapshot of the futex word (see the fence in [`Self::ring`]).
+        pub(super) fn park_enter(&self) {
+            self.shared().parked.fetch_add(1, Ordering::AcqRel);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+
+        /// Release the claim [`Self::park_enter`] took, never below zero.
+        pub(super) fn park_exit(&self) {
+            let parked = &self.shared().parked;
+            let mut cur = parked.load(Ordering::Acquire);
+            loop {
+                debug_assert!(cur != 0, "park_exit without a matching park_enter");
+                let Some(next) = super::parked_decrement(cur) else {
+                    return;
+                };
+                match parked.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return,
+                    Err(seen) => cur = seen,
+                }
+            }
+        }
+
+        /// Block on the futex word until a ring moves it from `snapshot` or `cap`
+        /// elapses. `RingPending` when the word already moved (no block), `Parked`
+        /// after a completed wait (woken, timed out or interrupted),
+        /// `Unavailable` for a zero cap or an unexpected errno, so the caller
+        /// paces with its own nap. Record-only: it changes only WHEN the park
+        /// returns, never what the step reads.
+        pub(super) fn park_wait_ring(
+            &self,
+            snapshot: u32,
+            cap: Duration,
+        ) -> crate::monitor_wait::AddrParkOutcome {
+            use crate::monitor_wait::AddrParkOutcome;
+            if cap.is_zero() {
+                return AddrParkOutcome::Unavailable;
+            }
+            let word = &self.shared().wake_seq;
+            if word.load(Ordering::Acquire) != snapshot {
+                return AddrParkOutcome::RingPending;
+            }
+            let timeout = libc::timespec {
+                tv_sec: cap.as_secs() as libc::time_t,
+                tv_nsec: libc::c_long::from(cap.subsec_nanos()),
+            };
+            // SAFETY: `word` is a live, 4-byte-aligned u32 in this MAP_SHARED
+            // mapping; `timeout` is a valid relative timespec on this frame. A
+            // shared FUTEX_WAIT returns at once with EAGAIN when the word no longer
+            // equals `snapshot`.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    word as *const AtomicU32,
+                    libc::FUTEX_WAIT,
+                    snapshot,
+                    &timeout as *const libc::timespec,
+                    std::ptr::null::<u32>(),
+                    0u32,
+                )
+            };
+            if rc == 0 {
+                return AddrParkOutcome::Parked;
+            }
+            match io::Error::last_os_error().raw_os_error().unwrap_or(0) {
+                libc::EAGAIN => AddrParkOutcome::RingPending,
+                libc::ETIMEDOUT | libc::EINTR => AddrParkOutcome::Parked,
+                _ => AddrParkOutcome::Unavailable,
+            }
         }
     }
 
@@ -1261,16 +1403,22 @@ fn wake_word_active_from(backend_usable: bool, killed: bool) -> bool {
 
 /// Can a consumer KERNEL-BLOCK on a doorbell's wake word on this host?
 ///
-/// `true` only on macOS with the os_sync family resolved, unlatched and not
-/// killed by [`DOORBELL_OS_SYNC_ENV`]. Linux uses the CPU monitor-wait primitive
-/// (`UMONITOR`/`WFE`) where available, and Android observes the ring at its next
-/// poll; neither uses this kernel-wake park rung. Other targets have no primitive.
+/// `true` on Linux and Android, where the page's wake word is a shared futex,
+/// and on macOS with the os_sync family resolved, unlatched and not killed by
+/// [`DOORBELL_OS_SYNC_ENV`]. A park whose slice the CPU monitor-wait primitive
+/// performs (`UMONITOR`/`WFE` on the ring counter) never reaches this rung; a
+/// park without one blocks on the wake word instead of pacing its recheck nap.
+/// Other targets have no wake word.
 pub fn wake_word_block_primitive_available() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        true
+    }
     #[cfg(target_os = "macos")]
     {
         doorbell_os_sync_tier_active()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         false
     }
@@ -1413,7 +1561,7 @@ fn retry_lost_name_race<T>(
 /// Pure and split out because the arm it decides is unreachable through the guard,
 /// so the `debug_assert` beside it can never fire in a test build, and the warn it
 /// guards is the only evidence a release build would leave.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", test))]
 fn parked_decrement(cur: u32) -> Option<u32> {
     cur.checked_sub(1)
 }
@@ -1587,7 +1735,7 @@ pub(crate) fn note_tier_inactive() {
 /// syscall is issued) and would wait out its whole cap in silence. Inside this
 /// module the order is a convention the guard makes obvious, not one the compiler
 /// checks.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 #[must_use = "the parked claim is released on drop - bind the guard for the block's lifetime"]
 pub struct ParkedDoorbellGuard<'a> {
     bell: &'a Doorbell,
@@ -1599,7 +1747,7 @@ pub struct ParkedDoorbellGuard<'a> {
     snapshot: u32,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 impl<'a> ParkedDoorbellGuard<'a> {
     /// Claim the gate for the duration of one kernel block, and read the compare
     /// value the block will use.
@@ -1623,7 +1771,7 @@ impl<'a> ParkedDoorbellGuard<'a> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 impl Drop for ParkedDoorbellGuard<'_> {
     fn drop(&mut self) {
         self.bell.park_exit();
@@ -2356,12 +2504,59 @@ mod tests {
         );
     }
 
-    /// Off macOS there is no kernel wake word at all, so the availability gate
-    /// is a compile-time `false` and the park rung is compiled out.
-    #[cfg(not(target_os = "macos"))]
+    /// On Linux and Android the wake word is a shared futex, which every host
+    /// carries, so the availability gate answers `true` with no probe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn the_wake_word_is_unavailable_off_macos() {
-        assert!(!wake_word_block_primitive_available());
+    fn the_wake_word_is_available_on_linux_and_android() {
+        assert!(wake_word_block_primitive_available());
+    }
+
+    /// A ring on the producer's mapping wakes a consumer blocked on the futex
+    /// word through ITS OWN mapping of the same page, long before the block's
+    /// cap: the executor-unit shape (two mappings in one process) and the
+    /// process-per-node shape (two processes) key the same shared futex. The
+    /// claim is released once the block returns.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_ring_on_one_mapping_wakes_a_futex_park_on_another() {
+        use crate::monitor_wait::AddrParkOutcome;
+        let ns = format!("dbfutex_{}", std::process::id());
+        let producer = Doorbell::open_owned(&ns, "/futex/wake").expect("producer page");
+        let consumer = Doorbell::open_unowned(&ns, "/futex/wake").expect("consumer page");
+        let cap = Duration::from_secs(5);
+        let (outcome, waited) = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let guard = ParkedDoorbellGuard::enter(&consumer);
+                let started = std::time::Instant::now();
+                let outcome = guard.wait(cap);
+                (outcome, started.elapsed())
+            });
+            let spun_up = std::time::Instant::now();
+            while producer.parked_for_test() == 0 {
+                assert!(
+                    spun_up.elapsed() < Duration::from_secs(5),
+                    "the consumer's claim never reached the producer's mapping"
+                );
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            producer.ring();
+            waiter.join().expect("waiter thread panicked")
+        });
+        assert!(
+            matches!(outcome, AddrParkOutcome::Parked | AddrParkOutcome::RingPending),
+            "the block must report a completed wait or a ring in hand, got {outcome:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "the ring must end the block, not its {cap:?} cap: it waited {waited:?}"
+        );
+        assert_eq!(
+            consumer.parked_for_test(),
+            0,
+            "the guard releases its claim when the block returns"
+        );
     }
 
     // ---- the macOS kernel wake word (real SHM, real syscalls) ----

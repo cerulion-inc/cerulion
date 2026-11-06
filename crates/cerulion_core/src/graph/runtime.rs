@@ -13555,7 +13555,7 @@ impl GraphRuntime {
     /// RECORD-ONLY (Principle 7): it reads the ring COUNTERS and the wake epoch,
     /// never the iceoryx2 SHM message queue, never a scheduler mutation, never a
     /// clock. It changes only WHEN this loop re-polls.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     fn doorbell_wake_word_block(
         &self,
         baseline: Option<&[u64]>,
@@ -13578,6 +13578,7 @@ impl GraphRuntime {
             // family latched after a sibling's unrecoverable errno. The gate is
             // re-evaluated every iteration, so the wait is never reached to
             // report it; this is the site that observes it.
+            #[cfg(target_os = "macos")]
             if !wake_word && self.monitor_wait_policy.doorbell() && has_armed_line {
                 crate::doorbell::note_tier_inactive();
             }
@@ -14267,20 +14268,18 @@ impl GraphRuntime {
                 // until the cohort arrives. Only when neither applies is DATA the
                 // thing this context waits for.
                 //
-                // Compiled out entirely off macOS:
-                // `crate::doorbell::wake_word_block_primitive_available` (not the
-                // barrier's function of the same name, which answers the opposite
-                // on Linux) is a compile-time `false` there, and a Linux consumer
-                // whose CPU carries a monitor-wait primitive wakes on this very same
-                // doorbell line through the primitive armed above, a hardware park
-                // reached on the `performed == true` path this arm never sees; a
-                // Linux host without one reaches this arm and naps.
+                // The wake word is a shared futex on Linux and Android and the
+                // os_sync word on macOS. A consumer whose CPU carries a monitor-wait
+                // primitive wakes on this same doorbell line through the primitive
+                // armed above, a hardware park reached on the `performed == true`
+                // path this arm never sees; a host without one blocks here until
+                // the producer's ring instead of pacing its recheck nap.
                 //
                 // Snapshot, re-derive, block: the same lost-wake protocol as its
                 // two siblings. Any ring landing after the snapshot fails the
                 // kernel compare (Principle 6); a ring that ALREADY advanced the
                 // baseline skips the block and the nap.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
                 if !kernel_blocked {
                     let cap = pace_slice
                         .min(park_deadline.saturating_duration_since(std::time::Instant::now()));
