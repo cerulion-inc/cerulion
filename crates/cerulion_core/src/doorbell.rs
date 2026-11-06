@@ -2563,6 +2563,60 @@ mod tests {
         );
     }
 
+    /// On Linux and Android a ring with no claim on the page moves the ring
+    /// counter and nothing else. The futex word and the kernel sit behind the
+    /// page's `parked` count, and a consumer that parks in hardware never claims
+    /// it, so on a host whose CPU carries a monitor-wait primitive a publish costs
+    /// one increment and one load. Read through the OTHER mapping of the page, so
+    /// the word asserted on is the shared one. The positive control holds a claim
+    /// across one ring and sees the word move by exactly one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_ring_with_nobody_parked_moves_only_the_ring_counter() {
+        let ns = test_ns("hw_ring");
+        let topic = "scan";
+        let owner = Doorbell::open_owned(&ns, topic).expect("owner open_owned");
+        let consumer = Doorbell::open_unowned(&ns, topic).expect("consumer open_unowned");
+
+        let seq0 = consumer.seq();
+        let word0 = consumer.wake_seq_snapshot();
+        for _ in 0..3 {
+            owner.ring();
+        }
+        assert_eq!(
+            consumer.seq(),
+            seq0 + 3,
+            "every ring advances the ring counter by exactly one"
+        );
+        assert_eq!(
+            consumer.wake_seq_snapshot(),
+            word0,
+            "with no claim on the page a ring must leave the futex word alone: a \
+             consumer parked in hardware hears the ring counter, and nobody blocks on \
+             the word"
+        );
+
+        let guard = ParkedDoorbellGuard::enter(&consumer);
+        owner.ring();
+        drop(guard);
+        assert_eq!(
+            consumer.seq(),
+            seq0 + 4,
+            "a ring with a claim held still advances the ring counter by exactly one"
+        );
+        assert_eq!(
+            consumer.wake_seq_snapshot(),
+            word0.wrapping_add(1),
+            "with a claim held a ring must move the futex word by exactly one, or a \
+             blocked consumer's kernel compare would still match and it would sleep \
+             through the ring"
+        );
+
+        drop(consumer);
+        drop(owner);
+        cleanup(&ns, &[topic]);
+    }
+
     // ---- the macOS kernel wake word (real SHM, real syscalls) ----
 
     /// The availability rule's truth table, over an INJECTED pair rather than
