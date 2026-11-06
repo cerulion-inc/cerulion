@@ -34,8 +34,8 @@
 //!
 //! [`write_at_startup`] publishes the facts once the endpoint is bound (a
 //! failure is a loud warn, never fatal — the facts are an additive overlay).
-//! [`refresh`] is the SEAM the claim / pair verb handlers call after
-//! mutating ownership: it rewrites the FILE (so `claimable` becomes `"0"` on
+//! [`refresh`] is the seam a claim / pair verb handler can call after
+//! mutating ownership (none calls it today): it rewrites the FILE (so `claimable` becomes `"0"` on
 //! disk). NOTE — this does NOT by itself flip the ALREADY-ADVERTISED mDNS TXT:
 //! the gateway reads the facts file ONCE at advertise time and registers a
 //! static `ServiceInfo`, so a discovering peer sees the updated `claimable` only
@@ -98,8 +98,8 @@ impl BeaconFacts {
     /// The temp file has a FIXED `.tmp` sibling name (mirroring the trust store +
     /// device index atomic-write convention), so this is NOT safe to call
     /// concurrently on the same `path`. That holds today: the startup write is
-    /// one-shot, and the claim/pair handlers that call [`refresh`] are
-    /// serialized through the `&mut TrustStore` mutation they follow, so at most
+    /// one-shot, and a claim/pair handler that called [`refresh`] would be
+    /// serialized through the `&mut TrustStore` mutation it follows, so at most
     /// one facts write is ever in flight.
     pub fn write_atomically(&self, path: &Path) -> Result<(), RemotedError> {
         let on_disk = OnDisk {

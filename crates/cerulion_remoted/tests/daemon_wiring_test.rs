@@ -33,10 +33,11 @@ fn seed_key_and_mac(root: &std::path::Path) {
 
 #[tokio::test]
 async fn network_disabled_refuses_to_serve_without_binding() {
-    // The kill-switch short-circuits BEFORE load_state: even though the key file
-    // is absent (which would otherwise be a hard error), `run` returns Ok(())
-    // cleanly — it never loads state, never binds an endpoint. If it had tried to
-    // bind, the absent key would have surfaced an Err; the Ok proves it did not.
+    // The kill-switch short-circuits BEFORE RemotePlane::bind: even though the
+    // key file is absent (which would otherwise be a hard error), `run` returns
+    // Ok(()) cleanly; it never loads keys, never binds an endpoint. If it had
+    // tried to bind, the absent key would have surfaced an Err; the Ok proves it
+    // did not.
     let dir = tempdir().unwrap();
     let cfg =
         RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, /*disabled=*/ true);
@@ -150,5 +151,29 @@ async fn fresh_robot_missing_mac_key_defers_to_the_absent_store_gap() {
     assert!(
         matches!(err, RemotedError::Store(_)),
         "a fresh robot's absent store is the provisioning gap, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn present_store_with_an_empty_mac_key_file_is_a_provisioning_class_error() {
+    // An EMPTY MAC key file verifies nothing and cannot persist a claim, so a
+    // present store is never served under it: a LOUD MacKey error before any
+    // endpoint binds (the store content is never read).
+    let dir = tempdir().unwrap();
+    let remoted = dir.path().join("remoted");
+    fs::create_dir_all(&remoted).unwrap();
+    fs::write(remoted.join("device_key"), [7u8; 32]).unwrap();
+    fs::write(remoted.join("trust_store.mac_key"), b"").unwrap();
+    fs::write(remoted.join("trust_store"), b"present-but-unverifiable").unwrap();
+    let cfg =
+        RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, /*disabled=*/ false);
+    let err = run(cfg, async {}).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            RemotedError::MacKey(m) if m.contains("empty trust-store MAC key")
+                && m.contains(&remoted.join("trust_store.mac_key").display().to_string())
+        ),
+        "expected an empty-key MacKey error naming the key file, got {err:?}"
     );
 }
