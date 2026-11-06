@@ -221,6 +221,20 @@ const INFO_JSON_PARSERS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Files the walk below finds that do NOT parse the cdylib info-JSON
+/// envelope, each with the reason. The walk keys on a `Deserialize` body
+/// that names both `inputs` and `outputs`, and another document can match it.
+///
+/// Checked both ways: an entry the walk no longer finds fails as stale, so
+/// this list cannot become a blanket pass for a future parser.
+const NOT_INFO_JSON_PARSERS: &[(&str, &str)] = &[(
+    "crates/cerulion_cli_engine/src/graph_live.rs",
+    "reads the `run.json` a robot serves in its `runs` reply, not the cdylib info JSON. Its \
+     topology `NodeView` names each node's `inputs` and `outputs`, which is what the walk \
+     matches. The view ignores unknown keys by design, so an older desk still reads a newer \
+     robot (see its `UNDENIED_TYPES` entries in `config_deny_unknown_fields_test.rs`)",
+)];
+
 /// The structured fields that identify the ENVELOPE scan inside a parser file.
 ///
 /// Scoping matters because a file may report at more than one LEVEL. `node.rs`
@@ -418,7 +432,21 @@ fn every_info_json_parser_in_the_repo_is_classified() {
         silent.join("\n")
     );
 
-    let unclassified: Vec<&String> = found.difference(&declared).collect();
+    for (f, _) in NOT_INFO_JSON_PARSERS {
+        assert!(
+            found.contains(*f),
+            "the parser walk no longer finds {f}, which `NOT_INFO_JSON_PARSERS` lists as a \
+             false match: the entry is stale, remove it (found: {found:?})"
+        );
+    }
+    let not_parsers: BTreeSet<String> = NOT_INFO_JSON_PARSERS
+        .iter()
+        .map(|(f, _)| f.to_string())
+        .collect();
+    let unclassified: Vec<&String> = found
+        .difference(&declared)
+        .filter(|f| !not_parsers.contains(*f))
+        .collect();
     assert!(
         unclassified.is_empty(),
         "file(s) parse the cdylib info-JSON envelope but are not classified: {unclassified:?}\n\n\

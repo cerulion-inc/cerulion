@@ -655,6 +655,32 @@ node_echo() { # <topic> <evidence file> <label>
 }
 node_echo /app/timer/count node-echo.txt "open timer echo"
 node_echo /app/relay/echo relay-echo.txt "open relay echo"
+# The app hosts its run: `graph live` lists the sample graph's nodes with
+# their triggers and topics, and `graph fires` shows the relay firing on each
+# timer frame and writing its echo while the desk asks.
+live_rc=0
+live_out="$(host_capture timeout 20 "${HOST_ENV[@]}" "$HOST_CER" graph live \
+  --connect tcp/127.0.0.1:7683 --robot "$APP_IDENTITY")" || live_rc=$?
+printf 'rc=%s\n%s\n' "$live_rc" "$live_out" > "$OUT/graph-live.txt"
+(( live_rc == 0 )) || fail "graph live" "rc=$live_rc output=$live_out"
+for row in '^  timer +timer +every 100 ms +→ /app/timer/count$' \
+  '^  relay +relay +on /app/timer/count +→ /app/relay/echo$' \
+  '^  printer +printer +on /app/relay/echo +→ \(no outputs\)$' \
+  '^  fire telemetry: available \(v1, ring 4096, lease 5 s\)$'; do
+  grep -Eq "$row" <<<"$live_out" || fail "graph live" "no line matches '$row' in: $live_out"
+done
+pass "graph live" "timer, relay and printer with their triggers and topics; fire telemetry v1"
+fires_rc=0
+fires_out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$HOST_CER" graph fires \
+  --connect tcp/127.0.0.1:7683 --robot "$APP_IDENTITY" --for 3)" || fires_rc=$?
+printf 'rc=%s\n%s\n' "$fires_rc" "$fires_out" > "$OUT/graph-fires.txt"
+(( fires_rc == 0 )) || fail "graph fires" "rc=$fires_rc output=$fires_out"
+relay_fires="$(grep -cE ' ago  relay +on /app/timer/count .* wrote /app/relay/echo$' <<<"$fires_out" || true)"
+(( relay_fires >= 10 )) ||
+  fail "graph fires" "relay fires writing /app/relay/echo=$relay_fires, want >= 10 in 3 s of a 100 ms timer: $fires_out"
+grep -Eq '^[0-9]+ fires? in [0-9.]+ s · 0 lost · ' <<<"$fires_out" ||
+  fail "graph fires" "no totals line with 0 lost: $fires_out"
+pass "graph fires" "relay fires=$relay_fires on /app/timer/count, each writing /app/relay/echo, 0 lost"
 status_lines() {
   device logcat -d -s CerulionSample:I 2>/dev/null | tr -d '\r' | grep '"lan_access":"open"'
 }

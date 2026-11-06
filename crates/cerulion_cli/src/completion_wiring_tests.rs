@@ -455,7 +455,9 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion bag play::resim",
         "cerulion bag record::topics",
         "cerulion connect::robot",
+        "cerulion graph fires::robot",
         "cerulion graph levels::name",
+        "cerulion graph live::robot",
         "cerulion graph partition::name",
         "cerulion graph profile::name",
         "cerulion graph run::name",
@@ -645,6 +647,8 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion pair::addrs",
         "cerulion pair::relay_url",
         "cerulion ros2 attach::iface",
+        "cerulion graph fires::connect",
+        "cerulion graph live::connect",
         "cerulion topic find::connect",
         "cerulion topic find::listen",
         "cerulion topic list::connect",
@@ -705,6 +709,10 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // windowed transport listen a TAB press may not open.
         "cerulion graph pause::run_id",
         "cerulion graph resume::run_id",
+        // ---- A REMOTE run id (or graph name). `graph fires --run` names a run
+        // on a robot; listing them means a runs query over the network, which
+        // a TAB press may not make.
+        "cerulion graph fires::run",
         // ---- Numbers.
         // BAG-TIME bounds in seconds, not paths. (They replace
         // `--max-ticks`, which is deleted outright — no alias, no shim.)
@@ -713,6 +721,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion bag play::start_offset",
         "cerulion bag record::duration",
         "cerulion bag record::schema_wait_ms",
+        "cerulion graph fires::for_secs",
         "cerulion graph partition::budget_ns",
         "cerulion graph profile::duration",
         "cerulion graph profile::fires",

@@ -74,6 +74,8 @@ pub mod flashback_cmd;
 pub mod graph_cmd;
 pub mod graph_edit;
 pub mod graph_launch_args;
+// `cerulion graph live` / `graph fires`: a remote robot's runs and node fires.
+pub mod graph_live;
 pub mod graph_params_check;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
