@@ -42,6 +42,7 @@ use super::discovery::{
 };
 use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use super::gateway::is_reserved_topic;
+use super::hosted_runs::{HostedRuns, HostedServe};
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
 use super::run_registry;
@@ -2295,31 +2296,39 @@ fn handle_runs_verb(
 
 /// The runs-serve DECISION: the demand-authorization gate FIRST
 /// (the same access boundary `demand`/`catalog`/`schema` consult), then the
-/// serve-time gather + run-directory read. Extracted so the sync test seam runs
-/// the EXACT decision the real callback runs, minus the reply.
+/// serve-time gather + run-directory read, then the runs this host serves from
+/// memory ([`RunSource::hosted`]). Extracted so the sync test seam runs the
+/// EXACT decision the real callback runs, minus the reply.
 ///
 /// # Three answers, and none of them is a confident empty
 ///
 /// 1. **Refused** - [`cerulion_q::RunsReply::refused`]: no runs, an `error`
 ///    reason, and a NON-settled verdict, so a denied desk cannot read the empty
-///    list as "this robot is running nothing".
-/// 2. **Gather failed** - empty runs +
+///    list as "this robot is running nothing". The hosted slot is never read.
+/// 2. **Gather failed** - only the hosted runs +
 ///    [`cerulion_q::RunsCompleteness::not_established`] and NO `error`. A failed
 ///    gather is not a refusal (the `error` field means exactly "the robot refused
 ///    you"), so it is reported as the non-claim it is: the desk renders "could not
 ///    establish the running graph". A LOUD `warn!` carries the cause, because a
-///    gateway that cannot reach its own machine's registry is a real fault.
-/// 3. **Gathered** - whatever the registry established, with the gather's OWN
-///    completeness verdict carried through unchanged. That passthrough is the
-///    whole reason [`cerulion_q::RunsCompleteness`] exists: a windowed LISTEN that
-///    expired with live writers unheard produces the SAME empty list a genuinely
-///    idle machine produces, and only the verdict tells them apart (the same
-///    lesson the discovery marker and the checked mirror gather taught).
+///    gateway that cannot reach its own machine's registry is a real fault. The
+///    hosted runs are still served: they come from this process's memory, not
+///    from the registry that failed.
+/// 3. **Gathered** - whatever the registry established plus the hosted runs,
+///    with the gather's OWN completeness verdict carried through unchanged. That
+///    passthrough is the whole reason [`cerulion_q::RunsCompleteness`] exists: a
+///    windowed LISTEN that expired with live writers unheard produces the SAME
+///    empty list a genuinely idle machine produces, and only the verdict tells
+///    them apart (the same lesson the discovery marker and the checked mirror
+///    gather taught). A served hosted run does not change the verdict: the host
+///    knows it exactly.
 ///
 /// Runs whose directory could not be read are SKIPPED with a named reason (see
 /// [`run_artifacts::collect_run_entries`]) rather than served as entries carrying
 /// empty documents - and each skip is logged, because a run present in the
-/// registry and absent from the answer is otherwise an unexplained hole.
+/// registry and absent from the answer is otherwise an unexplained hole. A hosted
+/// entry that fails the served-entry checks is named the same way (see
+/// [`HostedRuns::host`]), and either kind of withheld run demotes a settled
+/// verdict, because the list is then a strict subset.
 fn runs_serve_decision(
     runs: &RunSource,
     authorizer: &dyn DemandAuthorizer,
@@ -2332,8 +2341,22 @@ fn runs_serve_decision(
         return cerulion_q::RunsReply::refused(robot, reason);
     }
     note_lan_authorized(authorizer, "runs GET", RUNS_QUERY_RESOURCE);
-    let gather = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
-        Ok(gather) => gather,
+    let gathered = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
+        Ok(gather) => {
+            let fold = run_artifacts::collect_run_entries(&gather.records);
+            for skip in &fold.skipped {
+                tracing::warn!(
+                    robot = %robot,
+                    run_id = %cerulion_q::format_run_id(skip.run_id),
+                    run_dir = %skip.run_dir,
+                    reason = %skip.reason,
+                    "runs GET: skipping a live run whose directory could not be read; \
+                     an entry carrying an empty document would render desk-side as a graph \
+                     with no nodes"
+                );
+            }
+            Some((fold, gather.completeness.into()))
+        }
         Err(e) => {
             tracing::warn!(
                 robot = %robot,
@@ -2341,35 +2364,53 @@ fn runs_serve_decision(
                 "runs GET: the run registry could not be gathered; answering \
                  'could not establish', never 'no runs'"
             );
-            return cerulion_q::build_runs_reply(
-                robot,
-                Vec::new(),
-                Vec::new(),
-                cerulion_q::RunsCompleteness::not_established(),
-            );
+            None
         }
     };
-    let fold = run_artifacts::collect_run_entries(&gather.records);
-    for skip in &fold.skipped {
-        tracing::warn!(
-            robot = %robot,
-            run_id = %cerulion_q::format_run_id(skip.run_id),
-            run_dir = %skip.run_dir,
-            reason = %skip.reason,
-            "runs GET: skipping a live run whose directory could not be read; \
-             an entry carrying an empty document would render desk-side as a graph with \
-             no nodes"
-        );
-    }
-    cerulion_q::build_runs_reply(
-        robot,
-        fold.entries,
-        fold.skipped
-            .iter()
-            .map(run_artifacts::SkippedRun::to_wire)
-            .collect(),
-        gather.completeness.into(),
-    )
+    assemble_runs_reply(robot, gathered, runs.hosted.served())
+}
+
+/// Build an authorized runs reply from the registry's answer (`None` when the
+/// gather could not run) and what the host serves from memory, through the ONE
+/// reply builder.
+///
+/// One run id carries one verdict, because a desk refuses the whole reply
+/// otherwise. The builder's `run_id` dedup is the only dedup of entries, so a
+/// hosted run that is also gathered is served once; on a tie the gathered entry,
+/// supplied first, survives. A run that either side describes is served and is
+/// not also named undescribable, and a run that both sides withhold is named
+/// once, with the gathered reason.
+fn assemble_runs_reply(
+    robot: &str,
+    gathered: Option<(run_artifacts::RunFold, cerulion_q::RunsCompleteness)>,
+    hosted: HostedServe,
+) -> cerulion_q::RunsReply {
+    let (gathered_entries, gathered_withheld, completeness) = match gathered {
+        Some((fold, completeness)) => (
+            fold.entries,
+            fold.skipped
+                .iter()
+                .map(run_artifacts::SkippedRun::to_wire)
+                .collect(),
+            completeness,
+        ),
+        None => (
+            Vec::new(),
+            Vec::new(),
+            cerulion_q::RunsCompleteness::not_established(),
+        ),
+    };
+    let entries: Vec<cerulion_q::RunEntry> =
+        gathered_entries.into_iter().chain(hosted.entries).collect();
+    // hot-path-alloc-ok: cold, one set of run ids per remote runs GET on the
+    // control plane.
+    let mut named: BTreeSet<String> = entries.iter().map(|e| e.run_id.clone()).collect();
+    let undescribable = gathered_withheld
+        .into_iter()
+        .chain(hosted.undescribable)
+        .filter(|withheld| named.insert(withheld.run_id.clone()))
+        .collect();
+    cerulion_q::build_runs_reply(robot, entries, undescribable, completeness)
 }
 
 /// The shared, thread-safe source the `catalog` verb reads to build a
@@ -2512,7 +2553,7 @@ pub struct SchemaSource {
 /// serves `demand`, so a runs GET delays a concurrent demand GET by its own
 /// duration.
 ///
-/// Cheap to clone (one `Arc` + a `Duration`), mirroring [`CatalogSource`].
+/// Cheap to clone (two `Arc`s + a `Duration`), mirroring [`CatalogSource`].
 #[derive(Clone)]
 pub struct RunSource {
     /// The gateway host's own iceoryx2 namespace - the one its
@@ -2523,6 +2564,12 @@ pub struct RunSource {
     /// fast path), so this is paid only when a writer is live and has not yet
     /// been heard from.
     pub gather_window: Duration,
+    /// The runs this host serves from memory (an embedded runtime has no run
+    /// registry record and no run directory). A gateway fills it with its
+    /// [`NetworkManager::hosted_runs`], so the query surface serves what the
+    /// host put there. Absence stays exact: a hosted run is listed only while
+    /// its [`HostedRunGuard`](super::hosted_runs::HostedRunGuard) lives.
+    pub hosted: HostedRuns,
 }
 
 /// Assemble a catalog reply from the LIVE gateway state - the bridge
@@ -3760,6 +3807,11 @@ pub struct NetworkManager {
     /// authorizer is [`AllowAllAuthorizer`]; the posture comes from
     /// [`LanAccess::from_env`].
     demand_authorizer: Arc<Mutex<Arc<dyn DemandAuthorizer>>>,
+    /// The runs this process serves from memory through the `runs` verb.
+    /// Created with the manager, so it exists before the latched query surface
+    /// that reads it (the surface outlives the gateway construction that
+    /// started it).
+    hosted_runs: HostedRuns,
 }
 
 impl NetworkManager {
@@ -3823,7 +3875,20 @@ impl NetworkManager {
                 lan_access,
                 inner_authorizer,
             )))),
+            hosted_runs: HostedRuns::default(),
         }
+    }
+
+    /// The runs this process serves from memory through the `runs` verb. Every
+    /// call returns a handle onto the same set; a run hosted through it is
+    /// served by this manager's query surface until its guard drops.
+    ///
+    /// Only a declared query surface serves it ([`Self::has_query_surface`]). A
+    /// gateway declares one when it has egress topics or an `AllowAll` policy; a
+    /// deny-all, ingress-only gateway declares none, so a desk's `runs` GET to
+    /// such a robot gets no reply, hosted runs included.
+    pub fn hosted_runs(&self) -> HostedRuns {
+        self.hosted_runs.clone()
     }
 
     /// Record the LAN demand bridge manager and apply the current posture.
@@ -7974,5 +8039,647 @@ mod tests {
         record_reinject_failure(&counters, &latch, "/t", None);
         assert_eq!(counters.reinject_failure_drops.load(Ordering::Relaxed), 4);
         assert!(latch.reinject_failure_warned.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod hosted_runs_serve_tests {
+    use super::*;
+    use crate::transport::cerulion_q::{
+        decode_runs_reply, encode_runs_reply, RunEntry, RunEntryState, RunsCompleteness, RunsReply,
+        UndescribableRun,
+    };
+    use crate::transport::hosted_runs::{HostedRun, HostedRunGuard};
+    use crate::transport::run_artifacts::{RunFold, SkippedRun};
+    use crate::transport::run_registry::{
+        RunHandle, RunRecord, RunState, RunWatcher, RUN_GATHER_WINDOW, RUN_REGISTRY_MAX_READERS,
+    };
+
+    const ROBOT: &str = "temi";
+    const RUN: u128 = 0x5d1c_0000_0000_0000_0000_0000_0000_9e02;
+    const RUN_TEXT: &str = "0x5d1c0000000000000000000000009e02";
+    const BAD_RUN: u128 = 0x0bad;
+    const BAD_RUN_TEXT: &str = "0x00000000000000000000000000000bad";
+    const STARTED_AT_NS: u64 = 1_762_264_931_000_000_000;
+    const GRAPH_YAML: &str = "name: temi\nprefix: temi\n";
+    const RUN_JSON: &str = "{\"version\":1,\"host\":\"embedded\"}\n";
+    const IDLE_LEGACY_BYTES: &str =
+        r#"{"version":1,"robot":"temi","runs":[],"completeness":{"kind":"settled"}}"#;
+    const HEARD_CEILING: Duration = Duration::from_secs(10);
+    /// Set to the parent test's process id in the child it spawns, so a value
+    /// inherited from a shell never takes the child arm.
+    const GATHERED_CHILD_ENV: &str = "CERULION_HOSTED_RUNS_GATHERED_CHILD";
+    const GATHERED_CHILD_DONE: &str = "<<<gathered child done>>>";
+    const GATHERED_YAML: &str = "# gathered\nname: perception\nprefix: /percep\n";
+    const GATHERED_JSON: &str = "{\"version\":1,\"graph_name\":\"perception\"}\n";
+
+    struct DenyAll;
+    impl DemandAuthorizer for DenyAll {
+        fn authorize_demand(&self, _subject: &DemandSubject, resource: &str) -> DemandDecision {
+            DemandDecision::deny(format!("test: no access to {resource}"))
+        }
+    }
+
+    fn source_on(iox_config: iceoryx2::config::Config) -> RunSource {
+        RunSource {
+            iox_config: Arc::new(iox_config),
+            gather_window: RUN_GATHER_WINDOW,
+            hosted: HostedRuns::default(),
+        }
+    }
+
+    fn idle_source() -> RunSource {
+        source_on(crate::testing::iceoryx_test_config())
+    }
+
+    fn host(source: &RunSource, live: bool) -> (HostedRunGuard, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(live));
+        let entry = RunEntry::new(
+            RUN,
+            "temi",
+            STARTED_AT_NS,
+            RunState::Live,
+            GRAPH_YAML,
+            RUN_JSON,
+        )
+        .expect("a well-formed entry");
+        let guard = source.hosted.host(
+            RUN,
+            HostedRun {
+                entry,
+                live: Arc::clone(&flag),
+            },
+        );
+        (guard, flag)
+    }
+
+    fn bad_hosted_run() -> HostedRun {
+        HostedRun {
+            entry: RunEntry {
+                run_id: BAD_RUN_TEXT.to_string(),
+                graph_name: "temi".to_string(),
+                run_started_at_ns: STARTED_AT_NS,
+                state: RunEntryState::Live,
+                graph_yaml: String::new(),
+                run_json: RUN_JSON.to_string(),
+            },
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn withheld(run_id_text: &str, reason: &str) -> UndescribableRun {
+        UndescribableRun {
+            run_id: run_id_text.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Serve through the decision until `done` holds, or panic with the last
+    /// reply once [`HEARD_CEILING`] passes.
+    fn serve_until(source: &RunSource, done: impl Fn(&RunsReply) -> bool) -> RunsReply {
+        let deadline = Instant::now() + HEARD_CEILING;
+        loop {
+            let reply = runs_serve_decision_for_test(source, &AllowAllAuthorizer, ROBOT);
+            if done(&reply) {
+                return reply;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no matching runs reply within {HEARD_CEILING:?}; last {reply:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn expected_hosted(state: RunEntryState) -> RunEntry {
+        RunEntry {
+            run_id: RUN_TEXT.to_string(),
+            graph_name: "temi".to_string(),
+            run_started_at_ns: STARTED_AT_NS,
+            state,
+            graph_yaml: GRAPH_YAML.to_string(),
+            run_json: RUN_JSON.to_string(),
+        }
+    }
+
+    fn served_reply(runs: Vec<RunEntry>, completeness: RunsCompleteness) -> RunsReply {
+        RunsReply {
+            version: 1,
+            robot: ROBOT.to_string(),
+            runs,
+            completeness,
+            undescribable: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn entry_named(graph_name: &str, started_at_ns: u64) -> RunEntry {
+        RunEntry::new(
+            RUN,
+            graph_name,
+            started_at_ns,
+            RunState::Live,
+            GRAPH_YAML,
+            RUN_JSON,
+        )
+        .expect("a well-formed entry")
+    }
+
+    fn hosted_entries(entries: Vec<RunEntry>) -> HostedServe {
+        HostedServe {
+            entries,
+            undescribable: Vec::new(),
+        }
+    }
+
+    fn bytes(reply: &RunsReply) -> String {
+        String::from_utf8(encode_runs_reply(reply)).expect("runs replies are JSON text")
+    }
+
+    #[test]
+    fn with_an_empty_slot_an_idle_machine_answers_the_legacy_bytes() {
+        let reply = runs_serve_decision_for_test(&idle_source(), &AllowAllAuthorizer, ROBOT);
+        assert_eq!(bytes(&reply), IDLE_LEGACY_BYTES);
+    }
+
+    #[test]
+    fn with_an_empty_slot_a_gathered_fold_answers_the_legacy_bytes() {
+        let fold = RunFold {
+            entries: vec![RunEntry::new(
+                0x2a,
+                "perception",
+                1_700_000_000_000_000_000,
+                RunState::Live,
+                "name: perception\n",
+                "{\"k\":1}\n",
+            )
+            .expect("a well-formed entry")],
+            skipped: vec![SkippedRun {
+                run_id: 0x2b,
+                run_dir: "/runs/perception-1".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            HostedServe::default(),
+        );
+
+        assert_eq!(
+            bytes(&reply),
+            concat!(
+                r#"{"version":1,"robot":"temi","runs":[{"run_id":"0x0000000000000000000000000000002a","#,
+                r#""graph_name":"perception","run_started_at_ns":1700000000000000000,"state":"live","#,
+                r#""graph_yaml":"name: perception\n","run_json":"{\"k\":1}\n"}],"#,
+                r#""completeness":{"kind":"incomplete","live_writers":0,"writers_heard":0},"#,
+                r#""undescribable":[{"run_id":"0x0000000000000000000000000000002b","#,
+                r#""reason":"run directory holds no readable graph.yaml"}]}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn a_hosted_run_is_served_beside_an_idle_registry() {
+        let source = idle_source();
+        let (_guard, _live) = host(&source, true);
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        let expected = served_reply(
+            vec![expected_hosted(RunEntryState::Live)],
+            RunsCompleteness::Settled,
+        );
+        assert_eq!(reply, expected);
+        assert_eq!(
+            decode_runs_reply(&encode_runs_reply(&reply)),
+            Ok(expected),
+            "a desk decodes the hosted entry through the wire gate unchanged"
+        );
+    }
+
+    #[test]
+    fn a_hosted_run_whose_live_flag_cleared_is_served_as_ending() {
+        let source = idle_source();
+        let (_guard, live) = host(&source, true);
+        live.store(false, Ordering::Release);
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        assert_eq!(
+            reply,
+            served_reply(
+                vec![expected_hosted(RunEntryState::Ending)],
+                RunsCompleteness::Settled
+            )
+        );
+    }
+
+    #[test]
+    fn dropping_the_guard_withdraws_the_hosted_run_and_the_legacy_bytes_return() {
+        let source = idle_source();
+        let (guard, _live) = host(&source, true);
+        let before = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        assert_eq!(before.runs.len(), 1);
+
+        drop(guard);
+
+        let after = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        assert_eq!(bytes(&after), IDLE_LEGACY_BYTES);
+    }
+
+    #[test]
+    fn a_failed_gather_still_serves_the_hosted_run_and_claims_nothing() {
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let (_guard, _live) = host(&source, true);
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: 0x77,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 1,
+                state: RunState::Live,
+                graph_name: "unreachable".to_string(),
+                run_dir: "/nonexistent/unreachable".to_string(),
+            },
+        )
+        .expect("publish a live registry writer");
+        // The gather works while a reader slot is free: it hears the writer and
+        // reports its run as undescribable (its directory does not exist).
+        let deadline = Instant::now() + HEARD_CEILING;
+        let mut heard = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        while heard.undescribable.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            heard = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        }
+        assert_eq!(
+            heard
+                .undescribable
+                .iter()
+                .map(|u| u.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0x00000000000000000000000000000077"],
+            "precondition: the gather hears the live writer"
+        );
+        let _hogs: Vec<RunWatcher> = (0..RUN_REGISTRY_MAX_READERS)
+            .map(|i| {
+                RunWatcher::open_on_config(&namespace, 0x77).unwrap_or_else(|e| {
+                    panic!("reader slot {i} of {RUN_REGISTRY_MAX_READERS} must be claimable: {e}")
+                })
+            })
+            .collect();
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        assert_eq!(
+            reply,
+            served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established()
+            ),
+            "a failed gather serves the runs this process knows from memory, and its \
+             verdict claims nothing about the rest of the machine"
+        );
+        reply.validate().expect("a well-formed reply");
+    }
+
+    #[test]
+    fn a_denied_runs_get_never_reads_the_hosted_slot() {
+        let source = idle_source();
+        let (_guard, _live) = host(&source, true);
+        let held = source.hosted.hold_lock_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let serving = source.clone();
+        let server = std::thread::spawn(move || {
+            let _ = tx.send(runs_serve_decision_for_test(&serving, &DenyAll, ROBOT));
+        });
+
+        let answer = rx.recv_timeout(HEARD_CEILING);
+        drop(held);
+        server.join().expect("the serve thread");
+
+        let reply = answer.expect(
+            "a denied runs GET completed while the hosted slot was locked, so it never read it",
+        );
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: Vec::new(),
+                completeness: RunsCompleteness::not_established(),
+                undescribable: Vec::new(),
+                error: Some("test: no access to <runs: live runs + graphs>".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hosted_run_and_its_gathered_twin_are_served_once() {
+        let fold = |started_at_ns| RunFold {
+            entries: vec![entry_named("gathered", started_at_ns)],
+            skipped: Vec::new(),
+        };
+        let served_name = |gathered_at: u64, hosted_at: u64| {
+            let reply = assemble_runs_reply(
+                ROBOT,
+                Some((fold(gathered_at), RunsCompleteness::Settled)),
+                hosted_entries(vec![entry_named("hosted", hosted_at)]),
+            );
+            assert_eq!(reply.runs.len(), 1, "one run id, one served entry");
+            reply.runs[0].graph_name.clone()
+        };
+
+        assert_eq!(served_name(10, 20), "hosted", "the later start survives");
+        assert_eq!(served_name(20, 10), "gathered", "the later start survives");
+        assert_eq!(
+            served_name(10, 10),
+            "gathered",
+            "on a tie the gathered entry, supplied first, survives"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_no_gather_serves_only_the_hosted_entries_as_not_established() {
+        let reply = assemble_runs_reply(
+            ROBOT,
+            None,
+            hosted_entries(vec![entry_named("temi", STARTED_AT_NS)]),
+        );
+        assert_eq!(
+            reply,
+            served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established()
+            )
+        );
+    }
+
+    #[test]
+    fn hosted_entries_do_not_lift_a_withheld_runs_demotion() {
+        let fold = RunFold {
+            entries: Vec::new(),
+            skipped: vec![SkippedRun {
+                run_id: 0x2b,
+                run_dir: "/runs/perception-1".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            hosted_entries(vec![entry_named("temi", STARTED_AT_NS)]),
+        );
+        assert_eq!(
+            reply,
+            RunsReply {
+                undescribable: vec![UndescribableRun {
+                    run_id: "0x0000000000000000000000000000002b".to_string(),
+                    reason: "run directory holds no readable graph.yaml".to_string(),
+                }],
+                ..served_reply(
+                    vec![expected_hosted(RunEntryState::Live)],
+                    RunsCompleteness::not_established()
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn a_hosted_entry_new_would_refuse_is_named_undescribable_and_the_desk_still_decodes_the_reply()
+    {
+        let source = idle_source();
+        let (_good_guard, _live_good) = host(&source, true);
+        let _bad_guard = source.hosted.host(BAD_RUN, bad_hosted_run());
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                BAD_RUN_TEXT,
+                "the hosted entry carries an empty graph.yaml",
+            )],
+            ..served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established(),
+            )
+        };
+        assert_eq!(reply, expected);
+        assert_eq!(
+            decode_runs_reply(&encode_runs_reply(&reply)),
+            Ok(expected),
+            "one bad hosted entry must not make the desk refuse the whole reply"
+        );
+    }
+
+    #[test]
+    fn every_hosted_runs_handle_of_a_manager_is_the_same_set() {
+        let manager = NetworkManager::new(NetworkConfig::default());
+        let source = RunSource {
+            hosted: manager.hosted_runs(),
+            ..idle_source()
+        };
+        let (guard, _live) = host(&source, true);
+        assert_eq!(
+            manager.hosted_runs().served().entries,
+            vec![expected_hosted(RunEntryState::Live)]
+        );
+        drop(guard);
+        assert!(manager.hosted_runs().served().entries.is_empty());
+    }
+
+    #[test]
+    fn a_hosted_run_whose_gathered_twin_is_withheld_is_served_once_as_the_hosted_entry() {
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let (_guard, _live) = host(&source, true);
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: RUN,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 1,
+                state: RunState::Live,
+                graph_name: "temi".to_string(),
+                run_dir: "/nonexistent/unreachable".to_string(),
+            },
+        )
+        .expect("publish a live registry writer");
+
+        // Settled only once the gather heard the writer; an unheard live writer
+        // answers incomplete.
+        let reply = serve_until(&source, |reply| reply.completeness.is_settled());
+
+        let expected = served_reply(
+            vec![expected_hosted(RunEntryState::Live)],
+            RunsCompleteness::Settled,
+        );
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    #[test]
+    fn a_run_both_sides_withhold_is_named_once_with_the_gathered_reason() {
+        let fold = RunFold {
+            entries: Vec::new(),
+            skipped: vec![SkippedRun {
+                run_id: RUN,
+                run_dir: "/runs/temi".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            HostedServe {
+                entries: Vec::new(),
+                undescribable: vec![withheld(
+                    RUN_TEXT,
+                    "the hosted entry carries an empty graph.yaml",
+                )],
+            },
+        );
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                RUN_TEXT,
+                "run directory holds no readable graph.yaml",
+            )],
+            ..served_reply(Vec::new(), RunsCompleteness::not_established())
+        };
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    #[test]
+    fn a_withheld_hosted_run_whose_gathered_twin_is_described_is_served_as_the_gathered_entry() {
+        let gathered = entry_named("gathered", STARTED_AT_NS);
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((
+                RunFold {
+                    entries: vec![gathered.clone()],
+                    skipped: Vec::new(),
+                },
+                RunsCompleteness::Settled,
+            )),
+            HostedServe {
+                entries: Vec::new(),
+                undescribable: vec![withheld(
+                    RUN_TEXT,
+                    "the hosted entry carries an empty graph.yaml",
+                )],
+            },
+        );
+        let expected = served_reply(vec![gathered], RunsCompleteness::Settled);
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    /// The fold reads `CERULION_HOME` at serve time, so the arm that needs a
+    /// readable run directory runs in a child process with its own environment;
+    /// setting the variable here would race every other test in this binary.
+    #[cfg(unix)]
+    #[test]
+    fn through_the_decision_a_gathered_run_is_served_beside_the_hosted_runs_and_deduped_once() {
+        let parent = std::os::unix::process::parent_id().to_string();
+        if std::env::var_os(GATHERED_CHILD_ENV).is_some_and(|v| v == parent.as_str()) {
+            gathered_beside_hosted_in_this_process();
+            println!("{GATHERED_CHILD_DONE}");
+            return;
+        }
+        let home_dir = tempfile::tempdir().expect("a temp CERULION_HOME");
+        let home = std::fs::canonicalize(home_dir.path()).expect("canonicalize CERULION_HOME");
+        std::fs::create_dir_all(home.join("runs")).expect("the runs root");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "transport::network::hosted_runs_serve_tests::\
+                 through_the_decision_a_gathered_run_is_served_beside_the_hosted_runs_and_deduped_once",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(GATHERED_CHILD_ENV, std::process::id().to_string())
+            .env("CERULION_HOME", &home)
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(GATHERED_CHILD_DONE),
+            "the child failed or never ran its arm ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn gathered_beside_hosted_in_this_process() {
+        let run_dir = run_registry::run_dir_root()
+            .expect("the child's CERULION_HOME")
+            .join("perception");
+        std::fs::create_dir_all(&run_dir).expect("the run directory");
+        std::fs::write(run_dir.join(run_artifacts::GRAPH_YAML_FILE), GATHERED_YAML)
+            .expect("write graph.yaml");
+        std::fs::write(run_dir.join(run_artifacts::RUN_JSON_FILE), GATHERED_JSON)
+            .expect("write run.json");
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: RUN,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 20,
+                state: RunState::Live,
+                graph_name: "perception".to_string(),
+                run_dir: run_dir.to_string_lossy().into_owned(),
+            },
+        )
+        .expect("publish a live registry writer");
+        let host_twin = |started_at_ns| {
+            source.hosted.host(
+                RUN,
+                HostedRun {
+                    entry: entry_named("hosted", started_at_ns),
+                    live: Arc::new(AtomicBool::new(true)),
+                },
+            )
+        };
+        let gathered = RunEntry {
+            run_id: RUN_TEXT.to_string(),
+            graph_name: "perception".to_string(),
+            run_started_at_ns: 20,
+            state: RunEntryState::Live,
+            graph_yaml: GATHERED_YAML.to_string(),
+            run_json: GATHERED_JSON.to_string(),
+        };
+
+        let bad = source.hosted.host(BAD_RUN, bad_hosted_run());
+        let _earlier_twin = host_twin(10);
+        let reply = serve_until(&source, |reply| {
+            reply.runs.iter().any(|e| e.graph_name == "perception")
+        });
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                BAD_RUN_TEXT,
+                "the hosted entry carries an empty graph.yaml",
+            )],
+            ..served_reply(vec![gathered], RunsCompleteness::not_established())
+        };
+        assert_eq!(
+            reply, expected,
+            "the gathered run started later, so it survives its hosted twin, and the bad \
+             hosted entry hides nothing"
+        );
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+
+        drop(bad);
+        let _later_twin = host_twin(30);
+        let reply = serve_until(&source, |reply| reply.completeness.is_settled());
+        assert_eq!(
+            reply,
+            served_reply(vec![entry_named("hosted", 30)], RunsCompleteness::Settled),
+            "the hosted twin started later, so it survives the gathered run"
+        );
     }
 }

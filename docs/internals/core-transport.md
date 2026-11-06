@@ -497,6 +497,21 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
   misses it; consumers read it with the long-lived `RunWatcher`, never a one-shot
   gather.
+- Hosted runs (`transport/hosted_runs.rs`): an embedded host has no registry record and
+  no run directory, so it serves its run from memory.
+  `NetworkManager::hosted_runs().host(run_id, run)` lists a `HostedRun` (its entry and
+  its `live` flag) and returns a `#[must_use]` `HostedRunGuard`; dropping the guard
+  withdraws it. Hosting the same `run_id` again replaces the run, and the old guard then
+  withdraws nothing. The served state comes from `live` at serve time: `Live` while set,
+  `Ending` once the host clears it, until the guard drops. The entry is checked again through `RunEntry::new`
+  and is always served under `run_id`; one that fails the checks is named in
+  `undescribable` with its reason, which demotes a `settled` verdict. The `runs` verb
+  keeps its order (access gate, registry gather, run directories) and folds the hosted
+  entries into the same reply through the one `run_id` dedup (the later start survives;
+  on a tie, the gathered entry). A refused GET never reads the slot; a failed gather
+  still serves the hosted runs, with `not_established`. Only a declared query surface
+  serves them (`NetworkManager::has_query_surface`): a deny-all, ingress-only gateway
+  declares none, so a run hosted there gets no reply.
 - Cross-machine data-plane diagnosis: `crates/cerulion_core/tests/cross_machine_data_plane_harness.rs` is the
   standing two-machine A/B harness (env-driven robot/desk roles; ignored, never run in
   CI; run per its module docs on a live machine pair). It models the shipping asymmetric
