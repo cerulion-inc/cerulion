@@ -2546,7 +2546,10 @@ mod tests {
             waiter.join().expect("waiter thread panicked")
         });
         assert!(
-            matches!(outcome, AddrParkOutcome::Parked | AddrParkOutcome::RingPending),
+            matches!(
+                outcome,
+                AddrParkOutcome::Parked | AddrParkOutcome::RingPending
+            ),
             "the block must report a completed wait or a ring in hand, got {outcome:?}"
         );
         assert!(

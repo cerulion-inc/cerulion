@@ -223,7 +223,11 @@ unsafe fn waitpkg_enumerated() -> bool {
 /// doorbell's kernel wake word where the target has one). Read once, with the
 /// backend; unset or any other value leaves the CPU probe in charge.
 fn primitive_disabled_by_env() -> bool {
-    primitive_disabled_from(std::env::var("CERULION_MONITOR_WAIT_PRIMITIVE").ok().as_deref())
+    primitive_disabled_from(
+        std::env::var("CERULION_MONITOR_WAIT_PRIMITIVE")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// The pure rule of [`primitive_disabled_by_env`] over an injected value: only
