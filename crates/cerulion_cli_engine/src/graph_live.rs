@@ -1399,7 +1399,8 @@ fn connect_set(connect: &[String], reachable: &HashSet<String>) -> CliResult<Vec
     for locator in &skipped {
         tracing::warn!(
             locator = %clean(locator),
-            "--connect locator did not accept a connection within {wait}; asking the other \
+            wait = %wait,
+            "--connect locator did not accept a connection in time; asking the other \
              locators only"
         );
     }
