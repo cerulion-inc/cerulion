@@ -3042,17 +3042,97 @@ mod tests {
         }
     }
 
+    /// Probe runs of a freshly written stub before `wait_until_stub_runs` gives up.
+    #[cfg(unix)]
+    const STUB_PROBE_ATTEMPTS: u32 = 500;
+
+    /// Writes an executable shell stub at `path` and returns once it can be
+    /// executed. A process forked by a concurrent test before its exec holds a
+    /// copy of this write descriptor, and while it does, executing the stub
+    /// fails with ETXTBSY; a probe run (which exits before `body`) is retried
+    /// every 10 ms, at most `STUB_PROBE_ATTEMPTS` times.
+    #[cfg(unix)]
+    fn install_python_stub(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_stub_runs(path);
+    }
+
+    #[cfg(unix)]
+    fn wait_until_stub_runs(path: &Path) {
+        for _ in 0..STUB_PROBE_ATTEMPTS {
+            match std::process::Command::new(path)
+                .env("CERULION_TEST_PROBE", "1")
+                .status()
+            {
+                Ok(status) => {
+                    assert!(
+                        status.success(),
+                        "probe run of {}: {status}",
+                        path.display()
+                    );
+                    return;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("probe run of {}: {error}", path.display()),
+            }
+        }
+        panic!(
+            "{} stayed busy for {STUB_PROBE_ATTEMPTS} probe runs",
+            path.display()
+        );
+    }
+
+    /// Holds a write descriptor on a stub, the way a concurrently forked child
+    /// does, and checks that running it fails with ETXTBSY and that
+    /// `wait_until_stub_runs` returns only after the descriptor is closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_stub_install_waits_out_a_held_write_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy");
+        install_python_stub(&path, "exit 0");
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let error = std::process::Command::new(&path)
+            .env("CERULION_TEST_PROBE", "1")
+            .status()
+            .expect_err("a stub open for writing must not run");
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "{error} (kernel {})",
+            kernel.trim()
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let released = std::time::Instant::now();
+            drop(writer);
+            released
+        });
+        wait_until_stub_runs(&path);
+        let returned = std::time::Instant::now();
+        let released = release.join().unwrap();
+        assert!(
+            returned > released,
+            "wait_until_stub_runs returned before the writer closed"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn regenerate_python_info_cleans_temp_file_on_every_result() {
-        use std::os::unix::fs::PermissionsExt;
-
         fn make_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions).unwrap();
+            install_python_stub(&path, body);
             path
         }
 
@@ -3093,21 +3173,29 @@ mod tests {
             match (name, result, oracle) {
                 ("valid", Ok(()), Some(expected)) => {
                     let source = std::fs::read_to_string(node_dir.join("src/lib.rs")).unwrap();
-                    assert!(source.contains(expected));
+                    assert!(
+                        source.contains(expected),
+                        "lib.rs lacks {expected}: {source}"
+                    );
                 }
                 ("two", Err(err), None) => {
-                    assert!(err.to_string().contains("expected exactly one document"));
+                    assert!(
+                        err.to_string().contains("expected exactly one document"),
+                        "{err}"
+                    );
                 }
                 ("bad", Err(err), None) => {
-                    assert!(err.to_string().contains("produced invalid JSON"));
+                    assert!(err.to_string().contains("produced invalid JSON"), "{err}");
                 }
                 ("array", Err(err), None) => {
-                    assert!(err
-                        .to_string()
-                        .contains("expected object with inputs and outputs arrays"));
+                    assert!(
+                        err.to_string()
+                            .contains("expected object with inputs and outputs arrays"),
+                        "{err}"
+                    );
                 }
                 ("stderr", Err(err), None) => {
-                    assert!(err.to_string().contains("stub stderr"));
+                    assert!(err.to_string().contains("stub stderr"), "{err}");
                 }
                 other => panic!("unexpected metadata result: {other:?}"),
             }
@@ -3162,8 +3250,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn regenerate_python_build_rs_bakes_interpreter_libdir() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let stub_dir = tempfile::tempdir().unwrap();
         let options = NodeCreateOptions {
@@ -3181,18 +3267,14 @@ mod tests {
         let stub = nodes_dir.join("python-stub");
         let site = stub_dir.path().join("site");
         std::fs::create_dir(&site).unwrap();
-        std::fs::write(
+        install_python_stub(
             &stub,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '%s\\n' '{{\"libdir\":\"/opt/python/lib\",\"purelib\":\"{}\",\"platlib\":\"{}\"}}'; fi\n",
+            &format!(
+                "if [ \"$1\" = \"-c\" ]; then printf '%s\\n' '{{\"libdir\":\"/opt/python/lib\",\"purelib\":\"{}\",\"platlib\":\"{}\"}}'; fi",
                 site.display(),
                 site.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&stub, permissions).unwrap();
+        );
 
         let node_dir = nodes_dir.join("rpath_node");
         let paths = query_python_paths(&stub).unwrap();

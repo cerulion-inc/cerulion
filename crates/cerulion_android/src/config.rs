@@ -183,8 +183,9 @@ pub struct SubscribeConfig {
     pub topic: String,
     /// Qualified message schema name.
     pub schema: String,
-    /// Messages the subscription queue holds before it drops the oldest;
-    /// defaults to 10, the default depth of a node input.
+    /// Messages the subscription queue holds from each publisher of the
+    /// topic before it drops that publisher's oldest; defaults to 10, the
+    /// default depth of a node input.
     #[serde(default = "default_subscribe_depth")]
     pub depth: usize,
 }

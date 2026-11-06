@@ -17,12 +17,13 @@ dev-dependencies are stripped by `cargo package`):
 | Crate | Internal normal/build deps |
 |---|---|
 | `cerulion_macros` | (none; external only: proc-macro2, quote, syn) |
-| `cerulion_core` | `cerulion_macros` |
+| `cerulion_core` | `cerulion_macros`, `cerulion_pairing` |
 | `native_ros2_messages` | `cerulion_core` (as dep **and** build-dep) |
+| `cerulion` | `cerulion_core`, `cerulion_macros`, `native_ros2_messages` |
 | `cerulion_dds` | (none; published DDS forks are external dependencies) |
 | `cerulion_discovery` | (none) |
 | `cerulion_hygiene` | (none) |
-| `cerulion_mdns` | (none) |
+| `cerulion_mdns` | `cerulion_discovery` |
 | `cerulion_pairing` | (none) |
 | `cerulion_link` | (none) |
 | `cerulion_telemetry` | (none) |
@@ -33,30 +34,31 @@ dev-dependencies are stripped by `cargo package`):
 | `cerulion_wsd` | `cerulion_core`, `cerulion_cli_engine`, `cerulion_hygiene` |
 | `cerulion_cli_engine` | `cerulion_core`, `native_ros2_messages`, `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `cerulion_pairing`, `cerulion_bag`, `cerulion_bagd`, `cerulion_netd` |
 | `cerulion_cli_tui` | `cerulion_cli_engine`, `cerulion_core` |
-| `cerulion_cli` | `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_core`, `cerulion_dds`, `cerulion_bagd`, `cerulion_bag`, `cerulion_netd`, `cerulion_telemetry`, `native_ros2_messages` |
+| `cerulion_cli` | `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_core`, `cerulion_dds`, `cerulion_bagd`, `cerulion_telemetry` |
 | `cerulion_android` | `cerulion_bag`, `cerulion_bagd`, `cerulion_cli_engine`, `cerulion_core`, `cerulion_mdns` |
 
 Publish in this order:
 
-1. **`cerulion_macros`**
-2. **`cerulion_core`**
-3. **`native_ros2_messages`**
-4. **`cerulion_dds`**, **`cerulion_discovery`**, **`cerulion_hygiene`**, **`cerulion_mdns`**,
-   **`cerulion_pairing`**, **`cerulion_link`**, **`cerulion_bag`**, and
-   **`cerulion_telemetry`** (independent of one another after their listed
-   prerequisites; `cerulion_telemetry` has no internal dependency)
-5. **`cerulion_wireclient`**
-6. **`cerulion_netd`**
-7. **`cerulion_bagd`**
-8. **`cerulion_cli_engine`**
-9. **`cerulion_cli_tui`**, **`cerulion_wsd`** and **`cerulion_android`**
+1. **`cerulion_macros`**, **`cerulion_pairing`**, **`cerulion_discovery`**,
+   **`cerulion_dds`**, **`cerulion_hygiene`**, **`cerulion_link`** and
+   **`cerulion_telemetry`** (no internal dependency; independent of one another)
+2. **`cerulion_core`** and **`cerulion_mdns`**
+3. **`native_ros2_messages`**, **`cerulion_bag`** and **`cerulion_wireclient`**
+4. **`cerulion`** and **`cerulion_netd`**
+5. **`cerulion_bagd`**
+6. **`cerulion_cli_engine`**
+7. **`cerulion_cli_tui`**, **`cerulion_wsd`** and **`cerulion_android`**
    (independent of one another)
-10. **`cerulion_cli`**
+8. **`cerulion_cli`**
+
+Each step needs only crates from earlier steps. `tools/scripts/publish_crates.sh`
+does not follow this list: it hands every publishable crate to Cargo, which
+orders them itself. The list is for a manual publish.
 
 > Note: the intuitive order `cerulion_core → cerulion_macros
-> → cerulion_cli` is impossible: `cerulion_core` has a normal
-> dependency on `cerulion_macros`, so the macros crate must be published
-> first. `native_ros2_messages`, the DDS platform crate, and the transport and
+> → cerulion_cli` is impossible: `cerulion_core` has normal
+> dependencies on `cerulion_macros` and `cerulion_pairing`, so both must be
+> published first. `native_ros2_messages`, the DDS platform crate, and the transport and
 > recording crates must also be published before `cerulion_cli_engine`; all
 > CLI crates are last.
 
@@ -153,7 +155,7 @@ Run from the workspace root, in order:
       `./tools/scripts/test_build_deb.sh` check the three lists; the install
       smoke of `release-artifacts.yml` checks the installed release.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
-      access for all nineteen publishable crates listed above.
+      access for all twenty publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
       the new version before publishing the next crate in the order.
 
@@ -233,9 +235,10 @@ and runs in the `Lint` job.
 
 ## First publication: new-crate rate limit and partial publishes
 
-Seventeen of the nineteen publishable crates exist on crates.io; `cerulion_telemetry` and
+Eighteen of the twenty publishable crates exist on crates.io; `cerulion_telemetry` and
 `cerulion_android` are new and are published for the first time with the release that adds
-them. The `0.1.0` release
+them. The umbrella `cerulion` crate's name already exists on crates.io (at `0.0.2`), so it is
+not a new crate name. The `0.1.0` release
 published eleven of them for the first time (`cerulion_bag`, `cerulion_bagd`,
 `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_link`,
 `cerulion_mdns`, `cerulion_netd`, `cerulion_pairing`, `cerulion_wireclient` and

@@ -16,6 +16,7 @@ on:
     paths:
       - 'crates/rmw_cerulion/**'
       - 'crates/cerulion_core/**'
+      - 'crates/cerulion_bag/**'
       - 'crates/cerulion_heaphook/**'
       - 'crates/native_ros2_messages/**'
       - 'tools/ci/rmw-distros/**'
@@ -27,6 +28,7 @@ on:
     paths:
       - 'crates/rmw_cerulion/**'
       - 'crates/cerulion_core/**'
+      - 'crates/cerulion_bag/**'
       - 'crates/cerulion_heaphook/**'
       - 'crates/native_ros2_messages/**'
       - 'tools/ci/rmw-distros/**'

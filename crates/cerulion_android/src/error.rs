@@ -71,7 +71,9 @@ pub enum EmbedError {
     /// Recorder setup or execution failed.
     #[error("{0}")]
     Recorder(String),
-    /// The requested publish or subscribe topic is not configured.
+    /// The requested publish or subscribe topic is not configured. The
+    /// payload is the whole message, which names the topic and says whether
+    /// it was a publish or a subscribe topic.
     #[error("{0}")]
     UnknownTopic(String),
     /// Publish JSON could not be encoded.

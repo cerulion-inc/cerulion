@@ -672,6 +672,15 @@ pub struct StatusResponse {
     /// and schemas stay served on the shared gateway after release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_access: Option<LanAccess>,
+    /// Every egress topic's send-queue counters on the shared gateway, sorted
+    /// by topic: frames forwarded (zenoh accepted the put), best-effort frames
+    /// dropped and reliable frames refused because the topic's send queue was
+    /// full, failed puts, and frames discarded because demand ended, LAN
+    /// access closed, or the gateway stopped before their put. A
+    /// topic appears once a remote has demanded it. Absent (`None`) when the
+    /// daemon runs no egress gateway, and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<Vec<cerulion_core::EgressTopicStats>>,
 }
 
 /// The response to [`Request::RegisterEgress`].
@@ -1892,6 +1901,18 @@ mod tests {
             idle: false,
             connect_endpoints: Some(vec!["tcp/10.0.0.5:7683".to_string()]),
             lan_access: Some(LanAccess::Paired),
+            egress: Some(vec![cerulion_core::EgressTopicStats {
+                topic: "/tf".to_string(),
+                reliability: cerulion_core::EgressReliability::Reliable,
+                send_queue: 16,
+                queued: 1,
+                in_flight: 0,
+                forwarded: 40,
+                dropped: 0,
+                refused: 3,
+                failed: 0,
+                discarded: 2,
+            }]),
         });
         let v: serde_json::Value = serde_json::from_str(&st.to_json_line()).unwrap();
         assert_eq!(v["lan_access"], "paired");
@@ -1903,6 +1924,27 @@ mod tests {
         assert_eq!(v["demands"][0]["plane"], "iroh");
         // The folded connect set rides the same response.
         assert_eq!(v["connect_endpoints"][0], "tcp/10.0.0.5:7683");
+        // So do the egress send-queue counters, by name.
+        assert_eq!(v["egress"][0]["topic"], "/tf");
+        assert_eq!(v["egress"][0]["reliability"], "reliable");
+        assert_eq!(v["egress"][0]["send_queue"], 16);
+        assert_eq!(v["egress"][0]["forwarded"], 40);
+        assert_eq!(v["egress"][0]["refused"], 3);
+        assert_eq!(v["egress"][0]["discarded"], 2);
+        // A daemon that runs no gateway, or predates the field, sends no
+        // `egress`; it decodes as unreported, never as "no topics".
+        let old: StatusResponse =
+            serde_json::from_str(r#"{"id":4,"demands":[],"active_connections":0,"idle":true}"#)
+                .unwrap();
+        assert_eq!(old.egress, None);
+        // An entry from a daemon with fewer counters still decodes; the
+        // missing ones read 0.
+        let sparse: cerulion_core::EgressTopicStats =
+            serde_json::from_str(r#"{"topic":"/tf","forwarded":3}"#).unwrap();
+        assert_eq!(
+            (sparse.topic.as_str(), sparse.forwarded, sparse.refused),
+            ("/tf", 3, 0)
+        );
     }
 
     /// An older daemon does not send `connect_endpoints` at all, and
