@@ -150,7 +150,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -165,7 +165,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "portwrite".to_string(),
@@ -183,7 +183,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "drain".to_string(),

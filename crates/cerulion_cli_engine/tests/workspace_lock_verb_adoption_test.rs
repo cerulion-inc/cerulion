@@ -108,7 +108,7 @@ fn the_cheaply_drivable_verbs_top_up_a_pre_lock_gitignore() {
         &ws.join("graphs"),
         "perception",
         NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "camera".to_string(),

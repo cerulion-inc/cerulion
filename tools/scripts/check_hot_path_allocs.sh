@@ -162,9 +162,9 @@ team_auth.rs test_ca.rs"
 
 # cerulion_core/src/graph — the level executor lives here (runtime.rs).
 #
-#   chain.rs       the STATIC chain analysis; `census_chains`, the unit
-#                  derivation and the partitioner read its link rules once at
-#                  graph build or load, and no step reads them. Same class as
+#   chain.rs       the STATIC chain-fusion census; `census_chains` walks the
+#                  topology, the trigger edges and the levels once at graph
+#                  build and no execution path reads its result. Same class as
 #                  topology.rs below, which it is built on top of.
 #   config.rs      serde YAML types; parsed once at graph LOAD.
 #   node.rs        NodeEntry loading + the cdylib FFI shim. Its per-step half is
@@ -173,9 +173,6 @@ team_auth.rs test_ca.rs"
 #                  run at LOAD. Excluded rather than swept: a real sweep
 #                  of its 125 findings has not been done, and the exclusion
 #                  says so instead of annotating them away here.
-#   executor.rs    executor-unit derivation: splits each process group into
-#                  the units its threads run, once per graph load and at
-#                  `graph plan`, before any transport resource exists.
 #   launch_args.rs launch-argument resolution (`args:` defaults, `name:=value`
 #                  overrides) and the `${name}` substitution into the graph
 #                  document; runs once per graph parse, before the graph types
@@ -190,7 +187,7 @@ team_auth.rs test_ca.rs"
 #   topology.rs    the STATIC build-time dataflow model; `build()`/`validate()`
 #                  run once at graph build.
 #   validation.rs  build-time graph validation.
-GRAPH_EXCLUDE="chain.rs config.rs executor.rs launch_args.rs node.rs param_resume.rs params.rs partition.rs topology.rs validation.rs"
+GRAPH_EXCLUDE="chain.rs config.rs launch_args.rs node.rs param_resume.rs params.rs partition.rs topology.rs validation.rs"
 
 # cerulion_core/src/scheduler — the fire/decide engine.
 #

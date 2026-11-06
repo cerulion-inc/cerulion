@@ -169,9 +169,7 @@ fn build_workspace_with(root: &Path, prefix: &str, fixture: &str) {
 /// `cer_d_{hex}` namespace the introspection processes could never see.
 /// Since that move the mp data plane is ALSO the default namespace (the mp
 /// visibility pin lives in `mp_default_ns_e2e_test.rs`); the flag stays so
-/// THIS file keeps pinning the single-process monolith shape for its one-node
-/// graph. The two-type graph is two executor units, which `--single-process`
-/// runs in one worker process.
+/// THIS file keeps pinning the single-process monolith shape.
 fn spawn_graph_run(root: &Path) -> (ChildGuard, PathBuf) {
     let stdout_path = root.join("run.stdout");
     let stderr_path = root.join(RUN_STDERR);
@@ -686,13 +684,9 @@ fn topic_type_find_list_t_and_bw_e2e_against_a_running_graph() {
     let prefix = "topicintroc";
     build_two_type_workspace(tmp.path(), prefix);
     let (mut guard, stderr_path) = spawn_graph_run(tmp.path());
-    // Two sources are two executor units, so `--single-process` on the real
-    // clock runs them in one worker process beside `graph run`, whose topics
-    // are live once the supervisor signals GO (the one-node arms run the
-    // monolith and wait on its own start line).
     wait_for_log_line(
         &stderr_path,
-        "GO signaled; deployment live",
+        "starting graph (live)",
         Duration::from_secs(30),
     );
     let prober = format!("/{prefix}/prober/out");

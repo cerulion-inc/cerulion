@@ -362,7 +362,7 @@ Any of these also orders the pair, and remains the better shape in some cases:
 |---|---|
 | Mark the edge `#[input(trigger)]` | It becomes a DAG edge, so the level-boundary barrier orders it and no extra rendezvous is needed. Usually the better control shape too; this is how `examples/obstacle_avoidance` is wired. |
 | Co-locate both nodes in one `process_groups:` group | One worker, so the monolith's snapshot-then-tick order applies directly. |
-| `cerulion graph run --single-process` | The plain monolith: under the `lockstep` opt-out a `--single-process` run is one level loop, whatever its executor units. |
+| `cerulion graph run --single-process` | The plain monolith. |
 
 **Where it is pinned.** The ORDERING guarantee is
 `crates/cerulion_core/tests/mid_level_barrier_iox2_test.rs`: two `period_ms` nodes at
@@ -755,10 +755,8 @@ executor handle such a bag with no switch, and so does the recording arm: a
 multi-process `graph run --record` stamps `free_run` and records each rank's
 own wall-faithful timeline from the shared epoch unless the run opted out with
 `CERULION_EXECUTION_MODE=lockstep`, in which case the bag stamps `lockstep` and
-is quantum-timed. A monolith recording (`--single-process --record` of a graph
-that is one executor unit, or under the opt-out) stamps `lockstep`; a
-`--single-process --record` of a graph whose nodes split into several executor
-units records one rank per unit and stamps `free_run`, like the default.
+is quantum-timed. A monolith recording (`--single-process --record`) always
+stamps `lockstep`.
 
 ## Replaying a multi-process recording
 
@@ -848,16 +846,13 @@ process model in each row applies to it.
 | macOS | Multi-process (supervisor + workers). Under the `lockstep` opt-out, the same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then an `os_sync_wait_on_address` kernel wake on macOS 14.4 and later, or chunked ~100 µs sleep-rechecks below that and under `CERULION_BARRIER_OS_SYNC=0` (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
 | other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice; you lose process isolation. Under the `lockstep` opt-out its results match the split's (determinism firewall). Under the free-run default a split's cross-rank pairings are decided by OS scheduling, so what reproduces such a run is its recorded bag, not a second live run. |
 
-`--single-process` keeps every node in one process on ANY host (useful for
+`--single-process` forces the monolith path on ANY host (useful for
 debugging a multi-process graph in one process, or for an
-externally-clocked run; see below). For a graph that is one executor unit,
-and on a non-Unix host, a non-real clock or the `lockstep` opt-out, that
-process is the monolith; on the real clock a graph whose nodes split into
-several units runs them all in one worker process beside `graph run`.
+externally-clocked run; see below).
 
 **macOS wake-latency tier:** any host without a CPU monitor-wait
 primitive (macOS included, whether running the real multi-process split
-or a `--single-process` run) gets a live-loop park via the
+or a `--single-process` monolith) gets a live-loop park via the
 **degraded sleep-recheck tier**, on by default for live runs. The park is a
 bounded ~100 µs recheck nap (never a busy-spin): on macOS 14.4 and later each
 nap is an `os_sync_wait_on_address` timed wait; below 14.4, or under
@@ -893,10 +888,10 @@ cerulion graph run perception_stack --trace-limit 500000
 | Flag | Notes |
 |---|---|
 | `--peer-loss <continue\|fail>` | Applies to every multi-process run, including one whose groups were derived automatically. A single-process run warns once that the option does not apply. Default `continue`. |
-| `--single-process` | Keeps every node in one process even with `process_groups:` (info log names the override). On a graph WITHOUT `process_groups:` it opts out of the multi-process auto-partition default entirely: no derivation, no confirm (info log). On the real clock a graph whose nodes split into executor units runs every unit in one worker process beside `graph run`; a graph that is one unit, and any run on the lockstep execution mode or a virtual or external time source, is the plain monolith. |
+| `--single-process` | Forces the monolith even with `process_groups:` (info log names the override). On a graph WITHOUT `process_groups:` it opts out of the multi-process auto-partition default entirely: no derivation, no confirm, the plain monolith run (info log). |
 | `--trace-limit <N>` | Caps the in-memory fire-trace ring (default 100 000 entries, stamped into every worker). The trace is a bounded observability window, NOT the replay record (recording is the bag's job). Unbounded growth costs ~2 GB/h at 1 kHz × 10 nodes, so `0` is rejected at parse; there is no unbounded escape hatch. |
-| `--record[=DIR]` | Records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring, which exist on every multi-process run, recording or not (see `--no-rings`), all drained by one `bagd`; rank-stamped provenance in every record's `reserved`. By default (free-run) each rank records its OWN wall-faithful timeline from a shared epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the recording is quantum-timed (see "Recording a multi-process run" above); the bag's `coordination` stamp and the run directory's `gating` label say which. `--single-process --record` of a graph that is one executor unit (or under the opt-out) takes the single-process wall-faithful path instead; of a graph whose nodes split into several units it records from its one worker process, one rank per unit. Unix-only; requires the live clock. |
-| `--no-rings` | Declines this run's per-rank SCHEDULER-TRACE rings. They are provisioned by DEFAULT on every multi-process run so that a Flashback capture of ANY serving graph can be RE-EXECUTED (`cerulion bag play --resim`) rather than only a run somebody decided in advance to record; this is the opt-out for a memory-tight robot. Cost declined: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. It ALSO stops the Flashback window recorder being started for this run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). **Conflicts with `--record`** at parse time: `--record` requires the scheduler trace, because that is what a deterministic re-execution reads. On shapes that mint no ring anyway it is NOT a no-op: a `--single-process` run of a graph that is one executor unit, or a `--time-source external` run, still has its window recorder stopped by it, so the run takes no captures. Each says at launch which it was. (`cerulion ros2 attach` and `node run` define no such flag at all.) NOT `--trace-limit`, which caps the IN-MEMORY fire-trace ring above; these are the SHARED-MEMORY rings a recorder drains. |
+| `--record[=DIR]` | Records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring, which exist on every multi-process run, recording or not (see `--no-rings`), all drained by one `bagd`; rank-stamped provenance in every record's `reserved`. By default (free-run) each rank records its OWN wall-faithful timeline from a shared epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the recording is quantum-timed (see "Recording a multi-process run" above); the bag's `coordination` stamp and the run directory's `gating` label say which. `--single-process --record` takes the single-process wall-faithful path instead. Unix-only; requires the live clock. |
+| `--no-rings` | Declines this run's per-rank SCHEDULER-TRACE rings. They are provisioned by DEFAULT on every multi-process run so that a Flashback capture of ANY serving graph can be RE-EXECUTED (`cerulion bag play --resim`) rather than only a run somebody decided in advance to record; this is the opt-out for a memory-tight robot. Cost declined: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. It ALSO stops the Flashback window recorder being started for this run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). **Conflicts with `--record`** at parse time: `--record` requires the scheduler trace, because that is what a deterministic re-execution reads. On shapes that mint no ring anyway it is NOT a no-op: a `--single-process` or `--time-source external` run still has its window recorder stopped by it, so the run takes no captures. Each says at launch which it was. (`cerulion ros2 attach` and `node run` define no such flag at all.) NOT `--trace-limit`, which caps the IN-MEMORY fire-trace ring above; these are the SHARED-MEMORY rings a recorder drains. |
 | `--time-source external` | **Rejected** for multi-process: every worker runs on the real clock (free-run by default, each rank on its own wall-faithful clock, or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`) and an external time master driving N separate processes is unspecified either way. Drop the flag, or use `--single-process`. |
 | `--time-source virtual` | Ignored with a loud warning: multi-process workers always run on the real clock (free-run by default, barrier lockstep under the opt-out). With `--record` it is rejected outright: recording requires the live clock (`--time-source real`, the default). |
 

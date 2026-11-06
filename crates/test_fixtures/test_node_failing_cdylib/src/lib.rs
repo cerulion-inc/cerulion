@@ -6,7 +6,7 @@
 //! - the runtime_error_2 integration test (default `tick_logic` mode)
 //! - the tests for FFI codes 2 (panic) and the
 //!   init-fail path.
-//! - `chunk_c_ffi_codes_3_4_test.rs` for FFI codes 3 (instance lock
+//! - `chunk_c_ffi_codes_3_4_test.rs` for FFI codes 3 (mutex
 //!   poisoned via `tick_panic`) and 4 (handle not found via raw
 //!   libloading — no fixture mode needed; the test simply calls
 //!   `cerulion_node_tick` with a handle that was never `init`'d).
@@ -16,13 +16,13 @@
 //!   FFI code 1, rich `LAST_ERROR` populated.
 //! - `tick_panic`: tick `panic!()`s → first call returns FFI code 2
 //!   (caught by `catch_unwind`) and `LAST_ERROR = "panic caught by
-//!   catch_unwind"`. The macro's tick wrapper holds the instance's own
-//!   lock across the user `tick()` body (see
+//!   catch_unwind"`. The macro's tick wrapper holds the NODES mutex
+//!   guard across the user `tick()` body (see
 //!   `cerulion_macros/src/codegen.rs` `cerulion_node_tick`), so the
-//!   panic-induced unwind drops the guard mid-flight and poisons that
-//!   lock. Every later FFI call on that instance then returns FFI code 3
-//!   with `LAST_ERROR = "<entrypoint>: node instance mutex poisoned"`.
-//!   This cascade is the path exercised by that test.
+//!   panic-induced unwind drops the guard mid-flight and poisons
+//!   NODES. Every subsequent FFI call on this cdylib then returns
+//!   FFI code 3 with `LAST_ERROR = "<entrypoint>: NODES mutex
+//!   poisoned"`. This cascade is the path exercised by that test.
 //! - `init_fail`: init returns Err → `cerulion_node_init` returns 0
 //!   handle, `LAST_ERROR` set.
 

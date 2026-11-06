@@ -223,7 +223,7 @@ fn chain_graph(
         prefix: "lsb".to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
@@ -235,7 +235,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "mid".to_string(),
@@ -247,7 +247,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -921,7 +921,7 @@ fn build_period_graph() -> (GraphRuntime, Arc<VirtualClock>) {
         identity: "live_spin_budget_period_test".to_string(),
         prefix: "lsbp".to_string(),
         nodes: vec![NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "producer".to_string(),

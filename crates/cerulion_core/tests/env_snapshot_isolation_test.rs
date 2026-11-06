@@ -74,7 +74,7 @@ fn build_runtime_recording_env_var(
         identity: "env_iso".to_string(),
         prefix: "envt".to_string(),
         nodes: vec![NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: node_id.clone(),

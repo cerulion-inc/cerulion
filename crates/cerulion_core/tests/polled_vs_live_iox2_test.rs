@@ -231,7 +231,7 @@ fn chain_graph(
         prefix: "pvl".to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
@@ -243,7 +243,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "mid".to_string(),
@@ -255,7 +255,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -804,7 +804,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
         nodes: vec![
             // UNIFIED consumer (plain trigger → drop_oldest → ListenerOnly).
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "unified".to_string(),
@@ -817,7 +817,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
             },
             // INELIGIBLE consumer (sample(2) → dual-subscriber → Ipc).
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sampled".to_string(),

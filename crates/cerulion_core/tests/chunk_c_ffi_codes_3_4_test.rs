@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Defensive end-to-end coverage for FFI codes 3 (an instance's
-//! lock poisoned) and 4 (handle not found) on `cerulion_node_tick`,
+//! Defensive end-to-end coverage for FFI codes 3 (NODES
+//! mutex poisoned) and 4 (handle not found) on `cerulion_node_tick`,
 //! exercised by raw libloading (bypassing `DylibNodeEntry`).
 //!
 //! Why test these defensively:
@@ -14,12 +14,13 @@
 //!   sends its own valid handle to the FFI.
 //! - Code 3 is unreachable via `DylibNodeEntry::tick` directly
 //!   (a panic in tick still returns `Err(TransportError)` to the
-//!   host, surfacing as code 2 to the caller), but the instance's
-//!   own lock, held across its tick, DOES get poisoned by the
-//!   unwind. Any later FFI call on that instance returns code 3 with
-//!   `LAST_ERROR = "<entry>: node instance mutex poisoned"`, while
-//!   other instances of the library keep working. This test
-//!   exercises that cascade explicitly so the contract is locked.
+//!   host, surfacing as code 2 to the caller), but the cdylib's
+//!   NODES mutex DOES get poisoned by the unwind. Any subsequent
+//!   FFI call on the same loaded cdylib hits the poison check at
+//!   the top of `cerulion_node_tick` / `_init` / `_shutdown` and
+//!   returns code 3 (or 0 sentinel for init) with `LAST_ERROR =
+//!   "<entry>: NODES mutex poisoned"`. This test exercises that
+//!   cascade explicitly so the contract is locked.
 //!
 //! ## Why raw libloading
 //!
@@ -48,14 +49,14 @@
 //! serialization but does NOT guarantee FIFO acquisition order.
 //! When tests have correctness dependencies on which one runs
 //! first (e.g., code-4 assertions must precede the panic-poison
-//! phase, because the poisoned instance stays poisoned for
-//! every later FFI call on it in this binary), `#[serial]` alone
+//! phase, because poisoning leaves `NODES` permanently `Err` for
+//! every subsequent FFI call in this binary), `#[serial]` alone
 //! is insufficient.
 //!
 //! For that case we fold ALL ordered assertions into a single
 //! `#[test]` body — `cdylib_ffi_codes_3_and_4_full_lifecycle` —
 //! whose 5 sequential phases — (a) code-4 missing handles,
-//! (b) init + first tick → code 2 (panic-poisons the instance),
+//! (b) init + first tick → code 2 (panic-poisons NODES),
 //! (c) second tick → code 3, (d) third tick → code 3 persists,
 //! (e) cascade through init + shutdown under poison — run in
 //! fixed order regardless of how libtest schedules other tests. A design that
@@ -155,10 +156,10 @@ unsafe fn take_last_error(
 ///   shared library returns the SAME loaded image. The cdylib's
 ///   `NODES: Mutex<...>` static is therefore shared across every
 ///   `libloading::Library::new(path)` call within the same process.
-/// - The panic-poison phase poisons an instance for the rest of the
+/// - The panic-poison phase poisons NODES for the rest of the
 ///   process. If a sibling test in the same binary that asserts
 ///   `code == 4` happens to acquire the `#[serial]` mutex AFTER
-///   the panic-poison test, it sees that instance already poisoned and
+///   the panic-poison test, it sees NODES already poisoned and
 ///   gets `code == 3` instead — flake.
 /// - libtest's alphabetical scheduling is best-effort; the
 ///   `#[serial]` mutex-acquisition order is NOT guaranteed FIFO.
@@ -171,15 +172,14 @@ unsafe fn take_last_error(
 ///
 ///   phase 1: code 4 — boundary handles (0, u64::MAX) + 99_999 stale.
 ///            NODES is fresh; assertions hold unconditionally.
-///   phase 2: init + first tick → code 2 (panic caught); the
-///            instance's own lock is poisoned by the unwind.
-///   phase 3: second tick → code 3 (instance lock poisoned).
+///   phase 2: init + first tick → code 2 (panic caught); NODES
+///            gets poisoned via guard Drop during unwind.
+///   phase 3: second tick → code 3 (NODES poisoned).
 ///   phase 4: third tick → still code 3 (poison persists, no
 ///            auto-recovery).
-///   phase 5: a second instance initializes and shuts down cleanly;
-///            pump_history and shutdown on the poisoned instance return
-///            code 3 with entrypoint-specific LAST_ERROR, and the handle is
-///            gone after its shutdown (code 4).
+///   phase 5: cascade - init under poison → 0 sentinel + entrypoint-
+///            specific LAST_ERROR; shutdown under poison → code 3 +
+///            entrypoint-specific LAST_ERROR.
 ///
 /// Mirrors `chunk_c_ffi_error_test.rs::cdylib_shutdown_handle_zero_returns_code_4`
 /// (for the code-4 boundary phase) and pins the full code-3 cascade
@@ -191,7 +191,7 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
     // code-4 assertions hit the missing-handle branch of
     // `cerulion_node_tick` BEFORE the fixture's `fail_mode()` is
     // consulted, so the env value is irrelevant for that phase.
-    // Then phase 2 uses it to trigger the panic that poisons the instance.
+    // Then phase 2 uses it to trigger the panic that poisons NODES.
     // `EnvVarGuard` ensures cleanup even if any assertion panics.
     let _env = EnvVarGuard::set("CER_FAIL_MODE", "tick_panic");
 
@@ -205,7 +205,7 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
     let shutdown_fn: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> =
         unsafe { lib.get(b"cerulion_node_shutdown") }.expect("cerulion_node_shutdown export");
     // The new ABI-v7 pump entrypoint participates in the
-    // same poison cascade as tick and shutdown.
+    // same NODES-poison cascade as tick/init/shutdown.
     let pump_history_fn: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> =
         unsafe { lib.get(b"cerulion_node_pump_history") }
             .expect("cerulion_node_pump_history export");
@@ -260,7 +260,7 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
         );
     }
 
-    // ===== phase 2: init + panic-tick → code 2 (poisons the instance) =====
+    // ===== phase 2: init + panic-tick → code 2 (poisons NODES) =====
     //
     // Build a NodeContext for `cerulion_node_init`. The fixture's
     // `#[output] out: Vector3` declares the port name `out`.
@@ -292,9 +292,16 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
     // here is NOT a leak on its own — it cleanly transfers
     // ownership to the cdylib in every path.
     //
-    // The poisoned instance's NodeContext is dropped when phase 5's
-    // shutdown takes the entry out of the registry: a poisoned instance
-    // lock is refused (code 3) but the entry it guarded is released.
+    // The genuine leak is downstream: once NODES is poisoned by the
+    // first tick's panic-unwind, neither `cerulion_node_shutdown`
+    // nor the cdylib's static destructors can remove the entry from
+    // NODES - the lock is frozen Err for the rest of the process.
+    // The NodeContext (and its iceoryx2 `CerulionPublisher`, etc.)
+    // therefore leaks for the remainder of this test binary's life.
+    // We accept this leak: (a) the test process exits seconds later,
+    // (b) calling `cerulion_node_shutdown(handle)` after poisoning
+    // would just return code 3 without freeing anything, and (c)
+    // the alternative (don't poison NODES) defeats the test.
     let ctx_ptr = Box::into_raw(Box::new(ctx)) as *mut std::ffi::c_void;
 
     let handle = unsafe { init_fn(ctx_ptr) };
@@ -318,15 +325,11 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
         "phase 2: code-2 LAST_ERROR must be the panic-catch message; got: {msg_panic}"
     );
 
-    // ===== phase 3: second tick → code 3 (the instance lock is poisoned) =====
-    //
-    // Each instance carries its own lock, held across its tick, so the
-    // phase-2 unwind poisoned that lock and left the library's registry
-    // (`NODES`, held only for lookups) healthy.
+    // ===== phase 3: second tick → code 3 (NODES is now poisoned) =====
     let code_poison = unsafe { tick_fn(handle) };
     assert_eq!(
         code_poison, 3,
-        "phase 3: second tick must return code 3 (instance lock poisoned by phase 2 panic-unwind); got {code_poison}"
+        "phase 3: second tick must return code 3 (NODES mutex poisoned by phase 2 panic-unwind); got {code_poison}"
     );
     let msg_poison =
         unsafe { take_last_error(&take_last_error_fn, &free_error_fn, "phase 3 code-3 tick") };
@@ -335,78 +338,66 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
         "phase 3: code-3 LAST_ERROR must identify the FFI entrypoint; got: {msg_poison}"
     );
     assert!(
-        msg_poison.contains("node instance mutex poisoned"),
-        "phase 3: code-3 LAST_ERROR must name the poisoned instance lock; got: {msg_poison}"
+        msg_poison.contains("NODES mutex poisoned"),
+        "phase 3: code-3 LAST_ERROR must mention the NODES mutex poison; got: {msg_poison}"
     );
 
     // ===== phase 4: third tick → still code 3 (no auto-recovery) =====
     //
-    // Locks the contract that a poisoned instance does NOT recover between
-    // calls. A change that silently "heals" the lock (for example by calling
-    // `clear_poison`) would flip this assertion.
+    // Locks the contract that NODES does NOT auto-recover between
+    // calls. A future change that silently "heals" the poisoned
+    // mutex (e.g., by calling `clear_poison` or replacing NODES)
+    // would flip this assertion.
     let code_persist = unsafe { tick_fn(handle) };
     assert_eq!(
         code_persist, 3,
         "phase 4: third tick must remain code 3 (poison persists across calls); got {code_persist}"
     );
-    let _ = unsafe { take_last_error(&take_last_error_fn, &free_error_fn, "phase 4 code-3 tick") };
 
-    // ===== phase 5: the poison is the instance's alone =====
+    // ===== phase 5: cascade through init + shutdown under poison =====
     //
-    // A second instance of the same library initializes and shuts down
-    // cleanly: the registry is healthy. On the poisoned instance every
-    // entrypoint returns code 3 naming ITS OWN entrypoint, so a refactor that
-    // consolidates the poison check cannot silently drop a per-entry
-    // identifier.
-    let topic2 = unique_topic("tick_panic_sibling");
-    let out_pub2 = tt.publisher(&topic2, MaxSliceLen::const_new(256), 0);
-    let _out_sub2 = tt.subscriber(&topic2);
-    let mut publishers2: IndexMap<String, AnyPublisher> = IndexMap::new();
-    publishers2.insert("out".to_string(), AnyPublisher::Ipc(out_pub2));
-    let ctx2 = NodeContext::with_runtime_env(
-        publishers2,
+    // Every NODES-touching FFI entrypoint must detect the poison and
+    // use its OWN entrypoint identifier in `LAST_ERROR`. A future
+    // refactor that consolidates the poison check across entrypoints
+    // could otherwise silently drop a per-entry identifier; the
+    // assertions below catch that regression.
+    //
+    // codegen.rs:997 consumes the Box BEFORE the NODES lock check,
+    // so we need a fresh stub ctx for this call (the original ctx
+    // was consumed by the successful phase 2 init above).
+    let stub_ctx = NodeContext::with_runtime_env(
+        IndexMap::new(),
         IndexMap::new(),
         Arc::new(RealClock),
         ShutdownSignal::new(),
         ::std::sync::Arc::new(::std::collections::HashMap::new()),
     );
-    let sibling = unsafe { init_fn(Box::into_raw(Box::new(ctx2)) as *mut std::ffi::c_void) };
-    assert_ne!(
-        sibling, 0,
-        "phase 5: a second instance must initialize while the first is poisoned"
-    );
-    let sibling_down = unsafe { shutdown_fn(sibling) };
+    let stub_ctx_ptr = Box::into_raw(Box::new(stub_ctx)) as *mut std::ffi::c_void;
+    let init_under_poison = unsafe { init_fn(stub_ctx_ptr) };
     assert_eq!(
-        sibling_down, 0,
-        "phase 5: the second instance must shut down cleanly; got {sibling_down}"
+        init_under_poison, 0,
+        "phase 5: init under poison must return 0 (sentinel); got {init_under_poison}"
     );
-
-    let pump_under_poison = unsafe { pump_history_fn(handle) };
-    assert_eq!(
-        pump_under_poison, 3,
-        "phase 5: pump_history on the poisoned instance must return code 3; got {pump_under_poison}"
-    );
-    let pump_msg = unsafe {
+    let init_msg = unsafe {
         take_last_error(
             &take_last_error_fn,
             &free_error_fn,
-            "phase 5 pump_history under poison",
+            "phase 5 init under poison",
         )
     };
     assert!(
-        pump_msg.contains("cerulion_node_pump_history")
-            && pump_msg.contains("node instance mutex poisoned"),
-        "phase 5: pump-under-poison LAST_ERROR must name the pump_history entrypoint and the \
-         instance lock; got: {pump_msg}"
+        init_msg.contains("cerulion_node_init"),
+        "phase 5: init-under-poison LAST_ERROR must identify the init entrypoint; got: {init_msg}"
+    );
+    assert!(
+        init_msg.contains("NODES mutex poisoned"),
+        "phase 5: init-under-poison LAST_ERROR must mention NODES poison; got: {init_msg}"
     );
 
-    // Shutdown takes the entry out of the registry, then refuses to run the
-    // node's own shutdown on a poisoned instance: code 3, and the handle is
-    // gone afterwards (code 4).
     let shutdown_under_poison = unsafe { shutdown_fn(handle) };
     assert_eq!(
         shutdown_under_poison, 3,
-        "phase 5: shutdown of the poisoned instance must return code 3; got {shutdown_under_poison}"
+        "phase 5: shutdown under poison must return code 3; got {shutdown_under_poison}"
     );
     let sd_msg = unsafe {
         take_last_error(
@@ -416,17 +407,41 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
         )
     };
     assert!(
-        sd_msg.contains("cerulion_node_shutdown")
-            && sd_msg.contains("node instance mutex poisoned"),
-        "phase 5: shutdown-under-poison LAST_ERROR must name the shutdown entrypoint and the \
-         instance lock; got: {sd_msg}"
+        sd_msg.contains("cerulion_node_shutdown"),
+        "phase 5: shutdown-under-poison LAST_ERROR must identify the shutdown entrypoint; got: {sd_msg}"
     );
-    let shutdown_again = unsafe { shutdown_fn(handle) };
+    assert!(
+        sd_msg.contains("NODES mutex poisoned"),
+        "phase 5: shutdown-under-poison LAST_ERROR must mention NODES poison; got: {sd_msg}"
+    );
+
+    // ===== phase 5: pump_history under poison =====
+    //
+    // The ABI-v7 `cerulion_node_pump_history` entrypoint must participate in
+    // the SAME poison cascade as tick/init/shutdown: code 3 + a LAST_ERROR
+    // that names ITS OWN entrypoint. Pins that the macro generated the pump's
+    // poison branch (a refactor consolidating the poison check could otherwise
+    // drop the per-entry identifier for the newest entrypoint).
+    let pump_under_poison = unsafe { pump_history_fn(handle) };
     assert_eq!(
-        shutdown_again, 4,
-        "phase 5: the poisoned instance's handle is gone after its shutdown; got {shutdown_again}"
+        pump_under_poison, 3,
+        "phase 5: pump_history under poison must return code 3; got {pump_under_poison}"
     );
-    let _ = unsafe { take_last_error(&take_last_error_fn, &free_error_fn, "phase 5 code-4") };
+    let pump_msg = unsafe {
+        take_last_error(
+            &take_last_error_fn,
+            &free_error_fn,
+            "phase 5 pump_history under poison",
+        )
+    };
+    assert!(
+        pump_msg.contains("cerulion_node_pump_history"),
+        "phase 5: pump-under-poison LAST_ERROR must identify the pump_history entrypoint; got: {pump_msg}"
+    );
+    assert!(
+        pump_msg.contains("NODES mutex poisoned"),
+        "phase 5: pump-under-poison LAST_ERROR must mention NODES poison; got: {pump_msg}"
+    );
 
     // `_env` drops here, removing CER_FAIL_MODE even if any of the
     // phase assertions above had panicked.

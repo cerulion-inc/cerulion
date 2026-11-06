@@ -922,7 +922,7 @@ static GATED_FIRES: AtomicU64 = AtomicU64::new(0);
 /// `Vector3` every step — reused as the gated closure's upstream feeder.
 fn vec_feeder_def(id: &str) -> NodeDef {
     NodeDef {
-        isolate: None,
+        fuse: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -959,7 +959,7 @@ fn build_gated_runtime() -> GraphRuntime {
         // The serial-gated closure consumer at level 0 (non-trigger input → no
         // DAG edge → stays a level-0 root sharing the level with `feeder`).
         NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "gated".to_string(),

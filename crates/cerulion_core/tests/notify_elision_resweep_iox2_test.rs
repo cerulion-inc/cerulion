@@ -129,7 +129,7 @@ fn build_offgate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -144,7 +144,7 @@ fn build_offgate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -217,7 +217,7 @@ fn build_ongate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -232,7 +232,7 @@ fn build_ongate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 }],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
