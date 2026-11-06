@@ -578,6 +578,40 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         n: Option<u64>,
     },
+    /// How the nodes of one hosted run are firing: per-node counts, rates and
+    /// durations over the last few seconds, plus the newest fires after `after`.
+    /// Answered with an [`ActivityReply`].
+    ///
+    /// A NEW VERB, and **no [`PROTOCOL_VERSION`] bump**: a daemon that predates
+    /// it answers the structured unknown-method error, which a controller reads
+    /// as "this daemon has no fire telemetry".
+    ///
+    /// # Asking is what keeps the robot recording
+    ///
+    /// The first `activity` for a `(robot, run_id)` starts a follower that asks
+    /// the robot for that run's fires four times a second, on its own netd
+    /// connection. Every `activity` for the same run keeps the follower until
+    /// three seconds after that ask, so a controller that stops asking stops the
+    /// follower three seconds later, and the robot stops recording five seconds
+    /// after that. At most four runs are followed at once: a fifth is answered
+    /// `degraded` while all four are still asked about, and takes the place of
+    /// one whose three seconds have run out.
+    ///
+    /// Like every handler, it never waits: the answer is what the follower holds
+    /// this instant (`starting` before its first reply).
+    Activity {
+        /// Correlation id echoed in the response.
+        id: u64,
+        /// The robot hosting the run, as its `runs` row names it: one name, with
+        /// no `/`, `*`, `$`, `?` or `#`, and not an `account:` route.
+        robot: String,
+        /// The run, in the canonical `0x` + 32 lowercase hex form its `runs`
+        /// row carries.
+        run_id: String,
+        /// The `next` of the previous answer. Omitted on the first ask.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<u64>,
+    },
 }
 
 impl Request {
@@ -598,7 +632,8 @@ impl Request {
             | Request::SubscribeEvents { id }
             | Request::Monitors { id }
             | Request::Runs { id, .. }
-            | Request::Sample { id, .. } => *id,
+            | Request::Sample { id, .. }
+            | Request::Activity { id, .. } => *id,
         }
     }
 
@@ -682,6 +717,8 @@ pub enum Response {
     Runs(RunsResponse),
     /// The `sample` result: the latest messages of one attached topic.
     Sample(SampleResponse),
+    /// The `activity` result: how one hosted run's nodes are firing.
+    Activity(ActivityReply),
     /// Any error (bad request, attach failure, reserved-field rejection).
     Error(ErrorResponse),
 }
@@ -1240,6 +1277,152 @@ pub struct SampleRow {
     /// One line for a label: the schema and the first few fields to three
     /// significant figures, or why `fields` is `null`.
     pub summary: String,
+}
+
+/// The `activity` result line: `{"id":..,"ok":true,"activity":{..}}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivityReply {
+    /// Echoed correlation id.
+    pub id: u64,
+    /// Always `true`; a failure is an [`ErrorResponse`].
+    pub ok: bool,
+    /// What the daemon holds about the run this instant.
+    pub activity: ActivityResponse,
+}
+
+/// How one hosted run's nodes are firing, as this daemon's follower last heard.
+///
+/// Nodes are named by their index into the run's `topology.nodes` (its
+/// `run.json`), which this daemon never reads: a controller resolves names,
+/// trigger topics and the `wrote` bits through that topology.
+///
+/// Every age is measured from this daemon's own clock: the robot reports how
+/// old each fire was when it served it, and the daemon adds the time since.
+/// No clock sync with the robot is needed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivityResponse {
+    /// The robot, as asked.
+    pub robot: String,
+    /// The run, as asked.
+    pub run_id: String,
+    /// What the follower's newest poll learned.
+    pub state: ActivityState,
+    /// The last fire sequence this answer accounts for, inclusive. Pass it as
+    /// the next request's `after`. `fires`, `lost` and `skipped` together
+    /// account for every sequence in `(after, next]` the follower followed (an
+    /// `after` before the follow began, or none, counts from its start).
+    pub next: u64,
+    /// Fires in that span the robot dropped before the follower read them.
+    pub lost: u64,
+    /// Fires in that span the follower read but this answer leaves out: past
+    /// the newest [`crate::activity::MAX_ACTIVITY_FIRES`], or older than the
+    /// [`crate::activity::ACTIVITY_LOG_CAPACITY`] fires this daemon keeps per
+    /// run. A robot loss older than those is counted here too.
+    pub skipped: u64,
+    /// The span the per-node counts and durations cover, in milliseconds: five
+    /// seconds, or less once the run fired more in that span than this daemon
+    /// keeps. A follow younger than the span holds fires only since its first
+    /// poll.
+    pub window_ms: u32,
+    /// The nodes inside a tick at the newest poll, in topology order.
+    pub in_tick: Vec<InTick>,
+    /// One row per node the log holds a fire for or that is inside a tick,
+    /// ascending by node.
+    pub nodes: Vec<NodeActivity>,
+    /// The fires after `after`, newest first, at most
+    /// [`crate::activity::MAX_ACTIVITY_FIRES`].
+    pub fires: Vec<FireSeen>,
+}
+
+/// What the follower's newest poll of the robot learned.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActivityState {
+    /// The follower has not had an answer yet.
+    Starting,
+    /// The robot served fires and is recording.
+    Live {
+        /// How long ago the robot's current recording lease began.
+        armed_since_ms_ago: f64,
+    },
+    /// The robot did not answer: unreachable, a binary that predates the
+    /// `fires` verb, or no query surface.
+    Silent,
+    /// The robot hosts no run with this id. Ask `runs` again.
+    UnknownRun,
+    /// The run is hosted but records no fires.
+    NotServed,
+    /// The robot refused this desk.
+    Refused {
+        /// The robot's reason.
+        reason: String,
+    },
+    /// The robot answered with bytes this desk cannot use. Asking again reads
+    /// the same bytes until the robot is rebuilt.
+    Unusable {
+        /// Why.
+        reason: String,
+    },
+    /// netd could not run the query.
+    Degraded {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// A node inside a tick.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InTick {
+    /// Index into the run's `topology.nodes`.
+    pub node: u16,
+    /// How long the tick has been running, in milliseconds.
+    pub ms: f64,
+}
+
+/// One node's fires.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NodeActivity {
+    /// Index into the run's `topology.nodes`.
+    pub node: u16,
+    /// Fires inside `window_ms`.
+    pub fires: u32,
+    /// Age of the newest fire the log holds, inside the window or not. `null`
+    /// for a node seen only inside a tick.
+    pub last_ms_ago: Option<f64>,
+    /// Median tick duration inside the window (the lower middle of an even
+    /// count). `null` with no fire inside the window.
+    pub dur_p50_ns: Option<u32>,
+    /// Longest tick duration inside the window.
+    pub dur_max_ns: Option<u32>,
+    /// Fires inside the window that panicked.
+    pub panics: u32,
+    /// Fires inside the window whose tick returned an error.
+    pub errors: u32,
+    /// The newest fire's cause byte.
+    pub last_cause: Option<u8>,
+    /// The newest fire's written-output mask.
+    pub last_wrote: Option<u64>,
+    /// The newest fire's flags, `0` when the log holds none.
+    pub last_flags: u8,
+}
+
+/// One fire.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FireSeen {
+    /// The robot's fire sequence.
+    pub seq: u64,
+    /// Index into the run's `topology.nodes`.
+    pub node: u16,
+    /// Cause byte: `1` period, `3` data, `4` sync, `5` external, `0` unknown.
+    pub cause: u8,
+    /// Flag bits, as `cerulion_core::fire_tap::FireFlags` names them.
+    pub flags: u8,
+    /// How long ago the tick started, in milliseconds.
+    pub ms_ago: f64,
+    /// Tick wall duration in nanoseconds.
+    pub dur_ns: u32,
+    /// Bit k set = output k of the node committed a frame during the tick.
+    pub wrote: u64,
 }
 
 /// `detach` result payload.
@@ -4405,6 +4588,174 @@ mod tests {
     /// equality is unchanged.
     #[test]
     fn adding_sample_leaves_the_protocol_version_at_one() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(
+            Hello::new(None).to_json_line(),
+            r#"{"vizd":"cerulion-vizd","protocol":1,"rerun_url":null}"#
+        );
+    }
+
+    const ACTIVITY_RUN: &str = "0x5d1c00000000000000000000000f9e02";
+
+    #[test]
+    fn the_activity_request_parses_and_serializes_on_its_method_string() {
+        let first =
+            format!(r#"{{"id":7,"method":"activity","robot":"temi","run_id":"{ACTIVITY_RUN}"}}"#);
+        let request = Request::Activity {
+            id: 7,
+            robot: "temi".into(),
+            run_id: ACTIVITY_RUN.into(),
+            after: None,
+        };
+        assert_eq!(parse_request(&first).expect("parses"), request);
+        assert_eq!(
+            request.to_json_line(),
+            format!(r#"{{"method":"activity","id":7,"robot":"temi","run_id":"{ACTIVITY_RUN}"}}"#)
+        );
+        assert_eq!(request.id(), 7);
+
+        let resumed = format!(
+            r#"{{"id":8,"method":"activity","robot":"temi","run_id":"{ACTIVITY_RUN}","after":5119}}"#
+        );
+        assert_eq!(
+            parse_request(&resumed).expect("parses"),
+            Request::Activity {
+                id: 8,
+                robot: "temi".into(),
+                run_id: ACTIVITY_RUN.into(),
+                after: Some(5119),
+            }
+        );
+    }
+
+    #[test]
+    fn an_activity_request_missing_its_run_or_with_a_near_miss_method_is_refused() {
+        let err = parse_request(r#"{"id":9,"method":"activity","robot":"temi"}"#)
+            .expect_err("run_id is required");
+        assert_eq!(err.id, Some(9));
+        assert!(err.message.contains("run_id"), "{}", err.message);
+        let err = parse_request(&format!(
+            r#"{{"id":10,"method":"activities","robot":"temi","run_id":"{ACTIVITY_RUN}"}}"#
+        ))
+        .expect_err("near miss refused");
+        assert_eq!(err.id, Some(10));
+        assert!(err.message.contains("activities"), "{}", err.message);
+        let err = parse_request(&format!(
+            r#"{{"id":11,"method":"activity","robot":"temi","run_id":"{ACTIVITY_RUN}","after":-1}}"#
+        ))
+        .expect_err("a negative cursor is refused");
+        assert_eq!(err.id, Some(11));
+    }
+
+    #[test]
+    fn the_live_activity_response_serializes_to_the_exact_line() {
+        let resp = Response::Activity(ActivityReply {
+            id: 7,
+            ok: true,
+            activity: ActivityResponse {
+                robot: "temi".into(),
+                run_id: ACTIVITY_RUN.into(),
+                state: ActivityState::Live {
+                    armed_since_ms_ago: 31840.5,
+                },
+                next: 5123,
+                lost: 0,
+                skipped: 0,
+                window_ms: 5000,
+                in_tick: vec![InTick { node: 2, ms: 356.0 }],
+                nodes: vec![NodeActivity {
+                    node: 0,
+                    fires: 5,
+                    last_ms_ago: Some(412.0),
+                    dur_p50_ns: Some(38211),
+                    dur_max_ns: Some(61002),
+                    panics: 0,
+                    errors: 0,
+                    last_cause: Some(1),
+                    last_wrote: Some(1),
+                    last_flags: 0,
+                }],
+                fires: vec![FireSeen {
+                    seq: 5123,
+                    node: 2,
+                    cause: 3,
+                    flags: 0,
+                    ms_ago: 9.5,
+                    dur_ns: 95001,
+                    wrote: 0,
+                }],
+            },
+        });
+        assert_eq!(
+            resp.to_json_line(),
+            format!(
+                concat!(
+                    r#"{{"id":7,"ok":true,"activity":{{"robot":"temi","run_id":"{run}","#,
+                    r#""state":{{"kind":"live","armed_since_ms_ago":31840.5}},"next":5123,"lost":0,"#,
+                    r#""skipped":0,"window_ms":5000,"in_tick":[{{"node":2,"ms":356.0}}],"#,
+                    r#""nodes":[{{"node":0,"fires":5,"last_ms_ago":412.0,"dur_p50_ns":38211,"#,
+                    r#""dur_max_ns":61002,"panics":0,"errors":0,"last_cause":1,"last_wrote":1,"#,
+                    r#""last_flags":0}}],"#,
+                    r#""fires":[{{"seq":5123,"node":2,"cause":3,"flags":0,"ms_ago":9.5,"#,
+                    r#""dur_ns":95001,"wrote":0}}]}}}}"#
+                ),
+                run = ACTIVITY_RUN
+            )
+        );
+    }
+
+    #[test]
+    fn every_non_live_activity_state_names_its_kind_and_keeps_null_fields() {
+        let states = [
+            (ActivityState::Starting, r#"{"kind":"starting"}"#),
+            (ActivityState::Silent, r#"{"kind":"silent"}"#),
+            (ActivityState::UnknownRun, r#"{"kind":"unknown_run"}"#),
+            (ActivityState::NotServed, r#"{"kind":"not_served"}"#),
+            (
+                ActivityState::Refused {
+                    reason: "paired".into(),
+                },
+                r#"{"kind":"refused","reason":"paired"}"#,
+            ),
+            (
+                ActivityState::Unusable {
+                    reason: "skew".into(),
+                },
+                r#"{"kind":"unusable","reason":"skew"}"#,
+            ),
+            (
+                ActivityState::Degraded {
+                    reason: "no netd".into(),
+                },
+                r#"{"kind":"degraded","reason":"no netd"}"#,
+            ),
+        ];
+        for (state, line) in states {
+            assert_eq!(serde_json::to_string(&state).unwrap(), line);
+        }
+        let in_tick_only = NodeActivity {
+            node: 3,
+            fires: 0,
+            last_ms_ago: None,
+            dur_p50_ns: None,
+            dur_max_ns: None,
+            panics: 0,
+            errors: 0,
+            last_cause: None,
+            last_wrote: None,
+            last_flags: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&in_tick_only).unwrap(),
+            concat!(
+                r#"{"node":3,"fires":0,"last_ms_ago":null,"dur_p50_ns":null,"dur_max_ns":null,"#,
+                r#""panics":0,"errors":0,"last_cause":null,"last_wrote":null,"last_flags":0}"#
+            )
+        );
+    }
+
+    #[test]
+    fn adding_activity_leaves_the_protocol_version_at_one() {
         assert_eq!(PROTOCOL_VERSION, 1);
         assert_eq!(
             Hello::new(None).to_json_line(),
