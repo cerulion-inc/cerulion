@@ -258,7 +258,7 @@ pub struct NetworkConfig {
     /// `None` (the default) is fine for sessions that never announce
     /// (discovery queries, ingress-only bridges).
     pub robot_identity: Option<String>,
-    /// Certificate files for `quic/` locators, set as zenoh's
+    /// Certificate files for `quic/` and `tls/` locators, set as zenoh's
     /// `transport/link/tls/*` keys by `NetworkManager::build_zenoh_config`.
     /// `None` (the default) sets none of them.
     pub tls: Option<NetworkTls>,
@@ -275,7 +275,9 @@ pub struct NetworkConfig {
     /// Per-topic egress put policy. A topic listed with
     /// [`EgressReliability::BestEffort`] is put with zenoh's best-effort marker
     /// by [`NetworkManager::publish_to_network`]; every other topic is put
-    /// reliable. Empty (the default) puts every topic reliable.
+    /// reliable. An entry's `send_queue` bounds the gateway's send queue for
+    /// the topic ([`NetworkManager::egress_send_queue`]). Empty (the default)
+    /// puts every topic reliable behind a queue as deep as its egress tap.
     pub egress_qos: Vec<EgressQos>,
 }
 
@@ -3703,6 +3705,9 @@ pub struct NetworkManager {
     /// Canonical topics put with zenoh's best-effort marker, derived once from
     /// `config.egress_qos` so a put reads a set rather than the list.
     best_effort_topics: HashSet<String>,
+    /// Canonical topic → its declared egress send-queue bound, derived once
+    /// from `config.egress_qos`.
+    send_queues: HashMap<String, std::num::NonZeroUsize>,
     session: OnceCell<zenoh::Session>,
     task: Mutex<TaskState>,
     /// Canonical-topic-keyed registry of active network→local ingress
@@ -3923,9 +3928,18 @@ impl NetworkManager {
             .filter(|q| q.reliability == EgressReliability::BestEffort)
             .map(|q| canonical_topic(&q.topic).into_owned())
             .collect();
+        let send_queues = config
+            .egress_qos
+            .iter()
+            .filter_map(|q| {
+                q.send_queue
+                    .map(|n| (canonical_topic(&q.topic).into_owned(), n))
+            })
+            .collect();
         Self {
             config,
             best_effort_topics,
+            send_queues,
             session: OnceCell::new(),
             task: Mutex::new(TaskState {
                 handle: None,
@@ -4020,9 +4034,16 @@ impl NetworkManager {
     /// every retained egress-topic announce token and disables every LAN egress
     /// bridge. The bridge manager refuses LAN enables until access is opened again;
     /// reopening permits demands but does not replay withheld announces.
-    /// Once this call returns with [`LanAccess::Paired`], no gateway forwarding
-    /// pass forwards another frame until access reopens: closing waits out every
-    /// pass that started before it (after every lock here is released).
+    /// Once this call returns with [`LanAccess::Paired`], no gateway puts another
+    /// frame until access reopens: closing waits out every drive pass and egress
+    /// put that started before it (after every lock here is released). After a
+    /// reopen no gateway puts a frame it drained or queued before the close: the
+    /// close advances the LAN access epoch, a sender drops a queued frame of an
+    /// older epoch, and the next drive pass detaches every egress tap and empties
+    /// every send queue. A topic whose publisher keeps history delivers that
+    /// history to the fresh tap, as to any new demand. A drive pass that started
+    /// before the close and drains after a reopen tags its frames with the older
+    /// epoch, so they are dropped too.
     ///
     /// The posture gates ingress (LAN to local) too. Switching to
     /// [`LanAccess::Paired`] suspends every live ingress entry (see
@@ -4114,9 +4135,10 @@ impl NetworkManager {
             (bridges, released)
         };
         drop(released);
-        // Every lock above is released before these waits: a gateway pass that
-        // loaded `true` just before the close still holds the shared guard until
-        // its batch is forwarded, so the exclusive take blocks until it drains.
+        // Every lock above is released before these waits: a drive pass that
+        // loaded `true` just before the close holds the shared guard until its
+        // batch is queued, and an egress sender holds it until its put returns,
+        // so the exclusive take blocks until both are done.
         // An ingress callback that read `lan_paired` before the store holds the
         // ingress gate until its frame is re-injected.
         if access == LanAccess::Paired {
@@ -4387,6 +4409,14 @@ impl NetworkManager {
         }
     }
 
+    /// The topic's declared egress send-queue bound from
+    /// [`NetworkConfig::egress_qos`], or `None` when it declares none.
+    pub fn egress_send_queue(&self, topic: &str) -> Option<std::num::NonZeroUsize> {
+        self.send_queues
+            .get(canonical_topic(topic).as_ref())
+            .copied()
+    }
+
     /// [`Self::publish_to_network`] with an explicit put reliability.
     ///
     /// `BestEffort` sets zenoh's best-effort marker on the put
@@ -4394,6 +4424,15 @@ impl NetworkManager {
     /// selects a best-effort link for the frame when the peer connection has
     /// one (a `mixed_rel` QUIC endpoint's datagram link) and the reliable link
     /// otherwise; the marker itself retransmits nothing.
+    ///
+    /// `Reliable` puts with zenoh's `CongestionControl::Block`, so a full zenoh
+    /// transmit queue makes this call wait rather than discard the frame;
+    /// `BestEffort` puts with `Drop`. A reliable call can wait as long as the
+    /// link is congested, up to zenoh's `wait_before_close` (5 s by default).
+    /// If the queue has not moved by then, zenoh discards the frame, closes
+    /// its link to the peer, and this call still returns `Ok`. The gateway
+    /// makes every put on a per-topic sender thread, so that wait does not
+    /// reach its drive loop except while a LAN close waits for the put.
     ///
     /// # Errors
     ///
@@ -4428,6 +4467,7 @@ impl NetworkManager {
         session
             .put(&key, frame)
             .reliability(zenoh_reliability)
+            .congestion_control(super::egress_send::congestion_control_for(reliability))
             .wait()
             .map_err(|e| TransportError::Publish {
                 topic: topic.to_string(),
@@ -6287,39 +6327,19 @@ impl NetworkManager {
     }
 }
 
-/// Set zenoh's `transport/link/tls/*` keys from `tls`. Each file is read here
-/// and must hold a PEM block (`-----BEGIN `), so a wrong, unreadable or non-PEM
-/// path fails the session open naming it, rather than a QUIC listener that
-/// fails inside zenoh or a connect that zenoh retries in the background. Whether
-/// the PEM is the right certificate or key is zenoh's check, at handshake, with
-/// one exception read here: a listener certificate marked CA:TRUE (see
-/// [`refuse_ca_listener_certificate`]).
+/// Set zenoh's `transport/link/tls/*` keys from `tls`, after
+/// [`check_tls_files`](super::carrier::check_tls_files) has read each file: a
+/// wrong, unreadable or non-PEM path, or a listener certificate marked
+/// `CA:TRUE`, fails the session open naming the `tls.*` setting and the path,
+/// rather than a `quic/` or `tls/` listener that fails inside zenoh or a
+/// connect that zenoh retries in the background.
 fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()> {
-    let refuse = |path: &std::path::Path, key: &str, why: String| TransportError::SessionCreation {
-        reason: format!("tls file '{}' for {key} {why}", path.display()),
-    };
+    super::carrier::check_tls_files(tls, &super::carrier::CarrierSettingNames::GRAPH)
+        .map_err(|reason| TransportError::SessionCreation { reason })?;
     for (key, path) in tls.file_keys() {
-        if !path.is_absolute() {
-            return Err(refuse(path, key, "is not an absolute path".to_string()));
-        }
-        let bytes =
-            std::fs::read(path).map_err(|e| refuse(path, key, format!("cannot be read: {e}")))?;
-        if !bytes.windows(11).any(|w| w == b"-----BEGIN ") {
-            return Err(refuse(
-                path,
-                key,
-                "holds no PEM block (-----BEGIN ...)".to_string(),
-            ));
-        }
-        if key == "transport/link/tls/listen_certificate" {
-            refuse_ca_listener_certificate(&bytes).map_err(|why| refuse(path, key, why))?;
-        }
-        let Some(utf8) = path.to_str() else {
-            return Err(TransportError::SessionCreation {
-                reason: format!("tls file '{}' for {key} is not valid UTF-8", path.display()),
-            });
-        };
-        let json = serde_json::to_string(utf8).map_err(|e| TransportError::SessionCreation {
+        // `check_tls_files` has refused a path that is not UTF-8.
+        let utf8 = path.to_string_lossy();
+        let json = serde_json::to_string(&utf8).map_err(|e| TransportError::SessionCreation {
             reason: format!("failed to serialize {key}: {e}"),
         })?;
         config
@@ -6336,35 +6356,6 @@ fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()
         .map_err(|e| TransportError::SessionCreation {
             reason: format!("failed to set transport/link/tls/verify_name_on_connect: {e}"),
         })?;
-    Ok(())
-}
-
-/// A `quic/` or `tls/` listener's certificate (the first CERTIFICATE block of the file)
-/// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
-/// which rejects a CA certificate presented as the end entity
-/// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the
-/// listener's log while the connector retries. `openssl req -x509` writes
-/// `CA:TRUE` unless told otherwise, so the error names the flag that fixes it.
-fn refuse_ca_listener_certificate(pem: &[u8]) -> Result<(), String> {
-    let block = x509_parser::pem::Pem::iter_from_buffer(pem)
-        .filter_map(Result::ok)
-        .find(|p| p.label == "CERTIFICATE")
-        .ok_or_else(|| "holds no CERTIFICATE PEM block".to_string())?;
-    let cert = block
-        .parse_x509()
-        .map_err(|e| format!("holds a CERTIFICATE block that does not parse: {e}"))?;
-    let is_ca = cert
-        .basic_constraints()
-        .map_err(|e| format!("has an unreadable basicConstraints extension: {e}"))?
-        .is_some_and(|bc| bc.value.ca);
-    if is_ca {
-        return Err(
-            "is marked CA:TRUE, and a quic/ peer refuses a CA certificate as the \
-                    listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
-                    e.g. add `-addext basicConstraints=critical,CA:FALSE` to `openssl req -x509`"
-                .to_string(),
-        );
-    }
     Ok(())
 }
 

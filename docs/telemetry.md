@@ -76,9 +76,18 @@ A CI run uses neither: it sends under its own random id (see below).
 
 When a machine that has never signed in runs its first login, the login
 request carries the random id so the events from before the login are joined
-to the account; the CLI also sends a `$create_alias` event for the join. A
-CI run never joins: its login carries no id and sends no alias. Nothing else
-is added to the login. A machine that signed out keeps its account on record
+to the account; the CLI also sends a `$create_alias` event for the join.
+Events sent under the random id carry `$process_person_profile: false`, so
+PostHog keeps no person profile for them; the alias still attributes them to
+the account's person. PostHog's person processing describes how a later
+`$identify` links personless events to a person through a person override
+(https://posthog.com/handbook/engineering/person-processing); its ingestion
+pipeline handles `$create_alias` almost the same way as `$identify`
+(https://posthog.com/docs/how-posthog-works/ingestion-pipeline), and its
+identify guide says an alias merges past and future events into one user
+(https://posthog.com/docs/product-analytics/identify). A CI run never
+joins: its login carries no id and sends no alias. Nothing else is added to
+the login. A machine that signed out keeps its account on record
 and carries nothing. If that first login happens in the run that printed the
 notice, which sends nothing, an empty `telemetry_alias_pending` file next to
 the consent file marks the join as owed, and the next run outside CI that
@@ -106,7 +115,7 @@ The first command that could send, run with stderr on a terminal, prints one
 line on stderr, and the CLI sends nothing in that run:
 
 ```text
-Cerulion sends usage telemetry; turn it off with `cerulion telemetry off` (details: `cerulion telemetry status`).
+Cerulion sends usage telemetry; turn it off with `cerulion telemetry off` (details: https://cerulion.com/telemetry).
 ```
 
 Later commands send. The notice is shown once per machine: it is saved as
@@ -117,8 +126,9 @@ terminal prints no notice and sends as usual; the notice is then printed by
 the first command that could send, run on a terminal. The vizd daemon prints
 no notice of its own and sends nothing until the CLI has shown it on the
 machine (or under CI), so a `cerulion viz` that prints the notice may start
-a daemon that sends. `cerulion telemetry status` prints the link to this
-page.
+a daemon that sends. The notice and `cerulion telemetry status` link to
+this page at https://cerulion.com/telemetry; `cerulion telemetry status`
+also prints the local setting.
 
 ## CI runs
 

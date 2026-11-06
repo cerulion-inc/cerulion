@@ -177,7 +177,7 @@ unsafe fn take_last_error(
 ///   phase 3: second tick → code 3 (NODES poisoned).
 ///   phase 4: third tick → still code 3 (poison persists, no
 ///            auto-recovery).
-///   phase 5: cascade — init under poison → 0 sentinel + entrypoint-
+///   phase 5: cascade - init under poison → 0 sentinel + entrypoint-
 ///            specific LAST_ERROR; shutdown under poison → code 3 +
 ///            entrypoint-specific LAST_ERROR.
 ///
@@ -295,7 +295,7 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
     // The genuine leak is downstream: once NODES is poisoned by the
     // first tick's panic-unwind, neither `cerulion_node_shutdown`
     // nor the cdylib's static destructors can remove the entry from
-    // NODES — the lock is frozen Err for the rest of the process.
+    // NODES - the lock is frozen Err for the rest of the process.
     // The NodeContext (and its iceoryx2 `CerulionPublisher`, etc.)
     // therefore leaks for the remainder of this test binary's life.
     // We accept this leak: (a) the test process exits seconds later,

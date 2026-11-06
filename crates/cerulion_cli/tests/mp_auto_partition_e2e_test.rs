@@ -22,10 +22,10 @@
 //!    engine-side pins call `prepare_recording_inputs` directly and so cannot
 //!    see the supervisor handing it the wrong config.
 //!
-//!    - *(1b) the control + the monolith half* — `--single-process
+//!    - *(1b) the control + the monolith half* - `--single-process
 //!      --record` on the same unpartitioned graph (written with NO `prefix:`
 //!      line) embeds a graph with NO `process_groups:`, because that is what it
-//!      ran; and its prefix — absent on disk, resolved at run time — is the one
+//!      ran; and its prefix - absent on disk, resolved at run time - is the one
 //!      every recorded channel is named under. Covers `run_graph_recording`,
 //!      the path arm 1 does not reach.
 //! 2. **Persist then respect** — `cerulion graph partition apdemo --yes`
@@ -33,7 +33,7 @@
 //!    original bytes), and a second `graph run` RESPECTS it: supervisor GO
 //!    breadcrumb present, NO auto-partition notice of any kind (the absence
 //!    pin — a persisted partition must not re-derive or re-notice).
-//! 3. **The opt-out** — `graph run --single-process` on the unpartitioned
+//! 3. **The opt-out** - `graph run --single-process` on the unpartitioned
 //!    twin runs the MONOLITH: zero `run-worker` children across the window,
 //!    no GO breadcrumb, the skip notice present, file untouched.
 //!
@@ -880,7 +880,7 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 
 /// (1b) The CONTROL + the MONOLITH half: a `--single-process --record` run
 /// of the SAME unpartitioned graph must embed a graph with NO `process_groups:`
-/// — because that is what it EXECUTED.
+/// - because that is what it EXECUTED.
 ///
 /// Two things this arm does that (1) cannot:
 ///

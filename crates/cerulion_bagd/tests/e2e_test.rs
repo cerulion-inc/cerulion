@@ -5558,18 +5558,116 @@ fn an_append_failure_keeps_the_open_chunks_earlier_batch() {
 /// capture is scoped to the test's span and bagd spawns its writer beneath it).
 /// The OUTCOME is the pin.
 ///
+/// The salvage unit is one drain-to-writer HAND-OFF, so this arm makes batch
+/// two exactly one: the burst lands with `fault_inject_tap_drain_gate` CLOSED,
+/// and one drain pass takes all four once it reopens. With the drain running,
+/// a pass that runs between two publishes hands the burst over as two batches:
+/// the first fails and is salvaged, and the writer, now latched, discards the
+/// second. That split is pinned by the arm below.
+///
 /// Dropping the branch's `discard_pending_chunk()` fails this — the
 /// un-discarded chunk survives, the retry appends batch two to it, and the next
 /// flush (which succeeds, the fault being one-shot) lands BOTH batches.
 #[test]
 fn a_failed_close_after_an_append_failure_still_salvages_the_failing_batch() {
+    let run = run_failed_close_scenario("closefail", FailingBatchShape::OneHandOff);
+    assert_eq!(
+        run.recovered, run.batch_two,
+        "a chunk whose close FAILED is discarded (batch one is gone, deliberately and \
+         loudly), but the failing batch is still retried into a fresh chunk: the \
+         recovery must not lose the frames it CAN still write"
+    );
+}
+
+/// The split the arm above rules out, forced: batch two's first frame is a
+/// hand-off of its OWN, and the rest of batch two reaches the drain only after
+/// it. The failing hand-off is salvaged whole, and nothing handed over after the
+/// write error latched is written: a latched writer stops writing, the run dies
+/// and the bag stays un-finalized. A burst is salvaged whole only when it
+/// reaches the writer in one hand-off.
+///
+/// The split is made with the WRITER stall gate. While it holds, the writer
+/// cannot reach the fault, so the drain-side `messages` count on the status
+/// feed can confirm the lone frame was handed over (a latched writer would turn
+/// that hand-off into `dropped_unwritten` and stop the status feed). Only then
+/// are the other three published.
+///
+/// Letting `writer_thread_main`'s `do_write` write while `writable`
+/// is false fails this: the later hand-off lands behind the salvaged frame.
+#[test]
+fn a_failing_hand_off_is_salvaged_whole_and_a_later_one_is_not_written() {
+    let run = run_failed_close_scenario("closesplit", FailingBatchShape::SplitAfterFirstFrame);
+    assert_eq!(
+        run.recovered,
+        run.batch_two[..1],
+        "the salvage retries the hand-off that FAILED, whole; frames handed over after the \
+         error latched are not written (a latched writer discards them and the bag is NOT \
+         finalized)"
+    );
+}
+
+/// How batch two reaches the writer in [`run_failed_close_scenario`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailingBatchShape {
+    /// All four frames in one hand-off (drain gate closed while they publish).
+    OneHandOff,
+    /// The first frame in a hand-off of its own; the other three after it.
+    SplitAfterFirstFrame,
+}
+
+/// What [`run_failed_close_scenario`] published as batch two and what the
+/// un-finalized bag held for the topic afterwards.
+struct FailedCloseRun {
+    batch_two: Vec<Vec<u8>>,
+    recovered: Vec<Vec<u8>>,
+}
+
+/// Block until the live `/bagd/status` feed reports at least `want` frames in
+/// `messages`, the drain-side count of frames handed to a writer that was still
+/// writable at the hand-off. Load can only DELAY the frame, so the timeout is a
+/// liveness backstop rather than the property.
+fn await_status_messages(
+    sub: &mut cerulion_core::transport::subscriber::DataOnlySubscriber,
+    want: u64,
+    timeout: Duration,
+) -> bool {
+    let mut seen: Vec<serde_json::Value> = Vec::new();
+    let start = Instant::now();
+    loop {
+        drain_status_json(sub, &mut seen);
+        if seen
+            .iter()
+            .any(|s| s["messages"].as_u64().is_some_and(|n| n >= want))
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(FILE_POLL_INTERVAL);
+    }
+}
+
+/// The shared geometry of the two failed-close arms:
+///
+///   1. batch one (3 frames) is handed off and lands in the OPEN chunk (the
+///      chunk cap is far above the recording and no successful batch follows,
+///      so nothing closes it);
+///   2. batch two (4 frames) faults at its FIRST message;
+///   3. the recovery's close of the open chunk fails (one-shot), so batch one
+///      is discarded, and the retry re-writes the failing hand-off into a fresh
+///      chunk whose close succeeds.
+///
+/// Every ordering step is a positive handshake on the status feed or a seam,
+/// never a sleep.
+fn run_failed_close_scenario(label: &str, shape: FailingBatchShape) -> FailedCloseRun {
     const FIRST: u32 = 3;
     const SECOND: u32 = 4;
     const BODY: usize = 32;
     let mgr = make_manager(16);
-    let topic = unique_topic("closefail");
-    let out = unique_out("closefail");
-    let ready = unique_out("closefail_ready");
+    let topic = unique_topic(label);
+    let out = unique_out(label);
+    let ready = unique_out(&format!("{label}_ready"));
 
     let mut pubr = publisher_with_provisioning(&mgr, &topic, 8, 64, 256);
 
@@ -5578,12 +5676,19 @@ fn a_failed_close_after_an_append_failure_still_salvages_the_failing_batch() {
     cfg.schema_wait = Duration::from_millis(200);
     cfg.flush_interval = Duration::from_millis(20);
     cfg.chunk_max_bytes = cerulion_bag::DEFAULT_CHUNK_MAX_BYTES;
-    // Fault batch two's FIRST message, so its whole burst is the remainder the
-    // salvage retry has to re-write.
+    // Fault batch two's FIRST message, so the failing hand-off is the remainder
+    // the salvage retry has to re-write.
     cfg.fault_inject_flush_error_after_messages = Some(FIRST as u64);
     // ONE flush failure: the recovery's close. The retry's own close then
-    // succeeds, which is what makes "batch two survived" observable at all.
+    // succeeds, which is what makes "the failing hand-off survived" observable.
     cfg.fault_inject_flush_chunk_failures = 1;
+    // The handshakes below read this feed; a short period keeps each one to
+    // tens of milliseconds.
+    cfg.status_period = Some(Duration::from_millis(20));
+    let drain_gate = Arc::new(AtomicBool::new(true));
+    cfg.fault_inject_tap_drain_gate = Some(drain_gate.clone());
+    let stall = Arc::new(WriterStallGate::default());
+    cfg.fault_inject_writer_stall_gate = Some(stall.clone());
     let handle = spawn_bagd(mgr.clone(), cfg, shutdown.clone());
     // This run is expected to SELF-TERMINATE on its injected fault, so
     // nothing in this arm ever stores the shutdown flag and the `join()` below is
@@ -5595,6 +5700,11 @@ fn a_failed_close_after_an_append_failure_still_salvages_the_failing_batch() {
         wait_for_file(&ready, LIVENESS_CEILING),
         "ready-file never appeared"
     );
+    // bagd's setup created the /bagd/status publisher BEFORE the ready-file, so
+    // the service exists; attach open-only on the SAME manager.
+    let mut status_sub = mgr
+        .create_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+        .expect("status subscriber");
     settle();
 
     for i in 0..FIRST {
@@ -5606,13 +5716,50 @@ fn a_failed_close_after_an_append_failure_still_salvages_the_failing_batch() {
         ))
         .expect("publish batch one");
     }
-    // Batch one must be its OWN batch, and still OPEN when batch two arrives.
-    std::thread::sleep(Duration::from_millis(200));
-    let mut batch_two: Vec<Vec<u8>> = Vec::new();
-    for i in FIRST..FIRST + SECOND {
-        let frame = build_frame(0x0C41, i, 10 + i as u64, &[(i as u8) + 1; BODY]);
-        pubr.publish_raw(&frame).expect("publish batch two");
-        batch_two.push(frame);
+    // Batch one is handed off before any of batch two exists, so the two can
+    // never share a hand-off. No fault can fire on batch one, so the writer
+    // stays writable and the count is reported.
+    assert!(
+        await_status_messages(&mut status_sub, FIRST as u64, LIVENESS_CEILING),
+        "batch one must be handed to the writer before batch two is published"
+    );
+
+    let batch_two: Vec<Vec<u8>> = (FIRST..FIRST + SECOND)
+        .map(|i| build_frame(0x0C41, i, 10 + i as u64, &[(i as u8) + 1; BODY]))
+        .collect();
+    match shape {
+        FailingBatchShape::OneHandOff => {
+            // Close the drain gate and wait out any pass that read it open (see
+            // `await_drain_gate_quiesced`), so all four frames are queued
+            // before a drain can take any of them.
+            drain_gate.store(false, Ordering::Relaxed);
+            assert!(
+                await_drain_gate_quiesced(&mut status_sub, LIVENESS_CEILING),
+                "the recorder must reach a pass that began AFTER the gate closed"
+            );
+            for frame in &batch_two {
+                pubr.publish_raw(frame).expect("publish batch two");
+            }
+            // One pass drains the tap queue to EMPTY and the flush that follows
+            // hands everything staged to the writer: one hand-off.
+            drain_gate.store(true, Ordering::Relaxed);
+        }
+        FailingBatchShape::SplitAfterFirstFrame => {
+            // Hold the writer at its next batch, so the lone frame's hand-off
+            // cannot fail (and latch) before the status feed has counted it.
+            stall.engaged.store(true, Ordering::Relaxed);
+            pubr.publish_raw(&batch_two[0])
+                .expect("publish batch two's first frame");
+            assert!(
+                await_status_messages(&mut status_sub, FIRST as u64 + 1, LIVENESS_CEILING),
+                "batch two's first frame must be handed off on its own"
+            );
+            for frame in &batch_two[1..] {
+                pubr.publish_raw(frame)
+                    .expect("publish the rest of batch two");
+            }
+            stall.engaged.store(false, Ordering::Relaxed);
+        }
     }
 
     let result = handle.join().expect("join");
@@ -5627,20 +5774,18 @@ fn a_failed_close_after_an_append_failure_still_salvages_the_failing_batch() {
         !completeness.is_finalized(),
         "the loss is only tolerable because the bag is NOT finalized, got {completeness:?}"
     );
-    let frames: Vec<Vec<u8>> = msgs
+    let recovered: Vec<Vec<u8>> = msgs
         .into_iter()
         .filter(|m| m.topic == topic)
         .map(|m| m.data)
         .collect();
-    assert_eq!(
-        frames, batch_two,
-        "a chunk whose close FAILED is discarded (batch one is gone, deliberately and \
-         loudly), but the failing batch is still retried into a fresh chunk — the \
-         recovery must not lose the frames it CAN still write"
-    );
 
     cleanup(&out);
     let _ = std::fs::remove_file(&ready);
+    FailedCloseRun {
+        batch_two,
+        recovered,
+    }
 }
 
 // ============================================================

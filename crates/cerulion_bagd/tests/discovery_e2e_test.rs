@@ -36,13 +36,14 @@ use common::*;
 
 /// An arbitrary, stable schema hash for the hand-built frames.
 const HASH: u64 = 0x0942_0942_0942_0942;
-/// Comfortably longer than one rescan, so a scan provably ran in the window.
+/// Comfortably longer than one enumeration cadence, so a scan provably ran in
+/// the window.
 const RESCAN_SETTLE: Duration =
     Duration::from_millis((DISCOVERY_RESCAN_INTERVAL.as_millis() as u64) * 3 + 200);
 
-/// How often [`await_rescan_tap`] asks. Mirrors [`FILE_POLL_INTERVAL`].
+/// How often [`await_discovered_tap`] asks. Mirrors [`FILE_POLL_INTERVAL`].
 const TAP_ATTACH_POLL: Duration = Duration::from_millis(5);
-/// A LIVENESS ceiling for [`await_rescan_tap`], deliberately stated in seconds
+/// A LIVENESS ceiling for [`await_discovered_tap`], deliberately stated in seconds
 /// rather than in units of [`DISCOVERY_RESCAN_INTERVAL`]: load can delay the
 /// recorder's drive loop, and a bound that scales with the thing under test is
 /// the wall-in-its-own-units mistake this helper exists to remove.
@@ -50,13 +51,14 @@ const TAP_ATTACH_DEADLINE: Duration = Duration::from_secs(20);
 /// Liveness bound for the bag file appearing once the channel set closes.
 const BAG_CREATED_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Block until bagd's discovery RESCAN has ATTACHED a tap to `topic`.
+/// Block until bagd's DISCOVERY has ATTACHED a tap to `topic`.
 ///
 /// # Why this is a condition and not a sleep
 ///
-/// A producer created after the ready-file is discovered by the drive loop's
-/// rescan, which runs every [`DISCOVERY_RESCAN_INTERVAL`] (250 ms). Sleeping a
-/// fixed multiple of that interval and then publishing is a RACE, and it is the
+/// A producer created after the ready-file is discovered by a worker thread
+/// woken by the topic's own service file appearing, so WHEN the tap attaches is
+/// the machine's business and not a cadence anyone can sleep out. Sleeping a
+/// fixed interval and then publishing is a RACE, and it is the
 /// one that loses in the direction that destroys data: a data-only tap requests
 /// no late-joiner history, so a frame committed BEFORE the tap attaches lands in
 /// no queue at all and can never be recovered. It fired on main CI (run
@@ -75,11 +77,11 @@ const BAG_CREATED_DEADLINE: Duration = Duration::from_secs(20);
 /// the only port that can appear is the recorder's tap.
 ///
 /// The PORT is the right boundary, not bagd's own tap vector: `open_tap` creates
-/// the subscriber and `rescan_discovery` pushes the `TapState` microseconds
+/// the subscriber and `apply_discovery` pushes the `TapState` microseconds
 /// later on the same thread, and a frame published in between is QUEUED by
 /// iceoryx2 into a port that already exists — it is drained on the next pass,
 /// not lost.
-fn await_rescan_tap(mgr: &TransportManager, topic: &str) {
+fn await_discovered_tap(mgr: &TransportManager, topic: &str) {
     let start = Instant::now();
     loop {
         let subscribers = mgr.topic_subscriber_count(topic);
@@ -88,9 +90,10 @@ fn await_rescan_tap(mgr: &TransportManager, topic: &str) {
         }
         assert!(
             start.elapsed() < TAP_ATTACH_DEADLINE,
-            "bagd's discovery rescan never attached a tap to '{topic}': its data service still \
-             reports 0 subscriber ports after {:?} (the rescan cadence is \
-             {DISCOVERY_RESCAN_INTERVAL:?}). Every frame published from here would land in no \
+            "bagd's discovery never attached a tap to '{topic}': its data service still \
+             reports 0 subscriber ports after {:?} (discovery is woken by the service directory \
+             changing; its fallback cadence is {DISCOVERY_RESCAN_INTERVAL:?}). Every frame \
+             published from here would land in no \
              queue at all, so this is a FAILURE of the recorder or of this harness — not a \
              frame-loss bug in the assertions below",
             start.elapsed()
@@ -197,18 +200,17 @@ fn verdict_line_present(lines: &[&str], topic: &str) -> bool {
 /// These arms create a producer that must land AFTER the bag exists, and they
 /// used to establish that with a fixed sleep. That is elapsed time standing in
 /// for a state, and the state is load-dependent: creation waits for the LATER of
-/// the settle hold releasing (`DISCOVERY_SETTLE_MIN` = 500 ms, then two quiet
-/// scans at a 250 ms cadence, capped at 2 s) and every declared tap learning its
-/// schema. MEASURED on an idle desk, the disclosure arm closed its channel set at
-/// 506–522 ms and created its late producer at 607–610 ms — a margin of **88–101
-/// ms against a 250 ms scan cadence**. One delayed scan pass is ~2.5x that
-/// margin.
+/// the settle hold releasing (`DISCOVERY_SETTLE_MIN` = 500 ms with nothing new
+/// discovered, capped at 2 s) and every declared tap learning its schema.
+/// MEASURED on an idle desk, the disclosure arm closed its channel set at
+/// 506-522 ms and created its late producer at 607-610 ms - a margin under
+/// 100 ms.
 ///
 /// When the margin is lost the producer appears while the set is still OPEN, so
-/// the rescan TAPS it — correct bagd behaviour, and the exact inverse of the
-/// arm's oracle. It is also self-reinforcing: a tap that is ADDED resets
-/// `discovery_quiet_scans`, which re-extends the hold, so the arm cannot recover
-/// by waiting. That is what fired on main CI (run 31659934041) after the first
+/// discovery TAPS it - correct bagd behaviour, and the exact inverse of the
+/// arm's oracle. It is also self-reinforcing: a tap that is ADDED restarts the
+/// quiet window, which re-extends the hold, so the arm cannot recover by
+/// waiting. That is what fired on main CI (run 31659934041) after the first
 /// fix landed — reported by the verdict rendezvous as a 20 s timeout
 /// with the topic TAPPED.
 ///
@@ -255,13 +257,13 @@ macro_rules! verdict_probe {
 }
 
 /// Block until bagd has MINTED the `appeared_after_bag_creation` verdict for
-/// `topic`: the `await_rescan_tap` rendezvous, applied to an OBSERVATION rather
+/// `topic`: the `await_discovered_tap` rendezvous, applied to an OBSERVATION rather
 /// than to a tap attach.
 ///
 /// # Why this is a condition and not a sleep
 ///
 /// A producer created after the bag exists can never be TAPPED (MCAP channels
-/// are frozen at creation), so `await_rescan_tap`'s port-count rendezvous has
+/// are frozen at creation), so `await_discovered_tap`'s port-count rendezvous has
 /// nothing to watch: the recorder's whole reaction is a ledger entry. Sleeping a
 /// fixed multiple of [`DISCOVERY_RESCAN_INTERVAL`] and then finalizing is
 /// therefore a bet that a loaded runner completes one scanner cadence AND one
@@ -296,12 +298,12 @@ fn await_post_creation_verdict(
             // did not say which would turn an inverted oracle into "flaky".
             let diagnosis = if mgr.topic_subscriber_count(topic) == 0 {
                 "its data service has NO subscriber port, so the recorder did not tap it either — \
-                 the rescan never observed it at all, which is a starved recorder or a broken \
+                 discovery never observed it at all, which is a starved recorder or a broken \
                  harness"
             } else {
                 // Sound as far as it goes: `plan_discovery` opens a tap ONLY on
                 // the `!bag_created` branch, so a subscriber port really does
-                // prove the set was open when the rescan saw this topic. The
+                // prove the set was open when discovery saw this topic. The
                 // mistaken reading here was "real
                 // regression rather than a timing miss", which sent a reader
                 // hunting a bagd bug for what was, on main CI run 31659934041,
@@ -316,8 +318,8 @@ fn await_post_creation_verdict(
                  or the producer was created too early — check the ordering before blaming bagd"
             };
             panic!(
-                "bagd never minted the post-creation verdict for '{topic}' after {:?} (the rescan \
-                 cadence is {DISCOVERY_RESCAN_INTERVAL:?}): {diagnosis}",
+                "bagd never minted the post-creation verdict for '{topic}' after {:?} (the \
+                 enumeration fallback cadence is {DISCOVERY_RESCAN_INTERVAL:?}): {diagnosis}",
                 start.elapsed()
             );
         }
@@ -740,7 +742,7 @@ fn with_discovery_off_the_same_undeclared_producer_is_absent_and_no_claim_is_mad
 /// be a back-fill the recorder cannot perform.
 #[test]
 #[serial_test::serial]
-fn a_producer_appearing_after_arm_is_picked_up_by_the_rescan_and_marked_late() {
+fn a_producer_appearing_after_arm_is_picked_up_by_discovery_and_marked_late() {
     let mgr = make_manager(16);
     let declared = unique_topic("late_declared");
     let late = unique_topic("late_arrival");
@@ -751,7 +753,7 @@ fn a_producer_appearing_after_arm_is_picked_up_by_the_rescan_and_marked_late() {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // A long schema wait plus a DELIBERATELY SILENT declared tap keeps the bag
-    // un-created (`learned_all()` is false) while the rescan runs — so this test
+    // un-created (`learned_all()` is false) while discovery runs - so this test
     // exercises the "discovered before creation" window deterministically rather
     // than racing it.
     let cfg = discovery_cfg(
@@ -765,12 +767,12 @@ fn a_producer_appearing_after_arm_is_picked_up_by_the_rescan_and_marked_late() {
 
     // The producer is born AFTER the recorder armed: the shape discovery exists for.
     let mut late_pub = producer(&mgr, &late);
-    // Wait for the RESCAN to have attached its tap, rather than
-    // sleeping a multiple of the rescan interval and hoping. A frame published
+    // Wait for DISCOVERY to have attached its tap, rather than
+    // sleeping an interval and hoping. A frame published
     // before the attach reaches no queue (a data-only tap has no back-fill), so
     // this rendezvous is what makes the four-frame oracle below a statement
     // about DISCOVERY rather than about the drive loop's scheduling luck.
-    await_rescan_tap(&mgr, &late);
+    await_discovered_tap(&mgr, &late);
 
     // Now let both speak: the bag is created once every tap (including the
     // just-discovered one) has learned its schema.
@@ -794,7 +796,7 @@ fn a_producer_appearing_after_arm_is_picked_up_by_the_rescan_and_marked_late() {
     assert_eq!(entry.frames_recorded, 4);
     assert!(
         entry.attached_late,
-        "a rescan find is covered only from its attach instant — the manifest must \
+        "a discovered find is covered only from its attach instant - the manifest must \
          say so rather than imply the whole run"
     );
     assert_eq!(coverage.gap_count(), 0);
@@ -857,7 +859,7 @@ fn a_live_producer_the_bag_does_not_contain_is_named_with_its_reason() {
     let mut late_pub = producer(&mgr, &unrecorded);
     publish_oracle(&mut late_pub, "z", 3);
     // Rendezvous on the recorder having OBSERVED it, rather than
-    // sleeping a few rescan cadences and finalizing into whatever happened to
+    // sleeping a few enumeration cadences and finalizing into whatever happened to
     // have run. Under CI load the scan lost that race and the manifest came back
     // with no entry at all — which reads as the recorder deciding not to report,
     // the exact defect this arm exists to catch.
@@ -1128,8 +1130,8 @@ fn a_discovered_default_borrow_topic_is_recorded_in_full_beside_a_declared_one()
 /// gets its window. `graph run --record` hands bagd `--topics-json`, which
 /// produces ONLY exact-mode taps: every schema is known at construction, so
 /// `learned_all()` is true on drive-loop pass 1 and the bag was created before
-/// any rescan could run. Discovery was structurally INERT on the one path it
-/// was built for, and the whole suite was green.
+/// any later enumeration could run. Discovery was structurally INERT on the one
+/// path it was built for, and the whole suite was green.
 ///
 /// The producer here is created AFTER the ready-file, exactly as the attach
 /// bridge's routes are created after GO releases the graph.
@@ -1171,7 +1173,7 @@ fn on_the_exact_mode_record_path_a_producer_appearing_after_arm_is_still_recorde
     // MORE here, not less: this arm's channel set is held open only by the
     // discovery settle window, so publishing earlier (at the attach instant
     // rather than after a fixed sleep) also leaves more of that window intact.
-    await_rescan_tap(&mgr, &late);
+    await_discovered_tap(&mgr, &late);
     publish_oracle(&mut declared_pub, "d", 2);
     publish_oracle(&mut late_pub, "l", 3);
     await_bag_created(&out);
@@ -1707,11 +1709,12 @@ fn an_incomplete_recording_says_so_on_its_terminal_line() {
 
 /// THE FLOOR. Bag creation is held for at least [`DISCOVERY_SETTLE_MIN`].
 ///
-/// The re-check found the real floor was ONE rescan interval (~250 ms) while
-/// three documents said 500 ms: `setup` discounts the ARM-TIME scan, but
-/// drive-loop pass 1 rescans microseconds later — still strictly before the
+/// The re-check found the real floor was ONE enumeration interval (~250 ms)
+/// while three documents said 500 ms: `setup` discounts the ARM-TIME scan, but
+/// the loop enumerated again microseconds later - still strictly before the
 /// parent has seen the ready file and written GO, so equally uninformative — and
-/// that scan DID count toward the quiet threshold. On the flagship `ros2 attach`
+/// that scan DID count toward the quiet threshold the window then used. On the
+/// flagship `ros2 attach`
 /// path that closes the channel set ~250 ms after GO, which DDS discovery does
 /// not beat, so every bridge route would land `appeared_after_bag_creation` and
 /// the blocker's observable outcome would be unchanged.
