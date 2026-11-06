@@ -178,6 +178,7 @@ pub mod posix_shm;
 #[allow(missing_docs)]
 pub mod prelude;
 pub mod read_outcome;
+pub mod replay_feed;
 // The rustc that compiled THIS copy of `cerulion_core`, compared across the
 // cdylib FFI boundary by `DylibNodeEntry::load` to catch a toolchain-skew
 // niche-encoding mismatch the ABI version cannot see. See the module doc.
@@ -786,7 +787,44 @@ pub mod wire;
 ///   turns that silent misread into a load refusal naming the rebuild.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 28;
+///
+/// - v29: the replay read gate carries a private per-input FEED.
+///   `ReadPlanStage` gains `feed`, the replay's `replay_feed::ReadFeed`, which
+///   the gate's admission asks to publish a read's recorded frames before the
+///   pop; `ReplayReadViolationKind` gains `FeedFailed { ordinal }` and
+///   `UnrecordedTake`; and `CerulionSubscriber::try_receive_one` and its owned
+///   twin report a read on a fed stage to the gate. The read-outcome stage
+///   stages its producer annotation once per WRITER RUN: `ReadOutcomeStage`
+///   gains `annotates_every_read` (set at build on a multi-writer edge, which
+///   keeps an annotation before every read) and `StageInner` gains
+///   `run_writer`, the token of each read site's open run. The gate's admission and
+///   the subscriber's take paths run inside a node library, so a library built
+///   against an earlier core pops a fed stage's empty queue without asking the
+///   feed and serves nothing where the recording served a frame. `ReadFeed`
+///   gains `frames`, the recorded writer and sequence of each frame a fill
+///   publishes, and `StreamObservation::id` and the `drop_oldest` baselines
+///   hold a `u128` key, a fed frame's recorded writer token or a live frame's
+///   origin port id.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v30: a batched read names every frame it consumed when they and the read
+///   fit in its read stage's window. `CerulionSubscriber`
+///   gains `batch_frames`, the `(sequence, producer token)` of each frame the
+///   current drain popped while the read log is armed, up to its read stage's
+///   capacity, and `ReadOutcomeKind`
+///   gains `BatchFrame = 8`, which the subscriber stages once per popped frame
+///   the read does not name, before the read (`trace_format` 9).
+///   `ReadOutcomeStage` gains `records_batch_frames: AtomicBool`, the batch
+///   frame rule a replay adopts from the bag's trace format beside
+///   `records_every_consult`, so a replay of a bag below format 9 stages no
+///   `BatchFrame` record. The drain
+///   paths run inside a node library, so a library built against an earlier
+///   core reads the subscriber at stale offsets and stages no `BatchFrame`
+///   records.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 30;
 
 // Re-export commonly used types
 #[cfg(unix)]

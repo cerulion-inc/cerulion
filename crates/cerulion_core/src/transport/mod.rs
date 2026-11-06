@@ -118,7 +118,7 @@ use publisher::{CerulionPublisher, CerulionPublisherConfig};
 use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 
 /// Maximum topic name length (255 - "/event" suffix = 249).
-const MAX_TOPIC_LEN: usize = 249;
+pub(crate) const MAX_TOPIC_LEN: usize = 249;
 
 /// Refuse node/transport startup when this process's iceoryx2 build lacks
 /// Android shared-memory support (stock iceoryx2 has no `shm_open` on
@@ -1383,6 +1383,21 @@ pub enum PublisherProvisioning {
     Multi,
 }
 
+impl PublisherProvisioning {
+    /// The `max_publishers` a service provisioned this way is created with:
+    /// `None` for [`Self::External`] (the setter stays uncalled, so
+    /// iceoryx2's create default applies), `Some(1)` for
+    /// [`Self::SingleWriter`] and `Some(`[`MULTI_PUBLISHER_LOOSE_MAX`]`)` for
+    /// [`Self::Multi`].
+    pub(crate) const fn max_publishers(self) -> Option<usize> {
+        match self {
+            Self::External => None,
+            Self::SingleWriter => Some(1),
+            Self::Multi => Some(MULTI_PUBLISHER_LOOSE_MAX),
+        }
+    }
+}
+
 /// The `max_publishers` cap provisioned for every
 /// [`PublisherProvisioning::Multi`] topic. One shared constant across all
 /// Cerulion graphs — see the variant doc for why it is loose and why it
@@ -1480,12 +1495,11 @@ impl TopicServiceConfig {
         // for the Some arm: `None` imposes no open requirement, so a
         // graph value below iceoryx2's create-default can never fail a
         // default opener's OPEN-time check.)
-        let (max_subscribers, max_publishers) = match publisher_provisioning {
-            PublisherProvisioning::External => (None, None),
-            PublisherProvisioning::SingleWriter => (
-                Some(in_graph_subscribers.saturating_add(INTROSPECTION_SUBSCRIBER_HEADROOM)),
-                Some(1),
-            ),
+        let max_subscribers = match publisher_provisioning {
+            PublisherProvisioning::External => None,
+            PublisherProvisioning::SingleWriter => {
+                Some(in_graph_subscribers.saturating_add(INTROSPECTION_SUBSCRIBER_HEADROOM))
+            }
             // A multi-publisher topic is CROSS-GRAPH by
             // definition, so BOTH port caps must be graph-independent
             // shared constants — `Some(n)` provisions AND requires
@@ -1495,11 +1509,9 @@ impl TopicServiceConfig {
             // Cerulion graph requires the same two constants, so opens
             // pass by equality; the runtime fail-fasts at build when one
             // graph ALONE exceeds the subscriber cap.
-            PublisherProvisioning::Multi => (
-                Some(MULTI_SUBSCRIBER_LOOSE_MAX),
-                Some(MULTI_PUBLISHER_LOOSE_MAX),
-            ),
+            PublisherProvisioning::Multi => Some(MULTI_SUBSCRIBER_LOOSE_MAX),
         };
+        let max_publishers = publisher_provisioning.max_publishers();
         // The buffer ceiling is the third graph-dependent knob
         // that must be a shared constant on cross-graph (Multi) topics —
         // see MULTI_TOPIC_BUFFER_CEILING. The runtime fail-fasts at build
@@ -7424,7 +7436,7 @@ pub(crate) fn classify_node_name_refusal(raw: &str) -> NodeNameRefusal {
 }
 
 /// Validate that the topic name is within iceoryx2's service name limit.
-fn validate_topic_name(topic: &str) -> Result<(), String> {
+pub(crate) fn validate_topic_name(topic: &str) -> Result<(), String> {
     if topic.is_empty() {
         return Err("topic name cannot be empty".to_string());
     }
