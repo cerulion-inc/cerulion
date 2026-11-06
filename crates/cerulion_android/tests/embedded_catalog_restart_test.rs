@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A catalog read after a stop and a start in one process describes the
-//! live run: its topics, its schemas, the schema hashes registered to it and
-//! the frames its gateway observed, never the earlier run's. Own binary: the
+//! live run: its topics, its schemas and the frames its gateway observed,
+//! and for a runtime topic the schema hash registered last. Own binary: the
 //! transport manager and the runtime's latched query surface are
 //! process-global.
 
@@ -148,8 +148,9 @@ fn catalog_after_a_restart_reports_the_live_run() {
         ]))
         .expect("start the second run");
     publish_until_observed(&mut runtime, "c", r#"{"data":"second run"}"#);
-    // Its producer registers d again under a new schema: the catalog must
-    // come to the new hash, never keep the first run's.
+    // Its producer registers d again under a new schema. Until then the
+    // catalog can show the first run's hash (that registration stays on the
+    // process-wide manager); after it, the catalog must show the new hash.
     let second = register_until_listed(SECOND_HASH);
     let d = entry(&second, "d").expect("the catalog lists d");
     assert_eq!(d.provenance, CatalogProvenance::Runtime, "{d:?}");

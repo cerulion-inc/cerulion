@@ -251,8 +251,8 @@ fn latest_value_input_holds_each_app_frame_in_order(runtime: &mut EmbeddedRuntim
 /// frame leaves every later echo with `x` above `z`. The test subscriber
 /// creates the echo topic before the start with a 64-frame queue, so it
 /// keeps every echo of the burst and the check covers all 64 of them, not
-/// only the newest one. The relay's publisher opens that topic and keeps
-/// its deeper queue.
+/// only the newest one. The relay's publisher opens that existing topic, so
+/// the subscriber keeps its 64-frame buffer.
 fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntime, pid: u32) {
     let app_topic = format!("/app_feed_deep_{pid}/cmd");
     let prefix = format!("app_feed_deep_graph_{pid}");
@@ -277,7 +277,8 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
         .expect("a graph that reads an app topic on a 64-deep trigger input starts");
     assert_running_one_node(runtime);
 
-    for i in 1..=64 {
+    let burst = u32::try_from(BURST).expect("the burst fits in a u32");
+    for i in 1..=burst {
         publish_x(runtime, &app_topic, f64::from(i));
     }
     drop(hold);
@@ -302,7 +303,7 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
     // Every echo of the burst, in tick order: an echo with x != z means a
     // frame was lost or reordered, and a missing or extra echo shows as a
     // length difference.
-    let expected: Vec<(f64, f64)> = (1..=64).map(|i| (f64::from(i), f64::from(i))).collect();
+    let expected: Vec<(f64, f64)> = (1..=burst).map(|i| (f64::from(i), f64::from(i))).collect();
     assert_eq!(echoes, expected);
     runtime.stop().expect("stop the deep trigger graph");
 }

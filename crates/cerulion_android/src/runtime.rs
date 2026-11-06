@@ -1686,7 +1686,7 @@ fn build_into(
     //     publisher was alive. iceoryx2 keeps such a connection while it
     //     holds undelivered data, which is what lets `poll` read a run that
     //     finished. A subscriber opens a connection to each publisher that
-    //     exists when it is created, which here is every app publisher and
+    //     exists when it is created, which here includes every app publisher and
     //     every publisher the graph build made. It opens a connection to a
     //     later publisher only when `poll` reads. A frame from a publisher
     //     that is created and dropped between two reads can be lost, even
