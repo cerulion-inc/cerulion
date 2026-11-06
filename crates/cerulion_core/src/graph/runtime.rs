@@ -2180,10 +2180,11 @@ fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
 /// - no line is ARMED: no declared topic of this runtime is writable from
 ///   outside it, which an empty registry also gives (see [`rung_topics`]).
 ///
-/// Pure and compiled unconditionally: the rung itself is macOS-only, so a term
-/// deleted here would otherwise be invisible to every test on every other
-/// target, and the worker's wait-policy line reads the same function on every
-/// target rather than re-typing a subset of it.
+/// Pure and compiled unconditionally: the rung itself is compiled only on macOS,
+/// Linux and Android, and reached on Linux only without a CPU monitor-wait
+/// primitive, so a term deleted here would otherwise be invisible to every test
+/// on a host that never reaches it, and the worker's wait-policy line reads the
+/// same function on every target rather than re-typing a subset of it.
 fn doorbell_rung_applies(
     policy_doorbell: bool,
     wake_word_available: bool,
@@ -3403,6 +3404,13 @@ pub struct GraphRuntime {
     /// producer-reconnect LivelinessEvent; the ≤100µs timer backstop
     /// keeps correctness in that case.)
     doorbell_registry: Option<crate::doorbell::DoorbellRegistry>,
+    /// The park's doorbell baseline buffer, sized at build to the registry and
+    /// refilled from it at each [`Self::monitor_wait_block`] entry
+    /// (`DoorbellRegistry::snapshot_into`), so a park entry reads the ring
+    /// counters without an allocation. A `Mutex` because `monitor_wait_block`
+    /// takes `&self`; only the live-loop thread takes it, so it is never
+    /// contended.
+    doorbell_baseline: std::sync::Mutex<Vec<u64>>,
     /// The registry's first topic when a kernel wake may arm on it, `None`
     /// otherwise. The registry spans data-trigger AND sync-input topics, so a
     /// sync input can hold the armed line. `None` covers a graph every one of
@@ -3518,10 +3526,10 @@ pub struct GraphRuntime {
     /// Count of `!performed`-arm iterations that took a WAKE-WORD kernel block
     /// instead of the pacing sleep, summed over the three rungs the arm tries
     /// in order: the credit word (`CreditShared::park_wait_credit`), the
-    /// barrier (`BarrierShared::park_wait_activity`) and, on macOS, the primary
-    /// doorbell (`Doorbell::park_wait_ring`). The mutation seam pinning that
-    /// those kernel wakes are LIVE (reverting an arm swap zeroes this while
-    /// every pin stays green, isolating the regression).
+    /// barrier (`BarrierShared::park_wait_activity`) and, on macOS, Linux and
+    /// Android, the primary doorbell (`Doorbell::park_wait_ring`). The mutation
+    /// seam pinning that those kernel wakes are LIVE (reverting an arm swap
+    /// zeroes this while every pin stays green, isolating the regression).
     /// Record-only (never read by the scheduler); 0 where no rung applies: no
     /// credit edge at its threshold, no barrier participant, no doorbell
     /// registry, a slot beyond a parked bitmask, or no wake primitive on this
@@ -7192,9 +7200,10 @@ impl GraphRuntime {
                 // subscribes are all consumers this build never hears about, and a
                 // gate keyed to the plan leaves each of them waiting out its
                 // recheck period on every hop. What arming costs a publish whose
-                // page nobody blocks on is one atomic on the ring counter and one
-                // cached backend read; the kernel wake itself stays behind the
-                // page's `parked` claim, so a topic with no blocked consumer
+                // page nobody blocks on is one atomic on the ring counter, plus one
+                // load of the page's `parked` count on Linux and Android and one
+                // cached backend read on macOS; the kernel wake itself stays behind
+                // the page's `parked` claim, so a topic with no blocked consumer
                 // reaches no syscall.
                 //
                 // `sibling_consumed_topics` is no longer the gate. It is still the
@@ -9333,6 +9342,9 @@ impl GraphRuntime {
             // The resolved monitor-wait/doorbell policy + the
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
+            doorbell_baseline: std::sync::Mutex::new(Vec::with_capacity(
+                doorbell_registry.as_ref().map_or(0, |r| r.len()),
+            )),
             doorbell_registry,
             doorbell_armed_topic,
             producer_doorbells_armed,
@@ -13555,7 +13567,7 @@ impl GraphRuntime {
     /// RECORD-ONLY (Principle 7): it reads the ring COUNTERS and the wake epoch,
     /// never the iceoryx2 SHM message queue, never a scheduler mutation, never a
     /// clock. It changes only WHEN this loop re-polls.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     fn doorbell_wake_word_block(
         &self,
         baseline: Option<&[u64]>,
@@ -13578,6 +13590,7 @@ impl GraphRuntime {
             // family latched after a sibling's unrecoverable errno. The gate is
             // re-evaluated every iteration, so the wait is never reached to
             // report it; this is the site that observes it.
+            #[cfg(target_os = "macos")]
             if !wake_word && self.monitor_wait_policy.doorbell() && has_armed_line {
                 crate::doorbell::note_tier_inactive();
             }
@@ -13803,23 +13816,31 @@ impl GraphRuntime {
         // held FIXED: the doorbell counters are RELATIVE, so only deltas from
         // this baseline matter. NEVER re-snapshot inside the loop — that would
         // absorb (lose) a ring that landed since.
-        let baseline: Option<Vec<u64>> = if self.monitor_wait_policy.doorbell() {
-            self.doorbell_registry.as_ref().map(|r| r.snapshot_all())
-        } else {
-            None
+        // It is read into the buffer sized at build, which this thread alone
+        // locks for the whole park.
+        let mut baseline_buf = self
+            .doorbell_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let baseline: Option<&[u64]> = match self.doorbell_registry.as_ref() {
+            Some(reg) if self.monitor_wait_policy.doorbell() => {
+                reg.snapshot_into(&mut baseline_buf);
+                Some(baseline_buf.as_slice())
+            }
+            _ => None,
         };
         // The armed line's pre-park value: the `expected` the hardware monitor
         // re-checks against, read at the slot taken with the address above.
         let primary_expected: Option<u64> =
-            armed_line.and_then(|(_, slot)| baseline.as_ref().and_then(|b| b.get(slot).copied()));
+            armed_line.and_then(|(_, slot)| baseline.and_then(|b| b.get(slot).copied()));
 
         // The direction-B park baseline — for each MAPPED
         // `block` edge this process produces on, was it AT OR OVER threshold as
         // we went to park, and what was the credit word's wake epoch then?
         //
         // Stored IN the edge rather than in a per-park `Vec`, so an idle park
-        // allocates nothing (the sibling doorbell baseline is a known
-        // hot-path-alloc; this one deliberately is not). Single-writer: only
+        // allocates nothing (the sibling doorbell baseline refills a buffer
+        // sized at build for the same reason). Single-writer: only
         // the live-loop thread runs this, and the atomics are here because
         // `monitor_wait_block` takes `&self`.
         //
@@ -13951,7 +13972,7 @@ impl GraphRuntime {
             // wake signal) — never the iceoryx2 SHM message queue. The sample is
             // still read by `step()`/`drain_level`; this only changes WHEN we
             // step. Non-allocating (`any_advanced_since`, no per-recheck Vec).
-            if let (Some(reg), Some(base)) = (self.doorbell_registry.as_ref(), baseline.as_ref()) {
+            if let (Some(reg), Some(base)) = (self.doorbell_registry.as_ref(), baseline) {
                 if reg.any_advanced_since(base) {
                     doorbell_got = true;
                 }
@@ -14267,24 +14288,22 @@ impl GraphRuntime {
                 // until the cohort arrives. Only when neither applies is DATA the
                 // thing this context waits for.
                 //
-                // Compiled out entirely off macOS:
-                // `crate::doorbell::wake_word_block_primitive_available` (not the
-                // barrier's function of the same name, which answers the opposite
-                // on Linux) is a compile-time `false` there, and a Linux consumer
-                // whose CPU carries a monitor-wait primitive wakes on this very same
-                // doorbell line through the primitive armed above, a hardware park
-                // reached on the `performed == true` path this arm never sees; a
-                // Linux host without one reaches this arm and naps.
+                // The wake word is a shared futex on Linux and Android and the
+                // os_sync word on macOS. A consumer whose CPU carries a monitor-wait
+                // primitive wakes on this same doorbell line through the primitive
+                // armed above, a hardware park reached on the `performed == true`
+                // path this arm never sees; a host without one blocks here until
+                // the producer's ring instead of pacing its recheck nap.
                 //
                 // Snapshot, re-derive, block: the same lost-wake protocol as its
                 // two siblings. Any ring landing after the snapshot fails the
                 // kernel compare (Principle 6); a ring that ALREADY advanced the
                 // baseline skips the block and the nap.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
                 if !kernel_blocked {
                     let cap = pace_slice
                         .min(park_deadline.saturating_duration_since(std::time::Instant::now()));
-                    let outcome = self.doorbell_wake_word_block(baseline.as_deref(), cap);
+                    let outcome = self.doorbell_wake_word_block(baseline, cap);
                     if outcome.performed() {
                         kernel_blocked = true;
                         if outcome.parked() {
@@ -14612,7 +14631,7 @@ impl GraphRuntime {
         // surface the same fact here where the live loop actually decides how to
         // idle (the observability gap an earlier investigation fell into).
         //
-        // `data_wake` is the macOS doorbell rung's own gate, read through the
+        // `data_wake` is the doorbell wake-word rung's own gate, read through the
         // function the rung reads, so the line cannot claim a rung that would
         // decline (a registry built for a graph with no data-trigger topics is
         // present but EMPTY, which `doorbell` alone does not show, hence
@@ -19478,10 +19497,9 @@ mod tests {
     }
 
     /// The park's topic ordering and armed line, over injected facts, pinned on
-    /// every OS: the selection decides whether a kernel wake arms at all, and on
-    /// a target where the macOS rung is compiled out the Linux hardware park
-    /// reads the same first topic, so a defect here is invisible to any
-    /// single-target test.
+    /// every OS: the selection decides whether a kernel wake arms at all, and the
+    /// Linux hardware park reads the same first topic as the wake-word rung, so
+    /// a defect here is invisible to any single-target test.
     #[test]
     fn rung_topics_arms_the_first_writable_from_outside_and_drops_nothing() {
         let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

@@ -529,8 +529,9 @@ struct MonitorWaitInputs<'a> {
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
     /// consumer KERNEL-BLOCK on a doorbell's wake word on this host? True on
-    /// macOS with the Apple os_sync family resolved, false on every other target
-    /// and wherever that family is absent, latched or killed. A SECOND,
+    /// Linux and Android (a shared futex) and on macOS with the Apple os_sync
+    /// family resolved; false on other targets and on macOS wherever that family
+    /// is absent, latched or killed. A SECOND,
     /// INDEPENDENT fact from `primitive_available`, read only by arm 2 (on arm 3
     /// the CPU monitor-wait primitive already hears the ring on the same line).
     data_wake_available: bool,
@@ -569,8 +570,9 @@ struct MonitorWaitInputs<'a> {
 ///    `monitor_wait` and with
 ///    `cerulion_core::doorbell::wake_word_block_primitive_available`, the host
 ///    fact that a consumer can kernel-block on a doorbell wake word: true on
-///    macOS with the Apple os_sync family resolved, false on every other target
-///    and wherever that family is absent, latched or killed. Where it is false a
+///    Linux and Android (a shared futex) and on macOS with the Apple os_sync
+///    family resolved; false on other targets and on macOS wherever that family
+///    is absent, latched or killed. Where it is false a
 ///    ring is still observed, but only by the recheck poll that already polls the
 ///    listener, so an armed doorbell buys nothing and is FORCED OFF.
 ///    A near-miss `CERULION_DOORBELL` value warns via the shared ladder and
@@ -661,8 +663,8 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     // (15-54µs p50). `monitor_wait` rides the SAME flag ladder as arm 3;
     // `doorbell` rides it too and is then ANDed with `monitor_wait` and with the
     // host's wake-word fact, so on this tier a doorbell never coerces the park
-    // ON. It arms where a consumer can kernel-block on a doorbell (macOS with the
-    // os_sync family resolved, which is what
+    // ON. It arms where a consumer can kernel-block on a doorbell (Linux and
+    // Android, and macOS with the os_sync family resolved, which is what
     // `wake_word_block_primitive_available` reports) and is FORCED OFF elsewhere,
     // where a ring would be seen no sooner than the recheck poll already sees the
     // listener.
@@ -673,9 +675,10 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         // doorbell's wake word on this host? Where the answer is no, a ring is
         // still observed, but by the park's own recheck poll, which the listener
         // poll beside it already runs at the same cadence: an armed doorbell would
-        // buy nothing and it stays FORCED OFF. Where the answer is yes (macOS with
-        // the os_sync family resolved) the park BLOCKS on the wake word instead of
-        // pacing and a producer's publish wakes the consumer directly.
+        // buy nothing and it stays FORCED OFF. Where the answer is yes (Linux and
+        // Android, and macOS with the os_sync family resolved) the park BLOCKS on
+        // the wake word instead of pacing and a producer's publish wakes the
+        // consumer directly.
         //
         // The doorbell is ANDed with `monitor_wait`, which is arm 2's
         // long-standing difference from arm 3: arm 3 lets `doorbell ⇒
