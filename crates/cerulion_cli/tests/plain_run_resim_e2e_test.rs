@@ -331,6 +331,10 @@ fn strip_ansi(s: &str) -> String {
 /// this file is about. One group gives a genuine multi-process run (the
 /// supervisor never collapses to a monolith, even at one group) with the single
 /// worker ring the judge can reason about.
+///
+/// `relay` declares `isolate: false`, so the group is also ONE executor unit:
+/// with no profile it would be two units, so two state rings, and a process
+/// hosting several units takes no flashback checkpoint.
 fn build_workspace(root: &Path, prefix: &str) {
     std::fs::create_dir_all(root.join("graphs")).unwrap();
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
@@ -374,6 +378,7 @@ fn build_workspace(root: &Path, prefix: &str) {
              \x20\x20\x20 schema: geometry_msgs/Vector3\n\
              - id: relay\n\
              \x20 type: relay\n\
+             \x20 isolate: false\n\
              \x20 inputs:\n\
              \x20 - name: trigger_in\n\
              \x20\x20\x20 source: ticker/cmd\n\
@@ -1913,7 +1918,7 @@ impl CoTenant {
     /// nothing. `>= 1` is exact here: this process creates the topic's only
     /// publisher and attaches no subscriber of its own, so the only port that can
     /// appear is the recorder's tap. Same helper, same reasoning, as
-    /// `discovery_e2e_test::await_rescan_tap`.
+    /// `discovery_e2e_test::await_discovered_tap`.
     fn await_tapped(&self, topic: &str) {
         let mgr = TransportManager::get_or_init().expect("the co-tenant's transport");
         let start = Instant::now();

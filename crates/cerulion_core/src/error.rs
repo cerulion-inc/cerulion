@@ -391,6 +391,10 @@ pub enum TransportError {
     /// An explicitly local observer could not hold `topic`'s source lease.
     #[error("Local observation of topic '{topic}' could not hold its source: {reason}")]
     LocalObservationLease { topic: String, reason: String },
+    /// The publishers attached to `topic`'s data service could not be read
+    /// (`TransportManager::topic_publisher_retain_marks`).
+    #[error("Could not read the publishers of topic '{topic}': {reason}")]
+    TopicPublishers { topic: String, reason: String },
     /// Internal error (e.g., poisoned mutex).
     #[error("Internal error: {reason}. This is a bug in Cerulion — please report it.")]
     Internal { reason: String },

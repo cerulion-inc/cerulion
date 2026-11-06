@@ -535,11 +535,14 @@ tell the two apart.) Such a bag records frames and carries no
 `state_coverage.json`, so `bag play --resim` will refuse it: anchors for that
 run live in the standing recorder's captures. Whether it also carries a
 scheduler TRACE is a separate fact the run states under `trace_rings`: a
-multi-process run declares rings and the bag gets one; so does a
-`--single-process --record` run, which creates a rank-0 ring for its own
-recorder and declares it (`trace_rings: declared`, same as the multi-process
-shape). The monolith shapes that mint none (a plain `--single-process` run,
-`ros2 attach`, `node run`, an external time source) write no `trace_rings` key
+multi-process run declares rings and the bag gets one, and so does a
+`--single-process` run of a graph whose nodes split into several executor
+units, which runs them in one worker process; so does a
+`--single-process --record` run of a graph that is one unit, which creates a
+rank-0 ring for its own recorder and declares it (`trace_rings: declared`, same
+as the multi-process shape). The monolith shapes that mint none (a plain
+`--single-process` run of a graph that is one executor unit, `ros2 attach`,
+`node run`, an external time source) write no `trace_rings` key
 at all, so the bag reports the absence as the legacy by-omission cause and gets
 neither ring nor trace. Every UNKNOWN
 state proceeds instead, exactly as a manifest without the key does, and says so.
@@ -553,10 +556,11 @@ memory elsewhere; such a run gets frames and attachments but **no trace**, and
 `__cerulion/run.json`'s `trace` field says exactly that rather than leaving a
 reader to conclude the recorder lost something.
 
-The MONOLITH shapes (`--single-process`, `cerulion ros2 attach`, `node run`)
-mint no ring either, and that is a decision rather than an omission: their gating
-clock is WALL-driven, so a trace taken there would carry boundaries a resim
-cannot re-advance to, i.e. a `resimmable: true` that is confidently false.
+The MONOLITH shapes (`--single-process` on a graph that is one executor unit,
+`cerulion ros2 attach`, `node run`) mint no ring either, and that is a decision
+rather than an omission: their gating clock is WALL-driven, so a trace taken
+there would carry boundaries a resim cannot re-advance to, i.e. a
+`resimmable: true` that is confidently false.
 Routing them onto the recording clock's discipline is not implemented.
 
 No `bag record` flag can add a trace to a run already under way: the rings are
@@ -580,7 +584,7 @@ license a positive claim about WHY a bag carries no trace.
 | `declared` | Rings were created; `rings` names them | `from the attach point`, unless a declared RANK is missing (below) | **yes**: every multi-process `graph run`, recording or not |
 | `declined: <reason>` | The run DECLINED rings at launch, by CHOICE | `none: this run DECLINED …`, carrying the run's reason | **yes**: `graph run --no-rings` |
 | `unavailable: <reason>` | The run wanted rings and was REFUSED, by a resource gate or a run shape whose clock cannot produce a resimmable trace | `none: this run wanted … and could not have them` | **yes**: a `/dev/shm` free-space refusal, or a failed departure ring on a plain run |
-| *absent* | The run said nothing: an earlier binary, a MONOLITH shape (`--single-process` / `ros2 attach` / `node run`), or a declaration that was never written | the legacy `none: the run's manifest declared no trace rings …` | **yes**, on those shapes |
+| *absent* | The run said nothing: an earlier binary, a MONOLITH shape (`--single-process` on a graph that is one executor unit / `ros2 attach` / `node run`), or a declaration that was never written | the legacy `none: the run's manifest declared no trace rings …` | **yes**, on those shapes |
 | *anything else* | A state THIS BUILD does not know: a manifest written by a newer `cerulion` | `unknown: … a scheduler-trace state this build does not know (\`<token>\`) … upgrade this build to read it` | n/a: read, never written |
 
 A present-but-unreadable value and an absent key look identical to a reader
@@ -916,9 +920,11 @@ fact rather than a hedge.
 **A `free_run` bag is what a multi-process `graph run --record` produces by
 default.** The reader re-executes such a bag PER RANK. A `lockstep` stamp means
 one of two things: the run opted out with `CERULION_EXECUTION_MODE=lockstep`,
-or it was a MONOLITH recording (`--single-process --record`; a monolith has no
-ranks); the `lockstep` row above covers both. The variable is an execution-mode
-switch rather than a tuning knob; see
+or it was a MONOLITH recording (`--single-process --record` of a graph that is
+one executor unit; a monolith has no ranks); the `lockstep` row above covers
+both. A `--single-process --record` of a graph whose nodes split into several
+units runs them in one worker process and stamps `free_run`, one rank per unit.
+The variable is an execution-mode switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 
@@ -1127,7 +1133,7 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 | A channel behind by more than 16 of its own deltas fast-forwards at up to 4x its recorded rate until it catches up | The deficit is carried in full so alignment is preserved; only the RATE is bounded, using the channel's own cadence. Routine write-batching deficits fall inside the free window and cost no wall time | None: inherent to the trade-off (the alternative is an unbounded backlog dump) |
 | The 4x bound does not apply to a channel whose consecutive stamps are identical | There is no recorded cadence to divide; such frames publish as fast as the loop runs | None: faithful to the recording (it says those frames were simultaneous) |
 | bagd's **declared** tap attach is all-or-nothing, so the preflight narrows but cannot close the exit-between-probe-and-attach window | The preflight probe is itself a TOCTOU: a producer can exit between it and bagd's own attach. (A DISCOVERED tap is deliberately not all-or-nothing: an inference is not a request, so its failed open is ledgered as `attach_failed` and retried, never fatal) | None: the declared attach fails as a whole, so start the recorder once every declared producer is stable |
-| **With discovery ON** (`graph run --record`, or a hand-run `cerulion bagd` that was given `--topics-json`): a producer that appears AFTER the bag is created is NAMED, not recorded, and that is permanent | MCAP channels are registered when the bag is created and are immutable afterwards (`BagWriter::create` takes the complete topic list up front, and rotation reuses that set verbatim), so a topic discovered later can be given no channel. Discovery closes the window BEFORE creation (bagd enumerates the live service directory, rescans every `DISCOVERY_RESCAN_INTERVAL` (250 ms), and HOLDS bag creation open while discovery is still finding things) and reports whatever falls outside it: the topic lands in `record_coverage.json` as `appeared_after_bag_creation`, `cerulion bag info` prints it, and the run's terminal line escalates to a WARN | Widen the pre-creation window: `CERULION_RECORD_DISCOVERY_SETTLE_MS=<ms>` on every path (including `graph run --record`, which builds bagd's argv itself), or `cerulion bagd --discovery-settle-ms <ms>` on one you launch by hand. **Not** `--schema-wait-timeout-ms`, which is a force-create deadline for schema learning, not a hold-open. A producer that appears after the bag is created cannot be added to that bag |
-| **With discovery OFF** (which is `cerulion bag record` always, and any recorder run under `CERULION_RECORD_DISCOVERY=off`), a topic that appears mid-recording is neither recorded NOR named | `bag record` sets `discover_live = false` (it owns its own selection policy), and that flag short-circuits `rescan_discovery` entirely, so there is no rescan to find the topic and nothing to write into `untapped` either. The bag records `enumerated: false`, which is the accurate form of "nobody looked", but it cannot name what it did not look for | Nothing widens a window that is not open. Re-run the capture with the producer already live, or use `graph run --record` (where discovery is on) if you need the recorder to pick up producers that register after it arms. `--discovery-settle-ms` is **inert** here: the hold is released immediately when discovery is off |
+| **With discovery ON** (`graph run --record`, or a hand-run `cerulion bagd` that was given `--topics-json`): a producer that appears AFTER the bag is created is NAMED, not recorded, and that is permanent | MCAP channels are registered when the bag is created and are immutable afterwards (`BagWriter::create` takes the complete topic list up front, and rotation reuses that set verbatim), so a topic discovered later can be given no channel. Discovery closes the window BEFORE creation (bagd enumerates the live service directory, re-enumerates whenever the kernel reports that directory changed, and HOLDS bag creation open while discovery is still finding things) and reports whatever falls outside it: the topic lands in `record_coverage.json` as `appeared_after_bag_creation`, `cerulion bag info` prints it, and the run's terminal line escalates to a WARN | Widen the pre-creation window: `CERULION_RECORD_DISCOVERY_SETTLE_MS=<ms>` on every path (including `graph run --record`, which builds bagd's argv itself), or `cerulion bagd --discovery-settle-ms <ms>` on one you launch by hand. **Not** `--schema-wait-timeout-ms`, which is a force-create deadline for schema learning, not a hold-open. A producer that appears after the bag is created cannot be added to that bag |
+| **With discovery OFF** (which is `cerulion bag record` always, and any recorder run under `CERULION_RECORD_DISCOVERY=off`), a topic that appears mid-recording is neither recorded NOR named | `bag record` sets `discover_live = false` (it owns its own selection policy), and that flag short-circuits discovery entirely, so nothing is watching for the topic and there is nothing to write into `untapped` either. The bag records `enumerated: false`, which is the accurate form of "nobody looked", but it cannot name what it did not look for | Nothing widens a window that is not open. Re-run the capture with the producer already live, or use `graph run --record` (where discovery is on) if you need the recorder to pick up producers that register after it arms. `--discovery-settle-ms` is **inert** here: the hold is released immediately when discovery is off |
 | A non-finalized bag cannot be played | The zero-copy frame walk needs the summary footer | None: only a finalized bag is playable |
 | A type NEITHER this machine NOR the bag defines still renders nothing | Nothing anywhere knows it: the bag can only carry what its recording machine could resolve | Re-record from a workspace that holds the `.msg` files |

@@ -53,9 +53,10 @@ pub struct QosSnapshot {
     /// its RETENTION, the frames it really keeps:
     ///
     ///
-    /// - PUBLISHER: the clamped history. `TRANSIENT_LOCAL` depth 1000 ⇒ 16,
-    ///   depth 5 ⇒ 5, and VOLATILE ⇒ 0 (it retains nothing for a late
-    ///   joiner). NOT the topic's `subscriber_max_buffer_size` ceiling,
+    /// - PUBLISHER: the clamped history. `TRANSIENT_LOCAL` (and
+    ///   BEST_AVAILABLE, which a publisher resolves to it) depth 1000 ⇒ 16,
+    ///   depth 5 ⇒ 5, and VOLATILE ⇒ 0 (it asks for no history of its
+    ///   own). NOT the topic's `subscriber_max_buffer_size` ceiling,
     ///   which is a subscriber-SLOT budget rather than a depth anything
     ///   retains — reporting it would make a depth-5 publisher claim 16.
     /// - SUBSCRIPTION: the transport's default subscriber buffer, which IS
@@ -82,7 +83,7 @@ pub struct EndpointRecord {
     pub node_namespace: String,
     /// The topic's ROS graph type name ("pkg/msg/Name").
     pub type_name: String,
-    /// Deterministic entity gid (== `rmw_get_gid_for_publisher`).
+    /// Entity gid (== `rmw_get_gid_for_publisher` for a publisher).
     pub endpoint_gid: [u8; 16],
     /// QoS the endpoint was created with.
     pub qos: QosSnapshot,
@@ -170,8 +171,9 @@ impl GraphRegistry {
 pub struct Runtime {
     pub transport: Arc<TransportManager>,
     pub graph: RwLock<GraphRegistry>,
-    /// Monotonic counter for deterministic per-process entity ids (gids,
-    /// client instance numbers). Never wall-clock, never random.
+    /// Monotonic per-process entity counter: bytes 8 to 15 of subscription
+    /// and client gids ([`crate::gid::mint_gid`]). Never wall-clock, never
+    /// random.
     pub entity_counter: AtomicU64,
     /// Every live node's graph guard condition state. Registry
     /// mutations trigger ALL of them so executors blocked in `rmw_wait`
@@ -700,6 +702,8 @@ pub struct PublisherData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<PublisherInner>,
+    /// Publisher gid: the iceoryx2 port id, which every sample the port
+    /// sends carries as its origin ([`crate::gid::publisher_gid`]).
     pub gid: [u8; 16],
     pub sequence: AtomicU64,
     /// Flood-suppressed loudness + an unconditional counter for
@@ -1051,8 +1055,7 @@ pub struct SubscriptionData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<SubscriptionInner>,
-    /// Deterministic per-process entity gid (entity counter + schema
-    /// hash, never random) — the endpoint id reported by
+    /// Entity gid ([`crate::gid`]): the endpoint id reported by
     /// `rmw_get_subscriptions_info_by_topic` and the key the graph
     /// registry deregisters by on destroy.
     pub gid: [u8; 16],
@@ -1139,6 +1142,8 @@ pub struct ClientData {
     pub request_bridge: Arc<crate::bridge::AnyBridge>,
     pub response_bridge: Arc<crate::bridge::AnyBridge>,
     pub client: Mutex<cerulion_core::transport::service::ServiceClient>,
+    /// Entity gid ([`crate::gid`]): `rmw_get_gid_for_client`, the request
+    /// header's writer guid and the client's reply topic.
     pub gid: [u8; 16],
     /// See [`SubscriptionData::decode_failures`] — a response the
     /// bridge cannot decode must not be dropped silently.

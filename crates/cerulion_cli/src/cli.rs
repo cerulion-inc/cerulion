@@ -702,6 +702,7 @@ impl Commands {
                 | GraphAction::Validate { .. }
                 | GraphAction::List
                 | GraphAction::Levels { .. }
+                | GraphAction::Plan { .. }
                 | GraphAction::Partition { .. }
                 | GraphAction::Pause { .. }
                 | GraphAction::Resume { .. } => OneShot,
@@ -887,18 +888,26 @@ pub enum Ros2Action {
     /// the verb included: read THIS page with `cerulion help ros2 run`, and
     /// `ros2 run --help` for the native surface.
     ///
-    /// The one exception is `--adopt-take` given right after `run`, which is
-    /// refused. `ros2` is a Python CLI that starts the node as a further
-    /// subprocess with close_fds=True, so the heap hook this launcher hands
-    /// over as an inherited descriptor never reaches the node and every take
-    /// would be served by copy. For zero-copy plain takes, launch the node
-    /// executable directly with the hook preloaded and
+    /// The exceptions are Cerulion's own flags, given right after `run`.
+    /// `--adopt-take` is refused. `ros2` is a Python CLI that starts the node
+    /// as a further subprocess with close_fds=True, so the heap hook this
+    /// launcher hands over as an inherited descriptor never reaches the node
+    /// and every take would be served by copy. For zero-copy plain takes,
+    /// launch the node executable directly with the hook preloaded and
     /// CERULION_RMW_ADOPT_TAKE=1 (Linux/GNU only: the hook interposes glibc's
     /// malloc/free).
     ///
+    /// `--record-deliveries <DIR>` records what the process consumed, in the
+    /// order it consumed it, into `<DIR>/<exe>-<pid>.rdl.mcap`.
+    /// `--replay-deliveries <LOG>` replays that one process against its log
+    /// and writes `<LOG>.verdict.json` (identical, or the first node, topic
+    /// and window whose outputs diverged). The two exclude each other. See
+    /// docs/ros2_replay.md for what replays exactly and what is refused.
+    ///
     /// Exit codes (pre-exec failures only; a successful exec inherits ros2's
     /// own): 69 = `librmw_cerulion.so` missing or `--adopt-take` given,
-    /// 127 = `ros2` not on PATH, 1 = other. Unix-only.
+    /// 2 = a refused delivery-log flag, 127 = `ros2` not on PATH, 1 = other.
+    /// Unix-only.
     Run {
         /// Forwarded verbatim to `ros2 run` (e.g. `demo_nodes_cpp talker`);
         /// a LEADING `--adopt-take` is Cerulion's own flag, refused here
@@ -922,9 +931,15 @@ pub enum Ros2Action {
     /// the verb included: read THIS page with `cerulion help ros2 launch`, and
     /// `ros2 launch --help` for the native surface.
     ///
+    /// `--record-deliveries <DIR>` right after `launch` records every ROS 2
+    /// process the launch starts, one `<exe>-<pid>.rdl.mcap` each. There is
+    /// no replay flag here: a replay is one process, run with
+    /// `cerulion ros2 run --replay-deliveries <LOG> ...`.
+    ///
     /// Exit codes (pre-exec failures only; a successful exec inherits ros2's
     /// own): 69 = `librmw_cerulion.so` missing or `--adopt-take` given,
-    /// 127 = `ros2` not on PATH, 1 = other. Unix-only.
+    /// 2 = a refused delivery-log flag, 127 = `ros2` not on PATH, 1 = other.
+    /// Unix-only.
     Launch {
         /// Forwarded verbatim to `ros2 launch` (e.g.
         /// `demo.launch.py use_rviz:=false`, or the `pkg file.launch.py`
@@ -1537,9 +1552,13 @@ pub enum GraphAction {
         #[arg(long = "peer-loss", value_enum)]
         peer_loss: Option<PeerLoss>,
         /// Force a single-process run, even when the graph declares
-        /// `process_groups:`. The graph produces identical results, just
-        /// without process isolation. On a graph WITHOUT `process_groups:`
-        /// this also skips deriving the multi-process default. Conflicts with `--auto-partition`.
+        /// `process_groups:`. Every node shares one process, with no process
+        /// isolation between them. On a graph WITHOUT `process_groups:`
+        /// this also skips deriving the multi-process default. On the real
+        /// clock the one process still runs its nodes in executor units, one
+        /// thread per unit (`cerulion graph plan` shows them), so a slow node
+        /// does not hold the others; a graph that is one unit runs as one level
+        /// loop. Conflicts with `--auto-partition`.
         #[arg(long = "single-process")]
         single_process: bool,
         /// Keep this run on this machine: no network gateway, session,
@@ -1656,6 +1675,23 @@ pub enum GraphAction {
     /// census into its run directory. Nothing in the runtime fuses chains
     /// yet: the block reports what the graph would allow.
     Levels {
+        /// Graph name
+        #[arg(add = ArgValueCandidates::new(completion::graph_names))]
+        name: String,
+    },
+    /// Show the processes a free run of a graph starts and the executor units
+    /// inside each (read-only).
+    ///
+    /// Inside one process, nodes run in executor units, each on its own
+    /// thread, so a slow unit never holds another unit's fire. Without a
+    /// profile every data-triggered node is a unit of its own. A linear chain
+    /// of trigger edges merges into one unit only where the graph's profile
+    /// (`graphs/<NAME>.costs.yaml`) shows the unit's ticks stay under a
+    /// quarter of its period and of its nodes' `tick_within_ms`;
+    /// `isolate: true` and `isolate: false` override, except that a `block`
+    /// edge's producer and consumers always share a unit. Every unit is
+    /// printed with its nodes and the reason it starts.
+    Plan {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
         name: String,
@@ -1798,10 +1834,12 @@ pub enum GraphAction {
     /// worker its own plan file. Users always run `cerulion graph run`.
     #[command(hide = true)]
     RunWorker {
-        /// Path to the serialized `WorkerPlan` JSON the supervisor wrote.
-        #[arg(long)]
+        /// Path to a serialized `WorkerPlan` JSON the supervisor wrote. Given
+        /// more than once, the process runs each plan (one executor unit
+        /// each) on its own thread.
+        #[arg(long, required = true)]
         #[arg(value_hint = clap::ValueHint::FilePath)]
-        plan: PathBuf,
+        plan: Vec<PathBuf>,
     },
     /// HIDDEN: run the network gateway process of a `graph run`.
     ///
@@ -3277,11 +3315,43 @@ mod time_source_flag_tests {
                 action: GraphAction::RunWorker { plan },
             } => assert_eq!(
                 plan,
-                std::path::PathBuf::from("/tmp/worker_P0.json"),
+                vec![std::path::PathBuf::from("/tmp/worker_P0.json")],
                 "the --plan path must be captured verbatim"
             ),
             _ => panic!("expected Graph::RunWorker"),
         }
+    }
+
+    /// A worker process hosting several executor units takes one `--plan`
+    /// per unit, in order.
+    #[test]
+    fn graph_run_worker_takes_one_plan_per_hosted_unit() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "graph",
+            "run-worker",
+            "--plan",
+            "/tmp/a.json",
+            "--plan",
+            "/tmp/b.json",
+        ])
+        .expect("repeated --plan must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::RunWorker { plan },
+            } => assert_eq!(
+                plan,
+                vec![
+                    std::path::PathBuf::from("/tmp/a.json"),
+                    std::path::PathBuf::from("/tmp/b.json")
+                ]
+            ),
+            _ => panic!("expected Graph::RunWorker"),
+        }
+        assert!(
+            Cli::try_parse_from(["cerulion", "graph", "run-worker"]).is_err(),
+            "run-worker without a --plan must be refused"
+        );
     }
 
     /// `graph run-worker` WITHOUT `--plan` is rejected by clap (the

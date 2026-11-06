@@ -15,11 +15,59 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::auth;
 use iceoryx2::prelude::SemanticString;
 use mp_support::ChildGuard;
+
+/// Upper bound on how long the sentinel waits for a request's blank line.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Reads the request through its blank line (or until `REQUEST_DEADLINE`,
+/// end of stream or a read error), then writes a 503 and closes. Closing with
+/// unread request bytes sends a reset, and the client can then lose the unread
+/// response or fail its next write.
+fn answer_unavailable(mut stream: TcpStream) {
+    // On macOS an accepted socket inherits the listener's O_NONBLOCK.
+    stream.set_nonblocking(false).unwrap();
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let mut request = Vec::new();
+    let mut chunk = [0; 2048];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+/// Sends a GET in two writes with `pause` before each, and reads the whole
+/// response.
+fn request_positive_control(address: SocketAddr, pause: Duration) -> std::io::Result<String> {
+    let mut client = TcpStream::connect(address)?;
+    client.set_read_timeout(Some(Duration::from_secs(2)))?;
+    std::thread::sleep(pause);
+    client.write_all(b"GET /positive-control HTTP/1.1\r\n")?;
+    std::thread::sleep(pause);
+    client.write_all(b"Host: localhost\r\n\r\n")?;
+    let mut response = String::new();
+    client.read_to_string(&mut response)?;
+    Ok(response)
+}
 
 struct HttpSentinel {
     address: SocketAddr,
@@ -39,16 +87,9 @@ impl HttpSentinel {
         let shutdown = Arc::clone(&stop);
         let worker = std::thread::spawn(move || loop {
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     count.fetch_add(1, Ordering::SeqCst);
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(100)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_millis(100)))
-                        .unwrap();
-                    let _ = stream.read(&mut [0; 2048]);
-                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    answer_unavailable(stream);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     // Drain already queued connections before stopping.
@@ -66,16 +107,12 @@ impl HttpSentinel {
             stop,
             worker: Some(worker),
         };
-        let mut client = TcpStream::connect(address).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        client
-            .write_all(b"GET /positive-control HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .unwrap();
-        let mut response = String::new();
-        client.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 503 "));
+        let response = request_positive_control(address, Duration::ZERO)
+            .unwrap_or_else(|err| panic!("HTTP sentinel positive control: {err}"));
+        assert!(
+            response.starts_with("HTTP/1.1 503 "),
+            "HTTP sentinel positive control response: {response:?}"
+        );
         assert_eq!(sentinel.accepted.swap(0, Ordering::SeqCst), 1);
         sentinel
     }
@@ -285,4 +322,16 @@ fn robot_completion_is_local_and_silent_under_hostile_logging() {
         .filter(|value| !value.is_empty())
         .collect();
     assert_eq!(candidates, ["cached_robot"]);
+}
+
+#[test]
+fn http_sentinel_answers_a_request_that_arrives_after_accept() {
+    let mut sentinel = HttpSentinel::start();
+    let response = request_positive_control(sentinel.address, Duration::from_millis(300))
+        .unwrap_or_else(|err| panic!("late request to the HTTP sentinel: {err}"));
+    assert!(
+        response.starts_with("HTTP/1.1 503 "),
+        "late request response: {response:?}"
+    );
+    assert_eq!(sentinel.finish(), 1);
 }

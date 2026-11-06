@@ -4,6 +4,8 @@
 //! These types map directly to the graph YAML format.
 //! The graph YAML file is the single source of truth (Principle #5).
 
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 use crate::transport::carrier::{EgressQos, EgressReliability, NetworkTls};
@@ -373,9 +375,10 @@ pub struct NetworkBlock {
     /// (validated at graph-load).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<String>,
-    /// Certificate files for `quic/` locators in `listen` / `connect`.
-    /// Graph-load validation refuses the block on a graph with no `quic/`
-    /// locator, and a `quic/` locator without the files it needs.
+    /// Certificate files for `quic/` and `tls/` locators in `listen` /
+    /// `connect`. Graph-load validation refuses a block that sets no file,
+    /// each file without the `quic/` or `tls/` locator that reads it, and a
+    /// `quic/` or `tls/` locator without the files it needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<NetworkTls>,
     /// The put reliability of every `egress` entry that sets no
@@ -402,11 +405,13 @@ fn is_default_reliability(r: &EgressReliability) -> bool {
 ///     reliability: reliable           # reliable whatever default_reliability says
 ///   - topic: /chatter
 ///     external: true                  # published by a process outside this graph
+///   - topic: /robot/camera/image
+///     send_queue: 32                  # frames the gateway queues while the link is congested
 /// ```
 ///
-/// The bare string is the map with no `reliability` and `external: false`,
-/// and such an entry serializes back to the bare string. Unknown map keys are
-/// a parse error.
+/// The bare string is the map with no `reliability`, no `send_queue` and
+/// `external: false`, and such an entry serializes back to the bare string.
+/// Unknown map keys are a parse error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTopic {
     /// Canonical absolute topic name.
@@ -423,6 +428,12 @@ pub struct EgressTopic {
     /// memory service once a remote demands it and a publisher has created
     /// the service.
     pub external: bool,
+    /// How many frames the gateway queues for this topic while zenoh's
+    /// transmit queue is full. When the queue is full a `reliable` topic's
+    /// new frame is refused (counted and logged) and a `best_effort` topic's
+    /// oldest queued frame is dropped. `None` sizes the queue to the depth of
+    /// the gateway's tap on the topic.
+    pub send_queue: Option<NonZeroUsize>,
 }
 
 impl EgressTopic {
@@ -433,6 +444,7 @@ impl EgressTopic {
             topic: topic.into(),
             reliability: None,
             external: false,
+            send_queue: None,
         }
     }
 
@@ -451,6 +463,7 @@ impl EgressTopic {
             topic: topic.into(),
             reliability: Some(reliability),
             external: false,
+            send_queue: None,
         }
     }
 
@@ -464,6 +477,12 @@ impl EgressTopic {
     /// The topic name.
     pub fn as_str(&self) -> &str {
         &self.topic
+    }
+
+    /// Whether this entry is a bare topic name: no `reliability`, no
+    /// `send_queue` and `external: false`.
+    fn is_bare(&self) -> bool {
+        self.reliability.is_none() && !self.external && self.send_queue.is_none()
     }
 }
 
@@ -494,14 +513,14 @@ impl std::fmt::Display for EgressTopic {
 }
 
 // A topic name compares equal to an entry when the entry is that name's bare
-// spelling: the same `topic`, no `reliability` of its own and `external:
-// false`. An entry that sets a `reliability` or `external: true` is not equal
-// to any string, which keeps these impls
+// spelling: the same `topic`, no `reliability` or `send_queue` of its own and
+// `external: false`. An entry that sets any of them is not equal to any
+// string, which keeps these impls
 // consistent with `EgressTopic == EgressTopic`. A `Vec<EgressTopic>` compares
 // with a `Vec<String>` or a `Vec<&str>` through them.
 impl PartialEq<str> for EgressTopic {
     fn eq(&self, other: &str) -> bool {
-        self.reliability.is_none() && !self.external && self.topic == other
+        self.is_bare() && self.topic == other
     }
 }
 
@@ -544,17 +563,20 @@ struct EgressTopicMap {
     reliability: Option<EgressReliability>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     external: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    send_queue: Option<NonZeroUsize>,
 }
 
 impl Serialize for EgressTopic {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.reliability.is_none() && !self.external {
+        if self.is_bare() {
             serializer.serialize_str(&self.topic)
         } else {
             EgressTopicMap {
                 topic: self.topic.clone(),
                 reliability: self.reliability,
                 external: self.external,
+                send_queue: self.send_queue,
             }
             .serialize(serializer)
         }
@@ -568,7 +590,8 @@ impl<'de> Deserialize<'de> for EgressTopic {
             type Value = EgressTopic;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(
-                    "a topic name, or a map with `topic` and optional `reliability` and `external`",
+                    "a topic name, or a map with `topic` and optional `reliability`, `external` \
+                     and `send_queue`",
                 )
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EgressTopic, E> {
@@ -584,6 +607,7 @@ impl<'de> Deserialize<'de> for EgressTopic {
                     topic: m.topic,
                     reliability: m.reliability,
                     external: m.external,
+                    send_queue: m.send_queue,
                 })
             }
         }
@@ -631,7 +655,7 @@ impl NetworkBlock {
     /// | `connect` | `connect_endpoints` (1:1) |
     /// | `listen` | `listen_endpoints` (1:1) |
     /// | `tls` | `tls` (1:1) |
-    /// | `egress` entries put `best_effort` (their own `reliability`, else `default_reliability`) | `egress_qos` |
+    /// | `egress` entries put `best_effort` (their own `reliability`, else `default_reliability`) or declaring `send_queue` | `egress_qos` |
     /// | — | scouting knobs: NOT exposed in v1 — both stay the transport default OFF (nothing is discovered by accident) |
     pub fn to_network_config(&self) -> Option<crate::transport::network::NetworkConfig> {
         use crate::transport::network::{NetworkConfig, ZenohMode};
@@ -646,11 +670,14 @@ impl NetworkBlock {
             listen_endpoints: self.listen.clone(),
             tls: self.tls.clone(),
             egress_qos: self
-                .egress_reliabilities()
-                .filter(|(_, r)| *r == EgressReliability::BestEffort)
-                .map(|(topic, reliability)| EgressQos {
-                    topic: topic.to_string(),
+                .egress
+                .iter()
+                .map(|e| (e, e.effective_reliability(self.default_reliability)))
+                .filter(|(e, r)| *r == EgressReliability::BestEffort || e.send_queue.is_some())
+                .map(|(e, reliability)| EgressQos {
+                    topic: e.topic.clone(),
                     reliability,
+                    send_queue: e.send_queue,
                 })
                 .collect(),
             // Scouting deliberately rides the transport default (OFF) —
@@ -703,26 +730,22 @@ pub struct NodeDef {
     /// in v1). Mutually exclusive with `type:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ros2: Option<Ros2NodeDef>,
-    /// OPTIONAL per-node execution opt-out: `fuse: false` ENDS any fused
-    /// chain at this node.
+    /// OPTIONAL per-node executor override, read when a process hosts more
+    /// than one node.
     ///
-    /// Absent means the node does not end a chain, which is the default for
-    /// every node that does not say otherwise. `true` is accepted and means
-    /// the same as absent, so a graph may state the default explicitly
-    /// without that reading as a request for something different.
+    /// Inside a process, nodes run in executor units, each on its own thread.
+    /// Without a profile every data-triggered node is a unit of its own; a
+    /// linear chain of trigger edges shares one unit only where the graph's
+    /// profile shows the merge stays within its tick budget. `isolate: true`
+    /// gives this node a unit of its own (a `block` flow still keeps its
+    /// producer and consumers together). `isolate: false` keeps it in the unit
+    /// of the nodes that trigger it whatever the automatic rules say. Absent
+    /// leaves the choice to those rules.
+    /// `cerulion graph plan` shows the units and why each one starts.
     ///
-    /// The opt-out is per INSTANCE rather than per node TYPE because whether
-    /// a consumer should pull its producer's period along with it is a
-    /// property of the deployment, not of the code: the same logger type is a
-    /// best-effort tail in one graph and a control node in another. Fusion
-    /// converts consumer lag into head-node period slip, which is what a
-    /// control chain wants and a best-effort tail does not.
-    ///
-    /// NOTHING in the executor reads this yet: an opted-out node appears in
-    /// the resolved decision that is logged at graph build and in no
-    /// execution path.
+    /// This key replaces `fuse: false`, which is refused at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuse: Option<bool>,
+    pub isolate: Option<bool>,
     /// OPTIONAL per-instance values for the node type's `#[param]` fields:
     /// a flat map of param name to scalar (`params: {gain: 2.5, frame_id:
     /// left}`). Absent names keep the macro default. Resolved ONCE at graph
@@ -1426,6 +1449,51 @@ tls:
         assert!(err.to_string().contains("topic"), "{err}");
     }
 
+    /// `send_queue: N` parses on the map spelling, serializes back as a map
+    /// and round-trips; it reaches `egress_qos` for a reliable topic too, so
+    /// the gateway sizes that topic's queue from it. Zero, a negative number
+    /// and a non-integer are parse errors naming the key's expected type.
+    #[test]
+    fn egress_send_queue_parses_round_trips_and_reaches_egress_qos() {
+        let net: NetworkBlock = serde_yaml::from_str(
+            "mode: peer\negress:\n  - topic: /r/cam\n    send_queue: 32\n  - /r/cmd\n",
+        )
+        .unwrap();
+        assert_eq!(
+            net.egress[0],
+            EgressTopic {
+                topic: "/r/cam".to_string(),
+                reliability: None,
+                external: false,
+                send_queue: NonZeroUsize::new(32),
+            }
+        );
+        assert_ne!(
+            net.egress[0], "/r/cam",
+            "an entry with a send_queue is not bare"
+        );
+        let out = serde_yaml::to_string(&net).unwrap();
+        assert!(out.contains("send_queue: 32"), "{out}");
+        assert!(out.contains("- /r/cmd\n"), "{out}");
+        assert_eq!(serde_yaml::from_str::<NetworkBlock>(&out).unwrap(), net);
+        assert_eq!(
+            net.to_network_config().unwrap().egress_qos,
+            vec![EgressQos {
+                topic: "/r/cam".to_string(),
+                reliability: EgressReliability::Reliable,
+                send_queue: NonZeroUsize::new(32),
+            }]
+        );
+        for bad in ["0", "-1", "8.5", "lots"] {
+            let yaml = format!("egress:\n  - topic: /r/cam\n    send_queue: {bad}\n");
+            let err = serde_yaml::from_str::<NetworkBlock>(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("nonzero usize"),
+                "send_queue: {bad} must be refused, got {err}"
+            );
+        }
+    }
+
     /// `external: true` parses on the map spelling, serializes back as a map
     /// (never the bare string, which would drop it) and round-trips; a
     /// non-boolean value is a parse error naming the key.
@@ -1472,6 +1540,7 @@ tls:
                 topic: "/chatter".to_string(),
                 reliability: Some(EgressReliability::BestEffort),
                 external: true,
+                send_queue: None,
             }]
         );
         let out = serde_yaml::to_string(&net).unwrap();
@@ -1521,6 +1590,7 @@ tls:
             vec![EgressQos {
                 topic: "/r/scan".to_string(),
                 reliability: EgressReliability::BestEffort,
+                send_queue: None,
             }]
         );
         let plain = NetworkBlock {
@@ -1635,11 +1705,13 @@ egress:
                 want.push(EgressQos {
                     topic: "/r/bare".to_string(),
                     reliability: BestEffort,
+                    send_queue: None,
                 });
             }
             want.push(EgressQos {
                 topic: "/r/be".to_string(),
                 reliability: BestEffort,
+                send_queue: None,
             });
             let cfg = block.to_network_config().unwrap();
             assert_eq!(cfg.egress_qos, want, "default {default:?}");

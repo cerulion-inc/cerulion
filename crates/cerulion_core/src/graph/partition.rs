@@ -1221,6 +1221,81 @@ pub fn auto_partition(
     isolated: &BTreeSet<String>,
     budget_ns: u64,
 ) -> TransportResult<AutoPartition> {
+    auto_partition_with_options(
+        config,
+        entry_infos,
+        trigger_edges,
+        costs,
+        isolated,
+        budget_ns,
+        AutoPartitionOptions::default(),
+    )
+}
+
+/// Choices [`auto_partition_with_options`] takes beyond the costs and the
+/// budget. The default is [`auto_partition`]'s result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoPartitionOptions {
+    /// Put every linear chain ([`chain_colocation_seeds`]) whose summed node
+    /// cost is within the per-group budget in one group before the
+    /// cost-driven fusions, whatever the edge costs or a zero rate say; a
+    /// chain over the budget is cut where the cost model cuts it, and a chain
+    /// is cut at every node in the isolated set and at every node whose group
+    /// already holds one, so an isolated node keeps its group. For a run
+    /// whose processes execute their nodes in executor units (the free run on
+    /// the real clock): the units split a whole chain again inside its process
+    /// where the profile does not show a merge safe.
+    pub keep_linear_chains: bool,
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes
+/// [`auto_partition_with_options`] ignore
+/// [`AutoPartitionOptions::keep_linear_chains`].
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_SEED_MUTANT_ENV: &str = "CERULION_CHAIN_SEED_MUTANT";
+
+fn chain_seed_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        std::env::var_os(CHAIN_SEED_MUTANT_ENV).is_some()
+    }
+    #[cfg(not(feature = "oracle-mutants"))]
+    {
+        false
+    }
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes the chain
+/// seeding of [`AutoPartitionOptions::keep_linear_chains`] ignore the
+/// per-group budget.
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_BUDGET_MUTANT_ENV: &str = "CERULION_CHAIN_BUDGET_MUTANT";
+
+fn chain_budget_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        std::env::var_os(CHAIN_BUDGET_MUTANT_ENV).is_some()
+    }
+    #[cfg(not(feature = "oracle-mutants"))]
+    {
+        false
+    }
+}
+
+/// [`auto_partition`] with [`AutoPartitionOptions`].
+///
+/// # Errors
+///
+/// As [`auto_partition`].
+pub fn auto_partition_with_options(
+    config: &GraphConfig,
+    entry_infos: &IndexMap<String, NodeInfo>,
+    trigger_edges: &TriggerEdges,
+    costs: &PartitionCosts,
+    isolated: &BTreeSet<String>,
+    budget_ns: u64,
+    options: AutoPartitionOptions,
+) -> TransportResult<AutoPartition> {
     // `isolated` names the online profiler's UNDER-SAMPLED
     // nodes. An isolated node (a) SKIPS the missing-cost error below (it carries
     // NO fabricated cost — Principle #13), (b) is never a fusion candidate
@@ -1437,6 +1512,26 @@ pub fn auto_partition(
         );
     }
 
+    // With `keep_linear_chains`, every linear chain is one group after the
+    // `block` seeds and before the greedy loop, so a chain the loop would split
+    // is already one group the loop treats as asking for nothing.
+    if options.keep_linear_chains && !chain_seed_mutant() {
+        seed_linear_chains(
+            &mut uf,
+            &chain_colocation_seeds(entry_infos, &topo, trigger_edges),
+            &node_ids,
+            &id_to_idx,
+            &node_cost,
+            isolated,
+            budget_ns,
+            config,
+            entry_infos,
+            trigger_edges,
+            &topo,
+            &global_levels,
+        )?;
+    }
+
     let mut fusions: Vec<FusionRecord> = Vec::new();
     let mut rejections: Vec<FusionRejection> = Vec::new();
     let reject = |rejections: &mut Vec<FusionRejection>,
@@ -1556,6 +1651,127 @@ pub fn auto_partition(
         fusions,
         rejections,
     })
+}
+
+/// The linear chains the cost-aware partitioner keeps in one group under
+/// [`AutoPartitionOptions::keep_linear_chains`]: every path
+/// of chain links ([`crate::graph::chain::linear_links`], the predicates the
+/// fusion census and the executor units share), head first, each with at least
+/// two nodes.
+pub fn chain_colocation_seeds(
+    entry_infos: &IndexMap<String, NodeInfo>,
+    topo: &GraphTopology,
+    trigger_edges: &TriggerEdges,
+) -> Vec<Vec<String>> {
+    crate::graph::chain::linear_chains(&crate::graph::chain::linear_links(
+        entry_infos,
+        topo,
+        trigger_edges,
+    ))
+}
+
+/// Union every chain's members into one group when the merged group is one a
+/// worker can run (the same re-levelization and contiguity check every
+/// candidate fusion passes) and its summed node cost is within `budget_ns`,
+/// the bound every candidate fusion meets. A chain whose group would not
+/// re-levelize stays split, with a warn naming it; a chain over the budget is
+/// not seeded, so the greedy loop below places its cuts by the cost model.
+///
+/// A node in `isolated` has no measured cost (its `node_cost` entry is a
+/// placeholder 0), so the seeding merges no group that holds one: a chain is
+/// cut at every member whose group holds an isolated node, that member keeps
+/// its group, and each run of two or more members between the cuts is seeded
+/// as a chain of its own.
+#[allow(clippy::too_many_arguments)]
+fn seed_linear_chains(
+    uf: &mut UnionFind,
+    chains: &[Vec<String>],
+    node_ids: &[&str],
+    id_to_idx: &HashMap<&str, usize>,
+    node_cost: &[u64],
+    isolated: &BTreeSet<String>,
+    budget_ns: u64,
+    config: &GraphConfig,
+    entry_infos: &IndexMap<String, NodeInfo>,
+    trigger_edges: &TriggerEdges,
+    topo: &GraphTopology,
+    global_levels: &Levels,
+) -> TransportResult<()> {
+    let n = node_ids.len();
+    // The runs are cut before any union: a union below joins only groups
+    // without an isolated node, so it never adds one to a group.
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for chain in chains {
+        let mut run: Vec<usize> = Vec::new();
+        for &i in chain.iter().filter_map(|id| id_to_idx.get(id.as_str())) {
+            let root = uf.find(i);
+            let holds_isolated =
+                (0..n).any(|j| isolated.contains(node_ids[j]) && uf.find(j) == root);
+            if holds_isolated {
+                tracing::debug!(
+                    graph = %config.identity(),
+                    chain = %chain.join(" -> "),
+                    cut_at = node_ids[i],
+                    "a linear chain is cut at a member whose group holds a node the profiler \
+                     isolated; that group is not merged with the chain"
+                );
+                runs.push(std::mem::take(&mut run));
+            } else {
+                run.push(i);
+            }
+        }
+        runs.push(run);
+    }
+    for members in runs {
+        if members.len() < 2 {
+            continue;
+        }
+        let chain: Vec<&str> = members.iter().map(|&i| node_ids[i]).collect();
+        let roots: HashSet<usize> = members.iter().map(|&i| uf.find(i)).collect();
+        if roots.len() == 1 {
+            continue;
+        }
+        let merged: Vec<usize> = (0..n).filter(|&i| roots.contains(&uf.find(i))).collect();
+        let load = merged
+            .iter()
+            .fold(0u64, |acc, &i| acc.saturating_add(node_cost[i]));
+        if load > budget_ns && !chain_budget_mutant() {
+            tracing::debug!(
+                graph = %config.identity(),
+                chain = %chain.join(" -> "),
+                load_ns = load,
+                budget_ns,
+                "a linear chain over the per-group budget is not kept whole; the cost model \
+                 places its cuts"
+            );
+            continue;
+        }
+        let member_ids: Vec<&str> = merged.iter().map(|&i| node_ids[i]).collect();
+        match check_group(
+            &member_ids,
+            config,
+            entry_infos,
+            trigger_edges,
+            topo,
+            global_levels,
+        )? {
+            GroupCheck::Valid => {
+                for pair in members.windows(2) {
+                    uf.union(pair[0], pair[1]);
+                }
+            }
+            GroupCheck::Bridged { .. } | GroupCheck::NonContiguous { .. } => {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    chain = %chain.join(" -> "),
+                    "a linear chain cannot share one process group: the merged group would not \
+                     re-levelize to the levels it owns, so the chain stays split across \
+                     processes"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The process-per-node BASELINE grouping — every node in its
@@ -3242,7 +3458,7 @@ mod block_colocation_tests {
 
     fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
         NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: id.to_string(),
@@ -3411,6 +3627,350 @@ mod block_colocation_tests {
                 ("grp_b".to_string(), vec!["b".to_string()]),
                 ("grp_c".to_string(), vec!["c".to_string()]),
             ]
+        );
+    }
+
+    /// The graph the chain arms partition: `src` fans out to `mid` and
+    /// `side`, so the one linear chain is `mid -> tail`. Every node costs
+    /// 1000 ns and every edge has rate 0, so the greedy loop fuses nothing on
+    /// its own.
+    fn chain_fixture() -> (
+        GraphConfig,
+        IndexMap<String, NodeInfo>,
+        TriggerEdges,
+        PartitionCosts,
+    ) {
+        let config = config_of(vec![
+            node("src", vec![], vec![out("a"), out("b")]),
+            node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
+            node("tail", vec![inp("inp", "mid/m")], vec![]),
+            node("side", vec![inp("inp", "src/b")], vec![]),
+        ]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        for id in ["mid", "tail", "side"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(
+                    vec![meta("inp", true, BackpressurePolicy::DropOldest)],
+                    vec![],
+                ),
+            );
+        }
+        let mut edges = TriggerEdges::new();
+        edges.insert("mid", "/p/src/a");
+        edges.insert("tail", "/p/mid/m");
+        edges.insert("side", "/p/src/b");
+        let costs = PartitionCosts {
+            node_p50_ns: ["src", "mid", "tail", "side"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        (config, infos, edges, costs)
+    }
+
+    fn units_partition(budget_ns: u64) -> AutoPartition {
+        let (config, infos, edges, costs) = chain_fixture();
+        auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &costs,
+            &BTreeSet::new(),
+            budget_ns,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive")
+    }
+
+    fn group_of(out: &AutoPartition, id: &str) -> String {
+        out.groups
+            .iter()
+            .find(|(_, members)| members.iter().any(|m| m == id))
+            .map(|(g, _)| g.clone())
+            .expect("every node is in a group")
+    }
+
+    /// For a run in executor units (`keep_linear_chains`), a linear chain
+    /// whose summed cost is within the budget is one group even where the
+    /// greedy loop would fuse none of its edges (rate 0), and a fan-out
+    /// sibling off the chain keeps its own. Without the option the same graph
+    /// is process per node, as the cost model alone decides.
+    /// `CERULION_CHAIN_SEED_MUTANT` (`oracle-mutants`) drops the seeding, and
+    /// this arm must then fail.
+    #[test]
+    fn a_linear_chain_in_a_unit_run_is_never_split_across_groups() {
+        let (config, infos, edges, costs) = chain_fixture();
+        let plain = auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1_000_000)
+            .expect("derive");
+        assert_eq!(
+            plain.groups.len(),
+            4,
+            "without the option a rate-0 graph is process per node: {:?}",
+            plain.groups
+        );
+        // The chain's two nodes cost 2000 ns together, within the budget.
+        let out = units_partition(1_000_000);
+        let group_of = |id: &str| group_of(&out, id);
+        // `src` fans out to `mid` and `side`, so the chain is `mid -> tail`.
+        let chains = chain_colocation_seeds(
+            &infos,
+            &GraphTopology::build(&config, &infos).unwrap(),
+            &edges,
+        );
+        assert_eq!(chains, vec![vec!["mid".to_string(), "tail".to_string()]]);
+        assert_eq!(
+            group_of("mid"),
+            group_of("tail"),
+            "the chain must share a group"
+        );
+        assert_ne!(
+            group_of("mid"),
+            group_of("side"),
+            "the fan-out sibling is no chain member"
+        );
+        assert_ne!(
+            group_of("src"),
+            group_of("mid"),
+            "a fan-out edge is no link"
+        );
+        assert!(
+            out.fusions.is_empty() && out.rejections.iter().all(|r| r.producer != "mid"),
+            "the chain is a seed, never a candidate: {:?}",
+            out.rejections
+        );
+        // Every chain the shared analysis finds lies inside one group.
+        for chain in &chains {
+            let g = group_of(&chain[0]);
+            assert!(
+                chain.iter().all(|n| group_of(n) == g),
+                "chain {chain:?} split"
+            );
+        }
+    }
+
+    /// For a run in executor units, a linear chain whose summed cost is over
+    /// the per-group budget is not kept whole: the cost model places its cuts,
+    /// and no group the chain seeding made exceeds the budget. Here every edge
+    /// has rate 0, so the cost model cuts every hop. `CERULION_CHAIN_BUDGET_MUTANT`
+    /// (`oracle-mutants`) drops the budget check from the seeding, and this arm
+    /// must then fail.
+    #[test]
+    fn a_linear_chain_over_the_budget_in_a_unit_run_is_cut_by_the_cost_model() {
+        // `mid -> tail` costs 2000 ns; the budget holds one node, not both.
+        let budget_ns = 1_500;
+        let out = units_partition(budget_ns);
+        assert_ne!(
+            group_of(&out, "mid"),
+            group_of(&out, "tail"),
+            "an over-budget chain was kept whole: {:?}",
+            out.groups
+        );
+        let (_, _, _, costs) = chain_fixture();
+        for (group, members) in &out.groups {
+            let load: u64 = members.iter().map(|m| costs.node_p50_ns[m]).sum();
+            assert!(
+                load <= budget_ns,
+                "group {group} {members:?} costs {load} ns, over the {budget_ns} ns budget"
+            );
+        }
+    }
+
+    /// The groups of `out` as sorted member lists, sorted: the partition's
+    /// shape without its group names.
+    fn member_sets(out: &AutoPartition) -> Vec<Vec<String>> {
+        let mut sets: Vec<Vec<String>> = out
+            .groups
+            .values()
+            .map(|members| {
+                let mut m = members.clone();
+                m.sort();
+                m
+            })
+            .collect();
+        sets.sort();
+        sets
+    }
+
+    fn owned(groups: &[&[&str]]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    /// For a run in executor units, a linear chain `c1 -> c2 -> c3 -> c4`
+    /// whose second node the profiler isolated (no cost, so its `node_cost`
+    /// is a placeholder 0) is cut at that node: `c2` keeps a group of its
+    /// own, `c1` is left alone before the cut, and `c3 -> c4` is kept whole.
+    /// The measured nodes cost 1000 ns each, well within the budget, so only
+    /// the isolated node cuts the chain.
+    #[test]
+    fn a_linear_chain_in_a_unit_run_is_cut_at_a_node_the_profiler_isolated() {
+        let config = config_of(vec![
+            node("src", vec![], vec![out("a"), out("b")]),
+            node("c1", vec![inp("inp", "src/a")], vec![out("o")]),
+            node("c2", vec![inp("inp", "c1/o")], vec![out("o")]),
+            node("c3", vec![inp("inp", "c2/o")], vec![out("o")]),
+            node("c4", vec![inp("inp", "c3/o")], vec![]),
+            node("side", vec![inp("inp", "src/b")], vec![]),
+        ]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        for id in ["c1", "c2", "c3", "c4", "side"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(
+                    vec![meta("inp", true, BackpressurePolicy::DropOldest)],
+                    vec![],
+                ),
+            );
+        }
+        let mut edges = TriggerEdges::new();
+        edges.insert("c1", "/p/src/a");
+        edges.insert("c2", "/p/c1/o");
+        edges.insert("c3", "/p/c2/o");
+        edges.insert("c4", "/p/c3/o");
+        edges.insert("side", "/p/src/b");
+        let costs = PartitionCosts {
+            node_p50_ns: ["src", "c1", "c3", "c4", "side"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        let chains = chain_colocation_seeds(
+            &infos,
+            &GraphTopology::build(&config, &infos).unwrap(),
+            &edges,
+        );
+        assert_eq!(
+            chains,
+            owned(&[&["c1", "c2", "c3", "c4"]]),
+            "the fixture's one chain"
+        );
+        let isolated: BTreeSet<String> = ["c2".to_string()].into_iter().collect();
+        let out = auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &costs,
+            &isolated,
+            1_000_000,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive");
+        assert_eq!(
+            member_sets(&out),
+            owned(&[&["c1"], &["c2"], &["c3", "c4"], &["side"], &["src"]]),
+            "an isolated node keeps its own group and cuts the chain: {:?}",
+            out.groups
+        );
+    }
+
+    /// For a run in executor units, a chain is cut at a member whose group
+    /// already holds an isolated node, although the member itself is
+    /// measured. `p` publishes `cmd`, which the isolated `k` consumes as
+    /// `block`, so the `block` seed puts `p` and `k` in one group before the
+    /// chain seeding runs, and `h -> p -> k` is the fixture's one linear
+    /// chain. The chain is cut at `p` and at `k`: `h` keeps its own group and
+    /// the `block` group stays `{p, k}`. A seeding that cut only at the
+    /// isolated node itself would merge `h` into the `block` group.
+    #[test]
+    fn a_linear_chain_in_a_unit_run_never_joins_a_group_holding_an_isolated_node() {
+        let config = config_of(vec![
+            node("h", vec![], vec![out("o")]),
+            node("p", vec![inp("t", "h/o")], vec![out("cmd")]),
+            node("k", vec![inp("gate", "p/cmd")], vec![]),
+        ]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("h".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        infos.insert(
+            "p".to_string(),
+            NodeInfo::with_meta(
+                vec![meta("t", true, BackpressurePolicy::DropOldest)],
+                vec![],
+            ),
+        );
+        infos.insert(
+            "k".to_string(),
+            NodeInfo::with_meta(vec![meta("gate", true, BackpressurePolicy::Block)], vec![]),
+        );
+        let mut edges = TriggerEdges::new();
+        edges.insert("p", "/p/h/o");
+        edges.insert("k", "/p/p/cmd");
+        let costs = PartitionCosts {
+            node_p50_ns: ["h", "p"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        let chains = chain_colocation_seeds(
+            &infos,
+            &GraphTopology::build(&config, &infos).unwrap(),
+            &edges,
+        );
+        assert_eq!(
+            chains,
+            owned(&[&["h", "p", "k"]]),
+            "the fixture's one chain"
+        );
+        let isolated: BTreeSet<String> = ["k".to_string()].into_iter().collect();
+        let out = auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &costs,
+            &isolated,
+            1_000_000,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive");
+        assert_eq!(
+            member_sets(&out),
+            owned(&[&["h"], &["k", "p"]]),
+            "the chain must not join the group that holds the isolated `k`: {:?}",
+            out.groups
+        );
+
+        // The cut binds the chain seeding only. With a profiled rate on
+        // `h -> p` (a profile rates every edge no isolated node touches), the
+        // cost rules fuse `h` into the `block` group.
+        let rated = PartitionCosts {
+            edge_rate_mhz: [(("h".to_string(), "p".to_string()), 100_000u64)]
+                .into_iter()
+                .collect(),
+            ..costs
+        };
+        let out = auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &rated,
+            &isolated,
+            1_000_000,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive");
+        assert_eq!(
+            member_sets(&out),
+            owned(&[&["h", "k", "p"]]),
+            "a rated edge into the `block` group is a cost-rule candidate: {:?}",
+            out.groups
         );
     }
 

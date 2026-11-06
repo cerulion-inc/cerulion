@@ -381,7 +381,7 @@ fn a_truncated_recording_says_so_on_its_terminal_line() {
 /// conjuncts rather than passing for the same reason control (c) does.
 #[test]
 #[serial_test::serial]
-fn a_producer_the_rescan_picked_up_makes_no_prefix_claim() {
+fn a_producer_discovery_picked_up_makes_no_prefix_claim() {
     let mgr = make_manager(16);
     let declared = unique_topic("declared");
     let late = unique_topic("late");
@@ -389,7 +389,7 @@ fn a_producer_the_rescan_picked_up_makes_no_prefix_claim() {
     let ready = unique_out("late_ready");
 
     // A silent DECLARED attach tap holds bag creation open (the deterministic
-    // way to reach a rescan pickup — see its own late-producer arm).
+    // way to reach a discovery pickup - see its own late-producer arm).
     let mut declared_pub = publisher_with_provisioning(&mgr, &declared, 8, 16, 4096);
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -406,11 +406,11 @@ fn a_producer_the_rescan_picked_up_makes_no_prefix_claim() {
     assert!(wait_for_file(&ready, Duration::from_secs(10)), "bagd ready");
 
     // A producer that appears AFTER the recorder armed and streams BEFORE any
-    // rescan can find it, so its first recorded frame is nonzero. Published
+    // discovery can find it, so its first recorded frame is nonzero. Published
     // back-to-back deliberately: nothing is draining them yet, and the tighter
-    // this burst is, the smaller the window in which a rescan could land
+    // this burst is, the smaller the window in which an enumeration could land
     // between the publisher's creation and its frame 0 (~µs against the 250 ms
-    // rescan cadence). Should one ever land there, the `first recorded sequence
+    // enumeration cadence). Should one ever land there, the `first recorded sequence
     // > 0` precondition below fails LOUDLY rather than inverting a verdict.
     let mut late_pub = publisher_with_provisioning(&mgr, &late, 8, 16, 4096);
     for i in 0..6u32 {
@@ -436,7 +436,7 @@ fn a_producer_the_rescan_picked_up_makes_no_prefix_claim() {
     let entry = coverage
         .tapped
         .get(&late)
-        .expect("the rescan-discovered topic is in the manifest");
+        .expect("the discovered topic is in the manifest");
     assert_eq!(entry.source, TapSource::Discovered);
     assert!(
         entry.attached_late,
