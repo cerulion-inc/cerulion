@@ -908,6 +908,15 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             }
         }
 
+        // Lets the fire tap attribute each tick's commits to its outputs. An
+        // entry without a context (before `init`, after `shutdown`) cannot.
+        fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+            match self.context.as_ref() {
+                ::core::option::Option::Some(ctx) => ctx.output_commit_counts(out),
+                ::core::option::Option::None => false,
+            }
+        }
+
         // Declare the drain capability the forwarding above
         // provides. Decoupled from `performs_input_snapshot` (the rayon flag
         // the unified drain piggybacked on) — the runtime's eligibility predicate

@@ -1801,6 +1801,23 @@ impl NodeContext {
         self.publishers.get_mut(name)
     }
 
+    /// Write each publisher's [`AnyPublisher::committed_frames`] into `out`, in
+    /// the graph's `outputs:` order. Returns `false`, leaving `out` unchanged,
+    /// when `out.len()` is not this node's output count.
+    ///
+    /// Only a loaned proxy's commit moves a count. A frame sent with
+    /// [`AnyPublisher::publish_raw`] carries its caller's own wire sequence and
+    /// moves none, so the fire tap does not see that write.
+    pub fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+        if out.len() != self.publishers.len() {
+            return false;
+        }
+        for (count, publisher) in out.iter_mut().zip(self.publishers.values()) {
+            *count = publisher.committed_frames();
+        }
+        true
+    }
+
     /// Drive `pump_history` on every publisher this node owns
     /// (runtime cadence for quiescent-publisher late-joiner history delivery).
     /// Off the firing path.
@@ -3163,6 +3180,18 @@ pub trait NodeEntry: Send {
     /// grep `"producer reconciliation (per topic)"`.
     fn collect_publisher_recon_stats(&self, _out: &mut Vec<PublisherReconStat>) {}
 
+    /// Write each output's committed-frame count into `out`, in the graph's
+    /// `outputs:` order, through [`NodeContext::output_commit_counts`].
+    ///
+    /// The default returns `false`: the entry cannot see its publishers (a
+    /// cdylib moves its context into the library at `init`), so the fire tap
+    /// records its fires with `FireFlags::WROTE_UNKNOWN`. An entry that owns
+    /// its `NodeContext` forwards to it; the generated `#[cerulion_node]`
+    /// entry and `ClosureNodeEntry` do.
+    fn output_commit_counts(&self, _out: &mut [u32]) -> bool {
+        false
+    }
+
     /// This node's `CerulionState::STATE_SHAPE`, or `None`
     /// if it declares no restorable state.
     ///
@@ -3689,6 +3718,12 @@ impl NodeEntry for ClosureNodeEntry {
         if let Some(ctx) = self.context.as_ref() {
             ctx.collect_publisher_recon_stats(out);
         }
+    }
+
+    fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|ctx| ctx.output_commit_counts(out))
     }
 
     // Forward the unified trigger drain to the NodeContext,
