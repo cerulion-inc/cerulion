@@ -1839,11 +1839,13 @@ pub enum GraphAction {
     /// wrote. No message content is read. The robot records fires only while a
     /// desk asks and stops 5 s after the last ask. The reading ends with the
     /// number of fires read and the number the robot lost before this desk
-    /// read them. Without `--follow` or `--for`, it reads for 5 s. Needs
-    /// `--connect`.
+    /// read them. Without `--follow` or `--for`, it reads for 5 s. Without
+    /// `--connect`, it reads through this machine's `cerulion-netd`, which
+    /// needs protocol 10 or newer; with it, through a session of this
+    /// command's own that reaches only the locators given.
     Fires {
-        /// Zenoh locator of the robot's gateway (repeatable), for example
-        /// `tcp/127.0.0.1:7683`.
+        /// Zenoh locator of a robot's gateway to ask directly (repeatable),
+        /// for example `tcp/127.0.0.1:7683`. No discovery runs beside it.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// The robot to ask, by its network name. Without it, every robot that

@@ -1996,6 +1996,72 @@ pub fn decode_fires_reply(bytes: &[u8]) -> Result<FiresReply, FiresDecodeError> 
     FiresReply::try_from(wire)
 }
 
+/// What a desk learned from one `fires` GET to one robot. The three answers
+/// have three different remedies, so a consumer must not fold one into
+/// another. Classify the GET's payloads with [`gather_fires_answer`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FiresAnswer {
+    /// The robot answered usably about the run it was asked about. The reply's
+    /// `outcome` says what it did with the GET: served rows, did not know the
+    /// run, records no fires for it, or refused. `reply.robot` is the robot the
+    /// GET named.
+    Reply {
+        /// The robot's reply, validated as [`decode_fires_reply`] validates it.
+        reply: FiresReply,
+    },
+    /// Nothing came back within the window: the robot is unreachable, runs a
+    /// binary that predates the verb, or declares no query surface. Says
+    /// nothing about the run; the next poll may be answered.
+    Silent,
+    /// The robot answered with bytes this binary cannot use: a wire version
+    /// skew, corruption, or a reply about a different run. Asking again reads
+    /// the same bytes until the robot's binaries are rebuilt.
+    Unusable {
+        /// Why, in operator-readable text.
+        reason: String,
+    },
+}
+
+/// PURE: classify the reply payloads (arrival order) of one `fires` GET that
+/// asked `robot` about the run `run_id`. The first payload that decodes as a
+/// reply about `run_id` wins and is attributed to `robot`, the key it came
+/// back on (the [`RunsReply`] rule); else the reason the last payload could
+/// not be used (the [`gather_runs_outcome`] rule); else silence.
+///
+/// A reply about another run is unusable: its node indices would be read
+/// against the wrong run's topology.
+///
+/// Every desk path that GETs fires classifies through this one function, so
+/// netd's answer and a direct GET's answer cannot disagree about the same
+/// bytes.
+pub fn gather_fires_answer<'a>(
+    robot: &str,
+    run_id: &str,
+    payloads: impl IntoIterator<Item = &'a [u8]>,
+) -> FiresAnswer {
+    let mut last_reason: Option<String> = None;
+    for bytes in payloads {
+        match decode_fires_reply(bytes) {
+            Ok(mut reply) if reply.run_id == run_id => {
+                reply.robot = robot.to_string();
+                return FiresAnswer::Reply { reply };
+            }
+            Ok(reply) => {
+                last_reason = Some(format!(
+                    "the robot answered about run {} when asked about run {run_id}",
+                    reply.run_id
+                ));
+            }
+            Err(e) => last_reason = Some(e.to_string()),
+        }
+    }
+    match last_reason {
+        Some(reason) => FiresAnswer::Unusable { reason },
+        None => FiresAnswer::Silent,
+    }
+}
+
 /// The version probe [`decode_fires_reply`] reads before the payload.
 #[derive(Deserialize)]
 struct WireVersion {
@@ -4823,5 +4889,122 @@ mod tests {
             "fires reply carries a state the serve side never produces (row seq 5 is after the \
              page end 4)"
         );
+    }
+
+    fn fires_answer(payloads: &[&[u8]]) -> FiresAnswer {
+        gather_fires_answer("temi", FIRES_RUN_TEXT, payloads.iter().copied())
+    }
+
+    #[test]
+    fn no_fires_payload_is_silence() {
+        assert_eq!(fires_answer(&[]), FiresAnswer::Silent);
+    }
+
+    #[test]
+    fn a_fires_reply_is_attributed_to_the_robot_the_get_named() {
+        let mut from_robot = served_seqs(1, 0, &[1]);
+        from_robot.robot = "orin-7".to_string();
+        let mut expected = from_robot.clone();
+        expected.robot = "temi".to_string();
+        assert_eq!(
+            fires_answer(&[&encode_fires_reply(&from_robot)]),
+            FiresAnswer::Reply { reply: expected }
+        );
+    }
+
+    #[test]
+    fn every_robot_outcome_rides_through_as_a_reply() {
+        for outcome in [
+            FiresOutcome::UnknownRun,
+            FiresOutcome::NotServed,
+            FiresOutcome::Refused {
+                reason: "not authorized".to_string(),
+            },
+        ] {
+            let reply = FiresReply::new("temi", FIRES_RUN, outcome);
+            assert_eq!(
+                fires_answer(&[&encode_fires_reply(&reply)]),
+                FiresAnswer::Reply { reply }
+            );
+        }
+    }
+
+    #[test]
+    fn a_fires_payload_this_binary_cannot_use_is_unusable_with_its_reason() {
+        let skewed = format!(
+            r#"{{"version":2,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"not_served"}}}}"#
+        );
+        assert_eq!(
+            fires_answer(&[skewed.as_bytes()]),
+            FiresAnswer::Unusable {
+                reason: "unknown fires wire version 2 (this binary supports 1)".to_string(),
+            }
+        );
+        match fires_answer(&[b"not json"]) {
+            FiresAnswer::Unusable { reason } => {
+                assert!(
+                    reason.starts_with("fires reply did not parse ("),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fires_reply_about_another_run_is_unusable() {
+        let other = FiresReply::new("temi", FIRES_RUN + 1, FiresOutcome::NotServed);
+        assert_eq!(
+            fires_answer(&[&encode_fires_reply(&other)]),
+            FiresAnswer::Unusable {
+                reason: format!(
+                    "the robot answered about run 0x5d1c0000000000000000000000009e03 when asked \
+                     about run {FIRES_RUN_TEXT}"
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn the_first_usable_fires_reply_wins_else_the_last_reason() {
+        let good = encode_fires_reply(&served_seqs(1, 0, &[1]));
+        let other_run = encode_fires_reply(&FiresReply::new(
+            "temi",
+            FIRES_RUN + 1,
+            FiresOutcome::NotServed,
+        ));
+        let not_served =
+            encode_fires_reply(&FiresReply::new("temi", FIRES_RUN, FiresOutcome::NotServed));
+        for payloads in [
+            vec![
+                b"not json".as_slice(),
+                other_run.as_slice(),
+                good.as_slice(),
+            ],
+            vec![good.as_slice(), not_served.as_slice()],
+        ] {
+            match fires_answer(&payloads) {
+                FiresAnswer::Reply { reply } => assert!(
+                    matches!(reply.outcome, FiresOutcome::Served { next: 1, .. }),
+                    "{reply:?}"
+                ),
+                other => panic!("expected the served reply, got {other:?}"),
+            }
+        }
+        match fires_answer(&[b"not json", other_run.as_slice()]) {
+            FiresAnswer::Unusable { reason } => {
+                assert!(
+                    reason.starts_with("the robot answered about run"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+        match fires_answer(&[other_run.as_slice(), b"not json"]) {
+            FiresAnswer::Unusable { reason } => {
+                assert!(reason.starts_with("fires reply did not parse"), "{reason}");
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
     }
 }

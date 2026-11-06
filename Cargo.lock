@@ -1410,6 +1410,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-test",
+ "zenoh",
 ]
 
 [[package]]
