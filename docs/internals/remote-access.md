@@ -666,10 +666,12 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   the registration bootstrap provision the robot again. That discards the trust
   store, so desks pair again. Keep `<state_root>/robot-registration.json` only
   while the device certificate inside it is still valid, which is 7 days from
-  issue: provisioning verifies that certificate again, and an expired one is
-  refused. After that, remove `robot-registration.json` as well, so the
-  bootstrap runs its first-registration path again; that path needs a current
-  `cerulion login` on the robot. Under netd's robot supervisor, a bootstrap
+  issue (the account service's default, `CaConfig::device_cert_ttl_ns` in
+  `crates/cerulion_accountd/src/ca.rs`): provisioning verifies that
+  certificate again, and an expired one is refused. After that, remove
+  `robot-registration.json` as well, so the bootstrap runs its
+  first-registration path again; that path needs a current `cerulion login`
+  on the robot. Under netd's robot supervisor, a bootstrap
   that gave up needs a `cerulion-netd` restart. A library host restores or
   streams its keys again through its own `KeyProvider`.
 

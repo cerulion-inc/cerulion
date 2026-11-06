@@ -71,6 +71,9 @@ impl NodeEntry for TooDeepRelayEntry {
 }
 
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
+/// The frames in the deep relay's burst: the deepest queue an input can
+/// declare.
+const BURST: usize = 64;
 const VECTOR3: &str = "geometry_msgs/Vector3";
 
 /// A graph of one node whose input `input` reads the app topic `source`
@@ -245,9 +248,11 @@ fn latest_value_input_holds_each_app_frame_in_order(runtime: &mut EmbeddedRuntim
 /// the app publishes a burst of 64, so at least 63 frames wait in the queue
 /// at once (a 16-frame queue would drop the oldest of them). Frame `i`
 /// carries `x = i`, and the relay writes its tick count into `z`, so a lost
-/// frame leaves every later echo with `x` above `z`. The test subscriber's
-/// own queue is shallower than the burst and can drop old echoes, but it
-/// always keeps the newest one, `(64, 64)`.
+/// frame leaves every later echo with `x` above `z`. The test subscriber
+/// creates the echo topic before the start with a 64-frame queue, so it
+/// keeps every echo of the burst and the check covers all 64 of them, not
+/// only the newest one. The relay's publisher opens that existing topic, so
+/// the subscriber keeps its 64-frame buffer.
 fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntime, pid: u32) {
     let app_topic = format!("/app_feed_deep_{pid}/cmd");
     let prefix = format!("app_feed_deep_graph_{pid}");
@@ -260,22 +265,26 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
         "echo",
     );
     let hold = hold_deep_relay();
+    // The earlier steps started the runtime, so the process manager exists.
+    let manager = TransportManager::get().expect("transport manager");
+    let mut echo_config = manager.default_topic_config();
+    echo_config.subscriber_max_buffer_size = BURST;
+    let subscriber = manager
+        .create_subscriber_with_buffers(&echo_topic, echo_config, BURST)
+        .expect("subscribe to the deep relay output with a queue for the whole burst");
     runtime
         .start(&start_config(&graph, &app_topic))
         .expect("a graph that reads an app topic on a 64-deep trigger input starts");
     assert_running_one_node(runtime);
 
-    let subscriber = TransportManager::get()
-        .expect("transport manager")
-        .create_subscriber(&echo_topic)
-        .expect("subscribe to the deep relay output");
-    for i in 1..=64 {
+    let burst = u32::try_from(BURST).expect("the burst fits in a u32");
+    for i in 1..=burst {
         publish_x(runtime, &app_topic, f64::from(i));
     }
     drop(hold);
     let mut echoes = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while echoes.last() != Some(&(64.0, 64.0)) && Instant::now() < deadline {
+    while echoes.len() < BURST && Instant::now() < deadline {
         subscriber
             .wait_for_message(Duration::from_millis(200), |message| {
                 echoes.push(x_and_z(message.payload()));
@@ -291,15 +300,11 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
             })
             .expect("wait for deep relay output");
     }
-    assert_eq!(echoes.last(), Some(&(64.0, 64.0)), "{echoes:?}");
-    assert!(
-        echoes.iter().all(|&(x, z)| x == z),
-        "an echo with x != z means a frame was lost or reordered: {echoes:?}"
-    );
-    assert!(
-        echoes.windows(2).all(|pair| pair[0].1 < pair[1].1),
-        "echoes arrive in tick order: {echoes:?}"
-    );
+    // Every echo of the burst, in tick order: an echo with x != z means a
+    // frame was lost or reordered, and a missing or extra echo shows as a
+    // length difference.
+    let expected: Vec<(f64, f64)> = (1..=burst).map(|i| (f64::from(i), f64::from(i))).collect();
+    assert_eq!(echoes, expected);
     runtime.stop().expect("stop the deep trigger graph");
 }
 
