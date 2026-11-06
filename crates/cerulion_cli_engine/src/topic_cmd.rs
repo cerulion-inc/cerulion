@@ -5830,7 +5830,7 @@ mod tests {
     }
 
     /// `sanitize_display` neutralizes terminal
-    /// control characters — ESC/CSI, CR, LF, BEL, NUL, DEL, C1 controls, the
+    /// control characters, ESC/CSI, CR, LF, BEL, NUL, DEL, C1 controls, the
     /// line and paragraph separators, the bidi controls and every other format
     /// character all become U+FFFD; ordinary UTF-8 (incl. non-ASCII robot
     /// names) is untouched. Hand oracles.

@@ -236,7 +236,7 @@ pub fn tcp_port_open(addr: SocketAddr, timeout: Duration) -> bool {
 
 /// Parse + resolve a zenoh locator (`tcp/host:port`) and probe the resolved
 /// addresses that [`addresses_to_probe`] keeps; reachable when any one
-/// accepts. Unparseable or unresolvable ⇒ `false` (unreachable — it could
+/// accepts. Unparseable or unresolvable ⇒ `false` (unreachable, it could
 /// never be connected anyway). The blocking DNS resolve is bounded only by
 /// this running inside a per-candidate thread under the batch deadline.
 fn probe_locator(locator: &str, timeout: Duration) -> bool {
