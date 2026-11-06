@@ -39,6 +39,13 @@ User reference: docs/rcp.md.
   `(safety class: irreversible)` description suffix and `safety_class` in
   every call result. Receipt lines carry the tool name, not the class.
 - stdout carries only the MCP stream in stdio mode; logs go to stderr.
+- The Jev eye (`src/eye/`) runs on its own `rcp-eye` thread, only under
+  `eyes.jev`; a failed `EyeHost::spawn` leaves the daemon serving. Its receipts
+  share the receipt log's lock with the e-stop's intent receipt. An ask from a
+  replay node (`eye/source.rs`) is dropped first, then the ask bound
+  (`EyeCore::intake`) and `admit` run, all before any receipt or network call;
+  each answer is receipted `eye.jev` before it is published. `Look` has no
+  `Default` or `bool`; the key is sent only in the `Authorization` header.
 
 ## Testing
 
@@ -46,6 +53,8 @@ User reference: docs/rcp.md.
   tests use per-test SHM roots (`init_for_test`) and unique topics;
   `binary_smoke_test.rs` spawns the binary on the default root, so each of its
   manifests names journal topics unique to the test and process.
+- `eye_*_test.rs` run against a local stand-in route (no key, no network);
+  `eye_graph_test.rs` installs the log subscriber, so one test per binary.
 - `tools_test.rs` drives the MCP surface against a stand-in graph thread and
   asserts the exact receipt sequence of each scenario; `binary_smoke_test.rs`
   checks the manifest switches reach the shipped binary.

@@ -75,6 +75,16 @@ remove them before committing.
   error naming the socket, the wait, and the child's death, the "died" vs "still
   booting" discriminator, never a silent multi-second stare. Shipped bounds are
   oracle-pinned (ceiling within a sane band; grace well under the ceiling).
+- **Stdio**: the spawned daemon inherits none of the consumer's streams. stdin is
+  `/dev/null`; stdout and stderr are appended to `<name>.log` beside the socket.
+  The log is mode `0600` and accepted only as a regular, singly linked file owned
+  by the user (a symlink, a FIFO or a hard link is refused, and the daemon then
+  starts with its output discarded). A spawn that finds it at 1 MiB or more
+  renames it to `<name>.log.1` first; a daemon that never exits (a standing
+  gateway) is not rotated while it runs. A consumer's pipes therefore close when
+  the consumer exits, and a readiness wait that fails names the log and quotes
+  its last lines from this start. netd colours its log lines only when stderr is
+  a terminal.
 - **`ChildLiveness`**: an errored `try_wait` neither fail-fasts nor claims the
   child is alive; an unobservable child is treated as unknown.
 - **Binary resolution**: `resolve_netd_bin_from` is a pure ladder over an injected
@@ -398,7 +408,7 @@ rung itself.
 | `crates/cerulion_netd/tests/daemon_e2e_test.rs` | Refcount→mirror wiring over the real UDS with a spy plane: shared mirror, idempotent re-demand, conflict refusal, ensure-failure rollback, close-releases-all, flock singleton, discovery marker on both query verbs | no | none |
 | `crates/cerulion_netd/tests/daemon_idle_exit_e2e_test.rs` | Idle self-exit over the REAL binary: socket unlinked first, no half-dead zombie, client retry binds the respawn | no | daemon binary (built by cargo test) |
 | `crates/cerulion_netd/tests/cli_version_test.rs` | `--version`/`-V` over the REAL binary: the exact `cerulion-netd <version>` line on stdout, empty stderr, exit 0, with no daemon boot | no | daemon binary (built by cargo test) |
-| `crates/cerulion_netd/tests/client_e2e_test.rs` | `NetdClient` demand/release pairing, spawn-readiness wait (first-use line at `INFO`, one stall `WARN` past two seconds, none on a prompt boot), died-vs-booting discriminator, version trust downgrade at the call sites | no (env arms use a file-local mutex) | daemon binary via `CARGO_BIN_EXE` |
+| `crates/cerulion_netd/tests/client_e2e_test.rs` | `NetdClient` demand/release pairing, spawn-readiness wait (first-use line at `INFO`, one stall `WARN` past two seconds, none on a prompt boot), died-vs-booting discriminator, an auto-started daemon holding none of the consumer's pipes (a re-executed consumer process) and a failed start quoting its startup log, version trust downgrade at the call sites | no (env arms use a file-local mutex) | daemon binary via `CARGO_BIN_EXE` |
 | `crates/cerulion_netd/tests/client_egress_e2e_test.rs` | `register_egress` composed through client + daemon + production egress plane really egresses (no inert shipping) | no | none |
 | `crates/cerulion_netd/tests/mirror_plane_iox2_test.rs` | Production `GatewayMirrorPlane` over real iceoryx2 + zenoh: ensure/release, provenance registered and removed, single-writer slot freed, full demand→release→re-demand cycle | no | none |
 | `crates/cerulion_netd/tests/mirror_restart_e2e_test.rs` | A held demand self-heals across a robot gateway restart, with no client re-demand needed | no | none |

@@ -181,7 +181,16 @@ fn status_needs_no_login_and_writes_nothing() {
     );
     assert!(!keyed.stdout.contains(NO_KEY), "{}", keyed.stdout);
     assert!(!home.path().join("telemetry.json").exists());
+    assert!(
+        out.stdout.contains(&format!("what is sent: {DETAILS}")),
+        "status links the page that describes what is sent: {}",
+        out.stdout
+    );
 }
+
+/// The short address of the page that describes what is sent; the notice
+/// and `cerulion telemetry status` both print it.
+const DETAILS: &str = "https://cerulion.com/telemetry";
 
 #[test]
 fn off_then_on_persist_in_the_consent_file() {
@@ -300,6 +309,11 @@ fn the_notice_is_one_short_line() {
     assert_eq!(lines.len(), 1, "{}", first.stderr);
     assert!(lines[0].chars().count() <= 120, "{:?}", lines[0]);
     assert!(
+        lines[0].contains("`cerulion telemetry off`") && lines[0].contains(DETAILS),
+        "the notice names the off switch and links what is sent: {:?}",
+        lines[0]
+    );
+    assert!(
         !first.stderr.contains("\n\n"),
         "no blank line follows the notice: {:?}",
         first.stderr
@@ -377,6 +391,50 @@ fn a_ci_run_sends_without_a_notice_under_the_random_id_and_leaves_the_notice_owe
         tty.stderr
     );
     assert_nothing_sent(&sink, "the notice run sends nothing");
+}
+
+/// The join a first login makes: events sent before it under the random id
+/// are personless (`$process_person_profile: false`), and the login's
+/// `$create_alias` names that same id under the account and is itself not
+/// personless, so the analytics backend links the earlier events to the
+/// account's person.
+#[test]
+fn events_sent_before_a_first_login_are_named_by_its_alias() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let issuer = issuer(sub);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", issuer.url.as_str()),
+    ];
+    cerulion_piped(home.path(), &env, &["graph", "list"]);
+    let before = events_sent(&sink);
+    let run = the_one(&before, "cli_command_run");
+    let anon = run["distinct_id"]
+        .as_str()
+        .expect("a distinct id")
+        .to_owned();
+    assert!(anon.starts_with("anon:"), "{before:?}");
+    assert_eq!(
+        run["properties"]["$process_person_profile"], false,
+        "{before:?}"
+    );
+
+    let out = cerulion_piped(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    let events = events_sent(&sink);
+    let alias = the_one(&events, "$create_alias");
+    assert_eq!(alias["distinct_id"], sub, "{events:?}");
+    assert_eq!(
+        alias["properties"]["alias"], anon,
+        "the alias names the id the earlier events were sent under: {events:?}"
+    );
+    assert!(
+        alias["properties"].get("$process_person_profile").is_none(),
+        "a personless alias would merge nothing: {alias}"
+    );
 }
 
 #[test]

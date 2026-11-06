@@ -363,7 +363,10 @@ fn verb_registry(
             sessions,
             clock,
         )))
-        .register(engage_estop);
+        .register(engage_estop)
+        .register(Box::new(crate::robot_settings::CloudAccessVerb::new(
+            shared.clone(),
+        )));
     verbs
 }
 
@@ -457,6 +460,7 @@ mod verb_set_tests {
         });
         let expected = [
             "claim",
+            "cloud-access",
             "code-pair-finish",
             "code-pair-start",
             "engage-estop",
