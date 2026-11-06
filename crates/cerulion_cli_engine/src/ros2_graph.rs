@@ -439,11 +439,7 @@ impl Ros2Children {
         match (result, failure) {
             (Ok(()), Some(msg)) => Err(CliError::Validation(msg)),
             (
-                Err(
-                    e @ (CliError::NodeFatal { .. }
-                    | CliError::WorkerNodeFatal { .. }
-                    | CliError::WorkerNodeFatalAnnounced),
-                ),
+                Err(e @ (CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. })),
                 Some(msg),
             ) => {
                 tracing::error!(graph = %self.graph, fatal = %e, "node fatal stop (the ros2 entry failure below decides the exit status)");

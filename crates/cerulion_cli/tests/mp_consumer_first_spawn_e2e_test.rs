@@ -17,9 +17,7 @@
 //!   `c_snap` sits at global level 0, tying `prod`'s level.
 //! * group `main` (listed second) holds `prod`
 //!   (`test_node_macro_period_cdylib`, output `cmd`) + FOUR data-trigger
-//!   forwarders `dt0..dt3` (`test_node_macro_data_trigger_cdylib`, level 1),
-//!   each declaring `isolate: false`, so `main` is ONE executor unit and the
-//!   producer worker's local view below holds every forwarder.
+//!   forwarders `dt0..dt3` (`test_node_macro_data_trigger_cdylib`, level 1).
 //!
 //! `spawn_order` sorts by (min owned global level, rank); both groups' min
 //! level is 0, and rank = `process_groups:` listing order — so the tie-break
@@ -298,15 +296,10 @@ fn build_workspace(root: &Path, prefix: &str) {
          \x20 - name: cmd\n\
          \x20\x20\x20 schema: geometry_msgs/Vector3\n",
     );
-    // Each `dt` declares `isolate: false`, so it shares `prod`'s executor unit
-    // and `main` runs as ONE unit: the arithmetic above counts the producer
-    // worker's LOCAL subgraph view, and with no profile each fan-out consumer
-    // would otherwise be a unit of its own, outside that view.
     for i in 0..DT_CONSUMERS {
         yaml.push_str(&format!(
             "- id: dt{i}\n\
              \x20 type: dt\n\
-             \x20 isolate: false\n\
              \x20 inputs:\n\
              \x20 - name: trigger_in\n\
              \x20\x20\x20 source: prod/cmd\n\

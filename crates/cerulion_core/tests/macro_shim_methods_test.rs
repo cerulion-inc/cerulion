@@ -105,7 +105,7 @@ fn shim_methods_reach_runtime_clock_and_shutdown_signal() {
         identity: "shim_methods".to_string(),
         prefix: "shim_methods".to_string(),
         nodes: vec![NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),

@@ -1497,13 +1497,7 @@ fn in_memory_and_written_block_partitions_are_identical() {
 #[test]
 fn the_preflight_reads_no_file_and_holds_the_callers_bytes() {
     let src = std::fs::read_to_string("src/partition_emit.rs").expect("readable");
-    let wrapper = code_only(fn_body(&src, "pub fn run_auto_partition_preflight("));
-    assert!(
-        wrapper.contains("run_auto_partition_preflight_with("),
-        "the preflight must delegate to `run_auto_partition_preflight_with`, whose body \
-         is pinned below\n{wrapper}"
-    );
-    let body = code_only(fn_body(&src, "pub fn run_auto_partition_preflight_with("));
+    let body = code_only(fn_body(&src, "pub fn run_auto_partition_preflight("));
 
     for spelling in ["read_to_string", "fs::read(", "graph_read"] {
         assert!(

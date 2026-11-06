@@ -88,7 +88,7 @@ fn macro_sync_with_two_yaml_wired_inputs_builds_successfully() {
         prefix: "msyw".to_string(),
         nodes: vec![
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -112,7 +112,7 @@ fn macro_sync_with_two_yaml_wired_inputs_builds_successfully() {
                 ],
             },
             NodeDef {
-                isolate: None,
+                fuse: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fuser".to_string(),
@@ -177,7 +177,7 @@ fn macro_sync_with_zero_yaml_wired_inputs_fails_to_build_with_diagnostic() {
         identity: "macro_sync_no_inputs".to_string(),
         prefix: "msni".to_string(),
         nodes: vec![NodeDef {
-            isolate: None,
+            fuse: None,
             params: Default::default(),
             ros2: None,
             id: "fuser".to_string(),

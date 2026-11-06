@@ -265,7 +265,7 @@ fn credit_ns(tag: &str) -> String {
 /// One node's `NodeDef`.
 fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
-        isolate: None,
+        fuse: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
