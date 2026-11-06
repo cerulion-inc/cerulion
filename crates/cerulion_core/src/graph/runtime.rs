@@ -3404,6 +3404,13 @@ pub struct GraphRuntime {
     /// producer-reconnect LivelinessEvent; the ≤100µs timer backstop
     /// keeps correctness in that case.)
     doorbell_registry: Option<crate::doorbell::DoorbellRegistry>,
+    /// The park's doorbell baseline buffer, sized at build to the registry and
+    /// refilled from it at each [`Self::monitor_wait_block`] entry
+    /// (`DoorbellRegistry::snapshot_into`), so a park entry reads the ring
+    /// counters without an allocation. A `Mutex` because `monitor_wait_block`
+    /// takes `&self`; only the live-loop thread takes it, so it is never
+    /// contended.
+    doorbell_baseline: std::sync::Mutex<Vec<u64>>,
     /// The registry's first topic when a kernel wake may arm on it, `None`
     /// otherwise. The registry spans data-trigger AND sync-input topics, so a
     /// sync input can hold the armed line. `None` covers a graph every one of
@@ -9335,6 +9342,9 @@ impl GraphRuntime {
             // The resolved monitor-wait/doorbell policy + the
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
+            doorbell_baseline: std::sync::Mutex::new(Vec::with_capacity(
+                doorbell_registry.as_ref().map_or(0, |r| r.len()),
+            )),
             doorbell_registry,
             doorbell_armed_topic,
             producer_doorbells_armed,
@@ -13806,23 +13816,31 @@ impl GraphRuntime {
         // held FIXED: the doorbell counters are RELATIVE, so only deltas from
         // this baseline matter. NEVER re-snapshot inside the loop — that would
         // absorb (lose) a ring that landed since.
-        let baseline: Option<Vec<u64>> = if self.monitor_wait_policy.doorbell() {
-            self.doorbell_registry.as_ref().map(|r| r.snapshot_all())
-        } else {
-            None
+        // It is read into the buffer sized at build, which this thread alone
+        // locks for the whole park.
+        let mut baseline_buf = self
+            .doorbell_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let baseline: Option<&[u64]> = match self.doorbell_registry.as_ref() {
+            Some(reg) if self.monitor_wait_policy.doorbell() => {
+                reg.snapshot_into(&mut baseline_buf);
+                Some(baseline_buf.as_slice())
+            }
+            _ => None,
         };
         // The armed line's pre-park value: the `expected` the hardware monitor
         // re-checks against, read at the slot taken with the address above.
         let primary_expected: Option<u64> =
-            armed_line.and_then(|(_, slot)| baseline.as_ref().and_then(|b| b.get(slot).copied()));
+            armed_line.and_then(|(_, slot)| baseline.and_then(|b| b.get(slot).copied()));
 
         // The direction-B park baseline — for each MAPPED
         // `block` edge this process produces on, was it AT OR OVER threshold as
         // we went to park, and what was the credit word's wake epoch then?
         //
         // Stored IN the edge rather than in a per-park `Vec`, so an idle park
-        // allocates nothing (the sibling doorbell baseline is a known
-        // hot-path-alloc; this one deliberately is not). Single-writer: only
+        // allocates nothing (the sibling doorbell baseline refills a buffer
+        // sized at build for the same reason). Single-writer: only
         // the live-loop thread runs this, and the atomics are here because
         // `monitor_wait_block` takes `&self`.
         //
@@ -13954,7 +13972,7 @@ impl GraphRuntime {
             // wake signal) — never the iceoryx2 SHM message queue. The sample is
             // still read by `step()`/`drain_level`; this only changes WHEN we
             // step. Non-allocating (`any_advanced_since`, no per-recheck Vec).
-            if let (Some(reg), Some(base)) = (self.doorbell_registry.as_ref(), baseline.as_ref()) {
+            if let (Some(reg), Some(base)) = (self.doorbell_registry.as_ref(), baseline) {
                 if reg.any_advanced_since(base) {
                     doorbell_got = true;
                 }
@@ -14285,7 +14303,7 @@ impl GraphRuntime {
                 if !kernel_blocked {
                     let cap = pace_slice
                         .min(park_deadline.saturating_duration_since(std::time::Instant::now()));
-                    let outcome = self.doorbell_wake_word_block(baseline.as_deref(), cap);
+                    let outcome = self.doorbell_wake_word_block(baseline, cap);
                     if outcome.performed() {
                         kernel_blocked = true;
                         if outcome.parked() {

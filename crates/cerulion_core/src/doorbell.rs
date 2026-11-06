@@ -2032,6 +2032,15 @@ impl DoorbellRegistry {
         self.doorbells.iter().map(Doorbell::seq).collect()
     }
 
+    /// [`snapshot_all`](Self::snapshot_all) into a caller's buffer: `out` is
+    /// cleared and refilled in topic order, and once its capacity covers the
+    /// registry the refill allocates nothing. The live loop's park entry takes
+    /// its baseline through this.
+    pub fn snapshot_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(self.doorbells.iter().map(Doorbell::seq));
+    }
+
     /// `true` iff ANY doorbell's ring count differs from the parallel `baseline`
     /// snapshot (a prior [`snapshot_all`](Self::snapshot_all)). The
     /// non-allocating poll-all the runtime's park loop uses to detect a ring on
@@ -2477,6 +2486,36 @@ mod tests {
     }
 
     // ---- lifecycle (real SHM): create → ring → observe → drop-unlinks ----
+
+    /// The park entry's baseline read: `snapshot_into` refills the caller's
+    /// buffer with exactly what `snapshot_all` returns, stale content cleared,
+    /// and a buffer already sized to the registry keeps its allocation.
+    #[test]
+    fn snapshot_into_refills_a_sized_buffer_in_place() {
+        let ns = test_ns("snap_into");
+        let topics = vec!["/a".to_string(), "/b".to_string()];
+        let reg = DoorbellRegistry::open(&ns, &topics).expect("registry open");
+        let ringer = Doorbell::open_unowned(&ns, "/b").expect("ringer open");
+        ringer.ring();
+        let mut out = Vec::with_capacity(reg.len());
+        out.push(u64::MAX);
+        let buffer = out.as_ptr();
+        reg.snapshot_into(&mut out);
+        assert_eq!(
+            out,
+            reg.snapshot_all(),
+            "the same counters in the same order"
+        );
+        assert_eq!(
+            out.as_ptr(),
+            buffer,
+            "a buffer sized to the registry is refilled in place, so the park entry \
+             allocates nothing"
+        );
+        drop(ringer);
+        drop(reg);
+        cleanup(&ns, &["/a", "/b"]);
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
