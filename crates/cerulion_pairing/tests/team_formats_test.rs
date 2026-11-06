@@ -93,6 +93,7 @@ fn bundle(generation: u8, robots: Vec<Vec<u8>>) -> TeamTrustBundle {
         generation: generation as u32,
         issued_at_ns: ISSUED,
         issuing_ca_der: ca_der(generation),
+        next_ca_der: ca_der(generation + 1),
         retired: (1..generation)
             .rev()
             .map(|g| RetiredGeneration {
@@ -885,6 +886,8 @@ fn oracle_bundle_payload(b: &TeamTrustBundle) -> Vec<u8> {
     o.extend_from_slice(&b.issued_at_ns.to_le_bytes());
     o.extend_from_slice(&le32(b.issuing_ca_der.len()));
     o.extend_from_slice(&b.issuing_ca_der);
+    o.extend_from_slice(&le32(b.next_ca_der.len()));
+    o.extend_from_slice(&b.next_ca_der);
     o.extend_from_slice(&le32(b.retired.len()));
     for r in &b.retired {
         o.extend_from_slice(&r.generation.to_le_bytes());
@@ -1035,6 +1038,20 @@ fn bundle_structure_refusals() {
 
     let mut b = bundle(3, vec![]);
     b.issuing_ca_der = vec![0x30, 0x00];
+    assert!(matches!(check(b), Err(PairingError::TeamCertMalformed(_))));
+
+    // The next CA must be the generation after the current one, of the same team.
+    let rival = issue_team_ca(&TeamShort::new("rival").unwrap(), 4, &ca_key(4), ISSUE_NS).unwrap();
+    for next in [ca_der(3), ca_der(5), ca_der(2), rival] {
+        let mut b = bundle(3, vec![]);
+        b.next_ca_der = next;
+        assert!(matches!(
+            check(b),
+            Err(PairingError::TeamStatementInvalid(_))
+        ));
+    }
+    let mut b = bundle(3, vec![]);
+    b.next_ca_der = vec![0x30, 0x00];
     assert!(matches!(check(b), Err(PairingError::TeamCertMalformed(_))));
 }
 

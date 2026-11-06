@@ -48,6 +48,8 @@ mod guard_wait;
 mod init;
 mod misc;
 mod node;
+#[cfg(any(test, feature = "period-park"))]
+mod period_learner;
 mod pubsub;
 mod services;
 
@@ -236,6 +238,20 @@ pub(crate) fn stamp_sequence_numbers(info: &mut ffi::rmw_message_info_t, publica
     #[cfg(not(cerulion_has_message_info_sequence_numbers))]
     {
         let _ = (info, publication);
+    }
+}
+
+/// Writes the publisher gid of a taken message into `info`: this
+/// implementation's identifier, and in the first 16 bytes of the storage the
+/// gid of the port whose id is `origin` (the received sample's origin,
+/// [`crate::gid::publisher_gid`]), all zero for `None`. The tail (24-byte
+/// storage before Iron) is zero. One helper for all four live take paths.
+#[inline]
+pub(crate) fn stamp_publisher_gid(info: &mut ffi::rmw_message_info_t, origin: Option<u128>) {
+    info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+    info.publisher_gid.data = Default::default();
+    if let Some(origin) = origin {
+        info.publisher_gid.data[..16].copy_from_slice(&crate::gid::publisher_gid(origin));
     }
 }
 
