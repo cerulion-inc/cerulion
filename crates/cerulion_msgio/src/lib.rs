@@ -55,3 +55,67 @@ pub fn checked_walker(schemas: Vec<MessageSchema>) -> Result<FrameWalker, text::
         .map(|(set, _warnings)| set.walker().clone())
         .map_err(|e| text::VerbError::Usage(format!("the schemas do not lay out: {e}")))
 }
+
+/// Schemas built the way `rmw_cerulion` builds a type's schema from its ROS 2
+/// introspection members (`type_bridge::collect_schemas`): each message in
+/// the package of its introspection namespace, each nested member named
+/// with its package, and the hash read off a `LayoutResolver` over the type
+/// and every type it nests (`BridgedMessage::new`).
+#[cfg(test)]
+pub(crate) mod introspection {
+    use cerulion_core::codegen::layout::LayoutResolver;
+    use cerulion_core::codegen::{FieldDef, FieldType, MessageSchema};
+
+    /// The message `package/name` with `members` in declaration order.
+    pub(crate) fn message(
+        package: &str,
+        name: &str,
+        members: Vec<(&str, FieldType)>,
+    ) -> MessageSchema {
+        let mut schema = MessageSchema::new_in_package(name, package);
+        for (field, field_type) in members {
+            schema.add_field(FieldDef::new(field, field_type));
+        }
+        schema
+    }
+
+    /// A member whose type is the message `package/name`.
+    pub(crate) fn nested(package: &str, name: &str) -> FieldType {
+        FieldType::Nested {
+            schema_name: name.to_string(),
+            package: Some(package.to_string()),
+            fixed: None,
+        }
+    }
+
+    /// `std_msgs/Header` and the `builtin_interfaces/Time` it nests.
+    pub(crate) fn header() -> Vec<MessageSchema> {
+        vec![
+            message(
+                "builtin_interfaces",
+                "Time",
+                vec![("sec", FieldType::I32), ("nanosec", FieldType::U32)],
+            ),
+            message(
+                "std_msgs",
+                "Header",
+                vec![
+                    ("stamp", nested("builtin_interfaces", "Time")),
+                    ("frame_id", FieldType::String),
+                ],
+            ),
+        ]
+    }
+
+    /// The schema hash `rmw_cerulion` stamps for `root`, laid out over `set`
+    /// (the root and every type it nests). The bridge refuses a set with
+    /// resolution warnings, so this does too.
+    pub(crate) fn hash(set: Vec<MessageSchema>, root: &str) -> u64 {
+        let (mut resolver, warnings) = LayoutResolver::new(set);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        resolver
+            .layout_of(root)
+            .unwrap_or_else(|| panic!("{root} does not lay out"))
+            .schema_hash
+    }
+}

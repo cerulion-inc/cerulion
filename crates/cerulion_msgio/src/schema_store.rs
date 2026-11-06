@@ -6,6 +6,16 @@
 //! [`MessageSchema`] via the SAME [`parse_rosmsg`] the built-in registry and
 //! codegen use: the package name comes FROM THE PATH (`.msg` text carries no
 //! package), so `schemas/sensor_msgs/msg/Imu.msg` parses as `sensor_msgs/Imu`.
+//!
+//! A nested type written without its package parses bare, and resolving the
+//! set ([`cerulion_core::codegen::resolve_fixed_nested`], which every walker
+//! build runs) writes the package in: a bare `Type` the set holds in the
+//! file's own package becomes `<pkg>/Type`, and a bare `Header` the package
+//! does not define becomes `std_msgs/Header`. That is the name ROS 2
+//! introspection gives the field and `rmw_cerulion` hashes it with. Any other
+//! bare reference (a workspace YAML type, a type the set lacks) keeps its
+//! spelling.
+//!
 //! The nested `<pkg>/msg/` layout is deliberate:
 //!
 //! - it mirrors an ament install prefix, so a robot-local
@@ -201,8 +211,10 @@ impl SchemaStore {
 /// The `.srv` text parses with the same [`parse_rossrv`] codegen uses, so its
 /// two parts are the messages `package/<name>_Request` and
 /// `package/<name>_Response`, the names (and therefore the schema hashes) a
-/// ROS 2 node on `rmw_cerulion` gives them. `Ok(None)` when the file does not
-/// exist; an unreadable or unparsable file is an `Err` naming it.
+/// ROS 2 node on `rmw_cerulion` gives them. Their bare nested references are
+/// qualified when the walker's set is resolved, as a store `.msg` file's are
+/// (see the module doc). `Ok(None)` when the file does not exist; an
+/// unreadable or unparsable file is an `Err` naming it.
 ///
 /// [`parse_rossrv`]: cerulion_core::codegen::parse_rossrv
 pub fn load_store_service(
@@ -328,4 +340,113 @@ fn msg_files(msg_dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::introspection::{hash, header, message, nested};
+    use cerulion_core::codegen::FieldType;
+
+    fn store(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (rel, text) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_bare_nested_type_in_a_store_msg_hashes_as_ros_2_introspection_names_it() {
+        // The oracle is the schema rmw_cerulion builds from the introspection
+        // members of each type: `Level` written in demo_msgs is
+        // `demo_msgs/Level`, a bare `Header` in a package without one is
+        // `std_msgs/Header`, and a bare `Header` in a package that defines
+        // one is that package's.
+        let dir = store(&[
+            ("demo_msgs/msg/Level.msg", "uint8 value\n"),
+            (
+                "demo_msgs/msg/Reading.msg",
+                "Header header\nLevel level\nLevel[] history\ngeometry_msgs/Point at\n",
+            ),
+            ("own_msgs/msg/Header.msg", "uint32 seq\n"),
+            ("own_msgs/msg/Tagged.msg", "Header header\n"),
+        ]);
+        let walker = crate::checked_walker(crate::store_schemas(Some(dir.path()))).unwrap();
+        let float = |axis| (axis, FieldType::F64);
+        let mut reading = header();
+        reading.extend([
+            message("demo_msgs", "Level", vec![("value", FieldType::U8)]),
+            message(
+                "geometry_msgs",
+                "Point",
+                vec![float("x"), float("y"), float("z")],
+            ),
+            message(
+                "demo_msgs",
+                "Reading",
+                vec![
+                    ("header", nested("std_msgs", "Header")),
+                    ("level", nested("demo_msgs", "Level")),
+                    (
+                        "history",
+                        FieldType::DynamicArray {
+                            element_type: Box::new(nested("demo_msgs", "Level")),
+                        },
+                    ),
+                    ("at", nested("geometry_msgs", "Point")),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            walker.schema_hash_for("demo_msgs/Reading"),
+            Some(hash(reading, "demo_msgs/Reading"))
+        );
+        let tagged = vec![
+            message("own_msgs", "Header", vec![("seq", FieldType::U32)]),
+            message(
+                "own_msgs",
+                "Tagged",
+                vec![("header", nested("own_msgs", "Header"))],
+            ),
+        ];
+        assert_eq!(
+            walker.schema_hash_for("own_msgs/Tagged"),
+            Some(hash(tagged, "own_msgs/Tagged"))
+        );
+    }
+
+    #[test]
+    fn resolution_qualifies_only_a_bare_reference_its_own_package_defines() {
+        let dir = store(&[
+            (
+                "geometry_msgs/msg/PoseLabel.msg",
+                "Pose pose\nstring label\n",
+            ),
+            (
+                "demo_msgs/msg/Wrap.msg",
+                "Elsewhere one\nElsewhere[] more\n",
+            ),
+        ]);
+        let walker = crate::checked_walker(crate::store_schemas(Some(dir.path()))).unwrap();
+        let reference = |qualified: &str, field: usize| {
+            let mut field_type =
+                &walker.schema_for_name(qualified).unwrap().fields[field].field_type;
+            while let FieldType::DynamicArray { element_type } = field_type {
+                field_type = element_type;
+            }
+            match field_type {
+                FieldType::Nested { package, .. } => package.clone(),
+                other => panic!("{qualified} field {field} is {other:?}"),
+            }
+        };
+        assert_eq!(
+            reference("geometry_msgs/PoseLabel", 0).as_deref(),
+            Some("geometry_msgs"),
+            "a built-in type of the file's own package"
+        );
+        assert_eq!(reference("demo_msgs/Wrap", 0), None);
+        assert_eq!(reference("demo_msgs/Wrap", 1), None);
+    }
 }

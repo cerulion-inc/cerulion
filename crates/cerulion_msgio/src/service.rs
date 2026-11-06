@@ -14,7 +14,8 @@
 //! call on the same id matches no later one. The request and response types
 //! are the two parts of the service's `.srv` file, `<pkg>/<Name>_Request` and
 //! `<pkg>/<Name>_Response`, read from the workspace store
-//! (`schemas/<pkg>/srv/<Name>.srv`). A field-less part, and every field-less
+//! (`schemas/<pkg>/srv/<Name>.srv`), each nested type named with its package
+//! as ROS 2 introspection names it. A field-less part, and every field-less
 //! message they use, gets the one `uint8` member ROS 2's IDL generation adds
 //! ([`MEMBER_PLACEHOLDER`]), which `rmw_cerulion` lays out and hashes as a
 //! field.
@@ -535,6 +536,87 @@ mod tests {
                 "{part}"
             );
         }
+    }
+
+    #[test]
+    fn a_bare_nested_type_in_a_srv_hashes_as_ros_2_introspection_names_it() {
+        // ROS 2 reads `Level`, `Span` and `Item`, written without a package
+        // in demo_msgs' files, as `demo_msgs/Level`, `demo_msgs/Span` and
+        // `demo_msgs/Item`; the oracle is the schema rmw_cerulion builds from
+        // those introspection members, nested types included. `Span` is fixed,
+        // so its own `Level` members reach the request hash.
+        use crate::introspection::{hash, message, nested};
+        use cerulion_core::codegen::FieldType;
+        let dir = store(&[
+            ("demo_msgs/msg/Level.msg", "uint8 value\n"),
+            ("demo_msgs/msg/Span.msg", "Level lo\nLevel hi\n"),
+            ("demo_msgs/msg/Item.msg", "string name\nLevel level\n"),
+            (
+                "demo_msgs/srv/ListItems.srv",
+                "Level min\nSpan span\n---\nItem[] items\nItem first\nLevel[2] range\n",
+            ),
+        ]);
+        let types =
+            resolve_store_service_types("demo_msgs/srv/ListItems", Some(dir.path())).unwrap();
+        let level = || message("demo_msgs", "Level", vec![("value", FieldType::U8)]);
+        let span = message(
+            "demo_msgs",
+            "Span",
+            vec![
+                ("lo", nested("demo_msgs", "Level")),
+                ("hi", nested("demo_msgs", "Level")),
+            ],
+        );
+        let item = message(
+            "demo_msgs",
+            "Item",
+            vec![
+                ("name", FieldType::String),
+                ("level", nested("demo_msgs", "Level")),
+            ],
+        );
+        let request = message(
+            "demo_msgs",
+            "ListItems_Request",
+            vec![
+                ("min", nested("demo_msgs", "Level")),
+                ("span", nested("demo_msgs", "Span")),
+            ],
+        );
+        let response = message(
+            "demo_msgs",
+            "ListItems_Response",
+            vec![
+                (
+                    "items",
+                    FieldType::DynamicArray {
+                        element_type: Box::new(nested("demo_msgs", "Item")),
+                    },
+                ),
+                ("first", nested("demo_msgs", "Item")),
+                (
+                    "range",
+                    FieldType::FixedArray {
+                        element_type: Box::new(nested("demo_msgs", "Level")),
+                        length: 2,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            types.walker.schema_hash_for("demo_msgs/ListItems_Request"),
+            Some(hash(
+                vec![level(), span, request],
+                "demo_msgs/ListItems_Request"
+            ))
+        );
+        assert_eq!(
+            types.walker.schema_hash_for("demo_msgs/ListItems_Response"),
+            Some(hash(
+                vec![level(), item, response],
+                "demo_msgs/ListItems_Response"
+            ))
+        );
     }
 
     #[test]
