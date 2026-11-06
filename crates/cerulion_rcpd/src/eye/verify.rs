@@ -10,17 +10,24 @@
 //!    One receipt joins one answer.
 //! 3. Every answer names an ask the recording holds, and its `ask_sha256`
 //!    is the SHA-256 of a recorded ask with that `ask_id`.
-//! 4. Every `late` receipt follows a `timeout` answer with the same request.
+//! 4. Every `late` receipt for a request that an answer in the recording
+//!    names follows a `timeout` answer with that request. The receipt log
+//!    is shared by every run, so a `late` receipt for a request no answer in
+//!    the recording names is another recording's, and is neither checked
+//!    nor counted.
 //! 5. Where the recording holds the frame an answer sent, the image's
 //!    SHA-256 and the request body's SHA-256 recompute from the frame and
-//!    the answer's recorded model, state and questions. An answer that sent
-//!    a request but does not record its frame, model, state or questions
-//!    fails.
+//!    the answer's recorded model, state and questions. Each publisher
+//!    numbers its frames from zero, so a recording can hold several frames
+//!    with the answer's sequence number (two cameras, or one that
+//!    restarted); the check passes when one of them is the image sent. An
+//!    answer that sent a request but does not record its frame, model,
+//!    state or questions fails.
 //!
 //! Asks without an answer are counted, not failed: a recording can stop
 //! between an ask and its answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use cerud::receipt::{read_all, ReceiptOutcome};
@@ -63,7 +70,7 @@ pub struct EyeBagReport {
     pub joined: usize,
     /// Asks with no answer in the recording.
     pub unanswered: usize,
-    /// `late` receipts.
+    /// `late` receipts for requests the recording's answers name.
     pub late: usize,
     /// Answers whose request was recomputed from the recorded frame.
     pub requests_checked: usize,
@@ -132,6 +139,8 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
     }
     let mut answered: BTreeMap<String, usize> = BTreeMap::new();
     let mut timeouts: BTreeMap<String, usize> = BTreeMap::new();
+    // The requests the recording's answers name.
+    let mut requests: BTreeSet<String> = BTreeSet::new();
     for (seq, text) in &answers {
         let Ok(answer) = serde_json::from_str::<Value>(text) else {
             report
@@ -149,6 +158,9 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
                 .push(format!("answer to ask {id} carries no digest"));
             continue;
         };
+        if let Some(request) = request {
+            requests.insert(request.to_owned());
+        }
         let key = (digest.to_owned(), outcome.to_owned());
         match pool.get_mut(&key) {
             Some(n) if *n > 0 => {
@@ -180,7 +192,7 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
         }
         check_request(&answer, &images, &mut report);
     }
-    for digest in late {
+    for digest in late.into_iter().filter(|d| requests.contains(d)) {
         report.late += 1;
         match timeouts.get_mut(&digest) {
             Some(n) if *n > 0 => *n -= 1,
@@ -201,11 +213,12 @@ pub fn verify_bag(bag: &Path, receipts: &Path, topics: &EyeTopics) -> Result<Eye
 }
 
 /// Recompute the image and request digests of `answer` from the recorded
-/// frame it names, when it sent a request and the recording holds that
-/// frame. [`EyeBagReport::requests_checked`] counts the requests whose
-/// digests were recomputed; each failure goes to
+/// frame it names, when it sent a request and the recording holds a frame
+/// with that number: the one whose SHA-256 is the answer's `image_sha256`,
+/// else the last recorded. [`EyeBagReport::requests_checked`] counts the
+/// requests whose digests were recomputed; each failure goes to
 /// [`EyeBagReport::problems`].
-fn check_request(answer: &Value, images: &BTreeMap<u32, Vec<u8>>, report: &mut EyeBagReport) {
+fn check_request(answer: &Value, images: &BTreeMap<u32, Vec<Vec<u8>>>, report: &mut EyeBagReport) {
     let Some(request) = answer.get("request_sha256").and_then(Value::as_str) else {
         return;
     };
@@ -221,7 +234,13 @@ fn check_request(answer: &Value, images: &BTreeMap<u32, Vec<u8>>, report: &mut E
         ));
         return;
     };
-    let Some(image) = images.get(&seq) else {
+    let sent = answer.get("image_sha256").and_then(Value::as_str);
+    let recorded = images.get(&seq).map(Vec::as_slice).unwrap_or_default();
+    let Some(image) = recorded
+        .iter()
+        .find(|image| sent == Some(sha256_hex(image).as_str()))
+        .or_else(|| recorded.last())
+    else {
         return;
     };
     let field = |name: &str| answer.get(name).filter(|v| !v.is_null());
@@ -236,7 +255,7 @@ fn check_request(answer: &Value, images: &BTreeMap<u32, Vec<u8>>, report: &mut E
     let image_sha256 = sha256_hex(image);
     let body = request_body(model, state, questions, image);
     report.requests_checked += 1;
-    if answer.get("image_sha256").and_then(Value::as_str) != Some(image_sha256.as_str()) {
+    if sent != Some(image_sha256.as_str()) {
         report.problems.push(format!(
             "answer to ask {id}: the recorded frame {seq} is not the image it sent"
         ));

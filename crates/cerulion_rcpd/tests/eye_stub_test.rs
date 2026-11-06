@@ -36,10 +36,13 @@ fn core(dir: &Path, base_url: &str) -> (EyeCore, Arc<JevClient>) {
     (EyeCore::new(Arc::new(settings), Instant::now()), client)
 }
 
+/// The wrist camera's publisher id in [`frames`].
+const CAMERA: u128 = 0x5eed;
+
 fn frames() -> FrameStore {
     let mut store = FrameStore::default();
-    store.push(1, &jpeg_header_for_test(640, 480, 2_000));
-    store.push(2, &jpeg_header_for_test(1280, 720, 2_000));
+    store.push(CAMERA, 1, &jpeg_header_for_test(640, 480, 2_000));
+    store.push(CAMERA, 2, &jpeg_header_for_test(1280, 720, 2_000));
     store
 }
 
@@ -488,6 +491,14 @@ async fn off_no_key_a_bad_ask_and_a_bad_frame_never_reach_the_network() {
         answer(core.admit(&ask(2, 0, 7, 1_500), now, now, later, &store)),
         (Outcome::Refused, String::from("frame_not_held"))
     );
+    // A number two publishers' held frames carry: refused at once, and
+    // neither frame is sent.
+    let mut two_cameras = frames();
+    two_cameras.push(CAMERA + 1, 1, &jpeg_header_for_test(640, 480, 3_000));
+    assert_eq!(
+        answer(core.admit(&ask(9, 0, 1, 1_500), now, now, now, &two_cameras)),
+        (Outcome::Refused, String::from("frame_ambiguous"))
+    );
     // A free-form ask.
     let prompt = json!({ "ask_id": 3, "question_set": "press", "frame": { "topic": "/stub/wrist/image", "seq": 1 }, "prompt": "describe the room" });
     assert_eq!(
@@ -573,6 +584,29 @@ async fn the_deadline_is_the_budget_from_the_wire_time_inside_the_window_else_fr
     assert_eq!(
         (late.outcome, late.detail.as_deref()),
         (Outcome::Timeout, Some("deadline_before_send"))
+    );
+    // A deadline above `timeout_ms` is held to it.
+    let sent = ask_sent(behind(200), now_ns, now);
+    let Admit::Send(dispatch) = core.admit(&ask(5, 0, 1, 60_000), sent, now, now, &frames()) else {
+        panic!("the request is sent");
+    };
+    assert_eq!(dispatch.deadline, now - ms(200) + budget);
+    drop(dispatch);
+    // An ask without a deadline gets the section's `timeout_ms`, which is
+    // the default budget when the section leaves it out.
+    let no_deadline = json!({
+        "ask_id": 6,
+        "question_set": "press",
+        "frame": { "topic": "/stub/wrist/image", "seq": 1 },
+        "numbers": { "case": 0 },
+    })
+    .to_string();
+    let Admit::Send(dispatch) = core.admit(&no_deadline, sent, now, now, &frames()) else {
+        panic!("the request is sent");
+    };
+    assert_eq!(
+        dispatch.deadline,
+        now - ms(200) + Duration::from_millis(cerulion_rcpd::eye::limits::TIMEOUT_MS)
     );
 }
 

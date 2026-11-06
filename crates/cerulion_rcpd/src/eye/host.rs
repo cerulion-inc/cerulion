@@ -3,7 +3,12 @@
 //!
 //! The thread owns its transport ports (they stay on the thread that made
 //! them): a subscriber on the ask topic, a subscriber on the frame topic and
-//! a publisher on the answer topic. It is separate from the journal thread:
+//! a publisher on the answer topic. The ask and frame topics belong to the
+//! graph, whose nodes publish them, and the graph sets their depth when it
+//! creates them: the eye opens each only once it exists and never creates
+//! it, trying again every [`OPEN_RETRY`] until it can, so a daemon started
+//! before the graph leaves both to the graph. The eye creates the answer
+//! topic, which it publishes. It is separate from the journal thread:
 //! no look runs on it, and a request on the network holds nothing the
 //! journal or the tools take. Its receipts go to the tools' receipt log and
 //! take the same lock as the e-stop's intent receipt, which is written
@@ -109,6 +114,10 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How long the loop sleeps when nothing happened.
 const IDLE: Duration = Duration::from_millis(1);
+
+/// How often the eye tries again to open an ask or frame topic the graph has
+/// not created yet.
+pub const OPEN_RETRY: Duration = Duration::from_millis(10);
 
 /// How often, at most, the status file is rewritten for asks dropped
 /// without an answer.
@@ -243,36 +252,60 @@ impl EyeSettings {
 /// One frame held from the frame topic.
 #[derive(Debug, Clone)]
 pub struct HeldFrame {
+    /// The id of the publisher that sent it.
+    pub origin: u128,
     /// The frame's wire sequence number.
     pub seq: u32,
     /// The JPEG bytes, or the size of a frame too large to send.
     pub data: Result<Vec<u8>, usize>,
 }
 
-/// The newest [`FRAMES_HELD`] frames.
+/// The newest [`FRAMES_HELD`] frames, each filed under its publisher and its
+/// sequence number. Each publisher numbers its own frames from zero, so two
+/// publishers on the frame topic, or a camera that restarted, can each have
+/// a held frame with one sequence number.
 #[derive(Debug, Clone, Default)]
 pub struct FrameStore {
     frames: VecDeque<HeldFrame>,
 }
 
+/// What [`FrameStore::get`] finds for a sequence number.
+#[derive(Debug, Clone, Copy)]
+pub enum FrameLookup<'a> {
+    /// One held frame has the number.
+    Held(&'a HeldFrame),
+    /// No held frame has it.
+    Missing,
+    /// Frames from more than one publisher have it: an ask naming it is
+    /// refused (`frame_ambiguous`), and no frame is sent.
+    Ambiguous,
+}
+
 impl FrameStore {
-    /// Keep the frame with `seq`, dropping the oldest past [`FRAMES_HELD`].
-    pub fn push(&mut self, seq: u32, data: &[u8]) {
-        self.frames.retain(|f| f.seq != seq);
+    /// Keep the frame `seq` from the publisher `origin`, replacing that
+    /// publisher's frame with the same number and dropping the oldest past
+    /// [`FRAMES_HELD`].
+    pub fn push(&mut self, origin: u128, seq: u32, data: &[u8]) {
+        self.frames.retain(|f| (f.origin, f.seq) != (origin, seq));
         let data = if data.len() > limits::MAX_IMAGE_BYTES {
             Err(data.len())
         } else {
             Ok(data.to_vec())
         };
-        self.frames.push_back(HeldFrame { seq, data });
+        self.frames.push_back(HeldFrame { origin, seq, data });
         while self.frames.len() > FRAMES_HELD {
             self.frames.pop_front();
         }
     }
 
-    /// The frame with `seq`.
-    pub fn get(&self, seq: u32) -> Option<&HeldFrame> {
-        self.frames.iter().rev().find(|f| f.seq == seq)
+    /// The held frame with `seq`.
+    pub fn get(&self, seq: u32) -> FrameLookup<'_> {
+        let mut held = self.frames.iter().filter(|f| f.seq == seq);
+        match (held.next(), held.next()) {
+            (None, _) => FrameLookup::Missing,
+            (Some(frame), None) => FrameLookup::Held(frame),
+            (Some(_), Some(_)) => FrameLookup::Ambiguous,
+        }
     }
 }
 
@@ -489,8 +522,9 @@ impl EyeCore {
     /// ask's id; the switch (`disabled`); the ask's shape (`malformed`); the
     /// key (`no_credential`); a 429 backoff (`rate_limited`); a spend-limit
     /// hold (`quota`); the deadline (`timeout`); the frame (wait, then
-    /// `refused`); the image and token shape (`refused`); the in-flight and
-    /// rate limits (`throttled`).
+    /// `refused`, or `refused` at once when frames from two publishers carry
+    /// its number); the image and token shape (`refused`); the in-flight
+    /// and rate limits (`throttled`).
     pub fn admit(
         &mut self,
         text: &str,
@@ -541,11 +575,11 @@ impl EyeCore {
         if now >= deadline {
             return answer(Outcome::Timeout, "deadline_before_send");
         }
-        let Some(held) = frames.get(ask.frame.seq) else {
-            if now < received + FRAME_WAIT {
-                return Admit::Wait;
-            }
-            return answer(Outcome::Refused, "frame_not_held");
+        let held = match frames.get(ask.frame.seq) {
+            FrameLookup::Held(held) => held,
+            FrameLookup::Ambiguous => return answer(Outcome::Refused, "frame_ambiguous"),
+            FrameLookup::Missing if now < received + FRAME_WAIT => return Admit::Wait,
+            FrameLookup::Missing => return answer(Outcome::Refused, "frame_not_held"),
         };
         let image = match &held.data {
             Ok(bytes) => bytes,
@@ -663,11 +697,37 @@ impl Drop for EyeHost {
 }
 
 struct Ports {
-    asks: CerulionSubscriber,
+    /// `None` until the graph has created the ask topic.
+    asks: Option<CerulionSubscriber>,
     ask_topic: String,
+    /// `None` without an `eyes.jev` section, and until the graph has created
+    /// the frame topic.
     frames: Option<CerulionSubscriber>,
     frame_topic: String,
+    /// Whether the eye reads a frame topic: it has an `eyes.jev` section.
+    reads_frames: bool,
     answers: CerulionPublisher,
+    /// When the topics not yet open are tried again.
+    retry_at: Instant,
+}
+
+/// A subscriber on the graph topic `topic`, opened without creating it:
+/// `None` while the topic does not exist.
+///
+/// # Errors
+///
+/// The transport error when the topic exists, or its name is not valid, and
+/// two tries to open it fail.
+fn open_graph_topic(
+    manager: &TransportManager,
+    topic: &str,
+) -> Result<Option<CerulionSubscriber>, RcpdError> {
+    match manager.create_subscriber_open_only(topic) {
+        Ok(subscriber) => Ok(Some(subscriber)),
+        Err(_) if manager.data_service_missing(topic) => Ok(None),
+        // Created since the first try, or a failure the second try reports.
+        Err(_) => Ok(Some(manager.create_subscriber_open_only(topic)?)),
+    }
 }
 
 impl Ports {
@@ -676,27 +736,42 @@ impl Ports {
             &settings.answer_topic,
             MaxSliceLen::const_new(MAX_ANSWER_BYTES),
         )?;
-        let asks = manager.create_subscriber(&settings.ask_topic)?;
-        let frames = match &settings.jev {
-            Some(jev) => Some(manager.create_subscriber(&jev.frame_topic)?),
-            None => None,
+        let asks = open_graph_topic(manager, &settings.ask_topic)?;
+        let frame_topic = settings
+            .jev
+            .as_ref()
+            .map(|j| j.frame_topic.clone())
+            .unwrap_or_default();
+        let reads_frames = settings.jev.is_some();
+        let frames = if reads_frames {
+            open_graph_topic(manager, &frame_topic)?
+        } else {
+            None
         };
+        let waiting = [
+            (asks.is_none(), settings.ask_topic.as_str()),
+            (reads_frames && frames.is_none(), frame_topic.as_str()),
+        ];
+        for (_, topic) in waiting.iter().filter(|(missing, _)| *missing) {
+            tracing::info!(
+                topic,
+                "the eye opens this topic once the graph has created it"
+            );
+        }
         Ok(Self {
             asks,
             ask_topic: settings.ask_topic.clone(),
             frames,
-            frame_topic: settings
-                .jev
-                .as_ref()
-                .map(|j| j.frame_topic.clone())
-                .unwrap_or_default(),
+            frame_topic,
+            reads_frames,
             answers,
+            retry_at: Instant::now() + OPEN_RETRY,
         })
     }
 }
 
 /// The counters behind the status file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Counters {
     day: String,
     asks: u64,
@@ -705,6 +780,25 @@ struct Counters {
     dropped_asks: u64,
     limit_reached: bool,
     last_outcome: Option<Outcome>,
+}
+
+impl Counters {
+    /// The counts `saved` records for `today`, so a restarted daemon goes on
+    /// counting the day; zero counts for another day's status file, or none.
+    fn restored(saved: Option<JevStatus>, today: &str) -> Self {
+        match saved {
+            Some(saved) if saved.day == today => Self {
+                day: saved.day,
+                asks: saved.asks_today,
+                looks: saved.looks_today,
+                replay_asks: saved.replay_asks_today,
+                dropped_asks: saved.dropped_asks_today,
+                limit_reached: saved.limit_reached_today,
+                last_outcome: saved.last_outcome.as_deref().and_then(Outcome::parse),
+            },
+            _ => Self::default(),
+        }
+    }
 }
 
 struct EyeLoop {
@@ -734,6 +828,9 @@ struct EyeLoop {
     /// Wrist frames from a replay or an unnamed publisher, not held: loud on
     /// the first and each decade.
     played_frames: FailureRegimeLatch,
+    /// Graph topics that exist but could not be opened: loud once, then
+    /// counted, until one opens.
+    open_failures: FailureRegimeLatch,
     /// Whether the counters changed since the status file was written.
     status_dirty: bool,
     /// When the status file was last written.
@@ -797,14 +894,19 @@ fn give_notice(settings: &EyeSettings, on: bool) {
 }
 
 impl EyeHost {
-    /// Open the ports and start the thread; returns once the ports exist.
-    /// Prints the data notice the region's level calls for. A client that
-    /// cannot be built is logged, and every look is answered `unavailable`.
+    /// Open the ports and start the thread; returns once the answer
+    /// publisher exists and the ask and frame topics the graph has created
+    /// are open (the thread opens the others once they exist). Today's
+    /// counts carry on from the status file. Prints the data notice the
+    /// region's level calls for. A client that cannot be built is logged,
+    /// and every look is answered `unavailable`.
     ///
     /// # Errors
     ///
-    /// [`RcpdError::Transport`] when a port cannot be created,
-    /// [`RcpdError::ObserverSpawn`] when the thread cannot start.
+    /// [`RcpdError::Transport`] when the answer publisher cannot be created
+    /// or an ask or frame topic that exists, or whose name is not valid,
+    /// cannot be opened, [`RcpdError::ObserverSpawn`] when the thread cannot
+    /// start.
     pub fn spawn(
         manager: Arc<TransportManager>,
         settings: EyeSettings,
@@ -842,6 +944,10 @@ impl EyeHost {
                     }
                 };
                 let (done_tx, done_rx) = mpsc::channel();
+                let counters = Counters::restored(
+                    switch::read_status(&settings.state_dir),
+                    &switch::utc_day(SystemTime::now()),
+                );
                 let core = EyeCore::new(Arc::new(settings), Instant::now());
                 let mut eye = EyeLoop {
                     core,
@@ -855,12 +961,13 @@ impl EyeHost {
                     pending: VecDeque::new(),
                     done_tx,
                     done_rx,
-                    counters: Counters::default(),
+                    counters,
                     frame_failures: FailureRegimeLatch::new(),
                     absent_answers: FailureRegimeLatch::new(),
                     ask_flood: FailureRegimeLatch::new(),
                     played_asks: FailureRegimeLatch::new(),
                     played_frames: FailureRegimeLatch::new(),
+                    open_failures: FailureRegimeLatch::new(),
                     status_dirty: false,
                     status_written: None,
                     notice_given,
@@ -885,10 +992,17 @@ impl EyeHost {
 impl EyeLoop {
     fn run(&mut self, stop: &AtomicBool) {
         while !stop.load(Ordering::SeqCst) {
+            self.open_graph_topics(Instant::now());
             let mut busy = self.read_frames();
             let now = Instant::now();
             let now_ns = cerulion_core::real_ns();
-            for ask in drain_stamped_strings(&self.ports.asks, &self.ports.ask_topic) {
+            let asks = self
+                .ports
+                .asks
+                .as_ref()
+                .map(|asks| drain_stamped_strings(asks, &self.ports.ask_topic))
+                .unwrap_or_default();
+            for ask in asks {
                 busy = true;
                 if !self.ask_is_live(ask.origin) {
                     continue;
@@ -930,6 +1044,46 @@ impl EyeLoop {
         }
         if self.status_dirty {
             self.write_status();
+        }
+    }
+
+    /// Open the ask and frame topics not open yet that the graph has
+    /// created since, at most every [`OPEN_RETRY`].
+    fn open_graph_topics(&mut self, now: Instant) {
+        let frames_missing = self.ports.reads_frames && self.ports.frames.is_none();
+        if (self.ports.asks.is_some() && !frames_missing) || now < self.ports.retry_at {
+            return;
+        }
+        self.ports.retry_at = now + OPEN_RETRY;
+        if self.ports.asks.is_none() {
+            let topic = self.ports.ask_topic.clone();
+            self.ports.asks = self.try_open(&topic);
+        }
+        if frames_missing {
+            let topic = self.ports.frame_topic.clone();
+            self.ports.frames = self.try_open(&topic);
+        }
+    }
+
+    /// One try at [`open_graph_topic`] for `topic`, logged.
+    fn try_open(&mut self, topic: &str) -> Option<CerulionSubscriber> {
+        match open_graph_topic(&self.manager, topic) {
+            Ok(Some(subscriber)) => {
+                if let Some(suppressed) = self.open_failures.on_success() {
+                    tracing::info!(suppressed, "graph topics open again");
+                }
+                tracing::info!(topic, "the eye opened a topic the graph created");
+                Some(subscriber)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log_failure(
+                    &mut self.open_failures,
+                    "a topic the graph created could not be opened; trying again",
+                    &e.to_string(),
+                );
+                None
+            }
         }
     }
 
@@ -1005,9 +1159,10 @@ impl EyeLoop {
                 return;
             }
             let seq = message.header().sequence;
+            let origin = message.origin();
             // The store copies the image bytes only when they fit the shape.
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                store.push(seq, CompressedImage::build_reader(payload).data());
+                store.push(origin, seq, CompressedImage::build_reader(payload).data());
             }));
             match read {
                 Ok(()) => {
@@ -1237,8 +1392,10 @@ impl EyeLoop {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{ask_sent, client_for, FrameStore, MAX_WIRE_LAG};
+    use super::{ask_sent, client_for, Counters, FrameLookup, FrameStore, HeldFrame, MAX_WIRE_LAG};
     use crate::eye::limits::MAX_IMAGE_BYTES;
+    use crate::eye::switch::JevStatus;
+    use crate::eye::verdict::Outcome;
 
     #[test]
     fn an_asks_wire_time_is_its_send_time_only_inside_the_window() {
@@ -1261,15 +1418,83 @@ mod tests {
         assert_eq!(ask_sent(u64::MAX, now_ns, now), now);
     }
 
+    /// The frame `store` holds alone under `seq`.
+    fn held(store: &FrameStore, seq: u32) -> &HeldFrame {
+        match store.get(seq) {
+            FrameLookup::Held(frame) => frame,
+            other => panic!("frame {seq}: {other:?}"),
+        }
+    }
+
     #[test]
     fn a_frame_of_exactly_the_byte_limit_is_held_and_one_byte_more_is_not() {
         let mut store = FrameStore::default();
-        store.push(1, &vec![0x20_u8; MAX_IMAGE_BYTES]);
-        store.push(2, &vec![0x20_u8; MAX_IMAGE_BYTES + 1]);
-        let held = store.get(1).expect("frame 1");
-        assert_eq!(held.data.as_ref().map(Vec::len), Ok(200_000));
-        let over = store.get(2).expect("frame 2");
-        assert_eq!(over.data, Err(200_001));
+        store.push(7, 1, &vec![0x20_u8; MAX_IMAGE_BYTES]);
+        store.push(7, 2, &vec![0x20_u8; MAX_IMAGE_BYTES + 1]);
+        assert_eq!(held(&store, 1).data.as_ref().map(Vec::len), Ok(200_000));
+        assert_eq!(held(&store, 2).data, Err(200_001));
+    }
+
+    #[test]
+    fn frames_from_two_publishers_with_one_number_are_never_taken_for_each_other() {
+        let mut store = FrameStore::default();
+        store.push(1, 5, b"camera a, frame 5");
+        store.push(2, 5, b"camera b, frame 5");
+        assert!(matches!(store.get(5), FrameLookup::Ambiguous));
+        store.push(2, 6, b"camera b, frame 6");
+        assert_eq!(
+            held(&store, 6).data.as_deref(),
+            Ok(&b"camera b, frame 6"[..])
+        );
+        assert_eq!(held(&store, 6).origin, 2);
+        // A publisher's own frame with the same number replaces its earlier one.
+        store.push(2, 6, b"camera b, frame 6 again");
+        assert_eq!(
+            held(&store, 6).data.as_deref(),
+            Ok(&b"camera b, frame 6 again"[..])
+        );
+        assert!(matches!(store.get(9), FrameLookup::Missing));
+        // Once camera a's frame 5 leaves the store, camera b's is the one held.
+        for seq in 100..106 {
+            store.push(1, seq, b"camera a, later");
+        }
+        assert_eq!(
+            held(&store, 5).data.as_deref(),
+            Ok(&b"camera b, frame 5"[..])
+        );
+    }
+
+    #[test]
+    fn a_restart_goes_on_counting_the_day_the_status_file_records() {
+        let saved = JevStatus {
+            day: String::from("2026-11-05"),
+            asks_today: 12,
+            looks_today: 9,
+            replay_asks_today: 3,
+            dropped_asks_today: 2,
+            limit_reached_today: true,
+            last_outcome: Some(String::from("rate_limited")),
+            ..JevStatus::default()
+        };
+        let restored = Counters::restored(Some(saved.clone()), "2026-11-05");
+        assert_eq!(
+            restored,
+            Counters {
+                day: String::from("2026-11-05"),
+                asks: 12,
+                looks: 9,
+                replay_asks: 3,
+                dropped_asks: 2,
+                limit_reached: true,
+                last_outcome: Some(Outcome::RateLimited),
+            }
+        );
+        // Another day's file, or none, starts the day at zero.
+        assert_eq!(
+            Counters::restored(Some(saved), "2026-11-06"),
+            Counters::default()
+        );
+        assert_eq!(Counters::restored(None, "2026-11-05"), Counters::default());
     }
 
     #[test]

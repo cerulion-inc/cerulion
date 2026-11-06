@@ -7,8 +7,12 @@
 //!   before the first request leaves.
 //! - An answer whose receipt cannot be written is not published.
 //! - An eye with no client answers every look `unavailable`.
+//! - An eye started before the graph creates neither the ask topic nor the
+//!   frame topic: the graph creates them at its own depth, and the eye opens
+//!   them then and answers.
 //!
-//! One test per binary: it installs the process's log subscriber.
+//! The first test installs the process's log subscriber and reads every
+//! line; the second runs with no key on file, so it logs no data notice.
 
 mod eye_common;
 
@@ -83,8 +87,10 @@ struct Gate {
 }
 
 impl Gate {
+    /// The gate's ports, once the eye subscribes to the frame and ask
+    /// topics.
     fn open(mgr: &TransportManager, jev: &JevConfig) -> Self {
-        Self {
+        let gate = Self {
             frames: mgr
                 .create_publisher_simple(&jev.frame_topic, MaxSliceLen::const_new(512 * 1024))
                 .expect("frame publisher"),
@@ -95,7 +101,10 @@ impl Gate {
                 .create_subscriber(&jev.answer_topic)
                 .expect("answer subscriber"),
             frame_topic: jev.frame_topic.clone(),
-        }
+        };
+        eye_common::wait_for_subscribers(mgr, &jev.frame_topic, 1);
+        eye_common::wait_for_subscribers(mgr, &jev.ask_topic, 1);
+        gate
     }
 
     fn publish_frame(&mut self) -> u32 {
@@ -269,8 +278,14 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
 
         // A flood of 1,000 asks with Jev off: each answered ask is
         // `disabled` at once, and only the ask bound's worth are answered
-        // and receipted.
+        // and receipted. One ask is answered first, so the eye reads the ask
+        // topic and the gate the answer topic before the flood is counted.
         write_switch(&gate_state, false).expect("off");
+        gate.ask(9_000, seq);
+        let first = gate
+            .answer(9_000, Duration::from_secs(5))
+            .expect("answer 9000");
+        assert_eq!(outcome(&first).0, Outcome::Disabled);
         let before = eye_receipts(&gate_receipts);
         let flood = Instant::now();
         for id in 0..1_000u64 {
@@ -414,4 +429,61 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
             cerud::receipt::ReceiptOutcome::Ok
         )
         .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eye_started_before_the_graph_leaves_the_graphs_topics_to_the_graph() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prefix = format!("rcpd_eye_order_{}", std::process::id());
+    // No key on file: the ask is answered `no_credential`, with no request.
+    let key = dir.path().join("robot-jev.key");
+    let manifest = eye_common::write_manifest(
+        dir.path(),
+        &eye_common::eyes_yaml(&prefix, "http://127.0.0.1:9/api/v1", &key),
+    );
+    let loaded = RcpManifest::load_full(&manifest).expect("manifest");
+    let jev = loaded.eyes.jev.clone().expect("eyes.jev");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    let settings =
+        EyeSettings::resolve(&loaded.eyes, dir.path(), &state_dir, None).expect("settings");
+    let mgr = manager("order");
+    let sink = ReceiptSink::open(&state_dir.join("receipts.jsonl")).expect("receipts");
+    let eye = EyeHost::spawn(
+        mgr.clone(),
+        settings,
+        sink,
+        tokio::runtime::Handle::current(),
+    )
+    .expect("eye");
+    let gate_mgr = mgr.clone();
+    let gate_jev = jev.clone();
+    let gate = std::thread::spawn(move || {
+        // The graph creates the topics its nodes publish, deeper than the
+        // transport's default.
+        let mut deep = gate_mgr.default_topic_config();
+        deep.subscriber_max_buffer_size *= 4;
+        let _frame_topic = gate_mgr
+            .precreate_topic_services(&gate_jev.frame_topic, deep)
+            .expect("the graph creates its frame topic");
+        let _ask_topic = gate_mgr
+            .precreate_topic_services(&gate_jev.ask_topic, deep)
+            .expect("the graph creates its ask topic");
+        let mut gate = Gate::open(&gate_mgr, &gate_jev);
+        let seq = gate.publish_frame();
+        gate.ask(1, seq);
+        gate.answer(1, Duration::from_secs(5)).expect("answer 1")
+    });
+    let answer = tokio::task::spawn_blocking(move || gate.join())
+        .await
+        .expect("join")
+        .expect("gate");
+    drop(eye);
+    assert_eq!(
+        outcome(&answer),
+        (
+            Outcome::NoCredential,
+            Some(String::from("credential_missing"))
+        )
+    );
 }

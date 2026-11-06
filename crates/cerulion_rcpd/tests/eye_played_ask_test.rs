@@ -310,6 +310,8 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         let sent = || requests.load(Ordering::SeqCst);
         let mut played = 0_usize;
         let mut live = Asker::open(&live_mgr, &jev);
+        eye_common::wait_for_subscribers(&live_mgr, &jev.frame_topic, 1);
+        eye_common::wait_for_subscribers(&live_mgr, &jev.ask_topic, 1);
         let mut answers = Answers {
             sub: live_mgr
                 .create_subscriber(&jev.answer_topic)

@@ -270,7 +270,10 @@ eyes:
 A node asks with one `std_msgs/String` frame on the ask topic:
 `{"ask_id": 7, "question_set": "press_gate", "frame": {"topic": "/wrist/image", "seq": 412}, "deadline_ms": 1500, "numbers": {"jaw_gap_mm": 3.5}}`.
 `seq` is the wire sequence number of a frame on the frame topic; the daemon
-keeps the newest 8 and waits up to 100 ms for one not yet seen. The deadline
+keeps the newest 8 and waits up to 100 ms for one not yet seen. Each
+publisher numbers its own frames, so an ask whose `seq` held frames from two
+publishers carry (two cameras on the topic, or one that restarted) is
+refused (`frame_ambiguous`) and neither frame is sent. The deadline
 runs from the ask frame's wire timestamp when that stamp is at most 250 ms
 behind the host's monotonic clock, and from when the daemon reads the ask
 otherwise, so a run resumed after a pause, a graph on a virtual or external
@@ -315,7 +318,8 @@ Before any request the daemon refuses an ask that is not one of these shapes
 200 KB with sides of at least 280 pixels (`refused`), a request over 4,000
 estimated input tokens (`refused`), more than 2 requests in flight or more
 than 5 looks a second after a burst of 10 (`throttled`), every request for
-the `Retry-After` of a 429 (`rate_limited`), and, once the route reports a
+the `Retry-After` of a 429, at most 30 s, or 1 s when the header is missing
+or gives a date (`rate_limited`), and, once the route reports a
 spend limit reached, every request until 00:00 UTC (`quota`, logged once).
 
 The key is read before every look from `CERULION_JEV_KEY_FILE`, else
@@ -326,15 +330,21 @@ key is on file and the switch is not off:
 - `cerulion-rcpd jev off` stops requests with the next ask (`disabled`);
   `jev on` turns it back on; `jev status` prints on or off, the route, the
   model, today's asks, looks and asks dropped unanswered (UTC) and the last
-  outcome.
+  outcome. A restarted daemon goes on counting the day the status file
+  records.
 - The first time Jev is on, at start or before the first request of a run
   (a key placed while the daemon runs), the daemon logs one line saying that
   wrist frames leave the robot and how to turn Jev off. A region whose law
   requires more gets the line at every run (`clear`), or Jev off until
   `jev on` (`opt_in`).
-- An eye that cannot start (its topics cannot be opened) is logged and the
-  daemon serves its tools without it; an HTTPS client that cannot be built
-  (no system root certificates) answers every look `unavailable`.
+- The ask and frame topics belong to the graph, which sets their depth when
+  it creates them. The daemon opens each once it exists, trying every
+  10 ms, and never creates it, so it can start before or after the graph.
+  It creates the answer topic.
+- An eye that cannot start (its answer topic cannot be created, or a topic
+  name is not valid) is logged and the daemon serves its tools without it;
+  an HTTPS client that cannot be built (no system root certificates)
+  answers every look `unavailable`.
 
 The answer topic has no producer inside the graph, so
 `cerulion bag play --resim all` re-injects the recorded answer frames at
@@ -357,4 +367,9 @@ as a replay, and the log names the node.
 `--verify-bag` checks that every answer in a recording has its receipt,
 names an ask the recording holds and carries the SHA-256 of that ask's
 text, and, where the recording holds the frame, that the image and request
-digests recompute from it and the recorded model, state and questions.
+digests recompute from it and the recorded model, state and questions; of
+several recorded frames with that number, it uses the one whose SHA-256 the
+answer records. Every `late` receipt for a request an answer in the
+recording names must follow that request's `timeout` answer. The receipt
+log is shared by every run, so a `late` receipt for a request no answer in
+the recording names is another recording's and is left out.

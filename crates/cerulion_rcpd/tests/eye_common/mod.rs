@@ -356,6 +356,19 @@ pub fn key_file(dir: &Path) -> PathBuf {
     path
 }
 
+/// Wait until `topic` has at least `n` subscribers, failing after 5 s. The
+/// eye subscribes to an ask or frame topic only once it exists.
+pub fn wait_for_subscribers(mgr: &cerulion_core::TransportManager, topic: &str, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while mgr.topic_subscriber_count(topic) < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{topic} has fewer than {n} subscribers"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Whether `haystack` holds the test key, whole or as a long fragment.
 pub fn holds_key(haystack: &[u8]) -> bool {
     let key = TEST_KEY.as_bytes();

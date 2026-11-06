@@ -6,7 +6,9 @@
 //! served back byte for byte for the recorded asks, reproduce the gate's
 //! decisions; the recorded answer frames, read in recorded order as
 //! `bag play --resim` re-injects them, are Jev absent for a gate whose asks
-//! changed; and `--verify-bag` joins every answer to its receipt.
+//! changed; and `--verify-bag` joins every answer to its receipt, leaves out
+//! a late receipt from another recording, and finds the frame each answer
+//! sent in a recording that holds two frames with one number.
 //!
 //! One test per binary: it installs the process's log subscriber.
 
@@ -28,6 +30,7 @@ use cerulion_rcpd::eye::replay::{string_frames, RecordedAnswers};
 use cerulion_rcpd::eye::switch::{read_status, write_switch};
 use cerulion_rcpd::eye::verdict::{BoxEdge, EyeAnswer, Look, Outcome};
 use cerulion_rcpd::eye::verify::{verify_bag, EyeTopics};
+use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
 use cerulion_rcpd::tools::ReceiptSink;
 use eye_common::{good_body, holds_key, Reply, Stub, ANSWERED_MODEL};
@@ -608,29 +611,49 @@ async fn the_eye_records_answers_that_serve_back_and_verify_byte_for_byte() {
         .count();
     assert_eq!(orphans, live.len(), "{:?}", report.problems);
 
-    // A late receipt whose request no timeout answer names follows nothing.
-    let text = std::fs::read_to_string(&receipts).expect("receipts");
-    let moved: Vec<String> = text
-        .lines()
-        .map(|l| {
-            let mut entry: Value = serde_json::from_str(l).expect("receipt");
-            if entry["outcome"]["detail"] == "late" {
-                entry["args_digest"] = json!("0".repeat(64));
-            }
-            entry.to_string()
-        })
-        .collect();
-    let cut = dir.path().join("moved-late.jsonl");
-    std::fs::write(&cut, moved.join("\n") + "\n").expect("write");
-    let report = verify_bag(&bag, &cut, &topics).expect("verify");
-    assert!(
-        report
-            .problems
-            .iter()
-            .any(|p| p.contains("follows no timeout answer")),
-        "{:?}",
-        report.problems
+    // The receipt log is shared by every run. A receipt log that also holds
+    // an earlier recording's late reply: that receipt names a request no
+    // answer here names, so it is neither checked nor counted.
+    let late = || cerud::receipt::ReceiptOutcome::Error(String::from("late"));
+    let run_receipts = cerud::receipt::read_all(&receipts).expect("read receipts");
+    let copy_run = |sink: &ReceiptSink| {
+        for r in &run_receipts {
+            assert!(sink
+                .record(&r.caller, &r.verb, &r.args_digest, r.outcome.clone())
+                .is_some());
+        }
+    };
+    let earlier = dir.path().join("earlier-late.jsonl");
+    let sink = ReceiptSink::open(&earlier).expect("receipts");
+    assert!(sink
+        .record(EYE_CALLER, JEV_VERB, &"e".repeat(64), late())
+        .is_some());
+    copy_run(&sink);
+    drop(sink);
+    let report = verify_bag(&bag, &earlier, &topics).expect("verify");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(report.late, 1, "only this recording's late receipt");
+    // A late receipt for a request this recording answered `ok` follows no
+    // timeout answer.
+    let ok_request = serde_json::from_str::<Value>(&live[0].1).expect("answer")["request_sha256"]
+        .as_str()
+        .expect("ask 0 sent a request")
+        .to_owned();
+    let doubled = dir.path().join("late-after-ok.jsonl");
+    let sink = ReceiptSink::open(&doubled).expect("receipts");
+    copy_run(&sink);
+    assert!(sink
+        .record(EYE_CALLER, JEV_VERB, &ok_request, late())
+        .is_some());
+    drop(sink);
+    let report = verify_bag(&bag, &doubled, &topics).expect("verify");
+    assert_eq!(
+        report.problems,
+        [format!(
+            "a late receipt (digest {ok_request}) follows no timeout answer"
+        )]
     );
+    assert_eq!(report.late, 2);
 
     // A receipt log that lost the newest eye receipt no longer joins.
     let text = std::fs::read_to_string(&receipts).expect("receipts");
@@ -670,6 +693,28 @@ async fn the_eye_records_answers_that_serve_back_and_verify_byte_for_byte() {
             RosString::WIRE_FIXED_SIZE,
         ),
     ];
+    // A recording that spans a camera restart holds two frames with one
+    // number: each answer's request recomputes from the frame it sent.
+    let mut restarted = recorded
+        .iter()
+        .find(|r| r.topic == jev.frame_topic)
+        .expect("a recorded frame")
+        .clone();
+    let run = restarted
+        .frame
+        .windows(64)
+        .position(|w| w.iter().all(|&b| b == 0x20))
+        .expect("the JPEG's padding");
+    restarted.frame[run + 32] = 0x21;
+    restarted.ts = recorded.iter().map(|r| r.ts).max().expect("frames") + 1;
+    let mut spanning = recorded.clone();
+    spanning.push(restarted);
+    let restart = dir.path().join("camera-restart.mcap");
+    write_bag(&restart, &spanning, &schemas);
+    let report = verify_bag(&restart, &receipts, &topics).expect("verify");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(report.requests_checked, 7);
+
     let edited_frames: Vec<Recorded> = recorded
         .iter()
         .cloned()

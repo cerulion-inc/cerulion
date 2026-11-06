@@ -184,14 +184,17 @@ pub fn string_frames(reader: &BagReader, topic: &str) -> Result<Vec<(u32, String
 }
 
 /// Every `sensor_msgs/CompressedImage` frame's image bytes on `topic`, by
-/// wire sequence number; a later frame with the same number replaces an
-/// earlier one.
+/// wire sequence number, in file order. Each publisher numbers its frames
+/// from zero, so one number can hold frames from several publishers.
 ///
 /// # Errors
 ///
 /// Why the bag could not be read.
-pub fn image_frames(reader: &BagReader, topic: &str) -> Result<BTreeMap<u32, Vec<u8>>, String> {
-    let mut out = BTreeMap::new();
+pub fn image_frames(
+    reader: &BagReader,
+    topic: &str,
+) -> Result<BTreeMap<u32, Vec<Vec<u8>>>, String> {
+    let mut out: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
     for message in reader.messages().map_err(|e| e.to_string())? {
         let message = message.map_err(|e| e.to_string())?;
         if message.topic != topic {
@@ -209,7 +212,7 @@ pub fn image_frames(reader: &BagReader, topic: &str) -> Result<BTreeMap<u32, Vec
             CompressedImage::build_reader(bytes).data().to_vec()
         }));
         if let Ok(data) = data {
-            out.insert(header.sequence, data);
+            out.entry(header.sequence).or_default().push(data);
         }
     }
     Ok(out)

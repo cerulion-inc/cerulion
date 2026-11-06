@@ -124,24 +124,50 @@ pub fn read_credential(path: &Path) -> Result<Credential, CredentialProblem> {
     Ok(Credential(key.to_owned()))
 }
 
-/// Write `key` to `path` with mode 0600, for tests and hand provisioning.
+/// Write `key` to `path`, for tests and hand provisioning. The key goes to a
+/// new file beside `path`, created with mode 0600 (and only then written),
+/// which is then renamed over `path`. An existing file at `path` is
+/// replaced, never written into, so its mode never applies to the key.
 ///
 /// # Errors
 ///
-/// The I/O error.
+/// The I/O error; the new file is removed when a step after its creation
+/// fails.
 pub fn write_credential(path: &Path, key: &str) -> std::io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the key path names no file",
+        ));
+    };
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = path.with_file_name(temp_name);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(key.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()
+    let mut file = options.open(&temp)?;
+    let written = file
+        .write_all(key.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -192,5 +218,34 @@ mod tests {
         assert_eq!(read_credential(&path), Err(CredentialProblem::Format));
         std::fs::write(&path, "short\n").expect("write");
         assert_eq!(read_credential(&path), Err(CredentialProblem::Format));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_written_over_a_readable_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jev.key");
+        std::fs::write(&path, "an older file\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        write_credential(&path, "test-only-0123456789").expect("write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        assert_eq!(
+            read_credential(&path).expect("read").expose(),
+            "test-only-0123456789"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            left,
+            [std::ffi::OsString::from("jev.key")],
+            "no file left beside it"
+        );
     }
 }

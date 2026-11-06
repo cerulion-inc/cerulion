@@ -67,7 +67,7 @@ fn core(dir: &Path, base_url: &str) -> EyeCore {
 /// return the answer the gate gets.
 async fn look(core: &mut EyeCore, client: JevClient, id: u64) -> Answer {
     let mut frames = FrameStore::default();
-    frames.push(1, &jpeg_header_for_test(640, 480, 2_000));
+    frames.push(1, 1, &jpeg_header_for_test(640, 480, 2_000));
     let ask = json!({
         "ask_id": id,
         "question_set": "press",
