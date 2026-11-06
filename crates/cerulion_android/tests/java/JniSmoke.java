@@ -142,7 +142,8 @@ public final class JniSmoke {
                 + illegalState(() -> CerulionRuntime.loadLibrary("other_runtime")));
         System.out.println("status-before-init=" + state(CerulionRuntime.status()));
         System.out.println("codes=" + CerulionRuntime.DECODE + "," + CerulionRuntime.EMPTY
-                + "," + CerulionRuntime.RECEIVE);
+                + "," + CerulionRuntime.RECEIVE + "," + CerulionRuntime.REMOTE_NOT_PROVISIONED
+                + "," + CerulionRuntime.REMOTE);
         System.out.println("init-bad=" + CerulionRuntime.init(args[0] + "/missing", "jni-test"));
         System.out.println("init-ok=" + CerulionRuntime.init(args[0], "jni-test"));
         String initStatus = CerulionRuntime.status();
@@ -179,6 +180,20 @@ public final class JniSmoke {
         System.out.println("poll-overflow=" + poll("/jni/heartbeat") + ", " + poll("/jni/heartbeat")
                 + ", " + poll("/jni/heartbeat"));
         System.out.println("subscribed=" + field(CerulionRuntime.status(), "subscribed"));
+        System.out.println("publish-stamped=" + whenSettled(() -> CerulionRuntime.publishStamped(
+                "/jni/heartbeat", "{\"data\":\"stamped\"}", 1L)));
+        System.out.println("publish-stamped-negative=" + CerulionRuntime.publishStamped(
+                "/jni/heartbeat", "{\"data\":\"negative\"}", -1L));
+        System.out.println("publish-stamped-ahead=" + whenSettled(() -> CerulionRuntime.publishStamped(
+                "/jni/heartbeat", "{\"data\":\"ahead\"}", Long.MAX_VALUE)));
+        System.out.println("publish-stamped-null=" + CerulionRuntime.publishStamped(
+                "/jni/heartbeat", null, 1L));
+        System.out.println("publish-stamped-ahead-oversized=" + whenSettled(
+                () -> CerulionRuntime.publishStamped(
+                        "/jni/heartbeat", "{\"data\":\"" + "x".repeat(70000) + "\"}",
+                        Long.MAX_VALUE)));
+        System.out.println("poll-stamped=" + poll("/jni/heartbeat"));
+        System.out.println("poll-stamped-empty=" + poll("/jni/heartbeat"));
 
         int stop = whenSettled(CerulionRuntime::stop);
         String stoppedStatus = waitForState("stopped");

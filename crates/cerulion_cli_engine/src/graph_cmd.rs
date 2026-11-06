@@ -6059,7 +6059,7 @@ pub fn graph_run(
     }
     let executes_process_groups = matches!(deployment, Ok(Deployment::Supervisor));
     // The execution mode is RESOLVED here, once, from the same
-    // deployment fact — the environment is read exactly one time per run and
+    // deployment fact - the environment is read exactly one time per run and
     // the RESULT is threaded to the run-directory descriptor, the supervisor
     // (which stamps it into every worker plan) and the recording paths, so no
     // two of them can disagree about the contract the run executed under.
@@ -7294,7 +7294,7 @@ pub fn graph_run_worker(
             node_name: plan.node_name.clone(),
             clock: Arc::clone(&clock_dyn),
             subscriber_buffer_size: 16,
-            // Mp workers are ALWAYS network-free — the separate
+            // Mp workers are ALWAYS network-free - the separate
             // GATEWAY process (spawned by the supervisor) owns the robot's
             // whole network plane (one robot = one peer). Networked
             // multi-process is first-class and never refused.
@@ -11758,7 +11758,7 @@ fn graph_run_supervisor(
             ReadyWait::Ready => guards.push(guard),
             ReadyWait::CtrlC => {
                 // Stop spawning further workers; drain the ones already up (NOT
-                // a fail-loud — user-initiated). The JOIN loop below flips to
+                // a fail-loud - user-initiated). The JOIN loop below flips to
                 // Draining on its first pass (`running` is false) and
                 // SIGINTs every spawned worker, flipping each one's own
                 // `running` so its `wait_for_go` returns early and `run_live`

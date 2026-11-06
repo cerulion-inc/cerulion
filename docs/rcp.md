@@ -21,6 +21,8 @@ CERULION_RCP_TOKEN=... cerulion-rcpd --manifest rcp.yaml --http   # 127.0.0.1:78
 CERULION_RCP_TOKEN=... cerulion-rcpd --manifest rcp.yaml --http 127.0.0.1:7900
 cerulion-rcpd --manifest rcp.yaml --receipts /var/log/rcp/receipts.jsonl
 cerulion-rcpd --verify-receipts /var/log/rcp/receipts.jsonl   # 0: chain intact, 1: missing, empty or broken
+cerulion-rcpd --verify-bag run.mcap --manifest rcp.yaml       # 0: every Jev answer has its receipt
+cerulion-rcpd jev status --manifest rcp.yaml                  # also: jev on, jev off
 ```
 
 `--receipts` defaults to `.cerulion/rcp/receipts.jsonl` beside the manifest.
@@ -226,3 +228,148 @@ each refresh.
 
 One per `state` entry: the newest frame seen on that `std_msgs/String` topic,
 as text. Reading one before any frame has arrived is an error.
+
+## Jev, the gate's second eye
+
+With an `eyes.jev` section, the daemon answers the graph's requests for a
+second look at a wrist-camera frame with Jev, TypeSafe's System One model,
+through OpenRouter by default. Jev reads; the graph's gate decides. Jev is a
+cross-check that can only veto: a reading that disagrees with the gate's own
+measurement refuses, a reading that agrees never passes a gate by itself,
+and an absent Jev is never agreement.
+
+When Jev is on, each look sends one still frame from the wrist camera, the
+question set's text and the ask's numbers to the route: by default
+OpenRouter, which passes them to TypeSafe in the US. No robot or user id is
+in the request; the route sees the robot's network address and its key.
+Nothing else from any camera leaves the robot for Jev, and a recording of
+the frames and answers stays on the robot. TypeSafe lists where it
+processes data at https://trust.typesafe.ai/subprocessors.
+
+```yaml
+eyes:
+  jev:
+    base_url: https://openrouter.ai/api/v1  # default; requests go to {base_url}/systemone
+    model: typesafe/jev-1.14                # default; a pinned name, never an alias
+    credential_file: keys/jev.key           # optional, relative to this file
+    region: US                              # optional; picks the data notice
+    frame_topic: /wrist/image               # sensor_msgs/CompressedImage, JPEG
+    ask_topic: /rcp/eye/ask                 # default
+    answer_topic: /rcp/eye/answer           # default
+    timeout_ms: 1500                        # default and maximum
+    question_sets:
+      - name: press_gate
+        state: Wrist camera frame from an arm in front of a coffee machine.
+        numbers: [jaw_gap_mm]               # optional: the numbers an ask may carry
+        questions:
+          edge_visible: { type: noul, instructions: The rim's lower edge is visible in `frame`. }
+          rim: { type: box, instructions: The chrome rim band in `frame`. }
+        visible: { question: edge_visible, threshold: 0.7 }   # optional
+```
+
+A node asks with one `std_msgs/String` frame on the ask topic:
+`{"ask_id": 7, "question_set": "press_gate", "frame": {"topic": "/wrist/image", "seq": 412}, "deadline_ms": 1500, "numbers": {"jaw_gap_mm": 3.5}}`.
+`seq` is the wire sequence number of a frame on the frame topic; the daemon
+keeps the newest 8 and waits up to 100 ms for one not yet seen. Each
+publisher numbers its own frames, so an ask whose `seq` held frames from two
+publishers carry (two cameras on the topic, or one that restarted) is
+refused (`frame_ambiguous`) and neither frame is sent. The deadline
+runs from the ask frame's wire timestamp when that stamp is at most 250 ms
+behind the host's monotonic clock, and from when the daemon reads the ask
+otherwise, so a run resumed after a pause, a graph on a virtual or external
+time source and an ask mirrored from another machine keep their whole
+deadline. It sends one
+request carrying that frame unchanged, the set's text and the numbers, and
+publishes one answer frame per ask on the answer topic with an `outcome`:
+`ok`, or one of `disabled`, `no_credential`, `unavailable`, `timeout`,
+`rate_limited`, `quota`, `throttled`, `refused`, `wrong_model`, `malformed`,
+`not_visible` and `not_recorded`, each meaning Jev is absent. A reply the
+daemon takes up at or after its deadline is receipted `late` and never
+published, and the ask is answered `timeout`. The frame records
+the questions, the state, the model asked and the model that answered, and
+the SHA-256 of the image and of the request body; never the image bytes or
+the key. Every answer frame carries `"provenance": "third_party"`, so a
+training or labelling export can leave Jev's output out. A receipt
+(`eye.jev`, caller `rcp-eye`) is written before each answer is published,
+and an answer whose receipt cannot be written is not published.
+
+A gate picks the answer frames for an ask by its `ask_id`, reads each with
+`EyeAnswer::parse(answer, ask)`, passing the exact text of the ask frame it
+published, and compares Jev's reading with its own through `Look::compare`,
+which gives `Agree`, `Disagree` or `Absent(outcome)`. An answer frame whose
+`ask_sha256` is not the SHA-256 of that text was given for another ask, such
+as another frame under a reused `ask_id`, and reads as `not_recorded`.
+A gate that holds the frame passes its JPEG bytes to
+`EyeAnswer::for_image`: an `ok` answer whose `image_sha256` is not their
+SHA-256 reads as `not_recorded`. `bag play` re-publishes a recording's
+answer frames byte for byte, and ask ids and frame sequence numbers restart
+with each run, so a recorded answer can carry a live gate's exact ask text
+while naming another frame.
+
+The daemon answers at most 20 asks at once and 10 a second after that,
+whatever the outcome; an ask over that bound gets no answer and no receipt,
+so the asking node's own deadline makes Jev absent; the first drop is
+logged, and later ones are counted, in the log and in `jev status`.
+The eye's receipts share the receipt log, and its lock, with the tools and
+the e-stop.
+
+Before any request the daemon refuses an ask that is not one of these shapes
+(`malformed`), an image that is not a JPEG of at most 640 x 480 pixels and
+200 KB with sides of at least 280 pixels (`refused`), a request over 4,000
+estimated input tokens (`refused`), more than 2 requests in flight or more
+than 5 looks a second after a burst of 10 (`throttled`), every request for
+the `Retry-After` of a 429, at most 30 s, or 1 s when the header is missing
+or gives a date (`rate_limited`), and, once the route reports a
+spend limit reached, every request until 00:00 UTC (`quota`, logged once).
+
+The key is read before every look from `CERULION_JEV_KEY_FILE`, else
+`credential_file`, else `jev.key` beside the receipt log. The file holds one
+per-robot key and must not be readable by group or others. Jev is on while a
+key is on file and the switch is not off:
+
+- `cerulion-rcpd jev off` stops requests with the next ask (`disabled`);
+  `jev on` turns it back on; `jev status` prints on or off, the route, the
+  model, today's asks, looks and asks dropped unanswered (UTC) and the last
+  outcome. A restarted daemon goes on counting the day the status file
+  records.
+- The first time Jev is on, at start or before the first request of a run
+  (a key placed while the daemon runs), the daemon logs one line saying that
+  wrist frames leave the robot and how to turn Jev off. A region whose law
+  requires more gets the line at every run (`clear`), or Jev off until
+  `jev on` (`opt_in`).
+- The ask and frame topics belong to the graph, which sets their depth when
+  it creates them. The daemon opens each once it exists, trying every
+  10 ms, and never creates it, so it can start before or after the graph.
+  It creates the answer topic.
+- An eye that cannot start (its answer topic cannot be created, or a topic
+  name is not valid) is logged and the daemon serves its tools without it;
+  an HTTPS client that cannot be built (no system root certificates)
+  answers every look `unavailable`.
+
+The answer topic has no producer inside the graph, so
+`cerulion bag play --resim all` re-injects the recorded answer frames at
+their recorded steps, whatever the re-executed graph asks, and makes no Jev
+request itself. A gate that reads them with its own ask text sees an answer
+given for another ask text as `not_recorded`, and `--resim all --verify`
+reports a changed ask as a divergence on the ask topic. A running daemon's
+eye reads the same topics, and tells a played recording by where its frames
+come from: `bag play` publishes from the transport node `cerulion_bag_play`
+and `bag play --resim` from `cerulion_replay_` and the recording's identity.
+An ask from either gets no request, no answer and no receipt, with Jev on
+or off, and a wrist frame from either is never held, whatever their wire
+timestamps say, so an unpaced resim whose replay clock passes the host's
+time is dropped as surely as a recording from another boot. So are an ask
+and a frame whose publisher's node cannot be named. The first such ask is
+logged, later ones are counted, and `jev status` reports them. A live graph
+whose own node name takes one of those forms (a graph named `bag_play`, one
+whose name begins `replay_`, or a multi-process graph named `replay`) reads
+as a replay, and the log names the node.
+`--verify-bag` checks that every answer in a recording has its receipt,
+names an ask the recording holds and carries the SHA-256 of that ask's
+text, and, where the recording holds the frame, that the image and request
+digests recompute from it and the recorded model, state and questions; of
+several recorded frames with that number, it uses the one whose SHA-256 the
+answer records. Every `late` receipt for a request an answer in the
+recording names must follow that request's `timeout` answer. The receipt
+log is shared by every run, so a `late` receipt for a request no answer in
+the recording names is another recording's and is left out.

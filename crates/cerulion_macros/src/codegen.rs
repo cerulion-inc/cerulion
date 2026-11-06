@@ -1667,7 +1667,7 @@ fn gen_cdylib(
                             // NODES poison containment: drive
                             // the user's `external_source()` under an INNER
                             // `catch_unwind` so a panicking override does NOT unwind
-                            // through the LIVE `NODES` MutexGuard (`guard`) — an
+                            // through the LIVE `NODES` MutexGuard (`guard`) - an
                             // unwind through it would POISON `NODES` and brick every
                             // node of this cdylib in-process. `external_source` is a
                             // one-shot pre-binding query; unlike `tick`, torn node

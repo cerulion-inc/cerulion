@@ -25,7 +25,8 @@ build() {
   # The remote metadata probe runs on the device beside its netd. It is a
   # separate invocation: the example builds with cerulion_remoted's dev
   # dependencies, whose features must not reach the CLI and netd binaries.
-  cargo ndk -t "$ABI" --platform 30 build -p cerulion_remoted --example android_e2e_remoted_probe
+  cargo ndk -t "$ABI" --platform 30 build -p cerulion_remoted --example android_e2e_remoted_probe \
+    --example android_e2e_hosted_desk
   (cd "$ROOT/examples/basic_timer" && cargo ndk -t "$ABI" --platform 30 build)
   # The app ships ONE native library: the sample runtime library, which
   # links cerulion_android and the graph's nodes. `cargo ndk -o` would also
@@ -139,6 +140,7 @@ HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
 DEV_REMOTED_PROBE="$DEV/android_e2e_remoted_probe"
+DEV_HOSTED_DESK="$DEV/android_e2e_hosted_desk"
 GRAPH_PID="$DEV/graph.pid"
 NETD_PID="$DEV/netd.pid"
 CHECKS=0
@@ -419,6 +421,7 @@ device "mkdir -p '$DEV/home/.cerulion' && printf '%s' '{\"account_id\":\"0011223
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/examples/android_e2e_remoted_probe" "$DEV_REMOTED_PROBE" >/dev/null
+"${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/examples/android_e2e_hosted_desk" "$DEV_HOSTED_DESK" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/Cargo.toml" "$DEV/basic_timer/Cargo.toml" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/graphs" "$DEV/basic_timer/graphs" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/nodes" "$DEV/basic_timer/nodes" >/dev/null
@@ -848,11 +851,85 @@ pass "connect app start" "start=0 in pid $connect_pid, dialing tcp/127.0.0.1:$CO
 run_probe "connect direct demand" connect std_msgs/String connect-demand-probe.txt \
   --listen "tcp/127.0.0.1:$CONNECT_PORT"
 
+# Hosted remote plane: the app hosts the paired plane in its own process,
+# with the relay disabled and LAN access left paired. A fresh install (no
+# files/remote) must fail the start: status reports failed with
+# REMOTE_NOT_PROVISIONED (17) and no plane. Once the desk tool provisions
+# the plane's files and they are copied into the app, a paired desk on the
+# device reads the catalog and a heartbeat frame over loopback.
+hosted_line=
+# hosted_start <label> <pattern>: a new app process with the remote extra;
+# sets hosted_line to its first sample log line matching the pattern.
+hosted_start() {
+  local label=$1 want=$2 pid deadline
+  hosted_line=
+  device "am force-stop '$APP'"
+  device "am start -n '$APP/.MainActivity' --es remote disabled" >/dev/null
+  deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    pid="$(device "pidof '$APP'" 2>/dev/null | tr -d '\r' || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      hosted_line="$(device logcat -d --pid="$pid" -s CerulionSample:V 2>/dev/null |
+        tr -d '\r' | grep -E -m1 "$want" || true)"
+      [[ -n "$hosted_line" ]] && return 0
+    fi
+    sleep 1
+  done
+  fail "$label" "no app log line matching '$want'"
+}
+device "run-as '$APP' rm -rf files/remote"
+# `start` only queues the start: its result is the status the sample logs.
+hosted_start "hosted plane, fresh install" '"last_error":\{"code":17,'
+if ! grep -q '"state":"failed"' <<<"$hosted_line" || ! grep -q '"remote":null' <<<"$hosted_line"; then
+  fail "hosted plane, fresh install" "the failed start reports another state or a plane: $hosted_line"
+fi
+pass "hosted plane, fresh install" "state=failed last_error.code=17 (REMOTE_NOT_PROVISIONED) remote=null"
+# The desk tool's keys come from fixed seeds and serve this test only, so
+# writing them under the device scratch directory first is harmless.
+desk_out="$(device "'$DEV_HOSTED_DESK' provision '$DEV/hosted-state'" 2>&1)" ||
+  fail "hosted plane provisioning" "$desk_out"
+device "run-as '$APP' mkdir -p files/remote/remoted"
+for file in device_key trust_store.mac_key trust_store device_index.json; do
+  device "cat '$DEV/hosted-state/remoted/$file' | run-as '$APP' sh -c 'cat > files/remote/remoted/$file'"
+done
+device "rm -rf '$DEV/hosted-state'"
+pass "hosted plane provisioning" "$(tr -d '\r' <<<"$desk_out")"
+hosted_start "hosted plane start" '"remote":\{"endpoint_id"'
+printf '%s\n' "$hosted_line" > "$OUT/hosted-status.txt"
+grep -q '"lan_access":"paired"' <<<"$hosted_line" ||
+  fail "hosted plane start" "LAN access is not paired: $hosted_line"
+hosted_eid="$(grep -oE '"endpoint_id":"[0-9a-f]{64}"' <<<"$hosted_line" | cut -d'"' -f4)"
+hosted_socket="$(grep -oE '"bound_sockets":\["[^"]+"' <<<"$hosted_line" | cut -d'"' -f4)"
+hosted_port="${hosted_socket##*:}"
+[[ -n "$hosted_eid" && "$hosted_port" =~ ^[0-9]+$ ]] ||
+  fail "hosted plane start" "no endpoint id and port in: $hosted_line"
+pass "hosted plane start" "endpoint=$hosted_eid socket=$hosted_socket lan_access=paired"
+desk_rc=0
+desk_out="$(device "'$DEV_HOSTED_DESK' read '$hosted_eid' '$hosted_port' /app/heartbeat std_msgs/String" 2>&1)" ||
+  desk_rc=$?
+printf 'rc=%s\n%s\n' "$desk_rc" "$desk_out" > "$OUT/hosted-desk.txt"
+desk_fact="$(tr -d '\r' <<<"$desk_out" | grep '^hosted_desk mode=read ' || true)"
+if (( desk_rc != 0 )) || [[ "$desk_fact" != 'hosted_desk mode=read topic=/app/heartbeat catalog_schema=std_msgs/String frames=1 endpoint=provisioned' ]]; then
+  fail "hosted plane paired read" "rc=$desk_rc output=$desk_out"
+fi
+pass "hosted plane paired read" "${desk_fact#hosted_desk }"
+device "am force-stop '$APP'"
+device "run-as '$APP' rm -rf files/remote"
+
 "${ADB[@]}" logcat -d > "$OUT/logcat-open.txt" 2>&1
 app_log="$(tr -d '\r' < "$OUT/logcat-open.txt")"
 grep -q 'start=0' <<<"$app_log" || fail "app start" "start=0 absent"
-denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
+# Android refuses apps two ways of listing the network interfaces: the
+# netlink link dump (RTM_GETLINK, its own tag b/155595000) and the
+# /sys/class/net tree (label sysfs_net). The hosted remote plane's iroh
+# endpoint tries both while it binds and works without them, as the paired
+# read above shows. Audit logs whichever it records first, so those two, and
+# only those two (the sysfs one for reading permissions only), are expected.
+interface_listing='avc: denied \{ nlmsg_readpriv \} .*tclass=netlink_route_socket|avc: denied \{ ((search|getattr|open|read) )+\} .*tcontext=u:object_r:sysfs_net:s0 '
+app_denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
   grep 'avc: denied' | grep 'scontext=u:r:untrusted_app' | grep -v 'runas_app' || true)"
+denials="$(grep -Ev "$interface_listing" <<<"$app_denials" || true)"
+listing_refusals="$(grep -cE "$interface_listing" <<<"$app_denials" || true)"
 [[ -z "$denials" ]] || fail "app SELinux" "untrusted_app denial was logged: $denials"
-pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open, restart and connect runs (no dlopen or execute denial)"
+pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open, restart, connect and hosted runs (no dlopen or execute denial; interface listings refused as Android does for apps: $listing_refusals)"
 echo "android e2e: $CHECKS checks passed"

@@ -637,8 +637,12 @@ fn build_input_meta_lookup(metas: &[InputMeta]) -> HashMap<String, &InputMeta> {
 /// - **two consumers disagree** (distinct non-zero hashes) → `Err` naming
 ///   both `(node, input)` sites and both hashes.
 /// - otherwise → the one declared hash.
+///
+/// An embedder that opens ingress without a `network:` block (the Android
+/// app runtime) calls this too, so it and `graph run` refuse the same graphs
+/// with the same words.
 // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
-fn resolve_ingress_schema_hash(
+pub fn resolve_ingress_schema_hash(
     topic: &str,
     config: &GraphConfig,
     entry_infos: &IndexMap<String, NodeInfo>,
@@ -3530,11 +3534,12 @@ pub struct GraphRuntime {
     /// UNCONDITIONAL-field rule as its siblings; read via
     /// [`Self::park_wake_word_block_count_for_test`].
     park_wake_word_blocks: std::sync::atomic::AtomicU64,
-    /// Count of park-loop waits genuinely COMPLETED — the loop
-    /// bottom of [`Self::monitor_wait_block`] ends EVERY iteration with an
-    /// unconditional `std::thread::yield_now()`, counted here once per
-    /// completed wait on every tier (hardware park slice, scratch-word park,
-    /// degraded sleep chunk, wake-word block). The addr park's
+    /// Count of park-loop waits genuinely COMPLETED at the loop bottom of
+    /// [`Self::monitor_wait_block`], once per completed wait on every tier
+    /// (hardware park slice, scratch-word park, degraded sleep chunk,
+    /// wake-word block). The loop bottom yields the core only after a
+    /// hardware slice ([`Self::park_core_yield_count_for_test`] counts those
+    /// calls). The addr park's
     /// lost-wakeup fast path (`AddrParkOutcome::RingPending` — the doorbell
     /// moved after the loop-top poll, so no wait happened) yields but does
     /// NOT count, else doorbell-driven runs inflate slice telemetry. The
@@ -3542,13 +3547,39 @@ pub struct GraphRuntime {
     /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`WFE`-parked thread
     /// is RUNNING to the OS scheduler, so without it a co-located runnable
     /// peer got the core only at CFS wakeup granularity (measured p50
-    /// 6.997 ms RTT on a same-core pinned ping-pong). On the sleeping tiers
-    /// the yield is a ~0.5 µs no-op kept for one-shape parity with rmw's
-    /// `park_block`/`park_yields`. Record-only (never read by the
+    /// 6.997 ms RTT on a same-core pinned ping-pong). The sleeping tiers
+    /// issue no yield: their slice already released the core, and on macOS
+    /// a `sched_yield` with another thread runnable on the processor
+    /// depresses the caller's priority for up to one 10 ms scheduler
+    /// quantum. Record-only (never read by the
     /// scheduler — the determinism firewall); same UNCONDITIONAL-field rule
-    /// as its siblings; read via [`Self::park_yield_count_for_test`] and the
-    /// `run_live` exit telemetry line.
-    park_yields: std::sync::atomic::AtomicU64,
+    /// as its siblings; read via [`Self::park_slice_count_for_test`] and the
+    /// `run_live` exit telemetry line (key `park_slices`).
+    park_slices: std::sync::atomic::AtomicU64,
+    /// Count of `std::thread::yield_now()` calls the loop bottom of
+    /// [`Self::monitor_wait_block`] issued. A yield is issued only after a
+    /// slice the CPU monitor-wait primitive performed, so on a host without
+    /// one this stays 0 while `park_slices` counts the slices that slept.
+    /// Record-only; read via [`Self::park_core_yield_count_for_test`] and the
+    /// `run_live` exit telemetry line (key `park_core_yields`).
+    park_core_yields: std::sync::atomic::AtomicU64,
+    /// Count of park-loop passes of [`Self::monitor_wait_block`] that ended
+    /// with no completed wait and no yield: no hardware slice, no kernel
+    /// block, no nap. Such a pass skipped its block because the block's own
+    /// predicate already held (a wake in flight), or found its nap cap
+    /// saturated to zero at the park deadline. The loop top tests each of
+    /// those predicates and the deadline itself, so it returns on the next
+    /// pass unless the state changed in between, and no such pass repeats on
+    /// an unchanged state. Record-only; same UNCONDITIONAL-field rule as its
+    /// siblings; read via [`Self::park_unslept_pass_count_for_test`].
+    park_unslept_passes: std::sync::atomic::AtomicU64,
+    /// Test-injectable override for the park-entry `baseline_full` snapshot
+    /// of every watched credit edge ([`CreditParkEdge`]). `None` (production)
+    /// keeps the snapshot read off the word. Set only via the
+    /// `#[cfg(any(test, feature = "test-helpers"))]`
+    /// [`Self::set_credit_park_baseline_full_for_test`] (gate the SETTER, not
+    /// the field).
+    credit_baseline_full_override: Option<bool>,
     /// Test-injectable override for the park's single-park
     /// decision. `None` (production) ⇒ the hidden `CERULION_MW_SINGLE_PARK` env
     /// knob ([`Self::mw_single_park`], a process-global `OnceLock` — which is
@@ -9385,8 +9416,12 @@ impl GraphRuntime {
             park_recheck_os_sync_naps: std::sync::atomic::AtomicU64::new(0),
             // Wake-word kernel-block counter (record-only).
             park_wake_word_blocks: std::sync::atomic::AtomicU64::new(0),
-            // Per-slice yield counter (record-only).
-            park_yields: std::sync::atomic::AtomicU64::new(0),
+            // Completed-slice, loop-bottom yield and unslept-pass counters
+            // (record-only) + the test-only credit baseline override.
+            park_slices: std::sync::atomic::AtomicU64::new(0),
+            park_core_yields: std::sync::atomic::AtomicU64::new(0),
+            park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
+            credit_baseline_full_override: None,
             single_park_override: None,
             // External ingress sources are collected lazily at run_live
             // entry (never under polled step); empty until then.
@@ -13483,18 +13518,46 @@ impl GraphRuntime {
 
     /// Test seam: how many park-loop waits [`Self::monitor_wait_block`]
     /// has genuinely COMPLETED — counted at the loop bottom once per completed
-    /// wait (`RingPending` fast paths yield but do not count — see
-    /// the `park_yields` field doc). The counter
-    /// half of the yield pin: a parked runtime that idled to at least one
-    /// timeout reports `> 0` on EVERY tier (the degraded sleep tier included),
-    /// and on that tier `park_yields >= park_recheck_naps` (every nap chunk
-    /// is followed by a yield); a never-parked runtime reports exactly 0. The
-    /// yield CALL itself is pinned structurally (a counter bump without the
-    /// yield would pass this seam) — see
-    /// `monitor_wait_park_iox2_test::the_native_park_slice_yields_the_core`.
+    /// wait (`RingPending` fast paths are not completed waits and do not
+    /// count; see the `park_slices` field doc). A parked runtime that idled
+    /// to at least one timeout reports `> 0` on EVERY tier (the degraded sleep
+    /// tier included), and on that tier `park_slices >= park_recheck_naps`
+    /// (every nap chunk is a completed slice); a never-parked runtime reports
+    /// exactly 0. The yields are counted apart, by
+    /// [`Self::park_core_yield_count_for_test`], and the yield CALL is pinned
+    /// structurally (one call, inside the `if performed` branch that counts
+    /// it) by `monitor_wait_park_iox2_test::the_native_park_slice_yields_the_core`.
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn park_yield_count_for_test(&self) -> u64 {
-        self.park_yields.load(std::sync::atomic::Ordering::Relaxed)
+    pub fn park_slice_count_for_test(&self) -> u64 {
+        self.park_slices.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test seam: how many times [`Self::monitor_wait_block`] called
+    /// `std::thread::yield_now()` at its loop bottom (see the
+    /// `park_core_yields` field doc).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn park_core_yield_count_for_test(&self) -> u64 {
+        self.park_core_yields
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test seam: how many park-loop passes of [`Self::monitor_wait_block`]
+    /// ended with no completed wait and no yield (see the
+    /// `park_unslept_passes` field doc).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn park_unslept_pass_count_for_test(&self) -> u64 {
+        self.park_unslept_passes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test seam: force the park-entry `baseline_full` of every watched credit
+    /// edge to `forced` (`None` restores the snapshot read off the word), so a
+    /// test can hold the park in a snapshot a real drain produces only inside
+    /// a narrow window: a FULL baseline on an edge whose credit is already
+    /// free. Production never calls this.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_credit_park_baseline_full_for_test(&mut self, forced: Option<bool>) {
+        self.credit_baseline_full_override = forced;
     }
 
     /// Test seam: force the park's single-park decision,
@@ -13667,8 +13730,8 @@ impl GraphRuntime {
     /// p50 **6.997 ms** RTT with both ping-pong processes pinned to one CPU,
     /// vs 17 µs on the kernel-sleeping fd tier. So the hardware arm slices at
     /// the shared 20 µs [`crate::monitor_wait::PARK_RECHECK`] (not the 100 µs
-    /// pacing chunk) and EVERY loop iteration ends with
-    /// `std::thread::yield_now()` (counted in `park_yields`, record-only):
+    /// pacing chunk) and every hardware slice ends with
+    /// `std::thread::yield_now()` (counted in `park_core_yields`, record-only):
     /// a co-located peer runs within one slice, the core still never enters a
     /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`WFE`
     /// still wake instantly on the doorbell inside a slice. Cost: one ~0.5 µs
@@ -13769,7 +13832,7 @@ impl GraphRuntime {
         // `monitor_wait::PARK_RECHECK` (the same constant rmw's `park_block`
         // slices at). A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS
         // scheduler, so the hardware arm keeps its slices short and the loop
-        // bottom YIELDS after every slice (`park_yields`) — a co-located
+        // bottom YIELDS after every hardware slice (`park_core_yields`), so a co-located
         // runnable peer gets the core within one slice instead of at CFS
         // wakeup granularity (without the yield: p50 6.997ms RTT, both ping-pong
         // processes pinned to one CPU). The doorbell still wakes the park
@@ -13828,13 +13891,21 @@ impl GraphRuntime {
         // producer that is blocked (Principle #6).
         //
         // EMPTY list ⇒ zero work, which is every single-process build.
+        //
+        // The epoch is read BEFORE `outstanding`. A drain writes `outstanding`
+        // (Release) and then bumps `wake_seq` (Release), so an epoch load that
+        // observes a drain's bump makes the `outstanding` load after it observe
+        // that drain's decrement too: a FULL baseline is never paired with the
+        // epoch of a drain that already freed the credit. The opposite order
+        // permits that pairing, and the loop-top predicate below then has no
+        // epoch advance left to see.
         for e in &self.credit_park_edges {
+            let seq = e.word.wake_seq_snapshot();
+            let full = e.word.outstanding() >= e.threshold;
+            e.baseline_seq
+                .store(seq, std::sync::atomic::Ordering::Release);
             e.baseline_full.store(
-                e.word.outstanding() >= e.threshold,
-                std::sync::atomic::Ordering::Release,
-            );
-            e.baseline_seq.store(
-                e.word.wake_seq_snapshot(),
+                self.credit_baseline_full_override.unwrap_or(full),
                 std::sync::atomic::Ordering::Release,
             );
         }
@@ -13970,9 +14041,9 @@ impl GraphRuntime {
                     .is_some_and(|p| p.barrier.peers_waiting());
             // The FIFTH wake predicate — a peer consumer
             // freed credit on a cross-process `block` edge THIS process is
-            // deferred on. Two `Acquire` loads per watched edge, no alloc, no
-            // syscall (fine on the shallow-idle recheck path), and no work at
-            // all when the list is empty.
+            // deferred on. Up to three `Acquire` loads per watched edge, no
+            // alloc, no syscall (fine on the shallow-idle recheck path), and no
+            // work at all when the list is empty.
             //
             // GATED ON `baseline_full`, which is the whole design. The two
             // ungated shapes are both shipped bug classes:
@@ -13992,10 +14063,21 @@ impl GraphRuntime {
             // The advance test is `!=`, not `>`: `wake_seq` is a `u32` epoch
             // that wraps, and a park that straddled a wrap with `>` would sit
             // there until the recheck cadence saved it.
+            //
+            // Under the same gate the predicate also fires when the edge is
+            // already below threshold. That is the kernel-block arm's own skip
+            // test, so the arm never skips its block for a state the loop top
+            // does not wake on. A drain lowers `outstanding` before it bumps
+            // `wake_seq`, and between the two writes only this term sees the
+            // freed credit; without it the arm would skip the block, the loop
+            // top would see no advance, and the loop would re-poll with no
+            // block, no nap and no yield until the drain's bump landed or the
+            // park deadline passed.
             let credit_got = self.credit_park_edges.iter().any(|e| {
                 e.baseline_full.load(std::sync::atomic::Ordering::Acquire)
-                    && e.word.wake_seq_snapshot()
+                    && (e.word.wake_seq_snapshot()
                         != e.baseline_seq.load(std::sync::atomic::Ordering::Acquire)
+                        || e.word.outstanding() < e.threshold)
             });
             if listener_got || doorbell_got || fd_got || barrier_got || credit_got {
                 // Event arrived: we consumed up to `timeout`, so report
@@ -14076,9 +14158,9 @@ impl GraphRuntime {
             // block / degraded sleep chunk). The addr park's lost-wakeup fast
             // path (`RingPending` — a ring landed after the loop-top poll, so
             // the park was SKIPPED) is a wake in flight, not a slice: it must
-            // not count toward `park_yields` (slice telemetry), though the
-            // loop-bottom yield still runs (one shape; the next loop-top poll
-            // returns with the wake).
+            // not count toward `park_slices` (slice telemetry), though on the
+            // hardware arm the loop-bottom yield still runs (the next loop-top
+            // poll returns with the wake).
             let (performed, mut parked_slice) = if self.park_active() {
                 match (doorbell_addr, primary_expected) {
                     // SAFETY: `addr` is the registry's PRIMARY doorbell line — a
@@ -14150,7 +14232,8 @@ impl GraphRuntime {
                 // Snapshot → re-derive → block, the same lost-wake protocol:
                 // any bump landing after the snapshot fails the kernel compare
                 // (Principle #6). An edge that is ALREADY below threshold skips
-                // the block AND the sleep — the loop-top re-poll catches it.
+                // the block AND the sleep, and the loop-top credit predicate
+                // tests that same state, so the next loop top returns with it.
                 if !kernel_blocked && crate::credit::credit_wake_word_primitive_available() {
                     // FIRST full edge only: one address per block. A producer
                     // deferred on several edges is woken by this one and
@@ -14172,9 +14255,11 @@ impl GraphRuntime {
                             let snap = e.word.wake_seq_snapshot();
                             if e.word.outstanding() < e.threshold {
                                 // Credit is ALREADY free: skip the block and
-                                // the sleep; the loop-top re-poll returns
-                                // immediately. A wake in flight, not a
-                                // completed slice.
+                                // the sleep. The loop-top credit predicate
+                                // fires on this same `outstanding < threshold`
+                                // test under the `baseline_full` gate this edge
+                                // was found by, so the next loop top returns.
+                                // A wake in flight, not a completed slice.
                                 kernel_blocked = true;
                             } else {
                                 let cap = pace_slice.min(
@@ -14322,34 +14407,43 @@ impl GraphRuntime {
                         }
                         // A real nap chunk — a completed wait for slice
                         // telemetry (the counter pin's
-                        // `park_yields >= park_recheck_naps` rides this).
+                        // `park_slices >= park_recheck_naps` rides this).
                         parked_slice = true;
                     }
                 }
             }
             // The slice ended without a detected wake (a wake landing
             // DURING the slice is caught first thing at the next loop-top poll).
-            // Give the core to whoever is runnable before the next slice: to
-            // the OS scheduler a hardware-parked (`performed == true`) thread
-            // is RUNNING, so without this yield a co-located runnable peer —
-            // another graph process (multi-process is the default),
-            // bagd, netd, vizd, a ROS node — got the core only at CFS wakeup
-            // granularity (measured p50 6.997ms RTT with both ping-pong
-            // processes pinned to one CPU; the rmw park adopted the same
-            // per-slice yield). The `!performed` arms (degraded
-            // sleep / wake-word kernel block) already released the core — the
-            // extra yield there is a ~0.5µs no-op, kept UNCONDITIONAL so the
-            // loop bottom is one shape (mirrors rmw's `park_block`). The
-            // COUNT is gated: `park_yields` means "waits
-            // genuinely completed" — the addr park's RingPending fast path
-            // (a ring landed after the loop-top poll; no wait happened)
-            // yields but does NOT count, else doorbell-driven runs inflate
-            // the slice / slices-per-round telemetry. RECORD-ONLY
-            // (Principle #7): neither the yield nor the counter changes WHAT
-            // fires — only WHEN this loop re-polls.
-            std::thread::yield_now();
+            // A slice the CPU monitor-wait primitive performed (`performed`)
+            // kept this thread RUNNING to the OS scheduler, so it ends by giving
+            // the core to whoever is runnable: without the yield a co-located
+            // runnable peer (another graph process, bagd, netd, vizd, a ROS
+            // node) got the core only at CFS wakeup granularity (measured p50
+            // 6.997ms RTT with both ping-pong processes pinned to one CPU; the
+            // rmw park adopted the same per-slice yield). A slice that slept
+            // (the degraded nap, the wake-word kernel block, a credit or barrier
+            // block) already released the core and ends with no yield: on macOS
+            // `sched_yield` with another thread runnable on the processor
+            // depresses the caller's priority for up to one scheduler quantum
+            // (10 ms), so a consumer a ring has just woken would wait out that
+            // quantum before its next poll. The slice COUNT is gated
+            // separately: `park_slices` counts waits genuinely completed, so
+            // the addr park's RingPending fast path (a ring landed after the
+            // loop-top poll and no wait happened) is not counted, else
+            // doorbell-driven runs inflate the slice and slices-per-round
+            // telemetry. RECORD-ONLY (Principle #7): neither the yield nor the
+            // counters change WHAT fires, only WHEN this loop re-polls.
+            if performed {
+                std::thread::yield_now();
+                self.park_core_yields
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if parked_slice {
-                self.park_yields
+                self.park_slices
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !performed && !parked_slice {
+                self.park_unslept_passes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -14627,8 +14721,12 @@ impl GraphRuntime {
         let credit_at_entry = self
             .park_wakes_credit
             .load(std::sync::atomic::Ordering::Relaxed);
-        // The per-slice yield counter rides its own snapshot too.
-        let yields_at_entry = self.park_yields.load(std::sync::atomic::Ordering::Relaxed);
+        // The completed-slice and loop-bottom yield counters ride their own
+        // snapshots too.
+        let slices_at_entry = self.park_slices.load(std::sync::atomic::Ordering::Relaxed);
+        let core_yields_at_entry = self
+            .park_core_yields
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         // A deferred epoch is placed in the same breath as the
         // wall-following clock's anchor, so the controlled clock and boot-monotonic
@@ -14748,7 +14846,10 @@ impl GraphRuntime {
         let credit_now = self
             .park_wakes_credit
             .load(std::sync::atomic::Ordering::Relaxed);
-        let yields_now = self.park_yields.load(std::sync::atomic::Ordering::Relaxed);
+        let slices_now = self.park_slices.load(std::sync::atomic::Ordering::Relaxed);
+        let core_yields_now = self
+            .park_core_yields
+            .load(std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             park_entries = entries_now - entries_at_entry,
             wakes_listener = listener_now - listener_at_entry,
@@ -14757,7 +14858,8 @@ impl GraphRuntime {
             wakes_barrier = barrier_now - barrier_at_entry,
             wakes_credit = credit_now - credit_at_entry,
             wakes_timeout = timeout_now - timeout_at_entry,
-            park_yields = yields_now - yields_at_entry,
+            park_slices = slices_now - slices_at_entry,
+            park_core_yields = core_yields_now - core_yields_at_entry,
             "live loop park telemetry"
         );
 

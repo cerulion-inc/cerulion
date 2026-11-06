@@ -894,8 +894,10 @@ pub struct GatewayRuntime {
     /// a pure-ingress gateway (no queryable declared).
     get_demand_state: Arc<GetDemandState>,
     /// Queryable inversion: DEMANDER-side demand-GET tracking, present
-    /// iff this gateway has ingress topics (the demand-GET loop is running). Its
-    /// counters surface via [`Self::demand_get_pass_count`] etc.
+    /// iff this gateway has ingress topics (the demand-GET loop is running):
+    /// the manager's shared demand set, so its counters cover every pass the
+    /// manager's one loop ran. They surface via [`Self::demand_get_pass_count`]
+    /// etc.
     demand_get_state: Option<Arc<DemandGetState>>,
     /// The belt's LIVE iteration set for the
     /// synchronous [`Self::reconcile_demand_once`] seam (the background thread owns
@@ -1224,6 +1226,12 @@ impl GatewayRuntime {
         let run_source = RunSource {
             iox_config: Arc::new(manager.iox_config()),
             gather_window: RUN_GATHER_WINDOW,
+            // The manager's own slot, so a run hosted on this process's network
+            // manager is served by whichever construction latched the surface.
+            hosted: manager
+                .network()
+                .expect("network present (checked above)")
+                .hosted_runs(),
         };
         // Keep test-only clones BEFORE the sources move into the query
         // surface (the seams reconstruct the exact serve decision the callback runs).
@@ -1271,21 +1279,20 @@ impl GatewayRuntime {
         //     — every ~2 s it GETs each ingress topic's egress ON at the producer
         //     (a dialer QUERY that reaches a listening accepter — the direction
         //     that survives a strict connect-only link where the ingress DEMAND
-        //     token declaration above never forwards).
+        //     token declaration above never forwards). A manager runs ONE loop
+        //     for its lifetime, so the topics go into the manager's shared
+        //     demand set the loop reads: a later gateway on the same manager
+        //     (an embedder that starts its run again) is demanded too. Whoever
+        //     stops this gateway removes its topics again
+        //     (`NetworkManager::remove_ingress_demand_keepalive`).
         let demand_get_state = if plan.ingress.is_empty() {
             None
         } else {
-            let ingress_topics: Vec<String> = plan
-                .ingress
-                .iter()
-                .map(|e| canonical_topic(&e.topic).into_owned())
-                .collect();
-            let state = Arc::new(DemandGetState::from_topics(ingress_topics));
-            manager
-                .network()
-                .expect("network present (checked above)")
-                .start_demand_get_loop(Arc::clone(&state))?;
-            Some(state)
+            let network = manager.network().expect("network present (checked above)");
+            for entry in &plan.ingress {
+                network.ensure_ingress_demand_keepalive(&entry.topic)?;
+            }
+            Some(network.ingress_demand_state())
         };
 
         // Open the READER on the runtime-registration control service.
@@ -3126,3 +3133,192 @@ mod schema_serving_handles_tests {
 // Pure GatewayPlan tests (validate + serde round-trip) live in
 // `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
 // schema-serving replacement contract test stays local to access the private maps.
+
+#[cfg(test)]
+mod hosted_runs_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{GatewayEgressPolicy, GatewayPlan, GatewayRuntime};
+    use crate::transport::cerulion_q::{
+        RunEntry, RunEntryState, RunsCompleteness, RunsGatherOutcome, RunsReply,
+    };
+    use crate::transport::demand_authorizer::LanAccess;
+    use crate::transport::discovery::query_robot_runs;
+    use crate::transport::hosted_runs::HostedRun;
+    use crate::transport::network::{NetworkConfig, NetworkManager};
+    use crate::transport::run_registry::RunState;
+    use crate::transport::{TransportConfig, TransportManager};
+
+    const ROBOT: &str = "hostgw";
+    const WIRE_CEILING: Duration = Duration::from_secs(20);
+
+    fn allow_all_plan() -> GatewayPlan {
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowAll,
+            announce: Vec::new(),
+            ingress: Vec::new(),
+        }
+    }
+
+    /// A gateway listening on a probed loopback port, with the manager it runs
+    /// on. Retried, because another process can take the probed port first.
+    fn listening_gateway() -> (Arc<TransportManager>, GatewayRuntime, u16) {
+        for attempt in 0..3 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("an ephemeral loopback port")
+                .port();
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("hostgw_wire_{}_{attempt}", std::process::id()),
+                    network: Some(NetworkConfig {
+                        listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                        robot_identity: Some(ROBOT.to_string()),
+                        ..NetworkConfig::default()
+                    }),
+                    ..Default::default()
+                },
+                crate::testing::iceoryx_test_config(),
+            )
+            .expect("init gateway manager");
+            match GatewayRuntime::new(Arc::clone(&manager), allow_all_plan()) {
+                Ok(gateway) => return (manager, gateway, port),
+                Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
+            }
+        }
+        panic!("could not boot a listening gateway in 3 attempts");
+    }
+
+    /// GET `runs` over the wire until a decoded reply satisfies `done`.
+    fn runs_until(session: &zenoh::Session, done: impl Fn(&RunsReply) -> bool) -> RunsReply {
+        let deadline = Instant::now() + WIRE_CEILING;
+        let mut last = String::from("no GET issued");
+        while Instant::now() < deadline {
+            match query_robot_runs(session, ROBOT, Duration::from_millis(500)) {
+                RunsGatherOutcome::Decoded(reply) if done(&reply) => return reply,
+                other => last = format!("{other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no matching runs reply over the wire within {WIRE_CEILING:?}; last {last}");
+    }
+
+    #[test]
+    fn a_gateway_serves_the_runs_hosted_on_its_managers_network() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("hostgw_{}", std::process::id()),
+                network: Some(NetworkConfig {
+                    robot_identity: Some(ROBOT.to_string()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("init gateway manager");
+        let hosted = manager
+            .network()
+            .expect("a configured network")
+            .hosted_runs();
+        let gateway = GatewayRuntime::new(manager, allow_all_plan()).expect("gateway boot");
+        let entry = RunEntry::new(
+            0x7e41,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+
+        let guard = hosted.host(
+            0x7e41,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let served = gateway.runs_serve_for_test(ROBOT);
+        assert_eq!(
+            served
+                .runs
+                .iter()
+                .map(|e| (e.run_id.as_str(), e.graph_name.as_str(), e.state))
+                .collect::<Vec<_>>(),
+            vec![(
+                "0x00000000000000000000000000007e41",
+                "temi",
+                RunEntryState::Live
+            )]
+        );
+
+        drop(guard);
+        assert!(gateway.runs_serve_for_test(ROBOT).runs.is_empty());
+    }
+
+    #[test]
+    fn a_desk_get_over_loopback_reads_the_run_hosted_on_the_gateways_network() {
+        let (manager, _gateway, port) = listening_gateway();
+        let network = manager.network().expect("a configured network");
+        network.set_lan_access(LanAccess::Open);
+        let entry = RunEntry::new(
+            0x7e42,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+        let guard = network.hosted_runs().host(
+            0x7e42,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let desk = NetworkManager::new(NetworkConfig {
+            connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+            ..NetworkConfig::default()
+        });
+        let session = desk.session().expect("desk session connects");
+
+        let reply = runs_until(session, |reply| !reply.runs.is_empty());
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: vec![RunEntry {
+                    run_id: "0x00000000000000000000000000007e42".to_string(),
+                    graph_name: "temi".to_string(),
+                    run_started_at_ns: 42,
+                    state: RunEntryState::Live,
+                    graph_yaml: "name: temi\n".to_string(),
+                    run_json: "{\"version\":1}\n".to_string(),
+                }],
+                completeness: RunsCompleteness::Settled,
+                undescribable: Vec::new(),
+                error: None,
+            }
+        );
+
+        drop(guard);
+        let reply = runs_until(session, |reply| reply.runs.is_empty());
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: Vec::new(),
+                completeness: RunsCompleteness::Settled,
+                undescribable: Vec::new(),
+                error: None,
+            },
+            "a withdrawn run leaves the settled empty answer of an idle machine"
+        );
+    }
+}

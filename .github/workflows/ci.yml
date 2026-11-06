@@ -745,6 +745,18 @@ jobs:
       - name: Published crates verification self-test
         run: ./tools/scripts/test_verify_published.sh
 
+      # The release attaches the Android Java facade as an archive this script
+      # builds; the release workflow runs it only outside pull requests, so
+      # its oracle table runs here on every pull request.
+      - name: Android Java facade asset self-test
+        run: python3 -I tools/scripts/test_package_android_java.py
+
+      # Two pieces of release text a reader acts on: the Android app copy step
+      # in docs/android.md must compose with its own Cargo.toml example, and
+      # the CHANGELOG states the empty MAC key fix once, with no key length.
+      - name: Android release docs self-test
+        run: python3 -I tools/scripts/test_android_release_docs.py
+
       # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
       # the cut tree carries an em or en dash in over a thousand files, almost
       # all of it in comments, so a tree scan would red `main` and say nothing
@@ -1634,6 +1646,18 @@ jobs:
       - name: local-transport trace cap tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_trace_cap_test -- --test-threads=1
+      - name: local-transport publish stamp tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_publish_stamp_test -- --test-threads=1
+      - name: local-transport nested publish tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_nested_publish_test -- --test-threads=1
+      - name: local-transport LAN ingress tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test lan_ingress_test -- --test-threads=1
+      - name: local-transport remote plane host tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_remote_plane_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -2752,6 +2776,9 @@ jobs:
       - name: cerulion_android LAN connect integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_connect_test -- --test-threads=1
+      - name: cerulion_android LAN ingress integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_ingress_test -- --test-threads=1
       - name: cerulion_android LAN ownership tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
@@ -2785,6 +2812,12 @@ jobs:
       - name: cerulion_android trace cap integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_trace_cap_test -- --test-threads=1
+      - name: cerulion_android publish stamp integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_publish_stamp_test -- --test-threads=1
+      - name: cerulion_android nested publish integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test sample_graph_asset_test
@@ -4146,6 +4179,17 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
+      # The app's transport is the in-process one, and the hosted plane test
+      # starts the process runtime, so one thread.
+      - name: cerulion_android_remote tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android_remote')
+        run: cargo test -p cerulion_android_remote --features local-transport -- --test-threads=1
+      - name: selection marker, cerulion_android_remote
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android_remote') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android_remote (selected: $SELECTED)"
       - name: cerulion_accountd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd')
         run: cargo test -p cerulion_accountd

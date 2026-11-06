@@ -42,6 +42,7 @@ pub mod failure_regime_latch;
 pub mod fill_from;
 pub mod frame_drop_latch;
 pub mod gateway;
+pub mod hosted_runs;
 pub mod ingress_build;
 pub mod input_view;
 pub mod kind;
@@ -1341,6 +1342,19 @@ pub const RETAINING_PUBLISHER_NAME: &str = "cerulion.retains";
 /// Whether an iceoryx2 publisher port name is [`RETAINING_PUBLISHER_NAME`].
 pub(crate) fn publisher_name_retains(name: &str) -> bool {
     name == RETAINING_PUBLISHER_NAME
+}
+
+/// One publisher on a topic, as [`TransportManager::topic_publisher_nodes`]
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicPublisherNode {
+    /// The publisher's id: the
+    /// [`ReceivedMessage::origin`](subscriber::ReceivedMessage::origin) of
+    /// every frame it commits. Run random, so compared only within one run.
+    pub publisher: u128,
+    /// The name of the iceoryx2 node the publisher was created under, `None`
+    /// when that node's details cannot be read.
+    pub node_name: Option<String>,
 }
 
 /// How a topic's publisher side is provisioned, derived
@@ -4178,8 +4192,8 @@ impl TransportManager {
     /// within one pass once the transport is back. Call it once per demanded topic,
     /// right after `register_ingress_topic`. Idempotent + start-once.
     ///
-    /// A gateway (which boots its OWN demand-GET loop from its fixed ingress list)
-    /// never calls this — the manager's single loop slot is used by exactly one role.
+    /// A gateway adds its ingress topics to the same set at boot, so the
+    /// manager's one loop demands both.
     ///
     /// # Errors
     ///
@@ -6066,6 +6080,35 @@ impl TransportManager {
         self.topic_port_count(topic, false)
     }
 
+    /// [`Self::topic_subscriber_count`] that tells a failed probe apart from
+    /// no subscriber: `Some(n)` when the topic's data service opened (`n`
+    /// subscribers, in every process), `Some(0)` when the service does not
+    /// exist, and `None` when the name is invalid, the service states another
+    /// wire header version, or the open fails for another reason (for
+    /// example the process is out of file descriptors).
+    pub fn topic_subscriber_count_checked(&self, topic: &str) -> Option<usize> {
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let name: ServiceName = format!("{}/data", topic).as_str().try_into().ok()?;
+        match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                None
+            }
+            Ok(service) => Some(service.dynamic_config().number_of_subscribers()),
+            Err(PublishSubscribeOpenError::DoesNotExist) => Some(0),
+            Err(e) => {
+                tracing::debug!(topic = %topic, error = %e, "subscriber count probe failed");
+                None
+            }
+        }
+    }
+
     /// Live PUBLISHER count on a topic's data service, queried from
     /// iceoryx2's dynamic config — covers ALL processes, unlike any
     /// process-local registry (`rcl_action_server_is_
@@ -6201,6 +6244,84 @@ impl TransportManager {
             Err(PublishSubscribeOpenError::DoesNotExist) => Ok(Vec::new()),
             Err(e) => Err(map_err(format!("{e}"))),
         }
+    }
+
+    /// One entry per publisher attached to `topic`'s data service right now,
+    /// in every process: its id, which is the
+    /// [`ReceivedMessage::origin`](subscriber::ReceivedMessage::origin) of
+    /// every frame it commits, and the name of the iceoryx2 node it was
+    /// created under ([`TransportConfig::node_name`] for a Cerulion
+    /// transport). The name is `None` when that node's details cannot be
+    /// read: another user's node, or one in an undefined state.
+    ///
+    /// The ports come from the service's dynamic config and the names from
+    /// iceoryx2's node list under this transport's config, so each call reads
+    /// one node record per node on that config.
+    ///
+    /// An empty list when the service does not exist, and when it exists with
+    /// no publisher.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::TopicPublishers`], naming the cause, when the topic
+    /// is not a valid service name, the service cannot be opened for a reason
+    /// other than not existing, it states another wire header version, or the
+    /// node list cannot be read.
+    pub fn topic_publisher_nodes(&self, topic: &str) -> TransportResult<Vec<TopicPublisherNode>> {
+        use iceoryx2::node::NodeView;
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let map_err = |reason: String| TransportError::TopicPublishers {
+            topic: topic.to_string(),
+            reason,
+        };
+        let name: ServiceName = format!("{}/data", topic)
+            .as_str()
+            .try_into()
+            .map_err(|e| map_err(format!("{e}")))?;
+        let service = match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service) => service,
+            Err(PublishSubscribeOpenError::DoesNotExist) => return Ok(Vec::new()),
+            Err(e) => return Err(map_err(format!("{e}"))),
+        };
+        wire_header_attribute::check_opened(topic, service.attributes()).map_err(map_err)?;
+        let mut ports = Vec::new();
+        service.dynamic_config().list_publishers(|details| {
+            ports.push((details.publisher_id.value(), details.node_id));
+            CallbackProgression::Continue
+        });
+        if ports.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        Node::<CerService>::list(self.node.config(), |state| {
+            let details = match &state {
+                NodeState::Alive(view) => view.details().as_ref(),
+                NodeState::Dead(view) => view.details().as_ref(),
+                NodeState::Inaccessible(_) | NodeState::Undefined(_) => None,
+            };
+            if let Some(details) = details {
+                if ports.iter().any(|(_, node)| node == state.node_id()) {
+                    names.push((*state.node_id(), details.name().as_str().to_string()));
+                }
+            }
+            CallbackProgression::Continue
+        })
+        .map_err(|e| map_err(format!("the node list could not be read: {e:?}")))?;
+        Ok(ports
+            .into_iter()
+            .map(|(publisher, node)| TopicPublisherNode {
+                publisher,
+                node_name: names
+                    .iter()
+                    .find(|(id, _)| *id == node)
+                    .map(|(_, name)| name.clone()),
+            })
+            .collect())
     }
 
     /// Owned handle to the transport clock (the service layer

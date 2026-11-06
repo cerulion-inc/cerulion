@@ -772,6 +772,10 @@ pub unsafe extern "C" fn rmw_create_publisher(
                 return std::ptr::null_mut();
             }
         };
+        // The publisher gid is its iceoryx2 port id (`crate::gid`), the id
+        // every sample this port sends carries as its origin, so a take in
+        // any process reports this gid as the message's publisher gid.
+        let gid = crate::gid::publisher_gid(publisher.publisher_id());
 
         // The depth this endpoint reports is its clamped ask: TRANSIENT_LOCAL
         // depth-N reports N clamped to the type's limit (KEEP_ALL reports the
@@ -824,12 +828,6 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // end of this function defends (see `register_dynamic_egress`).
         #[cfg(feature = "test-seams")]
         crate::test_seams::maybe_panic_after_publisher_transport_create();
-
-        // Deterministic gid: entity counter + schema hash (never random).
-        let entity = runtime::next_entity_id();
-        let mut gid = [0u8; 16];
-        gid[..8].copy_from_slice(&entity.to_le_bytes());
-        gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         let can_loan = bridge.can_loan();
@@ -2658,14 +2656,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
             );
         }
 
-        // Deterministic gid: entity counter + schema hash (never random) —
-        // mirrors the publisher; the endpoint id reported by
-        // rmw_get_subscriptions_info_by_topic and the registry deregister
-        // key. Read the bridge BEFORE it moves into `data`.
-        let entity = runtime::next_entity_id();
-        let mut gid = [0u8; 16];
-        gid[..8].copy_from_slice(&entity.to_le_bytes());
-        gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
+        // The entity gid (`crate::gid`): the endpoint id
+        // rmw_get_subscriptions_info_by_topic reports and the registry
+        // deregister key.
+        let gid = crate::gid::mint_gid();
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         // Adopt-take hot path: the
@@ -2942,7 +2936,9 @@ unsafe fn serve_recorded_message(
         }
         *taken = true;
         if !message_info.is_null() {
-            // The same fill as the live take, from the recorded values.
+            // The live take's fill, from the recorded values, except the
+            // publisher gid: the log does not record it, so its 16 bytes
+            // stay zero.
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
             info.source_timestamp = rec.source_ts;
             info.received_timestamp = rec.received_ts;
@@ -3011,11 +3007,12 @@ unsafe fn take_impl_live(
     }
     let mut result = RMW_RET_OK;
     let mut took = false;
-    let mut info_out: Option<(u64, u64)> = None;
+    let mut info_out: Option<(u64, u64, u128)> = None;
     // ONE message per call (the rmw take contract): try_receive_one,
     // never the drain-everything path — extra drained frames would be
     // silently lost (Principle #6).
     let receive = inner.subscriber.try_receive_one(|msg| {
+        let origin = msg.origin();
         let header = msg.header();
         // The DECISION lives in `take_gate` — one pure
         // function, one legal mutation target, shared by all three take
@@ -3076,7 +3073,7 @@ unsafe fn take_impl_live(
         }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
+            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             crate::replay::capture_take_body(
                 msg.payload(),
                 header.sequence as i64,
@@ -3114,7 +3111,7 @@ unsafe fn take_impl_live(
         *taken = true;
         if !message_info.is_null() {
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-            if let Some((ts, seq)) = info_out {
+            if let Some((ts, seq, _)) = info_out {
                 info.source_timestamp = ts as i64;
                 info.received_timestamp = match runtime::runtime() {
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -3122,7 +3119,7 @@ unsafe fn take_impl_live(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            super::stamp_publisher_gid(&mut info, info_out.map(|(_, _, origin)| origin));
             info.from_intra_process = false;
             *message_info = info;
         }
@@ -3430,6 +3427,7 @@ unsafe fn take_adopted(
         // Empty queue — `taken` stays false.
         return RMW_RET_OK;
     };
+    let origin = owned.origin();
     // `owned.wire_header()` returns the header the read entry stored when it took
     // the frame: `try_receive_one_owned` serves a frame only through
     // `OwnedInboundSample::with_header`, handing it the header its own loop
@@ -3986,7 +3984,7 @@ unsafe fn take_adopted(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+        super::stamp_publisher_gid(&mut info, Some(origin));
         info.from_intra_process = false;
         *message_info = info;
     }
@@ -4207,6 +4205,7 @@ unsafe fn take_loaned_impl(
         }
         return RMW_RET_OK;
     };
+    let origin = owned.origin();
     // `owned.wire_header()` returns the header the read entry stored when it took
     // the frame: `try_receive_one_owned` serves a frame only through
     // `OwnedInboundSample::with_header`, handing it the header its own loop
@@ -4459,7 +4458,7 @@ unsafe fn take_loaned_impl(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+        super::stamp_publisher_gid(&mut info, Some(origin));
         info.from_intra_process = false;
         *message_info = info;
     }

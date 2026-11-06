@@ -20,6 +20,8 @@ public final class CerulionRuntime {
     public static final int DECODE = 14;
     public static final int EMPTY = 15;
     public static final int RECEIVE = 16;
+    public static final int REMOTE_NOT_PROVISIONED = 17;
+    public static final int REMOTE = 18;
 
     private static String loadedLibrary;
 
@@ -75,10 +77,32 @@ public final class CerulionRuntime {
         return nativeStart(configJson);
     }
 
-    /** Publish without waiting for startup or shutdown. Returns a stable error code. */
+    /**
+     * Publish without waiting for startup or shutdown. Returns a stable error
+     * code. The frame is stamped with the runtime clock's time.
+     */
     public static int publish(String topic, String json) {
         ensureLoaded();
         return nativePublish(topic, json);
+    }
+
+    /**
+     * Publish like {@link #publish(String, String)}, with the frame stamped
+     * {@code stampNs}: nanoseconds on the runtime clock's base. The runtime
+     * clock is {@code CLOCK_MONOTONIC}, the clock {@link System#nanoTime()}
+     * reads on Android. A stamp in the past is taken as is. A negative stamp
+     * returns {@link #INVALID_ARGUMENT} at once. Otherwise the call first
+     * checks the runtime state and the topic as
+     * {@link #publish(String, String)} does, with the same codes. Then a
+     * stamp more than one second ahead of the runtime clock returns
+     * {@link #INVALID_ARGUMENT} before the message is read, so a message
+     * {@code publish} refuses with {@link #ENCODE} returns
+     * {@link #INVALID_ARGUMENT} when its stamp is also too far ahead. A
+     * refused call sends nothing.
+     */
+    public static int publishStamped(String topic, String json, long stampNs) {
+        ensureLoaded();
+        return nativePublishStamped(topic, json, stampNs);
     }
 
     /**
@@ -125,6 +149,8 @@ public final class CerulionRuntime {
     private static native int nativeStart(String configJson);
 
     private static native int nativePublish(String topic, String json);
+
+    private static native int nativePublishStamped(String topic, String json, long stampNs);
 
     private static native int nativePoll(String topic, StringBuilder out);
 

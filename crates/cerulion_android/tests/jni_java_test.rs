@@ -88,7 +88,7 @@ status-before-load=call CerulionRuntime.loadLibrary(<your runtime library>) firs
 load-again=no-exception
 load-other=CerulionRuntime is bound to libcerulion_sample_runtime.so
 status-before-init=uninitialized
-codes=14,15,16
+codes=14,15,16,17,18
 init-bad=3
 init-ok=0
 linked-nodes=[\"printer\",\"relay\",\"timer\"]
@@ -105,6 +105,13 @@ poll-null-out=3
 poll-null-topic=3
 poll-overflow=0 {\"data\":\"b\"}, 0 {\"data\":\"\u{e7}\"}, 15
 subscribed={\"/jni/heartbeat\":{\"polled\":3,\"dropped\":1,\"undecodable\":0}}
+publish-stamped=0
+publish-stamped-negative=3
+publish-stamped-ahead=3
+publish-stamped-null=3
+publish-stamped-ahead-oversized=3
+poll-stamped=0 {\"data\":\"stamped\"}
+poll-stamped-empty=15
 stop=0 state=stopped
 start-graph=0 state=running nodes=3
 poll-graph=0 {\"data\":2}

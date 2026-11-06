@@ -537,8 +537,9 @@ core per idle subscriber. The shared
 `0` = off, `1` = force on (on a no-park Linux target the bounded one-rung `FirstRungOnce`
 shape). The Linux park pins run under that forced shape. The native
 `monitor_wait_block` slices on the same shared `PARK_RECHECK` bound and yields after every
-completed slice (counted in `park_yields`); its park horizon follows the live loop's own
-deadline rather than this table.
+hardware slice (counted in `park_core_yields`; a slice that slept ends with no yield, and
+completed slices of every tier are counted in `park_slices`); its park horizon follows the
+live loop's own deadline rather than this table.
 
 **Fired-only drain/probe.** A stock rclcpp executor's set is 1 subscription + 6
 parameter services + 2 guards; a loop that drains every listener and probes every
