@@ -179,8 +179,10 @@ pub struct ReplayIdUnavailable {
 /// Starts from the config of the topic the stage reads live, so the borrow
 /// budget a latest-value input holds is the same, and changes three things:
 /// the buffer is raised to `buffer` (the deepest single read the recording
-/// holds for this stage, never below the input's own depth), history is off,
-/// and the publisher side is producer-less (`External`), so the replay's one
+/// holds for this stage, never below the input's own depth), history is off
+/// (the create leg's history floor is cleared too, so the service the build
+/// creates has no history and exactly that buffer), and the
+/// publisher side is producer-less (`External`), so the replay's one
 /// feed publisher opens the service the subscriber created. The publisher
 /// slot count is `live_publishers` when it is `Some`
 /// ([`ReplayWiring::live_publishers`]), else `live`'s own: the subscriber sizes
@@ -195,6 +197,7 @@ pub fn replay_feed_topic_config(
     let mut cfg = live;
     cfg.subscriber_max_buffer_size = cfg.subscriber_max_buffer_size.max(buffer);
     cfg.history_size = 0;
+    cfg.create_history_floor = None;
     cfg.max_publishers = live_publishers.or(cfg.max_publishers);
     cfg.max_subscribers = None;
     cfg.publisher_provisioning = crate::transport::PublisherProvisioning::External;
@@ -675,6 +678,7 @@ mod tests {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(17),
             max_publishers: Some(16),
             publisher_provisioning: PublisherProvisioning::Multi,
@@ -688,6 +692,16 @@ mod tests {
         assert_eq!(fed.history_size, 0);
         assert_eq!(fed.max_subscribers, None);
         assert_eq!(fed.publisher_provisioning, PublisherProvisioning::External);
+        // A live config with a create-leg history floor yields a feed whose
+        // created service has no history and the feed's own buffer.
+        let floored = TopicServiceConfig {
+            create_history_floor: Some(8),
+            ..live
+        };
+        let fed = replay_feed_topic_config(floored, 6, None);
+        assert_eq!(fed.create_history_floor, None);
+        assert_eq!(fed.create_history_size(), 0);
+        assert_eq!(fed.create_subscriber_max_buffer_size(), 6);
     }
 
     /// A rank that writes nothing on a bus holds an `External` view of it, with
@@ -701,6 +715,7 @@ mod tests {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             publisher_provisioning: PublisherProvisioning::External,
