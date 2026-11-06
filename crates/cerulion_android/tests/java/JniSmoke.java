@@ -142,7 +142,8 @@ public final class JniSmoke {
                 + illegalState(() -> CerulionRuntime.loadLibrary("other_runtime")));
         System.out.println("status-before-init=" + state(CerulionRuntime.status()));
         System.out.println("codes=" + CerulionRuntime.DECODE + "," + CerulionRuntime.EMPTY
-                + "," + CerulionRuntime.RECEIVE);
+                + "," + CerulionRuntime.RECEIVE + "," + CerulionRuntime.REMOTE_NOT_PROVISIONED
+                + "," + CerulionRuntime.REMOTE);
         System.out.println("init-bad=" + CerulionRuntime.init(args[0] + "/missing", "jni-test"));
         System.out.println("init-ok=" + CerulionRuntime.init(args[0], "jni-test"));
         String initStatus = CerulionRuntime.status();

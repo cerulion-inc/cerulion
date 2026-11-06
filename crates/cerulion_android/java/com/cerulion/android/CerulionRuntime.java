@@ -20,6 +20,8 @@ public final class CerulionRuntime {
     public static final int DECODE = 14;
     public static final int EMPTY = 15;
     public static final int RECEIVE = 16;
+    public static final int REMOTE_NOT_PROVISIONED = 17;
+    public static final int REMOTE = 18;
 
     private static String loadedLibrary;
 

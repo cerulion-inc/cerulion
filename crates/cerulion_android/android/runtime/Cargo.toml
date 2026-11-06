@@ -19,6 +19,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cerulion_android = { path = "../.." }
+# The paired remote plane host, which a start's `remote` key enables.
+cerulion_android_remote = { path = "../../../cerulion_android_remote" }
 # `default-features = false` leaves each node's C exports out of this library.
 timer = { path = "../../../../examples/basic_timer/nodes/timer", default-features = false }
 printer = { path = "../../../../examples/basic_timer/nodes/printer", default-features = false }
