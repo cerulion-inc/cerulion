@@ -17,8 +17,8 @@
 //! # Platform boundary
 //!
 //! The interposition and FFI export layer is **Linux and GNU only**: dynamically
-//! linked **glibc 2.34 or newer** and **libstdc++** with the default
-//! `std::allocator`. macOS (SIP and libc++) and any other malloc interposer
+//! linked **glibc 2.31 or newer** (the release floor) and **libstdc++** with the
+//! default `std::allocator`. macOS (SIP and libc++) and any other malloc interposer
 //! (jemalloc, tcmalloc, ASan) are out of scope; the handshake degrades to the copy
 //! path, loudly, and never fails a publish.
 //!

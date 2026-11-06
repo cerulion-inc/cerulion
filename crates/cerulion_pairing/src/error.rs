@@ -204,6 +204,12 @@ pub enum PairingError {
     /// owner's access row with the code-pairing scope.
     #[error("code pairing cannot bind the robot's owner account")]
     CodePairOwnerAccount,
+    /// A cloud device certificate was presented while this robot's
+    /// allow-from-cloud switch is OFF.
+    #[error(
+        "this robot does not allow access from the cloud (its allow-from-cloud switch is off)"
+    )]
+    CloudAccessDisabled,
 
     // ---- owner-signed access grant ---------------------------------------
     /// An owner-signed [`crate::format::AccessGrant`] was presented whose owner
@@ -384,6 +390,14 @@ pub enum PairingError {
          machine); delete it only if this machine's clock and team state are known good"
     )]
     HighWaterTampered,
+    /// A team credential file is missing, does not decode or fails its check.
+    #[error("team credentials {path}: {reason}")]
+    TeamCredentials {
+        /// The file.
+        path: std::path::PathBuf,
+        /// What is wrong with it and what to do.
+        reason: String,
+    },
     /// The high-water file has the wrong length or magic after its MAC verified,
     /// or before a MAC could be checked.
     #[error("the identity high-water file is malformed: {0}")]
