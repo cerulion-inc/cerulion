@@ -392,7 +392,8 @@ pub enum TransportError {
     #[error("Local observation of topic '{topic}' could not hold its source: {reason}")]
     LocalObservationLease { topic: String, reason: String },
     /// The publishers attached to `topic`'s data service could not be read
-    /// (`TransportManager::topic_publisher_retain_marks`).
+    /// (`TransportManager::topic_publisher_retain_marks`,
+    /// `TransportManager::topic_publisher_nodes`).
     #[error("Could not read the publishers of topic '{topic}': {reason}")]
     TopicPublishers { topic: String, reason: String },
     /// Internal error (e.g., poisoned mutex).

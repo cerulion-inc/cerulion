@@ -401,6 +401,36 @@ jobs:
             ${{ runner.temp }}/debs/*.deb.sha256
           if-no-files-found: error
 
+  # The `cerulion_android` Java facade as a versioned asset,
+  # `cerulion-android-java-<version>.tar.gz`: the crate's `java/` tree and its
+  # LICENSE, the same files the crates.io package carries, so an app can add
+  # the facade to its Gradle sources without reading a Cargo checkout. The
+  # script fixes member order, owner, mode and time, so the archive can be
+  # rebuilt from the tagged commit (byte for byte with this runner's zlib).
+  # The tag check is the `build` job's; `release` needs both jobs.
+  android-java:
+    name: Package the Android Java facade
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Package the facade
+        id: package
+        run: |
+          version=$(tools/scripts/workspace_version.sh)
+          python3 -I tools/scripts/package_android_java.py --version "$version" --out "$RUNNER_TEMP/android-java"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the facade artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cerulion-android-java-${{ steps.package.outputs.version }}
+          path: |
+            ${{ runner.temp }}/android-java/cerulion-android-java-${{ steps.package.outputs.version }}.tar.gz
+            ${{ runner.temp }}/android-java/cerulion-android-java-${{ steps.package.outputs.version }}.tar.gz.sha256
+          if-no-files-found: error
+
   # A Linux archive or deb whose rmw does not carry ROS 2 traffic must never
   # be published: install the deb in a clean Jazzy container and run the
   # README's own command through it. The same check runs on a plain dispatch,
@@ -467,7 +497,7 @@ jobs:
   release:
     name: Publish GitHub Release assets
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: [build, verify-rmw, rmw-lyrical]
+    needs: [build, android-java, verify-rmw, rmw-lyrical]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -476,7 +506,9 @@ jobs:
       # `rmw-lyrical-*` library artifacts and the `rmw-verify-*` logs are
       # build evidence, not downloads: the Jazzy library ships inside the Linux
       # archives, and the Lyrical library ships in the `cerulion-rmw-lyrical-*`
-      # tarballs this job packs from it.
+      # tarballs this job packs from it. The Android Java facade archive is a
+      # `cerulion-*` artifact too, so it is a release asset with its line in
+      # SHA256SUMS.
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -707,23 +739,28 @@ jobs:
       # before uploading — measured 30 min on a cold hosted runner — so the
       # wait must outlast that, not just the upload.
       #
-      # Wait for the two crates that ship the released binaries, not only the
-      # three that already exist on crates.io: `cargo publish --workspace`
-      # publishes in dependency order and cerulion_cli depends on every other
-      # publishable crate, so its presence at this version proves the whole
-      # workspace landed, except cerulion_wsd and the cerulion umbrella,
-      # which nothing depends on and which publish beside it, so they are
-      # waited for by name. A publish that stops at one of the twelve
-      # never-published names (the crates.io new-crate rate-limit shape) would
-      # otherwise leave this smoke GREEN while `cargo install cerulion_cli`
-      # resolves nothing. The umbrella is added to the list only when the
-      # checked-out tag contains crates/cerulion: a smoke-only dispatch
-      # against a release cut before the umbrella existed never published it.
+      # Wait for the crates that ship the released binaries, not only the
+      # lowest ones: `cargo publish --workspace` publishes in dependency order
+      # and cerulion_cli depends on every other publishable crate, so its
+      # presence at this version proves the whole workspace landed, except
+      # cerulion_wsd, the cerulion umbrella and cerulion_android, which nothing
+      # depends on and which publish beside it, so they are waited for by name.
+      # A publish that stops at a crate name new to crates.io (the new-crate
+      # rate-limit shape) would otherwise leave this smoke GREEN while
+      # `cargo install cerulion_cli` resolves nothing. The umbrella is added to
+      # the list only when the checked-out tag contains crates/cerulion: a
+      # smoke-only dispatch against a release cut before the umbrella existed
+      # never published it.
       - name: Wait for crates.io publication
         run: |
           crates="cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd"
           if [ -f source-checkout/crates/cerulion/Cargo.toml ]; then
             crates="$crates cerulion"
+          fi
+          # v1.0.0 predates cerulion_android on crates.io; every later release
+          # publishes it.
+          if [ "$TAG" != v1.0.0 ]; then
+            crates="$crates cerulion_android"
           fi
           # shellcheck disable=SC2086 # one crate name per word
           source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 $crates

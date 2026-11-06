@@ -318,3 +318,83 @@ fn a_publisher_that_asks_for_history_carries_the_retaining_mark_until_it_drops()
         Some(Vec::new())
     );
 }
+
+/// Each publisher on a topic is listed with the name of the node its
+/// transport runs under, and its id is the origin of every frame it
+/// commits, so a reader can name the node a frame came from. A dropped
+/// publisher leaves the list.
+#[test]
+fn a_topics_publishers_name_the_node_each_frame_came_from() {
+    use cerulion_core::{TopicPublisherNode, TransportConfig, TransportManager};
+
+    let topic = unique_topic("publisher_nodes");
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = |name: &str| {
+        TransportManager::init_for_test(
+            TransportConfig {
+                node_name: name.to_string(),
+                ..Default::default()
+            },
+            root.clone(),
+        )
+        .expect("transport")
+    };
+    let reader = manager("publisher_nodes_reader");
+    assert_eq!(
+        reader.topic_publisher_nodes(&topic).ok(),
+        Some(Vec::new()),
+        "a topic with no service has no publisher"
+    );
+    let live = manager("publisher_nodes_live");
+    let played = manager("cerulion_replay_publisher_nodes");
+    let sub = reader.create_subscriber(&topic).expect("subscriber");
+    let mut from_live = live
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+        .expect("live publisher");
+    let mut from_played = played
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+        .expect("played publisher");
+    let mut listed = reader
+        .topic_publisher_nodes(&topic)
+        .expect("the probe reads the service and the node list");
+    listed.sort_by_key(|p| p.publisher);
+    let mut expected = vec![
+        TopicPublisherNode {
+            publisher: from_live.publisher_id(),
+            node_name: Some(String::from("publisher_nodes_live")),
+        },
+        TopicPublisherNode {
+            publisher: from_played.publisher_id(),
+            node_name: Some(String::from("cerulion_replay_publisher_nodes")),
+        },
+    ];
+    expected.sort_by_key(|p| p.publisher);
+    assert_eq!(listed, expected);
+
+    publish_vec3(&mut from_played, 1.0);
+    publish_vec3(&mut from_live, 2.0);
+    let mut origins = Vec::new();
+    for _ in 0..4 {
+        let _ = sub
+            .wait_for_message(Duration::from_millis(200), |msg| {
+                origins.push(msg.origin());
+            })
+            .expect("wait_for_message");
+        if origins.len() == 2 {
+            break;
+        }
+    }
+    origins.sort_unstable();
+    let mut sent = vec![from_played.publisher_id(), from_live.publisher_id()];
+    sent.sort_unstable();
+    assert_eq!(origins, sent, "each frame's origin is its publisher's id");
+
+    drop(from_played);
+    assert_eq!(
+        reader.topic_publisher_nodes(&topic).ok(),
+        Some(vec![TopicPublisherNode {
+            publisher: from_live.publisher_id(),
+            node_name: Some(String::from("publisher_nodes_live")),
+        }])
+    );
+}
