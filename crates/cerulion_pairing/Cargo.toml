@@ -26,6 +26,18 @@ include = ["src/", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 [lints]
 workspace = true
 
+[features]
+# A local development team issuer (`team::dev_issuer`) and the
+# `cerulion-dev-issuer` program. A build with it trusts team credentials that
+# chain to the development root set in `<config>/dev-issuer/`; no release
+# build enables it (tools/scripts/check_no_dev_issuer.sh).
+dev-issuer = []
+
+[[bin]]
+name = "cerulion-dev-issuer"
+path = "src/bin/cerulion_dev_issuer.rs"
+required-features = ["dev-issuer"]
+
 [lib]
 path = "src/lib.rs"
 

@@ -8,7 +8,7 @@
 //! itself fans the SIGINT out to its workers), and pin the multi-process bag
 //! contracts:
 //!
-//! 1. **mp happy path** — exit 0; ONE finalized bag; per-rank manifests
+//! 1. **mp happy path** - exit 0; ONE finalized bag; per-rank manifests
 //!    (`rank0` = `[ticker,relay]`, `rank1` = `[sink]`, the `rank4294967295`
 //!    departure sentinel = `[]`); every trace record's `reserved` ∈ {0,1} with
 //!    NO departure records (happy path); per-rank STEP-BOUNDARY streams
@@ -25,7 +25,7 @@
 //!    ids), no rank-1, no departure sentinel, every `reserved` == 0.
 //! 3. **`--time-source virtual` still rejected** — subprocess-level validator
 //!    pin (exit nonzero naming the live-clock requirement).
-//! 4. **Departure path** — SIGKILL the rank-1 worker under
+//! 4. **Departure path** - SIGKILL the rank-1 worker under
 //!    `--peer-loss continue`: exit 0 (degraded), the bag carries kind-2
 //!    departure record(s) with `reserved` == u32::MAX + `node_idx` == 1, the
 //!    survivor out-steps the dead rank, the sentinel manifest stays `[]`, and
@@ -537,7 +537,7 @@ fn mp_record_contracts_under_signal(
         );
     }
     // The manifest attachment JSON carries the `inputs` key with a NON-empty
-    // list for the consumer nodes (relay on rank 0, sink on rank 1) — the
+    // list for the consumer nodes (relay on rank 0, sink on rank 1) - the
     // offline resolver bagd stamps from the ring's input section.
     for (rank, consumer) in [(0u32, "relay"), (1u32, "sink")] {
         let manifest = raw_manifest(rank);
@@ -763,7 +763,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
             read_file(&stderr_path)
         )
     });
-    // A healthy pre-kill window so BOTH ranks bank fires + boundaries — waited
+    // A healthy pre-kill window so BOTH ranks bank fires + boundaries - waited
     // for on the evidence itself, so the kill lands only once both ranks really
     // have a recorded stream to compare afterwards.
     wait_for_bag_state(
@@ -938,7 +938,7 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
         RecordMode::Lockstep => assert!(
             last0 > last1,
             "the surviving rank 0 must out-step the killed rank 1 in the FINALIZED bag \
-             (rank0 last step {last0} vs rank1 {last1}) — the recorder flushed \
+             (rank0 last step {last0} vs rank1 {last1}) - the recorder flushed \
              {growths} time(s) after the kill, so post-kill records DID reach the bag; \
              a tie here is a scheduling finding, not a recording one"
         ),
