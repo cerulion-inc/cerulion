@@ -473,7 +473,7 @@ Use GitHub's **Cite this repository** button or [CITATION.cff](CITATION.cff):
   author  = {Sharma, Lakshay and Kariyawasam, Raveen and {Cerulion Inc. and contributors}},
   title   = {Cerulion: a robot runtime with byte-exact re-execution of recorded runs},
   year    = {2026},
-  version = {1.0.0},
+  version = {2.0.0},
   url     = {https://github.com/cerulion-inc/cerulion}
 }
 ```

@@ -745,6 +745,18 @@ jobs:
       - name: Published crates verification self-test
         run: ./tools/scripts/test_verify_published.sh
 
+      # The release attaches the Android Java facade as an archive this script
+      # builds; the release workflow runs it only outside pull requests, so
+      # its oracle table runs here on every pull request.
+      - name: Android Java facade asset self-test
+        run: python3 -I tools/scripts/test_package_android_java.py
+
+      # Two pieces of release text a reader acts on: the Android app copy step
+      # in docs/android.md must compose with its own Cargo.toml example, and
+      # the CHANGELOG states the empty MAC key fix once, with no key length.
+      - name: Android release docs self-test
+        run: python3 -I tools/scripts/test_android_release_docs.py
+
       # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
       # the cut tree carries an em or en dash in over a thousand files, almost
       # all of it in comments, so a tree scan would red `main` and say nothing

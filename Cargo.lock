@@ -83,7 +83,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "android_e2e_demand_probe"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "cerud"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerud",
  "cerulion_ops_proto",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
  "cerulion_macros",
@@ -1223,14 +1223,14 @@ dependencies = [
 
 [[package]]
 name = "cerulion-wire"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "cerulion_accountd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_android",
  "cerulion_bag",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android_remote"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_android",
  "cerulion_core",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bag"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_core",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bagd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_engine"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_accountd",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_tui"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_connectd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerud",
  "cerulion_core",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_core"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_dds"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "async-channel",
  "cerulion-ros2-client",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_discovery"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "dirs",
  "serde",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_heaphook"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "libc",
  "tracing",
@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_hygiene"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "libc",
  "rustix 1.1.3",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_link"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "iroh",
  "rustls",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_mdns"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_discovery",
  "mdns-sd",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_netd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_ops_proto"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1629,7 +1629,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "data-encoding",
  "dirs",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_rcpd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerud",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_remoted"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerud",
  "cerulion_core",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_telemetry"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "dirs",
  "reqwest",
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_tf"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "thiserror 2.0.17",
 ]
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_wireclient"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_wsd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "codegen_fixture_msgs"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
 ]
@@ -3568,14 +3568,14 @@ dependencies = [
 
 [[package]]
 name = "heaphook_probe"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "heaphook_shim"
-version = "1.0.0"
+version = "2.0.0"
 
 [[package]]
 name = "heck"
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
  "paste",
@@ -8092,7 +8092,7 @@ dependencies = [
 
 [[package]]
 name = "rmw_cerulion"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "bindgen 0.70.1",
  "cc",
