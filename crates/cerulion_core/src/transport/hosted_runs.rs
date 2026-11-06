@@ -9,16 +9,23 @@
 //! and the `runs` verb folds these entries into the same reply as the gathered
 //! ones.
 //!
+//! A hosted run may also carry the run's [`FireTap`]. The `fires` verb serves
+//! it, so a desk can follow when and how each node of the run ticks.
+//!
 //! The one writer of a hosted run is the [`HostedRunGuard`] that
 //! [`HostedRuns::host`] returns. Dropping the guard withdraws the run, so a run
-//! cannot stay listed after its host lets go of it.
+//! cannot stay listed, or keep serving fires, after its host lets go of it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::cerulion_q::{format_run_id, RunEntry, RunEntryError, RunEntryState, UndescribableRun};
+use super::cerulion_q::{
+    format_run_id, FiresOutcome, RunEntry, RunEntryError, RunEntryState, UndescribableRun,
+    MAX_FIRES_PER_REPLY,
+};
 use super::run_registry::RunState;
+use crate::fire_tap::{Cursor, FireBatch, FireTap};
 
 /// One run a host serves from memory.
 #[derive(Debug)]
@@ -31,6 +38,9 @@ pub struct HostedRun {
     /// reason; from then on the run is served as [`RunEntryState::Ending`] until
     /// its guard is dropped.
     pub live: Arc<AtomicBool>,
+    /// The run's fire tap, which the `fires` verb serves. `None`: the run
+    /// records no fires, and the verb answers [`FiresOutcome::NotServed`].
+    pub fires: Option<Arc<FireTap>>,
 }
 
 /// One hosted run as the `runs` verb serves it, plus the generation of the
@@ -40,6 +50,7 @@ pub struct HostedRun {
 struct Slot {
     generation: u64,
     live: Arc<AtomicBool>,
+    fires: Option<Arc<FireTap>>,
     /// The entry minted again through [`RunEntry::new`], or the reason it could
     /// not be.
     served: Result<RunEntry, UndescribableRun>,
@@ -86,7 +97,7 @@ pub struct HostedRuns {
 /// let entry = RunEntry::new(0x1, "temi", 1, RunState::Live, "name: temi\n", "{}\n").unwrap();
 /// let runs = HostedRuns::default();
 /// // ERROR: the unused guard drops here, which withdraws the run at once.
-/// runs.host(0x1, HostedRun { entry, live: Arc::new(AtomicBool::new(true)) });
+/// runs.host(0x1, HostedRun { entry, live: Arc::new(AtomicBool::new(true)), fires: None });
 /// ```
 ///
 /// # The twin: the same code, holding the guard, compiles
@@ -102,7 +113,7 @@ pub struct HostedRuns {
 /// use cerulion_core::transport::run_registry::RunState;
 /// let entry = RunEntry::new(0x1, "temi", 1, RunState::Live, "name: temi\n", "{}\n").unwrap();
 /// let runs = HostedRuns::default();
-/// let _guard = runs.host(0x1, HostedRun { entry, live: Arc::new(AtomicBool::new(true)) });
+/// let _guard = runs.host(0x1, HostedRun { entry, live: Arc::new(AtomicBool::new(true)), fires: None });
 /// ```
 #[must_use = "dropping the guard withdraws the run"]
 #[derive(Debug)]
@@ -128,7 +139,7 @@ impl HostedRuns {
     /// as an undescribable run with the reason, never as an entry: a desk refuses
     /// the whole reply when one entry fails those checks.
     pub fn host(&self, run_id: u128, run: HostedRun) -> HostedRunGuard {
-        let HostedRun { entry, live } = run;
+        let HostedRun { entry, live, fires } = run;
         let RunEntry {
             run_id: entry_run_id,
             graph_name,
@@ -175,6 +186,7 @@ impl HostedRuns {
             Slot {
                 generation,
                 live,
+                fires,
                 served,
             },
         );
@@ -209,6 +221,37 @@ impl HostedRuns {
             }
         }
         served
+    }
+
+    /// Serve one `fires` GET for `run_id`: arm or extend its tap's lease, and
+    /// return the rows the tap holds after `cursor`, at most
+    /// [`MAX_FIRES_PER_REPLY`]. The slot is looked up under the lock and the tap
+    /// is read after the lock is released, so a slow read never holds up a host
+    /// starting or withdrawing a run.
+    pub(crate) fn serve_fires(&self, run_id: u128, cursor: Cursor) -> FiresOutcome {
+        let tap = match self.lock().runs.get(&run_id) {
+            None => return FiresOutcome::UnknownRun,
+            Some(slot) => match &slot.fires {
+                None => return FiresOutcome::NotServed,
+                Some(tap) => Arc::clone(tap),
+            },
+        };
+        let FireBatch {
+            now_ns,
+            armed_since_ns,
+            next,
+            lost,
+            in_tick,
+            records,
+        } = tap.serve(cursor, MAX_FIRES_PER_REPLY);
+        FiresOutcome::Served {
+            now_ns,
+            armed_since_ns,
+            next,
+            lost,
+            in_tick,
+            fires: records,
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Slots> {
@@ -279,6 +322,7 @@ mod tests {
             HostedRun {
                 entry: entry(run_id, graph_name, 1_762_264_931_000_000_000),
                 live: Arc::clone(&flag),
+                fires: None,
             },
             flag,
         )
@@ -308,6 +352,7 @@ mod tests {
                 run_json: run_json.into(),
             },
             live: Arc::new(AtomicBool::new(true)),
+            fires: None,
         }
     }
 
@@ -372,6 +417,7 @@ mod tests {
             HostedRun {
                 entry: hosted_entry,
                 live: Arc::clone(&flag),
+                fires: None,
             },
         );
         assert_eq!(listed(&runs)[0].2, RunEntryState::Ending);
@@ -443,6 +489,7 @@ mod tests {
             HostedRun {
                 entry: entry(RUN_B, "temi", 1),
                 live: flag,
+                fires: None,
             },
         );
         assert_eq!(listed(&runs)[0].0, RUN_A_TEXT);
@@ -605,5 +652,256 @@ mod tests {
                 RunEntryState::Live
             )]
         );
+    }
+
+    mod fires {
+        use super::*;
+        use crate::clock::{Clock, VirtualClock};
+        use crate::fire_tap::{FireBody, FireCause, FireFlags, FireRecord, FireTapConfig};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const LEASE: Duration = Duration::from_secs(5);
+
+        fn tap_on(clock: Arc<dyn Clock>) -> Arc<FireTap> {
+            Arc::new(FireTap::new(
+                FireTapConfig {
+                    capacity: 64,
+                    lease: LEASE,
+                },
+                2,
+                vec![Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))],
+                clock,
+            ))
+        }
+
+        fn host_with(
+            runs: &HostedRuns,
+            run_id: u128,
+            fires: Option<Arc<FireTap>>,
+        ) -> HostedRunGuard {
+            runs.host(
+                run_id,
+                HostedRun {
+                    entry: entry(run_id, "temi", 1),
+                    live: Arc::new(AtomicBool::new(true)),
+                    fires,
+                },
+            )
+        }
+
+        fn body(at_ns: u64, node: u16, wrote: u64) -> FireBody {
+            FireBody {
+                at_ns,
+                dur_ns: 1_000,
+                node,
+                cause: FireCause::Data,
+                flags: FireFlags(0),
+                wrote,
+            }
+        }
+
+        #[test]
+        fn a_run_this_host_does_not_host_has_unknown_fires() {
+            let runs = HostedRuns::default();
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::Now),
+                FiresOutcome::UnknownRun
+            );
+
+            let clock = Arc::new(VirtualClock::new());
+            let guard = host_with(&runs, RUN_A, Some(tap_on(clock)));
+            assert_eq!(
+                runs.serve_fires(RUN_B, Cursor::Now),
+                FiresOutcome::UnknownRun
+            );
+
+            drop(guard);
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::After(0)),
+                FiresOutcome::UnknownRun,
+                "a withdrawn run serves no fires"
+            );
+        }
+
+        #[test]
+        fn a_hosted_run_without_a_tap_serves_no_fires() {
+            let runs = HostedRuns::default();
+            let _guard = host_with(&runs, RUN_A, None);
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::Now),
+                FiresOutcome::NotServed
+            );
+        }
+
+        #[test]
+        fn the_first_read_arms_the_tap_and_the_next_reads_the_rows_after_the_cursor() {
+            let runs = HostedRuns::default();
+            let clock = Arc::new(VirtualClock::new());
+            clock.set(1_000);
+            let tap = tap_on(clock.clone());
+            let _guard = host_with(&runs, RUN_A, Some(Arc::clone(&tap)));
+            tap.push(body(900, 0, 1));
+            assert_eq!(tap.stats().recorded, 0, "a disarmed tap records nothing");
+
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::Now),
+                FiresOutcome::Served {
+                    now_ns: 1_000,
+                    armed_since_ns: 1_000,
+                    next: 0,
+                    lost: 0,
+                    in_tick: Vec::new(),
+                    fires: Vec::new(),
+                }
+            );
+            assert!(tap.stats().armed);
+
+            tap.push(body(1_100, 0, 0b01));
+            tap.push(body(1_200, 1, 0b10));
+            clock.set(1_300);
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::After(0)),
+                FiresOutcome::Served {
+                    now_ns: 1_300,
+                    armed_since_ns: 1_000,
+                    next: 2,
+                    lost: 0,
+                    in_tick: Vec::new(),
+                    fires: vec![
+                        FireRecord {
+                            seq: 1,
+                            at_ns: 1_100,
+                            dur_ns: 1_000,
+                            node: 0,
+                            cause: FireCause::Data,
+                            flags: FireFlags(0),
+                            wrote: 0b01,
+                        },
+                        FireRecord {
+                            seq: 2,
+                            at_ns: 1_200,
+                            dur_ns: 1_000,
+                            node: 1,
+                            cause: FireCause::Data,
+                            flags: FireFlags(0),
+                            wrote: 0b10,
+                        },
+                    ],
+                }
+            );
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::After(2)),
+                FiresOutcome::Served {
+                    now_ns: 1_300,
+                    armed_since_ns: 1_000,
+                    next: 2,
+                    lost: 0,
+                    in_tick: Vec::new(),
+                    fires: Vec::new(),
+                },
+                "the inclusive `next` passed back reads nothing twice"
+            );
+        }
+
+        #[test]
+        fn an_ending_run_still_serves_the_fires_it_recorded() {
+            let runs = HostedRuns::default();
+            let clock = Arc::new(VirtualClock::new());
+            let tap = tap_on(clock);
+            let live = Arc::new(AtomicBool::new(true));
+            let _guard = runs.host(
+                RUN_A,
+                HostedRun {
+                    entry: entry(RUN_A, "temi", 1),
+                    live: Arc::clone(&live),
+                    fires: Some(Arc::clone(&tap)),
+                },
+            );
+            runs.serve_fires(RUN_A, Cursor::Now);
+            tap.push(body(5, 1, 0));
+            live.store(false, Ordering::Release);
+
+            let FiresOutcome::Served { fires, .. } = runs.serve_fires(RUN_A, Cursor::After(0))
+            else {
+                panic!("an ending run's tap is still served");
+            };
+            assert_eq!(
+                fires.iter().map(|f| (f.seq, f.node)).collect::<Vec<_>>(),
+                vec![(1, 1)]
+            );
+        }
+
+        #[test]
+        fn a_replacement_run_serves_its_own_tap() {
+            let runs = HostedRuns::default();
+            let clock = Arc::new(VirtualClock::new());
+            let _first = host_with(&runs, RUN_A, Some(tap_on(clock)));
+            let _second = host_with(&runs, RUN_A, None);
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::Now),
+                FiresOutcome::NotServed
+            );
+        }
+
+        /// A clock whose next read, once `pause` is set, blocks until released.
+        struct PausingClock {
+            pause: AtomicBool,
+            arrived: mpsc::SyncSender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Clock for PausingClock {
+            fn now_ns(&self) -> u64 {
+                if self.pause.swap(false, Ordering::AcqRel) {
+                    self.arrived.send(()).expect("the test waits for the pause");
+                    self.resume
+                        .lock()
+                        .expect("one reader")
+                        .recv()
+                        .expect("the test releases the pause");
+                }
+                7
+            }
+        }
+
+        #[test]
+        fn a_tap_read_in_progress_does_not_hold_up_hosting_or_withdrawing_a_run() {
+            let (arrived_tx, arrived) = mpsc::sync_channel(1);
+            let (release, resume_rx) = mpsc::sync_channel(1);
+            let clock = Arc::new(PausingClock {
+                pause: AtomicBool::new(true),
+                arrived: arrived_tx,
+                resume: Mutex::new(resume_rx),
+            });
+            let runs = HostedRuns::default();
+            let _guard = host_with(&runs, RUN_A, Some(tap_on(clock)));
+
+            let reader = {
+                let runs = runs.clone();
+                std::thread::spawn(move || runs.serve_fires(RUN_A, Cursor::Now))
+            };
+            arrived
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the read reaches the tap's clock");
+
+            let (hosted_tx, hosted) = mpsc::channel();
+            let host = {
+                let runs = runs.clone();
+                std::thread::spawn(move || {
+                    let guard = host_with(&runs, RUN_B, None);
+                    drop(guard);
+                    hosted_tx.send(()).expect("the test waits");
+                })
+            };
+            let outcome = hosted.recv_timeout(Duration::from_secs(10));
+            release.send(()).expect("the reader waits for the release");
+            host.join().expect("the host thread completes");
+            outcome.expect("hosting and withdrawing a run completes while a tap read is paused");
+            assert!(matches!(
+                reader.join().expect("the reader completes"),
+                FiresOutcome::Served { next: 0, .. }
+            ));
+        }
     }
 }

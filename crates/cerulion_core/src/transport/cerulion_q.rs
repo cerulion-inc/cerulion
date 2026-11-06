@@ -6,8 +6,8 @@
 //! `queryable_key` (`cerulion_q/{robot}/**`) and dispatches inbound GETs by
 //! verb; remote consumers (dialers) send EXPLICIT-robot GETs. This module owns
 //! ALL `cerulion_q` key construction + parsing (no scattered format strings
-//! elsewhere) plus the wire types + encoding for the `catalog` and `schema`
-//! verbs' replies.
+//! elsewhere) plus the wire types + encoding for the `catalog`, `schema`,
+//! `runs` and `fires` verbs' replies.
 //!
 //! # Why a queryable + dialer GETs (the pinned zenoh 1.8 wire asymmetry)
 //!
@@ -39,6 +39,12 @@
 //!   the robot's running graph. Takes no tail, exactly like `catalog`. The
 //!   answer carries a [`RunsCompleteness`] verdict, so an EMPTY answer is never
 //!   mistaken for "this robot is running nothing".
+//! - `cerulion_q/{robot}/fires/{run_id}/{after}`: arm or extend the fire tap
+//!   lease of a run the robot hosts, and return the node fires it recorded
+//!   after the cursor. `{run_id}` is the canonical [`format_run_id`] text and
+//!   `{after}` is `-` (from now) or the last sequence the desk holds, in
+//!   decimal. A row is metadata only: no payload bytes and no topic names
+//!   ([`FiresReply`]).
 //! - `cerulion_q/{robot}/schema/{pkg}/{Type}` (qualified) OR
 //!   `cerulion_q/{robot}/schema/{Name}` (a package-less workspace type):
 //!   return the `.msg`/YAML TEXT of the
@@ -62,11 +68,13 @@
 //!
 //! # Security (pairing integration point)
 //!
-//! All three verbs are currently UNAUTHENTICATED LAN reads, and the `catalog` +
-//! `schema` verbs expose STRICTLY MORE than the announce presence space — so this
-//! surface MUST be gated behind install-time PAIRING when that lands.
-//! The `schema` verb is the loudest of the three: it hands out the
-//! robot's verbatim custom `.msg`/YAML type definitions. Three facts:
+//! Every verb is a LAN read, and a LAN peer carries no paired identity. The
+//! `catalog` + `schema` verbs expose STRICTLY MORE than the announce presence
+//! space, so every verb asks the
+//! [`DemandAuthorizer`](super::demand_authorizer::DemandAuthorizer) before it
+//! reads anything, and [`LanAccess::Paired`](super::demand_authorizer::LanAccess)
+//! refuses every LAN peer. The `schema` verb hands out the robot's verbatim
+//! custom `.msg`/YAML type definitions. The facts:
 //!
 //! - The `catalog` verb's source is the gateway's bridge-REGISTERED topic set
 //!   (`registered_topics()` joined with the runtime schema-hash table), NOT the
@@ -79,7 +87,7 @@
 //!   one `cerulion_q/{robot}/catalog` GET reads type fingerprints + names the
 //!   announce space never exposes.
 //! - The `schema` verb serves the robot's verbatim custom `.msg`/YAML type
-//!   definitions — the richest exposure of the three. It is served ONLY from the
+//!   definitions. It is served ONLY from the
 //!   pre-built [`SchemaSource`](super::network::SchemaSource) (workspace custom
 //!   types; built-ins omitted), never from arbitrary filesystem paths, but an
 //!   unpaired peer must still not read a robot's private type schemas.
@@ -90,11 +98,15 @@
 //!   is gated on the same [`DemandAuthorizer`](super::demand_authorizer::DemandAuthorizer)
 //!   decision and answers a denied party with [`RunsReply::refused`].
 //!
-//! Therefore, when the presence-only-until-paired gate lands, the
-//! `catalog` + `schema` + `runs` verbs (and `demand`) MUST refuse an UNPAIRED
-//! peer — an unpaired GET must not enumerate a robot's registered topics + type
-//! fingerprints + schema text + graph topology or drive its egress. This is a
-//! doc marker only; no gate exists in this module.
+//! - The `fires` verb serves when and how each node of a hosted run ticked.
+//!   It is gated on the same decision as `runs`, and a refused GET reads
+//!   nothing and arms no lease ([`FiresOutcome::Refused`]).
+//!
+//! Therefore the `catalog` + `schema` + `runs` + `fires` verbs (and `demand`)
+//! MUST refuse an UNPAIRED peer: an unpaired GET must not enumerate a robot's
+//! registered topics + type fingerprints + schema text + graph topology, read
+//! its node fires, or drive its egress or its fire recording. This module holds
+//! no gate; the authorizer each verb consults is the gate.
 
 use std::collections::BTreeSet;
 
@@ -103,6 +115,7 @@ use serde::{Deserialize, Serialize};
 use super::liveness::TopicLiveness;
 use super::mirror_registry::GatherCompleteness;
 use super::run_registry::RunState;
+use crate::fire_tap::{FireCause, FireFlags, FireRecord, FIRE_SERVE_MAX};
 
 /// The verb-dispatched query-surface key-space prefix. A DISTINCT top-level chunk
 /// from `cerulion_lv` / `cerulion_ann` so a bridge watch or presence gather can
@@ -127,6 +140,13 @@ const VERB_SCHEMA: &str = "schema";
 /// answers wrongly with the whole list.
 const VERB_RUNS: &str = "runs";
 
+/// The `fires` verb chunk: the node-fire telemetry request. Takes exactly two
+/// tail chunks, the canonical run id and the cursor.
+const VERB_FIRES: &str = "fires";
+
+/// The `fires` cursor chunk that asks for the fires recorded from now on.
+const FIRES_CURSOR_NOW: &str = "-";
+
 /// A parsed query verb recovered from a `cerulion_q/{robot}/{verb}[/...]` key.
 /// The gateway's single queryable callback dispatches on this.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +165,10 @@ pub(crate) enum QueryVerb {
     /// `requested` is the full qualified-or-bare type name (all chunks
     /// non-empty), fed directly to [`collect_schema_closure`].
     Schema { requested: String },
+    /// `fires/{run_id}/{after}`: serve the fires the hosted run `run_id`
+    /// recorded after the sequence `after` (`None`: from now), and extend the
+    /// run's fire tap lease.
+    Fires { run_id: u128, after: Option<u64> },
 }
 
 /// The wildcard key expression a gateway declares its query surface on:
@@ -203,6 +227,21 @@ pub fn runs_selector(robot: &str) -> String {
     format!("{CERULION_Q_PREFIX}/{robot}/{VERB_RUNS}")
 }
 
+/// The fires GET selector `cerulion_q/{robot}/fires/{run_id}/{after}`: an
+/// EXPLICIT robot, for the reason [`runs_selector`] gives. `run_id` is the
+/// canonical [`format_run_id`] text the run's `runs` entry carries; `after` is
+/// the `next` of the previous [`FiresOutcome::Served`] answer, or `None` to
+/// read from now. The robot replies on this same key, so a desk can match
+/// a reply to its GET by key.
+pub fn fires_selector(robot: &str, run_id: &str, after: Option<u64>) -> String {
+    // hot-path-alloc-ok: cold, the desk builds one fires GET selector per poll
+    // on the control plane, never on the per-frame data plane.
+    match after {
+        Some(seq) => format!("{CERULION_Q_PREFIX}/{robot}/{VERB_FIRES}/{run_id}/{seq}"),
+        None => format!("{CERULION_Q_PREFIX}/{robot}/{VERB_FIRES}/{run_id}/{FIRES_CURSOR_NOW}"),
+    }
+}
+
 /// The schema GET selector `cerulion_q/{robot}/schema/{requested}` — an EXPLICIT
 /// robot AND type. `requested` is the qualified `pkg/Type` (two chunks)
 /// OR a package-less bare `Name` (one chunk); the `/`
@@ -239,6 +278,12 @@ pub(crate) fn parse_query_verb(key: &str) -> Option<QueryVerb> {
     if after_robot == VERB_RUNS {
         return Some(QueryVerb::Runs);
     }
+    if let Some(tail) = after_robot
+        .strip_prefix(VERB_FIRES)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        return parse_fires_tail(tail);
+    }
     // Schema carries a `{pkg}/{Type}` (two-chunk) OR a package-less `{Name}`
     // (one-chunk) tail after `schema/`, every chunk
     // non-empty. Rejects `schema` bare (no `/` tail — falls through), `schema/`
@@ -273,6 +318,33 @@ pub(crate) fn parse_query_verb(key: &str) -> Option<QueryVerb> {
         }
     }
     None
+}
+
+/// Parse the `{run_id}/{after}` tail of a `fires` key. Both chunks must be in
+/// the one form [`fires_selector`] writes: the canonical run id, and `-` or a
+/// decimal with no sign and no leading zero. Anything else is `None`, the
+/// no-op an unknown key gets, because the reply key repeats the cursor in
+/// that form and a reply on a key the GET did not ask on never reaches it.
+fn parse_fires_tail(tail: &str) -> Option<QueryVerb> {
+    let (run_id, cursor) = tail.split_once('/')?;
+    if !is_canonical_run_id(run_id) {
+        return None;
+    }
+    let after = if cursor == FIRES_CURSOR_NOW {
+        None
+    } else {
+        let canonical = !cursor.is_empty()
+            && cursor.bytes().all(|b| b.is_ascii_digit())
+            && (cursor == "0" || !cursor.starts_with('0'));
+        if !canonical {
+            return None;
+        }
+        Some(cursor.parse().ok()?)
+    };
+    Some(QueryVerb::Fires {
+        run_id: parse_run_id(run_id)?,
+        after,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1750,6 +1822,484 @@ pub fn gather_runs_outcome<'a>(replies: impl IntoIterator<Item = &'a [u8]>) -> R
     }
 }
 
+// ---------------------------------------------------------------------------
+// `fires` verb: wire types + encoding.
+//
+// The `fires` verb answers "which nodes of this run ticked since the last row I
+// hold?". It reads the fire tap of a run the robot hosts in memory (see
+// `hosted_runs`): one GET arms or extends the tap's lease and returns the rows
+// after the GET's cursor, so a desk polls with the `next` of its previous
+// answer. A row is metadata only (sequence, time, duration, node index, cause,
+// flags and the written-output mask): no payload bytes, no topic names and no
+// error text. A desk names the node and its outputs through the topology in the
+// run's `run.json`.
+//
+// Unlike `runs`, this verb MAY be polled: a serve reads a bounded ring and
+// gathers nothing.
+// ---------------------------------------------------------------------------
+
+/// The wire version of the [`FiresReply`] payload and of its row columns. A
+/// decoder rejects a version it does not understand. Bump on any change to the
+/// payload or to the column order.
+pub const FIRES_WIRE_VERSION: u32 = 1;
+
+/// The most rows one [`FiresReply`] carries. A desk that receives a full page
+/// asks again with the reply's `next` to read on. A lost sequence takes no
+/// row, so a shorter page reached the newest fire the run had recorded.
+pub const MAX_FIRES_PER_REPLY: usize = FIRE_SERVE_MAX;
+
+/// The most `in_tick` entries a served reply names: one per node, and a node
+/// index is a `u16`.
+const MAX_IN_TICK: usize = u16::MAX as usize + 1;
+
+/// The reply to a `cerulion_q/{robot}/fires/{run_id}/{after}` GET.
+///
+/// Deserializing one through serde checks the version and every
+/// [`FiresDecodeError::Invalid`] condition, as [`decode_fires_reply`] does, so a
+/// reply nested in another document (a daemon's answer to its client) cannot
+/// carry a state the serve side never produces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "WireFiresReply")]
+pub struct FiresReply {
+    /// The fires-payload wire version ([`FIRES_WIRE_VERSION`]).
+    pub version: u32,
+    /// The answering robot's identity.
+    pub robot: String,
+    /// The run the GET named, in the canonical [`format_run_id`] text.
+    pub run_id: String,
+    /// What the robot did with the GET.
+    pub outcome: FiresOutcome,
+}
+
+/// What a robot did with one `fires` GET.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FiresOutcome {
+    /// The run's fire tap served the fires after the cursor, and this GET
+    /// armed or extended the tap's lease.
+    Served {
+        /// The run's clock when the robot served the GET. A row is
+        /// `now_ns - at_ns` old.
+        now_ns: u64,
+        /// The run's clock when the current lease began. No fire before it
+        /// was recorded.
+        armed_since_ns: u64,
+        /// The last sequence this reply accounts for, inclusive. The next GET
+        /// passes it unchanged as its cursor.
+        next: u64,
+        /// The sequences in this reply's range that the run no longer holds:
+        /// overwritten before this read, or dropped under contention.
+        lost: u64,
+        /// `[node, since_ns]` for each node inside a tick when the robot served
+        /// the GET, in topology order.
+        in_tick: Vec<(u16, u64)>,
+        /// The fires, in strictly increasing sequence order. Each row is
+        /// `[seq, at_ns, dur_ns, node, cause, flags, wrote]`.
+        #[serde(serialize_with = "fire_rows::serialize")]
+        fires: Vec<FireRecord>,
+    },
+    /// The robot hosts no run with this id: the run ended or the id is stale.
+    /// A desk asks `runs` again.
+    UnknownRun,
+    /// The run is hosted but records no fires.
+    NotServed,
+    /// The demand-authorization gate refused the GET. Nothing was read and no
+    /// lease was armed.
+    Refused {
+        /// Why, in operator-readable text.
+        reason: String,
+    },
+}
+
+impl FiresReply {
+    /// A reply of the current wire version about `run_id`.
+    pub fn new(robot: &str, run_id: u128, outcome: FiresOutcome) -> Self {
+        FiresReply {
+            version: FIRES_WIRE_VERSION,
+            // hot-path-alloc-ok: cold, one reply per remote fires GET on the
+            // control plane, never per frame.
+            robot: robot.to_string(),
+            run_id: format_run_id(run_id),
+            outcome,
+        }
+    }
+}
+
+/// Why a fires reply could not be used. Every variant means the desk learned
+/// nothing about the run's fires from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FiresDecodeError {
+    /// The bytes did not parse as a fires payload: corruption, a foreign reply
+    /// on the key, a missing field, or a row that is not seven numbers of the
+    /// column widths.
+    Malformed { detail: String },
+    /// The payload carries a wire version this binary does not understand.
+    UnknownVersion { got: u32, supported: u32 },
+    /// The payload parsed and carries this version, but names a state the serve
+    /// side never produces: a non-canonical run id, more rows than
+    /// [`MAX_FIRES_PER_REPLY`], a cause byte no [`FireCause`] has, sequences
+    /// that do not strictly increase inside the reply's range, or `in_tick`
+    /// nodes that do not strictly increase.
+    Invalid { reason: String },
+}
+
+impl std::fmt::Display for FiresDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FiresDecodeError::UnknownVersion { got, supported } => write!(
+                f,
+                "unknown fires wire version {got} (this binary supports {supported})"
+            ),
+            FiresDecodeError::Malformed { detail } => {
+                write!(f, "fires reply did not parse ({detail})")
+            }
+            FiresDecodeError::Invalid { reason } => write!(
+                f,
+                "fires reply carries a state the serve side never produces ({reason})"
+            ),
+        }
+    }
+}
+
+/// Encode a [`FiresReply`] to its wire bytes (versioned JSON). A serialization
+/// failure is logged and yields empty bytes, which the desk decodes as
+/// [`FiresDecodeError::Malformed`]; the gateway never panics on it.
+pub fn encode_fires_reply(reply: &FiresReply) -> Vec<u8> {
+    match serde_json::to_vec(reply) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, "fires reply serialization failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Decode wire bytes into a [`FiresReply`], or say why they cannot be used.
+///
+/// Three gates, in this order: the bytes carry a `version` this binary
+/// understands (read first, so a peer on another version is reported as the
+/// skew it is whatever its payload looks like), they parse as this version's
+/// payload, and they name no state the serve side never produces (see
+/// [`FiresDecodeError::Invalid`]).
+pub fn decode_fires_reply(bytes: &[u8]) -> Result<FiresReply, FiresDecodeError> {
+    let malformed = |e: serde_json::Error| FiresDecodeError::Malformed {
+        detail: e.to_string(),
+    };
+    let WireVersion { version } = serde_json::from_slice(bytes).map_err(malformed)?;
+    if version != FIRES_WIRE_VERSION {
+        return Err(FiresDecodeError::UnknownVersion {
+            got: version,
+            supported: FIRES_WIRE_VERSION,
+        });
+    }
+    let wire: WireFiresReply = serde_json::from_slice(bytes).map_err(malformed)?;
+    FiresReply::try_from(wire)
+}
+
+/// The version probe [`decode_fires_reply`] reads before the payload.
+#[derive(Deserialize)]
+struct WireVersion {
+    version: u32,
+}
+
+/// A fires reply as parsed, before the checks that make it a [`FiresReply`].
+#[derive(Deserialize)]
+struct WireFiresReply {
+    version: u32,
+    robot: String,
+    run_id: String,
+    outcome: WireFiresFields,
+}
+
+/// A fires outcome object as read. A flat struct, not a tagged enum: serde
+/// buffers the whole object of a tagged enum before it reads the tag, which
+/// would hold every row of an oversized reply. A struct reads each field in
+/// place, so a [`Capped`] field holds no more than its cap.
+#[derive(Deserialize)]
+struct WireFiresFields {
+    kind: WireFiresKind,
+    now_ns: Option<u64>,
+    armed_since_ns: Option<u64>,
+    next: Option<u64>,
+    lost: Option<u64>,
+    in_tick: Option<Capped<(u16, u64), MAX_IN_TICK>>,
+    fires: Option<Capped<fire_rows::Row, MAX_FIRES_PER_REPLY>>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFiresKind {
+    Served,
+    UnknownRun,
+    NotServed,
+    Refused,
+}
+
+/// A fires outcome with every field its kind requires.
+enum WireFiresOutcome {
+    Served {
+        now_ns: u64,
+        armed_since_ns: u64,
+        next: u64,
+        lost: u64,
+        in_tick: Capped<(u16, u64), MAX_IN_TICK>,
+        fires: Capped<fire_rows::Row, MAX_FIRES_PER_REPLY>,
+    },
+    UnknownRun,
+    NotServed,
+    Refused {
+        reason: String,
+    },
+}
+
+impl TryFrom<WireFiresFields> for WireFiresOutcome {
+    type Error = FiresDecodeError;
+
+    fn try_from(fields: WireFiresFields) -> Result<Self, FiresDecodeError> {
+        fn required<T>(value: Option<T>, name: &str) -> Result<T, FiresDecodeError> {
+            value.ok_or_else(|| FiresDecodeError::Malformed {
+                detail: format!("missing field `{name}`"),
+            })
+        }
+        Ok(match fields.kind {
+            WireFiresKind::Served => WireFiresOutcome::Served {
+                now_ns: required(fields.now_ns, "now_ns")?,
+                armed_since_ns: required(fields.armed_since_ns, "armed_since_ns")?,
+                next: required(fields.next, "next")?,
+                lost: required(fields.lost, "lost")?,
+                in_tick: required(fields.in_tick, "in_tick")?,
+                fires: required(fields.fires, "fires")?,
+            },
+            WireFiresKind::UnknownRun => WireFiresOutcome::UnknownRun,
+            WireFiresKind::NotServed => WireFiresOutcome::NotServed,
+            WireFiresKind::Refused => WireFiresOutcome::Refused {
+                reason: required(fields.reason, "reason")?,
+            },
+        })
+    }
+}
+
+impl TryFrom<WireFiresReply> for FiresReply {
+    type Error = FiresDecodeError;
+
+    fn try_from(wire: WireFiresReply) -> Result<Self, FiresDecodeError> {
+        if wire.version != FIRES_WIRE_VERSION {
+            return Err(FiresDecodeError::UnknownVersion {
+                got: wire.version,
+                supported: FIRES_WIRE_VERSION,
+            });
+        }
+        let outcome = WireFiresOutcome::try_from(wire.outcome)?;
+        if !is_canonical_run_id(&wire.run_id) {
+            return Err(FiresDecodeError::Invalid {
+                reason: format!(
+                    "run_id {:?} is not the canonical `0x` + 32 lowercase hex form",
+                    wire.run_id
+                ),
+            });
+        }
+        let outcome = match outcome {
+            WireFiresOutcome::Served {
+                now_ns,
+                armed_since_ns,
+                next,
+                lost,
+                in_tick,
+                fires,
+            } => FiresOutcome::Served {
+                now_ns,
+                armed_since_ns,
+                next,
+                lost,
+                in_tick: served_in_tick(in_tick)?,
+                fires: served_records(next, lost, fires)?,
+            },
+            WireFiresOutcome::UnknownRun => FiresOutcome::UnknownRun,
+            WireFiresOutcome::NotServed => FiresOutcome::NotServed,
+            WireFiresOutcome::Refused { reason } => FiresOutcome::Refused { reason },
+        };
+        Ok(FiresReply {
+            version: wire.version,
+            robot: wire.robot,
+            run_id: wire.run_id,
+            outcome,
+        })
+    }
+}
+
+/// The records a served page's rows name, checked against the page itself.
+///
+/// A page accounts for the `rows + lost` sequences that end at `next`
+/// (inclusive): each one is a row or is lost. So `rows + lost` cannot exceed
+/// `next`, and every row's seq lies in `(next - rows - lost, next]`, strictly
+/// increasing. A row outside that range names a sequence the page does not
+/// account for.
+fn served_records(
+    next: u64,
+    lost: u64,
+    rows: Capped<fire_rows::Row, MAX_FIRES_PER_REPLY>,
+) -> Result<Vec<FireRecord>, FiresDecodeError> {
+    let invalid = |reason: String| FiresDecodeError::Invalid { reason };
+    if rows.len > MAX_FIRES_PER_REPLY {
+        return Err(invalid(format!(
+            "{} rows, above the {MAX_FIRES_PER_REPLY}-row reply cap",
+            rows.len
+        )));
+    }
+    let rows = rows.held;
+    let count = rows.len() as u64;
+    let Some(start) = count
+        .checked_add(lost)
+        .and_then(|span| next.checked_sub(span))
+    else {
+        return Err(invalid(format!(
+            "{count} row(s) and {lost} lost exceed the page end {next}"
+        )));
+    };
+    let mut previous: Option<u64> = None;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let record = fire_rows::record(row).map_err(|cause| {
+            invalid(format!(
+                "row seq {}: cause byte {cause} names no fire cause",
+                row.0
+            ))
+        })?;
+        let seq = record.seq;
+        match previous {
+            Some(previous) if seq <= previous => {
+                return Err(invalid(format!(
+                    "row seq {seq} follows seq {previous}: sequences strictly increase"
+                )));
+            }
+            None if seq <= start => {
+                return Err(invalid(format!(
+                    "row seq {seq} is not after the page start {start} ({count} row(s) and \
+                     {lost} lost end at {next})"
+                )));
+            }
+            _ => {}
+        }
+        if seq > next {
+            return Err(invalid(format!(
+                "row seq {seq} is after the page end {next}"
+            )));
+        }
+        previous = Some(seq);
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// The `in_tick` entries a served page names: at most one per node, in
+/// topology order.
+fn served_in_tick(
+    entries: Capped<(u16, u64), MAX_IN_TICK>,
+) -> Result<Vec<(u16, u64)>, FiresDecodeError> {
+    let invalid = |reason: String| FiresDecodeError::Invalid { reason };
+    if entries.len > MAX_IN_TICK {
+        return Err(invalid(format!(
+            "{} in_tick entries, above one per node ({MAX_IN_TICK})",
+            entries.len
+        )));
+    }
+    for pair in entries.held.windows(2) {
+        let ((previous, _), (node, _)) = (pair[0], pair[1]);
+        if node <= previous {
+            return Err(invalid(format!(
+                "in_tick node {node} follows node {previous}: nodes strictly increase"
+            )));
+        }
+    }
+    Ok(entries.held)
+}
+
+/// A JSON array of which the decoder holds at most `MAX` elements. It counts
+/// the rest without reading them, so an oversized reply costs the desk no more
+/// memory than a full one before the cap refuses it.
+struct Capped<T, const MAX: usize> {
+    held: Vec<T>,
+    /// Every element the array carries, held or not.
+    len: usize,
+}
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for Capped<T, MAX> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CappedVisitor<T, const MAX: usize>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de> for CappedVisitor<T, MAX> {
+            type Value = Capped<T, MAX>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut held = Vec::new();
+                while held.len() < MAX {
+                    let Some(element) = seq.next_element()? else {
+                        let len = held.len();
+                        return Ok(Capped { held, len });
+                    };
+                    held.push(element);
+                }
+                let mut len = MAX;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    len += 1;
+                }
+                Ok(Capped { held, len })
+            }
+        }
+
+        deserializer.deserialize_seq(CappedVisitor(std::marker::PhantomData))
+    }
+}
+
+/// The row form of a [`FireRecord`], whose column order the wire version pins.
+mod fire_rows {
+    use super::{FireCause, FireFlags, FireRecord};
+
+    /// `[seq, at_ns, dur_ns, node, cause, flags, wrote]`.
+    pub(super) type Row = (u64, u64, u32, u16, u8, u8, u64);
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        records: &[FireRecord],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(records.iter().map(row))
+    }
+
+    fn row(record: &FireRecord) -> Row {
+        (
+            record.seq,
+            record.at_ns,
+            record.dur_ns,
+            record.node,
+            record.cause as u8,
+            record.flags.0,
+            record.wrote,
+        )
+    }
+
+    /// The record a row names, or the cause byte that names no [`FireCause`].
+    pub(super) fn record(row: Row) -> Result<FireRecord, u8> {
+        let (seq, at_ns, dur_ns, node, cause, flags, wrote) = row;
+        Ok(FireRecord {
+            seq,
+            at_ns,
+            dur_ns,
+            node,
+            cause: FireCause::try_from(cause)?,
+            flags: FireFlags(flags),
+            wrote,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2489,6 +3039,10 @@ mod tests {
         assert!(matches!(
             parse_query_verb("cerulion_q/go2/runs"),
             Some(QueryVerb::Runs)
+        ));
+        assert!(matches!(
+            parse_query_verb("cerulion_q/go2/fires/0x0000000000000000000000000000002a/-"),
+            Some(QueryVerb::Fires { .. })
         ));
     }
 
@@ -3727,6 +4281,547 @@ mod tests {
             reordered.validate(),
             Ok(()),
             "validation must refuse forbidden STATES, not a presentation choice"
+        );
+    }
+
+    const FIRES_RUN: u128 = 0x5d1c_0000_0000_0000_0000_0000_0000_9e02;
+    const FIRES_RUN_TEXT: &str = "0x5d1c0000000000000000000000009e02";
+
+    fn fire(
+        seq: u64,
+        at_ns: u64,
+        dur_ns: u32,
+        node: u16,
+        cause: FireCause,
+        wrote: u64,
+    ) -> FireRecord {
+        FireRecord {
+            seq,
+            at_ns,
+            dur_ns,
+            node,
+            cause,
+            flags: FireFlags(0),
+            wrote,
+        }
+    }
+
+    fn served_page(next: u64, lost: u64, fires: Vec<FireRecord>) -> FiresReply {
+        FiresReply::new(
+            "temi",
+            FIRES_RUN,
+            FiresOutcome::Served {
+                now_ns: 88_123_456_789,
+                armed_since_ns: 88_100_000_000,
+                next,
+                lost,
+                in_tick: Vec::new(),
+                fires,
+            },
+        )
+    }
+
+    /// A served page of period fires of node 0, one at each of `seqs`.
+    fn served_seqs(next: u64, lost: u64, seqs: &[u64]) -> FiresReply {
+        served_page(
+            next,
+            lost,
+            seqs.iter()
+                .map(|&seq| fire(seq, seq, 1, 0, FireCause::Period, 0))
+                .collect(),
+        )
+    }
+
+    fn invalid(reply: &FiresReply) -> String {
+        match decode_fires_reply(&encode_fires_reply(reply)) {
+            Err(FiresDecodeError::Invalid { reason }) => reason,
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fires_selector_names_the_robot_the_run_and_the_cursor() {
+        assert_eq!(
+            fires_selector("temi", FIRES_RUN_TEXT, None),
+            "cerulion_q/temi/fires/0x5d1c0000000000000000000000009e02/-"
+        );
+        assert_eq!(
+            fires_selector("temi", FIRES_RUN_TEXT, Some(5123)),
+            "cerulion_q/temi/fires/0x5d1c0000000000000000000000009e02/5123"
+        );
+        assert_eq!(
+            fires_selector("robot.alpha_1", FIRES_RUN_TEXT, Some(0)),
+            "cerulion_q/robot.alpha_1/fires/0x5d1c0000000000000000000000009e02/0"
+        );
+    }
+
+    #[test]
+    fn parse_query_verb_fires_oracle() {
+        assert_eq!(
+            parse_query_verb("cerulion_q/temi/fires/0x5d1c0000000000000000000000009e02/5123"),
+            Some(QueryVerb::Fires {
+                run_id: FIRES_RUN,
+                after: Some(5123),
+            })
+        );
+        assert_eq!(
+            parse_query_verb("cerulion_q/temi/fires/0x5d1c0000000000000000000000009e02/-"),
+            Some(QueryVerb::Fires {
+                run_id: FIRES_RUN,
+                after: None,
+            })
+        );
+        assert_eq!(
+            parse_query_verb("cerulion_q/*/fires/0x0000000000000000000000000000002a/0"),
+            Some(QueryVerb::Fires {
+                run_id: 42,
+                after: Some(0),
+            })
+        );
+        assert_eq!(
+            parse_query_verb(
+                "cerulion_q/temi/fires/0xffffffffffffffffffffffffffffffff/18446744073709551615"
+            ),
+            Some(QueryVerb::Fires {
+                run_id: u128::MAX,
+                after: Some(u64::MAX),
+            })
+        );
+        for after in [None, Some(0), Some(1), Some(5123), Some(u64::MAX)] {
+            assert_eq!(
+                parse_query_verb(&fires_selector("robot.alpha_1", FIRES_RUN_TEXT, after)),
+                Some(QueryVerb::Fires {
+                    run_id: FIRES_RUN,
+                    after,
+                }),
+                "a selector the desk builds parses back: {after:?}"
+            );
+        }
+    }
+
+    /// Every tail outside the one form `fires_selector` writes is the `None`
+    /// no-op. The robot replies on the key it rebuilds from the parsed values,
+    /// so a tail it accepted in a second spelling would get a reply the GET
+    /// never receives.
+    #[test]
+    fn parse_query_verb_fires_rejects_malformed_tails() {
+        let id = FIRES_RUN_TEXT;
+        let keys = [
+            "cerulion_q/temi/fires".to_string(),
+            "cerulion_q/temi/fires/".to_string(),
+            format!("cerulion_q/temi/fires/{id}"),
+            format!("cerulion_q/temi/fires/{id}/"),
+            format!("cerulion_q/temi/fires/{id}/5/x"),
+            format!("cerulion_q/temi/fires/{id}/-/5"),
+            "cerulion_q/temi/fires//5".to_string(),
+            format!("cerulion_q/temi/fires/{id}/+5"),
+            format!("cerulion_q/temi/fires/{id}/05"),
+            format!("cerulion_q/temi/fires/{id}/00"),
+            format!("cerulion_q/temi/fires/{id}/-1"),
+            format!("cerulion_q/temi/fires/{id}/--"),
+            format!("cerulion_q/temi/fires/{id}/ 5"),
+            format!("cerulion_q/temi/fires/{id}/5.0"),
+            format!("cerulion_q/temi/fires/{id}/0x5"),
+            format!("cerulion_q/temi/fires/{id}/18446744073709551616"),
+            "cerulion_q/temi/fires/0x2a/5".to_string(),
+            "cerulion_q/temi/fires/0x5D1C0000000000000000000000009E02/5".to_string(),
+            "cerulion_q/temi/fires/5d1c0000000000000000000000009e02/5".to_string(),
+            "cerulion_q/temi/fires/0x05d1c0000000000000000000000009e02/5".to_string(),
+            format!("cerulion_q/temi/firesx/{id}/5"),
+            format!("cerulion_q/temi/fire/{id}/5"),
+            format!("cerulion_lv/temi/fires/{id}/5"),
+        ];
+        for key in keys {
+            assert_eq!(parse_query_verb(&key), None, "{key}");
+        }
+    }
+
+    /// The exact bytes of a served page: the row columns are pinned by the
+    /// wire version, and a desk in another language decodes this shape.
+    #[test]
+    fn a_served_fires_reply_encodes_to_the_pinned_bytes_and_decodes_back() {
+        let reply = FiresReply::new(
+            "temi",
+            FIRES_RUN,
+            FiresOutcome::Served {
+                now_ns: 88_123_456_789,
+                armed_since_ns: 88_100_000_000,
+                next: 5123,
+                lost: 0,
+                in_tick: vec![(2, 88_123_100_000)],
+                fires: vec![
+                    fire(5120, 88_111_000_000, 38_211, 0, FireCause::Period, 1),
+                    fire(5121, 88_112_000_000, 412_003, 1, FireCause::Data, 1),
+                    FireRecord {
+                        flags: FireFlags(FireFlags::TICK_ERROR | FireFlags::WROTE_UNKNOWN),
+                        ..fire(5122, 88_112_090_000, 21_007, 3, FireCause::Sync, 0)
+                    },
+                    fire(5123, 88_112_200_000, 95_001, 2, FireCause::External, 0b10),
+                ],
+            },
+        );
+        let pinned = concat!(
+            r#"{"version":1,"robot":"temi","run_id":"0x5d1c0000000000000000000000009e02","#,
+            r#""outcome":{"kind":"served","now_ns":88123456789,"armed_since_ns":88100000000,"#,
+            r#""next":5123,"lost":0,"in_tick":[[2,88123100000]],"fires":["#,
+            r#"[5120,88111000000,38211,0,1,0,1],"#,
+            r#"[5121,88112000000,412003,1,3,0,1],"#,
+            r#"[5122,88112090000,21007,3,4,6,0],"#,
+            r#"[5123,88112200000,95001,2,5,0,2]]}}"#
+        );
+        assert_eq!(
+            String::from_utf8(encode_fires_reply(&reply)).unwrap(),
+            pinned
+        );
+        assert_eq!(decode_fires_reply(pinned.as_bytes()), Ok(reply.clone()));
+        assert_eq!(
+            serde_json::from_str::<FiresReply>(pinned).expect("serde reads the same shape"),
+            reply
+        );
+    }
+
+    #[test]
+    fn the_outcomes_without_rows_encode_to_the_pinned_bytes_and_decode_back() {
+        let cases = [
+            (FiresOutcome::UnknownRun, r#"{"kind":"unknown_run"}"#),
+            (FiresOutcome::NotServed, r#"{"kind":"not_served"}"#),
+            (
+                FiresOutcome::Refused {
+                    reason: "not authorized".to_string(),
+                },
+                r#"{"kind":"refused","reason":"not authorized"}"#,
+            ),
+        ];
+        for (outcome, outcome_json) in cases {
+            let reply = FiresReply::new("temi", FIRES_RUN, outcome);
+            let pinned = format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{outcome_json}}}"#
+            );
+            assert_eq!(
+                String::from_utf8(encode_fires_reply(&reply)).unwrap(),
+                pinned
+            );
+            assert_eq!(decode_fires_reply(pinned.as_bytes()), Ok(reply));
+        }
+    }
+
+    #[test]
+    fn a_served_page_from_now_carries_no_rows_and_decodes() {
+        let reply = served_page(7, 0, Vec::new());
+        assert_eq!(decode_fires_reply(&encode_fires_reply(&reply)), Ok(reply));
+    }
+
+    #[test]
+    fn a_key_a_newer_peer_adds_is_ignored() {
+        let bytes = format!(
+            r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","later":true,"outcome":{{"kind":"not_served","later":1}}}}"#
+        );
+        assert_eq!(
+            decode_fires_reply(bytes.as_bytes()),
+            Ok(FiresReply::new("temi", FIRES_RUN, FiresOutcome::NotServed))
+        );
+    }
+
+    /// The version is read before the payload, so a peer on another version
+    /// is named as the skew it is even when its rows have another shape.
+    #[test]
+    fn a_fires_reply_on_another_version_is_named_by_its_version() {
+        let mut reply = served_seqs(1, 0, &[1]);
+        reply.version = FIRES_WIRE_VERSION + 1;
+        assert_eq!(
+            decode_fires_reply(&encode_fires_reply(&reply)),
+            Err(FiresDecodeError::UnknownVersion {
+                got: 2,
+                supported: 1,
+            })
+        );
+        let eight_columns = format!(
+            r#"{{"version":2,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":1,"lost":0,"in_tick":[],"fires":[[1,1,1,0,1,0,0,9]]}}}}"#
+        );
+        assert_eq!(
+            decode_fires_reply(eight_columns.as_bytes()),
+            Err(FiresDecodeError::UnknownVersion {
+                got: 2,
+                supported: 1,
+            })
+        );
+        assert_eq!(
+            decode_fires_reply(br#"{"version":0}"#),
+            Err(FiresDecodeError::UnknownVersion {
+                got: 0,
+                supported: 1,
+            })
+        );
+        assert!(serde_json::from_slice::<FiresReply>(&encode_fires_reply(&reply)).is_err());
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_fires_payload_are_malformed() {
+        let row = |row: &str| {
+            format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":1,"lost":0,"in_tick":[],"fires":[{row}]}}}}"#
+            )
+        };
+        let cases = [
+            "not json at all".to_string(),
+            String::new(),
+            r#"{"robot":"temi"}"#.to_string(),
+            format!(r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}"}}"#),
+            format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"exploded"}}}}"#
+            ),
+            format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":1,"lost":0,"in_tick":[]}}}}"#
+            ),
+            format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"refused"}}}}"#
+            ),
+            row("[1,1,1,0,1,0]"),
+            row("[1,1,1,0,1,0,0,0]"),
+            row("[1,1,4294967296,0,1,0,0]"),
+            row("[1,1,1,65536,1,0,0]"),
+            row("[1,1,1,0,256,0,0]"),
+            row("[-1,1,1,0,1,0,0]"),
+            row("[1,1.5,1,0,1,0,0]"),
+        ];
+        for bytes in cases {
+            assert!(
+                matches!(
+                    decode_fires_reply(bytes.as_bytes()),
+                    Err(FiresDecodeError::Malformed { .. })
+                ),
+                "{bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_above_the_row_cap_is_refused_and_one_at_it_decodes() {
+        let at_cap: Vec<u64> = (1..=MAX_FIRES_PER_REPLY as u64).collect();
+        let reply = served_seqs(512, 0, &at_cap);
+        assert_eq!(decode_fires_reply(&encode_fires_reply(&reply)), Ok(reply));
+
+        let above: Vec<u64> = (1..=MAX_FIRES_PER_REPLY as u64 + 1).collect();
+        assert_eq!(
+            invalid(&served_seqs(513, 0, &above)),
+            "513 rows, above the 512-row reply cap"
+        );
+    }
+
+    fn served_json(in_tick: &str, fires: &str) -> String {
+        format!(
+            r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":512,"lost":0,"in_tick":[{in_tick}],"fires":[{fires}]}}}}"#
+        )
+    }
+
+    /// The allocations `run` makes on this thread, counted by the lib test
+    /// binary's allocator.
+    fn allocations_in(run: impl FnOnce()) -> u64 {
+        use crate::fire_tap::tests::ALLOCATIONS;
+        ALLOCATIONS.set(Some(0));
+        run();
+        ALLOCATIONS.replace(None).expect("the count was armed")
+    }
+
+    /// The decoder holds no element past a cap: it counts the rest without
+    /// reading them, so an oversized reply costs the desk no more memory than
+    /// one a single element over the cap before the cap refuses it.
+    #[test]
+    fn elements_past_a_cap_are_counted_not_held() {
+        let rows = |count: usize| -> String {
+            let rows: Vec<String> = (1..=count)
+                .map(|seq| format!("[{seq},1,1,0,1,0,0]"))
+                .collect();
+            rows.join(",")
+        };
+        let full = rows(MAX_FIRES_PER_REPLY);
+        assert_eq!(
+            decode_fires_reply(served_json("", &format!(r#"{full},"x",{{}}"#)).as_bytes()),
+            Err(FiresDecodeError::Invalid {
+                reason: "514 rows, above the 512-row reply cap".to_string(),
+            })
+        );
+        let one_over = served_json("", &rows(MAX_FIRES_PER_REPLY + 1));
+        let far_over = served_json("", &rows(MAX_FIRES_PER_REPLY + 10_000));
+        assert_eq!(
+            decode_fires_reply(far_over.as_bytes()),
+            Err(FiresDecodeError::Invalid {
+                reason: "10512 rows, above the 512-row reply cap".to_string(),
+            })
+        );
+        let one_over = allocations_in(|| drop(decode_fires_reply(one_over.as_bytes())));
+        let far_over = allocations_in(|| drop(decode_fires_reply(far_over.as_bytes())));
+        assert!(
+            far_over <= one_over,
+            "10,000 more rows past the cap made {far_over} allocations, against {one_over}"
+        );
+
+        let nodes = |count: usize| -> String {
+            let nodes: Vec<String> = (0..count).map(|node| format!("[{node},1]")).collect();
+            nodes.join(",")
+        };
+        let Ok(FiresReply {
+            outcome: FiresOutcome::Served { in_tick, .. },
+            ..
+        }) = decode_fires_reply(served_json(&nodes(65_536), "").as_bytes())
+        else {
+            panic!("one in_tick entry per node decodes");
+        };
+        assert_eq!(in_tick.len(), 65_536);
+        let far_over = served_json(&nodes(65_536 + 10_000), "");
+        assert_eq!(
+            decode_fires_reply(far_over.as_bytes()),
+            Err(FiresDecodeError::Invalid {
+                reason: "75536 in_tick entries, above one per node (65536)".to_string(),
+            })
+        );
+        let one_over = served_json(&format!(r#"{},"x""#, nodes(65_536)), "");
+        let one_over = allocations_in(|| drop(decode_fires_reply(one_over.as_bytes())));
+        let far_over = allocations_in(|| drop(decode_fires_reply(far_over.as_bytes())));
+        assert!(
+            far_over <= one_over,
+            "10,000 more in_tick entries past the cap made {far_over} allocations, against \
+             {one_over}"
+        );
+    }
+
+    #[test]
+    fn an_in_tick_list_naming_a_node_twice_or_out_of_order_is_refused() {
+        for (in_tick, reason) in [
+            (
+                "[2,5],[2,6]",
+                "in_tick node 2 follows node 2: nodes strictly increase",
+            ),
+            (
+                "[3,1],[1,1]",
+                "in_tick node 1 follows node 3: nodes strictly increase",
+            ),
+        ] {
+            let bytes = served_json(in_tick, "");
+            assert_eq!(
+                decode_fires_reply(bytes.as_bytes()),
+                Err(FiresDecodeError::Invalid {
+                    reason: reason.to_string(),
+                })
+            );
+            assert!(serde_json::from_str::<FiresReply>(&bytes).is_err());
+        }
+        let ordered = served_json("[0,7],[3,9]", "");
+        let Ok(FiresReply {
+            outcome: FiresOutcome::Served { in_tick, .. },
+            ..
+        }) = decode_fires_reply(ordered.as_bytes())
+        else {
+            panic!("nodes in topology order decode");
+        };
+        assert_eq!(in_tick, vec![(0, 7), (3, 9)]);
+    }
+
+    #[test]
+    fn rows_whose_sequences_do_not_strictly_increase_are_refused() {
+        assert_eq!(
+            invalid(&served_seqs(6, 0, &[5, 5])),
+            "row seq 5 follows seq 5: sequences strictly increase"
+        );
+        assert_eq!(
+            invalid(&served_seqs(6, 0, &[6, 5])),
+            "row seq 5 follows seq 6: sequences strictly increase"
+        );
+    }
+
+    /// `next` is inclusive and the page covers `rows + lost` sequences ending
+    /// at it, so every row seq lies in `(next - rows - lost, next]`.
+    #[test]
+    fn rows_outside_the_range_the_page_accounts_for_are_refused() {
+        assert_eq!(
+            invalid(&served_seqs(6, 0, &[7])),
+            "row seq 7 is after the page end 6"
+        );
+        assert_eq!(
+            invalid(&served_seqs(10, 0, &[3, 4])),
+            "row seq 3 is not after the page start 8 (2 row(s) and 0 lost end at 10)"
+        );
+        assert_eq!(
+            invalid(&served_seqs(10, 0, &[8, 9])),
+            "row seq 8 is not after the page start 8 (2 row(s) and 0 lost end at 10)"
+        );
+        assert_eq!(
+            invalid(&served_seqs(1, 0, &[1, 2])),
+            "2 row(s) and 0 lost exceed the page end 1"
+        );
+        assert_eq!(
+            invalid(&served_seqs(1, u64::MAX, &[1])),
+            format!("1 row(s) and {} lost exceed the page end 1", u64::MAX)
+        );
+        assert_eq!(
+            invalid(&served_seqs(0, 0, &[0])),
+            "1 row(s) and 0 lost exceed the page end 0"
+        );
+        for (next, lost, seqs) in [
+            (10, 3, &[8u64, 10][..]),
+            (10, 3, &[6, 7]),
+            (10, 3, &[9, 10]),
+            (10, 10, &[]),
+        ] {
+            let reply = served_seqs(next, lost, seqs);
+            assert_eq!(
+                decode_fires_reply(&encode_fires_reply(&reply)),
+                Ok(reply),
+                "{seqs:?} with {lost} lost ending at {next}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cause_byte_no_fire_cause_has_is_refused() {
+        for cause in [2u8, 6, 255] {
+            let bytes = format!(
+                r#"{{"version":1,"robot":"temi","run_id":"{FIRES_RUN_TEXT}","outcome":{{"kind":"served","now_ns":1,"armed_since_ns":0,"next":1,"lost":0,"in_tick":[],"fires":[[1,1,1,0,{cause},0,0]]}}}}"#
+            );
+            assert_eq!(
+                decode_fires_reply(bytes.as_bytes()),
+                Err(FiresDecodeError::Invalid {
+                    reason: format!("row seq 1: cause byte {cause} names no fire cause"),
+                })
+            );
+            assert!(serde_json::from_str::<FiresReply>(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn a_reply_naming_a_non_canonical_run_id_is_refused() {
+        let mut reply = FiresReply::new("temi", 42, FiresOutcome::NotServed);
+        reply.run_id = "0x2a".to_string();
+        assert_eq!(
+            invalid(&reply),
+            "run_id \"0x2a\" is not the canonical `0x` + 32 lowercase hex form"
+        );
+    }
+
+    #[test]
+    fn every_fires_decode_error_renders_its_cause() {
+        assert_eq!(
+            FiresDecodeError::UnknownVersion {
+                got: 2,
+                supported: 1
+            }
+            .to_string(),
+            "unknown fires wire version 2 (this binary supports 1)"
+        );
+        assert_eq!(
+            FiresDecodeError::Malformed {
+                detail: "EOF".to_string()
+            }
+            .to_string(),
+            "fires reply did not parse (EOF)"
+        );
+        assert_eq!(
+            FiresDecodeError::Invalid {
+                reason: "row seq 5 is after the page end 4".to_string()
+            }
+            .to_string(),
+            "fires reply carries a state the serve side never produces (row seq 5 is after the \
+             page end 4)"
         );
     }
 }

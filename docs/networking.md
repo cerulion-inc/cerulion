@@ -473,7 +473,25 @@ serialized plan + the run's iceoryx2 namespace.
   RUNTIME (a `ros2 attach` raw route, hash-only over the reg-channel) is NAMED by
   its reg-channel hash. The `schema` selector is ALWAYS explicit (robot AND the
   full type name, `pkg/Type` or a bare `Name`): a mid-key wildcard would compute
-  an empty route on a strict connect-only link. The
+  an empty route on a strict connect-only link. The `fires` verb answers a
+  `cerulion_q/{robot}/fires/{run_id}/{after}` GET about a run the robot hosts
+  in memory (`NetworkManager::hosted_runs`) with the node ticks that run
+  recorded: metadata only, no payload bytes and no topic names. `{run_id}` is
+  the canonical run id (`0x` and 32 lowercase hex digits); `{after}` is `-`
+  (from now) or the last sequence the desk holds, in decimal. Any other tail is
+  not the verb and gets no reply. Each GET arms or extends the run's
+  fire-recording lease, so the run records ticks only while a desk asks. A
+  `served` reply (JSON, `version` 1) carries at most 512 rows
+  `[seq, at_ns, dur_ns, node, cause, flags, wrote]` in increasing `seq`, plus
+  `now_ns`, `armed_since_ns`, `in_tick` (the nodes inside a tick now), `next`
+  and `lost`. `next` is the last sequence the reply accounts for, inclusive:
+  the next GET passes it back unchanged. `lost` counts the sequences in that
+  range the run no longer holds (overwritten or dropped), so rows plus `lost`
+  equal `next` minus `after`. A full page means more are waiting. A lost
+  sequence takes no row, so a shorter page reached the newest fire. The other
+  outcomes are `unknown_run` (the robot hosts no such run: ask `runs` again),
+  `not_served` (the run records no fires) and `refused` (the access gate that
+  also guards `runs`; nothing is read and no lease is armed). The
   key space is DISTINCT from
   the `cerulion_lv`/`cerulion_ann` liveliness spaces, which STAY.
   The queryable handler calls the SAME `enable_bridge` seam (the allow-list gate
