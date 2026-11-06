@@ -4918,7 +4918,7 @@ mod tests {
             FiresOutcome::UnknownRun,
             FiresOutcome::NotServed,
             FiresOutcome::Refused {
-                reason: "LAN access is paired".to_string(),
+                reason: "not authorized".to_string(),
             },
         ] {
             let reply = FiresReply::new("temi", FIRES_RUN, outcome);
