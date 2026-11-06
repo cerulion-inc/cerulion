@@ -721,6 +721,60 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
         Classification::ExemptWithReason,
         "a FOREIGN schema: `compile_commands.json` is owned by CMake/clang, and a real entry legitimately carries keys this reader ignores (`output`, `arguments`, `command`). Denying an unknown key would refuse every genuine compile database, and this reader takes only the `directory`/`file` it names. The `ToolOutput`/`ToolRewrite`/`ToolEdit`/`ToolCandidate` types in the SAME module DO deny — those parse the Cerulion migration engine's OWN output, deployed from the same checkout, where an unknown key means a stale/garbled edit and must fail loudly",
     ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "RunView",
+        Classification::ExemptWithReason,
+        "a deliberately LENIENT view of the `run.json` a robot serves in its `runs` reply, read by `cerulion graph live`/`graph fires` on the desk. Nobody types it: the robot's runtime writes it. The module doc states the leniency as the design: a newer robot's manifest carries keys this desk does not know, and denying them would make an older desk refuse every newer robot",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "EndpointView",
+        Classification::ExemptWithReason,
+        "an endpoint entry inside the same lenient `run.json` view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "EndpointPortView",
+        Classification::ExemptWithReason,
+        "a topic entry of an endpoint inside the same lenient `run.json` view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "TopologyView",
+        Classification::ExemptWithReason,
+        "the `topology` block of the same lenient `run.json` view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "NodeView",
+        Classification::ExemptWithReason,
+        "a node entry of the same lenient `run.json` topology view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "PortView",
+        Classification::ExemptWithReason,
+        "a port entry of a node in the same lenient `run.json` topology view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "TriggerView",
+        Classification::ExemptWithReason,
+        "a node trigger inside the same lenient `run.json` topology view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "TelemetryView",
+        Classification::ExemptWithReason,
+        "the `telemetry` block of the same lenient `run.json` view; extra keys a newer robot adds are ignored by design",
+    ),
+    (
+        "cerulion_cli_engine/src/graph_live.rs",
+        "FiresDeclView",
+        Classification::ExemptWithReason,
+        "the `telemetry.fires` declaration inside the same lenient `run.json` view; extra keys a newer robot adds are ignored by design",
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────
