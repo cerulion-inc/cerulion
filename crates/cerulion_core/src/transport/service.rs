@@ -26,6 +26,16 @@
 //! chars), keeping well within iceoryx2's service-name length limit for
 //! realistic service names.
 //!
+//! The server keeps a reply publisher and a request-sequence entry per
+//! client GUID, and forgets a client whose reply topic has no subscriber
+//! left: when a request arrives from a GUID it holds no entry for, it checks
+//! every other client it holds and drops the departed ones, and a response that
+//! reaches no subscriber drops that client's entries. A client that is
+//! dropped and recreated under a new GUID (an `rmw_cerulion` client after a
+//! restart) therefore leaves nothing behind once the next new client sends
+//! a request. A client in a process that crashed counts as present until
+//! iceoryx2's dead-node cleanup removes its subscriber.
+//!
 //! # Wire format
 //!
 //! Each frame is a normal Cerulion wire frame published via
@@ -69,7 +79,14 @@
 //!
 //! - Client GUIDs are a pure function of `(node_id, service, instance)`
 //!   — see [`derive_client_guid`]. Same inputs → same GUID, every run.
+//!   A caller may pass its own GUID instead: `rmw_cerulion` passes a
+//!   host-unique entity gid (process id included), which differs per run,
+//!   so a restarted `rmw_cerulion` client replies on a new topic.
 //! - Sequence numbers are a per-client monotonic counter starting at 1.
+//! - Which clients a server still holds (see "Topology") depends on whether
+//!   their reply subscribers are attached when a new client's first request
+//!   is taken, so the request-sequence diagnostics of a client that left and
+//!   came back under the same GUID depend on when it left.
 //! - Timestamps come from the transport's [`Clock`] (the `VirtualClock`
 //!   under replay).
 //! - Requests are taken through the subscriber's FIFO, non-coalescing
@@ -101,9 +118,9 @@
 //!   request channel. Schema-hash gating degrades this loudly (foreign
 //!   frames warn + skip) but treat `svc/` as RESERVED for services.
 //! - `ServiceServer` keeps one lazily-created reply publisher per client
-//!   GUID forever (deterministic, but unbounded under client churn with
-//!   ever-fresh `instance` values). Restarting clients reuse their
-//!   derived GUID and cost nothing new.
+//!   GUID until that client's reply subscriber is gone (see "Topology"). A
+//!   client in a crashed process holds its entries until iceoryx2 removes
+//!   the dead process's ports.
 //! - The 16-byte GUID matches `RMW_GID_STORAGE_SIZE` on ROS 2 Iron and
 //!   later (Humble used 24 — not a target).
 
@@ -528,7 +545,9 @@ pub struct ServiceServer {
     request_sub: CerulionSubscriber,
     /// Lazily-created reply publishers, one per client GUID, in
     /// deterministic (BTreeMap) order. Creation is driven purely by
-    /// request arrival (data), never by timing.
+    /// request arrival (data), never by timing. A departed client's entry is
+    /// removed ([`Self::forget_departed_clients`]), which depends on whether
+    /// that client's reply subscriber is still attached.
     reply_pubs: BTreeMap<[u8; 16], CerulionPublisher>,
     transport: Arc<TransportManager>,
     reply_max_slice_len: MaxSliceLen,
@@ -542,6 +561,7 @@ pub struct ServiceServer {
     /// are the on-the-wire signature of request loss (the iceoryx2
     /// subscriber queue is a bounded safe-overflow ring; see the module
     /// docs' "Loss bounds" section). Detection only — no retransmit.
+    /// Removed with the client's reply publisher.
     last_seen_seq: BTreeMap<[u8; 16], i64>,
     /// Flood-suppression + unconditional counter for requests
     /// dropped on the schema-hash gate — the server-side twin of
@@ -560,8 +580,9 @@ impl ServiceServer {
     /// [`try_take_one_request`](Self::try_take_one_request) verbatim).
     ///
     /// The reply publisher for the client is created lazily on first
-    /// response to that client — creation order is driven by request
-    /// data, never timing, so it is replay-stable.
+    /// response to that client, so creation follows request data. A response
+    /// that reaches no subscriber drops the client's publisher and sequence
+    /// entry, and the next response to that GUID creates the publisher again.
     pub fn send_response(
         &mut self,
         envelope: &ServiceEnvelope,
@@ -616,6 +637,12 @@ impl ServiceServer {
         if let Err(e) = publisher.notify_sent_sample() {
             tracing::debug!(service = %self.service, error = ?e, "response notify failed");
         }
+        if recipients == 0 {
+            // No subscriber on the reply topic: the client is gone, so its
+            // publisher and sequence entry go too. A later response to the
+            // same GUID creates the publisher again.
+            self.forget_client(&envelope.client_guid);
+        }
         tracing::debug!(
             service = %self.service,
             sequence = envelope.sequence,
@@ -650,6 +677,7 @@ impl ServiceServer {
         let hash_latch = &mut self.request_hash_mismatches;
         let short_latch = &mut self.short_request_frames;
         let mut delivered = false;
+        let mut new_client: Option<[u8; 16]> = None;
         loop {
             let got = self.request_sub.try_receive_one(|msg| {
                 if msg.header().schema_hash != expected_hash {
@@ -676,6 +704,9 @@ impl ServiceServer {
                         // BACKWARD jump is a different story: the client
                         // restarted (derived GUIDs are reused by design) —
                         // diagnose it as such, never as queue overflow.
+                        // A client the server has forgotten (no reply
+                        // subscriber left, `forget_departed_clients`) starts
+                        // again from no entry, so its restart reads as new.
                         //
                         // BOTH arms must exist here: this is the ONLY
                         // request take path, so it is the only place either
@@ -683,9 +714,13 @@ impl ServiceServer {
                         // would otherwise pass in SILENCE — the backward
                         // jump satisfies neither `> prev + 1` nor any other
                         // arm, so nothing at all would be reported.
-                        let prev = last_seen
-                            .insert(envelope.client_guid, envelope.sequence)
-                            .unwrap_or(0);
+                        let prev = match last_seen.insert(envelope.client_guid, envelope.sequence) {
+                            Some(prev) => prev,
+                            None => {
+                                new_client = Some(envelope.client_guid);
+                                0
+                            }
+                        };
                         if envelope.sequence > prev + 1 {
                             tracing::warn!(
                                 service = %service,
@@ -719,9 +754,70 @@ impl ServiceServer {
                 }
             })?;
             if delivered || !got {
+                if let Some(arrived) = new_client {
+                    self.forget_departed_clients(&arrived);
+                }
                 return Ok(delivered);
             }
         }
+    }
+
+    /// Removes the reply publisher and the request-sequence entry of every
+    /// client whose reply topic has no subscriber
+    /// ([`TransportManager::topic_subscriber_count_checked`] reads `Some(0)`).
+    /// A client whose reply topic cannot be probed is kept, and the failed
+    /// probes are counted in one warning. The client whose request arrived
+    /// (`arrived`) is not probed, so a client without a reply subscriber keeps
+    /// its entry until a later sweep or a response that reaches no subscriber.
+    /// Runs one iceoryx2 service open per other client the server holds, each
+    /// time a request arrives from a new GUID.
+    fn forget_departed_clients(&mut self, arrived: &[u8; 16]) {
+        let mut guids: Vec<[u8; 16]> = self
+            .last_seen_seq
+            .keys()
+            .filter(|guid| *guid != arrived)
+            .copied()
+            .collect();
+        guids.extend(
+            self.reply_pubs
+                .keys()
+                .filter(|guid| !self.last_seen_seq.contains_key(*guid)),
+        );
+        let mut unprobed = 0usize;
+        let mut first_unprobed = None;
+        for guid in guids {
+            let topic = reply_topic(&self.service, &guid);
+            match self.transport.topic_subscriber_count_checked(&topic) {
+                Some(0) => {
+                    tracing::debug!(
+                        service = %self.service,
+                        topic = %topic,
+                        "service client departed; its reply publisher is dropped"
+                    );
+                    self.forget_client(&guid);
+                }
+                Some(_) => {}
+                None => {
+                    unprobed += 1;
+                    first_unprobed.get_or_insert(topic);
+                }
+            }
+        }
+        if unprobed > 0 {
+            tracing::warn!(
+                service = %self.service,
+                clients = unprobed,
+                first_topic = first_unprobed.as_deref().unwrap_or(""),
+                "could not probe the reply topics of these service clients for a \
+                 subscriber; their reply publishers are kept"
+            );
+        }
+    }
+
+    /// Drops the reply publisher and the request-sequence entry of `guid`.
+    fn forget_client(&mut self, guid: &[u8; 16]) {
+        self.reply_pubs.remove(guid);
+        self.last_seen_seq.remove(guid);
     }
 
     /// The service name.
@@ -729,9 +825,17 @@ impl ServiceServer {
         &self.service
     }
 
-    /// Number of distinct clients this server has replied to.
+    /// Number of clients this server holds a reply publisher for: the clients
+    /// it has replied to, less those it has forgotten after they departed.
     pub fn known_client_count(&self) -> usize {
         self.reply_pubs.len()
+    }
+
+    /// Number of clients this server tracks request sequences for: the
+    /// clients it has taken a request from, less those it has forgotten
+    /// after they departed.
+    pub fn tracked_client_count(&self) -> usize {
+        self.last_seen_seq.len()
     }
 
     /// Borrow the request subscriber (rmw wait-set integration: the
@@ -763,9 +867,9 @@ impl ServiceServer {
 impl TransportManager {
     /// Create the client side of a service.
     ///
-    /// `client_guid` should come from [`derive_client_guid`] (or the rmw
-    /// layer's gid) — it must be unique among live clients of this
-    /// service and replay-stable. `request_schema_hash` /
+    /// `client_guid` should come from [`derive_client_guid`] (replay-stable)
+    /// or the rmw layer's gid (host-unique, different per run); it must be
+    /// unique among live clients of this service. `request_schema_hash` /
     /// `response_schema_hash` identify the service's request/response
     /// types on the wire (e.g. FNV-1a of
     /// `"moveit_msgs/srv/GetPlanningScene_Request"`).

@@ -691,7 +691,8 @@ property (wall-faithful `fire_time_ns` jitter) deliberately does NOT carry
 over: a wall-following worker clock would advance by that worker's private
 jitter and desync it from its peers. Per-step boundary times are therefore
 EQUAL across ranks. Want the wall-faithful recording? Run
-`--single-process --record`, the single-process path.
+`--single-process --record`, the single-process path, for a graph that reads
+no topic from outside it (that path refuses one that does).
 
 **By default (free-run)** the paragraph above does not apply: there is no
 barrier and no handed gating quantum, and each rank records its OWN

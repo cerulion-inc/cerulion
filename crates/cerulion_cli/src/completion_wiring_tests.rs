@@ -753,6 +753,10 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion bagd::schema_demand_timeout_ms",
         "cerulion bagd::schema_wait_timeout_ms",
         "cerulion bagd::status_period_ms",
+        // A millisecond deadline, an invented number like the budgets above.
+        "cerulion doctor::timeout_ms",
+        // A host:port of the user's own QUIC endpoint; nothing local names it.
+        "cerulion doctor::udp_targets",
         // The checkpoint half.
         // `--state-ring` is a POSIX SHM object name (the same shape as `--ring`
         // above — not a filesystem path), and `--state-tag` is the mapped-SHM tag

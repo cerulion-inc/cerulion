@@ -16,6 +16,8 @@
 //!   waits for the graph's answers.
 //! - [`tools`]: deny-by-default tools, hash-chained receipts, the e-stop.
 //! - [`audit`]: the receipt chain check behind `--verify-receipts`.
+//! - [`eye`]: Jev, the gate's second eye: asks and answers on the graph, one
+//!   System One request per look, receipts, replay and `--verify-bag`.
 //! - [`server`]: the MCP handler.
 //! - [`http`]: the bearer-token streamable HTTP transport.
 //!
@@ -26,6 +28,7 @@
 
 pub mod audit;
 pub mod error;
+pub mod eye;
 pub mod graph;
 pub mod http;
 pub mod journal;

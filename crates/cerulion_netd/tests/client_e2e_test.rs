@@ -2204,3 +2204,233 @@ fn the_no_respawn_query_verbs_do_not_reconnect_on_an_early_close() {
         );
     }
 }
+
+// --------------------------------------------------------------------------
+// The auto-started daemon's stdio. A daemon that inherited a consumer's stdout
+// or stderr held that pipe's write end for its whole life, so a caller reading
+// the consumer's output (`cerulion topic list 2>&1 | cat`, a script, a harness)
+// saw end-of-file only when the daemon exited. The daemon now gets /dev/null on
+// stdin and its startup log beside the socket on stdout and stderr.
+// --------------------------------------------------------------------------
+
+/// The env var that arms [`spawn_helper_connects_then_exits`] with the socket
+/// to connect to. Unset, the helper does nothing, so a run of the ignored tests
+/// without it is a no-op.
+const SPAWN_HELPER_SOCK_ENV: &str = "CERULION_NETD_TEST_SPAWN_HELPER_SOCK";
+
+/// The consumer half of [`an_auto_started_netd_holds_none_of_the_callers_pipes`],
+/// run in a CHILD process (this test binary re-executed with `--exact --ignored`):
+/// it connects through the spawning path, which starts the daemon, then returns,
+/// so the child exits with the daemon still running.
+#[test]
+#[ignore = "re-executed as a child process by an_auto_started_netd_holds_none_of_the_callers_pipes"]
+fn spawn_helper_connects_then_exits() {
+    let Some(sock) = std::env::var_os(SPAWN_HELPER_SOCK_ENV) else {
+        return;
+    };
+    let client = NetdClient::connect_or_spawn_at(PathBuf::from(sock))
+        .expect("the helper connects through the spawning path");
+    drop(client);
+    println!("spawn helper connected");
+}
+
+/// Stops the daemon a test started (by its pidfile) when dropped, so a failed
+/// assertion still leaves no daemon behind.
+struct StopDaemon(PathBuf);
+impl Drop for StopDaemon {
+    fn drop(&mut self) {
+        if let Some(pid) =
+            cerulion_netd::hygiene::read_pidfile(&cerulion_netd::hygiene::pidfile_for(&self.0))
+        {
+            // SAFETY: `kill` on the pid the daemon this test started recorded; a
+            // stale pid at worst yields ESRCH.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+        let _ = wait_until(|| !self.0.exists(), Duration::from_secs(5));
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// THE regression pin for the inherited-stderr hang: a consumer process whose
+/// stdout and stderr are both pipes auto-starts a REAL daemon and exits, and
+/// both pipes reach end-of-file within [`PIPE_EOF_WITHIN`] of that exit while
+/// the daemon is still running. An inherited stream keeps its pipe open until
+/// the daemon exits (a minute here, by the idle grace below), so this fails.
+#[test]
+fn an_auto_started_netd_holds_none_of_the_callers_pipes() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+
+    /// How long after the consumer's exit its pipes may take to report
+    /// end-of-file. With no other writer that is immediate; the bound is slack
+    /// for a loaded runner, and far under the idle grace an inherited stream
+    /// would wait out.
+    const PIPE_EOF_WITHIN: Duration = Duration::from_secs(5);
+    /// The consumer's own bound: one cold daemon boot inside the spawn
+    /// path's readiness ceiling, twice over for its one retry, plus slack.
+    const CONSUMER_EXITS_WITHIN: Duration = Duration::from_secs(30);
+    /// Keeps the daemon alive past the consumer's bound plus the pipe bound, so
+    /// "still running" is established by the daemon rather than by a race with
+    /// its idle exit, and caps how long a daemon this test fails to stop lingers.
+    const IDLE_GRACE_MS: &str = "60000";
+
+    // Held across the consumer's spawn: on Apple targets std creates a pipe and
+    // sets close-on-exec in a second call, so a sibling arm forking in between
+    // would inherit the consumer's stderr write end. Every arm here that spawns
+    // a process holds this lock.
+    let _lk = env_lock();
+    let (_dir, sock) = unique_socket("pipes");
+    let _stop = StopDaemon(sock.clone());
+
+    let mut consumer = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([
+            "spawn_helper_connects_then_exits",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(SPAWN_HELPER_SOCK_ENV, &sock)
+        .env(NETD_BIN_ENV, env!("CARGO_BIN_EXE_cerulion-netd"))
+        .env(NETWORK_ENV, "off")
+        .env(IDLE_GRACE_ENV, IDLE_GRACE_MS)
+        .env(SOCKET_ENV, &sock)
+        // The daemon's default filter, pinned so its lifecycle line reaches the log.
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the consumer");
+
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let res = pipe.read_to_end(&mut out).map(|_| out);
+            let _ = tx.send(res);
+        });
+        rx
+    };
+    let stdout = drain(Box::new(consumer.stdout.take().unwrap()));
+    let stderr = drain(Box::new(consumer.stderr.take().unwrap()));
+
+    let deadline = Instant::now() + CONSUMER_EXITS_WITHIN;
+    let status = loop {
+        if let Some(status) = consumer.try_wait().expect("try_wait the consumer") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = consumer.kill();
+            panic!("the consumer did not exit within {CONSUMER_EXITS_WITHIN:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let exited = Instant::now();
+
+    let out = stdout
+        .recv_timeout(PIPE_EOF_WITHIN)
+        .unwrap_or_else(|_| {
+            panic!(
+                "the consumer's STDOUT pipe was still open {PIPE_EOF_WITHIN:?} after it exited: \
+                 the daemon it started holds it"
+            )
+        })
+        .expect("read stdout");
+    let err = stderr
+        .recv_timeout(PIPE_EOF_WITHIN.saturating_sub(exited.elapsed()))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the consumer's STDERR pipe was still open {PIPE_EOF_WITHIN:?} after it exited: \
+                 the daemon it started holds it"
+            )
+        })
+        .expect("read stderr");
+    let out = String::from_utf8_lossy(&out);
+    let err = String::from_utf8_lossy(&err);
+
+    // Not vacuous: the helper really ran (a filter that matched nothing would
+    // exit 0 with no daemon started) and connected through the spawning path.
+    assert!(
+        status.success(),
+        "the consumer failed: {status}\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("spawn helper connected") && out.contains("1 passed"),
+        "the helper must have run and connected:\n{out}\n{err}"
+    );
+
+    // The daemon outlived the consumer: the end-of-file came from the streams
+    // being detached, not from the daemon exiting.
+    let pid = cerulion_netd::hygiene::read_pidfile(&cerulion_netd::hygiene::pidfile_for(&sock))
+        .expect("the started daemon recorded its pid");
+    // SAFETY: signal 0 only checks that the pid exists.
+    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+    assert!(alive, "the daemon (pid {pid}) must still be running");
+    assert!(sock.exists(), "the daemon still holds its socket");
+
+    // Its output went to the startup log beside the socket, readable only by us.
+    let log = cerulion_netd::client::spawn_log_for(&sock);
+    assert_eq!(log, sock.with_file_name("netd.log"));
+    let mode = std::fs::metadata(&log)
+        .expect("the startup log exists")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the startup log is 0600");
+    // The daemon's own lines land there, uncoloured (stderr is not a terminal).
+    // The lifecycle line follows the socket bind, so it is waited for.
+    let mut text = String::new();
+    let logged = wait_until(
+        || {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            text.contains("cerulion-netd running")
+        },
+        PIPE_EOF_WITHIN,
+    );
+    assert!(logged, "the daemon's lifecycle line is in the log:\n{text}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "the log carries no terminal escape codes:\n{text:?}"
+    );
+}
+
+/// A daemon that fails to start is reported with its startup log: the error
+/// names the log and quotes what the daemon wrote to stderr.
+#[test]
+fn a_netd_that_fails_to_start_is_reported_with_its_log() {
+    const CAUSE: &str = "cerulion-netd: refusing to start (test cause 7f3a)";
+    let _lk = env_lock();
+    let (dir, sock) = unique_socket("startlog");
+    let script = write_fake_daemon(
+        &dir,
+        "failing-netd",
+        &format!("#!/bin/sh\necho '{CAUSE}' >&2\nexit 3\n"),
+    );
+    let _b = EnvGuard::set(NETD_BIN_ENV, script.to_str().unwrap());
+    let _s = EnvGuard::set(SOCKET_ENV, sock.to_str().unwrap());
+
+    let err = NetdClient::connect_or_spawn_at(sock.clone())
+        .expect_err("a daemon that exits at once never binds the socket");
+    let msg = err.to_string();
+    let log = cerulion_netd::client::spawn_log_for(&sock);
+    assert!(
+        msg.contains("EXITED"),
+        "attributed to the daemon's death: {msg}"
+    );
+    assert!(
+        msg.contains(&format!(
+            "cerulion-netd's startup output is in {}; its last lines:",
+            log.display()
+        )),
+        "the error names the startup log: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("  | {CAUSE}")),
+        "the error quotes what the daemon wrote to stderr: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
