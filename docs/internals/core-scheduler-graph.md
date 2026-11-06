@@ -353,13 +353,17 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is
   one event-stream period, next bullet; rmw's `park_block` uses the same constant) and ends
-  EVERY park-loop iteration with `yield_now()` (`park_yields`, record-only); a
+  every hardware slice with `yield_now()` (`park_core_yields`, record-only; completed slices
+  of every tier are counted apart in `park_slices`); a
   co-located runnable peer gets the core within one slice instead of at CFS wakeup
   granularity; without the yield a same-core pinned ping-pong measures p50 6.997 ms
   (`rmw_cerulion`'s `rmw_wait_pingpong_discriminator_test`, the `#[ignore]`'d
   `same_core_pair_park_on_spin_off_stays_under_100us` arm). The degraded sleep and
-  wake-word arms keep their measured ~100 µs pacing (a sleeping thread already released
-  its core); `CERULION_MW_SINGLE_PARK=1` (measurement-only) removes the yield boundary.
+  wake-word arms keep their measured ~100 µs pacing and end with no yield: a sleeping
+  thread already released its core, and on macOS a `sched_yield` with another thread
+  runnable on the processor depresses the caller's priority for up to one 10 ms scheduler
+  quantum, which a consumer just woken by a ring would wait out before its next poll;
+  `CERULION_MW_SINGLE_PARK=1` (measurement-only) removes the yield boundary.
   On aarch64 the slice is coarser: base WFE has no timeout operand, so a bounded wait
   rides the generic-timer event stream and the EFFECTIVE slice is one event-stream
   period, which is machine-specific (kernel target ~100 µs). A same-core ROUND-TRIP

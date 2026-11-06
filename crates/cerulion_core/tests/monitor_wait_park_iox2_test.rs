@@ -1765,6 +1765,16 @@ fn run_live_emits_wait_policy_line_with_active_park() {
         logs_contain("live loop park telemetry"),
         "run_live must emit the exit park-telemetry summary line"
     );
+    // It reports completed slices and loop-bottom yields under two keys: a
+    // slice that slept issues no yield, so one count cannot stand for both.
+    assert!(
+        logs_contain("park_slices=") && logs_contain("park_core_yields="),
+        "the exit telemetry line must carry park_slices and park_core_yields"
+    );
+    assert!(
+        !logs_contain("park_yields="),
+        "the exit telemetry line must not report slices under a yield key"
+    );
     runtime.shutdown();
 }
 
@@ -2178,7 +2188,8 @@ fn degraded_nap_tier_matches_the_resolved_os_sync_availability() {
 }
 
 // ===========================================================================
-// The park loop's per-slice YIELD (the same-core starvation defense).
+// The park loop's YIELD after a hardware slice (the same-core starvation
+// defense).
 //
 // A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS scheduler, so a park
 // that slices without yielding holds its core for the whole idle — a
@@ -2187,36 +2198,44 @@ fn degraded_nap_tier_matches_the_resolved_os_sync_availability() {
 // the rmw park, same primitive: p50 6.997ms RTT with both ping-pong
 // processes pinned to one CPU, vs 17µs on the kernel-sleeping tier). So
 // (mirroring rmw's `park_block`) the hardware arm slices at the
-// shared 20µs `monitor_wait::PARK_RECHECK` and EVERY park-loop iteration
-// ends with `std::thread::yield_now()` (counted by `park_yields`).
+// shared 20µs `monitor_wait::PARK_RECHECK` and every hardware slice ends
+// with `std::thread::yield_now()` (counted by `park_core_yields`); a slice
+// that slept issues no yield, and every completed slice is counted by
+// `park_slices`.
 //
 // Three pins, deliberately layered:
 //  - the COUNTER pin (below, every tier incl. macOS): a parked run
-//    completes + counts slices; a never-parked run counts exactly 0.
-//  - the STRUCTURAL pin: the counter pin alone passes a variant that keeps the
-//    `park_yields` bump but deletes the `yield_now()` itself (the two are
-//    output-equivalent on an idle machine), so the source walk requires the call
-//    — comment-stripped, so prose cannot satisfy it.
+//    completes + counts slices, and its yields are exactly its slices that
+//    were not naps (all of them on a hardware tier, none on a sleeping tier);
+//    a never-parked run counts exactly 0 of both.
+//  - the STRUCTURAL pin: the counters cannot see a `yield_now()` deleted while
+//    its bump stays, or a second one added outside the counted branch (each is
+//    output-equivalent on an idle machine), so the source walk requires exactly
+//    ONE call, inside the `if performed` branch that counts it,
+//    comment-stripped so prose cannot satisfy it.
 //  - the hardware-only same-core arm (`box_same_core`, Linux `--ignored`): the
 //    behavioral kill — park ON, both threads pinned to one CPU, RTT p50
 //    < 100µs; removing the yield (unsliced) reads ~ms (one CFS granularity
 //    per hop).
 // ===========================================================================
 
-/// Counter pin: every completed park-loop slice yields and is
-/// counted by `park_yields`, on EVERY tier (macOS runs the degraded
+/// Counter pin: every completed park-loop slice is
+/// counted by `park_slices`, on EVERY tier (macOS runs the degraded
 /// sleep tier; a WAITPKG/WFE machine runs the hardware tier — both slice, both
-/// count). The park-OFF control is the anti-tautology arm: the counter lives
+/// count), and only the hardware slices yield: this source-less ticker has no
+/// doorbell, barrier or credit word, so every slice is a hardware park or a
+/// nap, and `park_core_yields == park_slices - park_recheck_naps` on every
+/// tier. The park-OFF control is the anti-tautology arm: the counters live
 /// on the park loop's bottom and NOWHERE else, so a never-parked runtime
 /// must read exactly 0.
 #[test]
 #[serial]
-fn park_slices_yield_and_are_counted_on_every_tier() {
+fn park_slices_are_counted_on_every_tier_and_only_hardware_slices_yield() {
     const ITERS: usize = 6;
 
     /// One live-driven ticker run under `policy`; returns
-    /// `(park_entries, park_yields, park_recheck_naps)`.
-    fn run_counters(policy: MonitorWaitPolicy, iters: usize) -> (u64, u64, u64) {
+    /// `(park_entries, park_slices, park_recheck_naps, park_core_yields)`.
+    fn run_counters(policy: MonitorWaitPolicy, iters: usize) -> (u64, u64, u64, u64) {
         let fires = Arc::new(AtomicU64::new(0));
         let (config, factories) = ticker_graph(Arc::clone(&fires));
         let clock = Arc::new(VirtualClock::new());
@@ -2230,8 +2249,9 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
         }
         let out = (
             runtime.park_entry_count_for_test(),
-            runtime.park_yield_count_for_test(),
+            runtime.park_slice_count_for_test(),
             runtime.park_recheck_nap_count_for_test(),
+            runtime.park_core_yield_count_for_test(),
         );
         runtime.shutdown();
         out
@@ -2241,7 +2261,7 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
     // made of slices (20µs hardware / ~100µs degraded nap). A window is
     // hundreds of slices even on the slowest tier, so `> 0` is a huge-margin
     // floor, not a timing race.
-    let (entries, yields, naps) = run_counters(
+    let (entries, slices, naps, core_yields) = run_counters(
         MonitorWaitPolicy::new(true, false, mwp_ns("yieldcount")),
         ITERS,
     );
@@ -2250,26 +2270,46 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
         "apparatus: every live step must enter monitor_wait_block exactly once"
     );
     assert!(
-        yields > 0,
-        "a parked run that idled to its timeouts must have completed (and \
-         yielded after) at least one park slice — park_yields == 0 means the \
-         loop-bottom yield/counter is gone (the per-slice yield is missing)"
+        slices > 0,
+        "a parked run that idled to its timeouts must have completed at least \
+         one park slice: park_slices == 0 means the loop-bottom slice counter \
+         is gone"
     );
     assert!(
-        yields >= naps,
-        "every degraded nap chunk is followed by exactly one loop-bottom \
-         yield, so park_yields ({yields}) must be >= park_recheck_naps \
-         ({naps}) on every tier (hardware tiers nap 0 times)"
+        slices >= naps,
+        "every degraded nap chunk is a completed slice, so park_slices \
+         ({slices}) must be >= park_recheck_naps ({naps}) on every tier \
+         (hardware tiers nap 0 times)"
     );
+    assert_eq!(
+        core_yields,
+        slices - naps,
+        "the loop bottom yields once after every hardware slice and never after \
+         a nap, so park_core_yields must equal park_slices - park_recheck_naps \
+         ({slices} - {naps}); got {core_yields}"
+    );
+    if !cerulion_core::monitor_wait::monitor_wait_available() {
+        assert_eq!(
+            core_yields, 0,
+            "without a CPU monitor-wait primitive every slice is a nap, so the \
+             park must not yield at all"
+        );
+    }
 
     // Anti-tautology control: a park-OFF, barrier-less runtime NEVER enters
-    // monitor_wait_block (it takes the heartbeat path), so its yield counter
-    // must stay EXACTLY 0 — a regression counting yields from anywhere but
-    // the park loop's bottom fails here.
-    let (off_entries, off_yields, _) = run_counters(MonitorWaitPolicy::off(), ITERS);
+    // monitor_wait_block (it takes the heartbeat path), so both counters
+    // must stay EXACTLY 0: a regression counting slices or yields from
+    // anywhere but the park loop's bottom fails here.
+    let (off_entries, off_slices, _, off_core_yields) =
+        run_counters(MonitorWaitPolicy::off(), ITERS);
     assert_eq!(off_entries, 0, "park-OFF control must never park");
     assert_eq!(
-        off_yields, 0,
+        off_slices, 0,
+        "park-OFF control must count ZERO slices (the counter lives on the \
+         park loop's bottom and nowhere else)"
+    );
+    assert_eq!(
+        off_core_yields, 0,
         "park-OFF control must count ZERO yields (the counter lives on the \
          park loop's bottom and nowhere else)"
     );
@@ -2278,19 +2318,19 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
 /// Wake-exit pin: the counter pin above
 /// drives only TIMEOUT-exiting parks (a source-less ticker), so it cannot
 /// see a variant that leaves the EVENT-return branch (`listener_got || …`)
-/// exiting without the yield/bump accounting — the exact path a
+/// exiting without the slice accounting, the exact path a
 /// data-flowing robot rides all day. This drives a park that exits via a
 /// real LISTENER wake (an external publisher lands a frame MID-PARK) and
-/// pins that the slices completed BEFORE the wake still yielded+counted:
+/// pins that the slices completed BEFORE the wake were still counted:
 /// during a park attributed to a listener/doorbell wake (and NOT to the
-/// timeout), `park_yields` must have advanced. Scheduling-robust: if the
+/// timeout), `park_slices` must have advanced. Scheduling-robust: if the
 /// publish races the park entry (the loop-top poll returns before any
-/// slice ran — a wake attribution with a zero yield delta), the attempt is
+/// slice ran: a wake attribution with a zero slice delta), the attempt is
 /// retried rather than misread; a persistent zero across all attempts is
 /// the real regression.
 #[test]
 #[serial]
-fn park_wake_exit_still_yields_its_completed_slices() {
+fn park_wake_exit_still_counts_its_completed_slices() {
     const ATTEMPTS: usize = 5;
     /// The publisher's mid-park delay: long enough that the driving thread
     /// is parked (µs away) by the time the frame lands, short enough to
@@ -2323,7 +2363,7 @@ fn park_wake_exit_still_yields_its_completed_slices() {
     let mut proven = false;
     for attempt in 0..ATTEMPTS {
         let (entries0, listener0, doorbell0, timeout0) = runtime.park_wake_counts();
-        let yields0 = runtime.park_yield_count_for_test();
+        let slices0 = runtime.park_slice_count_for_test();
         let helper = std::thread::spawn(move || {
             std::thread::sleep(MID_PARK_DELAY);
             publish_one(&mut pubr, 1.0 + attempt as f64);
@@ -2332,7 +2372,7 @@ fn park_wake_exit_still_yields_its_completed_slices() {
         runtime.run_live_step_once_for_test(Duration::from_millis(400));
         pubr = helper.join().expect("mid-park publisher thread");
         let (entries1, listener1, doorbell1, timeout1) = runtime.park_wake_counts();
-        let yields1 = runtime.park_yield_count_for_test();
+        let slices1 = runtime.park_slice_count_for_test();
         assert_eq!(entries1 - entries0, 1, "one live step parks exactly once");
         let woke = listener1 + doorbell1 > listener0 + doorbell0;
         let timed_out = timeout1 > timeout0;
@@ -2343,12 +2383,12 @@ fn park_wake_exit_still_yields_its_completed_slices() {
             // accounting was skipped — unless the publish raced the
             // park entry (loop-top poll returned with ZERO completed
             // slices), which the retry absorbs.
-            if yields1 > yields0 {
+            if slices1 > slices0 {
                 proven = true;
                 break;
             }
             eprintln!(
-                "wake-exit attempt {attempt}: wake with zero yield delta \
+                "wake-exit attempt {attempt}: wake with zero slice delta \
                  (publish likely raced the park entry) — retrying"
             );
         } else {
@@ -2361,20 +2401,24 @@ fn park_wake_exit_still_yields_its_completed_slices() {
     runtime.shutdown();
     assert!(
         proven,
-        "across {ATTEMPTS} attempts, no LISTENER-woken park showed a yield \
-         delta — the event-return path is exiting without yielding/counting \
-         its completed slices (wake-exit regression)"
+        "across {ATTEMPTS} attempts, no LISTENER-woken park showed a slice \
+         delta: the event-return path is exiting without counting its \
+         completed slices (wake-exit regression)"
     );
 }
 
 /// STRUCTURAL pin (mirrors rmw's `the_park_slice_yields_the_core`
 /// in `guard_wait.rs`): the counter pin above passes a variant that keeps the
-/// `park_yields` bump but deletes the `yield_now()` call — the two are
-/// output-equivalent on an idle machine (the cost is a ~7ms same-core wall only
-/// on an oversubscribed one), and the behavioral kill (`box_same_core`) is
-/// hardware-only. So walk the SOURCE of `monitor_wait_block` — comment-stripped,
-/// so a call mentioned in prose or commented out cannot satisfy it — for the
-/// yield, its counter, and the shared 20µs hardware slice.
+/// `park_core_yields` bump but deletes the `yield_now()` call, and one that
+/// adds a second, uncounted `yield_now()` (after every slice that slept, say);
+/// each is output-equivalent on an idle machine (the cost shows only on an
+/// oversubscribed one: a ~7ms same-core wall without the hardware yield, up to
+/// a 10 ms macOS priority depression with the extra one), and the behavioral
+/// kill (`box_same_core`) is hardware-only. So walk the SOURCE of
+/// `monitor_wait_block` (comment-stripped, so a call mentioned in prose or
+/// commented out cannot satisfy it) for exactly one yield, inside the `if
+/// performed` branch that counts it, the slice counter, and the shared 20µs
+/// hardware slice.
 #[test]
 fn the_native_park_slice_yields_the_core() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/graph/runtime.rs"))
@@ -2429,9 +2473,16 @@ fn the_native_park_slice_yields_the_core() {
     assert!(
         loop_body.contains("std::thread::yield_now()"),
         "monitor_wait_block must yield the core INSIDE the recheck loop, \
-         after every park slice (a UMWAIT/WFE-parked thread is \
+         after every hardware park slice (a UMWAIT/WFE-parked thread is \
          RUNNING to the scheduler, so a non-yielding park starves a \
          co-located peer for a CFS tick)"
+    );
+    assert_eq!(
+        body.matches("std::thread::yield_now()").count(),
+        1,
+        "monitor_wait_block must call std::thread::yield_now() exactly ONCE: \
+         the counted yield after a hardware slice. A second call is a yield \
+         park_core_yields does not see"
     );
     assert!(
         !body[..loop_at].contains("std::thread::yield_now()"),
@@ -2444,21 +2495,64 @@ fn the_native_park_slice_yields_the_core() {
          brace — the loop only exits by `return`, so a post-loop yield never \
          runs on the park path at all"
     );
-    // The counter bump rides the yield, inside the loop too — and it is
+    // The slice counter bump sits inside the loop too, and it is
     // GATED on a genuinely-completed wait (`if parked_slice`): the addr
     // park's RingPending lost-wakeup fast path performs no wait and must not
     // count. (rustfmt splits receiver/call across lines, so compare
     // whitespace-free.)
     let compact_loop: String = loop_body.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        compact_loop.contains("ifparked_slice{self.park_yields.fetch_add(1"),
-        "…and count it (park_yields) inside the loop, GATED on a completed \
+        compact_loop.contains("ifparked_slice{self.park_slices.fetch_add(1"),
+        "…and count it (park_slices) inside the loop, GATED on a completed \
          wait (`if parked_slice {{ … }}`) — an unconditional bump counts the \
          lost-wakeup fast path as a phantom slice"
     );
+    // The yield is gated on a slice the CPU monitor-wait primitive performed: a
+    // slice that slept already released the core, and on macOS a sched_yield
+    // with another thread runnable depresses the caller's priority for up to a
+    // 10 ms scheduler quantum, so an ungated yield delays every woken consumer.
+    let gate = "ifperformed{std::thread::yield_now();";
+    let gate_at = compact_loop.find(gate).unwrap_or_else(|| {
+        panic!(
+            "the loop-bottom yield must be gated on a performed hardware slice \
+             (`if performed {{ std::thread::yield_now(); ... }}`)"
+        )
+    });
+    // The gated branch, brace-matched from its opening `{`, holds the one
+    // yield AND its counter bump, so `park_core_yields` counts every yield the
+    // loop issues.
+    let open = gate_at + "ifperformed".len();
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, b) in compact_loop.bytes().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let gated = &compact_loop[open..close.expect("the `if performed` branch closes")];
+    assert!(
+        gated.contains("self.park_core_yields.fetch_add(1"),
+        "the yield's branch must count it (park_core_yields), so the counter \
+         and the call cannot drift apart"
+    );
+    assert_eq!(
+        compact_loop
+            .matches("self.park_core_yields.fetch_add(1")
+            .count(),
+        1,
+        "park_core_yields must be bumped once, in the yield's branch"
+    );
     let compact_after: String = after_loop.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        !compact_after.contains("self.park_yields.fetch_add(1"),
+        !compact_after.contains("self.park_slices.fetch_add(1"),
         "…and the bump must not sit after the loop either — unreachable on \
          the park path, so the counter would read 0 forever"
     );
@@ -2468,6 +2562,364 @@ fn the_native_park_slice_yields_the_core() {
          monitor_wait::PARK_RECHECK (not the 100µs pacing chunk) — the slice \
          bound is the other half of the same-core starvation defense"
     );
+}
+
+/// A publisher that numbers its frames 1, 2, 3, ... so a consumer in another
+/// runtime can be held to the exact sequence it was sent.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct Numberer {
+    #[output]
+    out: Vector3,
+    fires: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl Numberer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let n = self.fires.fetch_add(1, Ordering::Relaxed) + 1;
+        self.out.x = n as f64;
+        Ok(())
+    }
+}
+
+/// Two runtimes, each built from its own graph and run on its own thread of
+/// this process, joined by one topic. Each runtime owns its own build, so the
+/// consumer's listeners are foreign to the producer's listener count the same
+/// way a consumer's in another process are, and the consumer reaches each frame
+/// the way one in another process does: its park wakes on the producer's notify
+/// and doorbell ring. The consumer parks between frames and the producer
+/// publishes while it is parked.
+///
+/// Held, each against a value written here rather than read back from the
+/// code under test:
+///
+/// - the producer never elides a notify on the topic: its live listener count
+///   is above the count its own build owns, so every publish notifies;
+/// - the consumer reads the exact sequence the producer sent. The producer
+///   sends at most one frame more than `FRAMES`, which is below the consumer's
+///   queue depth (`DEFAULT_CONSUMER_DEPTH`), so no frame is evicted however the
+///   two threads are scheduled;
+/// - the consumer is woken for its frames: while a frame is still due, every
+///   park it takes ends on a data wake (the notify or the doorbell ring) and
+///   none ends on its park timeout, which is longer than the producer's whole
+///   run, so a consumer nothing wakes fails here instead of reading its frames
+///   late;
+/// - on macOS with the os_sync doorbell tier, the consumer kernel-blocks on its
+///   doorbell wake word and at least one of the producer's rings issued a wake
+///   syscall that found it blocked there, so a ring ends a block before the
+///   block's own cap;
+/// - on a host without a CPU monitor-wait primitive every park slice sleeps (a
+///   kernel block on the doorbell wake word or a timed nap) and the loop bottom
+///   calls `std::thread::yield_now()` zero times. A yield after a slice that
+///   slept hands the core away a second time, and on macOS `sched_yield` with
+///   another thread runnable on the processor depresses the caller's priority
+///   for up to one scheduler quantum (10 ms), so a consumer a ring has just
+///   woken waits out that quantum before it polls the frame. On a host with the
+///   primitive the slices are hardware parks and each one yields, so the yields
+///   are at least the slices that were not naps.
+#[test]
+#[serial]
+fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() {
+    const FEED: &str = "/mwp/tworuntime/feed";
+    /// Frames the producer is driven to send. A producer step can fire one
+    /// frame more than asked, and `FRAMES + 1` stays below the consumer's
+    /// queue depth, so the queue cannot evict a frame.
+    const FRAMES: u64 = 8;
+    const _: () =
+        assert!(FRAMES as usize + 1 < cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH);
+    /// The consumer's park timeout while a frame is still due: longer than the
+    /// producer's whole run (`FRAMES` steps 3 ms apart), so a park that ends on
+    /// it was ended by no frame.
+    const DUE_PARK_TIMEOUT: Duration = Duration::from_secs(2);
+    let ns = mwp_ns("tworuntime");
+    let sent = Arc::new(AtomicU64::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let consumer_fires = Arc::new(AtomicU64::new(0));
+    let consumer_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The PRODUCER runtime, built first on this thread, so the topic's service
+    // exists with the producer's provisioning before the consumer opens it.
+    let producer_config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_tworuntime_producer".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![NodeDef {
+            fuse: None,
+            params: Default::default(),
+            ros2: None,
+            id: "numberer".to_string(),
+            node_type: "numberer".to_string(),
+            inputs: vec![],
+            outputs: vec![OutputDef {
+                name: "out".to_string(),
+                schema: "geometry_msgs/Vector3".to_string(),
+                max_slice_len: None,
+                history_size: 0,
+                topic: Some(FEED.to_string()),
+            }],
+        }],
+    };
+    let mut producer_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    producer_factories.insert(
+        "numberer".to_string(),
+        Box::new(NumbererEntry::with_state(Numberer {
+            fires: Arc::clone(&sent),
+            ..Default::default()
+        })),
+    );
+    // One iceoryx2 config for both runtimes and one transport node each, the
+    // way two graph processes on one host each open their own node on the
+    // same iceoryx2 domain.
+    let ix_config = cerulion_core::testing::iceoryx_test_config();
+    let transport = |name: &str, ix: iceoryx2::config::Config| {
+        TransportManager::init_for_test(
+            cerulion_core::transport::TransportConfig {
+                node_name: name.into(),
+                clock: Arc::new(VirtualClock::new()),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            ix,
+        )
+        .expect("create a transport node on the shared iceoryx2 config")
+    };
+    let producer_mgr = transport("mwp_tworuntime_producer", ix_config.clone());
+    let producer_drive = Arc::new(VirtualClock::new());
+    let producer_clock: Arc<dyn cerulion_core::clock::Clock> = producer_drive.clone();
+    let mut producer = GraphRuntime::build_live_with_schema_hashes_and_policy(
+        producer_config,
+        producer_factories,
+        &producer_mgr,
+        producer_clock,
+        None,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+    )
+    .expect("build the producer runtime");
+    // The CONSUMER runtime, built and run on its own thread: a data trigger on
+    // FEED, a topic it does not publish.
+    let consumer = {
+        let ns = ns.clone();
+        let ix_config = ix_config.clone();
+        let observed = Arc::clone(&observed);
+        let consumer_fires = Arc::clone(&consumer_fires);
+        let consumer_ready = Arc::clone(&consumer_ready);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let config = GraphConfig {
+                level_assignments: None,
+                network: None,
+                process_groups: Default::default(),
+                process_group_order: Default::default(),
+                multi_publisher_topics: Vec::new(),
+                name: None,
+                identity: "mwp_tworuntime_consumer".to_string(),
+                prefix: "mwp".to_string(),
+                nodes: vec![NodeDef {
+                    fuse: None,
+                    params: Default::default(),
+                    ros2: None,
+                    id: "reader".to_string(),
+                    node_type: "consumer".to_string(),
+                    inputs: vec![InputDef {
+                        name: "inp".to_string(),
+                        source: FEED.to_string(),
+                    }],
+                    outputs: vec![],
+                }],
+            };
+            let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+            factories.insert(
+                "reader".to_string(),
+                Box::new(ConsumerEntry::with_state(Consumer {
+                    observed,
+                    fires: Arc::clone(&consumer_fires),
+                    ..Default::default()
+                })),
+            );
+            let consumer_mgr = transport("mwp_tworuntime_consumer", ix_config);
+            let mut runtime = GraphRuntime::build_live_with_schema_hashes_and_policy(
+                config,
+                factories,
+                &consumer_mgr,
+                Arc::new(VirtualClock::new()),
+                None,
+                MonitorWaitPolicy::new(true, true, ns),
+            )
+            .expect("build the consumer runtime");
+            let (_, listener_before, doorbell_before, _) = runtime.park_wake_counts();
+            consumer_ready.store(true, Ordering::Release);
+            // While a frame is still due, each park gets the long timeout and its
+            // timeout exits are counted: a park a frame ends is a data wake.
+            let mut timeouts_while_due = 0u64;
+            while consumer_fires.load(Ordering::Relaxed) < FRAMES && !stop.load(Ordering::Acquire) {
+                let (_, _, _, timeouts_before) = runtime.park_wake_counts();
+                runtime.run_live_step_once_for_test(DUE_PARK_TIMEOUT);
+                let (_, _, _, timeouts_after) = runtime.park_wake_counts();
+                timeouts_while_due += timeouts_after - timeouts_before;
+            }
+            let (_, listener_after, doorbell_after, _) = runtime.park_wake_counts();
+            // The frame a producer step may send beyond FRAMES is read here.
+            while !stop.load(Ordering::Acquire) {
+                runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+            }
+            let counts = ConsumerCounts {
+                entries: runtime.park_entry_count_for_test(),
+                slices: runtime.park_slice_count_for_test(),
+                naps: runtime.park_recheck_nap_count_for_test(),
+                core_yields: runtime.park_core_yield_count_for_test(),
+                wake_word_blocks: runtime.park_wake_word_block_count_for_test(),
+                data_wakes_while_due: (listener_after - listener_before)
+                    + (doorbell_after - doorbell_before),
+                timeouts_while_due,
+            };
+            runtime.shutdown();
+            drop(consumer_mgr);
+            counts
+        })
+    };
+    let spun_up = std::time::Instant::now();
+    while !consumer_ready.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(20),
+            "the consumer runtime never finished building"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // One numbered frame per producer step, each published after a pause long
+    // enough that the consumer is parked in a slice when it lands.
+    #[cfg(target_os = "macos")]
+    let wakes_before = cerulion_core::doorbell::wake_syscall_counts();
+    while sent.load(Ordering::Relaxed) < FRAMES {
+        std::thread::sleep(Duration::from_millis(3));
+        producer_drive.advance(5_000_000);
+        producer.run_live_step_once_for_test(Duration::from_millis(1));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while consumer_fires.load(Ordering::Relaxed) < sent.load(Ordering::Relaxed)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    #[cfg(target_os = "macos")]
+    let wakes_after = cerulion_core::doorbell::wake_syscall_counts();
+    stop.store(true, Ordering::Release);
+    let c = consumer.join().expect("consumer thread panicked");
+    let elided = producer.notify_elided_count_for_test(FEED);
+    let total = sent.load(Ordering::Relaxed);
+    producer.shutdown();
+    drop(producer_mgr);
+    eprintln!(
+        "two-runtime park: {total} frames, consumer {} park entries, {} slices, {} naps, \
+         {} yields, {} wake-word blocks, {} data wakes and {} timeouts while due",
+        c.entries,
+        c.slices,
+        c.naps,
+        c.core_yields,
+        c.wake_word_blocks,
+        c.data_wakes_while_due,
+        c.timeouts_while_due
+    );
+
+    assert_eq!(
+        elided, 0,
+        "the consumer's listeners belong to another runtime, so the producer's live \
+         listener count is above the count its own build owns and every publish must \
+         notify"
+    );
+    assert!(
+        (FRAMES..=FRAMES + 1).contains(&total),
+        "apparatus: the producer was driven to send {FRAMES} frames and sent {total}"
+    );
+    let expected: Vec<f64> = (1..=total).map(|n| n as f64).collect();
+    assert_eq!(
+        *observed.lock().unwrap(),
+        expected,
+        "the consumer must read every frame the producer sent, in order (no frame \
+         can be evicted: the consumer's queue is deeper than the frames sent)"
+    );
+    assert!(
+        c.entries > 0 && c.slices > 0,
+        "apparatus: the consumer must have parked and completed park slices \
+         (entries {}, slices {})",
+        c.entries,
+        c.slices
+    );
+    assert_eq!(
+        c.timeouts_while_due, 0,
+        "every park the consumer took while a frame was due must end on a data wake \
+         (the producer's notify or doorbell ring), never on its {DUE_PARK_TIMEOUT:?} \
+         park timeout: {} parks timed out, so nothing woke the consumer for a frame",
+        c.timeouts_while_due
+    );
+    assert!(
+        c.data_wakes_while_due > 0,
+        "the consumer's parks while a frame was due must have ended on data wakes \
+         (got {})",
+        c.data_wakes_while_due
+    );
+    #[cfg(target_os = "macos")]
+    if !cerulion_core::monitor_wait::monitor_wait_available()
+        && cerulion_core::doorbell::wake_word_block_primitive_available()
+    {
+        let issued = wakes_after.0 - wakes_before.0;
+        let found_nobody = wakes_after.1 - wakes_before.1;
+        eprintln!(
+            "two-runtime park: the producer's rings issued {issued} wake syscalls, \
+             {found_nobody} found nobody"
+        );
+        assert!(
+            c.wake_word_blocks > 0,
+            "on the os_sync doorbell tier the consumer's park must kernel-block on its \
+             doorbell wake word (got {} blocks)",
+            c.wake_word_blocks
+        );
+        assert!(
+            issued > found_nobody,
+            "at least one of the producer's {total} rings must issue a wake syscall that \
+             finds the consumer blocked on its wake word ({issued} wake syscalls, \
+             {found_nobody} found nobody): otherwise every block ran to its cap and the \
+             consumer saw its frames at its next poll"
+        );
+    }
+    if cerulion_core::monitor_wait::monitor_wait_available() {
+        assert!(
+            c.core_yields > 0 && c.core_yields + c.naps >= c.slices,
+            "with a CPU monitor-wait primitive the slices are hardware parks, and a \
+             hardware-parked thread is running to the scheduler, so each slice that \
+             was not a nap must yield the core (got {} yields over {} slices, {} naps)",
+            c.core_yields,
+            c.slices,
+            c.naps
+        );
+    } else {
+        assert_eq!(
+            c.core_yields, 0,
+            "without a CPU monitor-wait primitive every slice slept, so the loop \
+             bottom must not yield: {} yields over {} completed slices",
+            c.core_yields, c.slices
+        );
+    }
+}
+
+/// What the consumer thread of
+/// `a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield`
+/// reports back from its runtime.
+struct ConsumerCounts {
+    entries: u64,
+    slices: u64,
+    naps: u64,
+    core_yields: u64,
+    wake_word_blocks: u64,
+    data_wakes_while_due: u64,
+    timeouts_while_due: u64,
 }
 
 /// Strip `//` line comments and (nesting) `/* */` block comments, so the
@@ -2660,7 +3112,7 @@ mod box_same_core {
     /// backstop is max(1ms, the platform bound), so a large-quantum machine
     /// stays coherent. A SECOND, load-robust oracle pins the geometry
     /// directly: park slices completed per MEASURED round (a live
-    /// `park_yields` snapshot over exactly the measured window — the
+    /// `park_slices` snapshot over exactly the measured window; the
     /// post-stop tail parks up to one whole 50ms timeout window, which
     /// would smear thousands of unrelated slices into a naive total/rounds
     /// figure) must stay <= MAX_SLICES_PER_ROUND (6): "the park wakes at
@@ -2772,12 +3224,12 @@ mod box_same_core {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_a = Arc::clone(&stop);
-        // Live snapshot of the parker's cumulative `park_yields`, published
+        // Live snapshot of the parker's cumulative `park_slices`, published
         // after every live-step iteration — lets the driver read the slice
         // count over EXACTLY the measured window (see the fn doc's
         // slice-geometry oracle).
-        let yields_live = Arc::new(AtomicU64::new(0));
-        let yields_live_parker = Arc::clone(&yields_live);
+        let slices_live = Arc::new(AtomicU64::new(0));
+        let slices_live_parker = Arc::clone(&slices_live);
         let parker = std::thread::spawn(move || {
             assert!(
                 pin_current_thread(cpu),
@@ -2785,12 +3237,12 @@ mod box_same_core {
             );
             while !stop_a.load(Ordering::Relaxed) {
                 runtime.run_live_step_once_for_test(Duration::from_millis(50));
-                yields_live_parker.store(runtime.park_yield_count_for_test(), Ordering::Relaxed);
+                slices_live_parker.store(runtime.park_slice_count_for_test(), Ordering::Relaxed);
             }
-            let yields = runtime.park_yield_count_for_test();
+            let slices = runtime.park_slice_count_for_test();
             let naps = runtime.park_recheck_nap_count_for_test();
             runtime.shutdown();
-            (yields, naps)
+            (slices, naps)
         });
         assert!(pin_current_thread(cpu), "pin the driver to cpu{cpu}");
 
@@ -2798,14 +3250,14 @@ mod box_same_core {
         // one ping in flight at a time, the driver COOPERATIVE (yield per
         // poll) so only the park under test can hold the core.
         let mut rtts: Vec<Duration> = Vec::with_capacity(ROUNDS);
-        let mut yields_at_measure_start = 0u64;
+        let mut slices_at_measure_start = 0u64;
         for round in 0..(WARMUP_ROUNDS + ROUNDS) {
             if round == WARMUP_ROUNDS {
                 // The slice-geometry window opens here: the last warm-up
                 // pong is in and the parker has published its cumulative
                 // count (modulo one in-flight iteration — noise at the
                 // /ROUNDS scale).
-                yields_at_measure_start = yields_live.load(Ordering::Relaxed);
+                slices_at_measure_start = slices_live.load(Ordering::Relaxed);
             }
             let t0 = Instant::now();
             publish_one(&mut pinger, round as f64);
@@ -2827,11 +3279,11 @@ mod box_same_core {
                 rtts.push(t0.elapsed());
             }
         }
-        let yields_at_measure_end = yields_live.load(Ordering::Relaxed);
+        let slices_at_measure_end = slices_live.load(Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
-        let (parker_yields, parker_naps) = parker.join().expect("join the parked live loop");
+        let (parker_slices, parker_naps) = parker.join().expect("join the parked live loop");
         let slices_per_round =
-            (yields_at_measure_end - yields_at_measure_start) as f64 / ROUNDS as f64;
+            (slices_at_measure_end - slices_at_measure_start) as f64 / ROUNDS as f64;
 
         rtts.sort();
         let pct = |q: f64| rtts[((rtts.len() - 1) as f64 * q) as usize];
@@ -2839,12 +3291,12 @@ mod box_same_core {
         let max = rtts[rtts.len() - 1];
         eprintln!(
             "same-core native park (cpu{cpu}): p50 {p50:?} p90 {p90:?} \
-             p99 {p99:?} max {max:?} over {ROUNDS} rounds; parker slices/yields \
-             {parker_yields} total, {slices_per_round:.2}/round in the measured \
+             p99 {p99:?} max {max:?} over {ROUNDS} rounds; parker slices \
+             {parker_slices} total, {slices_per_round:.2}/round in the measured \
              window; platform bound {threshold:?}{quantum_note}"
         );
         assert!(
-            parker_yields > 0,
+            parker_slices > 0,
             "apparatus: the parked loop must have completed (and yielded after) \
              park slices while idling between pings"
         );
