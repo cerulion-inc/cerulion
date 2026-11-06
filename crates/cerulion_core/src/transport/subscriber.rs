@@ -1516,16 +1516,20 @@ pub struct CerulionSubscriber {
     /// `EachFifo`: pop exactly ONE sample per read, in FIFO arrival order —
     /// the per-message delivery contract for data-trigger inputs ("fire on
     /// each message arriving"). Set at graph WIRING time for every
-    /// Data-policy trigger input (both Unified and Separate drain
-    /// disciplines); the scheduler pairs it with one fire per pending frame
+    /// Data-policy trigger input declared `consume = fifo`, the default (both
+    /// Unified and Separate drain disciplines); a `consume = latest` trigger
+    /// input keeps `Latest`. The scheduler pairs it with one fire per pending frame
     /// (carrying the remainder across steps), so a burst of N frames yields
     /// N ticks each observing exactly one frame, in order.
     consume_mode: ConsumeMode,
     /// Consecutive BOUNDARY RE-OFFERS of the same unserved frozen
     /// FIFO head (see [`Self::snapshot_latest_for_trigger`]). Reset to 0 the
     /// moment either trigger drain actually pops — i.e. the moment a tick took
-    /// the head. Only ever non-zero for an `EachFifo` input on the Unified
-    /// drain discipline, which is the only place a head can be re-offered.
+    /// the head. Non-zero only on the Unified drain discipline. For a
+    /// `consume = latest` trigger input it counts the boundaries since a tick
+    /// last read the input: a boundary that finds the frozen frame unread
+    /// increments it whether it re-offers that frame or replaces it with a
+    /// newer one, and a boundary that finds no unread frame resets it.
     ///
     /// The two sides are deliberately ASYMMETRIC: only a
     /// [`TriggerDrainSite::Boundary`] re-offer INCREMENTS it (a boundary runs
@@ -5143,8 +5147,34 @@ impl CerulionSubscriber {
         // reaching it proves the fire that just ran DID consume the head —
         // which is exactly the recovery condition, observed one step earlier
         // than the next boundary would see it.
-        self.note_head_served();
-        self.frozen = None;
+        //
+        // A `consume = latest` trigger input is the exception, and it never
+        // reaches the FIFO guard above. Its drain pops the whole queue, so a
+        // frozen frame no tick has read is not owed a fire of its own: a
+        // newer frame supersedes it. It is held aside here and put back
+        // below only when the drain finds nothing newer, which is what keeps
+        // a DEFERRED fire (`throttle_ms`, a `block` gate) reading the newest
+        // frame instead of nothing. A REFILL never pops past it, for the
+        // reason the FIFO guard gives: it asks whether the fire just run
+        // took the head, and an unserved head says it did not.
+        let unserved_latest = match (self.consume_mode, self.frozen.take()) {
+            (ConsumeMode::Latest, Some(FrozenSlot::Sample(sample))) => {
+                if site == TriggerDrainSite::Refill {
+                    self.frozen = Some(FrozenSlot::Sample(sample));
+                    return (0, None);
+                }
+                Some(sample)
+            }
+            _ => None,
+        };
+        if unserved_latest.is_some() {
+            // A boundary that finds the frame still unread counts toward the
+            // held-head streak whether or not a newer frame replaces it: in
+            // both cases no tick has read this input since the last one.
+            self.note_head_reoffered();
+        } else {
+            self.note_head_served();
+        }
         // A frame the descent staged in `next_head` is the
         // FIFO-correct answer, so PROMOTE it rather than popping the queue —
         // which would hand back a NEWER frame and invert this input's delivery
@@ -5202,7 +5232,10 @@ impl CerulionSubscriber {
         // Nothing is lost by the silence. A `next_head` cannot survive a step
         // in which its input's head was NOT served (the re-offer guard above
         // returns while `frozen` is `Some(Sample)`, so this branch is
-        // unreachable then), and when it IS served the burst refill promotes in
+        // unreachable then; a `consume = latest` input passes that guard with
+        // its frame held aside, but only the Sync descent,
+        // `sync_peek_next_stamp`, stages a `next_head`, and `latest` is
+        // refused on Sync nodes), and when it IS served the burst refill promotes in
         // the same step — so the head at the NEXT fire is re-recorded by that
         // step's own boundary drain or by the matcher's ops, never left to this
         // one to announce.
@@ -5318,6 +5351,20 @@ impl CerulionSubscriber {
                 }
                 FrozenSlot::Err(_) | FrozenSlot::Held => {}
             }
+        }
+        if let Some(held) = unserved_latest {
+            if matches!(outcome.slot, FrozenSlot::Empty) {
+                // Nothing newer (or the drain's newest frame was decimated): the
+                // held frame is still the newest this input may serve, so it
+                // is RE-OFFERED, one signal and its own stamp, the FIFO
+                // re-offer's shape. The drain's own record above already says
+                // what this boundary popped.
+                let ts = wire_timestamp_ns(held.payload());
+                self.frozen = Some(FrozenSlot::Sample(held));
+                return (1, ts);
+            }
+            // A newer frame (or a drain error, surfaced as before) replaces
+            // it: dropping `held` releases the superseded sample.
         }
         let (popped, latest_ts) = (outcome.popped, outcome.latest_ts);
         self.frozen = Some(outcome.slot);

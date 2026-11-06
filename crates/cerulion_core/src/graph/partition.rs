@@ -3192,6 +3192,7 @@ mod block_colocation_tests {
             depth: DEFAULT_CONSUMER_DEPTH,
             backpressure,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 

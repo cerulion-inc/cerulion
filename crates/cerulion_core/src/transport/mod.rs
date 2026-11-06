@@ -207,11 +207,12 @@ pub(crate) const ICEORYX2_DEFAULT_BORROWED_SAMPLES: usize = 2;
 /// of 2. Defined as `default + 1` so the "held + latest + transient =
 /// default + 1" rationale is self-documenting (and tracks the default if it
 /// ever changes, guarded by the drift-guard test). Armed as an open
-/// requirement ONLY on snapshot-source topics (see
-/// [`TopicServiceConfig::subscriber_max_borrowed_samples`]); a topic the
-/// graph owns is CREATED at it as a floor. Public so a runtime that creates a
-/// topic before the graph that reads it (the Android embedded runtime's app
-/// publishers) can create it at the same floor through
+/// requirement ONLY on snapshot-source topics and on the source topics of
+/// `consume = latest` trigger inputs, whose unread frozen frame is held the
+/// same way (see [`TopicServiceConfig::subscriber_max_borrowed_samples`]); a
+/// topic the graph owns is CREATED at it as a floor. Public so a runtime that
+/// creates a topic before the graph that reads it (the Android embedded
+/// runtime's app publishers) can create it at the same floor through
 /// [`TopicServiceConfig::create_borrow_floor`].
 pub const SUBSCRIBER_MAX_BORROWED_HELD: usize = ICEORYX2_DEFAULT_BORROWED_SAMPLES + 1;
 
@@ -960,13 +961,16 @@ pub struct TopicServiceConfig {
     /// global value) always succeed on graph-created services.
     pub subscriber_max_buffer_size: usize,
     /// The iceoryx2 `subscriber_max_borrowed_samples` for this topic.
-    /// `None` = use the iceoryx2 default (2). `Some(3)` is set ONLY on
-    /// topics that feed a non-trigger latest-value input of a macro node
-    /// (a snapshot consumer): such a consumer HOLDS the last-delivered
+    /// `None` = use the iceoryx2 default (2). `Some(3)` is set on topics
+    /// that feed a non-trigger latest-value input of a macro node (a
+    /// snapshot consumer): such a consumer HOLDS the last-delivered
     /// sample across steps, so the drain peak is held(1) +
     /// latest(1) + receive-transient(1) = 3 borrowed per connection. A
     /// burst (≥2 queued) would exceed the default 2 → `ExceedsMaxBorrows`.
-    /// Trigger-only / non-snapshot topics keep the default 2 (no waste).
+    /// The source topic of a `consume = latest` trigger input gets `Some(3)`
+    /// too: its subscriber holds a frame no tick has read through the next
+    /// drain. A topic none of whose consumers holds a frame keeps the
+    /// default 2, and a recorded topic takes the recorder's own raise.
     pub subscriber_max_borrowed_samples: Option<usize>,
     /// A CREATE-leg-only borrow floor — the `subscriber_max_borrowed_samples`
     /// a service THIS opener creates is raised to, WITHOUT arming any open-time
@@ -1813,7 +1817,7 @@ pub struct TopicRequirements {
     /// from `Option` to the concrete count (the iceoryx2 default
     /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` when unset). `>=` the held-snapshot
     /// budget `SUBSCRIBER_MAX_BORROWED_HELD` iff SOME consumer of this topic holds
-    /// a snapshot across steps. This is the headline term: a
+    /// a snapshot across steps or reads it as a `consume = latest` trigger. This is the headline term: a
     /// cross-group snapshot consumer is the reported bug. (This carries
     /// GENUINE requirements only — the owned-topic create-side borrow FLOOR
     /// deliberately does NOT enter the harvest, because a stamped union arms this
@@ -6911,9 +6915,10 @@ impl TransportManager {
                     PublishSubscribeOpenError::DoesNotSupportRequestedMinSubscriberBorrowedSamples,
                 ) => {
                     "; the service already exists with fewer borrowed samples \
-                     than this opener requires — a snapshot-consumer graph \
-                     needs subscriber_max_borrowed_samples >= 3 (the \
-                     latest-value hold) — stop the owning graph or earlier \
+                     than this opener requires: a snapshot-consumer or \
+                     `consume = latest` graph needs \
+                     subscriber_max_borrowed_samples >= 3 (the held frame); \
+                     stop the owning graph or earlier \
                      default opener, or start this graph first"
                 }
                 _ => "",

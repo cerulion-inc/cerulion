@@ -2871,6 +2871,7 @@ mod tests {
             depth,
             backpressure: cerulion_core::graph::node::BackpressurePolicy::Block,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 
@@ -2883,6 +2884,7 @@ mod tests {
             depth: 4,
             backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 
@@ -5697,6 +5699,7 @@ mod tests {
                         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
                         expect_within_ms: None,
+                        consume: Default::default(),
                     })
                     .collect();
                 let mut info = NodeInfo::with_meta(input_meta, Vec::new());
@@ -7112,6 +7115,7 @@ mod tests {
                             .map(|(_, _, policy)| *policy)
                             .unwrap_or_default(),
                         expect_within_ms: None,
+                        consume: Default::default(),
                     })
                     .collect();
                 (

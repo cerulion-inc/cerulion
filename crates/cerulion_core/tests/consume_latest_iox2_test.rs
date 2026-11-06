@@ -1,0 +1,696 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! `#[input(trigger, consume = latest)]`: a data-trigger input that fires the
+//! node at most once per scheduler step, on the NEWEST queued frame.
+//!
+//! The `fifo` default fires once per queued frame, in arrival order
+//! (`fifo_consume_iox2_test`). A `latest` input drains the queue at the
+//! step's read and serves the newest frame; the older frames in that drain
+//! are not served. A frame no fire has read yet is kept until a newer one
+//! arrives, so a deferred fire still reads it.
+//!
+//! Every oracle here is hand-written from those rules (never a self-compare),
+//! and each headline arm fails when the latest wiring is removed (the input
+//! then runs as `fifo` and observes the whole burst). The consumer reads via
+//! `try_view`, the read the `#[cerulion_node]` macro's generated tick uses, on
+//! both drain disciplines (Unified, and forced-Separate via the
+//! `CERULION_DRAIN_DISCIPLINE` seam), and once through a dlopen'd macro
+//! cdylib, where the declaration crosses the FFI as the info JSON's
+//! `"consume":"latest"` key.
+//!
+//! The composition matrix with `backpressure`:
+//!
+//! | backpressure | `consume = latest` |
+//! |---|---|
+//! | `drop_oldest` | evictions at the queue are counted; the read serves the newest survivor |
+//! | `block` | each fire's read empties the queue, so the producer is paced only when `depth` frames queue between two reads, as while a deferred fire spans `depth` publishes; superseded frames are not served |
+//! | `sample(N)` | the gate admits the drain's newest frame at most once per N ms; a decimated one is counted |
+//!
+//! `#[serial]`: the forced-Separate arms mutate the process-global
+//! `CERULION_DRAIN_DISCIPLINE` env.
+//!
+//! # Running
+//!
+//! ```bash
+//! cargo build -p test_node_macro_consume_latest_cdylib
+//! cargo nextest run -p cerulion_core --test consume_latest_iox2_test
+//! ```
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use cerulion_core::clock::VirtualClock;
+use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
+use cerulion_core::graph::node::{
+    BackpressurePolicy, ClosureNodeEntry, InputConsume, InputMeta, NodeEntry, NodeInfo,
+};
+use cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH;
+use cerulion_core::graph::GraphRuntime;
+use cerulion_core::prelude::*;
+use cerulion_core::MacroPolicy;
+use indexmap::IndexMap;
+use native_ros2_messages::geometry_msgs::Vector3;
+use serial_test::serial;
+
+/// RAII env guard (panic-safe removal) for the drain-discipline seam.
+struct EnvVarGuard(&'static str);
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        std::env::set_var(key, value);
+        Self(key)
+    }
+}
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
+const EXT: &str = "/latest/ext";
+
+/// The consumer's declaration.
+#[derive(Clone, Copy)]
+struct Consumer {
+    consume: InputConsume,
+    depth: usize,
+    backpressure: BackpressurePolicy,
+    throttle_ms: Option<u64>,
+}
+
+impl Consumer {
+    fn latest() -> Self {
+        Self {
+            consume: InputConsume::Latest,
+            depth: DEFAULT_CONSUMER_DEPTH,
+            backpressure: BackpressurePolicy::DropOldest,
+            throttle_ms: None,
+        }
+    }
+}
+
+/// A data-trigger closure consumer recording every `try_view`-observed value.
+fn consumer_entry(c: Consumer, seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
+    let mut info = NodeInfo::with_meta(
+        vec![InputMeta {
+            name: "inp".to_string(),
+            schema_hash: <Vector3 as ShmMessage>::SCHEMA_HASH,
+            trigger: true,
+            depth: c.depth,
+            backpressure: c.backpressure,
+            expect_within_ms: None,
+            consume: c.consume,
+        }],
+        vec![],
+    )
+    .with_policy(MacroPolicy::DataTrigger {
+        input_name: "inp".to_string(),
+    });
+    if let Some(ms) = c.throttle_ms {
+        info = info.with_throttle_ms(ms);
+    }
+    ClosureNodeEntry::new(info, move |ctx| {
+        if let Some(s) = ctx.subscriber_mut("inp") {
+            if let Ok(Some(v)) = s.try_view::<Vector3, _>(|view| view.x as u64) {
+                seen.lock().unwrap().push(v);
+            }
+        }
+        Ok(())
+    })
+    .with_label("latest_consumer")
+}
+
+fn sink_node(source: &str) -> NodeDef {
+    NodeDef {
+        fuse: None,
+        params: Default::default(),
+        ros2: None,
+        id: "sink".to_string(),
+        node_type: "latest_consumer".to_string(),
+        inputs: vec![InputDef {
+            name: "inp".to_string(),
+            source: source.to_string(),
+        }],
+        outputs: vec![],
+    }
+}
+
+fn graph(prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
+    GraphConfig {
+        name: None,
+        identity: "consume_latest".to_string(),
+        prefix: prefix.to_string(),
+        nodes,
+        multi_publisher_topics: Vec::new(),
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        level_assignments: None,
+        network: None,
+    }
+}
+
+/// A runtime with ONE consumer on the external source [`EXT`], plus that
+/// source's publisher.
+fn external_runtime(
+    prefix: &str,
+    c: Consumer,
+    seen: Arc<Mutex<Vec<u64>>>,
+) -> (
+    GraphRuntime,
+    cerulion_core::transport::publisher::CerulionPublisher,
+) {
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("sink".to_string(), Box::new(consumer_entry(c, seen)));
+    let clock = Arc::new(VirtualClock::new());
+    let runtime =
+        GraphRuntime::build_for_test(graph(prefix, vec![sink_node(EXT)]), factories, clock, 16)
+            .expect("build latest graph");
+    let mgr = runtime.test_transport().expect("test transport parked");
+    let ext = mgr
+        .create_publisher(EXT, MaxSliceLen::const_new(64), 0)
+        .expect("external publisher attaches");
+    (runtime, ext)
+}
+
+fn publish_all(
+    p: &mut cerulion_core::transport::publisher::CerulionPublisher,
+    values: impl IntoIterator<Item = u64>,
+) {
+    for v in values {
+        let mut proxy = p.loan_proxy::<Vector3>().expect("loan");
+        proxy.x = v as f64;
+        drop(proxy);
+    }
+}
+
+fn fires(runtime: &GraphRuntime) -> u64 {
+    runtime.node_handle("sink").unwrap().fire_count()
+}
+
+/// Bursts per step, then `idle` empty steps; returns (observed, fire count).
+fn run_bursts(prefix: &str, c: Consumer, bursts: &[&[u64]], idle: u32) -> (Vec<u64>, u64) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, mut ext) = external_runtime(prefix, c, Arc::clone(&seen));
+    for burst in bursts {
+        publish_all(&mut ext, burst.iter().copied());
+        runtime.step(Duration::from_millis(1));
+    }
+    for _ in 0..idle {
+        runtime.step(Duration::from_millis(1));
+    }
+    let observed = seen.lock().unwrap().clone();
+    let n = fires(&runtime);
+    (observed, n)
+}
+
+/// HEADLINE: a burst of 5 queued before one step is ONE fire reading the
+/// newest frame. Idle steps after it fire nothing. As `fifo` (the latest
+/// wiring removed) the same run observes `[1, 2, 3, 4, 5]` in 5 fires.
+#[test]
+#[serial]
+fn a_burst_is_one_fire_on_the_newest_frame() {
+    let (observed, n) = run_bursts("latburst", Consumer::latest(), &[&[1, 2, 3, 4, 5]], 6);
+    assert_eq!(
+        observed,
+        vec![5],
+        "one fire, on the newest frame of the burst"
+    );
+    assert_eq!(n, 1, "exactly one fire: the idle steps owe nothing");
+}
+
+/// A latest node carries no between-fires refill hook: a refill would fire
+/// it a second time in one step on a frame that arrived during its tick. The
+/// unified `fifo` control carries one.
+#[test]
+#[serial]
+fn a_latest_node_gets_no_refill_hook_and_the_fifo_control_does() {
+    for (consume, want) in [(InputConsume::Latest, false), (InputConsume::Fifo, true)] {
+        let c = Consumer {
+            consume,
+            ..Consumer::latest()
+        };
+        let (runtime, _ext) = external_runtime("latrefill", c, Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(
+            runtime.has_trigger_refill_for_test("sink"),
+            Some(want),
+            "{consume:?}"
+        );
+    }
+}
+
+/// The `fifo` control in the same harness: the declaration is the only
+/// difference, and it is what decides between the two oracles.
+#[test]
+#[serial]
+fn the_fifo_control_serves_the_same_burst_per_message() {
+    let c = Consumer {
+        consume: InputConsume::Fifo,
+        ..Consumer::latest()
+    };
+    let (observed, n) = run_bursts("latfifo", c, &[&[1, 2, 3, 4, 5]], 6);
+    assert_eq!(observed, vec![1, 2, 3, 4, 5]);
+    assert_eq!(n, 5);
+}
+
+/// One fire per step that saw data, each on that step's newest frame; a step
+/// with nothing queued does not fire.
+#[test]
+#[serial]
+fn each_step_fires_once_on_its_own_newest_frame() {
+    let (observed, n) = run_bursts(
+        "latsteps",
+        Consumer::latest(),
+        &[&[1, 2, 3], &[], &[4, 5], &[6]],
+        3,
+    );
+    assert_eq!(observed, vec![3, 5, 6]);
+    assert_eq!(n, 3, "the empty step and the idle tail fire nothing");
+}
+
+/// The forced-Separate discipline gives the SAME observation. There the
+/// trigger subscriber signals one arrival per queued frame, so this arm is
+/// what pins the scheduler's collapse of those arrivals to one fire.
+#[test]
+#[serial]
+fn forced_separate_discipline_gives_the_same_observation() {
+    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+    let (observed, n) = run_bursts(
+        "latsep",
+        Consumer::latest(),
+        &[&[1, 2, 3, 4, 5], &[], &[6, 7]],
+        4,
+    );
+    assert_eq!(observed, vec![5, 7]);
+    assert_eq!(
+        n, 2,
+        "the per-arrival signals collapse to one fire per step"
+    );
+}
+
+/// Two runs of one schedule observe the same sequence, equal to the oracle.
+#[test]
+#[serial]
+fn latest_delivery_is_deterministic_across_runs() {
+    let bursts: &[&[u64]] = &[&[1, 2], &[3], &[], &[4, 5, 6]];
+    let a = run_bursts("latdeta", Consumer::latest(), bursts, 2);
+    let b = run_bursts("latdetb", Consumer::latest(), bursts, 2);
+    assert_eq!(a, (vec![2, 3, 6], 3));
+    assert_eq!(a, b);
+}
+
+/// The live loop's step serves a queued burst the same way: one fire, newest
+/// frame.
+#[test]
+#[serial]
+fn a_live_step_serves_the_newest_frame_once() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, mut ext) = external_runtime("latlive", Consumer::latest(), Arc::clone(&seen));
+    // Warm-up: one frame + one live step establishes the connection.
+    publish_all(&mut ext, [100]);
+    runtime.run_live_step_once_for_test(Duration::from_millis(200));
+    assert_eq!(*seen.lock().unwrap(), vec![100]);
+
+    publish_all(&mut ext, [1, 2, 3, 4, 5]);
+    runtime.run_live_step_once_for_test(Duration::from_millis(200));
+    assert_eq!(*seen.lock().unwrap(), vec![100, 5]);
+    assert_eq!(fires(&runtime), 2);
+}
+
+/// A DEFERRED fire reads the frame it was deferred on when nothing newer
+/// arrives. With `throttle_ms = 5`, frame 2 arrives inside the window: the
+/// step drains it and defers the fire, and the steps after it find the queue
+/// empty. The read keeps frame 2 instead of dropping it, so the fire at the
+/// end of the window serves it.
+#[test]
+#[serial]
+fn a_deferred_fire_still_reads_the_frame_it_was_deferred_on() {
+    let c = Consumer {
+        throttle_ms: Some(5),
+        ..Consumer::latest()
+    };
+    let (observed, n) = run_bursts("latdefer", c, &[&[1], &[2]], 8);
+    assert_eq!(observed, vec![1, 2]);
+    assert_eq!(n, 2);
+}
+
+/// ...and a NEWER frame arriving during the defer supersedes the held one:
+/// the fire at the end of the window reads frame 4, not 2.
+#[test]
+#[serial]
+fn a_newer_frame_during_a_defer_supersedes_the_held_one() {
+    let c = Consumer {
+        throttle_ms: Some(5),
+        ..Consumer::latest()
+    };
+    let (observed, n) = run_bursts("latsuper", c, &[&[1], &[2], &[3], &[4]], 8);
+    assert_eq!(observed, vec![1, 4]);
+    assert_eq!(n, 2);
+}
+
+/// Two newer frames queued behind a held frame. The boundary drain keeps
+/// the held frame borrowed while it receives both, three samples borrowed on
+/// one connection, one above the iceoryx2 default, so the latest trigger's
+/// source topic is created with that headroom. Without it the drain fails
+/// with `ExceedsMaxBorrows` on every other deferred boundary (a failed drain
+/// leaves no held frame for the next one), and a fire landing on a failed
+/// boundary reads an error instead of a frame. The two schedules differ by
+/// one step, so whichever step the throttle releases on, one of them puts a
+/// failing boundary there.
+#[test]
+#[serial]
+fn two_newer_frames_behind_a_held_one_drain_without_a_failed_read() {
+    let c = Consumer {
+        throttle_ms: Some(5),
+        ..Consumer::latest()
+    };
+    for (prefix, lead) in [("lattwoa", 0u64), ("lattwob", 1)] {
+        let mut bursts: Vec<Vec<u64>> = vec![vec![1], vec![2]];
+        bursts.extend((0..lead).map(|_| Vec::new()));
+        bursts.extend((0..8u64).map(|k| vec![3 + 2 * k, 4 + 2 * k]));
+        let refs: Vec<&[u64]> = bursts.iter().map(Vec::as_slice).collect();
+        let (observed, n) = run_bursts(prefix, c, &refs, 12);
+        assert!(
+            n >= 3,
+            "{prefix}: the throttle releases more than once: {n} fires"
+        );
+        assert_eq!(
+            observed.len() as u64,
+            n,
+            "{prefix}: every fire reads a frame, none an error: {observed:?} over {n} fires"
+        );
+        assert_eq!(observed.first(), Some(&1), "{prefix}: {observed:?}");
+        assert_eq!(
+            observed.last(),
+            Some(&18),
+            "{prefix}: the newest frame is read last: {observed:?}"
+        );
+        assert!(
+            observed.windows(2).all(|w| w[0] < w[1]),
+            "{prefix}: reads only move forward: {observed:?}"
+        );
+    }
+}
+
+/// `drop_oldest` composition: a burst of 8 into a depth-4 queue evicts the
+/// oldest 4 at the queue, counted, and the read serves the newest survivor.
+#[test]
+#[serial]
+fn drop_oldest_counts_the_evictions_and_serves_the_newest() {
+    let c = Consumer {
+        depth: 4,
+        ..Consumer::latest()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, mut ext) = external_runtime("latevict", c, Arc::clone(&seen));
+    // The stream's first frame establishes the eviction baseline (uncounted).
+    publish_all(&mut ext, [100]);
+    runtime.step(Duration::from_millis(1));
+    publish_all(&mut ext, [1, 2, 3, 4, 5, 6, 7, 8]);
+    for _ in 0..4 {
+        runtime.step(Duration::from_millis(1));
+    }
+    assert_eq!(*seen.lock().unwrap(), vec![100, 8]);
+    assert_eq!(
+        runtime
+            .node_handle("sink")
+            .unwrap()
+            .backpressure_drop_oldest_count("inp"),
+        4,
+        "the 4 frames evicted at the queue are counted; the 3 the read \
+         superseded are not evictions"
+    );
+}
+
+/// `sample(N)` composition: frames 1..3 share a stamp, so the drain's newest
+/// (3) is the one the gate sees, and it is the first, so it is admitted. Frame
+/// 4, 6 ms later, is admitted; frame 5, 1 ms after 4, is decimated, counted.
+#[test]
+#[serial]
+fn sample_gates_the_newest_frame_of_each_drain() {
+    let c = Consumer {
+        backpressure: BackpressurePolicy::Sample(5),
+        ..Consumer::latest()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, mut ext) = external_runtime("latsamp", c, Arc::clone(&seen));
+    publish_all(&mut ext, [1, 2, 3]);
+    for _ in 0..6 {
+        runtime.step(Duration::from_millis(1));
+    }
+    publish_all(&mut ext, [4]);
+    runtime.step(Duration::from_millis(1));
+    publish_all(&mut ext, [5]);
+    for _ in 0..2 {
+        runtime.step(Duration::from_millis(1));
+    }
+    assert_eq!(*seen.lock().unwrap(), vec![3, 4]);
+    assert_eq!(
+        runtime
+            .node_handle("sink")
+            .unwrap()
+            .backpressure_sampled_count("inp"),
+        1,
+        "frame 5 is decimated and counted"
+    );
+}
+
+/// A `period_ms = 1` producer publishing its fire count into a depth-4
+/// `block` edge, read by a `consume = latest` consumer throttled to one fire
+/// per `throttle_ms`. Returns (observed, the sink's block defers, frames
+/// published) after 30 steps.
+fn run_block(prefix: &str, throttle_ms: u64) -> (Vec<u64>, u64, u64) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let counter = Arc::new(AtomicU64::new(0));
+    let counter_c = Arc::clone(&counter);
+    let producer_info = NodeInfo::from_names(vec![], vec!["out".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 1 });
+    let producer = ClosureNodeEntry::new(producer_info, move |ctx| {
+        let v = counter_c.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(p) = ctx.publisher_mut("out") {
+            let mut proxy = p.loan_proxy::<Vector3>()?;
+            proxy.x = v as f64;
+        }
+        Ok(())
+    })
+    .with_label("latest_block_producer");
+    let c = Consumer {
+        depth: 4,
+        backpressure: BackpressurePolicy::Block,
+        throttle_ms: Some(throttle_ms),
+        ..Consumer::latest()
+    };
+    let producer_node = NodeDef {
+        fuse: None,
+        params: Default::default(),
+        ros2: None,
+        id: "producer".to_string(),
+        node_type: "latest_block_producer".to_string(),
+        inputs: vec![],
+        outputs: vec![OutputDef {
+            name: "out".to_string(),
+            schema: "Vector3".to_string(),
+            max_slice_len: None,
+            topic: None,
+            history_size: 0,
+        }],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("producer".to_string(), Box::new(producer));
+    factories.insert(
+        "sink".to_string(),
+        Box::new(consumer_entry(c, Arc::clone(&seen))),
+    );
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test(
+        graph(prefix, vec![producer_node, sink_node("producer/out")]),
+        factories,
+        clock,
+        16,
+    )
+    .expect("build block graph");
+    for _ in 0..30 {
+        runtime.step(Duration::from_millis(1));
+    }
+    let observed = seen.lock().unwrap().clone();
+    let deferred = runtime
+        .node_handle("sink")
+        .unwrap()
+        .backpressure_block_fires_deferred_count("inp");
+    let published = counter.load(Ordering::Relaxed);
+    (observed, deferred, published)
+}
+
+/// `block` composition, a consumer that keeps up with the queue: throttled
+/// to one fire per 3 ms against a depth of 4, each fire drains the 3 frames
+/// queued since the last one, so the queue never fills and the producer is
+/// never paced. Each fire reads the newest frame: 1, then every third.
+#[test]
+#[serial]
+fn block_with_latest_serves_the_newest_and_paces_nothing_while_the_queue_fits() {
+    let (observed, deferred, published) = run_block("latblock", 3);
+    let expected: Vec<u64> = (0..observed.len() as u64).map(|k| 1 + 3 * k).collect();
+    assert!(observed.len() >= 9, "a real stream: {observed:?}");
+    assert_eq!(observed, expected);
+    assert_eq!(
+        deferred, 0,
+        "the queue never fills, so the block gate never defers"
+    );
+    assert_eq!(published, 30, "one publish per step");
+}
+
+/// `block` composition, a deferred fire spanning `depth` publishes: throttled
+/// to one fire per 6 ms against a depth of 4, the queue fills four steps
+/// after a fire and the block gate holds the producer until the next fire
+/// drains it. Each fire reads the newest frame, which is the fourth published
+/// since the last fire: 1, 5, 9, ...
+#[test]
+#[serial]
+fn block_with_latest_paces_the_producer_while_a_deferred_fire_spans_the_depth() {
+    let (observed, deferred, published) = run_block("latblockp", 6);
+    let expected: Vec<u64> = (0..observed.len() as u64).map(|k| 1 + 4 * k).collect();
+    assert!(observed.len() >= 4, "a real stream: {observed:?}");
+    assert_eq!(observed, expected);
+    assert!(deferred > 0, "the full queue defers the producer");
+    assert!(
+        published < 30,
+        "the producer was paced: {published} publishes"
+    );
+}
+
+/// Through a dlopen'd `#[cerulion_node]` cdylib: `consume = latest` reaches
+/// the host only as the info JSON's `"consume":"latest"` key. The node mirrors
+/// its trigger input to `cmd`, so the `cmd` stream is the observation record:
+/// one frame, the newest. Without the key the fixture forwards all five.
+#[test]
+#[serial]
+fn a_cdylib_declaring_latest_forwards_only_the_newest_frame() {
+    use cerulion_core::graph::node::DylibNodeEntry;
+
+    const IN_TOPIC: &str = "/latdyl/in";
+    let entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
+        "test_node_macro_consume_latest_cdylib",
+    ))
+    .expect("load consume-latest fixture cdylib");
+    let meta = entry.info().expect("fixture info").input_meta().to_vec();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(
+        meta[0].consume,
+        InputConsume::Latest,
+        "the key crossed the FFI"
+    );
+
+    let node = NodeDef {
+        fuse: None,
+        params: Default::default(),
+        ros2: None,
+        id: "node".to_string(),
+        node_type: "consume_latest_node".to_string(),
+        inputs: vec![InputDef {
+            name: "trigger_in".to_string(),
+            source: IN_TOPIC.to_string(),
+        }],
+        outputs: vec![OutputDef {
+            name: "cmd".to_string(),
+            schema: "Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: None,
+        }],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("node".to_string(), Box::new(entry));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime =
+        GraphRuntime::build_for_test(graph("latdyl", vec![node]), factories, clock, 16)
+            .expect("build cdylib graph");
+    let mgr = runtime.test_transport().expect("test transport parked");
+    let mut ext = mgr
+        .create_publisher(IN_TOPIC, MaxSliceLen::const_new(64), 0)
+        .expect("external publisher attaches");
+    let cmd_sub = mgr
+        .create_subscriber_open_only("/latdyl/node/cmd")
+        .expect("open the cdylib's cmd topic");
+
+    publish_all(&mut ext, [1, 2, 3, 4, 5]);
+    for _ in 0..4 {
+        runtime.step(Duration::from_millis(1));
+    }
+    publish_all(&mut ext, [6, 7]);
+    for _ in 0..4 {
+        runtime.step(Duration::from_millis(1));
+    }
+
+    let mut forwarded: Vec<u64> = Vec::new();
+    cmd_sub
+        .try_receive(|msg| {
+            let x = f64::from_le_bytes(msg.payload()[0..8].try_into().unwrap());
+            forwarded.push(x as u64);
+        })
+        .expect("drain cmd stream");
+    assert_eq!(forwarded, vec![5, 7]);
+}
+
+/// The subscriber's own state machine, driven by hand on a drain-to-latest
+/// subscriber (the mode a `consume = latest` trigger input is wired in):
+///
+/// * a boundary drain pops the whole queue and freezes the newest frame;
+/// * a REFILL with that frame still unread pops nothing, even with newer
+///   frames queued behind it, because it asks whether the fire just run took
+///   the head;
+/// * a boundary with the frame unread and nothing newer re-offers it;
+/// * a boundary with the frame unread and a newer frame queued replaces it;
+/// * the tick's read serves whatever is frozen.
+#[test]
+#[serial]
+fn the_latest_drain_holds_an_unread_frame_and_never_refills_past_it() {
+    use cerulion_core::transport::{TransportConfig, TransportManager};
+
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "latest_slot".into(),
+            clock: Arc::new(cerulion_core::clock::RealClock),
+            subscriber_buffer_size: 8,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = "latest_slot";
+    let mut publisher = mgr
+        .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("publisher");
+    let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+    let mut send = |x: u64| {
+        let mut p = publisher.loan_proxy::<Vector3>().expect("loan");
+        p.x = x as f64;
+    };
+    let read = |sub: &mut cerulion_core::transport::subscriber::CerulionSubscriber| {
+        sub.try_view::<Vector3, _>(|v| v.x as u64).expect("read")
+    };
+
+    send(1);
+    send(2);
+    send(3);
+    let (popped, ts) = sub.snapshot_latest_for_trigger();
+    assert_eq!(popped, 3, "the boundary drain pops the whole queue");
+    assert!(ts.is_some());
+
+    send(4);
+    assert_eq!(
+        sub.refill_for_trigger(),
+        (0, None),
+        "a refill never pops past an unread frame"
+    );
+
+    let (popped, _) = sub.snapshot_latest_for_trigger();
+    assert_eq!(popped, 1, "frame 4 replaces the unread frame 3");
+    let (popped, ts) = sub.snapshot_latest_for_trigger();
+    assert_eq!(popped, 1, "nothing newer: the unread frame 4 is re-offered");
+    assert!(ts.is_some());
+    assert_eq!(read(&mut sub), Some(4), "the tick reads the newest frame");
+
+    assert_eq!(
+        sub.snapshot_latest_for_trigger(),
+        (0, None),
+        "a read frame is not re-offered"
+    );
+}
