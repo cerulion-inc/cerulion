@@ -2606,9 +2606,12 @@ impl Numberer {
 ///   run, so a consumer nothing wakes fails here instead of reading its frames
 ///   late;
 /// - on macOS with the os_sync doorbell tier, the consumer kernel-blocks on its
-///   doorbell wake word and at least one of the producer's rings issued a wake
-///   syscall that found it blocked there, so a ring ends a block before the
-///   block's own cap;
+///   doorbell wake word. That a ring ends such a block before the block's own
+///   cap is held by `a_ring_wakes_a_kernel_blocked_consumer_well_inside_the_cap`
+///   in `doorbell.rs`, which hands the ring over only once the consumer holds
+///   the parked gate and retries a ring that missed the block; here the
+///   producer's ring counts are printed, not asserted, because a ring that
+///   lands between two blocks finds nobody without anything being wrong;
 /// - on a host without a CPU monitor-wait primitive every park slice sleeps (a
 ///   kernel block on the doorbell wake word or a timed nap) and the loop bottom
 ///   calls `std::thread::yield_now()` zero times. A yield after a slice that
@@ -2880,13 +2883,6 @@ fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() 
             "on the os_sync doorbell tier the consumer's park must kernel-block on its \
              doorbell wake word (got {} blocks)",
             c.wake_word_blocks
-        );
-        assert!(
-            issued > found_nobody,
-            "at least one of the producer's {total} rings must issue a wake syscall that \
-             finds the consumer blocked on its wake word ({issued} wake syscalls, \
-             {found_nobody} found nobody): otherwise every block ran to its cap and the \
-             consumer saw its frames at its next poll"
         );
     }
     if cerulion_core::monitor_wait::monitor_wait_available() {
