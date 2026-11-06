@@ -2612,6 +2612,8 @@ impl Numberer {
 ///   the parked gate and retries a ring that missed the block; here the
 ///   producer's ring counts are printed, not asserted, because a ring that
 ///   lands between two blocks finds nobody without anything being wrong;
+/// - on Linux and Android without a CPU monitor-wait primitive, the consumer
+///   kernel-blocks on its doorbell wake word, a shared futex, between frames;
 /// - on a host without a CPU monitor-wait primitive every park slice sleeps (a
 ///   kernel block on the doorbell wake word or a timed nap) and the loop bottom
 ///   calls `std::thread::yield_now()` zero times. A yield after a slice that
@@ -2883,6 +2885,16 @@ fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() 
             "on the os_sync doorbell tier the consumer's park must kernel-block on its \
              doorbell wake word (got {} blocks)",
             c.wake_word_blocks
+        );
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if !cerulion_core::monitor_wait::monitor_wait_available() {
+        assert!(
+            c.wake_word_blocks > 0,
+            "without a CPU monitor-wait primitive the consumer must kernel-block on the \
+             doorbell wake word between frames, not pace its recheck nap (0 wake-word \
+             blocks over {} completed slices)",
+            c.slices
         );
     }
     if cerulion_core::monitor_wait::monitor_wait_available() {

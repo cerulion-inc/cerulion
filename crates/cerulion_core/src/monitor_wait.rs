@@ -217,7 +217,25 @@ unsafe fn waitpkg_enumerated() -> bool {
     (core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 5)) != 0
 }
 
+/// Hidden measurement knob `CERULION_MONITOR_WAIT_PRIMITIVE`: `0` resolves the
+/// backend to `Unavailable`, so a host whose CPU carries WAITPKG or WFE parks on
+/// the tier a host without one parks on (the bounded sleep-recheck nap, and the
+/// doorbell's kernel wake word where the target has one). Read once, with the
+/// backend; unset or any other value leaves the CPU probe in charge.
+fn primitive_disabled_by_env() -> bool {
+    primitive_disabled_from(std::env::var("CERULION_MONITOR_WAIT_PRIMITIVE").ok().as_deref())
+}
+
+/// The pure rule of [`primitive_disabled_by_env`] over an injected value: only
+/// an exact `0` disables the primitive.
+fn primitive_disabled_from(raw: Option<&str>) -> bool {
+    raw == Some("0")
+}
+
 fn resolve_backend() -> MonitorWaitBackend {
+    if primitive_disabled_by_env() {
+        return MonitorWaitBackend::Unavailable;
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         // SAFETY: `waitpkg_enumerated` only does a baseline CPUID read (see its
@@ -1194,6 +1212,16 @@ mod tests {
             "a park slice must be short enough that a co-located peer runs \
              well inside 100 µs (two-to-five slices per same-core hop)"
         );
+    }
+
+    #[test]
+    fn only_an_exact_zero_disables_the_primitive() {
+        assert!(primitive_disabled_from(Some("0")));
+        assert!(!primitive_disabled_from(None));
+        assert!(!primitive_disabled_from(Some("")));
+        assert!(!primitive_disabled_from(Some("1")));
+        assert!(!primitive_disabled_from(Some("off")));
+        assert!(!primitive_disabled_from(Some(" 0")));
     }
 
     #[test]
