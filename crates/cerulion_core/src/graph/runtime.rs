@@ -2180,10 +2180,11 @@ fn park_poll_fd_ready(raw: std::os::unix::io::RawFd) -> bool {
 /// - no line is ARMED: no declared topic of this runtime is writable from
 ///   outside it, which an empty registry also gives (see [`rung_topics`]).
 ///
-/// Pure and compiled unconditionally: the rung itself is macOS-only, so a term
-/// deleted here would otherwise be invisible to every test on every other
-/// target, and the worker's wait-policy line reads the same function on every
-/// target rather than re-typing a subset of it.
+/// Pure and compiled unconditionally: the rung itself is compiled only on macOS,
+/// Linux and Android, and reached on Linux only without a CPU monitor-wait
+/// primitive, so a term deleted here would otherwise be invisible to every test
+/// on a host that never reaches it, and the worker's wait-policy line reads the
+/// same function on every target rather than re-typing a subset of it.
 fn doorbell_rung_applies(
     policy_doorbell: bool,
     wake_word_available: bool,
@@ -3518,10 +3519,10 @@ pub struct GraphRuntime {
     /// Count of `!performed`-arm iterations that took a WAKE-WORD kernel block
     /// instead of the pacing sleep, summed over the three rungs the arm tries
     /// in order: the credit word (`CreditShared::park_wait_credit`), the
-    /// barrier (`BarrierShared::park_wait_activity`) and, on macOS, the primary
-    /// doorbell (`Doorbell::park_wait_ring`). The mutation seam pinning that
-    /// those kernel wakes are LIVE (reverting an arm swap zeroes this while
-    /// every pin stays green, isolating the regression).
+    /// barrier (`BarrierShared::park_wait_activity`) and, on macOS, Linux and
+    /// Android, the primary doorbell (`Doorbell::park_wait_ring`). The mutation
+    /// seam pinning that those kernel wakes are LIVE (reverting an arm swap
+    /// zeroes this while every pin stays green, isolating the regression).
     /// Record-only (never read by the scheduler); 0 where no rung applies: no
     /// credit edge at its threshold, no barrier participant, no doorbell
     /// registry, a slot beyond a parked bitmask, or no wake primitive on this
@@ -7192,9 +7193,10 @@ impl GraphRuntime {
                 // subscribes are all consumers this build never hears about, and a
                 // gate keyed to the plan leaves each of them waiting out its
                 // recheck period on every hop. What arming costs a publish whose
-                // page nobody blocks on is one atomic on the ring counter and one
-                // cached backend read; the kernel wake itself stays behind the
-                // page's `parked` claim, so a topic with no blocked consumer
+                // page nobody blocks on is one atomic on the ring counter, plus one
+                // load of the page's `parked` count on Linux and Android and one
+                // cached backend read on macOS; the kernel wake itself stays behind
+                // the page's `parked` claim, so a topic with no blocked consumer
                 // reaches no syscall.
                 //
                 // `sibling_consumed_topics` is no longer the gate. It is still the
@@ -14611,7 +14613,7 @@ impl GraphRuntime {
         // surface the same fact here where the live loop actually decides how to
         // idle (the observability gap an earlier investigation fell into).
         //
-        // `data_wake` is the macOS doorbell rung's own gate, read through the
+        // `data_wake` is the doorbell wake-word rung's own gate, read through the
         // function the rung reads, so the line cannot claim a rung that would
         // decline (a registry built for a graph with no data-trigger topics is
         // present but EMPTY, which `doorbell` alone does not show, hence
@@ -19477,10 +19479,9 @@ mod tests {
     }
 
     /// The park's topic ordering and armed line, over injected facts, pinned on
-    /// every OS: the selection decides whether a kernel wake arms at all, and on
-    /// a target where the macOS rung is compiled out the Linux hardware park
-    /// reads the same first topic, so a defect here is invisible to any
-    /// single-target test.
+    /// every OS: the selection decides whether a kernel wake arms at all, and the
+    /// Linux hardware park reads the same first topic as the wake-word rung, so
+    /// a defect here is invisible to any single-target test.
     #[test]
     fn rung_topics_arms_the_first_writable_from_outside_and_drops_nothing() {
         let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

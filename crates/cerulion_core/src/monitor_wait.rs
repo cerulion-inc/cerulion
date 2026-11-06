@@ -173,26 +173,21 @@ enum MonitorWaitBackend {
     )]
     ArmWfeEventStream,
     /// No real primitive — the caller falls back to the blocking WaitSet wait.
-    /// Constructed on `linux + x86_64` without WAITPKG (the CPUID-clear else) and
-    /// on every NON-Linux / other-arch target (the `not(any(...))` arm). It is
-    /// NOT constructed on `linux + aarch64` — there `resolve_backend`
-    /// unconditionally returns `ArmWfeEventStream` — so it needs a per-variant
-    /// dead-code allow for EXACTLY that one cell (mirroring the other two
-    /// variants' per-target allows). Without it, `dead_code = deny` hard-fails
-    /// the whole-crate build on `aarch64-unknown-linux-gnu` — the Jetson/Orin
-    /// robotics target, and the one cfg cell neither aarch64-macOS (which
-    /// constructs via `not(any)`) nor x86_64-linux (which constructs via
-    /// the else) nor CI (ubuntu-x86 + macos-aarch64) ever compiles.
-    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
+    /// Constructed on every target by `CERULION_MONITOR_WAIT_PRIMITIVE=0`, on
+    /// `linux + x86_64` without WAITPKG (the CPUID-clear else) and on every
+    /// NON-Linux / other-arch target (the `not(any(...))` arm). On
+    /// `linux + aarch64` the knob is the only route to it, which is why it needs
+    /// no per-target dead-code allow there.
     Unavailable,
 }
 
 /// Resolve the backend for THIS target (uncached — `current_backend` caches it).
 ///
 /// `linux + x86_64`: probe CPUID leaf 7 sub-leaf 0, ECX bit 5 (WAITPKG); set
-/// ⇒ `WaitpkgUmwait`, else `Unavailable`. `linux + aarch64`: always
+/// ⇒ `WaitpkgUmwait`, else `Unavailable`. `linux + aarch64`:
 /// `ArmWfeEventStream` (the `WFE` + event-stream idiom is ARMv8 baseline).
-/// Every other target ⇒ `Unavailable`.
+/// Every other target ⇒ `Unavailable`. On every target
+/// `CERULION_MONITOR_WAIT_PRIMITIVE=0` resolves `Unavailable` before the probe.
 ///
 /// **WAITPKG on virtualized x86:** selection is
 /// purely the CPUID WAITPKG bit; some hypervisors enumerate WAITPKG yet trap

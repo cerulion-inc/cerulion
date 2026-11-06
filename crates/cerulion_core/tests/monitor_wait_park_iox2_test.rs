@@ -701,9 +701,11 @@ fn mixed_rank_graph(
 /// runtime's own resolved state, the one site the wait policy line also reads,
 /// never from that line's text.
 ///
-/// The data-wake term below is host-gated: off macOS it is false for every graph,
-/// so what carries this arm there is the armed-topic assertion and the registry
-/// assertion beside it, rather than the rung's own verdict.
+/// The data-wake term below is host-gated: it is false for every graph on a host
+/// with no doorbell wake word (macOS before 14.4 or with the os_sync tier off, and
+/// targets other than Linux, Android and macOS), so what carries this arm there
+/// is the armed-topic assertion and the registry assertion beside it, rather
+/// than the rung's own verdict.
 #[test]
 #[serial]
 fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
@@ -1204,10 +1206,12 @@ fn a_multi_publisher_topic_this_runtime_also_writes_is_armable() {
 /// alone. Zero on its own would not say much: it is also what a host with no wake
 /// word and a removed rung produce. So the same drive runs twice, once on the
 /// chain and once on a graph whose trigger has a writer that is not a node of
-/// this runtime and really rings, and the chain's zero is read against that graph's nonzero. The pair is
-/// macOS-only: off macOS there is no rung to judge and only the park-entry
-/// premise runs. On macOS it is skipped, with a recorded reason, where the host
-/// carries no usable os_sync backend.
+/// this runtime and really rings, and the chain's zero is read against that graph's nonzero. The pair
+/// runs where the park reaches the rung: on Linux and Android without a CPU
+/// monitor-wait primitive, and on macOS with a usable os_sync backend. Elsewhere
+/// it is skipped with a recorded reason (a hardware park performs every slice,
+/// so the rung is never reached), and on targets with no wake word only the
+/// park-entry premise runs.
 #[test]
 #[serial]
 fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
@@ -1231,16 +1235,19 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
         "the parked live drive must route its idle through the park, or the \
          counter below is zero for the wrong reason"
     );
-    #[cfg(target_os = "macos")]
-    if !cerulion_core::doorbell::wake_word_block_primitive_available() {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    if !cerulion_core::doorbell::wake_word_block_primitive_available()
+        || cerulion_core::monitor_wait::monitor_wait_available()
+    {
         eprintln!(
-            "SKIP: no usable os_sync backend on this host, so a zero block count \
-             says nothing about the producer term"
+            "SKIP: this park never reaches the doorbell rung on this host (no wake \
+             word, or a CPU monitor-wait primitive performs every slice), so a zero \
+             block count says nothing about the producer term"
         );
         runtime.shutdown();
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     assert_eq!(
         runtime.park_wake_word_block_count_for_test(),
         0,
@@ -1254,7 +1261,7 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
     // by a thread that is not a node of this runtime, with that thread ringing.
     // Its nonzero count is what makes the zero above a decision rather than an
     // absent capability.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     {
         let ns = mwp_ns("chainctl");
         let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
@@ -1521,34 +1528,40 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
         0,
         "rings carry no data — the wake is record-only and must not fire the consumer"
     );
-    // On macOS the park has no CPU monitor-wait primitive, so its idle is a
-    // KERNEL BLOCK on the doorbell's wake word rather than a pacing nap. This
-    // graph carries no barrier participant and no credit edge, so the shared
-    // wake-word block counter is attributable to the doorbell rung alone, which
-    // makes it the seam that fails if that rung is removed or the macOS ring
-    // goes back to being a no-op stub.
+    // Without a CPU monitor-wait primitive (macOS always; Linux and Android
+    // hosts without WAITPKG or WFE) the park's idle is a KERNEL BLOCK on the
+    // doorbell's wake word rather than a pacing nap. This graph carries no
+    // barrier participant and no credit edge, so the shared wake-word block
+    // counter is attributable to the doorbell rung alone, which makes it the seam
+    // that fails if that rung is removed or the ring goes back to bumping only
+    // its counter.
     //
-    // Asserted in BOTH directions against the host fact the rung is gated on,
-    // so a host without the Apple os_sync family (macOS before 14.4, or
-    // CERULION_DOORBELL_OS_SYNC=0 in the invoking shell) is a judged arm rather
-    // than a skipped one: the counter must then be exactly 0, which is what a
-    // rung that ignored its own gate would fail.
-    #[cfg(target_os = "macos")]
+    // Asserted in BOTH directions against the host facts the rung is gated on,
+    // so a host whose park never reaches the rung (macOS before 14.4 or
+    // CERULION_DOORBELL_OS_SYNC=0; a CPU that carries the primitive, whose
+    // hardware park performs every slice) is a judged arm rather than a skipped
+    // one: the counter must then be exactly 0, which is what a rung that ignored
+    // its own gate would fail.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     {
         let blocks = runtime.park_wake_word_block_count_for_test();
-        if cerulion_core::doorbell::wake_word_block_primitive_available() {
+        if cerulion_core::doorbell::wake_word_block_primitive_available()
+            && !cerulion_core::monitor_wait::monitor_wait_available()
+        {
             assert!(
                 blocks > 0,
-                "the macOS park must KERNEL-BLOCK on the doorbell wake word, not \
-                 pace on its recheck nap - no barrier and no credit edge exist \
-                 here, so this counter can only have come from the doorbell rung"
+                "a park without a CPU monitor-wait primitive must KERNEL-BLOCK on the \
+                 doorbell wake word, not pace on its recheck nap - no barrier and no \
+                 credit edge exist here, so this counter can only have come from the \
+                 doorbell rung"
             );
         } else {
             assert_eq!(
                 blocks, 0,
-                "with no wake word on this host the doorbell rung must not run \
-                 at all, and no sibling rung exists in this graph to bump the \
-                 shared counter"
+                "a park that never reaches the doorbell rung on this host (no wake \
+                 word, or a hardware park performing every slice) must take no \
+                 wake-word block, and no sibling rung exists in this graph to bump \
+                 the shared counter"
             );
         }
     }
@@ -2605,15 +2618,21 @@ impl Numberer {
 ///   none ends on its park timeout, which is longer than the producer's whole
 ///   run, so a consumer nothing wakes fails here instead of reading its frames
 ///   late;
-/// - on macOS with the os_sync doorbell tier, the consumer kernel-blocks on its
-///   doorbell wake word. That a ring ends such a block before the block's own
-///   cap is held by `a_ring_wakes_a_kernel_blocked_consumer_well_inside_the_cap`
-///   in `doorbell.rs`, which hands the ring over only once the consumer holds
-///   the parked gate and retries a ring that missed the block; here the
-///   producer's ring counts are printed, not asserted, because a ring that
-///   lands between two blocks finds nobody without anything being wrong;
-/// - on Linux and Android without a CPU monitor-wait primitive, the consumer
-///   kernel-blocks on its doorbell wake word, a shared futex, between frames;
+/// - on a host with no CPU monitor-wait primitive and a doorbell wake word (a
+///   shared futex on Linux and Android, os_sync on macOS 14.4 and later), the
+///   consumer kernel-blocks on its doorbell wake word rather than pacing its
+///   recheck nap. That a ring ends such a block before the block's own cap is
+///   held in `doorbell.rs`: on Linux and Android by
+///   `a_ring_on_one_mapping_wakes_a_futex_park_on_another`, which rings only
+///   once the consumer's claim shows through the producer's mapping of the page
+///   and takes a ring that reached the word before the block as a ring in hand;
+///   on macOS by `a_ring_wakes_a_kernel_blocked_consumer_well_inside_the_cap`,
+///   which hands the ring over only once the consumer holds the parked gate and
+///   retries a ring that missed the block. Here the producer's wake syscall
+///   counts are printed, not asserted, because a ring that lands outside a
+///   kernel block issues no wake syscall (no claim is held between two blocks)
+///   or issues one that finds nobody (the claim is held and the consumer is not
+///   yet in the kernel), without anything being wrong;
 /// - on a host without a CPU monitor-wait primitive every park slice sleeps (a
 ///   kernel block on the doorbell wake word or a timed nap) and the loop bottom
 ///   calls `std::thread::yield_now()` zero times. A yield after a slice that
@@ -2800,7 +2819,7 @@ fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() 
 
     // One numbered frame per producer step, each published after a pause long
     // enough that the consumer is parked in a slice when it lands.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     let wakes_before = cerulion_core::doorbell::wake_syscall_counts();
     while sent.load(Ordering::Relaxed) < FRAMES {
         std::thread::sleep(Duration::from_millis(3));
@@ -2813,7 +2832,7 @@ fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() 
     {
         std::thread::sleep(Duration::from_millis(2));
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     let wakes_after = cerulion_core::doorbell::wake_syscall_counts();
     stop.store(true, Ordering::Release);
     let c = consumer.join().expect("consumer thread panicked");
@@ -2870,7 +2889,7 @@ fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() 
          (got {})",
         c.data_wakes_while_due
     );
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     if !cerulion_core::monitor_wait::monitor_wait_available()
         && cerulion_core::doorbell::wake_word_block_primitive_available()
     {
@@ -2882,18 +2901,10 @@ fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() 
         );
         assert!(
             c.wake_word_blocks > 0,
-            "on the os_sync doorbell tier the consumer's park must kernel-block on its \
-             doorbell wake word (got {} blocks)",
-            c.wake_word_blocks
-        );
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if !cerulion_core::monitor_wait::monitor_wait_available() {
-        assert!(
-            c.wake_word_blocks > 0,
-            "without a CPU monitor-wait primitive the consumer must kernel-block on the \
-             doorbell wake word between frames, not pace its recheck nap (0 wake-word \
-             blocks over {} completed slices)",
+            "without a CPU monitor-wait primitive the consumer's park must kernel-block \
+             on its doorbell wake word, not pace its recheck nap (got {} blocks over {} \
+             completed slices)",
+            c.wake_word_blocks,
             c.slices
         );
     }
