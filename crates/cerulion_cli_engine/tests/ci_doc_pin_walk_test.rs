@@ -3439,6 +3439,9 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_hygiene", "go2_tf_source", "crate-path"),
     // crate_license_texts_test reads `crates/native_ros2_messages`.
     ("cerulion_hygiene", "native_ros2_messages", "crate-path"),
+    // eye/source.rs's unit test reads `../cerulion_cli_engine/src` for the
+    // node names `bag play` and the resim mint their transports with.
+    ("cerulion_rcpd", "cerulion_cli_engine", "crate-path"),
     // hot_path_dependency_gate walks `examples/go2`, which holds that member.
     ("cerulion_telemetry", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.
