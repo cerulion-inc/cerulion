@@ -397,7 +397,7 @@ pub fn monitor_wait_available() -> bool {
 /// return WITHOUT parking via its lost-wakeup guard (the layer-1 pre-arm
 /// early-out and the layer-2 arm-time recheck) when the doorbell moved after
 /// the caller's `expected` snapshot; a caller keeping slice telemetry
-/// (`park_yields`) must not count such a return as a completed slice, which a
+/// (`park_slices`) must not count such a return as a completed slice, which a
 /// plain `bool` could not express. (A park cut short at the DEADLINE boundary
 /// still reads `Parked` — pre-existing, bounded at one per park window, and
 /// the caller's own loop-top deadline check fires first in practice.)

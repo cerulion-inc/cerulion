@@ -590,7 +590,12 @@ An absolute "the edge has room" test reads true on every recheck of a producer t
 blocked: an unbounded tight loop. A bare "the epoch moved" test wakes an unblocked producer
 once per peer drain, so a 1 kHz consumer would wake it a thousand times a second for nothing.
 Gating on was-full-at-entry means credit contributes **zero** wake sources unless this
-producer is actually waiting on one.
+producer is actually waiting on one. Under that gate the predicate fires on the epoch moving
+OR on the edge already being below threshold. The second test is the one the kernel-block arm
+uses to skip its block, so a skipped block is always answered by the next loop top: a drain
+lowers `outstanding` before it bumps `wake_seq`, and between the two writes only that test
+sees the freed credit. For the same reason the park reads `wake_seq` before `outstanding`
+when it takes its entry baseline.
 
 It rides `MAPPED` edges only. On a co-located edge both ends are nodes of the same runtime,
 so a loop that blocked waiting for that word would be waiting for a drain only it can
