@@ -25,6 +25,12 @@ pub unsafe extern "C" fn rmw_create_node(
         let (Some(name_s), Some(ns_s)) = (ffi::cstr(name), ffi::cstr(namespace_)) else {
             return std::ptr::null_mut();
         };
+        // Delivery log: record the node. Replay: refuse a node the recording
+        // did not create at this point (the message is already logged and on
+        // rcl's error channel).
+        if crate::replay::on_node(name_s, ns_s).is_err() {
+            return std::ptr::null_mut();
+        }
         let Ok(rt) = runtime::runtime() else {
             return std::ptr::null_mut();
         };

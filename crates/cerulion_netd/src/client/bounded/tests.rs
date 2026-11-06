@@ -47,8 +47,19 @@ fn receive_install(peer: &UnixStream) -> String {
     line
 }
 
+/// Reads `peer` to the end and asserts the other end closed without sending more.
+///
+/// The read timeout bounds a peer that never closes. The other end may already
+/// have closed when this runs: macOS then refuses `setsockopt` with EINVAL, since
+/// the socket can neither send nor receive. Such a socket is already
+/// disconnected, so the read returns its buffered bytes and then EOF without a
+/// timeout.
 fn assert_peer_closed(mut peer: UnixStream) {
-    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    match peer.set_read_timeout(Some(Duration::from_secs(5))) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(error) => panic!("could not bound the closure read: {error}"),
+    }
     let mut unexpected = Vec::new();
     match peer.read_to_end(&mut unexpected) {
         Ok(_) => {}
@@ -469,4 +480,20 @@ fn the_bounded_connect_reaches_an_abstract_control_socket() {
     let client = NetdClient::finish_bounded_handshake(stream, path, deadline()).unwrap();
     drop(client);
     server.join().unwrap();
+}
+
+#[test]
+fn closure_check_accepts_a_peer_that_closed_before_it_ran() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    drop(stream);
+    assert_peer_closed(peer);
+}
+
+#[test]
+#[should_panic(expected = "poisoned connection sent another request")]
+fn closure_check_still_reports_bytes_left_by_a_peer_that_already_closed() {
+    let (mut stream, peer) = UnixStream::pair().unwrap();
+    stream.write_all(b"unexpected").unwrap();
+    drop(stream);
+    assert_peer_closed(peer);
 }

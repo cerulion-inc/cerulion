@@ -647,6 +647,12 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
          its own header records macOS VM stalls inflating a size's floor",
     ),
     (
+        "gateway_egress_congestion_iox2_test",
+        "each stall must end inside zenoh's 5 s wait_before_close, and a loaded \
+         runner stretches the stalled publish loop past the tests' 4 s bound, which \
+         then fails its PRECONDITION by name",
+    ),
+    (
         "graph_latency_test",
         "release-only user-POV latency gate (p50 plus flatness)",
     ),
