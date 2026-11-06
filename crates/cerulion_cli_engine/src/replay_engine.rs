@@ -11238,12 +11238,18 @@ fn read_identity_refusal(edge: Option<String>, cause: &str, detail: String) -> R
     }
 }
 
-/// The producer labels of `topics`, per topic, from the bag's sidecar.
+/// The producer labels of `topics`, per topic, from the bag's sidecar, and why
+/// the sidecar was not read in full when it was not ([`label_stream_unread`]).
 fn feed_topic_labels(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
-) -> BTreeMap<String, crate::replay_feed::TopicLabels> {
-    read_producer_sidecar(&rm.reader, topics)
+) -> (
+    BTreeMap<String, crate::replay_feed::TopicLabels>,
+    Option<String>,
+) {
+    let reading = read_producer_sidecar(&rm.reader, topics);
+    let unread = label_stream_unread(&reading);
+    let labels = reading
         .by_topic
         .into_iter()
         .map(|(topic, labels)| {
@@ -11255,17 +11261,75 @@ fn feed_topic_labels(
                     .collect(),
             )
         })
-        .collect()
+        .collect();
+    (labels, unread)
+}
+
+/// Why `reading` cannot vouch that a topic it holds no label for had one
+/// writer, or `None` when it can: the bag declares the label channel and every
+/// record on it was walked, decoded and placed on a channel the bag declares.
+///
+/// The recorder labels a topic's frames from its first frame when the graph
+/// declares it in `multi_publisher_topics`, and from the frame a second writer
+/// first appears on when it does not, so a topic a complete reading names no
+/// writer for had one writer. A reading that is not complete may have lost that
+/// topic's labels:
+/// a stream that could not be read or ended in a read error, a record this
+/// build cannot decode, a record naming a channel the bag does not declare, or
+/// a bag that declares no label channel (every recorder that stamps
+/// `trace_format` 8 or later registers it).
+fn label_stream_unread(reading: &SidecarReading) -> Option<String> {
+    let SidecarReading {
+        // The labels themselves are the index build's input.
+        by_topic: _,
+        channel,
+        undecodable,
+        unattributable,
+        torn,
+    } = reading;
+    match channel {
+        SidecarChannel::Present => {}
+        SidecarChannel::Unreadable => {
+            return Some("the bag's producer label stream could not be read".to_string())
+        }
+        SidecarChannel::Absent => {
+            return Some(
+                "the bag declares no producer label channel, so its recorder labeled no frame"
+                    .to_string(),
+            )
+        }
+        SidecarChannel::NotConsulted => {
+            return Some("the bag's producer label stream was not read".to_string())
+        }
+    }
+    let mut causes: Vec<String> = Vec::new();
+    if *torn {
+        causes.push("the bag's producer label stream ended in a read error".to_string());
+    }
+    if *undecodable > 0 {
+        causes.push(format!(
+            "{undecodable} producer label record(s) this build cannot decode, as a newer \
+             Cerulion writes"
+        ));
+    }
+    if *unattributable > 0 {
+        causes.push(format!(
+            "{unattributable} producer label record(s) name a channel the bag does not declare"
+        ));
+    }
+    (!causes.is_empty()).then(|| causes.join("; "))
 }
 
 /// Index the recorded frames of `topics` by identity for the private feeds,
 /// keeping only the identities `need` names. Refuses with exit 2 when `need`
 /// and the producer `labels` of `topics` are over `budget` bytes, before the
-/// bag's frames are walked.
+/// bag's frames are walked. With `labels_unread`, every topic `labels` names
+/// no writer for holds it, so its reads are refused when the feeds are planned.
 fn build_feed_frame_index(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
     labels: &BTreeMap<String, crate::replay_feed::TopicLabels>,
+    labels_unread: Option<&str>,
     need: crate::replay_feed::FeedNeed,
     budget: u64,
 ) -> Result<crate::replay_feed::FrameIndex, ReplayError> {
@@ -11288,7 +11352,8 @@ fn build_feed_frame_index(
         ));
     }
     let mut builder =
-        crate::replay_feed::FrameIndexBuilder::new(topics.iter().cloned(), labels, Some(need));
+        crate::replay_feed::FrameIndexBuilder::new(topics.iter().cloned(), labels, Some(need))
+            .labels_unread(labels_unread);
     rm.for_each_frame_span(&mut |topic, span, bytes| {
         let header = WireHeader::read_from_buf(bytes);
         builder.push(
@@ -11647,7 +11712,7 @@ fn plan_bag_side_admissions(
     };
     let every_read_edges = multi_writer_edges(config);
     let topics: BTreeSet<String> = plans.iter().flat_map(rank_consumed_topics).collect();
-    let labels = feed_topic_labels(rm, &topics);
+    let (labels, labels_unread) = feed_topic_labels(rm, &topics);
     let mut step_ends: BTreeMap<u32, Option<u64>> = BTreeMap::new();
     let mut need = crate::replay_feed::FeedNeed::default();
     for (rank, admission) in &planned {
@@ -11659,7 +11724,14 @@ fn plan_bag_side_admissions(
             step_end,
         );
     }
-    let index = build_feed_frame_index(rm, &topics, &labels, need, feed_index_budget)?;
+    let index = build_feed_frame_index(
+        rm,
+        &topics,
+        &labels,
+        labels_unread.as_deref(),
+        need,
+        feed_index_budget,
+    )?;
     let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
     for (rank, admission) in planned {
         let targets = rank_step_targets(trace, rank)?;
@@ -30356,6 +30428,78 @@ mod producer_sidecar_read_tests {
 
     fn read(path: &std::path::Path) -> SidecarReading {
         read_producer_sidecar(&cerulion_bag::BagReader::open(path).unwrap(), &wanted())
+    }
+
+    /// A fed replay trusts "no label means one writer" only from a reading of
+    /// the whole label stream: every other reading names why it is not one.
+    #[test]
+    fn only_a_label_stream_read_in_full_vouches_for_an_unlabeled_topic() {
+        let full = SidecarReading {
+            channel: SidecarChannel::Present,
+            ..SidecarReading::default()
+        };
+        assert_eq!(label_stream_unread(&full), None);
+        let cases = [
+            (
+                SidecarReading {
+                    channel: SidecarChannel::Unreadable,
+                    ..full.clone()
+                },
+                "could not be read",
+            ),
+            (
+                SidecarReading {
+                    channel: SidecarChannel::Absent,
+                    ..full.clone()
+                },
+                "declares no producer label channel",
+            ),
+            (
+                SidecarReading {
+                    channel: SidecarChannel::NotConsulted,
+                    ..full.clone()
+                },
+                "was not read",
+            ),
+            (
+                SidecarReading {
+                    torn: true,
+                    ..full.clone()
+                },
+                "ended in a read error",
+            ),
+            (
+                SidecarReading {
+                    undecodable: 3,
+                    ..full.clone()
+                },
+                "3 producer label record(s) this build cannot decode",
+            ),
+            (
+                SidecarReading {
+                    unattributable: 2,
+                    ..full.clone()
+                },
+                "2 producer label record(s) name a channel the bag does not declare",
+            ),
+        ];
+        for (reading, cause) in cases {
+            let said = label_stream_unread(&reading)
+                .unwrap_or_else(|| panic!("{reading:?} is not a reading in full"));
+            assert!(said.contains(cause), "{reading:?}: {said}");
+        }
+        // The crafted bag of the newer-version arm below, end to end.
+        let path = craft("unread_newer_version", |data| {
+            let mut future = valid_record(data, 0);
+            future[0] = future[0].wrapping_add(1);
+            vec![future]
+        });
+        let said = label_stream_unread(&read(&path)).expect("an undecodable record is named");
+        assert!(
+            said.contains("1 producer label record(s) this build cannot decode"),
+            "{said}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// THE ANTI-TAUTOLOGY CONTROL. Without it every "the count moved" arm below

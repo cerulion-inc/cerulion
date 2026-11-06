@@ -1036,7 +1036,12 @@ feed name is at most 86 characters whatever the node id's length, inside the
 onto that service exactly the frames the recorded read consumed, found in the
 bag by `(writer, sequence)`: a multi-writer topic's frames carry the
 recorder's per-frame producer labels (`__cerulion/frame_producers`), and a
-topic with no label had one writer. A read that popped several frames is fed
+topic with no label had one writer. That holds only when the replay reads the
+whole label stream: when the stream cannot be read or ends in a read error,
+holds a record this build cannot decode or one naming a channel the bag does
+not declare, or the bag declares no label channel, a read of a topic with no
+label is refused, since the frame at its sequence could be another writer's.
+A read that popped several frames is fed
 its `batch_frame` frames and then the frame it served, each by its own writer
 and sequence; nothing is counted back from the served sequence. Live
 evictions, several consumers of one topic and several writers on one topic
@@ -1069,6 +1074,7 @@ node, the input, the writer and the sequence:
 | `read_identity_batch_miscounted` | The recording names more frames for a read than it popped: a `batch_frame` record before it belongs to no frame it consumed |
 | `read_identity_decimated_unattributed` | A `sample(N)` read dropped the frames it popped and names none of them |
 | `read_identity_frames_unattributed` | An unlabelled topic's reads name more than one writer |
+| `read_identity_labels_unread` | The topic carries no writer label the replay could read and the bag's label stream was not read in full, so the topic may have had several writers |
 | `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |
 | `read_identity_ungateable_stage` | A stage the read gate cannot drive (a per-set `Sync` trigger input) |
 | `read_identity_rmw_node` | The graph has `ros2` nodes, whose takes the read log does not record |

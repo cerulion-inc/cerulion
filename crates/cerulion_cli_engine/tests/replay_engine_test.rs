@@ -1617,6 +1617,34 @@ fn write_producer_labels(
     resolved: &[u16],
     labels: &[ProducerLabel<'_>],
 ) -> cerulion_bag::BagResult<()> {
+    write_producer_labels_encoded(c, channel, resolved, labels, encode_label_as_recorded)
+}
+
+/// How a crafted bag encodes one producer label record onto the reserved
+/// channel.
+type LabelEncoder = fn(&cerulion_bag::ProducerRecord) -> Vec<u8>;
+
+/// A label record exactly as the recorder writes it.
+fn encode_label_as_recorded(record: &cerulion_bag::ProducerRecord) -> Vec<u8> {
+    record.encode().to_vec()
+}
+
+/// A label record as a newer Cerulion writes it: this build's layout under
+/// the next version byte, which this build's decoder refuses.
+fn encode_label_as_a_newer_version(record: &cerulion_bag::ProducerRecord) -> Vec<u8> {
+    let mut body = record.encode().to_vec();
+    body[0] = cerulion_bag::PRODUCER_RECORD_VERSION + 1;
+    body
+}
+
+/// [`write_producer_labels`] with each record's bytes from `encode`.
+fn write_producer_labels_encoded(
+    c: &mut cerulion_bag::ChunkScope<'_>,
+    channel: u16,
+    resolved: &[u16],
+    labels: &[ProducerLabel<'_>],
+    encode: LabelEncoder,
+) -> cerulion_bag::BagResult<()> {
     for (i, ((_, attribution, publisher_id), data_channel)) in
         labels.iter().zip(resolved).enumerate()
     {
@@ -1630,7 +1658,7 @@ fn write_producer_labels(
             i as u32,
             0,
             0,
-            &[&record.encode()[..]],
+            &[&encode(&record)[..]],
         )?;
     }
     Ok(())
@@ -1663,6 +1691,41 @@ fn write_bag_impl(
     producer_labels: Option<&[ProducerLabel<'_>]>,
     // The additive per-input staging-rim table.
     read_log_capacities: Option<serde_json::Value>,
+) {
+    write_bag_impl_encoded(
+        rec,
+        path,
+        env_json,
+        schema_name,
+        wire_fixed_size,
+        record_coverage,
+        inputs_json,
+        read_log_capacity,
+        recorder_json,
+        publishers_json,
+        producer_labels,
+        read_log_capacities,
+        encode_label_as_recorded,
+    );
+}
+
+/// [`write_bag_impl`] with each producer label record's bytes from
+/// `encode_label`.
+#[allow(clippy::too_many_arguments)]
+fn write_bag_impl_encoded(
+    rec: &Recording,
+    path: &std::path::Path,
+    env_json: Option<&[u8]>,
+    schema_name: &str,
+    wire_fixed_size: u32,
+    record_coverage: Option<&[u8]>,
+    inputs_json: Option<serde_json::Value>,
+    read_log_capacity: Option<serde_json::Value>,
+    recorder_json: Option<Vec<u8>>,
+    publishers_json: Option<serde_json::Value>,
+    producer_labels: Option<&[ProducerLabel<'_>]>,
+    read_log_capacities: Option<serde_json::Value>,
+    encode_label: LabelEncoder,
 ) {
     let topics: Vec<TopicSchema> = rec
         .messages
@@ -1701,7 +1764,7 @@ fn write_bag_impl(
         for (i, r) in rec.trace.iter().enumerate() {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
-        write_producer_labels(c, labels_channel, &label_channels, labels)?;
+        write_producer_labels_encoded(c, labels_channel, &label_channels, labels, encode_label)?;
         Ok(())
     })
     .unwrap();
@@ -41614,6 +41677,144 @@ fn a_frame_missing_from_the_bag_is_refused_by_name() {
             && msg.contains(&format!("sequence {lost_seq}")),
         "{msg}"
     );
+}
+
+/// A second writer's port id for the shared-topic arms below: no node of the
+/// eviction fixture publishes under it.
+const RI_SECOND_WRITER: u128 = 0x0B0B_0B0B_0B0B_0B0B_0B0B_0B0B_0B0B_0B0B;
+
+/// One producer label a recording carries: topic, attribution, writer port id.
+type RiLabelRow = (String, cerulion_bag::ProducerAttribution, u128);
+
+/// The eviction recording made a SHARED topic: the frame `src` published at
+/// one consumed sequence is replaced by a second writer's frame at that same
+/// sequence, and the topic carries the labels a recorder writes once a second
+/// writer appears (one `FrameLabel` per frame, naming its writer). Every read
+/// still names `src`, so `src`'s frame at that sequence is missing and the
+/// second writer's frame is the only frame there. Returns the recording, its
+/// labels and that sequence.
+fn ri_second_writer_live() -> (RiLive, Vec<RiLabelRow>, u32) {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let topic = "/riev/src/out";
+    let src = real_publisher_id(&live.rec, "src", "out");
+    let frames = live
+        .rec
+        .messages
+        .get_mut(topic)
+        .expect("PREMISE: src's topic is recorded");
+    let swapped = 20;
+    let seq = WireHeader::read_from_buf(&frames[swapped])
+        .unwrap()
+        .sequence;
+    frames[swapped][WireHeader::SIZE..WireHeader::SIZE + 8].copy_from_slice(&2.0f64.to_le_bytes());
+    let labels = (0..frames.len())
+        .map(|i| {
+            let writer = if i == swapped { RI_SECOND_WRITER } else { src };
+            (
+                topic.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                writer,
+            )
+        })
+        .collect();
+    (live, labels, seq)
+}
+
+/// Write the shared-topic recording as a single-rank free-run bag, as
+/// [`ri_bag`] does, with its label records' bytes from `encode`.
+fn ri_second_writer_bag(
+    rec: &Recording,
+    labels: &[RiLabelRow],
+    path: &std::path::Path,
+    encode: LabelEncoder,
+) {
+    let labels: Vec<ProducerLabel<'_>> = labels
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl_encoded(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(rec)),
+        Some(&labels),
+        Some(rec.stage_rows.clone()),
+        encode,
+    );
+}
+
+/// A shared topic whose reads name only one writer, whose labels this build
+/// cannot decode, is refused by name rather than fed the other writer's frame
+/// at the sequence a read names.
+///
+/// With readable labels the read whose frame is missing is refused as missing
+/// (the control: the second writer's frame sits at that sequence and the
+/// labeled lookup does not take it). With every label record at a newer
+/// version, the labels read as absent, and a frame found by its sequence alone
+/// would be the second writer's, fed as `src`'s.
+#[test]
+#[serial]
+fn a_shared_topic_whose_labels_cannot_be_read_is_refused_not_fed_by_sequence() {
+    let (live, labels, seq) = ri_second_writer_live();
+    let topic = "/riev/src/out";
+    let dir = tempfile::tempdir().unwrap();
+
+    let readable = dir.path().join("ri_second_writer_readable.mcap");
+    ri_second_writer_bag(&live.rec, &labels, &readable, encode_label_as_recorded);
+    let (outcome, _) = ri_replay(
+        &readable,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("PREMISE: src's frame at the swapped sequence is missing");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_frame_missing") && msg.contains(&format!("sequence {seq}")),
+        "PREMISE: with readable labels the missing frame is refused as missing: {msg}"
+    );
+
+    let unreadable = dir.path().join("ri_second_writer_unreadable.mcap");
+    ri_second_writer_bag(
+        &live.rec,
+        &labels,
+        &unreadable,
+        encode_label_as_a_newer_version,
+    );
+    let (outcome, replayed) = ri_replay(
+        &unreadable,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = match outcome {
+        Err(err) => err,
+        Ok(outcome) => panic!(
+            "a fed replay ran over labels it could not read (read identity {:?}, passed {}); \
+             the reads compared to live: {:?}",
+            outcome.read_identity,
+            outcome.passed,
+            ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST])
+        ),
+    };
+    let msg = err.to_string();
+    println!("RI_REFUSAL labels_unread: {msg}");
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    for part in [
+        "read_identity_labels_unread",
+        &format!("topic '{topic}'"),
+        "this build cannot decode",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
 }
 
 /// A bag recorded before read identity keeps the queue re-creation path, and

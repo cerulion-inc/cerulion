@@ -19,7 +19,9 @@
 //!   `(writer token, wire sequence)`, built by [`FrameIndexBuilder`] and, under
 //!   a need, holding only the identities it names. A multi-writer topic's
 //!   frames carry the recorder's per-frame producer labels; a topic with no
-//!   label at all was written by one writer.
+//!   label at all was written by one writer when the bag's label stream was
+//!   read in full, and its reads are refused
+//!   ([`FeedRefusalReason::LabelsUnread`]) when it was not.
 //! * [`plan_feeds`]: for every gated admission that pops, the list of frames it
 //!   consumed, in pop order. A read whose frames cannot be named is REFUSED by
 //!   node, input, writer and sequence ([`FeedRefusal`]); there is no fallback
@@ -92,6 +94,10 @@ enum Slot {
 struct TopicIndex {
     /// `true` when the recorder labeled this topic's frames with their writers.
     labeled: bool,
+    /// `Some` when the topic carries no label and the label stream the index
+    /// was built under was not read in full: why. [`plan_feeds`] refuses the
+    /// topic's reads instead of looking their frames up by sequence alone.
+    labels_unread: Option<String>,
     /// The identities held, sorted and distinct. Labeled: `(writer token,
     /// sequence)`. Unlabeled: `(0, sequence)`, the writer being the topic's
     /// only one. Under a [`FeedNeed`] these are the need's own keys for the
@@ -440,6 +446,22 @@ impl<'l> FrameIndexBuilder<'l> {
         }
     }
 
+    /// Record that the label stream the builder's labels came from was not
+    /// read in full, for `cause`: every topic those labels name no writer for
+    /// holds `cause`, and [`plan_feeds`] refuses its reads
+    /// ([`FeedRefusalReason::LabelsUnread`]). `None` changes nothing.
+    #[must_use]
+    pub fn labels_unread(mut self, cause: Option<&str>) -> Self {
+        if let Some(cause) = cause {
+            for (idx, _, _) in self.topics.values_mut() {
+                if !idx.labeled {
+                    idx.labels_unread = Some(cause.to_string());
+                }
+            }
+        }
+        self
+    }
+
     /// Take the next frame of `topic`, in the topic's file order. A topic the
     /// builder was not given is ignored.
     pub fn push(&mut self, topic: &str, frame: RecordedFrame) {
@@ -595,6 +617,14 @@ pub enum FeedRefusalReason {
         /// The distinct writers the reads name.
         writers: usize,
     },
+    /// The topic's frames carry no writer label this replay could read, and
+    /// the bag's label stream was not read in full, so the topic may have had
+    /// several writers and a frame found by its sequence alone may be another
+    /// writer's.
+    LabelsUnread {
+        /// Why the label stream was not read in full.
+        cause: String,
+    },
     /// The bag holds no frame with a readable wire header on the topic this
     /// input reads.
     TopicUnrecorded,
@@ -620,6 +650,7 @@ impl FeedRefusalReason {
             Self::BatchMiscounted { .. } => "read_identity_batch_miscounted",
             Self::DecimatedUnattributed { .. } => "read_identity_decimated_unattributed",
             Self::FramesUnattributed { .. } => "read_identity_frames_unattributed",
+            Self::LabelsUnread { .. } => "read_identity_labels_unread",
             Self::TopicUnrecorded => "read_identity_topic_unrecorded",
             Self::FrameClaimedTwice { .. } => "read_identity_frame_claimed_twice",
         }
@@ -696,6 +727,12 @@ impl fmt::Display for FeedRefusal {
                 f,
                 "the topic's frames carry no writer labels while its reads name {writers} \
                  writers, so no frame can be attributed"
+            ),
+            FeedRefusalReason::LabelsUnread { cause } => write!(
+                f,
+                "the topic's frames carry no writer label this replay could read ({cause}), so \
+                 the topic may have had several writers and the frame at that sequence may be \
+                 another writer's"
             ),
             FeedRefusalReason::TopicUnrecorded => write!(
                 f,
@@ -892,13 +929,13 @@ pub mod mutants {
 ///
 /// # Errors
 ///
-/// The first read whose frames cannot be named, as a [`FeedRefusal`].
+/// The first read whose frames cannot be named, as a boxed [`FeedRefusal`].
 pub fn plan_feeds(
     stages: &[FedStage<'_>],
     index: &FrameIndex,
     step_targets: &BTreeMap<u64, u64>,
     step_end: Option<u64>,
-) -> Result<FeedPlan, FeedRefusal> {
+) -> Result<FeedPlan, Box<FeedRefusal>> {
     let _ = step_targets;
     // Pass 1: an unlabeled topic must be read under ONE writer, counting the
     // writers its reads' batch frames name.
@@ -917,14 +954,16 @@ pub fn plan_feeds(
     let mut plan = FeedPlan::default();
     for stage in stages {
         let key = &stage.admission.key;
-        let refuse = |step: u64, writer: Option<u64>, sequence: Option<u32>, reason| FeedRefusal {
-            node: key.node.clone(),
-            input: stage.input.to_string(),
-            topic: stage.topic.to_string(),
-            step,
-            writer,
-            sequence,
-            reason,
+        let refuse = |step: u64, writer: Option<u64>, sequence: Option<u32>, reason| {
+            Box::new(FeedRefusal {
+                node: key.node.clone(),
+                input: stage.input.to_string(),
+                topic: stage.topic.to_string(),
+                step,
+                writer,
+                sequence,
+                reason,
+            })
         };
         plan.buffers.entry(key.clone()).or_insert(0);
         plan.topics.insert(key.clone(), stage.topic.to_string());
@@ -1007,6 +1046,16 @@ pub fn plan_feeds(
                     ));
                 };
                 if !topic.labeled {
+                    if let Some(cause) = &topic.labels_unread {
+                        return Err(refuse(
+                            step.step,
+                            Some(writer),
+                            Some(served),
+                            FeedRefusalReason::LabelsUnread {
+                                cause: cause.clone(),
+                            },
+                        ));
+                    }
                     let named = writers_by_topic.get(stage.topic).map_or(0, BTreeSet::len);
                     if named > 1 {
                         return Err(refuse(
@@ -1327,7 +1376,7 @@ mod tests {
         FrameIndex::build(&f, &l)
     }
 
-    fn plan(adm: &StageAdmission, idx: &FrameIndex) -> Result<FeedPlan, FeedRefusal> {
+    fn plan(adm: &StageAdmission, idx: &FrameIndex) -> Result<FeedPlan, Box<FeedRefusal>> {
         plan_with(adm, idx, false)
     }
 
@@ -1335,7 +1384,7 @@ mod tests {
         adm: &StageAdmission,
         idx: &FrameIndex,
         every_read: bool,
-    ) -> Result<FeedPlan, FeedRefusal> {
+    ) -> Result<FeedPlan, Box<FeedRefusal>> {
         plan_feeds(
             &[FedStage {
                 admission: adm,
@@ -1445,7 +1494,7 @@ mod tests {
     /// The depth-two overflow batch (1, then 19 and 20 after 2 to 18 were
     /// evicted mid-drain) of an unlabeled topic holding frames 1 to 20: its
     /// need, and its plan over the index built under that need.
-    fn overflow_batch_through_a_budgeted_index() -> (FeedNeed, Result<FeedPlan, FeedRefusal>) {
+    fn overflow_batch_through_a_budgeted_index() -> (FeedNeed, Result<FeedPlan, Box<FeedRefusal>>) {
         let mut adm = admission(&[(4, 20, Some(7), 3, ReadKind::DrainedBatch)]);
         adm.per_step[0].identity[0].batch = frames_of(&[(Some(7), 1), (Some(7), 19)]);
         let need = need_of(&adm, None);
@@ -1736,6 +1785,51 @@ mod tests {
         // A single-writer edge's run carries the writer forward.
         let idx = index(vec![frame(1, 5), frame(2, 6)], vec![]);
         plan_with(&adm, &idx, false).expect("a run continues the writer");
+    }
+
+    /// An unlabeled topic under a label stream that was not read in full is
+    /// refused by name with the stream's cause. Controls: the same index under
+    /// a stream read in full feeds the read by sequence, and a labeled topic
+    /// under the unread stream still feeds by writer and sequence.
+    #[test]
+    fn an_unlabeled_topic_under_an_unread_label_stream_is_refused_with_the_cause() {
+        fn build(labels: &BTreeMap<String, TopicLabels>, unread: Option<&str>) -> FrameIndex {
+            let mut b =
+                FrameIndexBuilder::new(["/t".to_string()], labels, None).labels_unread(unread);
+            b.push("/t", frame(1, 5));
+            b.finish()
+        }
+        let cause = "2 producer label record(s) this build cannot decode";
+        let adm = admission(&[(3, 5, Some(9), 1, ReadKind::Served)]);
+        let p = plan(&adm, &build(&NO_LABELS, None)).expect("a topic with no label had one writer");
+        assert_eq!(p.read(&key(), 3, 0).unwrap().frames, vec![span(1)]);
+        let r = plan(&adm, &build(&NO_LABELS, Some(cause))).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::LabelsUnread {
+                cause: cause.to_string()
+            }
+        );
+        assert_eq!(r.reason.code(), "read_identity_labels_unread");
+        let text = r.to_string();
+        for part in [
+            "'sink'",
+            "'inp'",
+            "topic '/t'",
+            "step 3",
+            "sequence 5",
+            cause,
+        ] {
+            assert!(text.contains(part), "{text}");
+        }
+        let labeled = BTreeMap::from([(
+            "/t".to_string(),
+            vec![(ProducerAttribution::FrameLabel { frame_index: 0 }, 9u128)],
+        )]);
+        let adm = admission(&[(3, 5, Some(writer_token(9)), 1, ReadKind::Served)]);
+        let p =
+            plan(&adm, &build(&labeled, Some(cause))).expect("a labeled topic keeps its labels");
+        assert_eq!(p.read(&key(), 3, 0).unwrap().frames, vec![span(1)]);
     }
 
     #[test]
