@@ -2730,51 +2730,126 @@ mod tests {
     }
 
     /// A ring on the producer's mapping wakes a consumer blocked on the futex
-    /// word through ITS OWN mapping of the same page, long before the block's
+    /// word through ITS OWN mapping of the same page, well inside the block's
     /// cap: two mappings in one process and two processes key the same shared
     /// futex. The claim is released once the block returns.
+    ///
+    /// The ringer waits until the consumer's claim shows through the
+    /// PRODUCER's mapping, so the ring takes the wake arm, then sleeps a further
+    /// 20 ms, which usually puts the consumer inside `FUTEX_WAIT` first. The
+    /// ring's wakes are counted on the ringing thread, read before and after
+    /// the ring, so no other arm of the binary moves them.
+    ///
+    /// An attempt whose ring did not land inside a kernel block is RETRIED
+    /// rather than judged. A ring that reaches the word before the block returns
+    /// `RingPending` and needs no wake at all; a wake the kernel answers with no
+    /// waiter reached a consumer that was not blocked; and a block that returned
+    /// before the ring was not ended by it. A consumer preempted between its
+    /// claim and its wait for longer than the sleep opens the first two. Every
+    /// other attempt is judged: the block must be a completed wait (`Parked`),
+    /// it must return within 1 s against its 5 s cap, and the ring must have
+    /// issued exactly one `FUTEX_WAKE` that the kernel did not answer with no
+    /// waiter. A wake that is missing or fails with an errno leaves the block to
+    /// run to its cap, so it fails the 1 s bound. The arm fails when none of its
+    /// 16 attempts lands a ring inside a block.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_ring_on_one_mapping_wakes_a_futex_park_on_another() {
         use crate::monitor_wait::AddrParkOutcome;
+        use std::time::Instant;
+        // The timeout the block is handed.
+        const CAP: Duration = Duration::from_secs(5);
+        // How far inside CAP a judged block must return.
+        const WOKEN_WITHIN: Duration = Duration::from_secs(1);
+        // Bounded so a claim that never shows fails the test rather than
+        // hanging it.
+        const GATE_WAIT: Duration = Duration::from_secs(5);
+        // The ringer's sleep after the gate. It raises the share of attempts
+        // whose ring lands inside the block; a miss is retried.
+        const SETTLE: Duration = Duration::from_millis(20);
+        const ATTEMPTS: u32 = 16;
+
         let ns = format!("dbfutex_{}", std::process::id());
         let producer = Doorbell::open_owned(&ns, "/futex/wake").expect("producer page");
         let consumer = Doorbell::open_unowned(&ns, "/futex/wake").expect("consumer page");
-        let cap = Duration::from_secs(5);
-        let (outcome, waited) = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| {
-                let guard = ParkedDoorbellGuard::enter(&consumer);
-                let started = std::time::Instant::now();
-                let outcome = guard.wait(cap);
-                (outcome, started.elapsed())
-            });
-            let spun_up = std::time::Instant::now();
-            while producer.parked_for_test() == 0 {
-                assert!(
-                    spun_up.elapsed() < Duration::from_secs(5),
-                    "the consumer's claim never reached the producer's mapping"
-                );
-                std::thread::yield_now();
+
+        let mut missed = 0u32;
+        let mut judged = false;
+        for _ in 0..ATTEMPTS {
+            let (outcome, waited, returned_at, rang_at, issued, found_nobody) =
+                std::thread::scope(|scope| {
+                    let waiter = scope.spawn(|| {
+                        let guard = ParkedDoorbellGuard::enter(&consumer);
+                        let started = Instant::now();
+                        let outcome = guard.wait(CAP);
+                        let returned_at = Instant::now();
+                        (outcome, returned_at - started, returned_at)
+                    });
+                    let spun_up = Instant::now();
+                    while producer.parked_for_test() == 0 {
+                        assert!(
+                            spun_up.elapsed() < GATE_WAIT,
+                            "the consumer's claim never reached the producer's mapping"
+                        );
+                        std::thread::yield_now();
+                    }
+                    std::thread::sleep(SETTLE);
+                    let (issued_before, nobody_before) = thread_wake_counts();
+                    let rang_at = Instant::now();
+                    producer.ring();
+                    let (issued_after, nobody_after) = thread_wake_counts();
+                    let (outcome, waited, returned_at) =
+                        waiter.join().expect("waiter thread panicked");
+                    (
+                        outcome,
+                        waited,
+                        returned_at,
+                        rang_at,
+                        issued_after - issued_before,
+                        nobody_after - nobody_before,
+                    )
+                });
+            assert_eq!(
+                consumer.parked_for_test(),
+                0,
+                "the guard releases its claim when the block returns"
+            );
+
+            if outcome == AddrParkOutcome::RingPending || found_nobody != 0 || returned_at < rang_at
+            {
+                missed += 1;
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(20));
-            producer.ring();
-            waiter.join().expect("waiter thread panicked")
-        });
-        assert!(
-            matches!(
+
+            assert_eq!(
                 outcome,
-                AddrParkOutcome::Parked | AddrParkOutcome::RingPending
-            ),
-            "the block must report a completed wait or a ring in hand, got {outcome:?}"
-        );
+                AddrParkOutcome::Parked,
+                "a block the ring landed inside must report a completed wait"
+            );
+            let since_ring = returned_at.saturating_duration_since(rang_at);
+            assert!(
+                waited < WOKEN_WITHIN,
+                "the ring must end the block, not its {CAP:?} cap: it waited {waited:?}, \
+                 {since_ring:?} of it after the ring"
+            );
+            assert_eq!(
+                issued, 1,
+                "the ring must issue exactly one FUTEX_WAKE while the consumer's claim is \
+                 held, and the kernel found a waiter for it"
+            );
+            println!(
+                "doorbell futex wake: {since_ring:?} from the ring to the block's return, \
+                 inside a {CAP:?} cap ({missed} of {ATTEMPTS} attempts missed the block)"
+            );
+            judged = true;
+            break;
+        }
+
         assert!(
-            waited < Duration::from_secs(1),
-            "the ring must end the block, not its {cap:?} cap: it waited {waited:?}"
-        );
-        assert_eq!(
-            consumer.parked_for_test(),
-            0,
-            "the guard releases its claim when the block returns"
+            judged,
+            "{ATTEMPTS} attempts all missed the block, so the wake under test never ran: a \
+             ring that reaches the word before the block, a wake that finds nobody and a \
+             block that returns before the ring judge neither way"
         );
     }
 
