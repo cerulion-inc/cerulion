@@ -8447,7 +8447,7 @@ impl GraphRuntime {
             // lines up is a plain value.
             let node_death_for_callback = Arc::clone(&node_death);
             let mut node_death_reported = false;
-            // Trigger policy comes from the macro side only — graph
+            // Trigger policy comes from the macro side only. Graph
             // YAML no longer carries a `policy:` block.
             // When a cdylib declares no `MacroPolicy`,
             // the runtime falls back to `Data` (fires on any input
