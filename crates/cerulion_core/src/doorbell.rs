@@ -379,7 +379,8 @@ mod imp {
         "parked must sit at offset 12, in the same cache line as the word it gates"
     );
 
-    /// A process-shared SHM doorbell — one cache-line-aligned `AtomicU64`.
+    /// A process-shared SHM doorbell: one cache-line page holding the ring
+    /// counter and its futex wake word (`DoorbellShared`).
     ///
     /// Construct via [`Doorbell::open_owned`] (producer — owns + `shm_unlink`s
     /// the name on drop) or [`Doorbell::open_unowned`] (consumer — maps only).
