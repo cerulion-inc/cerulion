@@ -103,11 +103,12 @@ impl DeviceAccountIndex {
     ///   binding (nor delete the MAC to reset the index — a present file with a
     ///   missing/short frame is refused, only a fully ABSENT file is empty).
     ///
-    /// On Unix, the group and other permission bits of a regular index file are
-    /// cleared before it is read.
+    /// On Unix, when `path` itself is a regular file with a single link, its group
+    /// and other permission bits are cleared before it is read; a symbolic link at
+    /// `path` is read through unchanged.
     pub fn load(path: impl AsRef<Path>, mac_key: &[u8]) -> Result<Self, RemotedError> {
         let path = path.as_ref();
-        match read_private(path) {
+        match crate::private_file::read_private(path, "device index") {
             Ok(bytes) => {
                 let on_disk = decode_and_verify(&bytes, mac_key, &path.display().to_string())?;
                 let mut map = HashMap::with_capacity(on_disk.bindings.len());
@@ -329,58 +330,6 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     name.push(path.file_name().unwrap_or_default());
     name.push(format!(".{:016x}.tmp", hasher.finish()));
     path.with_file_name(name)
-}
-
-/// Read the index file at `path`. On Unix, when the file is a regular file that
-/// group or other users can access, its group and other permission bits are
-/// cleared through the open handle before it is read, logged at `warn`. When
-/// clearing them fails, that is logged at `warn` and the read goes on.
-fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
-    #[cfg(unix)]
-    narrow_to_owner(&file, path);
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-/// Clear the group and other permission bits of the open index `file`, when it
-/// is a regular file.
-#[cfg(unix)]
-fn narrow_to_owner(file: &std::fs::File, path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = match file.metadata() {
-        Ok(meta) if meta.is_file() => meta.permissions().mode() & 0o7777,
-        Ok(_) => return,
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "could not read the device index's mode"
-            );
-            return;
-        }
-    };
-    if mode & 0o077 == 0 {
-        return;
-    }
-    let narrowed = mode & !0o077;
-    match file.set_permissions(std::fs::Permissions::from_mode(narrowed)) {
-        Ok(()) => tracing::warn!(
-            path = %path.display(),
-            mode = format_args!("{mode:o}"),
-            narrowed = format_args!("{narrowed:o}"),
-            "the device index was accessible to other users; cleared its group and other bits"
-        ),
-        Err(e) => tracing::warn!(
-            path = %path.display(),
-            mode = format_args!("{mode:o}"),
-            error = %e,
-            "the device index is accessible to other users and its group and other bits \
-             could not be cleared"
-        ),
-    }
 }
 
 /// The step of [`replace_durably`] that failed, for the error text.
@@ -947,6 +896,23 @@ mod tests {
             .unwrap();
         DeviceAccountIndex::load(&path, MAC_KEY).expect("the saved index loads");
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_index_is_read_through_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere-index");
+        DeviceAccountIndex::new()
+            .with_path(&target)
+            .save(MAC_KEY)
+            .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("device-index");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        DeviceAccountIndex::load(&link, MAC_KEY).expect("a symlinked index still loads");
+        assert_eq!(mode_of(&target), 0o644, "the link's target keeps its mode");
     }
 
     #[test]

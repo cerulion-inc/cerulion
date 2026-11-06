@@ -13,6 +13,48 @@ use crate::supabase::SupabaseConfig;
 /// One second in nanoseconds.
 pub const SEC_NS: u64 = 1_000_000_000;
 
+/// The environment variable that sets [`ServiceConfig::refresh_reuse_window_ns`],
+/// in whole seconds (`0` disables the window).
+pub const REFRESH_REUSE_WINDOW_ENV: &str = "CERULION_ACCOUNTD_REFRESH_REUSE_WINDOW_S";
+
+/// The default refresh-token reuse window: 60 s. It is at least one 30 s request
+/// timeout (`cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT`) plus the netd
+/// revocation sync's first 5 s retry delay, so that worker's first retry after a
+/// lost reply lands inside it; its later, doubling retries do not. An interactive
+/// `cerulion` command does not retry; the next command is its retry.
+pub const DEFAULT_REFRESH_REUSE_WINDOW_NS: u64 = 60 * SEC_NS;
+
+/// The largest accepted refresh-token reuse window: 300 s, the longest wait the
+/// netd revocation sync puts between two failed attempts. The window is how long
+/// an already-rotated refresh token can still obtain the pair that replaced it.
+pub const MAX_REFRESH_REUSE_WINDOW_NS: u64 = 300 * SEC_NS;
+
+/// Parse [`REFRESH_REUSE_WINDOW_ENV`]: `None` (unset) is the 60 s default; a value
+/// must be a whole number of seconds from 0 to 300. Anything else is an error that
+/// names the variable, so a typo never silently falls back to the default.
+pub fn parse_refresh_reuse_window(value: Option<&str>) -> Result<u64, String> {
+    let Some(raw) = value else {
+        return Ok(DEFAULT_REFRESH_REUSE_WINDOW_NS);
+    };
+    let max_s = MAX_REFRESH_REUSE_WINDOW_NS / SEC_NS;
+    let digits = raw.trim();
+    let not_seconds = || {
+        format!(
+            "{REFRESH_REUSE_WINDOW_ENV}={raw:?} is not a whole number of seconds (0 to {max_s})"
+        )
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(not_seconds());
+    }
+    let secs: u64 = digits.parse().map_err(|_| not_seconds())?;
+    if secs > max_s {
+        return Err(format!(
+            "{REFRESH_REUSE_WINDOW_ENV}={secs} is above the {max_s} s maximum"
+        ));
+    }
+    Ok(secs * SEC_NS)
+}
+
 /// A monotone-enough wall clock, injectable so tests can pin `now_ns`
 /// deterministically. The pure state machines take `now_ns` as a parameter and
 /// are tested independently; this seam only feeds the DB-touching flows.
@@ -113,6 +155,11 @@ pub struct ServiceConfig {
     pub session_ttl_ns: u64,
     /// Refresh-token lifetime (days).
     pub refresh_ttl_ns: u64,
+    /// How long after a rotation the refresh token it replaced is still accepted,
+    /// once, to return the pair that rotation issued (`0` disables it). Set by
+    /// [`REFRESH_REUSE_WINDOW_ENV`]; the default and bounds are
+    /// [`DEFAULT_REFRESH_REUSE_WINDOW_NS`] and [`MAX_REFRESH_REUSE_WINDOW_NS`].
+    pub refresh_reuse_window_ns: u64,
     /// Device-code lifetime (RFC 8628 `expires_in`).
     pub device_code_ttl_ns: u64,
     /// Minimum poll interval in seconds (RFC 8628 `interval`; `0` disables the
@@ -146,7 +193,8 @@ impl Default for ServiceConfig {
             ca: CaConfig::default(),
             session_ttl_ns: 15 * 60 * SEC_NS,        // 15 minutes
             refresh_ttl_ns: 30 * 24 * 3600 * SEC_NS, // 30 days
-            device_code_ttl_ns: 10 * 60 * SEC_NS,    // 10 minutes
+            refresh_reuse_window_ns: DEFAULT_REFRESH_REUSE_WINDOW_NS,
+            device_code_ttl_ns: 10 * 60 * SEC_NS, // 10 minutes
             device_code_interval_secs: 5,
             magic_link_ttl_ns: 15 * 60 * SEC_NS,   // 15 minutes
             oauth_flow_ttl_ns: 15 * 60 * SEC_NS,   // 15 minutes
@@ -207,6 +255,22 @@ mod tests {
         ] {
             assert!(output.contains("client_secret: [REDACTED]"));
             assert!(!output.contains(secret));
+        }
+    }
+
+    #[test]
+    fn the_refresh_reuse_window_parses_seconds_within_its_bounds() {
+        assert_eq!(parse_refresh_reuse_window(None), Ok(60_000_000_000));
+        assert_eq!(
+            ServiceConfig::default().refresh_reuse_window_ns,
+            60_000_000_000
+        );
+        assert_eq!(parse_refresh_reuse_window(Some("0")), Ok(0));
+        assert_eq!(parse_refresh_reuse_window(Some(" 45 ")), Ok(45_000_000_000));
+        assert_eq!(parse_refresh_reuse_window(Some("300")), Ok(300_000_000_000));
+        for bad in ["301", "-1", "+60", "1.5", "", "60s", "18446744073709551616"] {
+            let err = parse_refresh_reuse_window(Some(bad)).unwrap_err();
+            assert!(err.contains(REFRESH_REUSE_WINDOW_ENV), "{bad:?}: {err}");
         }
     }
 
