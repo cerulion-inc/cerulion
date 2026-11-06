@@ -96,7 +96,7 @@
 3 crates/cerulion_cli_engine/src/wedge_alarm.rs
 1 crates/cerulion_cli_engine/src/workspace.rs
 39 crates/cerulion_cli_engine/src/workspace_lock.rs
-7 crates/cerulion_connectd/src/main.rs
+6 crates/cerulion_connectd/src/main.rs
 2 crates/cerulion_connectd/src/pair.rs
 5 crates/cerulion_connectd/src/schema.rs
 9 crates/cerulion_connectd/src/worker.rs

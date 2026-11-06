@@ -23,12 +23,37 @@ const DIAL_ALLOWANCE: Duration = Duration::from_secs(20);
 
 /// Call the act verb `verb` with `args` on the robot `robot`, allowing the
 /// verb `verb_wait` for its own waits, and return its JSON result.
+///
+/// Refused with [`VerbError::Usage`] before anything else, the helper spawn
+/// included, while `CERULION_NETWORK` engages the kill-switch
+/// ([`network_refusal`]).
 pub fn call_robot_verb(
     robot: &str,
     verb: &str,
     args: &Value,
     verb_wait: Duration,
 ) -> Result<Value, VerbError> {
+    call_robot_verb_under(
+        robot,
+        verb,
+        args,
+        verb_wait,
+        std::env::var("CERULION_NETWORK").ok().as_deref(),
+    )
+}
+
+/// [`call_robot_verb`] with `network` as the `CERULION_NETWORK` value
+/// (`None` = unset).
+fn call_robot_verb_under(
+    robot: &str,
+    verb: &str,
+    args: &Value,
+    verb_wait: Duration,
+    network: Option<&str>,
+) -> Result<Value, VerbError> {
+    if let Some(refusal) = network_refusal(robot, verb, network) {
+        return Err(refusal);
+    }
     let robots = crate::connect_cmd::load_robots();
     let eid = crate::connect_cmd::resolve_eid_with(Some(robot), None, &robots)?;
     let key = crate::connect_cmd::default_connect_key_file()?.ok_or_else(|| {
@@ -60,6 +85,31 @@ pub fn call_robot_verb(
         &error_line(&stderr),
         robot,
     )
+}
+
+/// The refusal of an act-verb call while `network` (the `CERULION_NETWORK`
+/// value, `None` = unset) engages the kill-switch, under the run and query
+/// parse that `cerulion pair` and `cerulion viz --robot` use
+/// ([`crate::graph_cmd::network_env_kill_from`]): `off` after trimming,
+/// ASCII case-insensitively, engages it, any other non-empty value fails
+/// closed and engages it too, and an empty or whitespace-only value is
+/// unset. Every value the check `cerulion-connectd act` repeats refuses
+/// (the exact `off`) is refused here first.
+///
+/// The refusal names the value
+/// ([`crate::graph_cmd::NetworkEnvKill::refusal_label`]) and is
+/// [`VerbError::Usage`] (exit 2), the class [`call_robot_verb`] gives this
+/// machine's other refusals of a call (no paired device key, a helper usage
+/// error).
+pub fn network_refusal(robot: &str, verb: &str, network: Option<&str>) -> Option<VerbError> {
+    let label =
+        crate::graph_cmd::network_env_kill_from(network.map(str::to_string)).refusal_label()?;
+    Some(VerbError::Usage(format!(
+        "--robot {} reaches the robot over the network, which {label} disables; unset \
+         CERULION_NETWORK to call its {verb} verb (without --robot the command runs on this \
+         machine)",
+        crate::topic_cmd::sanitize_display(robot)
+    )))
 }
 
 /// The prefix of the stderr line `cerulion-connectd act` writes its error
@@ -392,6 +442,95 @@ mod tests {
         let mut bad = result.clone();
         bad["jpeg_base64"] = Value::from("***");
         assert!(write_snapshot(&bad, &req).is_err());
+    }
+
+    /// Restores the named environment variables on drop.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn take(names: &[&'static str]) -> Self {
+            Self(names.iter().map(|n| (*n, std::env::var_os(n))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Under the kill-switch the call is refused before the helper is
+    /// spawned: `off` in any case or with surrounding whitespace, and an
+    /// unrecognized value, which fails closed. The helper is a script that
+    /// writes a marker file when it runs and answers `{}`; this machine has a
+    /// device key and the robot is an endpoint id, so with the variable unset,
+    /// empty or whitespace-only (the controls) the same call reaches the spawn
+    /// and the marker appears.
+    #[cfg(unix)]
+    #[test]
+    fn the_kill_switch_refuses_before_the_helper_is_spawned() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::test_env::env_lock();
+        let _env = EnvRestore::take(&["CERULION_HOME", "CERULION_CONNECTD_BIN"]);
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CERULION_HOME", home.path());
+        crate::auth::identity_layout()
+            .unwrap()
+            .load_or_create_machine_key()
+            .unwrap();
+        let marker = home.path().join("helper-ran");
+        let helper = home.path().join("connectd-helper");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf ran > '{}'\nprintf '{{}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("CERULION_CONNECTD_BIN", &helper);
+        let robot = "ab".repeat(32);
+        let args = serde_json::json!({});
+        let call = |network: Option<&str>| {
+            call_robot_verb_under(&robot, "topic-publish", &args, Duration::ZERO, network)
+        };
+
+        let unrecognized = "CERULION_NETWORK=typo (an unrecognized value, which fails closed to \
+                            local-only)";
+        for (network, label) in [
+            ("off", "CERULION_NETWORK=off"),
+            ("OFF", "CERULION_NETWORK=off"),
+            (" off ", "CERULION_NETWORK=off"),
+            ("typo", unrecognized),
+        ] {
+            let refused = call(Some(network)).unwrap_err();
+            assert!(
+                !marker.exists(),
+                "the helper ran under CERULION_NETWORK={network:?}"
+            );
+            assert_eq!(refused.exit_code(), EXIT_USAGE, "{network:?}");
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "--robot {robot} reaches the robot over the network, which {label} \
+                     disables; unset CERULION_NETWORK to call its topic-publish verb (without \
+                     --robot the command runs on this machine)"
+                ),
+                "{network:?}"
+            );
+        }
+
+        for network in [None, Some(""), Some("  ")] {
+            let _ = std::fs::remove_file(&marker);
+            assert_eq!(call(network).unwrap(), serde_json::json!({}), "{network:?}");
+            assert!(marker.exists(), "{network:?}: the helper did not run");
+        }
     }
 
     #[test]

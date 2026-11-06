@@ -65,6 +65,9 @@ act verbs, work on the robot's own shared memory; with `--robot`,
   topic as a JPEG and `topic-echo-once` reads the newest message of a topic,
   decoded.
 
+While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
+`--robot` is refused on the desk before anything is sent to the robot.
+
 The only other desk to robot topic path today is LAN ingress (an `ingress:`
 block in a graph), which proves no identity per peer and is closed when
 `CERULION_LAN_ACCESS=paired`.

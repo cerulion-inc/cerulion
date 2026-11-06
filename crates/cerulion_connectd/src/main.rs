@@ -70,7 +70,8 @@ enum ConnectdCommand {
     ///
     /// # Exit codes
     ///
-    /// - `0` the result is on stdout, `1` usage or config error, `2` the verb
+    /// - `0` the result is on stdout, `1` usage or config error, or the
+    ///   network kill-switch is engaged (nothing was sent), `2` the verb
     ///   failed (the stderr line starting `act-error: ` carries the robot's
     ///   `<class>: <message>` text), `3`
     ///   the robot could not be reached in time, `4` the robot refused the
@@ -105,6 +106,10 @@ struct ActCli {
     /// Disable all relays (LAN or direct-dial only).
     #[arg(long)]
     relay_disabled: bool,
+    /// Kill-switch: pass `off` to refuse the call before the endpoint is
+    /// bound. `CERULION_NETWORK=off` also engages it.
+    #[arg(long)]
+    network: Option<String>,
 }
 
 /// `cerulion-connectd connect`: the desk-side re-inject client flags.
@@ -289,25 +294,40 @@ fn resolve_relay(
     }
 }
 
-/// Whether the `off` kill-switch is engaged (either the flag or the env). Warns
-/// on an unrecognized non-`off` value (a mistyped `--network of` must never be a
+/// Whether the `off` kill-switch is engaged (either the flag or the env) for
+/// the subcommand `command` (`connect`, `act`). Warns on an unrecognized
+/// non-`off` value (a mistyped `--network of` must never be a
 /// silently-ineffective switch).
-fn network_off(flag: Option<&str>, env: Option<&str>) -> bool {
+fn network_off(command: &'static str, flag: Option<&str>, env: Option<&str>) -> bool {
     for (src, val) in [("--network", flag), ("CERULION_NETWORK", env)] {
         match val {
             Some("off") => return true,
             Some(other) if !other.is_empty() => {
                 tracing::warn!(
+                    command = command,
                     source = src,
                     value = other,
-                    "cerulion connect: unrecognized network value (only `off` is a kill-switch); \
-                     ignoring — connecting"
+                    "cerulion-connectd: unrecognized network value (only `off` is a kill-switch); \
+                     ignoring it, the command goes ahead"
                 );
             }
             _ => {}
         }
     }
     false
+}
+
+/// The `act` refusal while the kill-switch is engaged ([`network_off`] over
+/// `--network` and `CERULION_NETWORK`, the reading `connect` uses), naming
+/// the act verb; `None` when it is not engaged.
+fn act_network_refusal(flag: Option<&str>, env: Option<&str>, verb: &str) -> Option<String> {
+    network_off("act", flag, env).then(|| {
+        format!(
+            "network kill-switch engaged (--network off / CERULION_NETWORK=off): refusing to \
+             call the robot's `{}` verb; nothing was sent",
+            verb.escape_debug()
+        )
+    })
 }
 
 fn init_tracing() {
@@ -423,6 +443,15 @@ async fn run_act_command(cli: ActCli) -> ExitCode {
         eprintln!("{ERROR_LINE_PREFIX}{msg}");
         ExitCode::from(EXIT_USAGE)
     };
+    // Read before the endpoint is bound: binding with the default relays
+    // already contacts them, and the dial follows.
+    if let Some(refusal) = act_network_refusal(
+        cli.network.as_deref(),
+        std::env::var("CERULION_NETWORK").ok().as_deref(),
+        &cli.verb,
+    ) {
+        return usage(refusal);
+    }
     let robot_eid = match parse_eid(&cli.eid) {
         Ok(e) => e,
         Err(e) => return usage(e.to_string()),
@@ -476,6 +505,7 @@ async fn run_act_command(cli: ActCli) -> ExitCode {
 /// outcome contract).
 async fn run_connect_command(cli: ConnectCli) -> ExitCode {
     if network_off(
+        "connect",
         cli.network.as_deref(),
         std::env::var("CERULION_NETWORK").ok().as_deref(),
     ) {
@@ -773,6 +803,37 @@ fn resolve_pair_code(cli_code: Option<String>) -> Result<String, String> {
 mod tests {
     use super::*;
     use cerulion_core::transport::cerulion_q::{CatalogEntry, CatalogProvenance};
+
+    /// `act` reads the kill-switch as `connect` does: the exact value `off`
+    /// in `--network` or `CERULION_NETWORK` refuses, naming the verb; an
+    /// empty, unset or other value does not.
+    #[test]
+    fn act_refuses_under_the_kill_switch_as_connect_reads_it() {
+        for (flag, env) in [
+            (Some("off"), None),
+            (None, Some("off")),
+            (Some("x"), Some("off")),
+        ] {
+            let refusal = act_network_refusal(flag, env, "service-call")
+                .unwrap_or_else(|| panic!("{flag:?} {env:?} must refuse"));
+            assert_eq!(
+                refusal,
+                "network kill-switch engaged (--network off / CERULION_NETWORK=off): refusing \
+                 to call the robot's `service-call` verb; nothing was sent"
+            );
+        }
+        for (flag, env) in [
+            (None, None),
+            (Some(""), Some("")),
+            (None, Some("OFF")),
+            (Some("of"), None),
+        ] {
+            assert_eq!(act_network_refusal(flag, env, "service-call"), None);
+            assert!(!network_off("connect", flag, env), "{flag:?} {env:?}");
+        }
+        let hostile = act_network_refusal(None, Some("off"), "x\u{1b}[2J").unwrap();
+        assert!(!hostile.chars().any(char::is_control), "{hostile:?}");
+    }
 
     #[test]
     fn pair_cli_debug_redacts_a_parsed_pairing_code() {
