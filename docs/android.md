@@ -241,7 +241,8 @@ printer = { path = "../nodes/printer", default-features = false }
 Copy the iceoryx2 `[patch.crates-io]` block from the node workspace's
 `Cargo.toml` into this file too: a patch applies only in the workspace that
 declares it. `cerulion_android`, `cerulion_core` and `native_ros2_messages`
-must resolve from one source; a split fails to compile with two different
+(and `cerulion_android_remote`, when the app hosts the remote plane) must
+resolve from one source; a split fails to compile with two different
 `NodeEntry` traits. When `cerulion_android` comes from git or a local
 checkout, take the other two from the same place:
 
@@ -780,11 +781,15 @@ in `egress`:
 
 A demand for a listed topic is served. A demand for any other topic is
 refused: the demand GET is answered `refused` and no frame of the topic
-leaves the device. An empty
+reaches that peer. An empty
 list refuses every topic. The catalog still names every topic the app serves,
 with its schema and liveness, so a desk can see that `/app/notes` exists but
 cannot receive it. A start with `egress` and an empty `listen` and `connect`
 builds no gateway, so the list has no effect and the start logs a warning.
+
+`egress` limits LAN peers only. With `remote` on, the plane the app hosts
+serves every topic to a paired desk with observe access (see
+[Host the paired remote plane](#host-the-paired-remote-plane)).
 
 ### Let a LAN peer publish into the graph
 
@@ -894,8 +899,10 @@ connection is checked against the plane's trust store; an unpaired desk is
 refused.
 
 The plane links iroh, so it lives in its own crate, `cerulion_android_remote`.
-The app runtime crate depends on it as it depends on `cerulion_android`, and
-lists its host first in `embed_nodes!` (the node list may then be empty):
+The crate is not on crates.io (it links `cerulion_remoted`, which is not
+published either), so the app runtime crate takes it by git or path from the
+same source as `cerulion_android`, and lists its host first in `embed_nodes!`
+(the node list may then be empty):
 
 ```rust
 cerulion_android::embed_nodes! {
@@ -1063,7 +1070,13 @@ The lane also checks the sample app's linked graph nodes:
 - a start after `am force-stop` succeeds in a new process over the files the
   killed process left;
 - a `tracing` line from the runtime reaches logcat under the `Cerulion` tag;
-- no SELinux denial is logged for the app's domain in any run.
+- with `remote` on, a fresh install fails its start with `REMOTE_NOT_PROVISIONED`
+  (17); after provisioning, a `paired` start reports its endpoint, and a
+  paired desk reads the app's catalog and one frame of `/app/heartbeat`
+  through the plane the app hosts;
+- no SELinux denial is logged for the app's domain in any run, except the two
+  refusals of network interface listing (`netlink_route_socket` and
+  `sysfs_net`) that Android gives every app while the hosted plane binds.
 
 Run it locally with a booted API 30 emulator:
 
