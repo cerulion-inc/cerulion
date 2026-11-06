@@ -109,7 +109,7 @@ fn establish_then_access_decision() {
         .verify_new_pairing(&good_presentation(), &peer(), T_NOW)
         .unwrap();
     assert!(
-        store.is_allowed(&acct(A_CLIENT), T_NOW).is_none(),
+        store.account_access(&acct(A_CLIENT), T_NOW).is_none(),
         "no row yet"
     );
     store
@@ -122,12 +122,12 @@ fn establish_then_access_decision() {
         )
         .unwrap();
     let row = store
-        .is_allowed(&acct(A_CLIENT), T_NOW)
+        .account_access(&acct(A_CLIENT), T_NOW)
         .expect("now allowed");
     assert_eq!(row.scope, op_scope());
     assert_eq!(row.source, PairingSource::StrongChain);
     assert!(
-        store.is_allowed(&acct(0xEE), T_NOW).is_none(),
+        store.account_access(&acct(0xEE), T_NOW).is_none(),
         "unknown account"
     );
 }

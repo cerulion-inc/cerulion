@@ -33,10 +33,11 @@ fn seed_key_and_mac(root: &std::path::Path) {
 
 #[tokio::test]
 async fn network_disabled_refuses_to_serve_without_binding() {
-    // The kill-switch short-circuits BEFORE load_state: even though the key file
-    // is absent (which would otherwise be a hard error), `run` returns Ok(())
-    // cleanly — it never loads state, never binds an endpoint. If it had tried to
-    // bind, the absent key would have surfaced an Err; the Ok proves it did not.
+    // The kill-switch short-circuits BEFORE RemotePlane::bind: even though the
+    // key file is absent (which would otherwise be a hard error), `run` returns
+    // Ok(()) cleanly; it never loads keys, never binds an endpoint. If it had
+    // tried to bind, the absent key would have surfaced an Err; the Ok proves it
+    // did not.
     let dir = tempdir().unwrap();
     let cfg =
         RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, /*disabled=*/ true);

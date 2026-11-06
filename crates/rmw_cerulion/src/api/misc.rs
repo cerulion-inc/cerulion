@@ -266,6 +266,26 @@ pub unsafe extern "C" fn rmw_serialized_message_resize(
 pub unsafe extern "C" fn rmw_publish_serialized_message(
     publisher: *const ffi::rmw_publisher_t,
     serialized_message: *const ffi::rmw_serialized_message_t,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_serialized_live(publisher, serialized_message, allocation);
+    }
+    crate::replay::output(
+        (*publisher).data as usize,
+        crate::replay::log::OutputKind::Publish,
+        || publish_serialized_live(publisher, serialized_message, allocation),
+    )
+}
+
+/// The live `rmw_publish_serialized_message`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish_serialized_message`].
+unsafe fn publish_serialized_live(
+    publisher: *const ffi::rmw_publisher_t,
+    serialized_message: *const ffi::rmw_serialized_message_t,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
@@ -371,6 +391,13 @@ pub unsafe extern "C" fn rmw_publish_serialized_message(
         header.timestamp_ns = now;
         header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
         let bytes = &frame[..];
+        if crate::replay::output_capture_armed() {
+            crate::replay::capture_output_body(
+                bytes
+                    .get(cerulion_core::wire::WireHeader::SIZE..)
+                    .unwrap_or(&[]),
+            );
+        }
         match inner.publisher.publish_raw(bytes) {
             Ok(_) => {
                 // Native history: publish_raw retained this
@@ -430,6 +457,9 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         }
         *taken = false;
         let data = &*((*subscription).data as *const crate::runtime::SubscriptionData);
+        // A serialized take bypasses the bridge: a recording marks its log not
+        // replayable.
+        crate::replay::report_serialized_take(&data.topic);
         // Poisoned = wedged: never re-enter torn iceoryx2 state.
         let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
             tracing::error!("entity wedged by an earlier panic; failing call");
@@ -437,15 +467,16 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         };
 
         let mut frame: Option<Vec<u8>> = None;
-        let mut info_out: Option<(u64, u64)> = None;
+        let mut info_out: Option<(u64, u64, u128)> = None;
         let receive = inner.subscriber.try_receive_one(|msg| {
+            let origin = msg.origin();
             // Reassemble the full frame (header + payload) — "cerulion"
             // serialization format IS the wire frame.
             let header = msg.header();
             let mut buf = vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
             header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
             buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
+            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             frame = Some(buf);
         });
         drop(inner);
@@ -471,7 +502,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         // like the deserializing take path does.
         if !message_info.is_null() {
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-            if let Some((ts, seq)) = info_out {
+            if let Some((ts, seq, _)) = info_out {
                 info.source_timestamp = ts as i64;
                 info.received_timestamp = match crate::runtime::runtime() {
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -479,7 +510,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            super::stamp_publisher_gid(&mut info, info_out.map(|(_, _, origin)| origin));
             info.from_intra_process = false;
             *message_info = info;
         }
@@ -893,11 +924,26 @@ pub unsafe extern "C" fn rmw_count_publishers(
     let Ok(key) = runtime::ros_topic_to_cerulion(topic) else {
         return RMW_RET_INVALID_ARGUMENT;
     };
-    count_in(
-        // The endpoint Vec IS the count — no parallel counter.
-        move |g| g.publishers.get(&key).map(|v| v.len()).unwrap_or(0),
-        count,
-    )
+    if count.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    let (ret, n) = crate::replay::graph(
+        crate::replay::log::GraphQuery::CountPublishers,
+        topic,
+        || {
+            let mut n = 0usize;
+            // The endpoint Vec IS the count: no parallel counter.
+            let ret = count_in(
+                move |g| g.publishers.get(&key).map(|v| v.len()).unwrap_or(0),
+                &mut n,
+            );
+            (ret, n as u64)
+        },
+    );
+    if ret == RMW_RET_OK {
+        *count = n as usize;
+    }
+    ret
 }
 
 /// # Safety
@@ -919,10 +965,25 @@ pub unsafe extern "C" fn rmw_count_subscribers(
     let Ok(key) = runtime::ros_topic_to_cerulion(topic) else {
         return RMW_RET_INVALID_ARGUMENT;
     };
-    count_in(
-        move |g| g.subscriptions.get(&key).map(|v| v.len()).unwrap_or(0),
-        count,
-    )
+    if count.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    let (ret, n) = crate::replay::graph(
+        crate::replay::log::GraphQuery::CountSubscribers,
+        topic,
+        || {
+            let mut n = 0usize;
+            let ret = count_in(
+                move |g| g.subscriptions.get(&key).map(|v| v.len()).unwrap_or(0),
+                &mut n,
+            );
+            (ret, n as u64)
+        },
+    );
+    if ret == RMW_RET_OK {
+        *count = n as usize;
+    }
+    ret
 }
 
 /// # Safety

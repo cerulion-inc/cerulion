@@ -245,8 +245,9 @@ native_ros2_messages = { git = "https://github.com/cerulion-inc/cerulion", rev =
 Take `cerulion_android` from git at one commit, `<rev>`, until crates.io
 lists it: check `https://crates.io/crates/cerulion_android` before you use
 a version requirement. `cerulion_android`, `cerulion_core` and
-`native_ros2_messages` must resolve from one source; a split fails to compile
-with two different `NodeEntry` traits. A node workspace made by a released
+`native_ros2_messages` (and `cerulion_android_remote`, when the app hosts the
+remote plane) must resolve from one source; a split fails to compile with two
+different `NodeEntry` traits. A node workspace made by a released
 `cerulion` pins `cerulion_core` and `native_ros2_messages` from crates.io at
 that release's exact version, and the two `[patch.crates-io]` entries move
 them to `<rev>` only when `<rev>` carries that same version: pick the commit
@@ -422,7 +423,7 @@ refuses with `ENCODE` returns `INVALID_ARGUMENT` when its stamp is also too
 far ahead. A refused call sends nothing.
 
 To read a node's output in the app, list the topic under `subscribe` and
-call `CerulionRuntime.poll`. It takes the oldest message off the
+call `CerulionRuntime.poll`. It takes the next message off the
 subscription's queue without waiting and appends it to a `StringBuilder` as
 the same JSON object text `publish` takes:
 
@@ -447,7 +448,10 @@ if (code == CerulionRuntime.OK) {
 ```
 
 Only `OK` appends to the builder. A subscription's queue holds `depth`
-messages; when it is full, the oldest message is dropped. `status` counts
+messages from each publisher of the topic; a graph output has one publisher,
+so it holds `depth` messages. When a publisher's part is full, its oldest
+message is dropped. Messages from one publisher come out oldest first;
+messages from different publishers keep no order between them. `status` counts
 each subscription under `subscribed`: `polled` messages `poll` returned,
 `dropped` messages missing from a publisher's message sequence, most often
 the full queue dropping its oldest, and also a send that failed after the
@@ -461,8 +465,18 @@ dropped before the first one the subscription receives from that publisher
 is not counted. A message that
 does not decode, for example one of another schema, is still taken off the
 queue, so the next poll reads the one after it. The runtime creates every
-subscription before the graph runs, so it receives the first message a node
-sends. A subscription can read a graph output, an app `publish` topic, or a
+subscription after the graph build, which runs each node's `init`, and
+before the first tick, so a subscription receives every message a node
+sends from `tick`, from the first one on. A message a node sends from `init`
+is not in the queue unless the node's output declares `history_size` (see
+the [graph YAML reference](user-api.md#graph-yaml-reference)): the node's
+publisher then delivers its last `history_size` messages, up to the
+subscription's `depth`, at the graph's next loop pass, as to any late
+joiner, as long as the node keeps its publisher and forwards the history
+pump. A node made with the node macros does both. A hand-written
+`NodeEntry` must forward `pump_history` and `pump_history_at` to its
+`NodeContext`, because their default does nothing. A
+subscription can read a graph output, an app `publish` topic, or a
 topic another publisher in the process sends; a start logs a warning for a
 subscribe topic that is neither an app `publish` topic nor a graph output,
 because a misspelled topic polls `EMPTY` forever. `poll` reads a run that
@@ -829,11 +843,15 @@ in `egress`:
 
 A demand for a listed topic is served. A demand for any other topic is
 refused: the demand GET is answered `refused` and no frame of the topic
-leaves the device. An empty
+reaches that peer. An empty
 list refuses every topic. The catalog still names every topic the app serves,
 with its schema and liveness, so a desk can see that `/app/notes` exists but
 cannot receive it. A start with `egress` and an empty `listen` and `connect`
 builds no gateway, so the list has no effect and the start logs a warning.
+
+`egress` limits LAN peers only. With `remote` on, the plane the app hosts
+serves every topic to a paired desk with observe access (see
+[Host the paired remote plane](#host-the-paired-remote-plane)).
 
 ### What a desk reads about the app's graph
 
@@ -977,11 +995,12 @@ connection is checked against the plane's trust store; an unpaired desk is
 refused.
 
 The plane links iroh, so it lives in its own crate, `cerulion_android_remote`.
-That crate is not published to crates.io, because the remote plane it links
-is not. Take it from git at the same `rev` as `cerulion_android`, so both
-resolve from one source; an app that hosts the plane therefore takes
-`cerulion_android` from git too, with the `[patch.crates-io]` entries shown
-in [Graph nodes in an app](#graph-nodes-in-an-app):
+That crate is not published to crates.io, because it links `cerulion_remoted`,
+which is not published either. Take it from git at the same `rev` as
+`cerulion_android`, or by `path` from the same checkout, so both resolve from
+one source; an app that hosts the plane therefore takes `cerulion_android`
+from git or a checkout too, with the `[patch.crates-io]` entries shown in
+[Graph nodes in an app](#graph-nodes-in-an-app):
 
 ```toml
 [dependencies]
@@ -1158,7 +1177,13 @@ The lane also checks the sample app's linked graph nodes:
 - a start after `am force-stop` succeeds in a new process over the files the
   killed process left;
 - a `tracing` line from the runtime reaches logcat under the `Cerulion` tag;
-- no SELinux denial is logged for the app's domain in any run.
+- with `remote` on, a fresh install fails its start with `REMOTE_NOT_PROVISIONED`
+  (17); after provisioning, a `paired` start reports its endpoint, and a
+  paired desk reads the app's catalog and one frame of `/app/heartbeat`
+  through the plane the app hosts;
+- no SELinux denial is logged for the app's domain in any run, except the two
+  refusals of network interface listing (`netlink_route_socket` and
+  `sysfs_net`) that Android gives every app while the hosted plane binds.
 
 Run it locally with a booted API 30 emulator:
 
