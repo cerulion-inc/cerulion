@@ -492,6 +492,7 @@ dependencies = [
  "cerulion_netd",
  "clap",
  "ctrlc",
+ "libc",
  "native_ros2_messages",
  "regex",
  "serde",
@@ -630,9 +631,11 @@ dependencies = [
 name = "cerulion_macros"
 version = "2.0.0"
 dependencies = [
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+ "toml_edit",
 ]
 
 [[package]]
