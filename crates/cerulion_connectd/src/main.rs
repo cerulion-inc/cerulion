@@ -65,6 +65,51 @@ enum ConnectdCommand {
     /// to its access list. Afterwards `cerulion connect <robot>` is admitted
     /// with no flags.
     Pair(PairCli),
+    /// Call one of the robot's act verbs (`topic-publish`, `service-call`,
+    /// `topic-snapshot`, `topic-echo-once`) and print its JSON result.
+    ///
+    /// # Exit codes
+    ///
+    /// - `0` the result is on stdout, `1` usage or config error, or the
+    ///   network kill-switch is engaged (nothing was sent), `2` the verb
+    ///   failed (the stderr line starting `act-error: ` carries the robot's
+    ///   `<class>: <message>` text), `3`
+    ///   the robot could not be reached in time, `4` the robot refused the
+    ///   call or does not serve the verb.
+    Act(ActCli),
+}
+
+/// `cerulion-connectd act`: one act-verb call.
+#[derive(Parser, Debug)]
+struct ActCli {
+    /// The robot's iroh endpoint id (64-char hex).
+    #[arg(long, value_name = "HEX")]
+    eid: String,
+    /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable.
+    #[arg(long = "addr", value_name = "IP:PORT")]
+    addrs: Vec<String>,
+    /// The desk device key file the robot paired with.
+    #[arg(long, value_name = "PATH")]
+    key_file: Option<PathBuf>,
+    /// The verb to call.
+    #[arg(long, value_name = "VERB")]
+    verb: String,
+    /// The verb's arguments as one JSON object.
+    #[arg(long, value_name = "JSON")]
+    args: String,
+    /// Seconds the dial, the handshake and the call may take in total.
+    #[arg(long, value_name = "SECS", default_value_t = 30.0)]
+    timeout: f64,
+    /// Self-hosted relay URL. Default: n0 public relays.
+    #[arg(long, env = "CERULION_RELAY_URL")]
+    relay_url: Option<String>,
+    /// Disable all relays (LAN or direct-dial only).
+    #[arg(long)]
+    relay_disabled: bool,
+    /// Kill-switch: pass `off` to refuse the call before the endpoint is
+    /// bound. `CERULION_NETWORK=off` also engages it.
+    #[arg(long)]
+    network: Option<String>,
 }
 
 /// `cerulion-connectd connect`: the desk-side re-inject client flags.
@@ -249,25 +294,40 @@ fn resolve_relay(
     }
 }
 
-/// Whether the `off` kill-switch is engaged (either the flag or the env). Warns
-/// on an unrecognized non-`off` value (a mistyped `--network of` must never be a
+/// Whether the `off` kill-switch is engaged (either the flag or the env) for
+/// the subcommand `command` (`connect`, `act`). Warns on an unrecognized
+/// non-`off` value (a mistyped `--network of` must never be a
 /// silently-ineffective switch).
-fn network_off(flag: Option<&str>, env: Option<&str>) -> bool {
+fn network_off(command: &'static str, flag: Option<&str>, env: Option<&str>) -> bool {
     for (src, val) in [("--network", flag), ("CERULION_NETWORK", env)] {
         match val {
             Some("off") => return true,
             Some(other) if !other.is_empty() => {
                 tracing::warn!(
+                    command = command,
                     source = src,
                     value = other,
-                    "cerulion connect: unrecognized network value (only `off` is a kill-switch); \
-                     ignoring — connecting"
+                    "cerulion-connectd: unrecognized network value (only `off` is a kill-switch); \
+                     ignoring it, the command goes ahead"
                 );
             }
             _ => {}
         }
     }
     false
+}
+
+/// The `act` refusal while the kill-switch is engaged ([`network_off`] over
+/// `--network` and `CERULION_NETWORK`, the reading `connect` uses), naming
+/// the act verb; `None` when it is not engaged.
+fn act_network_refusal(flag: Option<&str>, env: Option<&str>, verb: &str) -> Option<String> {
+    network_off("act", flag, env).then(|| {
+        format!(
+            "network kill-switch engaged (--network off / CERULION_NETWORK=off): refusing to \
+             call the robot's `{}` verb; nothing was sent",
+            verb.escape_debug()
+        )
+    })
 }
 
 fn init_tracing() {
@@ -369,6 +429,74 @@ async fn main() -> ExitCode {
     match cli.command {
         ConnectdCommand::Connect(c) => run_connect_command(c).await,
         ConnectdCommand::Pair(p) => run_pair_command(p).await,
+        ConnectdCommand::Act(a) => run_act_command(a).await,
+    }
+}
+
+/// The `act` subcommand: one act-verb call, its result on stdout.
+// Logging-rule exception: stdout carries the verb's JSON result and stderr the
+// robot's error text, the output protocol `cerulion ... --robot` reads.
+#[allow(clippy::print_stdout, clippy::print_stderr)]
+async fn run_act_command(cli: ActCli) -> ExitCode {
+    use cerulion_connectd::act::{run_act, ActConfig, ERROR_LINE_PREFIX, EXIT_OK, EXIT_USAGE};
+    let usage = |msg: String| {
+        eprintln!("{ERROR_LINE_PREFIX}{msg}");
+        ExitCode::from(EXIT_USAGE)
+    };
+    // Read before the endpoint is bound: binding with the default relays
+    // already contacts them, and the dial follows.
+    if let Some(refusal) = act_network_refusal(
+        cli.network.as_deref(),
+        std::env::var("CERULION_NETWORK").ok().as_deref(),
+        &cli.verb,
+    ) {
+        return usage(refusal);
+    }
+    let robot_eid = match parse_eid(&cli.eid) {
+        Ok(e) => e,
+        Err(e) => return usage(e.to_string()),
+    };
+    let direct_addrs = match parse_addrs(&cli.addrs) {
+        Ok(a) => a,
+        Err(e) => return usage(e.to_string()),
+    };
+    let desk_seed = match resolve_desk_seed(cli.key_file.as_deref()) {
+        Ok(s) => s,
+        Err(e) => return usage(e.to_string()),
+    };
+    let relay = match resolve_relay(cli.relay_url.as_deref(), cli.relay_disabled) {
+        Ok(r) => r,
+        Err(e) => return usage(e.to_string()),
+    };
+    let args: serde_json::Value = match serde_json::from_str(&cli.args) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        Ok(_) => return usage("--args must be a JSON object".to_string()),
+        Err(e) => return usage(format!("--args is not JSON: {e}")),
+    };
+    let Ok(timeout) = std::time::Duration::try_from_secs_f64(cli.timeout) else {
+        return usage(format!(
+            "--timeout must be 0 or more seconds, got {}",
+            cli.timeout
+        ));
+    };
+    let config = ActConfig {
+        robot_eid,
+        direct_addrs,
+        desk_seed,
+        relay,
+        verb: cli.verb,
+        args,
+        timeout,
+    };
+    match run_act(config).await {
+        Ok(result) => {
+            println!("{result}");
+            ExitCode::from(EXIT_OK)
+        }
+        Err(e) => {
+            eprintln!("{ERROR_LINE_PREFIX}{e}");
+            ExitCode::from(e.exit_code())
+        }
     }
 }
 
@@ -377,6 +505,7 @@ async fn main() -> ExitCode {
 /// outcome contract).
 async fn run_connect_command(cli: ConnectCli) -> ExitCode {
     if network_off(
+        "connect",
         cli.network.as_deref(),
         std::env::var("CERULION_NETWORK").ok().as_deref(),
     ) {
@@ -674,6 +803,37 @@ fn resolve_pair_code(cli_code: Option<String>) -> Result<String, String> {
 mod tests {
     use super::*;
     use cerulion_core::transport::cerulion_q::{CatalogEntry, CatalogProvenance};
+
+    /// `act` reads the kill-switch as `connect` does: the exact value `off`
+    /// in `--network` or `CERULION_NETWORK` refuses, naming the verb; an
+    /// empty, unset or other value does not.
+    #[test]
+    fn act_refuses_under_the_kill_switch_as_connect_reads_it() {
+        for (flag, env) in [
+            (Some("off"), None),
+            (None, Some("off")),
+            (Some("x"), Some("off")),
+        ] {
+            let refusal = act_network_refusal(flag, env, "service-call")
+                .unwrap_or_else(|| panic!("{flag:?} {env:?} must refuse"));
+            assert_eq!(
+                refusal,
+                "network kill-switch engaged (--network off / CERULION_NETWORK=off): refusing \
+                 to call the robot's `service-call` verb; nothing was sent"
+            );
+        }
+        for (flag, env) in [
+            (None, None),
+            (Some(""), Some("")),
+            (None, Some("OFF")),
+            (Some("of"), None),
+        ] {
+            assert_eq!(act_network_refusal(flag, env, "service-call"), None);
+            assert!(!network_off("connect", flag, env), "{flag:?} {env:?}");
+        }
+        let hostile = act_network_refusal(None, Some("off"), "x\u{1b}[2J").unwrap();
+        assert!(!hostile.chars().any(char::is_control), "{hostile:?}");
+    }
 
     #[test]
     fn pair_cli_debug_redacts_a_parsed_pairing_code() {

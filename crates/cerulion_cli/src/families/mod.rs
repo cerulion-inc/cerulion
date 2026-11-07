@@ -34,6 +34,7 @@ use crate::cli::{Cli, VerbLogClass};
 mod doctor;
 mod nested;
 mod schema;
+mod service;
 
 /// One top-level verb family. See the module docs for the contract.
 ///
@@ -64,7 +65,8 @@ pub(crate) trait VerbFamily: Sync {
 }
 
 /// Every registered family. Adding a family is one line here.
-pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema, &doctor::Doctor];
+pub(crate) static FAMILIES: &[&dyn VerbFamily] =
+    &[&schema::Schema, &service::Service, &doctor::Doctor];
 
 /// Why a set of families cannot be registered.
 #[derive(Debug, Clone, PartialEq, Eq)]

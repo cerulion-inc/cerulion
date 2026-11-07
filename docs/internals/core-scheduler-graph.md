@@ -340,14 +340,18 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   carries a 4-byte wake epoch beside the counter: the publisher bumps both and, while a
   consumer holds the page's `parked` claim, issues `os_sync_wake_by_address_all`, and
   the consumer kernel-blocks on the epoch instead of pacing
-  (`CERULION_DOORBELL_OS_SYNC=0` drops that block).
+  (`CERULION_DOORBELL_OS_SYNC=0` drops that block). The Linux and Android page has the
+  same layout with a futex word: the publisher bumps the counter, reads `parked`, and
+  only while a consumer holds a claim bumps the word and issues a shared `FUTEX_WAKE`,
+  so a host whose consumers park in hardware pays one increment and one load per ring.
 - Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT) / AMD MWAITX where
   present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
   cannot hit the cache-flushing deep C-state); no-primitive targets (macOS included) run
   the park default-ON in a degraded chunked short-sleep-recheck: never a busy-spin,
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
   wakes hot). That arm tries three kernel blocks before it paces, in order: a credit
-  word, barrier arrival, and on macOS the primary topic's doorbell epoch. A process
+  word, barrier arrival, and the primary topic's doorbell epoch (macOS, Linux and
+  Android). A process
   blocks on one address, so the first that applies owns it.
 - The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs

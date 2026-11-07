@@ -1048,8 +1048,9 @@ so logcat can show an `avc: denied` line for `netlink_route_socket`
 The plane reads the app's topics on the app's own transport, so the app runs
 no network daemon. It serves every topic of the app's transport to a paired
 desk; `egress` applies to LAN peers only. A desk can read; it cannot publish
-into the app. The plane refuses the `restart` and `engage-estop` verbs, which
-only the `cerulion-remoted` daemon serves.
+into the app. The plane refuses the `restart` and `engage-estop` verbs and the
+act verbs (`topic-publish`, `service-call`, `topic-snapshot`,
+`topic-echo-once`), which only the `cerulion-remoted` daemon serves.
 
 ## Single-process apps
 
@@ -1217,8 +1218,8 @@ node libraries are built on a host and retain their target-triple directory
 when copied to a device. An Android app runs only the graph nodes linked into
 its native library, cannot run a graph with `process_groups` (error code 5),
 and cannot run `cerulion viz`. A desk cannot publish into an app through the
-paired remote plane, and the plane an app hosts refuses `restart` and
-`engage-estop`. A line
+paired remote plane, and the plane an app hosts refuses `restart`,
+`engage-estop` and the act verbs. A line
 logged through the `log` crate instead of `tracing` does not reach logcat. A
 `cerulion topic list` run on the device cannot see an app's topics; read them
 from a host through the app's gateway. Emulator networking does not pass

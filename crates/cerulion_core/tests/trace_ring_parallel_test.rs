@@ -718,8 +718,60 @@ fn multi_level_dag_pushes_one_boundary_per_step_not_per_level() {
             }
         }
     }
+    // Every edge carries its writer as PRODUCER annotations, one per writer run,
+    // whose token is a hash of a run-random port id: assert each pairs with the
+    // read after it by node, input, served sequence and role, that each edge's
+    // one writer opens one run per read site, then compare the rest of the
+    // stream to the oracle.
+    let producer = cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+    let is_annotation = |r: &TraceRingRecord| {
+        r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+            && cerulion_core::trace_ring::unpack_read_outcome_meta(r.global_level).1 == producer
+    };
+    let mut annotations = 0;
+    for (i, r) in records.iter().enumerate() {
+        if is_annotation(r) {
+            let read = records[i + 1];
+            assert_eq!(
+                (read.node_idx, read.fire_time_ns, read.global_level >> 14),
+                (r.node_idx, r.fire_time_ns, r.global_level >> 14),
+                "an annotation names the read right after it"
+            );
+            annotations += 1;
+        }
+    }
+    let reads_and_rest: Vec<TraceRingRecord> = records
+        .iter()
+        .copied()
+        .filter(|r| !is_annotation(r))
+        .collect();
+    let runs: std::collections::BTreeSet<(u32, u16, usize)> = reads_and_rest
+        .iter()
+        .filter(|r| {
+            r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                && r.fire_time_ns != cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME
+        })
+        .map(|r| {
+            (
+                r.node_idx,
+                cerulion_core::trace_ring::unpack_read_outcome_meta(r.global_level).0,
+                cerulion_core::read_outcome::writer_run_site(
+                    cerulion_core::trace_ring::read_site_role(r.global_level),
+                ),
+            )
+        })
+        .collect();
+    assert!(
+        annotations < (STEPS * 2) as usize,
+        "PREMISE: the reads outnumber their writer runs"
+    );
     assert_eq!(
-        records, oracle,
+        annotations,
+        runs.len(),
+        "one annotation per writer run: each edge has one writer, one run per read site"
+    );
+    assert_eq!(
+        reads_and_rest, oracle,
         "boundary + 3-level fire/read-outcome interleave matches the hand oracle"
     );
 

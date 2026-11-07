@@ -3369,6 +3369,10 @@ pub struct IngressInjector {
     /// First-of-regime warn latch (flood-suppression), shared with the
     /// rate-conscious rejection/re-inject-failure loggers.
     warn: IngressWarnLatch,
+    /// The topic's data service, which [`Self::subscriber_count`] reads;
+    /// held only by an injector from
+    /// [`TransportManager::create_ingress_injector_with`].
+    data_service: Option<super::DataServiceFactory>,
     // Dropped LAST: remote identity must outlive the injection publisher.
     _origin: Option<super::mirror_origin::MirrorOrigin>,
 }
@@ -3401,8 +3405,28 @@ impl IngressInjector {
             publisher: Mutex::new(publisher),
             counters: Arc::new(IngressCounters::default()),
             warn: IngressWarnLatch::default(),
+            data_service: None,
             _origin: origin,
         }
+    }
+
+    /// This injector holding `data_service`, the topic's data service, for
+    /// [`Self::subscriber_count`].
+    pub(crate) fn with_data_service(mut self, data_service: super::DataServiceFactory) -> Self {
+        self.data_service = Some(data_service);
+        self
+    }
+
+    /// How many subscribers the topic's data service has attached now, from
+    /// every process on this host: the dynamic config's subscriber count, one
+    /// shared-memory read. `None` for an injector that holds no data service
+    /// (every constructor but
+    /// [`TransportManager::create_ingress_injector_with`]).
+    pub fn subscriber_count(&self) -> Option<usize> {
+        use iceoryx2::service::port_factory::PortFactory as _;
+        self.data_service
+            .as_ref()
+            .map(|service| service.dynamic_config().number_of_subscribers())
     }
 
     /// The canonical topic this injector re-injects into.

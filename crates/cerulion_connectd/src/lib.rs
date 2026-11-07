@@ -46,6 +46,7 @@
 // the parity/reinject tests) — keeps resolving with no source change.
 pub use cerulion_wireclient::{config, error, protocol};
 
+pub mod act;
 pub mod pair;
 pub mod schema;
 pub mod worker;

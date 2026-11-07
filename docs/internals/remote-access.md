@@ -42,9 +42,13 @@ the same entry instead of running the daemon.
   reads a key file or the default socket path itself: a serving change lands
   once for both hosts. A library host
   (`RemotePlane::new`) refuses the daemon-only verbs by name with
-  `unsupported_host`: `restart` (it restarts a systemd unit) and `engage-estop`
+  `unsupported_host`: `restart` (it restarts a systemd unit), `engage-estop`
   (it engages the daemon's control lease and incident capture; a host that served
-  it would report an e-stop that stops nothing). The authorizer still runs first,
+  it would report an e-stop that stops nothing), and the act verbs
+  `topic-publish`, `service-call`, `topic-snapshot` and `topic-echo-once` (they
+  run on the process's transport singleton and the daemon's schema directory, and
+  the two that send are gated by the daemon's e-stop, which a library host does
+  not serve). The authorizer still runs first,
   so an unpaired caller is denied as on the daemon. A library host announces
   `cerulion-remote-plane` in the ops handshake, not `cerulion-remoted`, does not
   read the `--network` / `CERULION_NETWORK` kill switch (the host decides
@@ -258,12 +262,19 @@ reopening redeclares both. A callback that checks the posture after the close,
 even one still in flight when the close returns, refuses and counts its frame.
 The demand GET loop does not consult the posture: it keeps sending GETs while
 paired, and each GET's selector names one ingress topic it demands. The
-remote plane does not carry writes from a desk: `cerulion/wire/2` moves frames
-from robot to desk only, and the `teleop` verb has no handler yet (see
-`docs/remote_plane.md`). Its re-inject seam is the desk-side path that copies
-robot frames into the desk's own shared memory; it does not consult the LAN
-posture and it is not a write path to the robot. Under `Paired` a desk has no
-way to write a robot topic today. Oracle tests:
+remote plane's wire protocol does not carry writes from a desk:
+`cerulion/wire/2` moves frames from robot to desk only, and the `teleop` verb
+has no handler yet (see `docs/remote_plane.md`). Its re-inject seam is the
+desk-side path that copies robot frames into the desk's own shared memory; it
+does not consult the LAN posture and it is not a write path to the robot. A desk
+writes the robot's topics and services over the ops plane instead (§5.1):
+`topic-publish` publishes a message on a robot topic and `service-call` calls a
+robot service, in the robot's own shared memory, for an account with
+`CAP_TELEOP` and role ≥ OPERATOR. Neither consults the LAN posture; both are
+refused while the robot's e-stop latch is engaged, and `topic-publish` refuses a
+topic under `/__cerulion`. Under `Paired` a desk writes a message it supplies
+into the robot's shared memory only through `topic-publish` and `service-call`.
+Oracle tests:
 `demand_authorizer.rs` unit tests,
 `demand_reconcile_never_enables_a_refused_demand` and
 `paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate` (the
@@ -278,11 +289,17 @@ The LAN posture is a whole-plane switch: a LAN source address proves no
 identity, so per-peer LAN authorization, with each LAN peer's identity bound to
 its pairing key, is not supported yet. The paired remote plane
 binds each session to its pairing key over an authenticated transport and
-authorizes each peer and each demanded topic, with revocation. It carries the
-observe direction only (robot to desk topic data). The teleop command direction is
-classified (`teleop` needs `CAP_TELEOP`) but has no handler, so a desk cannot
-teleoperate a robot over it yet. The ops protocol still runs the verbs the
-robot registers (for example `restart` and `engage-estop`).
+authorizes each peer and each demanded topic, with revocation. Its wire protocol
+carries the observe direction only (robot to desk topic data). The teleop
+command direction is classified (`teleop` needs `CAP_TELEOP`) but has no
+handler, so no verb takes the control lease or runs under the deadman yet. The
+ops protocol still runs the verbs the robot registers (for example `restart` and
+`engage-estop`), the act verbs among them (§5.1): with `CAP_TELEOP` and
+role ≥ OPERATOR a desk publishes a message on a robot topic (`topic-publish`) or
+calls a robot service (`service-call`), both refused while the e-stop latch is
+engaged and neither taking the control lease, and with `CAP_OBSERVE` and
+role ≥ VIEWER it reads one message of a topic (`topic-echo-once`) or a camera
+snapshot (`topic-snapshot`).
 
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/
@@ -339,6 +356,38 @@ robot registers (for example `restart` and `engage-estop`).
   issuer down and the relay unreachable: direct dial + the offline trust store;
   the issuer and relay are conveniences, not dependencies
   (`offline_connect_test.rs`).
+
+### 5.1 The act verbs (`act_verbs.rs`)
+
+Four ops verbs run generic operations on the robot's own shared memory for a
+paired peer, so a desk can act on a ROS 2 stack (on `rmw_cerulion`) or a
+Cerulion graph without a LAN egress path for the topic or service:
+
+| verb | row in `classify_verb` | mutating | result |
+|---|---|---|---|
+| `topic-publish` `{topic, type, message, times?, rate_hz?, wait_subscribers_s?}` | `CAP_TELEOP`, role OPERATOR | yes | `{topic, type, frames, subscribers, skipped, line}` |
+| `service-call` `{service, type, request?, timeout_s?}` | `CAP_TELEOP`, role OPERATOR | yes | `{response, response_text}` (`response_text`: the response as one JSON line, fields in declaration order) |
+| `topic-snapshot` `{topic, timeout_s?, quality?}` | `CAP_OBSERVE`, role VIEWER | no | `{jpeg_base64, width, height, encoding, stamp_ns, bytes}` |
+| `topic-echo-once` `{topic, timeout_s?}` | `CAP_OBSERVE`, role VIEWER | no | `{type, stamp_ns, sequence, message}` |
+
+The operations are `cerulion_msgio`'s, the ones `cerulion topic pub`,
+`service call` and `topic snapshot` run locally. Types resolve from the
+built-in corpus plus the `.msg`/`.srv` store under the directory
+`CERULION_REMOTED_SCHEMAS_DIR` names (read per call). A failure is
+`CerudError::Verb` whose text starts with the error class (`usage: `,
+`encode: `, `unavailable: `, `internal: `); the desk maps the class to the
+CLI's exit code (2, 1, 3, 1). Timeouts are capped at 60 s and a result at
+12 MiB, inside the 16 MiB ops frame, and a `message` or `request` at 1 MiB of
+text. `topic-publish` and `service-call` are refused while
+the e-stop latch (`cerud::lease::ControlLease`) is engaged; a running publish
+or call checks the latch every 10 ms and stops when it engages, a call
+stopped before its request goes out sends none, and a publish sends each
+frame, and a call its request, only while it holds the lease's lock and reads
+the latch clear. A publish is
+refused when its subscriber wait plus its frames at the rate exceed 90 s, and
+is stopped if it is still running 100 s after it started (a frame that takes
+longer to send than its period delays the rest). A topic under
+`/__cerulion` is refused. `service-call` also returns `response_text`.
 
 ## 6. The wire plane (robot side)
 
@@ -687,6 +736,9 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 
 | Test file | What it pins (1 line) |
 |---|---|
+| `crates/cerulion_remoted/tests/act_verbs_daemon_test.rs` | Every act verb is registered in the production `serve_endpoint` daemon: each answers `{}` with its own usage error over a real ops session |
+| `crates/cerulion_remoted/tests/act_verbs_cloud_test.rs` | The act verbs under the allow-from-cloud switch: a cloud device is refused publish and snapshot only while the switch is off |
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, the unavailable class |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |
@@ -709,6 +761,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/beacon_facts_test.rs` | Beacon-facts atomic write/round-trip/claimable flip |
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
 | `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
+| `crates/cerulion_connectd/tests/act_network_switch_test.rs` | The real `cerulion-connectd act` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same call dials it |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |

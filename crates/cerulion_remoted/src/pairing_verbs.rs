@@ -34,7 +34,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cerud::error::{CerudError, CerudResult};
-use cerud::lease::ControlLease;
 use cerud::transport::CallerIdentity;
 use cerud::verbs::VerbHandler;
 
@@ -49,6 +48,7 @@ use cerulion_pairing::verify::{
 use cerulion_pairing::PairingError;
 
 use crate::clock::RemotedClock;
+use crate::estop_lease::EstopLease;
 use crate::flashback::{EstopCaptureAsk, TransportAsk};
 use crate::trust::{SharedTrust, CODE_PAIR_SCOPE};
 
@@ -626,7 +626,8 @@ impl VerbHandler for CodePairFinishVerb {
 /// The engager recorded in the lease is `caller.id` — the TLS-authenticated
 /// device key hex, which is STABLE per pairing (a reconnect from the same paired
 /// device presents the SAME key), NEVER the ephemeral QUIC connection id. So the
-/// [`ControlLease`] session token survives a WAN drop + reopen: within the deadman
+/// [`ControlLease`](cerud::lease::ControlLease) session token survives a WAN
+/// drop + reopen: within the deadman
 /// window a reconnect re-presents the same token, and `engage_estop` is idempotent
 /// (it keeps the ORIGINAL engager). E-stop is robot STATE (`EstopState::Engaged`)
 /// that persists across reconnects until cleared — a transient reconnect never
@@ -635,7 +636,7 @@ impl VerbHandler for CodePairFinishVerb {
 /// §Q6; pinned by
 /// `cerud/tests/lease_test.rs` + `cerulion_remoted/tests/estop_starvation_test.rs`.)
 pub struct EngageEstopVerb {
-    lease: Arc<Mutex<ControlLease>>,
+    lease: EstopLease,
     /// Who to tell that an incident was declared.
     ///
     /// NOT an `Option`. A verb built by the only constructor a production build
@@ -647,12 +648,15 @@ pub struct EngageEstopVerb {
 }
 
 impl EngageEstopVerb {
-    /// Build the e-stop verb over the shared control lease.
+    /// Build the e-stop verb over the shared control lease. It engages
+    /// through [`EstopLease::engage`], which counts the engage in before it
+    /// waits for the lease's lock; the act verbs built from clones of the
+    /// same `lease` send nothing while it is counted.
     ///
     /// Wires the PRODUCTION capture ask. It opens no transport here and none at
     /// rest — only an actual engage reaches iceoryx2, on a detached thread (see
     /// [`crate::flashback`]).
-    pub fn new(lease: Arc<Mutex<ControlLease>>) -> Self {
+    pub fn new(lease: EstopLease) -> Self {
         EngageEstopVerb {
             lease,
             capture: Arc::new(TransportAsk::new()),
@@ -670,10 +674,13 @@ impl EngageEstopVerb {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seam"))]
     pub fn with_capture_ask(
-        lease: Arc<Mutex<ControlLease>>,
+        lease: impl Into<EstopLease>,
         capture: Arc<dyn EstopCaptureAsk>,
     ) -> Self {
-        EngageEstopVerb { lease, capture }
+        EngageEstopVerb {
+            lease: lease.into(),
+            capture,
+        }
     }
 }
 
@@ -692,8 +699,7 @@ impl VerbHandler for EngageEstopVerb {
         caller: &CallerIdentity,
         _args: &serde_json::Value,
     ) -> CerudResult<serde_json::Value> {
-        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
-        let safe = lease.engage_estop(&caller.id);
+        let safe = self.lease.engage(&caller.id);
         tracing::warn!(by = %caller.id, "cerulion_remoted: e-stop ENGAGED (safety floor)");
         // A human declared an incident; ask the machine's
         // recorder for the moment.
@@ -715,6 +721,7 @@ impl VerbHandler for EngageEstopVerb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerud::lease::ControlLease;
 
     #[test]
     fn caller_device_key_requires_auth_and_a_32_byte_hex_id() {
@@ -784,7 +791,7 @@ mod tests {
         // (production always dispatches via `execute_with_caller`). Test it on the
         // e-stop verb (it needs only a lease, no trust store).
         let lease = Arc::new(Mutex::new(ControlLease::with_default_window()));
-        let v = EngageEstopVerb::new(lease);
+        let v = EngageEstopVerb::new(EstopLease::new(lease));
         let err = v.execute(&serde_json::json!({})).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("caller-bound bootstrap verb"), "{msg}");
