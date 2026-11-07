@@ -21,6 +21,8 @@
 //! | `restart` / `deploy` | Normal | Role ≥ `OPERATOR` (a lifecycle mutation; no fine-grained cap models it, so the role IS the gate). |
 //! | `teleop` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR` — actuation. |
 //! | `cloud-access` | Normal | Role `OWNER`; the handler also requires a non-cloud owner row. |
+//! | `topic-publish` / `service-call` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR`: act on the robot's shared memory (`act_verbs`). |
+//! | `topic-snapshot` / `topic-echo-once` | Normal | `CAP_OBSERVE` (role ≥ `VIEWER`): read one frame. |
 //! | *any other* | — | **DENY** (deny-by-default; an unclassified verb is refused, never fail-open — a new mutating verb must be classified here). |
 //!
 //! Before the class is consulted, a key whose access is
@@ -99,6 +101,22 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
         verbs::CLOUD_ACCESS => VerbClass::Normal(AccessRequirement {
             required_caps: 0,
             max_role: Role::OWNER,
+        }),
+        crate::act_verbs::TOPIC_PUBLISH => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        }),
+        crate::act_verbs::SERVICE_CALL => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        }),
+        crate::act_verbs::TOPIC_SNAPSHOT => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        }),
+        crate::act_verbs::TOPIC_ECHO_ONCE => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
         }),
         _ => return None,
     })

@@ -27,7 +27,8 @@
 //!   through a [`KeyProvider`] and binds the endpoint; [`BoundPlane::serve`] runs
 //!   the accept loop. The daemon's [`run`] serves
 //!   [`RemotedConfig::daemon_plane`] with the [`KeyFiles`] provider; a library
-//!   host refuses the daemon-only `restart` and `engage-estop` verbs by name.
+//!   host refuses the daemon-only `restart`, `engage-estop` and act verbs by
+//!   name.
 //! - [`daemon`]: the kill switch, then the serving core: the `accept_one` loop dispatching on
 //!   the negotiated protocol. Each accepted connection is classified by the
 //!   authorizer and handed to the wire plane or the ops plane; a connection that is
@@ -67,6 +68,8 @@
 //!   stream to `cerud::OpsServer::serve_connection` via a `QuicOpsStream` adapter.
 //! - [`pairing_verbs`]: the self-gating bootstrap and safety verbs (`claim`, `pair`,
 //!   `code-pair-start`, `code-pair-finish`, `engage-estop`).
+//! - [`estop_lease`]: the control lease shared with a count of the e-stop engages
+//!   waiting for its lock, which the act verbs read before each send.
 //! - [`flashback`]: publishes a capture request when the ops-plane e-stop is engaged.
 //! - [`clock`]: the robot's TRUSTED clock for pairing verification (never a
 //!   client-supplied time).
@@ -83,6 +86,7 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod act_verbs;
 pub mod authorizer;
 pub mod beacon_facts;
 pub mod clock;
@@ -91,6 +95,7 @@ pub mod daemon;
 pub mod device_index;
 pub mod epoch_pull;
 pub mod error;
+pub mod estop_lease;
 pub mod flashback;
 pub mod forward;
 pub mod host;
@@ -117,6 +122,7 @@ pub use daemon::{
 };
 pub use device_index::DeviceAccountIndex;
 pub use error::RemotedError;
+pub use estop_lease::EstopLease;
 pub use flashback::{EstopCaptureAsk, TransportAsk};
 pub use host::{BoundPlane, KeyFiles, KeyProvider, RemotePlane};
 pub use local_schema::SchemaSource;

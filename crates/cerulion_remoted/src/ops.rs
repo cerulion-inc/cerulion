@@ -36,13 +36,17 @@
 //! log behind a brief-append `Mutex`, so ONE [`Arc<OpsServer>`] serves EVERY
 //! session CONCURRENTLY. A stalled/hostile session — parked on a blocking read,
 //! holding NO lock — cannot delay another session. In particular a paired
-//! `engage-estop` runs on its OWN concurrent session and reaches the lease
-//! immediately: the safety EFFECT (`lease.engage_estop`) runs BEFORE its audit
-//! receipt (e-stop is non-mutating, so no intent receipt precedes it), and the
-//! ONLY contention it can ever see is the brief receipt append — never a whole
-//! session. This is "e-stop = permission floor, any session, always wins" applied
-//! to the transport layer. Hash-chain integrity holds under concurrent appends
-//! because the sink's `Mutex` serializes each `record` as one atomic append.
+//! `engage-estop` runs on its OWN concurrent session: the safety EFFECT
+//! (`lease.engage_estop`) runs BEFORE its audit receipt (e-stop is
+//! non-mutating, so no intent receipt precedes it). Before the effect it waits
+//! on the lease's lock for at most the one act-verb send that holds it and one
+//! brief check by each running act verb: the engage is counted on the shared
+//! [`EstopLease`] before it waits, and an act verb that reads the count under
+//! the lock sends nothing. After the effect it waits for the brief receipt
+//! append. No wait is for a whole session. This is "e-stop = permission floor,
+//! any session, always wins" applied to the transport layer. Hash-chain
+//! integrity holds under concurrent appends because the sink's `Mutex`
+//! serializes each `record` as one atomic append.
 //!
 //! Each session is still BOUNDED by [`OPS_SESSION_DEADLINE`] (an authed-then-
 //! stalled peer's connection is CLOSED at the deadline, unwedging its blocking
@@ -82,6 +86,7 @@ use cerud::verbs::{InventoryVerb, LogTailVerb, RestartVerb, VerbHandler, VerbReg
 use crate::authorizer::PairingAuthorizer;
 use crate::clock::RemotedClock;
 use crate::error::RemotedError;
+use crate::estop_lease::EstopLease;
 use crate::host::OpsHost;
 use crate::pairing_verbs::{
     ClaimVerb, CodePairFinishVerb, CodePairStartVerb, EngageEstopVerb, PairVerb, PresentGrantVerb,
@@ -130,6 +135,8 @@ impl OpsServing {
     /// authorizer over `shared` (the LIVE trust state), and open the receipt log.
     ///
     /// `lease` is the shared control lease the `engage-estop` floor engages;
+    /// the e-stop verb and the act verbs share one [`EstopLease`] over it, so
+    /// an engage waiting for its lock is counted where the act verbs read it.
     /// `sessions` is the CPace fallback session store; `clock` is the robot's
     /// TRUSTED clock the pairing verbs verify against; `log_root` is the
     /// `log-tail` allow-list root; `receipt_path` is the audit log.
@@ -155,9 +162,9 @@ impl OpsServing {
     }
 
     /// [`OpsServing::new`] with the verb set of `host`: a library host registers
-    /// [`DaemonOnlyVerb`] under the `restart` and `engage-estop` names, so the
-    /// authorizer still classifies each call and a permitted caller gets a clear
-    /// refusal instead of an unknown verb.
+    /// [`DaemonOnlyVerb`] under the `restart`, `engage-estop` and act verb
+    /// names, so the authorizer still classifies each call and a permitted
+    /// caller gets a clear refusal instead of an unknown verb.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_host(
         host: OpsHost,
@@ -318,9 +325,10 @@ impl OpsServing {
     }
 }
 
-/// The ops verb registry of `host`: cerud's mechanical verbs and the remote-plane
-/// bootstrap and safety verbs, with `restart` and `engage-estop` refused by name
-/// on an embedded host. Both hosts register the same names.
+/// The ops verb registry of `host`: cerud's mechanical verbs, the remote-plane
+/// bootstrap and safety verbs and the act verbs, with `restart`, `engage-estop`
+/// and the act verbs refused by name on an embedded host. Both hosts register
+/// the same names.
 fn verb_registry(
     host: OpsHost,
     shared: &SharedTrust,
@@ -328,16 +336,24 @@ fn verb_registry(
     clock: RemotedClock,
     log_root: PathBuf,
 ) -> VerbRegistry {
-    let (restart, engage_estop): (Box<dyn VerbHandler>, Box<dyn VerbHandler>) = match host {
-        OpsHost::Daemon { lease } => (
-            Box::new(RestartVerb::new()),
-            Box::new(EngageEstopVerb::new(lease)),
-        ),
-        OpsHost::Embedded => (
-            Box::new(DaemonOnlyVerb::RESTART),
-            Box::new(DaemonOnlyVerb::ENGAGE_ESTOP),
-        ),
-    };
+    let (restart, engage_estop, act_lease): (Box<dyn VerbHandler>, Box<dyn VerbHandler>, _) =
+        match host {
+            OpsHost::Daemon { lease } => {
+                // One `EstopLease` for the plane: the e-stop verb engages through
+                // it and the act verbs read its count before each send.
+                let lease = EstopLease::new(lease);
+                (
+                    Box::new(RestartVerb::new()),
+                    Box::new(EngageEstopVerb::new(lease.clone())),
+                    Some(lease),
+                )
+            }
+            OpsHost::Embedded => (
+                Box::new(DaemonOnlyVerb::RESTART),
+                Box::new(DaemonOnlyVerb::ENGAGE_ESTOP),
+                None,
+            ),
+        };
     let mut verbs = VerbRegistry::new();
     // cerud's mechanical ops verbs.
     verbs
@@ -367,6 +383,17 @@ fn verb_registry(
         .register(Box::new(crate::robot_settings::CloudAccessVerb::new(
             shared.clone(),
         )));
+    // The act verbs: publish, service call, snapshot, one message.
+    match act_lease {
+        Some(lease) => crate::act_verbs::register(&mut verbs, lease),
+        None => {
+            verbs
+                .register(Box::new(DaemonOnlyVerb::TOPIC_PUBLISH))
+                .register(Box::new(DaemonOnlyVerb::SERVICE_CALL))
+                .register(Box::new(DaemonOnlyVerb::TOPIC_SNAPSHOT))
+                .register(Box::new(DaemonOnlyVerb::TOPIC_ECHO_ONCE));
+        }
+    }
     verbs
 }
 
@@ -392,7 +419,32 @@ impl DaemonOnlyVerb {
               this host would report an e-stop that stops nothing; stop through the host's \
               own stop path",
     };
+    const TOPIC_PUBLISH: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::TOPIC_PUBLISH,
+        why: ACT_WRITE_WHY,
+    };
+    const SERVICE_CALL: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::SERVICE_CALL,
+        why: ACT_WRITE_WHY,
+    };
+    const TOPIC_SNAPSHOT: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::TOPIC_SNAPSHOT,
+        why: ACT_READ_WHY,
+    };
+    const TOPIC_ECHO_ONCE: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::TOPIC_ECHO_ONCE,
+        why: ACT_READ_WHY,
+    };
 }
+
+/// Why a library host refuses `topic-publish` and `service-call`.
+const ACT_WRITE_WHY: &str = "it sends through the process's transport singleton only while the \
+                             daemon's e-stop is clear, and this host serves no e-stop that \
+                             could stop it";
+/// Why a library host refuses `topic-snapshot` and `topic-echo-once`.
+const ACT_READ_WHY: &str = "it reads through the process's transport singleton and the daemon's \
+                            schema directory, not this host's transport and schemas; read the \
+                            topic over the wire plane";
 
 impl VerbHandler for DaemonOnlyVerb {
     fn name(&self) -> &'static str {
@@ -424,7 +476,7 @@ mod verb_set_tests {
     use cerulion_pairing::format::{PublicKey, RobotId, RootSet};
     use cerulion_pairing::verify::TrustStore;
 
-    fn names(host: OpsHost) -> Vec<String> {
+    fn registry(host: OpsHost) -> VerbRegistry {
         let root = PublicKey(
             ed25519_dalek::SigningKey::from_bytes(&[1; 32])
                 .verifying_key()
@@ -439,13 +491,17 @@ mod verb_set_tests {
         )
         .unwrap();
         let shared = SharedTrust::new(store, DeviceAccountIndex::new(), Vec::new());
-        let registry = verb_registry(
+        verb_registry(
             host,
             &shared,
             SharedCodePairSessions::new(),
             RemotedClock::fixed(0),
             PathBuf::from("logs"),
-        );
+        )
+    }
+
+    fn names(host: OpsHost) -> Vec<String> {
+        let registry = registry(host);
         let mut names: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
         names.sort();
         names
@@ -469,8 +525,43 @@ mod verb_set_tests {
             "pair",
             "present-grant",
             "restart",
+            "service-call",
+            "topic-echo-once",
+            "topic-publish",
+            "topic-snapshot",
         ];
         assert_eq!(daemon, expected);
         assert_eq!(names(OpsHost::Embedded), expected);
+    }
+
+    #[test]
+    fn an_embedded_host_refuses_each_act_verb_by_name() {
+        let registry = registry(OpsHost::Embedded);
+        let args = serde_json::json!({
+            "topic": "/chatter",
+            "type": "std_msgs/msg/String",
+            "message": {"data": "hi"},
+            "service": "/add",
+        });
+        for verb in [
+            crate::act_verbs::TOPIC_PUBLISH,
+            crate::act_verbs::SERVICE_CALL,
+            crate::act_verbs::TOPIC_SNAPSHOT,
+            crate::act_verbs::TOPIC_ECHO_ONCE,
+        ] {
+            let handler = registry.get(verb).unwrap();
+            assert!(!handler.is_mutating(), "{verb} writes no intent receipt");
+            let err = handler.execute(&args).unwrap_err();
+            assert!(
+                matches!(err, CerudError::UnsupportedHost(_)),
+                "{verb}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&format!(
+                    "{verb} is served only by the cerulion-remoted daemon"
+                )),
+                "{verb}: {err}"
+            );
+        }
     }
 }
