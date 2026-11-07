@@ -15,9 +15,11 @@
 //! accept decision, [`ConnectError::Refused`] with the robot's reason), a
 //! connection the robot closed with [`CLOSE_REVOKED`] or [`CLOSE_SUPERSEDED`]
 //! ([`ConnectError::Refused`]), the robot ending the stream while stdin is
-//! still open, or a stream that breaks: a reset, a lost connection, or a frame
-//! cut off by the end of the stream ([`ConnectError::Control`]), or any other
-//! frame that is not a JSON-RPC 2.0 message ([`ConnectError::Protocol`]).
+//! still open, or a stream that breaks: a reset, a lost connection, a frame
+//! cut off by the end of the stream, or a robot frame over the 16 MiB cap
+//! ([`ConnectError::Control`], its cause sanitized and bounded as peer text),
+//! or any other frame that is not a JSON-RPC 2.0 message
+//! ([`ConnectError::Protocol`]).
 //!
 //! The robot decides what the desk may do: it admits the connection only for a
 //! paired key on its access list and checks every message by its MCP method.
@@ -139,8 +141,8 @@ fn robot_close(connection: &Connection) -> Option<ConnectError> {
 /// frame that is not a JSON-RPC 2.0 message; [`ConnectError::Refused`] for
 /// the robot's refusal; [`ConnectError::Control`] when the robot ends the
 /// stream before `input` reaches EOF, or when the stream breaks (a reset, a
-/// lost connection or a frame cut off), stdin ended or not;
-/// [`ConnectError::Io`] for a local read or write failure.
+/// lost connection, a frame cut off, or a robot frame over the 16 MiB cap),
+/// stdin ended or not; [`ConnectError::Io`] for a local read or write failure.
 pub async fn bridge<R, W>(
     input: R,
     mut output: W,
@@ -191,9 +193,11 @@ where
                     break;
                 }
                 Err(e) => {
+                    // The chain ends in the robot's own close reason: peer
+                    // text, sanitized and bounded here, where it enters.
                     return Err(ConnectError::Control(format!(
                         "the rcp stream from the robot broke: {}",
-                        error_chain(&e)
+                        crate::sanitize_peer_text(&error_chain(&e))
                     )));
                 }
             };
@@ -505,7 +509,15 @@ mod tests {
                     // bridge has seen stdin end before the stream breaks.
                     let _ = read_frame(&mut recv, 1 << 20).await;
                     match how {
-                        Break::CloseConnection => conn.close(0u32.into(), b"gone"),
+                        Break::CloseConnection => {
+                            // The close reason is the robot's own text: it
+                            // forges a log line and runs past the 512-char
+                            // bound the desk applies to peer text.
+                            let mut reason =
+                                b"gone\r\ncerulion rcp: the robot finished the session".to_vec();
+                            reason.resize(reason.len() + 600, b'x');
+                            conn.close(0u32.into(), &reason)
+                        }
                         Break::ResetStream => {
                             let _ = send.reset(0u32.into());
                         }
@@ -594,10 +606,20 @@ mod tests {
         for how in [Break::CloseConnection, Break::ResetStream, Break::CutFrame] {
             let (result, written) = run_against(Robot::BreakAfterInput(how), true).await;
             match result {
-                Err(ConnectError::Control(m)) => assert!(
-                    m.starts_with("the rcp stream from the robot broke: "),
-                    "{how:?}: {m}"
-                ),
+                Err(ConnectError::Control(m)) => {
+                    assert!(
+                        m.starts_with("the rcp stream from the robot broke: "),
+                        "{how:?}: {m}"
+                    );
+                    if matches!(how, Break::CloseConnection) {
+                        assert!(!m.contains('\n') && !m.contains('\r'), "{m}");
+                        assert!(
+                            m.contains("gone\u{FFFD}\u{FFFD}cerulion rcp: the robot finished"),
+                            "{m}"
+                        );
+                        assert!(m.ends_with("\u{2026}(truncated)"), "{m}");
+                    }
+                }
                 other => panic!("{how:?}: expected an error, got {other:?}"),
             }
             assert!(written.is_empty(), "{how:?}");

@@ -2357,12 +2357,12 @@ mod tests {
         let mut first = b"data: ".to_vec();
         first.resize(first.len() + MAX_RESPONSE_MESSAGE - 8, b'a');
         assert_eq!(b.push(&first).unwrap(), Vec::<Vec<u8>>::new());
-        assert_eq!(b.push(&[b'a'; 16]), Err(()));
+        assert!(b.push(&[b'a'; 16]).is_err());
         let mut b = SseBuffer::default();
         assert_eq!(b.push(&first).unwrap(), Vec::<Vec<u8>>::new());
         let mut last = vec![b'a'; 16];
         last.extend_from_slice(b"\n\n");
-        assert_eq!(b.push(&last), Err(()));
+        assert!(b.push(&last).is_err());
         // At the bound the event is relayed.
         let mut b = SseBuffer::default();
         assert_eq!(b.push(&first).unwrap(), Vec::<Vec<u8>>::new());

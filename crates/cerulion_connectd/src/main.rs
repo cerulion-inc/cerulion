@@ -587,11 +587,17 @@ async fn run_rcp_command(cli: RcpCli) -> ExitCode {
     match run_rcp(config, stdin_reader(), tokio::io::stdout()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(ConnectError::Refused(reason)) => {
-            tracing::error!(%reason, "cerulion rcp: the robot refused the rcp session");
+            tracing::error!(
+                reason = %sanitize_peer_text(&reason),
+                "cerulion rcp: the robot refused the rcp session"
+            );
             ExitCode::FAILURE
         }
         Err(e) => {
-            tracing::error!(error = %e, "cerulion rcp: session failed");
+            tracing::error!(
+                error = %sanitize_peer_text(&e.to_string()),
+                "cerulion rcp: session failed"
+            );
             ExitCode::FAILURE
         }
     }
