@@ -40490,6 +40490,110 @@ fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
     );
 }
 
+/// Two writers and no consumer.
+fn ri_no_consumer_yaml() -> &'static str {
+    "name: rinc\nprefix: rinc\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn ri_no_consumer_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![("w1", writer(1.0)), ("w2", writer(2.0))])
+}
+
+/// Two writers and no consumer, one writer per rank: the bag of a process that
+/// runs each source in its own executor unit. No node wires a read stage, so
+/// no rank manifest states staging rows, and a `--verify` replay has no read to
+/// place: it is fed zero reads and passes.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_graph_with_no_consumer_feeds_no_read_and_passes() {
+    let live = ri_record(ri_no_consumer_yaml(), ri_no_consumer_factories);
+    assert_eq!(
+        live.rec.stage_rows,
+        serde_json::json!({}),
+        "PREMISE: no node wires a read stage"
+    );
+    let published: Vec<(&String, usize)> = live
+        .rec
+        .messages
+        .iter()
+        .map(|(topic, frames)| (topic, frames.len()))
+        .collect();
+    assert!(
+        published.len() == 2 && published.iter().all(|(_, n)| *n >= RI_MIN_READS),
+        "PREMISE: both writers published: {published:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_no_consumer.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w2");
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_no_consumer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("a fed replay of a graph with no consumer runs");
+    assert_eq!(
+        outcome.read_identity,
+        replay_engine::ReadIdentityReport::Fed {
+            reads: 0,
+            frames: 0
+        },
+        "no node reads, so no read is fed"
+    );
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert!(
+        replayed.is_empty(),
+        "no consumer logged a read: {replayed:?}"
+    );
+}
+
+/// A bag that states no staging rows is still refused when a node of its graph
+/// consumes: the eviction fixture's bag, written without the staging-row table
+/// and its sentinel scalar, is refused before its first step, naming the rows.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_consumer_whose_bag_states_no_staging_rows_is_refused_by_name() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_no_rows.mcap");
+    write_bag_impl(
+        &live.rec,
+        &bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        live.rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        None,
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(&live.rec)),
+        Some(&[]),
+        None,
+    );
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a fed replay of a consumer with no staging rows is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_unplanned",
+        "the bag states no per-stage staging rows",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+    assert!(replayed.is_empty(), "no step ran: {replayed:?}");
+}
+
 /// The feed index bytes a fed replay of `bag` needs, read off the refusal a
 /// zero budget answers.
 fn ri_feed_index_need(bag: &std::path::Path, duration_bound_ns: Option<u64>) -> u64 {
