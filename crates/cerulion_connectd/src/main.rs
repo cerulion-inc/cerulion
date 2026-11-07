@@ -379,6 +379,16 @@ fn act_network_refusal(flag: Option<&str>, env: Option<&str>, verb: &str) -> Opt
     })
 }
 
+/// The `rcp` refusal while the kill-switch is engaged ([`network_off`] over
+/// `--network` and `CERULION_NETWORK`, the reading `connect` and `act` use);
+/// `None` when it is not engaged.
+fn rcp_network_refusal(flag: Option<&str>, env: Option<&str>) -> Option<&'static str> {
+    network_off("rcp", flag, env).then_some(
+        "network kill-switch engaged (--network off / CERULION_NETWORK=off): refusing to open \
+         the robot's rcp session; nothing was sent",
+    )
+}
+
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -553,15 +563,13 @@ async fn run_act_command(cli: ActCli) -> ExitCode {
 /// The `rcp` subcommand: bridge stdio to the robot's rcp plane until the
 /// session ends.
 async fn run_rcp_command(cli: RcpCli) -> ExitCode {
-    if network_off(
-        "rcp",
+    // Read before the endpoint is bound: binding with the default relays
+    // already contacts them, and the dial follows.
+    if let Some(refusal) = rcp_network_refusal(
         cli.network.as_deref(),
         std::env::var("CERULION_NETWORK").ok().as_deref(),
     ) {
-        tracing::warn!(
-            "cerulion rcp: network kill-switch engaged (--network off / CERULION_NETWORK=off); \
-             refusing to connect"
-        );
+        tracing::error!("cerulion rcp: {refusal}");
         return ExitCode::FAILURE;
     }
     let config = match rcp_config(&cli) {
@@ -926,6 +934,35 @@ mod tests {
         }
         let hostile = act_network_refusal(None, Some("off"), "x\u{1b}[2J").unwrap();
         assert!(!hostile.chars().any(char::is_control), "{hostile:?}");
+    }
+
+    /// `rcp` reads the kill-switch as `connect` and `act` do: the exact value
+    /// `off` in `--network` or `CERULION_NETWORK` refuses; an empty, unset or
+    /// other value does not.
+    #[test]
+    fn rcp_refuses_under_the_kill_switch_as_connect_reads_it() {
+        for (flag, env) in [
+            (Some("off"), None),
+            (None, Some("off")),
+            (Some("x"), Some("off")),
+        ] {
+            assert_eq!(
+                rcp_network_refusal(flag, env),
+                Some(
+                    "network kill-switch engaged (--network off / CERULION_NETWORK=off): \
+                     refusing to open the robot's rcp session; nothing was sent"
+                ),
+                "{flag:?} {env:?}"
+            );
+        }
+        for (flag, env) in [
+            (None, None),
+            (Some(""), Some("")),
+            (None, Some("OFF")),
+            (Some("of"), None),
+        ] {
+            assert_eq!(rcp_network_refusal(flag, env), None, "{flag:?} {env:?}");
+        }
     }
 
     #[test]

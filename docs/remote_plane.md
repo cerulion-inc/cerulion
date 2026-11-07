@@ -77,6 +77,7 @@ act verbs, work on the robot's own shared memory; with `--robot`,
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
+`cerulion rcp` is refused the same way.
 
 The only other desk to robot topic path today is LAN ingress (an `ingress:`
 block in a graph), which proves no identity per peer and is closed when

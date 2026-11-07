@@ -966,6 +966,8 @@ fn connect_exit_code(command: Commands) -> ExitCode {
 
 /// Resolve + spawn `cerulion-connectd rcp` with inherited stdio (the MCP
 /// stream) and forward its exit code. Errors go to stderr; stdout stays MCP-only.
+/// Under the network kill-switch it exits 2 before anything else
+/// ([`rcp_cmd::network_refusal`]).
 fn rcp_exit_code(command: Commands) -> ExitCode {
     let Commands::Rcp {
         robot,
@@ -979,6 +981,13 @@ fn rcp_exit_code(command: Commands) -> ExitCode {
     else {
         unreachable!("rcp_exit_code is only called for Commands::Rcp");
     };
+    // Before the robot is resolved, the key read or the helper spawned.
+    if let Some(refusal) =
+        rcp_cmd::network_refusal(network.as_deref(), std::env::var("CERULION_NETWORK").ok())
+    {
+        eprintln!("Error: {refusal}");
+        return ExitCode::from(rcp_cmd::EXIT_NETWORK_REFUSED);
+    }
     let args = rcp_cmd::RcpArgs {
         robot,
         eid,

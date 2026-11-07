@@ -398,7 +398,9 @@ ExecStart=/usr/bin/cerulion-rcpd --manifest /etc/cerulion/rcp.yaml --http
 ```
 
 On the desk, `cerulion rcp <robot>` serves the robot's rcpd as a local stdio
-MCP server. The robot admits only a desk on its access list and checks every
+MCP server. While the desk's network kill-switch is engaged
+(`CERULION_NETWORK=off` or `--network off`) it is refused with exit 2 before
+anything reaches the robot. The robot admits only a desk on its access list and checks every
 message: `resources/*`, `subscriptions/listen` and `tools/list` need the
 observe capability; `tools/call` needs the teleop capability and the operator
 role, except that any desk on the access list may call `estop`. Tool calls
