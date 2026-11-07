@@ -29,10 +29,18 @@
 //!
 //! The e-stop takes no Observe/Act slot; its own bound is
 //! [`RcpLimits::estops_in_flight`]. A notification takes no slot. Requests
-//! past either bound are answered with an error, never queued, and the reader
-//! never waits on the outbound queue, except while it relays the `initialize`
-//! result, which [`RcpLimits::head_timeout`] bounds: an error reply that does
-//! not fit is dropped.
+//! past either bound are answered with an error, never queued. The session
+//! reader never waits on rcpd or on the outbound queue: it hands each admitted
+//! message to the stream's forwarder task, which sends them to rcpd in the
+//! order they were admitted and waits for a lifecycle message's response head,
+//! and for the `initialize` result, within [`RcpLimits::head_timeout`], before
+//! the next. Just before it sends an Observe or Act message, the forwarder
+//! checks the key's access for the message's class again, and for an Act
+//! message the e-stop latch. Queued notifications have
+//! [`FORWARD_NOTIFICATION_ROOM`] places of their own; a notification past them
+//! is dropped, so a request that holds a slot always fits the queue. The
+//! forwarder stops when the stream's writer has stopped and ends with its
+//! session; an error reply the outbound queue cannot take is dropped.
 //!
 //! ## The e-stop latch
 //!
@@ -46,11 +54,13 @@
 //! once it is counted. While the latch is engaged or an engage is counted,
 //! every Act message is refused with [`DENIED_CODE`] before rcpd
 //! ([`ESTOP_ENGAGED_REFUSAL`]), and `estop_clear` with
-//! [`ESTOP_CLEAR_REFUSAL`]; Session, Observe and Estop messages still pass. The latch is read when a message is admitted: a
-//! request forwarded before an ops engage still runs at rcpd, whose own latch
-//! only an `estop` message closes. The latch clears only when
-//! `cerulion-remoted` restarts. While it is clear, `estop_clear` reaches rcpd
-//! as any tool call does.
+//! [`ESTOP_CLEAR_REFUSAL`]; Session, Observe and Estop messages still pass.
+//! The latch is read when a desk's message arrives and again just before the
+//! plane sends it to rcpd, so a tool call sent to rcpd before an ops
+//! `engage-estop`, including one rcpd holds behind the call it is running,
+//! still runs at rcpd, whose own latch only an `estop` message closes. The
+//! latch clears only when `cerulion-remoted` restarts. While it is clear,
+//! `estop_clear` reaches rcpd as any tool call does.
 //!
 //! A request sent with rcpd's session id that rcpd answers with HTTP `404`
 //! (rcpd restarted and no longer knows the session) is answered with
@@ -155,6 +165,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// caps the count of tiny frames.
 const OUTBOUND_QUEUE: usize = 32;
 
+/// The places for notifications in a stream's forward queue, past its request
+/// slots ([`RcpLimits::in_flight`] plus [`RcpLimits::estops_in_flight`]): a
+/// notification takes no slot but holds one of these places while it is
+/// queued and sent.
+pub const FORWARD_NOTIFICATION_ROOM: usize = 4;
+
+/// The refusal of a request the stream cannot take: its slots, or its
+/// forward queue, are full.
+const TOO_MANY_IN_FLIGHT: &str = "refused: too many requests in flight on this rcp stream";
+
 /// The rcp plane's bounds and timers. Each default states its reason; each is
 /// a `cerulion-remoted` flag ([`RcpFlags`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +210,10 @@ pub struct RcpLimits {
     /// this bounds only a wedged rcpd, never a long tool call.
     pub head_timeout: Duration,
     /// How long forwarded requests may still answer after the desk ends its
-    /// side of the stream (`--rcp-drain-ms`, default 30000): matches the head
-    /// bound, so a request forwarded just before the end is not cut off.
+    /// side of the stream (`--rcp-drain-ms`, default 30000). The drain starts
+    /// once the forwarder has sent every message the reader admitted; it
+    /// matches the head bound, so a request sent just before the end is not
+    /// cut off.
     pub drain: Duration,
 }
 
@@ -1168,14 +1190,34 @@ async fn serve_session(
 
     let in_flight = Arc::new(Semaphore::new(limits.in_flight));
     let estops = Arc::new(Semaphore::new(limits.estops_in_flight));
-    let mut tasks = JoinSet::new();
-    let mut streams = JoinSet::new();
+    let notification_room = Arc::new(Semaphore::new(FORWARD_NOTIFICATION_ROOM));
+    // The forwarder: every admitted message reaches rcpd from this task, in
+    // the order the reader admitted it, so the reader never waits on rcpd.
+    // The guard aborts it, and its tasks, when this session ends or is
+    // aborted.
+    let (to_forwarder, mut forwarding) = match &upstream {
+        Ok(u) => {
+            let capacity = limits
+                .in_flight
+                .saturating_add(limits.estops_in_flight)
+                .saturating_add(FORWARD_NOTIFICATION_ROOM)
+                .min(Semaphore::MAX_PERMITS);
+            let (tx, rx) = mpsc::channel::<Admitted>(capacity);
+            let task = tokio::spawn(forwarder(
+                rx,
+                u.clone(),
+                out.clone(),
+                plane.clone(),
+                device_key,
+                caller.clone(),
+            ));
+            (Some(tx), AbortOnDrop(Some(task)))
+        }
+        Err(_) => (None, AbortOnDrop(None)),
+    };
     let mut initialized = false;
     let mut initialize_seen = false;
     loop {
-        // Finished tasks are reaped as the session goes, not at its end.
-        while tasks.try_join_next().is_some() {}
-        while streams.try_join_next().is_some() {}
         let frame = tokio::select! {
             read = read_frame(&mut recv, MAX_REQUEST_FRAME) => match read {
                 Ok(f) => f,
@@ -1226,19 +1268,17 @@ async fn serve_session(
             }
             RcpClass::Session | RcpClass::Observe => {}
         }
-        let upstream = match &upstream {
-            Ok(u) => u.clone(),
-            Err(_) => {
-                if let Some(id) = message.id {
-                    out.try_error(id, UPSTREAM_CODE, "rcpd is not reachable on this robot");
-                }
-                continue;
+        let Some(to_forwarder) = &to_forwarder else {
+            if let Some(id) = message.id {
+                out.try_error(id, UPSTREAM_CODE, "rcpd is not reachable on this robot");
             }
+            continue;
         };
-        // One handshake per stream.
+        // One handshake per stream; each flag is set once its message is
+        // queued.
         let repeat = match message.method.as_str() {
-            "initialize" => std::mem::replace(&mut initialize_seen, true),
-            "notifications/initialized" => std::mem::replace(&mut initialized, true),
+            "initialize" => initialize_seen,
+            "notifications/initialized" => initialized,
             _ => false,
         };
         if repeat {
@@ -1251,7 +1291,7 @@ async fn serve_session(
             }
             continue;
         }
-        match message.class {
+        let permit = match message.class {
             // The e-stop takes no Observe/Act slot and never waits: it has its
             // own small bound, past which it is answered at once.
             RcpClass::Estop => {
@@ -1265,73 +1305,52 @@ async fn serve_session(
                     }
                     continue;
                 };
-                tasks.spawn(forward_and_relay(
-                    upstream,
-                    message,
-                    out.clone(),
-                    Some(permit),
-                ));
+                permit
             }
-            // Lifecycle messages keep their order: the response head (and the
-            // body of `initialize`) is in before the next desk message; any
-            // other body is relayed by a task.
-            RcpClass::Session => {
-                // A lifecycle request's body relayed by a task holds an
-                // in-flight slot like a request does, so a desk that stops
-                // reading cannot grow the task set. A notification takes no
-                // slot: rcpd answers it 202 with no body.
-                let permit = if message.id.is_some() {
-                    match in_flight.clone().try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => {
-                            if let Some(id) = message.id {
-                                out.try_error(
-                                    id,
-                                    UPSTREAM_CODE,
-                                    "refused: too many requests in flight on this rcp stream",
-                                );
-                            }
-                            continue;
-                        }
+            // A notification takes no slot (rcpd answers it 202 with no body),
+            // but one of the forward queue's notification places.
+            RcpClass::Session if message.id.is_none() => {
+                match notification_room.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::debug!(
+                            method = %message.method,
+                            "cerulion_remoted: rcp notification dropped: the stream's forward \
+                             queue has no room for notifications"
+                        );
+                        continue;
                     }
-                } else {
-                    None
-                };
-                let is_initialized = message.method == "notifications/initialized";
-                let body = forward(upstream.clone(), message, out.clone(), true).await;
-                // A body rcpd sends for a notification is not relayed.
-                if let (Some(body), Some(permit)) = (body, permit) {
-                    tasks.spawn(async move {
-                        body.await;
-                        drop(permit);
-                    });
-                }
-                if is_initialized && upstream.session_id().is_some() {
-                    streams.spawn(standalone_stream(upstream, out.clone()));
                 }
             }
-            RcpClass::Observe | RcpClass::Act => {
+            // A lifecycle request (its body relayed by a task) holds an
+            // in-flight slot like any other request, so a desk that stops
+            // reading cannot grow the task set. Lifecycle messages keep their
+            // order at the forwarder: the response head (and the body of
+            // `initialize`) is in before the next message is sent.
+            RcpClass::Session | RcpClass::Observe | RcpClass::Act => {
                 let Ok(permit) = in_flight.clone().try_acquire_owned() else {
                     if let Some(id) = message.id {
-                        out.try_error(
-                            id,
-                            UPSTREAM_CODE,
-                            "refused: too many requests in flight on this rcp stream",
-                        );
+                        out.try_error(id, UPSTREAM_CODE, TOO_MANY_IN_FLIGHT);
                     }
                     continue;
                 };
-                tasks.spawn(forward_and_relay(
-                    upstream,
-                    message,
-                    out.clone(),
-                    Some(permit),
-                ));
+                permit
+            }
+        };
+        let method = message.method.clone();
+        if hand_off(to_forwarder, &out, message, Some(permit)) {
+            match method.as_str() {
+                "initialize" => initialize_seen = true,
+                "notifications/initialized" => initialized = true,
+                _ => {}
             }
         }
     }
-    // The desk sent its last message: requests already forwarded may still
-    // answer, within the drain bound; the standalone stream never ends by itself.
+    // The desk sent its last message: the forwarder sends what the reader
+    // admitted, then requests already forwarded may still answer, within the
+    // drain bound; the standalone stream never ends by itself.
+    drop(to_forwarder);
+    let (mut tasks, mut streams) = forwarding.join().await.unwrap_or_default();
     streams.shutdown().await;
     let drained = tokio::time::timeout(limits.drain, async {
         while tasks.join_next().await.is_some() {}
@@ -1347,6 +1366,141 @@ async fn serve_session(
     }
     drop(out);
     let _ = writer.await;
+}
+
+/// One admitted message on its way to the stream's forwarder, with the slot it
+/// holds until its answer is relayed.
+struct Admitted {
+    message: RcpMessage,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Hand `message` to the stream's forwarder without waiting; whether it was
+/// queued. A full (or ended) forward queue answers a request with
+/// [`UPSTREAM_CODE`] and drops a notification; the slot or notification
+/// place is released either way.
+fn hand_off(
+    to_forwarder: &mpsc::Sender<Admitted>,
+    out: &Outlet,
+    message: RcpMessage,
+    permit: Option<OwnedSemaphorePermit>,
+) -> bool {
+    let Err(full) = to_forwarder.try_send(Admitted { message, permit }) else {
+        return true;
+    };
+    let Admitted { message, .. } = full.into_inner();
+    match message.id {
+        Some(id) => {
+            out.try_error(id, UPSTREAM_CODE, TOO_MANY_IN_FLIGHT);
+        }
+        None => tracing::debug!(
+            method = %message.method,
+            "cerulion_remoted: rcp notification dropped: the stream's forward queue is full"
+        ),
+    }
+    false
+}
+
+/// A spawned task aborted when this guard drops, so a session that ends or is
+/// aborted takes its forwarder, and the forwarder's tasks, with it.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    /// Wait for the task's output; `None` when there is no task or it failed.
+    /// The guard keeps the handle while it waits, so dropping this future
+    /// still aborts the task.
+    async fn join(&mut self) -> Option<T> {
+        let output = self.0.as_mut()?.await.ok();
+        self.0 = None;
+        output
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+/// The stream's forwarder: sends each message the reader admitted to rcpd,
+/// in order. A lifecycle message is sent inline ([`forward`] waits for its
+/// response head, and for the `initialize` result), so a session id rcpd
+/// issues is recorded before the next message is sent; after
+/// `notifications/initialized` it opens rcpd's standalone stream. Observe, Act
+/// and Estop messages are forwarded and relayed by their own tasks. Just
+/// before it sends an Observe or Act message it checks `device_key`'s access
+/// for the message's class again, and for an Act message the e-stop latch,
+/// so a call queued behind a held lifecycle message is refused after a revoke
+/// or an engage. It stops once the stream's writer has stopped. Returns the
+/// tasks and the standalone stream once the reader has closed the queue and
+/// every queued message is sent.
+async fn forwarder(
+    mut admitted: mpsc::Receiver<Admitted>,
+    upstream: Arc<Upstream>,
+    out: Outlet,
+    plane: Arc<RcpPlane>,
+    device_key: [u8; 32],
+    caller: String,
+) -> (JoinSet<()>, JoinSet<()>) {
+    let mut tasks = JoinSet::new();
+    let mut streams = JoinSet::new();
+    while let Some(Admitted { message, permit }) = admitted.recv().await {
+        // The writer has stopped (a revoke closes the connection from it):
+        // nothing more is sent to rcpd, and the queued slots are released.
+        if out.is_closed() {
+            break;
+        }
+        // Finished tasks are reaped as the session goes, not at its end.
+        while tasks.try_join_next().is_some() {}
+        while streams.try_join_next().is_some() {}
+        if matches!(message.class, RcpClass::Observe | RcpClass::Act) {
+            let allowed = authorize_key(&plane.shared, &device_key, Some(message.class));
+            if let Err(reason) = allowed {
+                tracing::info!(method = %message.method, %reason, %caller, "cerulion_remoted: queued rcp message denied before it was sent");
+                if let Some(id) = message.id {
+                    let text = format!("denied: {} needs more access: {reason}", message.method);
+                    out.try_error(id, DENIED_CODE, &text);
+                }
+                continue;
+            }
+        }
+        if message.class == RcpClass::Act {
+            let refusal = estop_refusal(&plane.lease, &message);
+            if let Some(text) = refusal {
+                tracing::info!(method = %message.method, %caller, "cerulion_remoted: queued rcp tool call refused under the e-stop");
+                if let Some(id) = message.id {
+                    out.try_error(id, DENIED_CODE, text);
+                }
+                continue;
+            }
+        }
+        if message.class != RcpClass::Session {
+            tasks.spawn(forward_and_relay(
+                upstream.clone(),
+                message,
+                out.clone(),
+                permit,
+            ));
+            continue;
+        }
+        let is_initialized = message.method == "notifications/initialized";
+        let is_request = message.id.is_some();
+        let body = forward(upstream.clone(), message, out.clone(), true).await;
+        // A body rcpd sends for a notification is not relayed; a request's
+        // body task keeps its slot.
+        if let (Some(body), true) = (body, is_request) {
+            tasks.spawn(async move {
+                body.await;
+                drop(permit);
+            });
+        }
+        if is_initialized && upstream.session_id().is_some() {
+            streams.spawn(standalone_stream(upstream.clone(), out.clone()));
+        }
+    }
+    (tasks, streams)
 }
 
 async fn forward_and_relay(
@@ -1382,14 +1536,17 @@ where
 }
 
 /// POST one admitted message to rcpd. Waits for the response head, within
-/// [`RcpLimits::head_timeout`], so a session id rcpd issues is recorded before the next
-/// desk message is forwarded, and returns the task that relays the body, if
+/// [`RcpLimits::head_timeout`], so a session id rcpd issues is recorded before
+/// the next message is sent, and returns the task that relays the body, if
 /// any. For `initialize` the body is relayed before returning, so the
-/// protocol version it carries is recorded too. `inline` is true on the
-/// session reader, whose failure replies never wait for queue space (they are
-/// dropped when it is full), except while it relays the `initialize` result,
-/// which [`RcpLimits::head_timeout`] bounds; a spawned task waits for it. An
-/// HTTP 404 to a request that carried the session id answers it with
+/// protocol version it carries is recorded too.
+///
+/// `inline` is true on the stream's forwarder: its failure replies never wait
+/// for queue space (they are dropped when it is full), and only its relay of
+/// the `initialize` result waits, within [`RcpLimits::head_timeout`]. A
+/// spawned task's replies wait for queue space.
+///
+/// An HTTP 404 to a request that carried the session id answers it with
 /// [`UPSTREAM_CODE`] and notifies the session's `Upstream::lost`.
 async fn forward(
     upstream: Arc<Upstream>,

@@ -536,6 +536,52 @@ mod verb_set_tests {
     }
 
     #[test]
+    fn the_act_verbs_read_the_engage_count_the_daemon_lends() {
+        use std::time::{Duration, Instant};
+        let host = OpsHost::daemon();
+        let lent = host.estop_lease().expect("the daemon has an e-stop lease");
+        let registry = registry(host);
+        let publish = registry.get(crate::act_verbs::TOPIC_PUBLISH).unwrap();
+        let args = serde_json::json!({
+            "topic": "/ops_unit/latch",
+            "type": "nope_msgs/msg/Nope",
+            "message": {},
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        // An engage through the lent lease, as the rcp plane makes, waits for
+        // the lock this test holds; `topic-publish` must see it counted and
+        // refuse without taking that lock. Every guard is dropped before an
+        // assertion, so a failure never strands the scoped threads.
+        let held = lent.lock().unwrap();
+        let (counted, refusal) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                lent.engage("iroh:ab");
+            });
+            let until = Instant::now() + Duration::from_secs(10);
+            while !lent.engage_pending() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let counted = lent.engage_pending();
+            let args = &args;
+            scope.spawn(move || {
+                let _ = tx.send(publish.execute(args));
+            });
+            let refusal = rx.recv_timeout(Duration::from_secs(10));
+            drop(held);
+            (counted, refusal)
+        });
+        assert!(counted, "the lent lease did not count the engage");
+        let err = refusal
+            .expect("topic-publish waited for the held lock: it does not read the lent count")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the robot's e-stop is engaged, so topic-publish is refused"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_embedded_host_refuses_each_act_verb_by_name() {
         let registry = registry(OpsHost::Embedded);
         let args = serde_json::json!({

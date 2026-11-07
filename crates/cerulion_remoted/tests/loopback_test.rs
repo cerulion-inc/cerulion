@@ -375,8 +375,37 @@ async fn run_accepts_a_store_bound_to_this_device() {
     assert_eq!(token.len(), 64);
 }
 
+/// One ops call on its own connection from `desk` to `addr`.
+#[cfg(unix)]
+async fn run_ops_call(
+    desk: &Endpoint,
+    addr: EndpointAddr,
+    verb: &'static str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, cerud::CerudError> {
+    let conn = bounded("dial ops", dial(desk, addr, alpn::OPS))
+        .await
+        .expect("dial ops");
+    let (send, recv) = bounded("open ops stream", open_frame_stream(&conn))
+        .await
+        .expect("open ops stream");
+    let result = bounded(
+        "ops call",
+        tokio::task::spawn_blocking(move || {
+            let mut client =
+                OpsClient::connect_current(QuicOpsStream::new(send, recv)).expect("handshake");
+            client.call(verb, args)
+        }),
+    )
+    .await
+    .expect("ops task");
+    conn.close(0u32.into(), b"done");
+    result
+}
+
 /// A group-readable rcpd token file does not stop `run`: the ops plane
-/// answers a paired desk, and the file is left as it was.
+/// answers a paired desk, the rcp plane answers its `estop` and engages the
+/// ops e-stop latch the act verbs obey, and the file is left as it was.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_serves_the_ops_plane_over_a_shared_rcp_token_file() {
@@ -421,24 +450,62 @@ async fn run_serves_the_ops_plane_over_a_shared_rcp_token_file() {
             SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
         ],
     );
-    let conn = bounded("dial ops", dial(&desk, addr, alpn::OPS))
+    let inventory = run_ops_call(&desk, addr.clone(), "inventory", serde_json::json!({})).await;
+    assert!(inventory.is_ok(), "the ops plane answers: {inventory:?}");
+
+    // The shipped `run` serves the rcp plane too, under the ops e-stop latch:
+    // an rcp `estop` is answered (rcpd is unreachable: the token file is
+    // shared) and engages the latch the ops act verbs obey.
+    let publish = serde_json::json!({
+        "topic": "/loopback/latch",
+        "type": "nope_msgs/msg/Nope",
+        "message": {},
+    });
+    let verb_error = |r: Result<serde_json::Value, cerud::CerudError>| match r {
+        Err(cerud::CerudError::Remote { kind, message }) if kind == "verb_error" => message,
+        other => panic!("expected the verb's error, got {other:?}"),
+    };
+    let before =
+        verb_error(run_ops_call(&desk, addr.clone(), "topic-publish", publish.clone()).await);
+    assert!(
+        before.starts_with("verb error: usage: unknown message type"),
+        "clear: {before}"
+    );
+    let rcp = bounded("dial rcp", dial(&desk, addr.clone(), alpn::RCP))
         .await
-        .expect("dial ops");
-    let (send, recv) = bounded("open ops stream", open_frame_stream(&conn))
+        .expect("dial rcp");
+    let (mut send, mut recv) = bounded("open rcp stream", open_frame_stream(&rcp))
         .await
-        .expect("open ops stream");
-    let inventory = bounded(
-        "inventory",
-        tokio::task::spawn_blocking(move || {
-            let mut client =
-                OpsClient::connect_current(QuicOpsStream::new(send, recv)).expect("handshake");
-            client.call("inventory", serde_json::json!({}))
-        }),
+        .expect("open rcp stream");
+    let estop = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                    "params": { "name": "estop", "arguments": {} } });
+    bounded(
+        "estop",
+        write_frame(&mut send, estop.to_string().as_bytes()),
     )
     .await
-    .expect("ops task");
-    assert!(inventory.is_ok(), "the ops plane answers: {inventory:?}");
-    conn.close(0u32.into(), b"done");
+    .expect("write");
+    let frame = bounded("estop answer", read_frame(&mut recv, 1 << 20))
+        .await
+        .expect("an answer");
+    let answer: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(answer["id"], serde_json::json!(1), "{answer}");
+    assert_eq!(
+        answer["error"]["code"],
+        serde_json::json!(-32603),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["error"]["message"],
+        serde_json::json!("rcpd is not reachable on this robot"),
+        "{answer}"
+    );
+    rcp.close(0u32.into(), b"done");
+    let after = verb_error(run_ops_call(&desk, addr, "topic-publish", publish).await);
+    assert_eq!(
+        after,
+        "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+    );
     let _ = stop.send(());
     let result = bounded("run stops", daemon).await.expect("daemon task");
     assert!(result.is_ok(), "{result:?}");

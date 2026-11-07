@@ -3,7 +3,8 @@
 //! robot's endpoint on loopback (relays disabled); the robot forwards each
 //! admitted MCP message to a REAL `cerulion-rcpd` (streamable HTTP, bearer
 //! token, tool host, journal) on loopback; a stand-in graph thread answers the
-//! journaled calls.
+//! journaled calls. One arm forwards to a hand-rolled HTTP/1 stand-in for rcpd
+//! that holds a request unanswered.
 //!
 //! Every account row is established through a REAL certificate chain with a
 //! chosen scope (deterministic seeds). Expected values (the caller string, the
@@ -387,40 +388,12 @@ tools:
             .await
             .expect("rcpd binds");
 
-        // The robot: one endpoint, the rcp plane over the live trust state.
-        let token_file = dir.path().join("rcp.token");
-        std::fs::write(&token_file, format!("CERULION_RCP_TOKEN={TOKEN}\n")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let robot = endpoint(ROBOT_SEED).await;
-        let trust = robot_trust(dir.path(), *robot.id().as_bytes());
-        let classify = Arc::new(PairingAuthorizer::from_shared(trust.clone()));
-        let mut link = RcpLink::under(dir.path());
-        link.addr = rcpd_addr;
-        link.token_file = token_file;
-        link.limits.revoke_check = QUIET_REVOKE_CHECK;
-        adjust(&mut link.limits);
-        let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
-        let plane = Arc::new(RcpPlane::new(link, trust.clone(), lease.clone()));
-        let (stop_serving, serve_rx) = tokio::sync::oneshot::channel::<()>();
-        let serving_endpoint = robot.clone();
-        tokio::spawn(async move {
-            let _ = cerulion_remoted::serve_planes(
-                &serving_endpoint,
-                classify,
-                None,
-                None,
-                None,
-                Some(plane),
-                async {
-                    let _ = serve_rx.await;
-                },
-            )
-            .await;
-        });
+        let ServedPlane {
+            robot,
+            trust,
+            lease,
+            stop_serving,
+        } = serve_rcp_plane(dir.path(), rcpd_addr, adjust).await;
         Fixture {
             robot,
             trust,
@@ -437,24 +410,8 @@ tools:
         }
     }
 
-    fn robot_addr(&self) -> EndpointAddr {
-        loopback_addr(self.robot.id(), &self.robot.bound_sockets())
-    }
-
     async fn session(&self, seed: u8) -> Session {
-        let desk = endpoint(seed).await;
-        let conn = bounded("dial", dial(&desk, self.robot_addr(), alpn::RCP))
-            .await
-            .expect("dial");
-        let (send, recv) = bounded("open_bi", open_frame_stream(&conn))
-            .await
-            .expect("open_bi");
-        Session {
-            _desk: desk,
-            _conn: conn,
-            send,
-            recv,
-        }
+        open_session(&self.robot, seed).await
     }
 
     /// Stop rcpd: it stops accepting and ends every response stream it has
@@ -517,6 +474,81 @@ impl Drop for Fixture {
         if let Some(g) = self.graph.take() {
             let _ = g.join();
         }
+    }
+}
+
+/// A robot serving the rcp plane alone, through `serve_planes`.
+struct ServedPlane {
+    robot: Endpoint,
+    trust: SharedTrust,
+    lease: EstopLease,
+    stop_serving: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The robot: one endpoint, the rcp plane over the live trust state under
+/// `dir`, forwarding to the rcpd at `rcpd_addr` with the fixture token, its
+/// limits adjusted by `adjust`.
+async fn serve_rcp_plane(
+    dir: &Path,
+    rcpd_addr: SocketAddr,
+    adjust: impl FnOnce(&mut RcpLimits),
+) -> ServedPlane {
+    let token_file = dir.join("rcp.token");
+    std::fs::write(&token_file, format!("CERULION_RCP_TOKEN={TOKEN}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let robot = endpoint(ROBOT_SEED).await;
+    let trust = robot_trust(dir, *robot.id().as_bytes());
+    let classify = Arc::new(PairingAuthorizer::from_shared(trust.clone()));
+    let mut link = RcpLink::under(dir);
+    link.addr = rcpd_addr;
+    link.token_file = token_file;
+    link.limits.revoke_check = QUIET_REVOKE_CHECK;
+    adjust(&mut link.limits);
+    let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+    let plane = Arc::new(RcpPlane::new(link, trust.clone(), lease.clone()));
+    let (stop_serving, serve_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving_endpoint = robot.clone();
+    tokio::spawn(async move {
+        let _ = cerulion_remoted::serve_planes(
+            &serving_endpoint,
+            classify,
+            None,
+            None,
+            None,
+            Some(plane),
+            async {
+                let _ = serve_rx.await;
+            },
+        )
+        .await;
+    });
+    ServedPlane {
+        robot,
+        trust,
+        lease,
+        stop_serving,
+    }
+}
+
+/// One rcp stream from the desk `seed` to `robot`.
+async fn open_session(robot: &Endpoint, seed: u8) -> Session {
+    let desk = endpoint(seed).await;
+    let addr = loopback_addr(robot.id(), &robot.bound_sockets());
+    let conn = bounded("dial", dial(&desk, addr, alpn::RCP))
+        .await
+        .expect("dial");
+    let (send, recv) = bounded("open_bi", open_frame_stream(&conn))
+        .await
+        .expect("open_bi");
+    Session {
+        _desk: desk,
+        _conn: conn,
+        send,
+        recv,
     }
 }
 
@@ -1198,6 +1230,342 @@ async fn an_rcp_estop_engages_the_latch_the_ops_act_verbs_obey() {
         json!("refused: the robot's e-stop is engaged"),
         "{r}"
     );
+}
+
+/// A stand-in rcpd on loopback, one HTTP/1 request per connection as the
+/// plane sends them. It answers `initialize` (200, a session id and a JSON
+/// result) and every notification (202), refuses the standalone `GET` (405),
+/// answers a `tools/call` with a JSON result after reporting its `params` on
+/// `tool_calls`, and holds each `ping` without writing a byte, after
+/// reporting its id on `pinged`, until `release` is notified; then it answers
+/// the ping. Any other request is answered 404.
+struct StandIn {
+    addr: SocketAddr,
+    pinged: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    tool_calls: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+async fn stand_in_rcpd() -> StandIn {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (pinged_tx, pinged) = tokio::sync::mpsc::unbounded_channel();
+    let (calls_tx, tool_calls) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = release.clone();
+    let json_reply = |result: Value| {
+        let body = result.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+             mcp-session-id: stand-in\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (pinged, calls, held) = (pinged_tx.clone(), calls_tx.clone(), held.clone());
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    match tcp.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                while buf.len() < head_end + length {
+                    match tcp.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let body: Value = serde_json::from_slice(&buf[head_end..head_end + length])
+                    .unwrap_or(Value::Null);
+                let method = body["method"].as_str().unwrap_or("");
+                let reply = match head.split(' ').next() {
+                    Some("post") if method == "initialize" => json_reply(json!({
+                        "jsonrpc": "2.0", "id": body["id"], "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "stand-in", "version": "0" }
+                        }
+                    })),
+                    Some("post") if method.starts_with("notifications/") => {
+                        "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_string()
+                    }
+                    Some("post") if method == "ping" => {
+                        let _ = pinged.send(body["id"].clone());
+                        held.notified().await;
+                        json_reply(json!({ "jsonrpc": "2.0", "id": body["id"], "result": {} }))
+                    }
+                    Some("post") if method == "tools/call" => {
+                        let _ = calls.send(body["params"].clone());
+                        json_reply(json!({ "jsonrpc": "2.0", "id": body["id"], "result": {
+                            "content": [{ "type": "text", "text": "{\"stand_in\":true}" }]
+                        } }))
+                    }
+                    Some("get") => {
+                        "HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n".to_string()
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_string(),
+                };
+                let _ = tcp.write_all(reply.as_bytes()).await;
+                let _ = tcp.shutdown().await;
+            });
+        }
+    });
+    StandIn {
+        addr,
+        pinged,
+        tool_calls,
+        release,
+    }
+}
+
+/// The plane over `stand_in` with a head timeout past every bound here (no
+/// answer to a held ping can come from the plane itself), an operator stream
+/// initialized, a `ping` (id 2) that the stand-in holds, `queued` sent after
+/// it, and a second `initialize` (id 5) refused: the reader handles frames in
+/// order, so `queued` was admitted and waits behind the ping. Returns the
+/// frames that came before that refusal too.
+async fn queue_behind_a_held_ping(
+    dir: &Path,
+    stand_in: &mut StandIn,
+    adjust: impl FnOnce(&mut RcpLimits),
+    queued: &[Value],
+) -> (ServedPlane, Session, Vec<Value>) {
+    let served = serve_rcp_plane(dir, stand_in.addr, |l| {
+        l.head_timeout = Duration::from_secs(3600);
+        adjust(l);
+    })
+    .await;
+    let mut s = open_session(&served.robot, OPERATOR.0).await;
+    s.initialize().await;
+    s.send_raw(
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    let held = bounded("rcpd holds the ping", stand_in.pinged.recv())
+        .await
+        .expect("the stand-in saw the ping");
+    assert_eq!(held, json!(2));
+    for message in queued {
+        s.send_raw(message.to_string().as_bytes()).await;
+    }
+    let again = json!({ "jsonrpc": "2.0", "id": 5, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": { "name": "rcp-e2e", "version": "0" }
+    } });
+    s.send_raw(again.to_string().as_bytes()).await;
+    let mut early = Vec::new();
+    loop {
+        let frame = bounded("read_frame", read_frame(&mut s.recv, 16 << 20))
+            .await
+            .expect("a reply frame");
+        let v: Value = serde_json::from_slice(&frame).expect("JSON reply");
+        if v.get("id") == Some(&json!(5)) {
+            assert_eq!(
+                v["error"]["message"],
+                json!("refused: one initialize per rcp stream"),
+                "{v}"
+            );
+            break;
+        }
+        early.push(v);
+    }
+    (served, s, early)
+}
+
+/// The reply to `id`: from `early` if it came before, else read from `s`.
+async fn reply_after(s: &mut Session, early: &[Value], id: i64) -> Value {
+    match early.iter().find(|v| v.get("id") == Some(&json!(id))) {
+        Some(v) => v.clone(),
+        None => s.reply(&json!(id)).await,
+    }
+}
+
+fn step_call(id: i64) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": "arm.step", "arguments": { "q": [0.1, -0.2] } } })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_rcp_estop_engages_the_ops_latch_while_rcpd_holds_a_ping() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stand_in = stand_in_rcpd().await;
+    // No answer to the held ping can come from the plane while this test
+    // runs: its head timeout is far past every bound here.
+    let served = serve_rcp_plane(dir.path(), stand_in.addr, |l| {
+        l.head_timeout = Duration::from_secs(3600);
+    })
+    .await;
+    let mut s = open_session(&served.robot, OPERATOR.0).await;
+    s.initialize().await;
+    s.send_raw(
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    let held = bounded("rcpd holds the ping", stand_in.pinged.recv())
+        .await
+        .expect("the stand-in saw the ping");
+    assert_eq!(held, json!(2));
+
+    // An estop on the same stream while rcpd holds the ping.
+    let estop = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": { "name": "estop", "arguments": {} } });
+    s.send_raw(estop.to_string().as_bytes()).await;
+    bounded("the rcp estop engages the ops latch", async {
+        while matches!(served.lease.lock().unwrap().estop(), EstopState::Clear) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        served.lease.lock().unwrap().estop(),
+        &EstopState::Engaged {
+            by: expected_caller(OPERATOR.0, OPERATOR.1)
+        }
+    );
+
+    // The plane itself answers an Act call now; no answer to the held ping
+    // reaches the desk before that refusal.
+    s.send_raw(step_call(4).to_string().as_bytes()).await;
+    loop {
+        let frame = bounded("read_frame", read_frame(&mut s.recv, 16 << 20))
+            .await
+            .expect("a reply frame");
+        let v: Value = serde_json::from_slice(&frame).expect("JSON reply");
+        assert_ne!(
+            v.get("id"),
+            Some(&json!(2)),
+            "the held ping was answered: {v}"
+        );
+        if v.get("id") == Some(&json!(4)) {
+            assert_eq!(v["error"]["code"], json!(-32001), "{v}");
+            assert_eq!(
+                v["error"]["message"],
+                json!("refused: the robot's e-stop is engaged"),
+                "{v}"
+            );
+            break;
+        }
+    }
+    let _ = served.stop_serving.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_act_call_queued_behind_a_held_ping_is_refused_after_an_ops_engage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stand_in = stand_in_rcpd().await;
+    let (served, mut s, early) =
+        queue_behind_a_held_ping(dir.path(), &mut stand_in, |_| {}, &[step_call(4)]).await;
+    // The ops plane's engage-estop, as its verb does, while the call waits.
+    served.lease.engage("iroh:ops-desk");
+    stand_in.release.notify_one();
+    let r = reply_after(&mut s, &early, 4).await;
+    assert_eq!(r["error"]["code"], json!(-32001), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!("refused: the robot's e-stop is engaged"),
+        "{r}"
+    );
+    assert!(
+        stand_in.tool_calls.try_recv().is_err(),
+        "the queued call reached rcpd after the engage"
+    );
+    let _ = served.stop_serving.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_call_is_refused_when_its_scope_loses_the_class_before_it_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stand_in = stand_in_rcpd().await;
+    let (served, mut s, early) =
+        queue_behind_a_held_ping(dir.path(), &mut stand_in, |_| {}, &[step_call(4)]).await;
+    // Re-establish the operator's account without CAP_TELEOP while the call
+    // waits; the account stays on the access list.
+    let pres = presentation(
+        OPERATOR.0,
+        OPERATOR.1,
+        Scope {
+            role: Role::OPERATOR,
+            caps: Scope::CAP_OBSERVE,
+        },
+    );
+    served
+        .trust
+        .verify_and_establish(
+            &pres,
+            &desk_key(OPERATOR.0),
+            Some("downgraded".into()),
+            T_NOW,
+        )
+        .expect("re-established with less scope");
+    stand_in.release.notify_one();
+    let r = reply_after(&mut s, &early, 4).await;
+    assert_eq!(r["error"]["code"], json!(-32001), "{r}");
+    let text = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("denied: tools/call needs more access: "),
+        "{r}"
+    );
+    assert!(
+        stand_in.tool_calls.try_recv().is_err(),
+        "the queued call reached rcpd after its scope lost the class"
+    );
+    let _ = served.stop_serving.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notifications_past_their_room_never_take_a_queued_estops_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stand_in = stand_in_rcpd().await;
+    // One request slot (the held ping) and one e-stop slot: the forward queue
+    // holds 1 + 1 + 4 messages. Six cancels then the estop.
+    let cancel = json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                         "params": { "requestId": 2, "reason": "rcp e2e" } });
+    let estop = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                        "params": { "name": "estop", "arguments": {} } });
+    let mut queued = vec![cancel; 6];
+    queued.push(estop);
+    let (served, mut s, early) = queue_behind_a_held_ping(
+        dir.path(),
+        &mut stand_in,
+        |l| {
+            l.in_flight = 1;
+            l.estops_in_flight = 1;
+        },
+        &queued,
+    )
+    .await;
+    stand_in.release.notify_one();
+    let r = reply_after(&mut s, &early, 7).await;
+    assert!(
+        r.get("result").is_some(),
+        "the estop was not forwarded: {r}"
+    );
+    let call = bounded("rcpd sees the estop", stand_in.tool_calls.recv())
+        .await
+        .expect("a tools/call");
+    assert_eq!(call["name"], json!("estop"), "{call}");
+    let _ = served.stop_serving.send(());
 }
 
 /// One ops call on its own connection from `desk` to `addr`.

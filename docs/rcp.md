@@ -413,25 +413,27 @@ The plane's bounds and timers are flags too: `--rcp-sessions-per-connection`,
 `--rcp-session-buffer-bytes`, `--rcp-revoke-check-ms`, `--rcp-head-timeout-ms`
 and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).
 
-### One e-stop for every remote path
+### One e-stop for the ops and rcp planes
 
-A robot reached through `cerulion-remoted` has one e-stop latch for every
-remote way to move it: the ops e-stop that `cerulion-remoted` holds. An
-`estop` call from a desk engages it before the call reaches rcpd, then rcpd
-engages its own latch as for any `estop`. The ops plane's `engage-estop`
-engages the same latch. While it is engaged:
+The ops e-stop that `cerulion-remoted` holds is one latch for the ops act
+verbs and the rcp plane. An `estop` call from a desk engages it before the
+call reaches rcpd, then rcpd engages its own latch as for any `estop`. The
+ops plane's `engage-estop` engages the same latch. While it is engaged:
 
 - every other tool call from a desk is refused before it reaches rcpd, with
   error `-32001` and the message `refused: the robot's e-stop is engaged`;
 - `estop_clear` is refused too, with `refused: the robot's ops e-stop is
   engaged; it clears when cerulion-remoted restarts`;
 - the ops act verbs `topic-publish` and `service-call` are refused;
-- `estop`, `tools/list`, the resources and the session messages still work.
+- `estop`, `tools/list`, the resources and the session messages still work;
+- `restart` does not read the latch: a desk with the operator role can
+  restart a graph while it is engaged, and LAN ingress does not read it
+  either.
 
-The ops latch is checked when a desk's message arrives. The ops plane's
-`engage-estop` does not reach rcpd: a tool call forwarded before it,
-including one rcpd holds behind the call it is running, still runs, and
-rcpd's own latch stays open. An `estop` over rcp also closes rcpd's own
+The ops latch is read when a desk's message arrives and again just before
+the plane sends it to rcpd. The ops plane's `engage-estop` does not reach
+rcpd: a tool call sent to rcpd before it, including one rcpd holds behind
+the call it is running, still runs, and rcpd's own latch stays open. An `estop` over rcp also closes rcpd's own
 latch, which refuses the calls rcpd has accepted but not yet published (see
 [E-stop](#e-stop)).
 

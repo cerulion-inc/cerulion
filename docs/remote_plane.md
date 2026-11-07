@@ -17,11 +17,12 @@ its engager; it does not stop motion by itself, and the state is held in the
 daemon's memory, so a daemon restart clears it, and nothing else does. Nothing
 outside the daemon can read that state yet: an engage returns a reply to the
 caller, writes a warning to the log, and asks Flashback to save a recording.
-It is the one e-stop latch every remote way to move the robot obeys: while it
-is engaged, the ops act verbs `topic-publish` and `service-call` and every
-tool call over the `cerulion/rcp/1` plane except `estop` are refused, and an
-`estop` over that plane engages it too (see
-[`docs/rcp.md`](rcp.md#one-e-stop-for-every-remote-path)). An `engage-estop`
+It is the one e-stop latch the ops act verbs and the `cerulion/rcp/1` plane
+obey: while it is engaged, the ops act verbs `topic-publish` and
+`service-call` and every tool call over the `cerulion/rcp/1` plane except
+`estop` are refused, and an `estop` over that plane engages it too (see
+[`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
+does not read it, and neither does LAN ingress. An `engage-estop`
 refuses the rcp tool calls that arrive after it but does not reach the
 robot's `cerulion-rcpd`, so a call rcpd already holds still runs; an `estop`
 over the rcp plane also closes rcpd's own latch, which refuses the calls rcpd

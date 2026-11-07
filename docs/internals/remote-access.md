@@ -447,6 +447,24 @@ one `POST` with rcpd's bearer token (read per session from
 under that caller (`cerulion_rcpd::caller`), so its receipts and the journaled
 call frame name the remote desk.
 
+The session reader never waits on rcpd: it admits each message (the class
+check, the e-stop engage or refusal, the one-initialize check and the slot)
+and hands it, without waiting, to the stream's forwarder task. The forwarder
+sends the messages to rcpd in the order they were admitted; it waits for a
+lifecycle message's response head, and for the `initialize` result, before
+the next, and sends and relays Observe, Act and Estop messages from their own
+tasks. Just before it sends an Observe or Act message it runs
+`rcp_authorize` for the message's class again, and for an Act message reads
+the e-stop latch again, so a call queued behind a held lifecycle message is
+refused after a revoke or an engage. Its bounded queue holds
+`in_flight + estops_in_flight + 4`: a request holds its slot while queued and
+a notification one of four notification places
+(`rcp::FORWARD_NOTIFICATION_ROOM`), so a request that holds a slot always
+fits; a notification with no place free is dropped. The forwarder stops once
+the stream's writer has stopped (a revoke closes the connection from the
+writer) and is aborted with its session. So an `estop` engages the ops latch
+while rcpd holds a lifecycle request.
+
 `rcp::rcp_authorize` is the one decision function, over one locked read
 (`SharedTrust::snapshot_row_for_key`: claimed flag, key access, allowing row).
 At accept (`classify_accept`) it needs a claimed robot and an allowed key. Each
@@ -468,7 +486,8 @@ application close with `rcp::CLOSE_REVOKED` or `rcp::CLOSE_SUPERSEDED`
 (mirrored as `connectd::rcp::CLOSE_*`), and the robot ending the stream
 before stdin's EOF each end the desk process with status 1 and an error line.
 
-One e-stop latch covers both remote actuation planes: the ops plane's
+One e-stop latch covers the ops act verbs and the rcp plane (`restart` does
+not read it): the ops plane's
 `cerud::lease::ControlLease` behind one `EstopLease` (the lease plus the
 count of e-stop engages waiting for its lock). The daemon builds it once
 (`OpsHost::daemon`); `serve_core` hands it to `OpsServing` (for
@@ -488,10 +507,11 @@ e-stop is engaged`, or for `estop_clear` (still `RcpClass::Act`) `refused:
 the robot's ops e-stop is engaged; it clears when cerulion-remoted
 restarts`. The lease guard is held only for that read or that state change,
 never across an `.await` and never with a connection, session, trust or
-receipt lock. The reader check is admission only: nothing
-on the ops side reaches rcpd, so after an ops `engage-estop` a request
-forwarded before it (one rcpd holds behind its serialized calls included)
-still runs and rcpd's own latch stays open. An rcp `estop` also closes
+receipt lock. The latch is read when a desk's message arrives
+and again just before the plane sends it to rcpd. Nothing on the ops side
+reaches rcpd, so after an ops `engage-estop` a tool call sent to rcpd before
+it (one rcpd holds behind its serialized calls included) still runs and
+rcpd's own latch stays open. An rcp `estop` also closes
 rcpd's latch, which refuses the calls rcpd has accepted but not yet
 published. `ControlLease::clear_estop` has no caller, so the latch clears
 only when `cerulion-remoted` restarts; then rcpd's own latch clears through
@@ -500,7 +520,8 @@ its `estop_clear` (`limits.estop_clear: agent`) or by deleting
 
 When rcpd answers HTTP 404 to a request that carried its session id (rcpd
 restarted and lost the session), the request is answered `-32603` and the
-session reader stops: the queued frames drain and the stream finishes. A
+session reader stops: the forwarder still sends what it holds, the queued
+frames drain and the stream finishes. A
 response body that ends without the response to its request (rcpd stopped
 mid-call, or a `notifications/cancelled` closed it) is answered `-32603` as
 well. A notification takes no in-flight slot, so a cancel reaches rcpd while
