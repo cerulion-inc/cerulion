@@ -242,9 +242,14 @@ fn alpn_constants_are_the_documented_wire_values() {
     // Hand oracle — the exact bytes on the wire.
     assert_eq!(alpn::WIRE, b"cerulion/wire/2");
     assert_eq!(alpn::OPS, b"cerulion/ops/1");
+    assert_eq!(alpn::RCP, b"cerulion/rcp/1");
     assert_eq!(
         alpn::ALL,
-        &[b"cerulion/wire/2".as_slice(), b"cerulion/ops/1"]
+        &[
+            b"cerulion/wire/2".as_slice(),
+            b"cerulion/ops/1",
+            b"cerulion/rcp/1"
+        ]
     );
 }
 
@@ -252,6 +257,9 @@ fn alpn_constants_are_the_documented_wire_values() {
 fn endpoint_config_defaults_to_n0_relays_and_both_planes() {
     let cfg = EndpointConfig::new([1u8; 32]);
     assert!(matches!(cfg.relay, RelayConfig::N0Default));
-    assert_eq!(cfg.alpns, vec![alpn::WIRE.to_vec(), alpn::OPS.to_vec()]);
+    assert_eq!(
+        cfg.alpns,
+        vec![alpn::WIRE.to_vec(), alpn::OPS.to_vec(), alpn::RCP.to_vec()]
+    );
     assert_eq!(cfg.secret_key, [1u8; 32]);
 }

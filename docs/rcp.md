@@ -36,7 +36,10 @@ Streamable HTTP is served at `/mcp`. Every request must carry
 `Authorization: Bearer <token>` matching `CERULION_RCP_TOKEN`, or it is
 answered `401`. Without the variable `--http` refuses to start. The default
 address is loopback; binding any other address logs a warning, and only
-`localhost`, `127.0.0.1` and `::1` are accepted as the `Host` header.
+`localhost`, `127.0.0.1` and `::1` are accepted as the `Host` header. A
+request may carry `x-cerulion-caller: <caller>` (1 to 200 characters from
+`[A-Za-z0-9:._@/-]`); a tool call it carries is receipted under that caller
+instead of `rcp-agent`, and a repeated or malformed value fails the call.
 
 ## The manifest
 
@@ -373,3 +376,76 @@ answer records. Every `late` receipt for a request an answer in the
 recording names must follow that request's `timeout` answer. The receipt
 log is shared by every run, so a `late` receipt for a request no answer in
 the recording names is another recording's and is left out.
+
+## Reaching rcpd from a desk
+
+`cerulion-remoted` serves the robot's rcpd to desks on its access list on the
+`cerulion/rcp/1` plane. Run rcpd with `--http` on its default loopback address
+and give it the token `cerulion-remoted` uses. At startup `cerulion-remoted`
+creates `<state root>/remoted/rcp.token` when it is absent: one
+`CERULION_RCP_TOKEN=<random token>` line, mode `0600`, owned by the user
+`cerulion-remoted` runs as. When the file exists but is not a regular file,
+or its group or others can read or write it, `cerulion-remoted` logs that at
+error and serves on: its ops and wire planes work, and every rcp request is
+answered with an error until the file is private (`chmod 600`). The file's
+format is a systemd environment file, so an rcpd systemd unit can read it
+with `EnvironmentFile=`, for example:
+
+```ini
+[Service]
+EnvironmentFile=/var/lib/cerulion/remoted/rcp.token
+ExecStart=/usr/bin/cerulion-rcpd --manifest /etc/cerulion/rcp.yaml --http
+```
+
+On the desk, `cerulion rcp <robot>` serves the robot's rcpd as a local stdio
+MCP server. While the desk's network kill-switch is engaged
+(`CERULION_NETWORK=off` or `--network off`) it is refused with exit 2 before
+anything reaches the robot. The robot admits only a desk on its access list and checks every
+message: `resources/*`, `subscriptions/listen` and `tools/list` need the
+observe capability; `tools/call` needs the teleop capability and the operator
+role, except that any desk on the access list may call `estop`. Tool calls
+made this way are receipted under the desk's identity,
+`iroh:<device key hex>/account:<account hex>`, and the journaled call frame
+carries the same value as `"caller"`. `cerulion-remoted --rcp-addr` (a
+loopback address) and `--rcp-token-file` change the address and the file.
+The plane's bounds and timers are flags too: `--rcp-sessions-per-connection`,
+`--rcp-connections-per-key`, `--rcp-in-flight`, `--rcp-estops-in-flight`,
+`--rcp-session-buffer-bytes`, `--rcp-revoke-check-ms`, `--rcp-head-timeout-ms`
+and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).
+
+### One e-stop for the ops and rcp planes
+
+The ops e-stop that `cerulion-remoted` holds is one latch for the ops act
+verbs and the rcp plane. An `estop` call from a desk engages it before the
+call reaches rcpd, then rcpd engages its own latch as for any `estop`. The
+ops plane's `engage-estop` engages the same latch. While it is engaged:
+
+- every other tool call from a desk is refused before it reaches rcpd, with
+  error `-32001` and the message `refused: the robot's e-stop is engaged`;
+- `estop_clear` is refused too, with `refused: the robot's ops e-stop is
+  engaged; it clears when cerulion-remoted restarts`;
+- the ops act verbs `topic-publish` and `service-call` are refused;
+- `estop`, `tools/list`, the resources and the session messages still work;
+- `restart` does not read the latch: a desk with the operator role can
+  restart a graph while it is engaged, and LAN ingress does not read it
+  either.
+
+The ops latch is read when a desk's message arrives and again just before
+the plane sends it to rcpd. The ops plane's `engage-estop` does not reach
+rcpd: a tool call sent to rcpd before it, including one rcpd holds behind
+the call it is running, still runs, and rcpd's own latch stays open. An `estop` over rcp also closes rcpd's own
+latch, which refuses the calls rcpd has accepted but not yet published (see
+[E-stop](#e-stop)).
+
+The latch clears only when `cerulion-remoted` restarts. To recover, restart
+`cerulion-remoted`, then clear rcpd's own latch if an `estop` closed it:
+`estop_clear` under `limits.estop_clear: agent`, or deleting
+`<receipts>.estop` and restarting rcpd. While the ops latch is clear,
+`estop_clear` reaches rcpd like any other tool call. Clients that talk to
+rcpd directly, over stdio or its own HTTP listener, see only rcpd's latch.
+
+When rcpd restarts, it forgets every MCP session. The next request on a
+desk's session is answered with error `-32603` (`rcpd lost this MCP session
+(it restarted); restart this MCP server`), the robot ends the session, and
+`cerulion rcp` exits with status 1. Restarting the MCP server in the MCP
+client opens a new session.

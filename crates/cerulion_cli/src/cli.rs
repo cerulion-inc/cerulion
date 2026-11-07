@@ -481,6 +481,48 @@ pub enum Commands {
         #[arg(long)]
         relay_disabled: bool,
     },
+    /// Serve a robot's cerulion-rcpd as a local stdio MCP server.
+    ///
+    /// Dials the robot's rcp plane with this machine's device key and bridges
+    /// one MCP session over stdin and stdout (newline-delimited JSON-RPC), so
+    /// an MCP client such as Claude Desktop can run `cerulion rcp <robot>` as
+    /// a stdio server and use the robot's rcpd resources and tools directly.
+    /// STDOUT carries only MCP messages; logs go to STDERR.
+    ///
+    /// The robot admits only a desk on its access list, and checks every
+    /// message: reading resources needs the observe capability, calling a
+    /// tool needs the teleop capability and the operator role, and any desk
+    /// on the access list may call the `estop` tool.
+    ///
+    /// Runs the `cerulion-connectd` helper binary. The release packages place
+    /// it beside `cerulion`; a source build gets it from
+    /// `cargo build -p cerulion_connectd`, and `CERULION_CONNECTD_BIN` points
+    /// at one anywhere else.
+    Rcp {
+        /// The robot: a 64-char-hex endpoint id, OR a name pinned in
+        /// `~/.cerulion/robots.toml` by `cerulion pair`. Omit when using `--eid`.
+        #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
+        /// The robot's iroh endpoint id (64-char hex). Overrides a positional name.
+        #[arg(long, value_name = "HEX")]
+        eid: Option<String>,
+        /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable.
+        #[arg(long = "addr", value_name = "IP:PORT")]
+        addrs: Vec<String>,
+        /// The desk device key file (32 raw bytes). Default: this machine's
+        /// key `~/.cerulion/identity/device.key` when it exists.
+        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+        key_file: Option<PathBuf>,
+        /// Self-hosted relay URL. Default: n0 public relays.
+        #[arg(long, value_name = "URL")]
+        relay_url: Option<String>,
+        /// Disable all relays (LAN / direct-dial only).
+        #[arg(long)]
+        relay_disabled: bool,
+        /// Kill-switch: pass `off` to refuse to connect.
+        #[arg(long)]
+        network: Option<String>,
+    },
     /// Sign in to a Cerulion account.
     ///
     /// Runs the device-code flow (RFC 8628): prints a short code and a
@@ -725,6 +767,7 @@ impl Commands {
             Commands::Viz { .. }
             | Commands::Connect { .. }
             | Commands::Pair { .. }
+            | Commands::Rcp { .. }
             | Commands::Login => LongRunning,
             // `ros2 attach` runs a bridge graph; `ros2 run`/`launch` exec()
             // the real ros2 (runtime processes — the classification covers

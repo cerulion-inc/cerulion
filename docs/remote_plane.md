@@ -14,13 +14,24 @@ zenoh gateway (`network:` blocks, `topic list`, mDNS).
 **What ships today.** The lease, deadman and e-stop state machine, and the
 remote `engage-estop` verb. Engaging the e-stop records the engaged state and
 its engager; it does not stop motion by itself, and the state is held in the
-daemon's memory, so a daemon restart clears it. Nothing outside the daemon can
-read that state yet: an engage returns a reply to the caller, writes a warning
-to the log, and asks Flashback to save a recording. A robot still needs its own
-stop path (a hardwired e-stop) to stop motion. Only the `cerulion-remoted`
-daemon serves `engage-estop`, `restart` and the act verbs (`topic-publish`,
-`service-call`, `topic-snapshot`, `topic-echo-once`): a process that hosts the
-remote plane as a library refuses each with an `unsupported_host` error. An Android app can
+daemon's memory, so a daemon restart clears it, and nothing else does. Nothing
+outside the daemon can read that state yet: an engage returns a reply to the
+caller, writes a warning to the log, and asks Flashback to save a recording.
+It is the one e-stop latch the ops act verbs and the `cerulion/rcp/1` plane
+obey: while it is engaged, the ops act verbs `topic-publish` and
+`service-call` and every tool call over the `cerulion/rcp/1` plane except
+`estop` are refused, and an `estop` over that plane engages it too (see
+[`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
+does not read it, and neither does LAN ingress. An `engage-estop`
+refuses the rcp tool calls that arrive after it but does not reach the
+robot's `cerulion-rcpd`, so a call rcpd already holds still runs; an `estop`
+over the rcp plane also closes rcpd's own latch, which refuses the calls rcpd
+has not yet published. A robot still needs its own stop path (a hardwired
+e-stop) to stop motion. Only the `cerulion-remoted` daemon serves
+`engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
+`topic-snapshot`, `topic-echo-once`) and the `cerulion/rcp/1` plane: a process
+that hosts the remote plane as a library refuses each of those verbs with an
+`unsupported_host` error and serves no rcp plane. An Android app can
 host the plane in its own process (see
 [Host the paired remote plane](android.md#host-the-paired-remote-plane)); a
 paired desk reads its catalog, schemas and topics there and cannot publish
@@ -67,6 +78,7 @@ act verbs, work on the robot's own shared memory; with `--robot`,
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
+`cerulion rcp` is refused the same way.
 
 The only other desk to robot topic path today is LAN ingress (an `ingress:`
 block in a graph), which proves no identity per peer and is closed when

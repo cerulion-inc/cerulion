@@ -499,6 +499,66 @@ fn robot_verbs_under_the_network_switch_refuse_before_the_helper_runs() {
 }
 
 #[test]
+#[cfg(unix)]
+fn rcp_under_the_network_switch_refuses_before_the_helper_runs() {
+    let robot = "ab".repeat(32);
+    // Control: with no switch the CLI reaches the helper, so the marker's
+    // absence below is the switch's doing.
+    let root = tempfile::tempdir().unwrap();
+    let (helper, marker) = stand_in_connectd(root.path());
+    let helper = helper.to_str().unwrap();
+    let control = run_with(
+        root.path(),
+        &["rcp", robot.as_str()],
+        &[("CERULION_CONNECTD_BIN", helper)],
+    );
+    assert!(
+        marker.exists(),
+        "the control run did not reach the helper: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // `off` in the variable or the flag, and an unrecognized value, which
+    // fails closed: each refuses and the refusal names the value.
+    let unrecognized =
+        "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)";
+    for (flag, network, label, remedy) in [
+        (
+            None,
+            Some("off"),
+            "CERULION_NETWORK=off",
+            "unset CERULION_NETWORK",
+        ),
+        (None, Some("typo"), unrecognized, "unset CERULION_NETWORK"),
+        (Some("off"), None, "--network off", "drop --network"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (helper, marker) = stand_in_connectd(root.path());
+        let helper = helper.to_str().unwrap();
+        let mut args = vec!["rcp", robot.as_str()];
+        if let Some(flag) = flag {
+            args.extend(["--network", flag]);
+        }
+        let mut env = vec![("CERULION_CONNECTD_BIN", helper)];
+        if let Some(network) = network {
+            env.push(("CERULION_NETWORK", network));
+        }
+        let output = run_with(root.path(), &args, &env);
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!marker.exists(), "{label}: the helper ran: {error}");
+        assert_eq!(output.status.code(), Some(2), "{label}: {error}");
+        assert!(
+            error.contains(&format!(
+                "cerulion rcp reaches the robot over the network, which {label} disables; \
+                 {remedy} to reach the robot's rcpd"
+            )),
+            "{label}: {error}"
+        );
+        assert!(output.stdout.is_empty(), "{label}");
+    }
+}
+
+#[test]
 #[cfg(all(unix, debug_assertions))]
 fn topic_pub_under_a_kill_switch_offers_nothing_on_the_lan() {
     let args = [

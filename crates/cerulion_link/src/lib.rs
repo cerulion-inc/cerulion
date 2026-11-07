@@ -20,7 +20,7 @@
 //! - [`assert_peer_identity`]: bind a connection's mutually-authenticated
 //!   peer key to an expected paired device key (the cert-subject == remote_id
 //!   check the higher layers assert).
-//! - [`alpn`]: the ALPN plane constants ([`alpn::WIRE`], [`alpn::OPS`]).
+//! - [`alpn`]: the ALPN plane constants ([`alpn::WIRE`], [`alpn::OPS`], [`alpn::RCP`]).
 //! - [`RelayConfig`]: the data-driven relay seam (n0 dev relays / disabled /
 //!   self-hosted prod URLs; no prod URLs hardcoded).
 //!   [`RelayConfig::resolve`] is the ONE shared precedence helper that turns
@@ -90,6 +90,8 @@ pub use relay::{RelayConfig, RelayParseError, CERULION_RELAY_URL_ENV};
 
 // Re-export the iroh types that appear in this crate's public API, so callers
 // need not add an iroh dependency (or risk a version skew) just to name them.
+/// Why a [`Connection`] closed ([`Connection::close_reason`]).
+pub use iroh::endpoint::ConnectionError;
 pub use iroh::endpoint::{Connection, RecvStream, SendStream};
 pub use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 
