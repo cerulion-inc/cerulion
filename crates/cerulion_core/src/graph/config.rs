@@ -737,8 +737,9 @@ pub struct NodeDef {
     /// run as one unit, one level loop. `isolate: true` gives this node a unit
     /// of its own, on its own thread, with or without a profile (a `block`
     /// flow still keeps its producer and consumers together; a unit runs a
-    /// contiguous band of levels, so without a profile the nodes past this
-    /// node's level run in a unit of their own too). With the
+    /// contiguous band of levels, so without a profile a node past this
+    /// node's level that no node of the process's unit feeds at the level
+    /// below runs in a later unit). With the
     /// graph's profile every node starts a unit and a linear chain of trigger
     /// edges shares one unit where the profile shows the merge stays within
     /// its tick budget; there `isolate: false` keeps this node in the unit of

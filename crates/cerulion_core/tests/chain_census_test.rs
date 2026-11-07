@@ -25,8 +25,8 @@ use cerulion_core::graph::chain::{census_chains, ChainCensus, Colocation, MAX_FU
 use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
 use cerulion_core::graph::topology::{GraphTopology, Levels, TriggerEdges};
 use cerulion_core::graph::{
-    build_trigger_edges, expand_process_groups, parse_graph, GraphConfig, HopCosts, PartitionCosts,
-    UnitGraph, UnitPlan, UnitProfile,
+    build_trigger_edges, expand_process_groups, parse_graph, validate_partition, Boundary,
+    GraphConfig, HopCosts, PartitionCosts, UnitGraph, UnitPlan, UnitProfile,
 };
 use indexmap::IndexSet;
 use std::collections::BTreeMap;
@@ -1015,6 +1015,193 @@ fn every_fused_chain_lies_inside_one_executor_unit() {
     );
     assert_eq!(chains(&census), vec!["src->relay->sink"]);
     assert_chains_inside_units(&census, &plan);
+}
+
+// ==========================================================================
+// Without a profile: the units `isolate: true` makes, against the validator
+// ==========================================================================
+
+/// A graph of `ids`, each publishing `out`, where node `c` reads input `i<p>`
+/// from node `p` for every `(p, c)` in `edges`.
+fn dag_yaml(ids: &[String], edges: &[(usize, usize)]) -> String {
+    let mut yaml = String::from("prefix: t\nnodes:\n");
+    for (c, id) in ids.iter().enumerate() {
+        yaml.push_str(&format!("  - id: {id}\n    type: {id}\n"));
+        let inputs: Vec<usize> = edges
+            .iter()
+            .filter(|(_, consumer)| *consumer == c)
+            .map(|(p, _)| *p)
+            .collect();
+        if !inputs.is_empty() {
+            yaml.push_str("    inputs:\n");
+            for p in inputs {
+                yaml.push_str(&format!(
+                    "      - name: i{p}\n        source: {}/out\n",
+                    ids[p]
+                ));
+            }
+        }
+        yaml.push_str("    outputs:\n      - name: out\n        schema: std_msgs/Int32\n");
+    }
+    yaml
+}
+
+/// Every graph of trigger edges on five nodes (an edge runs only from a lower
+/// node index to a higher one, so each is acyclic; a node with no input is a
+/// 10 ms source, any other fires on each input), with every set of at most two
+/// nodes declaring `isolate: true`, split into units without a profile as one
+/// process. For each split:
+///
+/// - the partition validator accepts it;
+/// - each isolated node is alone in its unit;
+/// - a node that is fed at the level just below it by a node that does not
+///   declare `isolate: true` shares a unit with one such node, so
+///   `isolate: true` splits off only the nodes a contiguous band of levels
+///   cannot keep;
+/// - with no isolated node the process is one unit;
+/// - a unit that says `no profile` holds every node that does not declare
+///   `isolate: true`.
+///
+/// Every violation is collected, so a failure reports how many splits break
+/// each rule.
+#[test]
+fn without_a_profile_isolate_true_splits_off_only_what_a_band_of_levels_needs() {
+    const N: usize = 5;
+    const INPUTS: [&str; N] = ["i0", "i1", "i2", "i3", "i4"];
+    let ids: Vec<String> = (0..N).map(|i| format!("n{i}")).collect();
+    let pairs: Vec<(usize, usize)> = (0..N).flat_map(|c| (0..c).map(move |p| (p, c))).collect();
+    let mut violations: Vec<(&str, String)> = Vec::new();
+    let mut splits = 0usize;
+    for mask in 0u32..(1 << pairs.len()) {
+        let edges: Vec<(usize, usize)> = pairs
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| mask & (1 << k) != 0)
+            .map(|(_, e)| *e)
+            .collect();
+        let yaml = dag_yaml(&ids, &edges);
+        let specs: Vec<(&str, Spec)> = (0..N)
+            .map(|c| {
+                let inputs: Vec<&'static str> = edges
+                    .iter()
+                    .filter(|(_, consumer)| *consumer == c)
+                    .map(|(p, _)| INPUTS[*p])
+                    .collect();
+                let spec = if inputs.is_empty() {
+                    Spec::period(10)
+                } else {
+                    Spec::undeclared(&inputs)
+                };
+                (ids[c].as_str(), spec)
+            })
+            .collect();
+        let h = Harness::new(&yaml, &specs);
+        let level = |i: usize| h.levels.level_of(&ids[i]).expect("every node has a level");
+        for iso in 0u32..(1 << N) {
+            if iso.count_ones() > 2 {
+                continue;
+            }
+            splits += 1;
+            let isolated = |i: usize| iso & (1 << i) != 0;
+            let mut one = h.config.clone();
+            for node in &mut one.nodes {
+                let i = ids.iter().position(|id| *id == node.id).expect("known id");
+                node.isolate = isolated(i).then_some(true);
+            }
+            one.process_groups = [("g".to_string(), ids.clone())].into_iter().collect();
+            let graph = UnitGraph::from_graph(&one, &h.infos, &h.topology, &h.trigger_edges);
+            let plan = expand_process_groups(&one, &graph, None, &IndexSet::new());
+            let case = format!(
+                "edges {edges:?}, isolated {:?}",
+                (0..N).filter(|&i| isolated(i)).collect::<Vec<_>>()
+            );
+            if let Err(e) = validate_partition(&plan.groups, &one, &h.infos, &h.trigger_edges) {
+                violations.push((
+                    "validator",
+                    format!("validator refuses the split ({case}): {e}"),
+                ));
+                continue;
+            }
+            let units = &plan.units["g"];
+            let unit_of = |i: usize| {
+                units
+                    .iter()
+                    .position(|u| u.nodes.contains(&ids[i]))
+                    .expect("every node is in a unit")
+            };
+            for i in (0..N).filter(|&i| isolated(i)) {
+                if units[unit_of(i)].nodes != [ids[i].clone()] {
+                    violations.push((
+                        "isolated",
+                        format!("{} is isolated but shares a unit ({case})", ids[i]),
+                    ));
+                }
+            }
+            for c in (0..N).filter(|&c| !isolated(c)) {
+                let feeders: Vec<usize> = edges
+                    .iter()
+                    .filter(|(p, consumer)| {
+                        *consumer == c && !isolated(*p) && level(*p) + 1 == level(c)
+                    })
+                    .map(|(p, _)| *p)
+                    .collect();
+                if !feeders.is_empty() && !feeders.iter().any(|&p| unit_of(p) == unit_of(c)) {
+                    violations.push((
+                        "feeder",
+                        format!(
+                            "{} leaves the unit of every node that feeds it at the level below \
+                             ({case})",
+                            ids[c]
+                        ),
+                    ));
+                }
+            }
+            if iso == 0 && units.len() != 1 {
+                violations.push((
+                    "one unit",
+                    format!("no isolated node, yet {} units ({case})", units.len()),
+                ));
+            }
+            for unit in units {
+                let says_whole = unit
+                    .boundaries
+                    .iter()
+                    .any(|(_, b)| *b == Boundary::NoProfile);
+                let holds_whole = (0..N)
+                    .filter(|&i| !isolated(i))
+                    .all(|i| unit.nodes.contains(&ids[i]));
+                if says_whole && !holds_whole {
+                    violations.push((
+                        "no profile",
+                        format!(
+                            "unit {} says every node runs in it but holds {:?} ({case})",
+                            unit.name, unit.nodes
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    assert!(splits > 16_000, "the sweep ran: {splits} splits");
+    let per_rule: Vec<String> = ["validator", "isolated", "feeder", "one unit", "no profile"]
+        .iter()
+        .map(|rule| {
+            let n = violations.iter().filter(|(r, _)| r == rule).count();
+            format!("{rule}: {n}")
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "{} violations over {splits} splits ({}); the first ones:\n{}",
+        violations.len(),
+        per_rule.join(", "),
+        violations
+            .iter()
+            .take(12)
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 // ==========================================================================

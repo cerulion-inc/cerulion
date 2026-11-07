@@ -21,9 +21,13 @@
 //! still joins its nodes, and `isolate: false` changes nothing. The unit
 //! carries [`Boundary::NoProfile`] on its first member and each isolated unit
 //! [`Boundary::Isolated`]. A unit runs a contiguous band of the graph's
-//! levels, so the other nodes are cut at an isolated node's level: those past
-//! it start a unit carrying [`Boundary::AfterIsolatedLevel`]. With a profile
-//! the rules below split and merge.
+//! levels, and the planner keeps a node above its band's first level in the
+//! unit only where a node of the unit feeds it at the level just below. An
+//! isolated node can be a node's only feeder at that level, so a node past an
+//! isolated node's level that no node of an earlier unit feeds at the level
+//! below starts a later unit, carrying [`Boundary::AfterIsolatedLevel`], and
+//! the first unit then carries [`Boundary::NoProfileCut`] in place of
+//! [`Boundary::NoProfile`]. With a profile the rules below split and merge.
 //!
 //! A unit is woken by the kernel on ONE input, its first declared trigger or
 //! sync input another unit or process writes; a frame on any other input is
@@ -163,14 +167,22 @@ pub enum Boundary {
     /// declare `isolate: true` runs in this unit. Carried by the unit's first
     /// such node.
     NoProfile,
-    /// The graph has no profile, and this unit holds the nodes of the process
-    /// at levels past an isolated node's level: a unit runs a contiguous band
-    /// of the graph's levels, so the process's other nodes are cut at the
-    /// level of each node that declares `isolate: true`.
+    /// The graph has no profile, and the nodes of the process that do not
+    /// declare `isolate: true` run in more than one unit, because an isolated
+    /// node cuts them: this is the first of those units, and each later one
+    /// starts with [`Boundary::AfterIsolatedLevel`]. Carried by the unit's
+    /// first node that does not declare `isolate: true`.
+    NoProfileCut,
+    /// The graph has no profile, and this unit starts past an isolated node's
+    /// level with nodes that no node of an earlier unit feeds at the level
+    /// just below: a unit runs a contiguous band of the graph's levels, and a
+    /// node above its band's first level must be fed from inside the unit at
+    /// the level just below.
     AfterIsolatedLevel {
-        /// The isolated node whose level the band starts after.
+        /// The isolated node at the highest level below this unit's first
+        /// level.
         node: String,
-        /// That level.
+        /// That node's level.
         level: usize,
     },
 }
@@ -204,9 +216,15 @@ impl Boundary {
             Self::NoProfile => "no profile: every node of this process that does not declare \
                                 `isolate: true` runs in this unit"
                 .to_string(),
+            Self::NoProfileCut => "no profile: the nodes of this process that do not declare \
+                                   `isolate: true` run in this unit, apart from those in a unit \
+                                   that starts past an isolated node's level (a unit runs a \
+                                   contiguous band of levels)"
+                .to_string(),
             Self::AfterIsolatedLevel { node, level } => format!(
-                "no profile: past level {level} of {node}, which declares isolate: true (a unit \
-                 runs a contiguous band of levels)"
+                "no profile: past level {level} of {node}, which declares isolate: true, and no \
+                 node of an earlier unit feeds it at the level below (a unit runs a contiguous \
+                 band of levels)"
             ),
         }
     }
@@ -573,8 +591,9 @@ fn merge_verdict(
 
 /// Split one host's members into executor units.
 ///
-/// Without a profile the members form one unit, cut at the level of each
-/// member that declares `isolate: true`, which forms one of its own, and a
+/// Without a profile the members form one unit, apart from each member that
+/// declares `isolate: true`, which forms one of its own, and the members past
+/// one that the first unit cannot hold in a contiguous band of levels; a
 /// `block` coupling joins its nodes' units. With a profile the link rules of
 /// this module's documentation split and merge them.
 ///
@@ -592,25 +611,41 @@ pub fn derive_units(
     units_from_profile(host, members, graph, profile)
 }
 
-/// [`derive_units`] without a profile: the members that do not declare
-/// `isolate: true` form one unit, its first member carrying
-/// [`Boundary::NoProfile`], and each member that does forms one of its own
-/// ([`Boundary::Isolated`]); each `block` coupling then joins the units of its
-/// nodes.
+/// [`derive_units`] without a profile.
 ///
-/// A unit must own a contiguous band of the graph's levels, unbridged by any
-/// node outside it (the partition validator's rule), and the one unit of the
-/// non-isolated members can span an isolated node's level. Those members are
-/// therefore cut at every CUT LEVEL, the level of an isolated member no
-/// coupling keeps with a non-isolated one: a member joins the band that ends
-/// at the first cut level at or above its own, and a band past the last cut
-/// level holds the rest. Each band's first member after the first band
-/// carries [`Boundary::AfterIsolatedLevel`] naming the cut it starts past. A
-/// path into a band from a node outside it comes from a lower level, so no
-/// band is bridged. When a member's level is unknown no cut is made.
+/// Each member that declares `isolate: true` forms a unit of its own
+/// ([`Boundary::Isolated`]), unless a `block` coupling keeps it with a member
+/// that does not; every other member is a PARTICIPANT. The participants form
+/// units under the partition validator's rule: a unit owns a contiguous band
+/// of the graph's levels, and each of its nodes re-levelizes, inside the unit,
+/// to its rank in that band, so on derived levels a node above the band's
+/// first level needs a node of the unit that feeds it at the level just below
+/// (on assigned levels the validator asks only for the contiguous band, which
+/// that feeder also gives). Only an isolated member can take that feeder away,
+/// so the participants are placed level by level, lowest first, member order
+/// breaking ties:
 ///
-/// A member a coupling keeps with another member carries no `isolate: true`
-/// reason; its unit lists the block topic instead.
+/// - a participant that no cutting isolated member precedes in level joins the
+///   first unit;
+/// - any other joins the earliest unit that starts at its level or holds a
+///   node feeding it at the level just below;
+/// - one that no unit takes starts a unit at its level.
+///
+/// Each unit therefore holds every level from its first to its last. On
+/// derived levels, in a process the partition validator accepts, every node
+/// above the process's lowest level is fed from inside the process at the
+/// level below, so each node of a unit above its first level is fed from
+/// inside the unit at the level below. When a member's level is unknown, or
+/// no isolated member cuts, the participants form one unit.
+///
+/// When the participants form one unit its first member that does not declare
+/// `isolate: true` carries [`Boundary::NoProfile`]. Otherwise that member of
+/// the first unit carries [`Boundary::NoProfileCut`], and that member of each
+/// later unit [`Boundary::AfterIsolatedLevel`], naming the cutting isolated
+/// member at the highest level below the unit's first level (member order
+/// breaking ties). Each `block` coupling then joins the units of its nodes; a
+/// member a coupling keeps with another member carries no `isolate: true`
+/// reason, and its unit lists the block topic instead.
 fn units_without_profile(host: &str, members: &[String], graph: &UnitGraph) -> Vec<ExecutorUnit> {
     let in_host: IndexSet<&str> = members.iter().map(String::as_str).collect();
     let isolated = |n: &str| graph.isolate.get(n) == Some(&true);
@@ -625,55 +660,98 @@ fn units_without_profile(host: &str, members: &[String], graph: &UnitGraph) -> V
             kept.insert(root(&mut coupled, i));
         }
     }
-    let cuts_known = members.iter().all(|m| graph.level.contains_key(m));
-    let mut cuts: Vec<(usize, &str)> = Vec::new();
-    if cuts_known {
-        for (i, member) in members.iter().enumerate() {
-            if isolated(member) && !kept.contains(&root(&mut coupled, i)) {
-                cuts.push((graph.level[member], member.as_str()));
-            }
+    let mut cut = vec![false; members.len()];
+    for (i, member) in members.iter().enumerate() {
+        cut[i] = isolated(member) && !kept.contains(&root(&mut coupled, i));
+    }
+    let mut feeders: Vec<Vec<usize>> = vec![Vec::new(); members.len()];
+    for (producer, consumer) in &graph.trigger_edges {
+        if let (Some(p), Some(c)) = (
+            in_host.get_index_of(producer.as_str()),
+            in_host.get_index_of(consumer.as_str()),
+        ) {
+            feeders[c].push(p);
         }
     }
-    cuts.sort_by_key(|(level, _)| *level);
-    cuts.dedup_by_key(|(level, _)| *level);
-    // The band of a non-isolated member: how many cut levels lie below its
-    // own level.
-    let band = |member: &str| {
-        graph
-            .level
-            .get(member)
-            .map_or(0, |l| cuts.iter().filter(|(cut, _)| cut < l).count())
-    };
+
+    // The unit of each participant (a cutting member's entry is unused): 0 is
+    // the first unit, `u >= 1` the later unit `later[u - 1]`, which records its
+    // first level and the cutting member it is named past, with that member's
+    // level.
+    let mut unit_of: Vec<usize> = vec![0; members.len()];
+    let mut later: Vec<(usize, usize, usize)> = Vec::new();
+    // Without a known level for every member, or without a cutting member,
+    // every participant stays in the first unit.
+    let levels: Option<Vec<usize>> = members
+        .iter()
+        .map(|m| graph.level.get(m).copied())
+        .collect();
+    if let Some(level) = levels.filter(|_| cut.contains(&true)) {
+        let mut participants: Vec<usize> = (0..members.len()).filter(|&i| !cut[i]).collect();
+        participants.sort_by_key(|&i| (level[i], i));
+        let mut first_level: Option<usize> = None;
+        for &i in &participants {
+            let l = level[i];
+            let past = (0..members.len())
+                .filter(|&j| cut[j] && level[j] < l)
+                .max_by_key(|&j| (level[j], std::cmp::Reverse(j)));
+            let u = match (first_level, past) {
+                (None, _) => {
+                    first_level = Some(l);
+                    0
+                }
+                (Some(_), None) => 0,
+                (Some(first), Some(j)) => {
+                    let starts_at = |u: usize| if u == 0 { first } else { later[u - 1].0 };
+                    // Participants are placed lowest level first, so a feeder
+                    // at the level below is already placed.
+                    let fed_from = |u: usize| {
+                        feeders[i]
+                            .iter()
+                            .any(|&p| !cut[p] && level[p] + 1 == l && unit_of[p] == u)
+                    };
+                    match (0..=later.len()).find(|&u| starts_at(u) == l || fed_from(u)) {
+                        Some(u) => u,
+                        None => {
+                            later.push((l, j, level[j]));
+                            later.len()
+                        }
+                    }
+                }
+            };
+            unit_of[i] = u;
+        }
+    }
 
     let mut parent: Vec<usize> = (0..members.len()).collect();
     let mut starts: IndexMap<&str, Boundary> = IndexMap::new();
-    let mut first_of_band: IndexMap<usize, usize> = IndexMap::new();
+    let mut head: Vec<Option<usize>> = vec![None; later.len() + 1];
+    let mut carrier: Vec<Option<usize>> = vec![None; later.len() + 1];
     for (i, member) in members.iter().enumerate() {
-        let n = member.as_str();
-        if isolated(n) && !kept.contains(&root(&mut coupled, i)) {
-            starts.insert(n, Boundary::Isolated);
+        if cut[i] {
+            starts.insert(member.as_str(), Boundary::Isolated);
             continue;
         }
-        if isolated(n) {
-            // Kept with a non-isolated member by a coupling: the coupling
-            // below joins it, and it carries no reason.
-            continue;
+        let u = unit_of[i];
+        match head[u] {
+            Some(h) => union(&mut parent, h, i),
+            None => head[u] = Some(i),
         }
-        let b = band(n);
-        match first_of_band.get(&b) {
-            Some(&first) => union(&mut parent, first, i),
-            None => {
-                first_of_band.insert(b, i);
-                let reason = match b.checked_sub(1).map(|k| cuts[k]) {
-                    None => Boundary::NoProfile,
-                    Some((level, node)) => Boundary::AfterIsolatedLevel {
-                        node: node.to_string(),
-                        level,
-                    },
-                };
-                starts.insert(n, reason);
-            }
+        if carrier[u].is_none() && !isolated(member) {
+            carrier[u] = Some(i);
         }
+    }
+    for (u, c) in carrier.iter().enumerate() {
+        let Some(c) = *c else { continue };
+        let reason = match u.checked_sub(1).map(|k| later[k]) {
+            None if later.is_empty() => Boundary::NoProfile,
+            None => Boundary::NoProfileCut,
+            Some((_, j, level)) => Boundary::AfterIsolatedLevel {
+                node: members[j].clone(),
+                level,
+            },
+        };
+        starts.insert(members[c].as_str(), reason);
     }
     let block_topics = join_couplings(graph, &in_host, &mut parent);
     let topics_by_root = topics_by_final_root(block_topics, &mut parent);
@@ -1377,7 +1455,8 @@ mod tests {
     fn without_a_profile_isolate_true_mid_graph_cuts_the_one_unit_past_its_level() {
         // `relay` (level 1) declares isolate: true. `producer` (0) and `join`
         // (2) in one unit would own levels 0 and 2 with level 1 outside it,
-        // which no unit may, so `join` starts a unit past relay's level.
+        // which no unit may, so `join` starts a unit past relay's level and
+        // `producer` heads the first of two units.
         let mut g = producer_relay_join();
         g.isolate.insert("relay".into(), true);
         let units = derive_units("g", &prj(), &g, None);
@@ -1385,7 +1464,7 @@ mod tests {
             nodes(&units),
             [s(&["producer"]), s(&["relay"]), s(&["join"])]
         );
-        assert_eq!(start_of(&units, "producer"), Some(&Boundary::NoProfile));
+        assert_eq!(start_of(&units, "producer"), Some(&Boundary::NoProfileCut));
         assert_eq!(start_of(&units, "relay"), Some(&Boundary::Isolated));
         assert_eq!(
             start_of(&units, "join"),
@@ -1399,7 +1478,8 @@ mod tests {
     #[test]
     fn without_a_profile_a_node_at_the_isolated_level_stays_below_the_cut() {
         // `x` (level 1) declares isolate: true; `c`, also at level 1, stays in
-        // `producer`'s unit, and `join` (2) starts the band past level 1.
+        // `producer`'s unit. `join` (2) is fed at level 1 only by `x`, so it
+        // starts a unit past level 1.
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
         let fan = ChainBar::FanOut { consumers: 3 };
         let mut g = graph(
@@ -1509,6 +1589,166 @@ mod tests {
                 level: 1
             })
         );
+    }
+
+    #[test]
+    fn without_a_profile_isolating_one_branch_of_a_fan_out_keeps_the_other_branch_whole() {
+        // `producer` (level 0) feeds `x` and `c` (level 1), and `c` feeds `d`
+        // (level 2). `x` declares isolate: true. `d` is past x's level but is
+        // fed at the level below by `c`, so `producer`, `c` and `d` stay one
+        // unit and only `x` leaves it.
+        let mut g = graph(
+            &[("c", "d")],
+            &[
+                ("producer", "x", ChainBar::FanOut { consumers: 2 }),
+                ("producer", "c", ChainBar::FanOut { consumers: 2 }),
+            ],
+            &[("producer", 10)],
+        );
+        g.isolate.insert("x".into(), true);
+        let units = derive_units("g", &s(&["producer", "x", "c", "d"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["producer", "c", "d"]), s(&["x"])]);
+        assert_eq!(
+            units[0].boundaries,
+            [("producer".to_string(), Boundary::NoProfile)],
+            "the one unit of the other nodes says so: {units:?}"
+        );
+        assert_eq!(units[1].boundaries, [("x".to_string(), Boundary::Isolated)]);
+    }
+
+    #[test]
+    fn without_a_profile_an_isolated_source_leaves_the_join_with_the_other_source() {
+        // `cam` and `lidar` (level 0) both feed `fusion` (level 1), and `lidar`
+        // declares isolate: true. `cam` feeds `fusion` at the level below, so
+        // the two share a unit and the join takes only lidar's frames from
+        // another unit.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[],
+            &[("cam", "fusion", join.clone()), ("lidar", "fusion", join)],
+            &[("cam", 10), ("lidar", 10)],
+        );
+        g.isolate.insert("lidar".into(), true);
+        let units = derive_units("g", &s(&["cam", "lidar", "fusion"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["cam", "fusion"]), s(&["lidar"])]);
+        assert_eq!(start_of(&units, "cam"), Some(&Boundary::NoProfile));
+        assert_eq!(start_of(&units, "fusion"), None, "{units:?}");
+    }
+
+    #[test]
+    fn without_a_profile_the_first_unit_of_a_cut_process_does_not_claim_every_node() {
+        // `relay` (level 1) declares isolate: true, so `join` (level 2) starts
+        // a unit past its level. `producer` heads the first unit, which does
+        // not hold every node that does not declare isolate: true, so its
+        // reason must not say so.
+        let mut g = producer_relay_join();
+        g.isolate.insert("relay".into(), true);
+        let units = derive_units("g", &prj(), &g, None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["producer"]), s(&["relay"]), s(&["join"])]
+        );
+        let first = start_of(&units, "producer").expect("producer heads a unit");
+        assert_ne!(first, &Boundary::NoProfile, "{units:?}");
+        assert!(
+            !first.describe().contains("every node"),
+            "`{}` claims a unit it does not hold",
+            first.describe()
+        );
+        assert_eq!(first, &Boundary::NoProfileCut);
+        assert!(
+            first
+                .describe()
+                .contains("apart from those in a unit that starts past"),
+            "{}",
+            first.describe()
+        );
+    }
+
+    #[test]
+    fn without_a_profile_each_later_unit_names_the_isolated_node_just_below_it() {
+        // src -> i1 -> a -> i2 -> b, with i1 (level 1) and i2 (level 3)
+        // isolated: `a` starts a unit past level 1 of i1, `b` one past level 3
+        // of i2.
+        let mut g = graph(
+            &[("src", "i1"), ("i1", "a"), ("a", "i2"), ("i2", "b")],
+            &[],
+            &[("src", 10)],
+        );
+        g.isolate.insert("i1".into(), true);
+        g.isolate.insert("i2".into(), true);
+        let members = s(&["src", "i1", "a", "i2", "b"]);
+        let units = derive_units("g", &members, &g, None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["src"]), s(&["i1"]), s(&["a"]), s(&["i2"]), s(&["b"])]
+        );
+        assert_eq!(start_of(&units, "src"), Some(&Boundary::NoProfileCut));
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&Boundary::AfterIsolatedLevel {
+                node: "i1".into(),
+                level: 1
+            })
+        );
+        assert_eq!(
+            start_of(&units, "b"),
+            Some(&Boundary::AfterIsolatedLevel {
+                node: "i2".into(),
+                level: 3
+            })
+        );
+    }
+
+    #[test]
+    fn without_a_profile_a_later_unit_keeps_the_chain_past_the_isolated_node() {
+        // src -> iso -> a -> b -> c: `a`, `b` and `c` share the unit past
+        // iso's level, each fed at the level below from inside it, and the
+        // unit's first member in member order carries the reason.
+        let mut g = graph(
+            &[("src", "iso"), ("iso", "a"), ("a", "b"), ("b", "c")],
+            &[],
+            &[("src", 10)],
+        );
+        g.isolate.insert("iso".into(), true);
+        let units = derive_units("g", &s(&["c", "b", "a", "iso", "src"]), &g, None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["c", "b", "a"]), s(&["iso"]), s(&["src"])]
+        );
+        assert_eq!(
+            units[0].boundaries,
+            [(
+                "c".to_string(),
+                Boundary::AfterIsolatedLevel {
+                    node: "iso".into(),
+                    level: 1
+                }
+            )]
+        );
+        assert_eq!(start_of(&units, "src"), Some(&Boundary::NoProfileCut));
+    }
+
+    #[test]
+    fn without_a_profile_a_node_no_isolated_node_precedes_in_level_stays_in_the_first_unit() {
+        // Assigned levels (a `level_assignments:` graph may leave a level
+        // between a producer and its consumer): `producer` 0, `b` 1, `a` 2
+        // fed only by `producer`, `x` 3 isolated and fed by `a`. No isolated
+        // node sits below `a`'s level, so `a` stays in the first unit though
+        // no node feeds it at level 1.
+        let mut g = graph(
+            &[("producer", "a"), ("producer", "b"), ("a", "x")],
+            &[],
+            &[("producer", 10)],
+        );
+        g.level = [("producer", 0), ("b", 1), ("a", 2), ("x", 3)]
+            .into_iter()
+            .map(|(n, l)| (n.to_string(), l))
+            .collect();
+        g.isolate.insert("x".into(), true);
+        let units = derive_units("g", &s(&["producer", "a", "b", "x"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["producer", "a", "b"]), s(&["x"])]);
+        assert_eq!(start_of(&units, "producer"), Some(&Boundary::NoProfile));
     }
 
     // ---- With a profile, every node starts alone and the profile merges links.

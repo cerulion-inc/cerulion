@@ -13452,7 +13452,9 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
 /// cost-fused groups when the graph has a profile). Each group is split into
 /// units by the same derivation the run uses: with the graph's profile (its
 /// `graphs/<name>.costs.yaml`) the link rules and the tick budget; without
-/// one, one unit per process and one per node declaring `isolate: true`.
+/// one, one unit per process, one per node declaring `isolate: true`, and one
+/// for the nodes past an isolated node that no earlier unit feeds at the level
+/// below.
 /// `--single-process` and the lockstep execution mode are not modelled: the
 /// view is the default free run.
 pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
@@ -13542,7 +13544,9 @@ pub(crate) fn render_unit_plan(
                  the tick budget holds"
             ),
             None => "no profile, so each process runs as one unit; a node that declares \
-                     `isolate: true` runs in a unit of its own"
+                     `isolate: true` runs in a unit of its own, and a node past its level that \
+                     no earlier unit feeds at the level below starts another (a unit runs a \
+                     contiguous band of levels)"
                 .to_string(),
         }
     );
@@ -23542,8 +23546,10 @@ nodes:
     /// and `graph plan` says why. The case: one process group holding a 10 ms
     /// producer, a relay it feeds and a join of both. With `isolate: true` on
     /// the join, the join alone gets a unit of its own and the plan names the
-    /// key; on the relay, the join also starts a unit past the relay's level,
-    /// and the partition validator accepts every unit.
+    /// key; on the relay, which alone feeds the join at the level below it,
+    /// the join also starts a unit past the relay's level, the first unit says
+    /// it does not hold every node, and the partition validator accepts every
+    /// unit.
     #[test]
     fn graph_plan_shows_one_unit_per_process_without_a_profile_and_says_why() {
         let tmp = tempfile::tempdir().unwrap();
@@ -23636,7 +23642,9 @@ process_groups:
         for line in [
             "graph upj: 1 process(es), 1 executor unit(s)",
             "  units: no profile, so each process runs as one unit; a node that declares \
-             `isolate: true` runs in a unit of its own",
+             `isolate: true` runs in a unit of its own, and a node past its level that no earlier \
+             unit feeds at the level below starts another (a unit runs a contiguous band of \
+             levels)",
             "process p0: 1 unit(s)",
             "  unit p0: src, mid, join",
             "    starts at src: no profile: every node of this process that does not declare \
@@ -23685,12 +23693,155 @@ process_groups:
             "graph upj: 1 process(es), 3 executor unit(s)",
             "process p0: 3 unit(s)",
             "  unit p0.src: src",
-            no_profile,
+            "    starts at src: no profile: the nodes of this process that do not declare \
+             `isolate: true` run in this unit, apart from those in a unit that starts past an \
+             isolated node's level (a unit runs a contiguous band of levels)",
             "  unit p0.mid: mid",
             "    starts at mid: isolate: true",
             "  unit p0.join: join",
-            "    starts at join: no profile: past level 1 of mid, which declares isolate: true (a \
-             unit runs a contiguous band of levels)",
+            "    starts at join: no profile: past level 1 of mid, which declares isolate: true, \
+             and no node of an earlier unit feeds it at the level below (a unit runs a \
+             contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("every node of this process that does not declare"),
+            "a cut process does not say every node runs in one unit; plan was:\n{plan}"
+        );
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// Without a profile, `isolate: true` takes out of the process's one unit
+    /// only the isolated node and the nodes a contiguous band of levels cannot
+    /// keep with the rest, and the partition validator accepts the split. Two
+    /// one-process graphs, each with one node isolated: a 10 ms source feeding
+    /// `fast` and `slow` (`slow` isolated) with `fast` feeding `sink`, where
+    /// `sink` is past slow's level but fed by `fast` at the level below; and
+    /// two sources `cam` and `lidar` (`lidar` isolated) feeding a join, which
+    /// `cam` feeds at the level below.
+    #[test]
+    fn graph_plan_keeps_in_the_one_unit_every_node_an_isolated_node_does_not_cut_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "keep_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let relay = |id: &str, source: &str, isolate: bool| {
+            format!(
+                "  - id: {id}\n    type: relay\n{}    inputs:\n      - name: inp\n        \
+                 source: {source}/out\n    outputs:\n      - name: out\n        schema: \
+                 geometry_msgs/Vector3\n",
+                if isolate { "    isolate: true\n" } else { "" }
+            )
+        };
+        let producer = |id: &str, isolate: bool| {
+            format!(
+                "  - id: {id}\n    type: producer\n{}    outputs:\n      - name: out\n        \
+                 schema: geometry_msgs/Vector3\n",
+                if isolate { "    isolate: true\n" } else { "" }
+            )
+        };
+        let fan = format!(
+            "name: fan\nprefix: fan\nnodes:\n{}{}{}{}process_groups:\n  p0: [src, fast, slow, \
+             sink]\n",
+            producer("src", false),
+            relay("fast", "src", false),
+            relay("slow", "src", true),
+            relay("sink", "fast", false),
+        );
+        std::fs::write(ws.root.join("graphs").join("fan.yaml"), fan).unwrap();
+        let fuse = format!(
+            "name: fuse\nprefix: fuse\nnodes:\n{}{}  - id: join\n    type: joiner\n    \
+             inputs:\n      - name: a\n        source: cam/out\n      - name: b\n        \
+             source: lidar/out\nprocess_groups:\n  p0: [cam, lidar, join]\n",
+            producer("cam", false),
+            producer("lidar", true),
+        );
+        std::fs::write(ws.root.join("graphs").join("fuse.yaml"), fuse).unwrap();
+
+        let no_profile = "    starts at src: no profile: every node of this process that does not \
+                          declare `isolate: true` runs in this unit";
+        let plan = graph_plan(&ws.root, "fan").unwrap();
+        eprintln!("fan plan:\n{plan}");
+        for line in [
+            "graph fan: 1 process(es), 2 executor unit(s)",
+            "  unit p0.src: src, fast, sink",
+            no_profile,
+            "  unit p0.slow: slow",
+            "    starts at slow: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+
+        let cam_heads = no_profile.replace("at src:", "at cam:");
+        let plan = graph_plan(&ws.root, "fuse").unwrap();
+        eprintln!("fuse plan:\n{plan}");
+        for line in [
+            "graph fuse: 1 process(es), 2 executor unit(s)",
+            "  unit p0.cam: cam, join",
+            cam_heads.as_str(),
+            "  unit p0.lidar: lidar",
+            "    starts at lidar: isolate: true",
         ] {
             assert!(
                 plan.lines().any(|l| l == line),
