@@ -383,11 +383,14 @@ fn act_network_refusal(flag: Option<&str>, env: Option<&str>, verb: &str) -> Opt
 /// `--network` and `CERULION_NETWORK`, the reading `connect` and `act` use);
 /// `None` when it is not engaged.
 fn rcp_network_refusal(flag: Option<&str>, env: Option<&str>) -> Option<&'static str> {
-    network_off("rcp", flag, env).then_some(
-        "network kill-switch engaged (--network off / CERULION_NETWORK=off): refusing to open \
-         the robot's rcp session; nothing was sent",
-    )
+    network_off("rcp", flag, env).then_some(RCP_NETWORK_REFUSAL)
 }
+
+/// The `rcp` refusal [`rcp_network_refusal`] returns, logged as
+/// `cerulion rcp: <refusal>`.
+const RCP_NETWORK_REFUSAL: &str = "network kill-switch engaged (--network off / \
+                                   CERULION_NETWORK=off): refusing to open the robot's rcp \
+                                   session; nothing was sent";
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -565,11 +568,13 @@ async fn run_act_command(cli: ActCli) -> ExitCode {
 async fn run_rcp_command(cli: RcpCli) -> ExitCode {
     // Read before the endpoint is bound: binding with the default relays
     // already contacts them, and the dial follows.
-    if let Some(refusal) = rcp_network_refusal(
+    if rcp_network_refusal(
         cli.network.as_deref(),
         std::env::var("CERULION_NETWORK").ok().as_deref(),
-    ) {
-        tracing::error!("cerulion rcp: {refusal}");
+    )
+    .is_some()
+    {
+        tracing::error!("cerulion rcp: {RCP_NETWORK_REFUSAL}");
         return ExitCode::FAILURE;
     }
     let config = match rcp_config(&cli) {
