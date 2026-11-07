@@ -280,6 +280,7 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
         Some(RemoteStatus {
             endpoint_id: ENDPOINT.into(),
             bound_sockets: vec![SOCKET.into()],
+            stop_error: None,
         })
     );
     // The plane takes no gateway: a start with no listen endpoints and no
@@ -414,18 +415,46 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
     assert_eq!(stopped.state, RuntimeState::Stopped);
     assert_eq!(stopped.remote, None);
 
-    // A plane that does not stop cleanly fails the stop: the state is not
-    // `stopped` while an endpoint may still be open, and no plane binds
-    // again in this process, since the old one may still answer under the
-    // device key. This step comes last: it holds for the process lifetime.
+    // A plane that does not stop cleanly at a restart does not stop the
+    // restart: the graph starts, and `status.remote` names the stuck plane
+    // and its stop error, so the app and the desk can see why remote access
+    // is down. No plane binds again in this process, since the old one may
+    // still answer under the device key. This step comes last: it holds for
+    // the process lifetime.
+    let stuck = Some(RemoteStatus {
+        endpoint_id: ENDPOINT.into(),
+        bound_sockets: vec![SOCKET.into()],
+        stop_error: Some("the endpoint did not close".into()),
+    });
     answer(&fake, Answer::BindStopFails);
+    std::env::set_var("CER_PERIOD_REQUEST_SHUTDOWN", "1");
     runtime
-        .start(&config(&topics, enabled.clone()))
+        .start(&finishing.to_string())
         .expect("the plane serves");
-    let error = runtime.stop().expect_err("the plane did not stop");
-    assert_eq!(error.code(), codes::REMOTE);
-    let failed = status(&runtime);
-    assert_eq!((failed.state, failed.remote), (RuntimeState::Failed, None));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while status(&runtime).state != RuntimeState::Finished {
+        assert!(std::time::Instant::now() < deadline, "the graph finishes");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::env::remove_var("CER_PERIOD_REQUEST_SHUTDOWN");
+    assert_eq!(
+        status(&runtime).remote.and_then(|remote| remote.stop_error),
+        None,
+        "the plane still serves"
+    );
+    runtime
+        .start(&config(&topics, json!({"enabled": false})))
+        .expect("the graph starts again while the old plane is stuck");
+    assert_eq!(log(&fake), ["remote.bind", "remote.serve", "remote.stop"]);
+    let restarted = status(&runtime);
+    assert_eq!(restarted.state, RuntimeState::Running);
+    assert_eq!(restarted.remote, stuck);
+    runtime.stop().expect("this run hosts no plane");
+    let stopped = status(&runtime);
+    assert_eq!(
+        (stopped.state, stopped.remote),
+        (RuntimeState::Stopped, stuck.clone())
+    );
     answer(&fake, Answer::Bind);
     let error = runtime
         .start(&config(&topics, enabled))
@@ -436,4 +465,5 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
         "{error}"
     );
     assert_eq!(log(&fake), Vec::<String>::new());
+    assert_eq!(status(&runtime).remote, stuck);
 }

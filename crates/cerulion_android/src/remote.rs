@@ -201,6 +201,13 @@ pub(crate) fn hosted_for_test(plane: Box<dyn BoundRemote>) -> Result<HostedPlane
     })
 }
 
+/// TEST SEAM: free the process's remote plane lease, also after a plane
+/// failed to stop.
+#[cfg(test)]
+pub(crate) fn free_lease_for_test() {
+    REMOTE_HOSTED.store(PLANE_FREE, Ordering::Release);
+}
+
 /// Take the process's remote plane lease and bind the plane through the
 /// registered host.
 pub(crate) fn bind(start: RemoteStart) -> Result<HostedPlane, EmbedError> {

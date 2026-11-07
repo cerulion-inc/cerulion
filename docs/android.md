@@ -1035,6 +1035,18 @@ start with `remote.enabled` in that process fails with code 18 too, since the
 old plane may still answer under the device key. Restart the app process to
 host the plane again.
 
+A plane that does not stop stays in `status.remote` with its stop error, so
+the app and a desk can see why remote access is down:
+
+```json
+"remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close"}
+```
+
+This also applies when the plane does not stop at a restart. The restart does
+not fail because of it: a config without `remote.enabled` starts its graph,
+and `status.remote` keeps the stuck plane. `stop_error` is not in the JSON
+while a plane serves. A later plane that serves replaces the stuck entry.
+
 While it binds, the plane's iroh endpoint lists the network interfaces
 through netlink and through `/sys/class/net`. Android refuses both to apps,
 so logcat can show an `avc: denied` line for `netlink_route_socket`
