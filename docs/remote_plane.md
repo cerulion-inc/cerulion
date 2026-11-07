@@ -15,8 +15,9 @@ zenoh gateway (`network:` blocks, `topic list`, mDNS).
 remote `engage-estop` verb. Engaging the e-stop records the engaged state and
 its engager; it does not stop motion by itself, and the state is held in the
 daemon's memory, so a daemon restart clears it, and nothing else does. Nothing
-outside the daemon can read that state yet: an engage returns a reply to the
-caller, writes a warning to the log, and asks Flashback to save a recording.
+outside the daemon can read that state yet: an `engage-estop` returns a reply
+to the caller, writes a warning to the log, and asks Flashback to save a
+recording; an `estop` over the rcp plane engages the latch without that ask.
 It is the one e-stop latch the ops act verbs and the `cerulion/rcp/1` plane
 obey: while it is engaged, the ops act verbs `topic-publish` and
 `service-call` and every tool call over the `cerulion/rcp/1` plane except

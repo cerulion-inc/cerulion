@@ -1068,7 +1068,8 @@ async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
         "{r}"
     );
     // A fresh rcpd on the same address and token does not know the session:
-    // the next request, the e-stop included, is answered and the stream ends.
+    // the next request, the e-stop included, is answered. Later requests get
+    // the same error, and the stream ends once the desk ends its side.
     f.restart_rcpd().await;
     let r = s
         .request(4, "tools/call", json!({ "name": "estop", "arguments": {} }))
@@ -1079,6 +1080,14 @@ async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
         json!("rcpd lost this MCP session (it restarted); restart this MCP server"),
         "{r}"
     );
+    let r = s.request(5, "ping", json!({})).await;
+    assert_eq!(r["error"]["code"], json!(-32603), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!("rcpd lost this MCP session (it restarted); restart this MCP server"),
+        "{r}"
+    );
+    s.send.finish().expect("finish");
     let next = bounded("the stream ends", read_frame(&mut s.recv, 1 << 20)).await;
     assert!(next.is_err(), "the robot ended the stream: {next:?}");
 }
@@ -1250,9 +1259,10 @@ async fn an_rcp_estop_engages_the_latch_the_ops_act_verbs_obey() {
 /// after reporting it on `gets`, and answers a `tools/call` with a JSON result
 /// after reporting its `params` on `tool_calls`. It holds `ping` id 2 without
 /// writing a byte, after reporting its id on `pinged`, until `release` is
-/// notified, then answers it; every other ping is answered at once. Any other
-/// request is answered 404. The method of every POST goes on `posts` in the
-/// order the stand-in reads them.
+/// notified, then answers it; every other ping is answered at once. A
+/// `tools/call` of `lost.step` is answered 404, as rcpd answers a session it
+/// no longer knows. Any other request is answered 404. The method of every
+/// POST goes on `posts` in the order the stand-in reads them.
 struct StandIn {
     addr: SocketAddr,
     pinged: tokio::sync::mpsc::UnboundedReceiver<Value>,
@@ -1334,6 +1344,11 @@ async fn stand_in_rcpd() -> StandIn {
                             held.notified().await;
                         }
                         json_reply(json!({ "jsonrpc": "2.0", "id": body["id"], "result": {} }))
+                    }
+                    Some("post")
+                        if method == "tools/call" && body["params"]["name"] == "lost.step" =>
+                    {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_string()
                     }
                     Some("post") if method == "tools/call" => {
                         let _ = calls.send(body["params"].clone());
@@ -1756,6 +1771,59 @@ async fn a_key_revoked_after_accept_cannot_engage_the_estop() {
     assert!(
         stand_in.tool_calls.try_recv().is_err(),
         "the revoked key's estop reached rcpd"
+    );
+    let _ = served.stop_serving.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_estop_after_rcpd_loses_the_session_still_engages_the_ops_latch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stand_in = stand_in_rcpd().await;
+    let served = serve_rcp_plane(dir.path(), stand_in.addr, |_| {}).await;
+    let mut s = open_session(&served.robot, OPERATOR.0).await;
+    s.initialize().await;
+    let session_lost = json!("rcpd lost this MCP session (it restarted); restart this MCP server");
+    // rcpd answers this call 404: it no longer knows the session.
+    let r = s
+        .request(
+            2,
+            "tools/call",
+            json!({ "name": "lost.step", "arguments": {} }),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], json!(-32603), "{r}");
+    assert_eq!(r["error"]["message"], session_lost, "{r}");
+    // The estop is sent once the reader has seen the loss.
+    bounded(
+        "the reader sees the loss",
+        served.plane.session_loss_seen_for_test(),
+    )
+    .await;
+    let r = s
+        .request(3, "tools/call", json!({ "name": "estop", "arguments": {} }))
+        .await;
+    assert_eq!(r["error"]["code"], json!(-32603), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!(
+            "rcpd lost this MCP session (it restarted), so this estop did not reach it; \
+             the robot's ops e-stop is engaged; restart this MCP server"
+        ),
+        "{r}"
+    );
+    assert_eq!(
+        served.lease.lock().unwrap().estop(),
+        &EstopState::Engaged {
+            by: expected_caller(OPERATOR.0, OPERATOR.1)
+        }
+    );
+    // Any other request gets the session-lost error, and nothing more reaches
+    // rcpd.
+    let r = s.request(4, "ping", json!({})).await;
+    assert_eq!(r["error"]["message"], session_lost, "{r}");
+    assert!(
+        stand_in.tool_calls.try_recv().is_err(),
+        "a tool call reached rcpd after the loss"
     );
     let _ = served.stop_serving.send(());
 }

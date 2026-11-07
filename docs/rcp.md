@@ -385,7 +385,8 @@ and give it the token `cerulion-remoted` uses. At startup `cerulion-remoted`
 creates `<state root>/remoted/rcp.token` when it is absent: one
 `CERULION_RCP_TOKEN=<random token>` line, mode `0600`, owned by the user
 `cerulion-remoted` runs as. When the file exists but is not a regular file,
-or its group or others can read or write it, `cerulion-remoted` logs that at
+or gives its group or others any permission (read, write or execute),
+`cerulion-remoted` logs that at
 error and serves on: its ops and wire planes work, and every rcp request is
 answered with an error until the file is private (`chmod 600`). The file's
 format is a systemd environment file, so an rcpd systemd unit can read it
@@ -449,8 +450,13 @@ The latch clears only when `cerulion-remoted` restarts. To recover, restart
 `estop_clear` reaches rcpd like any other tool call. Clients that talk to
 rcpd directly, over stdio or its own HTTP listener, see only rcpd's latch.
 
-When rcpd restarts, it forgets every MCP session. The next request on a
-desk's session is answered with error `-32603` (`rcpd lost this MCP session
-(it restarted); restart this MCP server`), the robot ends the session, and
-`cerulion rcp` exits with status 1. Restarting the MCP server in the MCP
-client opens a new session.
+When rcpd restarts, it forgets every MCP session. The next request on a desk's
+session is answered with error `-32603` (`rcpd lost this MCP session (it
+restarted); restart this MCP server`). The robot then sends nothing more to
+rcpd on that session and reads it on until the MCP client ends it, or for
+`--rcp-drain-ms`: an `estop` still engages the ops e-stop and is answered
+`-32603` with a message that says it did not reach rcpd and the ops e-stop is
+engaged, every other request gets the same session-lost error, and
+notifications are dropped. Restarting the MCP server in the MCP client opens a
+new session; when the robot ends the session first, `cerulion rcp` exits with
+status 1.

@@ -2,10 +2,10 @@
 
 The robot-side remote plane (daemon or `RemotePlane`): ONE iroh endpoint per
 robot (the device key's PUBLIC half IS the `EndpointId`, its 32-byte secret also
-seeds the pairing identity) multiplexing `cerulion/wire/2` and `cerulion/ops/1`. It
-also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
-`cerulion_wireclient`, `cerulion_connectd`, `cerud`, `cerulion_accountd` and
-`cerulion-wire`.
+seeds the pairing identity) multiplexing `cerulion/wire/2` and `cerulion/ops/1`,
+and in the daemon `cerulion/rcp/1`. It also carries the family-wide rules for
+`cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`,
+`cerud`, `cerulion_accountd` and `cerulion-wire`.
 
 ## Invariants
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb

@@ -532,12 +532,17 @@ its `estop_clear` (`limits.estop_clear: agent`) or by deleting
 `<receipts>.estop` and restarting rcpd.
 
 When rcpd answers HTTP 404 to a request that carried its session id (rcpd
-restarted and lost the session), the request is answered `-32603` and the
-session reader stops: the forwarder still sends what it holds, the queued
-frames drain and the stream finishes. A
-response body that ends without the response to its request (rcpd stopped
-mid-call, or a `notifications/cancelled` closed it) is answered `-32603` as
-well. A notification takes no in-flight slot, so a cancel reaches rcpd while
+restarted and lost the session), the request is answered `-32603`, and the
+session reader reads on until the desk ends its side or `--rcp-drain-ms`
+passes, sending nothing more to rcpd: an authorized `estop` engages the ops
+latch through `EstopLease::engage` and is answered `-32603` with a message
+that says only the ops latch is engaged, every other request gets the
+session-lost error, and notifications are dropped. Its `select!` is biased to
+take a frame already read before the loss. The forwarder still sends what it
+holds, the tasks drain within what is left of the drain bound, and the stream
+finishes. A response body that ends without the response to its request (rcpd
+stopped mid-call, or a `notifications/cancelled` closed it) is answered
+`-32603` as well. A notification takes no in-flight slot, so a cancel reaches rcpd while
 every slot is taken.
 
 ## 7. The desk half: connect, pair, and the client substrate
@@ -813,9 +818,10 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   root), `rcp.token` (the local `cerulion-rcpd` bearer token, bare or one
   `CERULION_RCP_TOKEN=<token>` line; `cerulion-remoted` creates it at startup
   when absent, one `CERULION_RCP_TOKEN=<64 hex>` line, mode 0600, owned by
-  the user it runs as; one its group or others can read or write is logged at
-  error, and the rcp plane answers every request with an error until only
-  its owner can read or write it), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
+  the user it runs as; one that is not a regular file or gives its group or
+  others any permission, execute included, is logged at error, and the rcp
+  plane answers every request with an error until it is a regular file only
+  its owner has any permission on), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
   `beacon_facts_test.rs`).
 

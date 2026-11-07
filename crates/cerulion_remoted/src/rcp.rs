@@ -70,8 +70,13 @@
 //!
 //! A request sent with rcpd's session id that rcpd answers with HTTP `404`
 //! (rcpd restarted and no longer knows the session) is answered with
-//! [`UPSTREAM_CODE`], and the stream ends. A response body that ends without
-//! the response to its request is answered with [`UPSTREAM_CODE`] too.
+//! [`UPSTREAM_CODE`]. The reader then reads on until the desk ends its side
+//! or [`RcpLimits::drain`] passes, and sends nothing more to rcpd: an
+//! authorized `estop` engages the ops latch and is answered with
+//! [`UPSTREAM_CODE`] and a message that says only the ops latch is engaged,
+//! every other request gets the session-lost error, and a notification is
+//! dropped. Then the stream ends. A response body that ends without the
+//! response to its request is answered with [`UPSTREAM_CODE`] too.
 //!
 //! | Method | Class | Requirement ([`requirement`]) |
 //! |---|---|---|
@@ -220,7 +225,9 @@ pub struct RcpLimits {
     /// once the forwarder is done: it has sent every message the reader
     /// admitted, or handed it to a task that sends or refuses it, or it
     /// stopped when the stream's writer stopped. The drain matches the head
-    /// bound, so a request sent just before the end is not cut off.
+    /// bound, so a request sent just before the end is not cut off. When rcpd
+    /// lost the stream's session, the drain runs from the loss, and the reader
+    /// reads on within it.
     pub drain: Duration,
 }
 
@@ -269,8 +276,15 @@ pub const ESTOP_CLEAR_REFUSAL: &str =
     "refused: the robot's ops e-stop is engaged; it clears when cerulion-remoted restarts";
 
 /// The error message of a request rcpd answered with HTTP 404 for the session
-/// id it carried.
+/// id it carried, and of every later request on that stream but `estop`.
 const SESSION_LOST: &str = "rcpd lost this MCP session (it restarted); restart this MCP server";
+
+/// The error message of an `estop` read after rcpd lost the stream's session:
+/// it engaged the ops latch and was not sent to rcpd.
+const ESTOP_SESSION_LOST: &str =
+    "rcpd lost this MCP session (it restarted), so this estop did not \
+                                  reach it; the robot's ops e-stop is engaged; restart this MCP \
+                                  server";
 
 /// What an account's scope must hold for a class: ALL of `required_caps`, and
 /// a role value <= `max_role` (a lower [`Role`] value is more privileged).
@@ -621,8 +635,8 @@ pub fn prepare(link: &RcpLink) -> Result<(), String> {
 /// Make sure the token file at `path` exists and is private: create it when
 /// absent (one `CERULION_RCP_TOKEN=<64 hex>` line from 32 random bytes,
 /// created exclusively, mode 0600 on unix, synced), and refuse an existing file
-/// that is not a regular file or, on unix, is readable or writable by its group
-/// or others.
+/// that is not a regular file or, on unix, gives its group or others any
+/// permission (read, write or execute).
 ///
 /// # Errors
 ///
@@ -810,6 +824,8 @@ pub struct RcpPlane {
     next_connection: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "test-seam"))]
     connect_holds: Mutex<Vec<(Value, Arc<ConnectHold>)>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    loss_seen: Notify,
 }
 
 /// TEST SEAM: a hold on the forward of one request, between its open
@@ -860,12 +876,23 @@ impl RcpPlane {
             next_connection: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-seam"))]
             connect_holds: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-seam"))]
+            loss_seen: Notify::new(),
         }
     }
 
     /// The rcpd link.
     pub fn link(&self) -> &RcpLink {
         &self.link
+    }
+
+    /// TEST SEAM: resolves once a stream's reader has seen rcpd lose the
+    /// stream's MCP session. Feature-gated, so it never compiles into the
+    /// production daemon.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seam"))]
+    pub async fn session_loss_seen_for_test(&self) {
+        self.loss_seen.notified().await;
     }
 
     /// TEST SEAM: hold the next forward of the request with JSON-RPC id `id`
@@ -1335,8 +1362,19 @@ async fn serve_session(
     })));
     let mut initialized = false;
     let mut initialize_seen = false;
+    // When rcpd lost the stream's MCP session. The reader then reads on until
+    // the desk ends its side or the drain bound passes, so an `estop` sent
+    // after the loss still engages the ops latch and every request is answered.
+    let mut lost_at: Option<tokio::time::Instant> = None;
     loop {
+        if lost_at.is_some_and(|at| at.elapsed() >= limits.drain) {
+            break;
+        }
+        let deadline = lost_at.map_or_else(tokio::time::Instant::now, |at| at + limits.drain);
+        // Biased: a frame already read is taken before the loss, so a queued
+        // `estop` goes the normal way.
         let frame = tokio::select! {
+            biased;
             read = frames.recv() => match read {
                 Some(Ok(f)) => f,
                 Some(Err(e)) => {
@@ -1345,10 +1383,14 @@ async fn serve_session(
                 }
                 None => break,
             },
-            () = session_lost(&upstream) => {
-                tracing::warn!(%caller, "cerulion_remoted: rcpd lost the rcp stream's MCP session; the stream ends");
-                break;
+            () = session_lost(&upstream), if lost_at.is_none() => {
+                tracing::warn!(%caller, "cerulion_remoted: rcpd lost the rcp stream's MCP session; the stream ends after the drain bound");
+                #[cfg(any(test, feature = "test-seam"))]
+                plane.loss_seen.notify_one();
+                lost_at = Some(tokio::time::Instant::now());
+                continue;
             }
+            () = tokio::time::sleep_until(deadline), if lost_at.is_some() => break,
         };
         if out.is_closed() {
             break;
@@ -1369,6 +1411,23 @@ async fn serve_session(
             if let Some(id) = message.id {
                 let text = format!("denied: {} needs more access: {reason}", message.method);
                 out.try_error(id, DENIED_CODE, &text);
+            }
+            continue;
+        }
+        // rcpd no longer knows this stream's session: nothing more is sent to
+        // it. An `estop` still engages the ops latch; a notification is dropped.
+        if lost_at.is_some() {
+            let estop = message.class == RcpClass::Estop;
+            if estop {
+                engage_estop(&plane.lease, &caller);
+            }
+            if let Some(id) = message.id {
+                let text = if estop {
+                    ESTOP_SESSION_LOST
+                } else {
+                    SESSION_LOST
+                };
+                out.try_error(id, UPSTREAM_CODE, text);
             }
             continue;
         }
@@ -1467,14 +1526,14 @@ async fn serve_session(
     }
     // The desk sent its last message: the forwarder sends what the reader
     // admitted, then requests already forwarded may still answer, within the
-    // drain bound; the standalone stream never ends by itself.
+    // drain bound, which runs from the loss when rcpd lost the session; the
+    // standalone stream never ends by itself.
     drop(to_forwarder);
     let (mut tasks, mut streams) = forwarding.join().await.unwrap_or_default();
     streams.shutdown().await;
-    let drained = tokio::time::timeout(limits.drain, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await;
+    let drain = lost_at.map_or(limits.drain, |at| limits.drain.saturating_sub(at.elapsed()));
+    let drained =
+        tokio::time::timeout(drain, async { while tasks.join_next().await.is_some() {} }).await;
     if drained.is_err() {
         tasks.shutdown().await;
     }
