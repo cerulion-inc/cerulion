@@ -730,7 +730,7 @@ fn a_bag_recorded_with_the_retired_fuse_key_still_replays() {
 
     let replayed = read_identity::resim(&ws, &run, ReplayMode::ResimNeutral, None);
     let log = match replayed {
-        read_identity::Replayed::Reads { exit, log } => {
+        read_identity::Replayed::Reads { exit, log, .. } => {
             assert_eq!(
                 exit, 0,
                 "the replay of a bag carrying `fuse: false` must exit 0"

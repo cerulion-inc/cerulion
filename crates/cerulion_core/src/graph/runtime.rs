@@ -1035,12 +1035,14 @@ fn edge_needs_producer_annotation(
     config.is_multi_publisher(topic) || provisioning == PublisherProvisioning::External
 }
 
-/// Can a publisher this process does not own write `topic`?
+/// Can a publisher outside this runtime's graph write `topic`?
 ///
 /// The same question [`edge_needs_producer_annotation`] asks, under the name the
 /// park's doorbell arming asks it by, so a reader narrowing one call site sees
-/// the other. The two terms are the two ways a writer the graph does not own is
-/// admitted: the `multi_publisher_topics:` opt-in, read off the config whatever
+/// the other. The graph is the one this runtime was built from: a whole process's
+/// graph, or one executor unit's cut of it, so a topic another unit of the same
+/// process produces has no in-graph producer here. The two terms are the two ways
+/// a writer the graph does not own is admitted: the `multi_publisher_topics:` opt-in, read off the config whatever
 /// the provisioning, and `External` provisioning, which is every topic with no
 /// in-graph producer. The opt-in ADMITS such a
 /// writer rather than guaranteeing one, so a `true` here is not proof a peer
@@ -2216,9 +2218,11 @@ struct RungTopics {
 /// returned, and every in-graph publish happens inside `step()`/`drain_level`,
 /// including the within-level fires, which run on the fire pool that `step()`
 /// joins before returning. So while that thread is blocked, no node of this
-/// runtime can ring. Hence `armable`: a line is armed only when a publisher this
-/// process does not own can write it, which
-/// [`topic_is_writable_from_outside`] answers over the resolved provisioning.
+/// runtime can ring. Hence `armable`: a line is armed only when a publisher
+/// outside this runtime's graph can write it (another process, or another
+/// executor unit of this process, each of which steps its own runtime on its own
+/// thread), which [`topic_is_writable_from_outside`] answers over the resolved
+/// provisioning.
 ///
 /// Both planes find the armed line by NAME, so the ordering decides nothing the
 /// park reads; it keeps the registry's positional accessors describing the same
@@ -3396,7 +3400,7 @@ pub struct GraphRuntime {
     monitor_wait_policy: crate::monitor_wait::MonitorWaitPolicy,
     /// Consumer-side SHM doorbell registry over the data-trigger + sync
     /// input topics, built only when `policy.doorbell`. Ordered by
-    /// [`rung_topics`]: the topics a publisher this process does not own can
+    /// [`rung_topics`]: the topics a publisher outside this runtime's graph can
     /// write come first in declared order, then the rest.
     /// `monitor_wait_block` arms the hardware monitor on the armed line's address,
     /// taken by topic, and poll-all-scans the registry for non-primary rings.
@@ -9403,7 +9407,8 @@ impl GraphRuntime {
         // Under an active doorbell policy, build the CONSUMER-side
         // doorbell registry over this graph's data-trigger + sync input topics,
         // ordered by `rung_topics` so the armed slot holds a topic a publisher
-        // this process does not own can write. `monitor_wait_block` arms the
+        // outside this graph (another process, or another executor unit of this
+        // process) can write. `monitor_wait_block` arms the
         // hardware monitor on the armed line's address, taken by topic, and
         // poll-all-scans the registry for non-primary rings. A
         // failed open is non-fatal: the live loop then falls back to the
@@ -9421,7 +9426,7 @@ impl GraphRuntime {
                 .map(|b| b.topic.to_string())
                 .collect();
             topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher this process does not own can write, read
+            // Which of them a publisher outside this graph can write, read
             // off the provisioning this build already RESOLVED per topic rather
             // than re-derived from the node list. `topic_is_writable_from_outside`
             // is true for a topic in the graph's `multi_publisher_topics` opt-in,
@@ -9451,7 +9456,7 @@ impl GraphRuntime {
                 tracing::debug!(
                     graph = %config.identity(),
                     topics = topics.len(),
-                    "no declared topic is writable from outside this process; the \
+                    "no declared topic is writable from outside this graph; the \
                      live loop keeps its bounded recheck and maps no doorbell page"
                 );
                 None
@@ -13741,15 +13746,19 @@ impl GraphRuntime {
     ///
     /// # Which line, and what that costs
     ///
-    /// The registry's PRIMARY: the first declared topic a publisher this process
-    /// does not own can write ([`rung_topics`]) - exactly the line the CPU
-    /// monitor-wait primitive arms on Linux where the CPU carries one. A consumer of several topics is NOT
-    /// kernel-woken by a ring on a non-primary line; it observes that ring at the
-    /// next pacing chunk through the record-only poll-all, which is what it does
-    /// today and what a host whose hardware monitor watches one line does. So
-    /// this is a strict improvement on the primary edge and a change to
-    /// nothing else. A linear chain, the shape a multi-process split produces,
-    /// has one input topic per worker and is entirely primary.
+    /// The registry's PRIMARY: the first declared topic a publisher outside this
+    /// runtime's graph can write ([`rung_topics`]), exactly the line the CPU
+    /// monitor-wait primitive arms on Linux where the CPU carries one. A consumer
+    /// of several such topics is NOT kernel-woken by a ring on a non-primary line;
+    /// it observes that ring at the next pacing chunk through the record-only
+    /// poll-all, as a host whose hardware monitor watches one line does. A linear
+    /// chain has one input topic per runtime and is entirely primary. A join is
+    /// not: the executor-unit planner starts a unit at every join not declared
+    /// `isolate: false`, so a join in a unit of its own takes the kernel wake on
+    /// its first armable input only and waits up to one pacing chunk for a frame
+    /// on any other, between two units of one process as between two processes.
+    /// `a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_input`
+    /// in `monitor_wait_park_iox2_test` holds this.
     ///
     /// # Why it can never be worse than the nap it replaces
     ///

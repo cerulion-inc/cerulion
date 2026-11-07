@@ -3461,6 +3461,541 @@ fn a_consumer_in_another_executor_unit_is_woken_and_its_sleeping_slices_never_yi
     );
 }
 
+/// Nanoseconds since the first call in this test process, read by a node's tick
+/// and by the thread driving it, so one subtraction gives the time from a publish
+/// to the fire it completed.
+fn since_test_epoch_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
+
+/// A `Sync` join of two topics: it fires once a frame has arrived on each of
+/// `a` and `b`, records the pair it joined and stamps the time of the fire.
+#[cerulion_node(unbounded_sync)]
+#[derive(Default)]
+struct Joiner {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+    joined: Arc<Mutex<Vec<(f64, f64)>>>,
+    fires: Arc<AtomicU64>,
+    fired_at_ns: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl Joiner {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.fired_at_ns
+            .store(since_test_epoch_ns(), Ordering::Release);
+        self.joined.lock().unwrap().push((self.a.x, self.b.x));
+        self.fires.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// A publisher that numbers its frames 1, 2, 3, ... like [`Numberer`] and stamps
+/// the time of each tick, which returns just before its frame is published.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct StampedNumberer {
+    #[output]
+    out: Vector3,
+    fires: Arc<AtomicU64>,
+    ticked_at_ns: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl StampedNumberer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let n = self.fires.fetch_add(1, Ordering::Relaxed) + 1;
+        self.out.x = n as f64;
+        self.ticked_at_ns
+            .store(since_test_epoch_ns(), Ordering::Release);
+        Ok(())
+    }
+}
+
+/// A join that runs as an executor unit of its own is kernel-woken by its first
+/// armable input only.
+///
+/// One graph declares two numbering producers, on `A` and `B`, and a `Sync` node
+/// that joins the two topics, all in ONE process group. With no profile the
+/// planner starts a unit at every node: the join's trigger edges are no chain
+/// link. Each unit runs the way a process hosting several units runs it (its own
+/// cut of the graph, transport node, clock and runtime, under the park policy
+/// with the doorbell armed), the join's unit on its own thread.
+///
+/// The join's unit opens the doorbell pages of both inputs and arms its kernel
+/// wake on ONE of them, the first declared input written from outside the unit.
+/// A unit blocks on one address, so a ring on the other input reaches no blocked
+/// waiter, and the unit observes that frame when its current block or hardware
+/// slice ends: at most one recheck later (20 us in hardware, up to 100 us
+/// without a CPU monitor-wait primitive, one event-stream period on aarch64).
+/// That limit is stated in `docs/user-api.md` (Executor units),
+/// `docs/deployment_tuning.md` (Data-wake doorbell) and the doc of
+/// `GraphRuntime::doorbell_wake_word_block`; this test holds it, so a change
+/// that wakes a unit on every input fails here and those texts change with it.
+///
+/// Each set is sent one input at a time: the first input's frame, a pause in
+/// which the join's unit drains it and parks again, then the second input's
+/// frame, which completes the set. Phase one completes every set on `B`, phase
+/// two on `A`. Held, against values written here:
+///
+/// - the planner puts the three nodes in three units of the one process;
+/// - the join's unit maps a page for both inputs and arms `A`, the first one
+///   declared;
+/// - the join reads every pair in order, `(1, 1)` to `(2 * SETS, 2 * SETS)`;
+/// - while a set is due, no park of the join's unit ends on its park timeout,
+///   which is longer than the whole run;
+/// - no ring that completes a set on `B` issues a wake syscall: the unit holds
+///   no claim on `B`'s page;
+/// - on a host with no CPU monitor-wait primitive and a doorbell wake word, the
+///   rings that complete a set on `A` do issue the kernel wake (the same
+///   reasoning as the executor-unit hop test above).
+///
+/// The time from the completing producer's tick, which returns just before its
+/// frame is published, to the join's fire is printed per phase, not asserted.
+#[test]
+#[serial]
+fn a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_input() {
+    use cerulion_core::graph::node::NodeInfo;
+    use cerulion_core::graph::topology::GraphTopology;
+    use cerulion_core::graph::{
+        build_trigger_edges, expand_process_groups, CrossProcessWiring, ExecutorUnit,
+        SiblingConsumedTopics, SiblingProducedTopics, UnitGraph,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// The process group the three nodes are declared in, also the graph's
+    /// identity.
+    const HOST: &str = "mwp_join";
+    /// The join's two inputs, absolute on both ends so a unit's cut keeps each
+    /// source as written. `A` is declared first.
+    const A: &str = "/mwp/join/a";
+    const B: &str = "/mwp/join/b";
+    /// Sets per phase.
+    const SETS: u64 = 16;
+    /// The join unit's park timeout while a set is due: longer than the whole
+    /// run, so a park that ends on it was ended by no frame.
+    const DUE_PARK_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The pause before each producer step, in which the join's unit drains
+    /// what it has and parks again.
+    const PACE: Duration = Duration::from_millis(3);
+    /// How long the driver waits for the join to fire a set before it reports
+    /// the apparatus broken.
+    const READ_BOUND: Duration = Duration::from_secs(30);
+
+    let ns = mwp_ns("join");
+    let sent_a = Arc::new(AtomicU64::new(0));
+    let sent_b = Arc::new(AtomicU64::new(0));
+    let ticked_a = Arc::new(AtomicU64::new(0));
+    let ticked_b = Arc::new(AtomicU64::new(0));
+    let joined = Arc::new(Mutex::new(Vec::<(f64, f64)>::new()));
+    let join_fires = Arc::new(AtomicU64::new(0));
+    let fired_at_ns = Arc::new(AtomicU64::new(0));
+    let join_ready = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let producer = |id: &str, topic: &str| NodeDef {
+        isolate: None,
+        params: Default::default(),
+        ros2: None,
+        id: id.to_string(),
+        node_type: "stamped_numberer".to_string(),
+        inputs: vec![],
+        outputs: vec![OutputDef {
+            name: "out".to_string(),
+            schema: "geometry_msgs/Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: Some(topic.to_string()),
+        }],
+    };
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: [(
+            HOST.to_string(),
+            vec![
+                "numberer_a".to_string(),
+                "numberer_b".to_string(),
+                "joiner".to_string(),
+            ],
+        )]
+        .into_iter()
+        .collect(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: HOST.to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            producer("numberer_a", A),
+            producer("numberer_b", B),
+            NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: "joiner".to_string(),
+                node_type: "joiner".to_string(),
+                inputs: vec![
+                    InputDef {
+                        name: "a".to_string(),
+                        source: A.to_string(),
+                    },
+                    InputDef {
+                        name: "b".to_string(),
+                        source: B.to_string(),
+                    },
+                ],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "numberer_a".to_string(),
+        Box::new(StampedNumbererEntry::with_state(StampedNumberer {
+            fires: Arc::clone(&sent_a),
+            ticked_at_ns: Arc::clone(&ticked_a),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "numberer_b".to_string(),
+        Box::new(StampedNumbererEntry::with_state(StampedNumberer {
+            fires: Arc::clone(&sent_b),
+            ticked_at_ns: Arc::clone(&ticked_b),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "joiner".to_string(),
+        Box::new(JoinerEntry::with_state(Joiner {
+            joined: Arc::clone(&joined),
+            fires: Arc::clone(&join_fires),
+            fired_at_ns: Arc::clone(&fired_at_ns),
+            ..Default::default()
+        })),
+    );
+
+    // The executor units of the one process, derived the way the deployment
+    // planner derives them, with no profile.
+    let infos: IndexMap<String, NodeInfo> = factories
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.info().expect("a macro node's info")))
+        .collect();
+    let trigger_edges = build_trigger_edges(&config, &infos);
+    let topology = GraphTopology::build(&config, &infos).expect("the graph's topology");
+    let unit_graph = UnitGraph::from_graph(&config, &infos, &topology, &trigger_edges);
+    let plan = expand_process_groups(&config, &unit_graph, None, &indexmap::IndexSet::new());
+    let units: &[ExecutorUnit] = plan.units.get(HOST).expect("the declared group's units");
+    for unit in units {
+        for (node, boundary) in &unit.boundaries {
+            eprintln!(
+                "executor unit {}: {node} starts it: {}",
+                unit.name,
+                boundary.describe()
+            );
+        }
+    }
+    let unit_of = |node: &str| -> &ExecutorUnit {
+        units
+            .iter()
+            .find(|u| u.nodes.iter().any(|n| n == node))
+            .unwrap_or_else(|| panic!("apparatus: no executor unit holds {node}"))
+    };
+    for node in ["numberer_a", "numberer_b", "joiner"] {
+        assert_eq!(
+            unit_of(node).nodes,
+            vec![node.to_string()],
+            "apparatus: without a profile the planner must give {node} an executor unit of \
+             its own, got {:?}",
+            units.iter().map(|u| &u.nodes).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        units
+            .iter()
+            .all(|u| plan.hosts.get(&u.name).map(String::as_str) == Some(HOST)),
+        "apparatus: every unit must be hosted by the one process ({HOST}), got {:?}",
+        plan.hosts
+    );
+    let cut = |unit: &ExecutorUnit| {
+        let mut sub = config.clone();
+        sub.nodes.retain(|n| unit.nodes.contains(&n.id));
+        sub.process_groups = IndexMap::new();
+        sub.process_group_order = Vec::new();
+        sub.identity = format!("{HOST}_{}", unit.nodes[0]);
+        sub
+    };
+    let mut take = |node: &str| -> IndexMap<String, Box<dyn NodeEntry>> {
+        let entry = factories
+            .shift_remove(node)
+            .expect("each node has one factory");
+        [(node.to_string(), entry)].into_iter().collect()
+    };
+    let a_factories = take("numberer_a");
+    let b_factories = take("numberer_b");
+    let join_factories = take("joiner");
+    let a_config = cut(unit_of("numberer_a"));
+    let b_config = cut(unit_of("numberer_b"));
+    let join_config = cut(unit_of("joiner"));
+
+    let ix_config = cerulion_core::testing::iceoryx_test_config();
+    let unit_transport =
+        |name: &str, clock: Arc<dyn cerulion_core::clock::Clock>, ix: iceoryx2::config::Config| {
+            TransportManager::detached_with_config(
+                cerulion_core::transport::TransportConfig {
+                    node_name: name.into(),
+                    clock,
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                ix,
+            )
+            .expect("create a unit's transport node on the run's iceoryx2 config")
+        };
+
+    // The two PRODUCER units, built first on this thread, so each topic's
+    // service exists with its producer's provisioning before the join opens it.
+    let build_producer = |unit_config: GraphConfig,
+                          unit_factories: IndexMap<String, Box<dyn NodeEntry>>,
+                          topic: &str,
+                          drive: &Arc<VirtualClock>| {
+        let read_by_sibling: SiblingConsumedTopics = [topic.to_string()].into_iter().collect();
+        let clock: Arc<dyn cerulion_core::clock::Clock> = drive.clone();
+        let mgr = unit_transport(&unit_config.identity, Arc::clone(&clock), ix_config.clone());
+        let runtime = GraphRuntime::build_live_free_run(
+            unit_config,
+            unit_factories,
+            &mgr,
+            clock,
+            None,
+            MonitorWaitPolicy::new(true, true, ns.clone()),
+            CrossProcessWiring::requirements_only(None)
+                .with_sibling_consumed_topics(&read_by_sibling),
+        )
+        .expect("build a producer unit's runtime");
+        (runtime, mgr)
+    };
+    let a_drive = Arc::new(VirtualClock::new());
+    let b_drive = Arc::new(VirtualClock::new());
+    let (mut a_runtime, a_mgr) = build_producer(a_config, a_factories, A, &a_drive);
+    let (mut b_runtime, b_mgr) = build_producer(b_config, b_factories, B, &b_drive);
+
+    // The JOIN unit, built and stepped on its own thread.
+    let join_thread = {
+        let ns = ns.clone();
+        let ix_config = ix_config.clone();
+        let join_fires = Arc::clone(&join_fires);
+        let join_ready = Arc::clone(&join_ready);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let from_siblings: SiblingProducedTopics =
+                [A.to_string(), B.to_string()].into_iter().collect();
+            let clock: Arc<dyn cerulion_core::clock::Clock> = Arc::new(VirtualClock::new());
+            let mgr = unit_transport("mwp_join_joiner", Arc::clone(&clock), ix_config);
+            let mut runtime = GraphRuntime::build_live_free_run(
+                join_config,
+                join_factories,
+                &mgr,
+                clock,
+                None,
+                MonitorWaitPolicy::new(true, true, ns),
+                CrossProcessWiring::requirements_only(None).with_sibling_topics(&from_siblings),
+            )
+            .expect("build the join unit's runtime");
+            let primary = runtime
+                .doorbell_primary_topic_for_test()
+                .map(str::to_string);
+            let pages = runtime.doorbell_topics_for_test();
+            let data_wake_rung = runtime.data_wake_rung_for_test();
+            join_ready.store(true, Ordering::Release);
+            let mut timeouts_while_due = 0u64;
+            while join_fires.load(Ordering::Acquire) < 2 * SETS && !stop.load(Ordering::Acquire) {
+                let (_, _, _, before) = runtime.park_wake_counts();
+                runtime.run_live_step_once_for_test(DUE_PARK_TIMEOUT);
+                let (_, _, _, after) = runtime.park_wake_counts();
+                timeouts_while_due += after - before;
+            }
+            let wake_word_blocks = runtime.park_wake_word_block_count_for_test();
+            runtime.shutdown();
+            drop(mgr);
+            (
+                primary,
+                pages,
+                data_wake_rung,
+                timeouts_while_due,
+                wake_word_blocks,
+            )
+        })
+    };
+    /// Sets `stop` when dropped, so an assertion that unwinds this thread also
+    /// ends the join unit's loop at its next park exit.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _stop_on_unwind = StopOnDrop(Arc::clone(&stop));
+    let spun_up = std::time::Instant::now();
+    while !join_ready.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(20),
+            "the join unit's runtime never finished building"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    /// One producer step on a virtual period boundary: exactly one numbered
+    /// frame, or the apparatus is broken.
+    fn step_once(
+        name: &str,
+        drive: &VirtualClock,
+        runtime: &mut GraphRuntime,
+        sent: &AtomicU64,
+        expect: u64,
+    ) {
+        drive.advance(5_000_000);
+        runtime.run_live_step_once_for_test(Duration::from_millis(1));
+        assert_eq!(
+            sent.load(Ordering::Relaxed),
+            expect,
+            "apparatus: one step of {name} must send exactly one frame"
+        );
+    }
+
+    // Wake syscalls issued and found-nobody by the completing rings, and the
+    // time from each completing publish to the join's fire, per phase.
+    let mut completed_on = [
+        (0u64, 0u64, Vec::<f64>::new()),
+        (0u64, 0u64, Vec::<f64>::new()),
+    ];
+    let mut sets = 0u64;
+    for (phase, a_last) in [false, true].into_iter().enumerate() {
+        for _ in 0..SETS {
+            let waiting = std::time::Instant::now();
+            while join_fires.load(Ordering::Acquire) < sets {
+                assert!(
+                    waiting.elapsed() < READ_BOUND,
+                    "apparatus: the join never fired set {sets} ({} fired)",
+                    join_fires.load(Ordering::Acquire)
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            std::thread::sleep(PACE);
+            if a_last {
+                step_once("numberer_b", &b_drive, &mut b_runtime, &sent_b, sets + 1);
+            } else {
+                step_once("numberer_a", &a_drive, &mut a_runtime, &sent_a, sets + 1);
+            }
+            std::thread::sleep(PACE);
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            let before = cerulion_core::doorbell::wake_syscall_counts();
+            if a_last {
+                step_once("numberer_a", &a_drive, &mut a_runtime, &sent_a, sets + 1);
+            } else {
+                step_once("numberer_b", &b_drive, &mut b_runtime, &sent_b, sets + 1);
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            {
+                let after = cerulion_core::doorbell::wake_syscall_counts();
+                completed_on[phase].0 += after.0 - before.0;
+                completed_on[phase].1 += after.1 - before.1;
+            }
+            let published_ns = if a_last { &ticked_a } else { &ticked_b }.load(Ordering::Acquire);
+            sets += 1;
+            let waiting = std::time::Instant::now();
+            while join_fires.load(Ordering::Acquire) < sets {
+                assert!(
+                    waiting.elapsed() < READ_BOUND,
+                    "apparatus: the join never fired set {sets} ({} fired)",
+                    join_fires.load(Ordering::Acquire)
+                );
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            let fired = fired_at_ns.load(Ordering::Acquire);
+            completed_on[phase]
+                .2
+                .push(fired.saturating_sub(published_ns) as f64 / 1000.0);
+        }
+    }
+    stop.store(true, Ordering::Release);
+    let (primary, pages, data_wake_rung, timeouts_while_due, wake_word_blocks) =
+        join_thread.join().expect("join unit thread panicked");
+    a_runtime.shutdown();
+    b_runtime.shutdown();
+    drop(a_mgr);
+    drop(b_mgr);
+
+    for (phase, input) in [(0usize, "B"), (1usize, "A")] {
+        let (issued, found_nobody, latencies) = &completed_on[phase];
+        let mut sorted = latencies.clone();
+        sorted.sort_by(f64::total_cmp);
+        eprintln!(
+            "join unit, sets completed on {input}: {issued} wake syscalls issued, \
+             {found_nobody} found nobody; publish to fire p50 {:.2} us, max {:.2} us",
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1]
+        );
+    }
+    eprintln!(
+        "join unit: armed {primary:?}, pages {pages:?}, data-wake rung {data_wake_rung}, \
+         {wake_word_blocks} wake-word blocks, {timeouts_while_due} timeouts while due"
+    );
+
+    assert_eq!(
+        pages,
+        Some(vec![A.to_string(), B.to_string()]),
+        "the join's unit must map a doorbell page for both inputs: each is written from \
+         another unit"
+    );
+    assert_eq!(
+        primary.as_deref(),
+        Some(A),
+        "the join's unit must arm its kernel wake on its first declared input written from \
+         outside it"
+    );
+    let expected: Vec<(f64, f64)> = (1..=2 * SETS).map(|n| (n as f64, n as f64)).collect();
+    assert_eq!(
+        *joined.lock().unwrap(),
+        expected,
+        "the join must read every pair in order"
+    );
+    assert_eq!(
+        timeouts_while_due, 0,
+        "no park of the join's unit may end on its {DUE_PARK_TIMEOUT:?} timeout while a set \
+         is due: a frame on either input is observed by the next recheck at the latest"
+    );
+    assert_eq!(
+        completed_on[0].0, 0,
+        "a ring on the join's second input reaches no blocked waiter: its unit blocks on one \
+         address, the first input's, and holds no claim on the second input's page. If a \
+         ring here now issues a wake, a unit is woken by every input, and the limit stated \
+         in docs/user-api.md (Executor units), docs/deployment_tuning.md (Data-wake \
+         doorbell) and GraphRuntime::doorbell_wake_word_block must change with this test"
+    );
+    if !cerulion_core::monitor_wait::monitor_wait_available() && host_has_a_doorbell_wake_word() {
+        assert!(
+            data_wake_rung && wake_word_blocks > 0,
+            "without a CPU monitor-wait primitive, on a host with a doorbell wake word, the \
+             join's unit must kernel-block on its armed input's wake word (rung \
+             {data_wake_rung}, {wake_word_blocks} blocks)"
+        );
+        assert!(
+            completed_on[1].0 > 0,
+            "the rings that complete a set on the armed input must issue the kernel wake on \
+             the join unit's wake word, and none of {SETS} did"
+        );
+    }
+}
+
 /// Strip `//` line comments and (nesting) `/* */` block comments, so the
 /// structural pin above cannot be satisfied by prose. String literals are
 /// deliberately not modeled (no walked token appears inside one in
