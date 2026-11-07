@@ -411,9 +411,9 @@ iroh + real iceoryx2: `wire_plane_test.rs` (byte-for-byte against hand oracles).
   stream permanently. Never `select!` on them; one dedicated task per stream
   drives them to completion. Every consumer in the family obeys this
   (wireclient's reader, connectd's worker, netd's iroh plane, remoted's serve
-  loop); the pattern is documented at each site. *The rule itself has no single
-  structural gate, verified at `crates/cerulion_link/src/framing.rs` module docs +
-  each caller.*
+  loop and rcp stream reader); the pattern is documented at each site. *The
+  rule itself has no single structural gate, verified at
+  `crates/cerulion_link/src/framing.rs` module docs + each caller.*
 - **The tap set is the gate** (`tap.rs`): a demand attaches remoted's own
   listener-less `DataOnlySubscriber`; un-demanding drops the tap; an
   un-demanded topic costs nothing. Taps are observation-only: the drain thread
@@ -447,18 +447,26 @@ one `POST` with rcpd's bearer token (read per session from
 under that caller (`cerulion_rcpd::caller`), so its receipts and the journaled
 call frame name the remote desk.
 
-The session reader never waits on rcpd: it admits each message (the class
-check, the e-stop engage or refusal, the one-initialize check and the slot)
-and hands it, without waiting, to the stream's forwarder task. The forwarder
-sends the messages to rcpd in the order they were admitted; it waits for a
-lifecycle message's response head, and for the `initialize` result, before
-the next, and sends and relays Observe, Act and Estop messages from their own
-tasks. Just before it sends an Observe or Act message it runs
-`rcp_authorize` for the message's class again, and for an Act message reads
-the e-stop latch again, so a call queued behind a held lifecycle message is
-refused after a revoke or an engage. Its bounded queue holds
-`in_flight + estops_in_flight + 4`: a request holds its slot while queued and
-a notification one of four notification places
+A task of its own reads each stream's frames, and the session reader selects
+on that task's channel, never on the framing. The session reader never waits
+on rcpd: it admits each message (the class check, the e-stop engage or
+refusal, the one-initialize check and the slot) and hands it, without waiting,
+to the stream's forwarder task. The forwarder sends the messages to rcpd in
+the order they were admitted; it waits for a lifecycle message's response
+head, and for the `initialize` result, before the next, and hands Observe, Act
+and Estop messages to tasks of their own, which send them and relay the
+answers. Such a task opens its connection to rcpd, then runs `rcp::SendCheck`
+just before the send: `rcp_authorize` for an Observe or Act message's class
+again, and for an Act message the e-stop latch again, so a call is refused
+after a revoke or an engage that lands while it waits in the queue or for its
+connection. A `notifications/cancelled` naming a request whose response head
+is not in yet is sent by a task of its own once that head is in, within
+`RcpLimits::head_timeout`. rcpd (rmcp's stateful streamable HTTP server) sends
+a request's SSE head once the request is in the MCP session, before the tool
+runs, so rcpd never receives a cancel before the call it names, requests stay
+concurrent up to `--rcp-in-flight`, and the forwarder never waits on a cancel.
+Its bounded queue holds `in_flight + estops_in_flight + 4`: a request holds
+its slot while queued and a notification one of four notification places
 (`rcp::FORWARD_NOTIFICATION_ROOM`), so a request that holds a slot always
 fits; a notification with no place free is dropped. The forwarder stops once
 the stream's writer has stopped (a revoke closes the connection from the
@@ -507,9 +515,9 @@ e-stop is engaged`, or for `estop_clear` (still `RcpClass::Act`) `refused:
 the robot's ops e-stop is engaged; it clears when cerulion-remoted
 restarts`. The lease guard is held only for that read or that state change,
 never across an `.await` and never with a connection, session, trust or
-receipt lock. The latch is read when a desk's message arrives
-and again just before the plane sends it to rcpd. Nothing on the ops side
-reaches rcpd, so after an ops `engage-estop` a tool call sent to rcpd before
+receipt lock. The latch is read when a desk's message arrives and again on
+the open connection to rcpd just before the plane sends it. Nothing on the
+ops side reaches rcpd, so after an ops `engage-estop` a tool call sent to rcpd before
 it (one rcpd holds behind its serialized calls included) still runs and
 rcpd's own latch stays open. An rcp `estop` also closes
 rcpd's latch, which refuses the calls rcpd has accepted but not yet
@@ -524,8 +532,8 @@ session reader stops: the forwarder still sends what it holds, the queued
 frames drain and the stream finishes. A
 response body that ends without the response to its request (rcpd stopped
 mid-call, or a `notifications/cancelled` closed it) is answered `-32603` as
-well. A notification takes no in-flight slot, so a cancel reaches rcpd while
-every slot is taken.
+well. A notification takes no in-flight slot, so a cancel reaches rcpd, after
+the call it names, while every slot is taken.
 
 ## 7. The desk half: connect, pair, and the client substrate
 

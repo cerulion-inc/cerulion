@@ -23,10 +23,10 @@ obey: while it is engaged, the ops act verbs `topic-publish` and
 `estop` are refused, and an `estop` over that plane engages it too (see
 [`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
 does not read it, and neither does LAN ingress. An `engage-estop`
-refuses the rcp tool calls that arrive after it but does not reach the
-robot's `cerulion-rcpd`, so a call rcpd already holds still runs; an `estop`
-over the rcp plane also closes rcpd's own latch, which refuses the calls rcpd
-has not yet published. A robot still needs its own stop path (a hardwired
+refuses every rcp tool call not yet sent to the robot's `cerulion-rcpd` but
+does not reach rcpd, so a tool call sent to rcpd before it still runs; an
+`estop` over the rcp plane also closes rcpd's own latch, which refuses the
+calls rcpd has not yet published. A robot still needs its own stop path (a hardwired
 e-stop) to stop motion. Only the `cerulion-remoted` daemon serves
 `engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
 `topic-snapshot`, `topic-echo-once`) and the `cerulion/rcp/1` plane: a process

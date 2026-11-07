@@ -400,11 +400,14 @@ ExecStart=/usr/bin/cerulion-rcpd --manifest /etc/cerulion/rcp.yaml --http
 On the desk, `cerulion rcp <robot>` serves the robot's rcpd as a local stdio
 MCP server. While the desk's network kill-switch is engaged
 (`CERULION_NETWORK=off` or `--network off`) it is refused with exit 2 before
-anything reaches the robot. The robot admits only a desk on its access list and checks every
-message: `resources/*`, `subscriptions/listen` and `tools/list` need the
-observe capability; `tools/call` needs the teleop capability and the operator
-role, except that any desk on the access list may call `estop`. Tool calls
-made this way are receipted under the desk's identity,
+anything reaches the robot, and without a sign-in. The robot admits only a
+desk on its access list and checks every message: `resources/*`,
+`subscriptions/listen` and `tools/list` need the observe capability;
+`tools/call` needs the teleop capability and the operator role, except that
+any desk on the access list may call `estop`. The robot checks a message's
+access again just before it sends the message to rcpd, and it sends a
+`notifications/cancelled` to rcpd only after the tool call it names. Tool
+calls made this way are receipted under the desk's identity,
 `iroh:<device key hex>/account:<account hex>`, and the journaled call frame
 carries the same value as `"caller"`. `cerulion-remoted --rcp-addr` (a
 loopback address) and `--rcp-token-file` change the address and the file.
@@ -430,11 +433,12 @@ ops plane's `engage-estop` engages the same latch. While it is engaged:
   restart a graph while it is engaged, and LAN ingress does not read it
   either.
 
-The ops latch is read when a desk's message arrives and again just before
-the plane sends it to rcpd. The ops plane's `engage-estop` does not reach
-rcpd: a tool call sent to rcpd before it, including one rcpd holds behind
-the call it is running, still runs, and rcpd's own latch stays open. An `estop` over rcp also closes rcpd's own
-latch, which refuses the calls rcpd has accepted but not yet published (see
+The ops latch is read when a desk's message arrives and again on the open
+connection to rcpd just before the plane sends it. The ops plane's
+`engage-estop` does not reach rcpd: a tool call sent to rcpd before it,
+including one rcpd holds behind the call it is running, still runs, and rcpd's
+own latch stays open. An `estop` over rcp also closes rcpd's own latch, which
+refuses the calls rcpd has accepted but not yet published (see
 [E-stop](#e-stop)).
 
 The latch clears only when `cerulion-remoted` restarts. To recover, restart
