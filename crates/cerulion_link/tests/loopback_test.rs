@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use cerulion_link::{
     accept_frame_stream, accept_one, alpn, assert_peer_identity, build_endpoint, dial, direct_addr,
-    open_frame_stream, read_frame, write_frame, EndpointConfig, RelayConfig,
+    open_frame_stream, read_frame, read_frame_or_end, write_frame, EndpointConfig, RelayConfig,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
@@ -181,6 +181,72 @@ async fn loopback_dial_by_key_roundtrips_frames_and_authenticates_both_direction
         client_saw.as_bytes(),
         &server_pub,
         "client's returned remote_id == server key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_frame_or_end_tells_a_finish_at_a_frame_boundary_from_a_cut_frame() {
+    // Two streams on one connection. The first carries one whole frame and
+    // finishes; the second carries one whole frame, then a length prefix and
+    // one byte of a second frame, and finishes.
+    let server = disabled_endpoint([17u8; 32]).await;
+    let client = disabled_endpoint([19u8; 32]).await;
+    let server_addr = loopback_addr(server.id(), &server.bound_sockets());
+    let server_ref = &server;
+    let client_ref = &client;
+
+    let server_fut = async move {
+        let accepted = bounded("accept_one", accept_one(server_ref))
+            .await
+            .expect("accept ok")
+            .expect("incoming");
+        let mut reads = Vec::new();
+        for _ in 0..2 {
+            let (_send, mut recv) = bounded("accept_bi", accept_frame_stream(&accepted.connection))
+                .await
+                .expect("accept_bi ok");
+            let first = bounded("read 1", read_frame_or_end(&mut recv, 1024)).await;
+            let second = bounded("read 2", read_frame_or_end(&mut recv, 1024)).await;
+            reads.push((first, second));
+        }
+        (accepted.connection, reads)
+    };
+
+    let client_fut = async move {
+        let conn = bounded("dial", dial(client_ref, server_addr, alpn::WIRE))
+            .await
+            .expect("dial ok");
+        let (mut whole, _recv) = bounded("open_bi 1", open_frame_stream(&conn))
+            .await
+            .expect("open_bi ok");
+        bounded("write 1", write_frame(&mut whole, b"one"))
+            .await
+            .expect("write ok");
+        whole.finish().expect("finish");
+        let (mut cut, _recv2) = bounded("open_bi 2", open_frame_stream(&conn))
+            .await
+            .expect("open_bi ok");
+        bounded("write 2", write_frame(&mut cut, b"two"))
+            .await
+            .expect("write ok");
+        bounded("write cut", cut.write_all(&[9, 0, 0, 0, b'x']))
+            .await
+            .expect("write cut ok");
+        cut.finish().expect("finish");
+        // Held until the server has read both streams.
+        (conn, _recv, _recv2)
+    };
+
+    let ((_s_conn, reads), _client) = tokio::join!(server_fut, client_fut);
+    let mut reads = reads.into_iter();
+    let (first, second) = reads.next().expect("the first stream");
+    assert_eq!(first.expect("a whole frame"), Some(b"one".to_vec()));
+    assert_eq!(second.expect("a finish at a boundary"), None);
+    let (first, second) = reads.next().expect("the second stream");
+    assert_eq!(first.expect("a whole frame"), Some(b"two".to_vec()));
+    assert!(
+        matches!(second, Err(cerulion_link::LinkError::Stream(_))),
+        "a cut frame is an error, not an end: {second:?}"
     );
 }
 

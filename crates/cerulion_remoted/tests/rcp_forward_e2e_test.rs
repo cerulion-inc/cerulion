@@ -1246,16 +1246,13 @@ async fn an_rcp_estop_engages_the_latch_the_ops_act_verbs_obey() {
 
 /// A stand-in rcpd on loopback, one HTTP/1 request per connection as the
 /// plane sends them. It answers `initialize` (200, a session id and a JSON
-/// result) and every notification (202), refuses the standalone `GET` (405),
-/// answers a `tools/call` with a JSON result after reporting its `params` on
-/// `tool_calls`, and holds each `ping` without writing a byte, after
-/// reporting its id on `pinged`, until `release` is notified; then it answers
-/// the ping. Any other request is answered 404.
-/// A hand-rolled HTTP/1 rcpd. It holds `ping` id 2 until `release`, answers
-/// every other ping at once, reports each held ping's id on `pinged`, each
-/// `tools/call`'s params on `tool_calls`, each standalone `GET` on `gets`
-/// (answered 405), and the method of every POST, in the order it reads them,
-/// on `posts`.
+/// result) and every notification (202), refuses the standalone `GET` (405)
+/// after reporting it on `gets`, and answers a `tools/call` with a JSON result
+/// after reporting its `params` on `tool_calls`. It holds `ping` id 2 without
+/// writing a byte, after reporting its id on `pinged`, until `release` is
+/// notified, then answers it; every other ping is answered at once. Any other
+/// request is answered 404. The method of every POST goes on `posts` in the
+/// order the stand-in reads them.
 struct StandIn {
     addr: SocketAddr,
     pinged: tokio::sync::mpsc::UnboundedReceiver<Value>,

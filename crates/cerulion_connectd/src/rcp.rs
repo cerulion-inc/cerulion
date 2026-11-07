@@ -8,14 +8,16 @@
 //! as one length-prefixed frame, and each frame from the robot is written to
 //! stdout as one line. Stdout carries nothing else: a robot frame that is not a
 //! JSON-RPC 2.0 message is never written. The session ends after stdin reaches
-//! EOF and the robot has finished answering; that is the one `Ok` end.
+//! EOF and the robot has finished the stream at a frame boundary; that is the
+//! one `Ok` end.
 //!
 //! Every other end is an error: the robot's refusal of the session (its
 //! accept decision, [`ConnectError::Refused`] with the robot's reason), a
 //! connection the robot closed with [`CLOSE_REVOKED`] or [`CLOSE_SUPERSEDED`]
 //! ([`ConnectError::Refused`]), the robot ending the stream while stdin is
-//! still open ([`ConnectError::Control`]), or any other frame that is not a
-//! JSON-RPC 2.0 message ([`ConnectError::Protocol`]).
+//! still open, or a stream that breaks: a reset, a lost connection, or a frame
+//! cut off by the end of the stream ([`ConnectError::Control`]), or any other
+//! frame that is not a JSON-RPC 2.0 message ([`ConnectError::Protocol`]).
 //!
 //! The robot decides what the desk may do: it admits the connection only for a
 //! paired key on its access list and checks every message by its MCP method.
@@ -26,9 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cerulion_link::{
-    alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame, write_frame,
-    Connection, ConnectionError, EndpointAddr, EndpointConfig, EndpointId, RecvStream, RelayConfig,
-    SendStream, DEFAULT_MAX_FRAME_LEN,
+    alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame_or_end, write_frame,
+    Connection, ConnectionError, EndpointAddr, EndpointConfig, EndpointId, LinkError, RecvStream,
+    RelayConfig, SendStream, DEFAULT_MAX_FRAME_LEN,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -136,8 +138,9 @@ fn robot_close(connection: &Connection) -> Option<ConnectError> {
 /// [`ConnectError::Protocol`] for a stdin line over [`MAX_LINE`] or a robot
 /// frame that is not a JSON-RPC 2.0 message; [`ConnectError::Refused`] for
 /// the robot's refusal; [`ConnectError::Control`] when the robot ends the
-/// stream before `input` reaches EOF; [`ConnectError::Io`] for a local read
-/// or write failure.
+/// stream before `input` reaches EOF, or when the stream breaks (a reset, a
+/// lost connection or a frame cut off), stdin ended or not;
+/// [`ConnectError::Io`] for a local read or write failure.
 pub async fn bridge<R, W>(
     input: R,
     mut output: W,
@@ -181,11 +184,17 @@ where
     });
     let downlink = async {
         loop {
-            let frame = match read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN).await {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::debug!(error = %e, "cerulion rcp: the robot closed the session");
+            let frame = match read_frame_or_end(&mut recv, DEFAULT_MAX_FRAME_LEN).await {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    tracing::debug!("cerulion rcp: the robot finished the session");
                     break;
+                }
+                Err(e) => {
+                    return Err(ConnectError::Control(format!(
+                        "the rcp stream from the robot broke: {}",
+                        error_chain(&e)
+                    )));
                 }
             };
             let line = session_line(frame)?;
@@ -209,6 +218,18 @@ where
         Err(_) => Ok(()),
     };
     down.and(up)
+}
+
+/// `e` and each error under it, joined with `: `.
+fn error_chain(e: &LinkError) -> String {
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 /// Process stdin as an [`AsyncRead`] fed by a detached std thread. Unlike
@@ -405,6 +426,21 @@ mod tests {
         AnswerThenWait,
         /// Answer the request and end the stream at once.
         AnswerThenEnd,
+        /// Answer nothing: once the desk ends its side, break the stream
+        /// the way the [`Break`] says.
+        BreakAfterInput(Break),
+    }
+
+    /// How [`Robot::BreakAfterInput`] breaks the stream.
+    #[derive(Clone, Copy, Debug)]
+    enum Break {
+        /// Close the connection with application code 0, which names
+        /// neither a revoke nor a newer connection.
+        CloseConnection,
+        /// Reset the robot's side of the stream.
+        ResetStream,
+        /// Send a length prefix and one byte of its frame, then finish.
+        CutFrame,
     }
 
     /// Run [`run_rcp`] against a stand-in robot on loopback that plays
@@ -412,7 +448,7 @@ mod tests {
     /// when `stdin_eof`. Returns the result and everything written to
     /// stdout.
     async fn run_against(robot: Robot, stdin_eof: bool) -> (Result<(), ConnectError>, Vec<u8>) {
-        use cerulion_link::{accept_frame_stream, accept_one};
+        use cerulion_link::{accept_frame_stream, accept_one, read_frame};
         let step = Duration::from_secs(20);
         let robot_ep = build_endpoint(
             EndpointConfig::new([71; 32])
@@ -463,6 +499,21 @@ mod tests {
                 Robot::AnswerThenEnd => {
                     write_frame(&mut send, answer).await.expect("write");
                     let _ = send.finish();
+                }
+                Robot::BreakAfterInput(how) => {
+                    // The desk ends its side only after stdin's EOF, so the
+                    // bridge has seen stdin end before the stream breaks.
+                    let _ = read_frame(&mut recv, 1 << 20).await;
+                    match how {
+                        Break::CloseConnection => conn.close(0u32.into(), b"gone"),
+                        Break::ResetStream => {
+                            let _ = send.reset(0u32.into());
+                        }
+                        Break::CutFrame => {
+                            send.write_all(&[64, 0, 0, 0, b'{']).await.expect("write");
+                            let _ = send.finish();
+                        }
+                    }
                 }
             }
             let _ = conn.closed().await;
@@ -536,6 +587,21 @@ mod tests {
             other => panic!("expected an error, got {other:?}"),
         }
         assert_eq!(written, answer, "frames before the end still reach stdout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_that_breaks_after_stdin_ends_is_an_error() {
+        for how in [Break::CloseConnection, Break::ResetStream, Break::CutFrame] {
+            let (result, written) = run_against(Robot::BreakAfterInput(how), true).await;
+            match result {
+                Err(ConnectError::Control(m)) => assert!(
+                    m.starts_with("the rcp stream from the robot broke: "),
+                    "{how:?}: {m}"
+                ),
+                other => panic!("{how:?}: expected an error, got {other:?}"),
+            }
+            assert!(written.is_empty(), "{how:?}");
+        }
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub use endpoint::{
 pub use error::{BoxError, LinkError};
 pub use framing::{
     accept_frame_stream, accept_uni_frame_stream, open_frame_stream, open_uni_frame_stream,
-    read_frame, write_frame, DEFAULT_MAX_FRAME_LEN,
+    read_frame, read_frame_or_end, write_frame, DEFAULT_MAX_FRAME_LEN,
 };
 pub use ops_stream::QuicOpsStream;
 pub use relay::{RelayConfig, RelayParseError, CERULION_RELAY_URL_ENV};

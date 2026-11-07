@@ -492,8 +492,10 @@ real rcpd by `rcp_forward_e2e_test.rs`. The desk half is `cerulion rcp`
 frames to stdout lines. A robot frame that is not a JSON-RPC 2.0 message is
 never written to stdout: the accept decision of a refused key, an
 application close with `rcp::CLOSE_REVOKED` or `rcp::CLOSE_SUPERSEDED`
-(mirrored as `connectd::rcp::CLOSE_*`), and the robot ending the stream
-before stdin's EOF each end the desk process with status 1 and an error line.
+(mirrored as `connectd::rcp::CLOSE_*`), the robot ending the stream
+before stdin's EOF, and a stream that breaks (a reset, a lost connection or a
+frame cut off; `cerulion_link::read_frame_or_end` tells these from a finish at
+a frame boundary) each end the desk process with status 1 and an error line.
 
 One e-stop latch covers the ops act verbs and the rcp plane (`restart` does
 not read it): the ops plane's

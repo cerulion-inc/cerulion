@@ -1995,7 +1995,8 @@ impl SseBuffer {
     ///
     /// # Errors
     ///
-    /// `Err(())` when an unfinished event grows past [`MAX_RESPONSE_MESSAGE`].
+    /// `Err(())` when an unfinished event grows past [`MAX_RESPONSE_MESSAGE`],
+    /// or a completed event's `data` is longer than it.
     #[allow(clippy::result_unit_err)]
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         self.pending
@@ -2021,6 +2022,9 @@ impl SseBuffer {
                     data.extend_from_slice(rest);
                     any = true;
                 }
+            }
+            if data.len() > MAX_RESPONSE_MESSAGE {
+                return Err(());
             }
             if any && !data.iter().all(u8::is_ascii_whitespace) {
                 out.push(data);
@@ -2343,6 +2347,30 @@ mod tests {
                 .unwrap(),
             vec![b"{\"a\":1}".to_vec(), b"x\ny".to_vec()]
         );
+    }
+
+    #[test]
+    fn an_event_completed_past_the_relay_bound_is_refused() {
+        // The event stays within the bound while it is unfinished, and passes
+        // it in the chunk that holds its final blank line.
+        let mut b = SseBuffer::default();
+        let mut first = b"data: ".to_vec();
+        first.resize(first.len() + MAX_RESPONSE_MESSAGE - 8, b'a');
+        assert_eq!(b.push(&first).unwrap(), Vec::<Vec<u8>>::new());
+        assert_eq!(b.push(&[b'a'; 16]), Err(()));
+        let mut b = SseBuffer::default();
+        assert_eq!(b.push(&first).unwrap(), Vec::<Vec<u8>>::new());
+        let mut last = vec![b'a'; 16];
+        last.extend_from_slice(b"\n\n");
+        assert_eq!(b.push(&last), Err(()));
+        // At the bound the event is relayed.
+        let mut b = SseBuffer::default();
+        assert_eq!(b.push(&first).unwrap(), Vec::<Vec<u8>>::new());
+        let mut last = vec![b'a'; 8];
+        last.extend_from_slice(b"\n\n");
+        let out = b.push(&last).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), MAX_RESPONSE_MESSAGE);
     }
 
     #[test]
