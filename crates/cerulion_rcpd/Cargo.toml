@@ -75,7 +75,7 @@ rustls = { version = "0.23", default-features = false, features = [
 rustls-platform-verifier = "0.7"
 url = "2"
 # The image asset in the System One request body.
-base64 = "0.22"
+base64 = "0.23"
 # `--verify-bag` and replay read recordings.
 cerulion_bag = { workspace = true }
 
