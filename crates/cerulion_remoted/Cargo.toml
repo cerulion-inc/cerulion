@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Robot-side daemon (and its embeddable serving entry) that owns the robot's single iroh endpoint and serves the wire (cerulion/wire/2) and ops (cerulion/ops/1) protocols on it, gating every connection through a deny-by-default pairing check against the offline cerulion_pairing trust store."
+description = "Robot-side daemon (and its embeddable serving entry) that owns the robot's single iroh endpoint and serves the wire (cerulion/wire/2), ops (cerulion/ops/1) and rcp (cerulion/rcp/1) protocols on it, gating every connection through a deny-by-default pairing check against the offline cerulion_pairing trust store."
 # Not published to crates.io: the robot-side daemon binary, and its serving
 # entry for hosts that link it by path, with path-only internal deps.
 publish = false
@@ -79,13 +79,21 @@ tokio = { version = "1", default-features = false, features = [
     # backs `forward.rs`'s `Notify` (previously pulled only via feature unification —
     # now declared here, since remoted uses it directly).
     "sync",
+    # `net` also carries the rcp plane's loopback HTTP client to cerulion-rcpd.
     "net",
     "io-util",
 ] }
-# OS entropy is used only for provisioning MAC and recovery secrets.
+# OS entropy is used only for provisioning MAC and recovery secrets, and for
+# the rcpd token the daemon writes when its token file is absent.
 getrandom = "0.2"
 # Safe file opens use these platform constants without calling unsafe APIs.
 libc = "0.2"
+# The rcp plane is an MCP streamable HTTP client of the robot's local
+# cerulion-rcpd, built on hyper's HTTP/1 client connection. The same major
+# versions rcpd serves with; no new crate enters the lock.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 # Structured logging (never println! in library code). Cap release logging at
 # info, mirroring cerulion_core / cerud / cerulion_bagd.
 tracing = { version = "0.1.44", features = ["release_max_level_info"] }
@@ -164,3 +172,8 @@ iroh = "=1.0.2"
 # `test-seam = ["cerud/test-seam"]` the delegated `cerud` seam) is compiled for
 # the integration tests only — NEVER for a plain `cargo build -p cerulion_remoted`.
 cerulion_remoted = { path = ".", features = ["test-seam"] }
+# The rcp-plane e2e test forwards to a REAL cerulion-rcpd (its streamable HTTP
+# server, tool host and journal) on loopback, answered by a stand-in graph
+# thread that publishes std_msgs/String results.
+cerulion_rcpd = { path = "../cerulion_rcpd" }
+native_ros2_messages = { workspace = true }

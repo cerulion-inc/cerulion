@@ -468,6 +468,7 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion node stage::graph",
         "cerulion node stage::node_type",
         "cerulion pair::robot",
+        "cerulion rcp::robot",
         "cerulion service call::robot",
         "cerulion topic pub::robot",
         "cerulion topic snapshot::robot",
@@ -646,11 +647,14 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion pair::account",
         "cerulion pair::code",
         "cerulion pair::eid",
+        "cerulion rcp::eid",
         // ---- Network locators, URLs and interface addresses.
         "cerulion connect::addrs",
         "cerulion connect::relay_url",
         "cerulion pair::addrs",
         "cerulion pair::relay_url",
+        "cerulion rcp::addrs",
+        "cerulion rcp::relay_url",
         "cerulion ros2 attach::iface",
         "cerulion topic find::connect",
         "cerulion topic find::listen",
@@ -661,6 +665,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // ---- Free-form policy / filter / mode strings behind a custom parser
         // rather than an enumerable `value_parser` list.
         "cerulion connect::network",
+        "cerulion rcp::network",
         "cerulion graph run::record_cpu",
         "cerulion node create::policy",
         "cerulion node modify::policy",

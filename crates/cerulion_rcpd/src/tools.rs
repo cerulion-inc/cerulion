@@ -387,7 +387,8 @@ impl ToolHost {
     }
 
     fn record(&self, verb: &str, digest: &str, outcome: ReceiptOutcome) -> Option<Receipt> {
-        self.receipts.record(CALLER, verb, digest, outcome)
+        self.receipts
+            .record(&crate::caller::current(), verb, digest, outcome)
     }
 
     /// A handle on this host's receipt log for other writers.
