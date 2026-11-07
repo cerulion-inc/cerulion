@@ -9,7 +9,7 @@
 //! - a trigger input gets every frame, one tick per frame;
 //! - a latest-value input of a period node holds each frame;
 //! - a node that reports an input deeper than 64 frames fails the start with
-//!   the depth limit named;
+//!   the depth limit named, before any node's `init` runs;
 //! - a trigger input 64 frames deep, the deepest an input can declare, gets a
 //!   burst of 64 frames that piles up in its queue, with none lost.
 //!
@@ -18,6 +18,7 @@
 //! registry and the transport are process state, so this file is its own
 //! binary and holds ONE test that runs its steps in order.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cerulion_android::{codes, EmbedError, EmbeddedRuntime, RuntimeState};
@@ -37,8 +38,13 @@ cerulion_android::embed_nodes! {
 
 /// The deep relay, reporting its trigger input one frame deeper than any
 /// input may declare. The node macro refuses such a declaration at compile
-/// time, so only a node entry written by hand can report it.
+/// time, so only a node entry written by hand can report it. Its `init` sets
+/// [`TOO_DEEP_INIT_RAN`], so the test can see that a refused start ran no
+/// node's `init`.
 struct TooDeepRelayEntry(DeepRelayNodeEntry);
+
+/// Set when a [`TooDeepRelayEntry`] runs its `init`.
+static TOO_DEEP_INIT_RAN: AtomicBool = AtomicBool::new(false);
 
 impl TooDeepRelayEntry {
     fn new() -> Self {
@@ -58,10 +64,16 @@ impl NodeEntry for TooDeepRelayEntry {
                 meta
             })
             .collect();
-        Ok(NodeInfo::with_meta(inputs, info.output_meta().to_vec()))
+        let too_deep = NodeInfo::with_meta(inputs, info.output_meta().to_vec());
+        // Keep the trigger policy, so the depth is the only fault.
+        Ok(match info.policy() {
+            Some(policy) => too_deep.with_policy(policy),
+            None => too_deep,
+        })
     }
 
     fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        TOO_DEEP_INIT_RAN.store(true, Ordering::SeqCst);
         self.0.init(context)
     }
 
@@ -305,7 +317,8 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
 
 /// An app topic read by an input deeper than 64 frames fails the start with
 /// a graph error that names the input, its depth and the limit, before the
-/// app creates the topic.
+/// app creates the topic and before any node's `init` runs, so the refused
+/// start has no side effects.
 fn an_input_deeper_than_64_fails_the_start_with_the_limit_named(
     runtime: &mut EmbeddedRuntime,
     pid: u32,
@@ -334,6 +347,11 @@ fn an_input_deeper_than_64_fails_the_start_with_the_limit_named(
         .expect("a failed start records its error");
     assert_eq!(last_error.code, codes::GRAPH, "{status:?}");
     assert_eq!(&last_error.message, message, "{status:?}");
+    assert_eq!(status.nodes, 0, "{status:?}");
+    assert!(
+        !TOO_DEEP_INIT_RAN.load(Ordering::SeqCst),
+        "a start refused for its input depth must not run any node's init"
+    );
 }
 
 #[test]
