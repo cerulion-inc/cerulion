@@ -742,6 +742,27 @@ pub fn build_mp_workspace_named(root: &Path, prefix: &str, graph_file: &str, int
     .unwrap();
 }
 
+/// Declare `isolate: false` on each of `nodes` in `graphs/<graph_file>.yaml`,
+/// so each joins the executor unit of the node that triggers it. On the
+/// `mpdemo` chain, `relay` and `sink` make every process ONE unit: `p0` runs
+/// `ticker` and `relay` on one thread, and `--single-process` runs the whole
+/// chain as the monolith. Without it, and with no profile, every data-triggered
+/// node is a unit of its own (`p0.ticker`, `p0.relay`, `p1` on a free run).
+pub fn join_trigger_units(root: &Path, graph_file: &str, nodes: &[&str]) {
+    let path = root.join(format!("graphs/{graph_file}.yaml"));
+    let mut yaml = std::fs::read_to_string(&path).expect("read the graph file");
+    for node in nodes {
+        let entry = format!("- id: {node}\n  type: {node}\n");
+        assert_eq!(
+            yaml.matches(&entry).count(),
+            1,
+            "precondition: `{node}` is declared once, with a type of its own name"
+        );
+        yaml = yaml.replace(&entry, &format!("{entry}  isolate: false\n"));
+    }
+    std::fs::write(&path, yaml).expect("write the graph file");
+}
+
 /// Spawn `cerulion graph run mpdemo --record=recordings [extra...]` in `root`,
 /// stdout+stderr redirected to files (readable while the child runs).
 pub fn spawn_mp_record(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, PathBuf) {

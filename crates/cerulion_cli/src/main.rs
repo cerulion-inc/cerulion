@@ -410,7 +410,9 @@ fn dispatch(cli: Cli) -> ExitCode {
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
-        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        CliError::NodeFatal { .. }
+        | CliError::WorkerNodeFatal { .. }
+        | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
         _ => 1,
     }
 }
@@ -1922,6 +1924,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Plan { name } => {
+                    print!("{}", graph_cmd::graph_plan(&ws.root, &name)?);
+                    Ok(())
+                }
                 GraphAction::Levels { name } => {
                     // Levelization inspection. The engine
                     // returns the fully-rendered report; print it verbatim,
@@ -2121,7 +2127,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     // way `graph run` does. `running` forwards Ctrl+C so the
                     // worker's live loop stops cleanly on SIGINT.
                     let running = setup_ctrlc_handler()?;
-                    graph_cmd::graph_run_worker(&ws.root, &plan, running)
+                    graph_cmd::graph_run_worker_host(&ws.root, &plan, running)
                 }
                 GraphAction::RunGateway { handoff } => {
                     // Hidden verb: the network GATEWAY process of a
@@ -4045,7 +4051,7 @@ mod login_gate_exemption_tests {
     fn internal_subprocess_verbs_are_exempt() {
         assert!(!command_needs_identity(&Commands::Graph {
             action: GraphAction::RunWorker {
-                plan: PathBuf::from("plan.json"),
+                plan: vec![PathBuf::from("plan.json")],
             },
         }));
         assert!(!command_needs_identity(&Commands::Graph {
@@ -5214,6 +5220,7 @@ mod cli_error_exit_code_tests {
         };
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1

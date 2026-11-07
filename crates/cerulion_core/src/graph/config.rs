@@ -730,26 +730,22 @@ pub struct NodeDef {
     /// in v1). Mutually exclusive with `type:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ros2: Option<Ros2NodeDef>,
-    /// OPTIONAL per-node execution opt-out: `fuse: false` ENDS any fused
-    /// chain at this node.
+    /// OPTIONAL per-node executor override, read when a process hosts more
+    /// than one node.
     ///
-    /// Absent means the node does not end a chain, which is the default for
-    /// every node that does not say otherwise. `true` is accepted and means
-    /// the same as absent, so a graph may state the default explicitly
-    /// without that reading as a request for something different.
+    /// Inside a process, nodes run in executor units, each on its own thread.
+    /// Without a profile every data-triggered node is a unit of its own; a
+    /// linear chain of trigger edges shares one unit only where the graph's
+    /// profile shows the merge stays within its tick budget. `isolate: true`
+    /// gives this node a unit of its own (a `block` flow still keeps its
+    /// producer and consumers together). `isolate: false` keeps it in the unit
+    /// of the nodes that trigger it whatever the automatic rules say. Absent
+    /// leaves the choice to those rules.
+    /// `cerulion graph plan` shows the units and why each one starts.
     ///
-    /// The opt-out is per INSTANCE rather than per node TYPE because whether
-    /// a consumer should pull its producer's period along with it is a
-    /// property of the deployment, not of the code: the same logger type is a
-    /// best-effort tail in one graph and a control node in another. Fusion
-    /// converts consumer lag into head-node period slip, which is what a
-    /// control chain wants and a best-effort tail does not.
-    ///
-    /// NOTHING in the executor reads this yet: an opted-out node appears in
-    /// the resolved decision that is logged at graph build and in no
-    /// execution path.
+    /// This key replaces `fuse: false`, which is refused at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuse: Option<bool>,
+    pub isolate: Option<bool>,
     /// OPTIONAL per-instance values for the node type's `#[param]` fields:
     /// a flat map of param name to scalar (`params: {gain: 2.5, frame_id:
     /// left}`). Absent names keep the macro default. Resolved ONCE at graph

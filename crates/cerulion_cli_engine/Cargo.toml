@@ -38,6 +38,9 @@ test-seams = []
 # (`replay_feed::mutants`) and the core's (`cerulion_core/oracle-mutants`). Off by
 # default and in every release build; only an explicit
 # `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
+# This crate's seams include `CERULION_UNIT_COLLAPSE_MUTANT`, which keeps every
+# process group one executor unit; the core's feature carries the unit planner's
+# seams.
 oracle-mutants = ["cerulion_core/oracle-mutants"]
 
 [dependencies]

@@ -137,7 +137,7 @@ fn live_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
         identity: "liveliness_sweep_test".to_string(),
         prefix: "lsw".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "cons".to_string(),
@@ -411,7 +411,7 @@ fn internal_edge_consumer_first_no_spurious_alive() {
         // point of this test (reverse of topological order).
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
@@ -423,7 +423,7 @@ fn internal_edge_consumer_first_no_spurious_alive() {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -536,7 +536,7 @@ fn data_trigger_lost_handler_silent_but_counter_fires() {
         identity: "liveliness_data_trigger_test".to_string(),
         prefix: "ldt".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "cons".to_string(),
@@ -676,7 +676,7 @@ fn multi_publisher_lost_only_on_last_leave() {
         identity: "liveliness_multi_pub_test".to_string(),
         prefix: "lmp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "cons".to_string(),

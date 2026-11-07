@@ -21,21 +21,32 @@
 //! BOTH breadcrumb families so the two supervisor arms are each other's
 //! positive control. The apparatus itself is proven before any absence is
 //! believed: the descriptor was found and parsed, the GO breadcrumb landed,
-//! and exactly two worker build lines were captured.
+//! and one worker build line per executor unit was captured, named by hand.
+//!
+//! A free run executes each process in executor units, and with no profile
+//! every data-triggered node is a unit of its own: `p0` runs `p0.ticker` and
+//! `p0.relay`, `p1` runs `p1`, and each unit logs its own build line, epoch and
+//! exit. The lockstep opt-out runs one level loop per process (`p0`, `p1`).
 //!
 //! # Arms
 //!
 //! 1. DEFAULT: the variable REMOVED from the child's environment ⇒
-//!    `gating: recorded_wall` (and `partition.process_groups: true`), both
-//!    workers `build_path=FreeRunTraced`, the supervisor creates no barrier, no
-//!    worker leaves a cohort.
+//!    `gating: recorded_wall` (and `partition.process_groups: true`), two
+//!    worker processes, every unit `build_path=FreeRunTraced`, the supervisor
+//!    creates no barrier, no unit leaves a cohort.
 //! 2. OPT-OUT: `CERULION_EXECUTION_MODE=lockstep` ⇒ `gating: quantum`, both
 //!    workers `build_path=Lockstep`, both leave the barrier cohort on
 //!    shutdown, no free-run breadcrumb.
-//! 3. NEGATIVE CONTROL: `--single-process`, variable removed ⇒ the monolith
-//!    route did not move: `partition.process_groups: false`, the read-only
-//!    `wall` label it always carried, no worker line, no barrier breadcrumb of
-//!    either kind.
+//! 3. NEGATIVE CONTROL: `--single-process` on the chain written as one unit
+//!    (`relay` and `sink` declare `isolate: false`), variable removed ⇒ the
+//!    monolith route did not move: `partition.process_groups: false`, the
+//!    read-only `wall` label it always carried, no worker line, no barrier
+//!    breadcrumb of either kind.
+//! 4. `--single-process` on the chain as written, three units: the default
+//!    free-runs them in ONE worker process (`recorded_wall`, three
+//!    `FreeRunTraced` units named after the graph) and the run says the
+//!    declared groups are not executed; under the lockstep opt-out the same run
+//!    is the monolith of arm 3.
 //!
 //! The `--record` twin of arm 1 is `mp_record_e2e_test`'s `RecordMode::Default`
 //! arm (the bag's `coordination: free_run` stamp + the epoch-placed streams);
@@ -159,7 +170,8 @@ fn wait_for_line(stdout_path: &Path, stderr_path: &Path, needle: &str, timeout: 
     }
 }
 
-/// Run `cerulion graph run mpdemo [extra]` under `mode` (NO `--record`), wait
+/// Run `cerulion graph run mpdemo [extra]` under `mode` (NO `--record`), on the
+/// chain written as one executor unit when `one_unit`, wait
 /// for the run descriptor and, on a supervisor arm, for GO; give the
 /// deployment a healthy window, SIGINT it, require exit 0, and hand back what
 /// it left behind.
@@ -168,9 +180,13 @@ fn run_and_stop(
     extra: &[&str],
     mode: SpawnExecutionMode,
     expect_supervisor: bool,
+    one_unit: bool,
 ) -> RunOutcome {
     let tmp = tempfile::tempdir().unwrap();
     build_mp_workspace(tmp.path(), prefix);
+    if one_unit {
+        join_trigger_units(tmp.path(), "mpdemo", &["relay", "sink"]);
+    }
     let home = tmp.path().join("cerhome");
     std::fs::create_dir_all(&home).unwrap();
     let home_str = home.to_str().expect("tempdir paths are UTF-8").to_owned();
@@ -242,23 +258,37 @@ fn run_and_stop(
     RunOutcome { run_json, log }
 }
 
-/// The apparatus saw both workers: exactly two build lines, no more (a third
-/// would be a respawn) and no fewer (a missing one would make every per-rank
-/// count below vacuous).
-fn assert_two_worker_build_lines(log: &str) {
+/// The apparatus saw every rank: one build line per executor unit, naming the
+/// units in `want` (sorted) and no other, so a respawn (a repeated name) or a
+/// missing unit (which would make every per-rank count below vacuous) fails
+/// here.
+fn assert_build_line_groups(log: &str, want: &[&str]) {
+    let mut groups: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("worker build path resolved from the stamped execution mode"))
+        .map(|l| {
+            l.split_whitespace()
+                .find_map(|t| t.strip_prefix("group="))
+                .unwrap_or_else(|| panic!("a build line names its unit: {l}"))
+        })
+        .collect();
+    groups.sort_unstable();
     assert_eq!(
-        log.matches("worker build path resolved from the stamped execution mode")
-            .count(),
-        2,
-        "both workers log their resolved build path to the shared stderr; log was:\n{log}"
+        groups, want,
+        "every unit logs its resolved build path to the shared stderr; log was:\n{log}"
     );
+}
+
+/// How many worker processes the supervisor spawned (one line each).
+fn spawned_workers(log: &str) -> usize {
+    log.matches("spawned worker process").count()
 }
 
 /// Arm 1, DEFAULT: nothing exported ⇒ the deployment free-runs.
 #[test]
 #[serial]
 fn a_process_groups_run_free_runs_by_default() {
-    let out = run_and_stop("emdef", &[], SpawnExecutionMode::Default, true);
+    let out = run_and_stop("emdef", &[], SpawnExecutionMode::Default, true, false);
     // POSITIVE witness 1: the descriptor names the EXECUTED deployment and the
     // gating clock of the mode the resolver chose with nothing exported. A
     // plain multi-process run mints its scheduler-trace rings, so every rank
@@ -277,13 +307,19 @@ fn a_process_groups_run_free_runs_by_default() {
          (`FreeRunTraced`), never a handed quantum: {}",
         out.run_json
     );
-    // POSITIVE witness 2: each worker's OWN build line names the traced
-    // free-run path.
-    assert_two_worker_build_lines(&out.log);
+    // POSITIVE witness 2: each unit's OWN build line names the traced
+    // free-run path; two worker processes host the three units.
+    assert_eq!(
+        spawned_workers(&out.log),
+        2,
+        "one worker process per process group; log was:\n{}",
+        out.log
+    );
+    assert_build_line_groups(&out.log, &["p0.relay", "p0.ticker", "p1"]);
     assert_eq!(
         out.log.matches("build_path=FreeRunTraced").count(),
-        2,
-        "both workers must resolve the traced free-run build path; log was:\n{}",
+        3,
+        "every unit must resolve the traced free-run build path; log was:\n{}",
         out.log
     );
     assert_eq!(
@@ -309,8 +345,8 @@ fn a_process_groups_run_free_runs_by_default() {
     );
     assert_eq!(
         out.log.matches("no barrier cohort to leave").count(),
-        2,
-        "both free-run workers exit with no cohort to leave; log was:\n{}",
+        3,
+        "every free-run unit exits with no cohort to leave; log was:\n{}",
         out.log
     );
     assert_eq!(
@@ -326,7 +362,7 @@ fn a_process_groups_run_free_runs_by_default() {
 #[test]
 #[serial]
 fn the_lockstep_opt_out_builds_the_barrier_deployment() {
-    let out = run_and_stop("emlock", &[], SpawnExecutionMode::Lockstep, true);
+    let out = run_and_stop("emlock", &[], SpawnExecutionMode::Lockstep, true, false);
     assert_eq!(
         out.run_json["partition"]["process_groups"],
         serde_json::json!(true),
@@ -339,7 +375,7 @@ fn the_lockstep_opt_out_builds_the_barrier_deployment() {
         "the opt-out hands every rank the same quantum behind the barrier: {}",
         out.run_json
     );
-    assert_two_worker_build_lines(&out.log);
+    assert_build_line_groups(&out.log, &["p0", "p1"]);
     assert_eq!(
         out.log.matches("build_path=Lockstep").count(),
         2,
@@ -376,9 +412,10 @@ fn the_lockstep_opt_out_builds_the_barrier_deployment() {
     );
 }
 
-/// Arm 3, NEGATIVE CONTROL: `--single-process` with nothing exported is the
-/// monolith it always was. The default is keyed on the deployment fact, so a
-/// route with no ranks shows none of it.
+/// Arm 3, NEGATIVE CONTROL: `--single-process` with nothing exported, on the
+/// chain written as one executor unit, is the monolith it always was. The
+/// default is keyed on the deployment fact, so a route with no ranks shows none
+/// of it.
 #[test]
 #[serial]
 fn a_single_process_run_is_untouched_by_the_flip() {
@@ -387,6 +424,7 @@ fn a_single_process_run_is_untouched_by_the_flip() {
         &["--single-process"],
         SpawnExecutionMode::Default,
         false,
+        true,
     );
     // POSITIVE witnesses: the descriptor reports the monolith and the
     // read-only `wall` label a live monolith carries (a monolith mints no
@@ -416,6 +454,94 @@ fn a_single_process_run_is_untouched_by_the_flip() {
             0,
             "a monolith must not log `{absent}`; log was:\n{}",
             out.log
+        );
+    }
+}
+
+/// Arm 4: `--single-process` on the chain as written. With no profile its three
+/// nodes are three executor units, and on the default free run every unit runs
+/// in ONE worker process beside `graph run`: the descriptor reports the one
+/// process group it executes and the wall-following clock, the three units are
+/// named after the graph, and the run says the declared groups are not
+/// executed. Under the lockstep opt-out the same run is the monolith, as arm 3.
+#[test]
+#[serial]
+fn a_single_process_run_of_several_units_free_runs_them_in_one_worker() {
+    let out = run_and_stop(
+        "emspu",
+        &["--single-process"],
+        SpawnExecutionMode::Default,
+        true,
+        false,
+    );
+    assert_eq!(
+        out.run_json["partition"]["process_groups"],
+        serde_json::json!(true),
+        "the units run as one process group: {}",
+        out.run_json
+    );
+    assert_eq!(
+        out.run_json["gating"],
+        serde_json::json!("recorded_wall"),
+        "each unit free-runs on its own wall-following clock: {}",
+        out.run_json
+    );
+    assert_eq!(
+        spawned_workers(&out.log),
+        1,
+        "every unit runs in one worker process; log was:\n{}",
+        out.log
+    );
+    assert_build_line_groups(&out.log, &["mpdemo.relay", "mpdemo.sink", "mpdemo.ticker"]);
+    assert_eq!(
+        out.log.matches("build_path=FreeRunTraced").count(),
+        3,
+        "every unit resolves the traced free-run build path; log was:\n{}",
+        out.log
+    );
+    assert_eq!(
+        out.log
+            .matches("free-run deployment: no shared barrier is created")
+            .count(),
+        1,
+        "the one-worker deployment creates no barrier; log was:\n{}",
+        out.log
+    );
+    assert!(
+        out.log
+            .contains("despite `process_groups:` (the declared groups are not executed)"),
+        "--single-process says the declared groups are not executed; log was:\n{}",
+        out.log
+    );
+
+    let lockstep = run_and_stop(
+        "emspl",
+        &["--single-process"],
+        SpawnExecutionMode::Lockstep,
+        false,
+        false,
+    );
+    assert_eq!(
+        lockstep.run_json["partition"]["process_groups"],
+        serde_json::json!(false),
+        "under the lockstep opt-out --single-process executes no process groups: {}",
+        lockstep.run_json
+    );
+    assert_eq!(
+        lockstep.run_json["gating"],
+        serde_json::json!("wall"),
+        "the lockstep opt-out runs the monolith: {}",
+        lockstep.run_json
+    );
+    for absent in [
+        "worker build path resolved from the stamped execution mode",
+        "GO signaled; deployment live",
+    ] {
+        assert_eq!(
+            lockstep.log.matches(absent).count(),
+            0,
+            "the lockstep monolith must not log `{absent}`; log was:\n{}",
+            lockstep.log
         );
     }
 }
