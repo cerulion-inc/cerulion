@@ -404,10 +404,11 @@ anything reaches the robot, and without a sign-in. The robot admits only a
 desk on its access list and checks every message: `resources/*`,
 `subscriptions/listen` and `tools/list` need the observe capability;
 `tools/call` needs the teleop capability and the operator role, except that
-any desk on the access list may call `estop`. The robot checks a message's
-access again just before it sends the message to rcpd, and it sends a
-`notifications/cancelled` to rcpd only after the tool call it names. Tool
-calls made this way are receipted under the desk's identity,
+any desk on the access list may call `estop`. The robot checks an Observe or
+Act message's access again just before it sends the message to rcpd; an
+`estop` is not checked again. It sends a `notifications/cancelled` to rcpd
+after rcpd has taken the tool call it names, or once `--rcp-head-timeout-ms`
+passes. Tool calls made this way are receipted under the desk's identity,
 `iroh:<device key hex>/account:<account hex>`, and the journaled call frame
 carries the same value as `"caller"`. `cerulion-remoted --rcp-addr` (a
 loopback address) and `--rcp-token-file` change the address and the file.

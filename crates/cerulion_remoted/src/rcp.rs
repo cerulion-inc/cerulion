@@ -39,13 +39,14 @@
 //! connection to rcpd is open, just before it sends an Observe or Act message,
 //! that task checks the key's access for the message's class again, and for
 //! an Act message the e-stop latch. A `notifications/cancelled` naming a
-//! request whose response head is not in yet waits for that head, within
-//! [`RcpLimits::head_timeout`], so rcpd never receives a cancel before the
-//! tool call it names. Queued notifications have [`FORWARD_NOTIFICATION_ROOM`]
-//! places of their own; a notification past them is dropped, so a request
-//! that holds a slot always fits the queue. The forwarder stops when the
-//! stream's writer has stopped and ends with its session; an error reply the
-//! outbound queue cannot take is dropped.
+//! request whose response head is not in yet waits for that head, so it
+//! reaches rcpd after rcpd has taken the tool call it names, or once
+//! `--rcp-head-timeout-ms` ([`RcpLimits::head_timeout`]) passes. Queued
+//! notifications have [`FORWARD_NOTIFICATION_ROOM`] places of their own; a
+//! notification past them is dropped, so a request that holds a slot always
+//! fits the queue. The forwarder stops when the stream's writer has stopped
+//! and ends with its session; an error reply the outbound queue cannot take
+//! is dropped.
 //!
 //! ## The e-stop latch
 //!

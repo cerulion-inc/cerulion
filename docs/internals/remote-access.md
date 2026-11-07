@@ -463,8 +463,9 @@ connection. A `notifications/cancelled` naming a request whose response head
 is not in yet is sent by a task of its own once that head is in, within
 `RcpLimits::head_timeout`. rcpd (rmcp's stateful streamable HTTP server) sends
 a request's SSE head once the request is in the MCP session, before the tool
-runs, so rcpd never receives a cancel before the call it names, requests stay
-concurrent up to `--rcp-in-flight`, and the forwarder never waits on a cancel.
+runs, so the cancel reaches rcpd after rcpd has taken the call it names, or
+once `--rcp-head-timeout-ms` passes; requests stay concurrent up to
+`--rcp-in-flight`, and the forwarder never waits on a cancel.
 Its bounded queue holds `in_flight + estops_in_flight + 4`: a request holds
 its slot while queued and a notification one of four notification places
 (`rcp::FORWARD_NOTIFICATION_ROOM`), so a request that holds a slot always
@@ -532,8 +533,8 @@ session reader stops: the forwarder still sends what it holds, the queued
 frames drain and the stream finishes. A
 response body that ends without the response to its request (rcpd stopped
 mid-call, or a `notifications/cancelled` closed it) is answered `-32603` as
-well. A notification takes no in-flight slot, so a cancel reaches rcpd, after
-the call it names, while every slot is taken.
+well. A notification takes no in-flight slot, so a cancel reaches rcpd while
+every slot is taken.
 
 ## 7. The desk half: connect, pair, and the client substrate
 
