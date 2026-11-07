@@ -23,8 +23,8 @@
 //!    see the supervisor handing it the wrong config.
 //!
 //!    - *(1b) the control + the monolith half*: `--single-process
-//!      --record` on the same unpartitioned chain written as one executor unit
-//!      (and with NO `prefix:` line) embeds a graph with NO `process_groups:`,
+//!      --record` on the same unpartitioned chain, one executor unit with no
+//!      profile (and with NO `prefix:` line), embeds a graph with NO `process_groups:`,
 //!      because that is what it ran; and its prefix, absent on disk and
 //!      resolved at run time, is the one every recorded channel is named
 //!      under. Covers `run_graph_recording`, the path arm 1 does not reach.
@@ -34,12 +34,13 @@
 //!    breadcrumb present, NO auto-partition notice of any kind (the absence
 //!    pin — a persisted partition must not re-derive or re-notice).
 //! 3. **The opt-out**: `graph run --single-process` on the unpartitioned
-//!    twin written as one executor unit runs the MONOLITH: zero `run-worker`
-//!    children across the window, no GO breadcrumb, the skip notice present,
-//!    file untouched. *(3b)* On the twin that is three units (no profile) ONE
-//!    `run-worker` child hosts every unit across the window, nothing is
-//!    derived, the skip notice is present, and the bag embeds one process
-//!    group holding every node, with one rank per unit.
+//!    twin, one executor unit with no profile, runs the MONOLITH: zero
+//!    `run-worker` children across the window, no GO breadcrumb, the skip
+//!    notice present, file untouched. *(3b)* On the twin whose `relay` and
+//!    `sink` declare `isolate: true`, three units, ONE `run-worker` child
+//!    hosts every unit across the window, nothing is derived, the skip notice
+//!    is present, and the bag embeds one process group holding every node,
+//!    with one rank per unit.
 //!
 //! Harness cribs `mp_record_e2e_test.rs` (tempdir workspace, PREBUILT fixture
 //! cdylibs — no in-test cargo build, redirected child logs, bounded waits,
@@ -351,14 +352,13 @@ fn build_unpartitioned_workspace_opt_prefix(root: &Path, prefix: Option<&str>) -
 }
 
 /// The same unpartitioned chain with `relay` and `sink` declared
-/// `isolate: false`, so each joins the executor unit of the node that triggers
-/// it and the three nodes are ONE unit. `--single-process` on the real clock
-/// runs a graph that is one unit in the `graph run` process as one level loop;
-/// the unprofiled chain above is three units, which it hosts in one worker
-/// process instead.
-fn build_one_unit_workspace(root: &Path, prefix: Option<&str>) -> String {
-    let three_units = build_unpartitioned_workspace_opt_prefix(root, prefix);
-    let mut yaml = three_units.clone();
+/// `isolate: true`, so each runs in an executor unit of its own and the three
+/// nodes are THREE units. `--single-process` on the real clock hosts them in
+/// one worker process; the chain as written has no profile, so it is one unit,
+/// which `--single-process` runs in the `graph run` process as one level loop.
+fn build_three_unit_workspace(root: &Path, prefix: &str) -> String {
+    let one_unit = build_unpartitioned_workspace(root, prefix);
+    let mut yaml = one_unit.clone();
     for node in ["relay", "sink"] {
         let entry = format!("  type: {node}\n");
         assert_eq!(
@@ -366,9 +366,9 @@ fn build_one_unit_workspace(root: &Path, prefix: Option<&str>) -> String {
             1,
             "precondition: the chain declares `{node}` once"
         );
-        yaml = yaml.replace(&entry, &format!("{entry}  isolate: false\n"));
+        yaml = yaml.replace(&entry, &format!("{entry}  isolate: true\n"));
     }
-    assert_ne!(yaml, three_units, "the isolate lines landed");
+    assert_ne!(yaml, one_unit, "the isolate lines landed");
     std::fs::write(root.join("graphs/apdemo.yaml"), &yaml).unwrap();
     yaml
 }
@@ -702,8 +702,8 @@ fn has_field(log: &str, field: &str) -> bool {
 }
 
 const GO_MARKER: &str = "GO signaled; deployment live";
-/// `--single-process` on a graph that is one executor unit: the nodes run in
-/// the `graph run` process as one level loop.
+/// `--single-process` on a graph that is one executor unit (no profile and no
+/// `isolate: true`): the nodes run in the `graph run` process as one level loop.
 const MONOLITH_NOTICE_MARKER: &str = "running the single-process monolith";
 /// What every `--single-process` run of a graph with no `process_groups:`
 /// says, whichever process its nodes run in.
@@ -912,10 +912,9 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 }
 
 /// (1b) The CONTROL + the MONOLITH half: a `--single-process --record` run
-/// of the same unpartitioned chain, written as ONE executor unit (`relay` and
-/// `sink` declare `isolate: false`), must embed a graph with NO
-/// `process_groups:`, because that is what it EXECUTED: one level loop in the
-/// `graph run` process.
+/// of the same unpartitioned chain, ONE executor unit (no profile and no
+/// `isolate: true`), must embed a graph with NO `process_groups:`, because
+/// that is what it EXECUTED: one level loop in the `graph run` process.
 ///
 /// Two things this arm does that (1) cannot:
 ///
@@ -939,7 +938,7 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
     let tmp = tempfile::tempdir().unwrap();
     // NO `prefix:` line — the hand-written graph shape (see the builder's doc).
-    let original_yaml = build_one_unit_workspace(tmp.path(), None);
+    let original_yaml = build_unpartitioned_workspace_opt_prefix(tmp.path(), None);
     assert!(
         !original_yaml.contains("prefix:"),
         "precondition: the on-disk graph must carry NO prefix, or the prefix half of this arm \
@@ -1111,14 +1110,14 @@ fn partition_yes_persists_then_run_respects_without_notice() {
     );
 }
 
-/// (3) `--single-process` on the unpartitioned twin written as one executor
-/// unit (`relay` and `sink` declare `isolate: false`) = the plain monolith: no
-/// derivation, no workers, no GO. (3b) runs the twin that is three units.
+/// (3) `--single-process` on the unpartitioned twin, one executor unit (no
+/// profile and no `isolate: true`) = the plain monolith: no derivation, no
+/// workers, no GO. (3b) runs the twin that is three units.
 #[test]
 #[serial]
 fn single_process_opt_out_runs_monolith_with_no_workers() {
     let tmp = tempfile::tempdir().unwrap();
-    let original_yaml = build_one_unit_workspace(tmp.path(), Some("apdc"));
+    let original_yaml = build_unpartitioned_workspace(tmp.path(), "apdc");
     let (mut guard, stdout_path, stderr_path) = spawn_graph_run(tmp.path(), &["--single-process"]);
     let sup_pid = guard.0.id();
 
@@ -1174,8 +1173,9 @@ fn single_process_opt_out_runs_monolith_with_no_workers() {
     );
 }
 
-/// (3b) `--single-process` on the unpartitioned twin with no profile, which is
-/// three executor units (every data-triggered node is a unit of its own): the
+/// (3b) `--single-process` on the unpartitioned twin whose `relay` and `sink`
+/// declare `isolate: true`, which is three executor units (each isolated node a
+/// unit of its own, `ticker` the process's remaining one): the
 /// three units run in ONE worker process beside `graph run`, and no other
 /// worker starts. The opt-out still derives nothing and still says the
 /// auto-partition default is skipped, and the recording embeds what ran: one
@@ -1186,15 +1186,15 @@ fn single_process_opt_out_runs_monolith_with_no_workers() {
 #[serial]
 fn single_process_opt_out_hosts_every_unit_in_one_worker() {
     let tmp = tempfile::tempdir().unwrap();
-    let original_yaml = build_unpartitioned_workspace(tmp.path(), "apdu");
+    let original_yaml = build_three_unit_workspace(tmp.path(), "apdu");
     assert!(
-        !original_yaml.contains("process_groups") && !original_yaml.contains("isolate"),
-        "precondition: no declared groups and no isolate key, or the three units are not the \
-         planner's own split"
+        !original_yaml.contains("process_groups")
+            && original_yaml.matches("isolate: true").count() == 2,
+        "precondition: no declared groups, and `isolate: true` on relay and sink alone"
     );
     assert!(
         !tmp.path().join("graphs/apdemo.costs.yaml").exists(),
-        "precondition: no profile, so no chain link merges"
+        "precondition: no profile, so the units come from the isolate keys alone"
     );
     let (mut guard, stdout_path, stderr_path) =
         spawn_graph_run(tmp.path(), &["--single-process", "--record=recordings"]);

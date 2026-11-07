@@ -16,8 +16,9 @@
 //!    place of the verbs, records a gap about as long as the stop. It is what
 //!    makes the assertion above able to fail.
 //! 3. **Every executor unit of every process of a multi-process run is held**,
-//!    free-run (the default) and lockstep, and the lockstep run is not poisoned by
-//!    a pause longer than its five-second boundary timeout.
+//!    free-run (the default, with `relay` declaring `isolate: true` so a process
+//!    hosts two units) and lockstep, and the lockstep run is not poisoned by a
+//!    pause longer than its five-second boundary timeout.
 //! 4. **The state is reported.** `run.json` carries `"paused": true` while the run
 //!    is held and `"paused": false` after, and a repeat of a verb succeeds and says
 //!    "already".
@@ -280,9 +281,12 @@ impl Recorded {
         tmp.path().join("home")
     }
 
-    fn start(prefix: &str, extra: &[&str], mode: SpawnExecutionMode) -> Self {
+    /// Start a recorded run of `mpdemo`, each node of `isolate` declaring
+    /// `isolate: true`.
+    fn start(prefix: &str, extra: &[&str], mode: SpawnExecutionMode, isolate: &[&str]) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         build_mp_workspace(tmp.path(), prefix);
+        isolate_nodes(tmp.path(), "mpdemo", isolate);
         let home = Self::home_of(&tmp);
         std::fs::create_dir_all(&home).unwrap();
         let home_str = home.display().to_string();
@@ -484,7 +488,12 @@ fn pause_hold_resume(run: &Recorded, topic: &str, hold: Duration, ranks: &[u32])
 #[serial]
 fn a_pause_leaves_no_gap_and_no_burst_in_a_single_process_recording() {
     let prefix = "gpe2ea";
-    let mut run = Recorded::start(prefix, &["--single-process"], SpawnExecutionMode::Default);
+    let mut run = Recorded::start(
+        prefix,
+        &["--single-process"],
+        SpawnExecutionMode::Default,
+        &[],
+    );
     let topic = format!("/{prefix}/ticker/cmd");
 
     pause_hold_resume(&run, &topic, PAUSE, &[]);
@@ -506,14 +515,20 @@ fn a_pause_leaves_no_gap_and_no_burst_in_a_single_process_recording() {
 /// for a reason that has nothing to do with the pause.
 ///
 /// The stop goes to every process of the run, as a terminal's job-control stop
-/// does: a `--single-process` run on the real clock whose nodes split into
-/// executor units runs them all in one worker process beside `graph run`, so
-/// stopping `graph run` alone leaves the nodes stepping.
+/// does: this graph is one executor unit and runs in the `graph run` process,
+/// but a `--single-process` run on the real clock whose nodes split into
+/// several units runs them in one worker process beside `graph run`, where
+/// stopping `graph run` alone would leave the nodes stepping.
 #[test]
 #[serial]
 fn stopping_the_process_instead_of_pausing_it_leaves_the_gap() {
     let prefix = "gpe2eb";
-    let mut run = Recorded::start(prefix, &["--single-process"], SpawnExecutionMode::Default);
+    let mut run = Recorded::start(
+        prefix,
+        &["--single-process"],
+        SpawnExecutionMode::Default,
+        &[],
+    );
     let topic = format!("/{prefix}/ticker/cmd");
 
     let mut stopped = vec![run.guard.id()];
@@ -560,15 +575,16 @@ fn stopping_the_process_instead_of_pausing_it_leaves_the_gap() {
 /// the pause.
 ///
 /// Each unit runs its own live loop and takes the pause on its own. The workspace
-/// has no profile, so nothing merges: p0 runs the ticker and the relay as two
-/// units (`p0.ticker`, `p0.relay`) and p1 runs the sink as one (`p1`). The
-/// expected units are written out here, not read from the run's log, so a run
-/// whose p0 starts one unit fails this arm.
+/// has no profile, so each process would be one unit; `relay` declares
+/// `isolate: true`, so p0 runs the ticker and the relay as two units
+/// (`p0.ticker`, `p0.relay`) and p1 runs the sink as one (`p1`). The expected
+/// units are written out here, not read from the run's log, so a run whose p0
+/// starts one unit fails this arm.
 #[test]
 #[serial]
 fn a_pause_holds_every_worker_of_a_free_run_deployment() {
     let prefix = "gpe2ec";
-    let mut run = Recorded::start(prefix, &[], SpawnExecutionMode::Default);
+    let mut run = Recorded::start(prefix, &[], SpawnExecutionMode::Default, &["relay"]);
     let ticker = format!("/{prefix}/ticker/cmd");
 
     pause_hold_resume(&run, &ticker, PAUSE, &[]);
@@ -602,7 +618,7 @@ fn a_pause_holds_every_worker_of_a_free_run_deployment() {
 #[serial]
 fn a_pause_longer_than_the_barrier_timeout_does_not_poison_a_lockstep_run() {
     let prefix = "gpe2ed";
-    let mut run = Recorded::start(prefix, &[], SpawnExecutionMode::Lockstep);
+    let mut run = Recorded::start(prefix, &[], SpawnExecutionMode::Lockstep, &[]);
     let ticker = format!("/{prefix}/ticker/cmd");
 
     // Both workers' step counters stand still for the hold and move after it. A

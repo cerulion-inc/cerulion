@@ -36,10 +36,11 @@
 //!      keep at least 90% of the baseline rate and a P99 within
 //!      `2 x baseline + 1 ms`.
 //! * `a_slow_node_in_the_same_process_does_not_slow_the_fast_node`: the same
-//!   graph under `--single-process`, BASELINE then SLOW. The one process runs
-//!   its nodes in executor units (`pace` publishes two topics, so `fast` and
-//!   `slow` each start a unit of their own on their own thread), and the SLOW
-//!   leg must meet the first arm's bound.
+//!   graph under `--single-process`, BASELINE then SLOW, with `fast` and `slow`
+//!   declaring `isolate: true`. Without a profile a process runs its nodes as
+//!   one unit; the key gives `fast` and `slow` each a unit of its own on its
+//!   own thread, so the one process runs three units, and the SLOW leg must
+//!   meet the first arm's bound.
 //!
 //! Each leg prints one line:
 //!
@@ -153,7 +154,8 @@ fn require_window(arm: &str, leg: &str, w: &FireWindow, floor: usize) {
 }
 
 /// Run one leg in `ws`: the graph with `slow`, as declared (three processes)
-/// or `--single-process`, and return the fast node's numbers.
+/// or `--single-process` with `fast` and `slow` declaring `isolate: true`,
+/// and return the fast node's numbers.
 fn run_leg(ws: &Workspace, arm: &str, leg: &str, slow: Slow, single_process: bool) -> FireWindow {
     let (graph, prefix) = unique_names("nb");
     let slow_node = match slow {
@@ -175,11 +177,17 @@ fn run_leg(ws: &Workspace, arm: &str, leg: &str, slow: Slow, single_process: boo
             &[("ri_sleep_us", ParamValue::UInt(us))],
         ),
     };
-    let nodes = vec![
+    let mut nodes = vec![
         node_def("pace", "ri_pace", &[], &["out", "side"], &[]),
         node_def("fast", "ri_fast", &[("inp", "pace/out")], &[], &[]),
         slow_node,
     ];
+    if single_process {
+        // Without a profile the one process would be one unit.
+        for node in nodes.iter_mut().filter(|n| n.id != "pace") {
+            node.isolate = Some(true);
+        }
+    }
     let groups = vec![
         ("g_pace", vec!["pace"]),
         ("g_fast", vec!["fast"]),

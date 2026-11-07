@@ -13,7 +13,26 @@
 //! words. A slow tick delays its own unit and, by data, the units that read from
 //! it; it never holds another unit's fire.
 //!
-//! # Every node starts alone; a profile merges links
+//! # Units are opt in
+//!
+//! Without a profile the nodes of a process form ONE unit, the level loop a
+//! process runs its nodes on when it hosts no units, except each node that
+//! declares `isolate: true`, which forms a unit of its own. A [`Coupling`]
+//! still joins its nodes, and `isolate: false` changes nothing. The unit
+//! carries [`Boundary::NoProfile`] on its first member and each isolated unit
+//! [`Boundary::Isolated`]. A unit runs a contiguous band of the graph's
+//! levels, so the other nodes are cut at an isolated node's level: those past
+//! it start a unit carrying [`Boundary::AfterIsolatedLevel`]. With a profile
+//! the rules below split and merge.
+//!
+//! A unit is woken by the kernel on ONE input, its first declared trigger or
+//! sync input another unit or process writes; a frame on any other input is
+//! seen when its current wait ends (`GraphRuntime::doorbell_wake_word_block`).
+//! A join that is a unit of its own therefore waits up to one recheck for a set
+//! that completes on another input
+//! (<https://github.com/cerulion-inc/cerulion/issues/755>).
+//!
+//! # With a profile, every node starts alone and the profile merges links
 //!
 //! A node may join its producer's unit only across a LINK: an edge the shared
 //! chain predicates ([`crate::graph::chain::linear_links`]) find to be a linear
@@ -26,10 +45,8 @@
 //! snapshot `graph profile` writes) shows the merge is safe: the unit's summed
 //! p50 tick, the new node included, stays under [`BUDGET_DIVISOR`]⁻¹ of the
 //! shortest period the merged unit is fed at, and under the same share of the
-//! tightest `tick_within_ms` of its members. Without a profile, or without a
-//! profiled tick for every node involved, nothing merges: every data-triggered
-//! node is a unit of its own, so a slow node never holds a fast one from the
-//! first run.
+//! tightest `tick_within_ms` of its members. A link whose nodes the profile
+//! holds no tick for does not merge.
 //!
 //! A unit is fed at each member's own period, else through each trigger edge
 //! into the member: at the edge's profiled rate, or, when the profile does not
@@ -51,12 +68,13 @@
 //!
 //! # Overrides
 //!
-//! `isolate: true` puts the node in a unit of its own. `isolate: false` joins
-//! the node to the unit of every same-process node that triggers it, whatever
-//! the automatic rules say: a fan-in node merges its producers' units, a
-//! fan-out consumer shares the producer's unit, and no profile is needed. When a
-//! producer declares `isolate: true` and its consumer `isolate: false`, the
-//! producer's declaration wins.
+//! `isolate: true` puts the node in a unit of its own, with or without a
+//! profile. With a profile, `isolate: false` joins the node to the unit of
+//! every same-process node that triggers it, whatever the link rules say: a
+//! fan-in node merges its producers' units, a fan-out consumer shares the
+//! producer's unit, and the tick budget is not applied. When a producer
+//! declares `isolate: true` and its consumer `isolate: false`, the producer's
+//! declaration wins.
 //!
 //! A [`Coupling`] (every producer and consumer of a topic with a `block`
 //! consumer) merges its nodes into one unit whatever the other rules say: the
@@ -83,7 +101,7 @@ use crate::graph::chain::{linear_links, ChainBar, ConsumerEdgeVerdict};
 use crate::graph::config::GraphConfig;
 use crate::graph::node::{MacroPolicy, NodeInfo};
 use crate::graph::partition::{block_colocation_seeds, PartitionCosts};
-use crate::graph::topology::{GraphTopology, TriggerEdges};
+use crate::graph::topology::{resolve_levels, GraphTopology, TriggerEdges};
 
 /// A link merges when the unit's summed p50 tick times this divisor stays
 /// below the period it is fed at (and below a member's `tick_within_ms`): a
@@ -120,7 +138,8 @@ pub enum Boundary {
         /// The isolated producer.
         producer: String,
     },
-    /// A link whose merge no profile shows to be safe.
+    /// A link whose merge the profile does not show to be safe, as when it
+    /// holds no tick for a node the merge involves.
     Unprofiled {
         /// The producer across the link.
         producer: String,
@@ -140,6 +159,20 @@ pub enum Boundary {
         /// The producer across the node's link.
         producer: String,
     },
+    /// The graph has no profile: every node of the process that does not
+    /// declare `isolate: true` runs in this unit. Carried by the unit's first
+    /// such node.
+    NoProfile,
+    /// The graph has no profile, and this unit holds the nodes of the process
+    /// at levels past an isolated node's level: a unit runs a contiguous band
+    /// of the graph's levels, so the process's other nodes are cut at the
+    /// level of each node that declares `isolate: true`.
+    AfterIsolatedLevel {
+        /// The isolated node whose level the band starts after.
+        node: String,
+        /// That level.
+        level: usize,
+    },
 }
 
 impl Boundary {
@@ -155,8 +188,8 @@ impl Boundary {
                 format!("after an isolated node ({producer} declares isolate: true)")
             }
             Self::Unprofiled { producer } => format!(
-                "no profile shows that joining {producer}'s unit is safe (run `cerulion graph \
-                 profile` to let a chain merge)"
+                "the profile does not show that joining {producer}'s unit is safe (re-run \
+                 `cerulion graph profile` so it holds a tick for every node the merge involves)"
             ),
             Self::UnknownFeed { node } => format!(
                 "the profile holds no rate for how often {node} is fed, so the merged unit's \
@@ -168,6 +201,13 @@ impl Boundary {
                     "on a cycle of chain links (fed by {producer}), which no chain head reaches"
                 )
             }
+            Self::NoProfile => "no profile: every node of this process that does not declare \
+                                `isolate: true` runs in this unit"
+                .to_string(),
+            Self::AfterIsolatedLevel { node, level } => format!(
+                "no profile: past level {level} of {node}, which declares isolate: true (a unit \
+                 runs a contiguous band of levels)"
+            ),
         }
     }
 }
@@ -253,6 +293,10 @@ pub struct UnitGraph {
     pub tick_within_ns: IndexMap<String, u64>,
     /// The `block` couplings.
     pub couplings: Vec<Coupling>,
+    /// Each node's global DAG level (the levels the partition validator
+    /// checks every unit's band against). Empty when the graph's levels cannot
+    /// be resolved (a trigger cycle, which the graph's build refuses).
+    pub level: IndexMap<String, usize>,
 }
 
 impl UnitGraph {
@@ -293,6 +337,13 @@ impl UnitGraph {
                 }
             }
         }
+        if let Ok(levels) = resolve_levels(config, topology, trigger_edges) {
+            for node in config.native_nodes() {
+                if let Some(l) = levels.level_of(&node.id) {
+                    out.level.insert(node.id.clone(), l);
+                }
+            }
+        }
         for seed in block_colocation_seeds(topology) {
             let mut nodes: IndexSet<String> = IndexSet::new();
             nodes.extend(seed.producers.iter().cloned());
@@ -317,7 +368,7 @@ pub struct UnitProfile<'a> {
 }
 
 /// Under the `oracle-mutants` feature, setting this variable makes
-/// [`derive_units`] merge a link that no profile shows to be safe.
+/// [`derive_units`] merge a link that the profile does not show to be safe.
 #[cfg(feature = "oracle-mutants")]
 pub const MERGE_MUTANT_ENV: &str = "CERULION_UNIT_MERGE_MUTANT";
 
@@ -522,6 +573,11 @@ fn merge_verdict(
 
 /// Split one host's members into executor units.
 ///
+/// Without a profile the members form one unit, cut at the level of each
+/// member that declares `isolate: true`, which forms one of its own, and a
+/// `block` coupling joins its nodes' units. With a profile the link rules of
+/// this module's documentation split and merge them.
+///
 /// Units are ordered by their first member and list their members in
 /// `members` order, so the result depends only on the inputs.
 pub fn derive_units(
@@ -530,6 +586,195 @@ pub fn derive_units(
     graph: &UnitGraph,
     profile: Option<UnitProfile<'_>>,
 ) -> Vec<ExecutorUnit> {
+    let Some(profile) = profile else {
+        return units_without_profile(host, members, graph);
+    };
+    units_from_profile(host, members, graph, profile)
+}
+
+/// [`derive_units`] without a profile: the members that do not declare
+/// `isolate: true` form one unit, its first member carrying
+/// [`Boundary::NoProfile`], and each member that does forms one of its own
+/// ([`Boundary::Isolated`]); each `block` coupling then joins the units of its
+/// nodes.
+///
+/// A unit must own a contiguous band of the graph's levels, unbridged by any
+/// node outside it (the partition validator's rule), and the one unit of the
+/// non-isolated members can span an isolated node's level. Those members are
+/// therefore cut at every CUT LEVEL, the level of an isolated member no
+/// coupling keeps with a non-isolated one: a member joins the band that ends
+/// at the first cut level at or above its own, and a band past the last cut
+/// level holds the rest. Each band's first member after the first band
+/// carries [`Boundary::AfterIsolatedLevel`] naming the cut it starts past. A
+/// path into a band from a node outside it comes from a lower level, so no
+/// band is bridged. When a member's level is unknown no cut is made.
+///
+/// A member a coupling keeps with another member carries no `isolate: true`
+/// reason; its unit lists the block topic instead.
+fn units_without_profile(host: &str, members: &[String], graph: &UnitGraph) -> Vec<ExecutorUnit> {
+    let in_host: IndexSet<&str> = members.iter().map(String::as_str).collect();
+    let isolated = |n: &str| graph.isolate.get(n) == Some(&true);
+
+    // An isolated member a coupling (or a chain of couplings) puts with a
+    // non-isolated member runs in that member's unit, so it cuts nothing.
+    let mut coupled: Vec<usize> = (0..members.len()).collect();
+    let _ = join_couplings(graph, &in_host, &mut coupled);
+    let mut kept: IndexSet<usize> = IndexSet::new();
+    for (i, member) in members.iter().enumerate() {
+        if !isolated(member) {
+            kept.insert(root(&mut coupled, i));
+        }
+    }
+    let cuts_known = members.iter().all(|m| graph.level.contains_key(m));
+    let mut cuts: Vec<(usize, &str)> = Vec::new();
+    if cuts_known {
+        for (i, member) in members.iter().enumerate() {
+            if isolated(member) && !kept.contains(&root(&mut coupled, i)) {
+                cuts.push((graph.level[member], member.as_str()));
+            }
+        }
+    }
+    cuts.sort_by_key(|(level, _)| *level);
+    cuts.dedup_by_key(|(level, _)| *level);
+    // The band of a non-isolated member: how many cut levels lie below its
+    // own level.
+    let band = |member: &str| {
+        graph
+            .level
+            .get(member)
+            .map_or(0, |l| cuts.iter().filter(|(cut, _)| cut < l).count())
+    };
+
+    let mut parent: Vec<usize> = (0..members.len()).collect();
+    let mut starts: IndexMap<&str, Boundary> = IndexMap::new();
+    let mut first_of_band: IndexMap<usize, usize> = IndexMap::new();
+    for (i, member) in members.iter().enumerate() {
+        let n = member.as_str();
+        if isolated(n) && !kept.contains(&root(&mut coupled, i)) {
+            starts.insert(n, Boundary::Isolated);
+            continue;
+        }
+        if isolated(n) {
+            // Kept with a non-isolated member by a coupling: the coupling
+            // below joins it, and it carries no reason.
+            continue;
+        }
+        let b = band(n);
+        match first_of_band.get(&b) {
+            Some(&first) => union(&mut parent, first, i),
+            None => {
+                first_of_band.insert(b, i);
+                let reason = match b.checked_sub(1).map(|k| cuts[k]) {
+                    None => Boundary::NoProfile,
+                    Some((level, node)) => Boundary::AfterIsolatedLevel {
+                        node: node.to_string(),
+                        level,
+                    },
+                };
+                starts.insert(n, reason);
+            }
+        }
+    }
+    let block_topics = join_couplings(graph, &in_host, &mut parent);
+    let topics_by_root = topics_by_final_root(block_topics, &mut parent);
+    for (i, member) in members.iter().enumerate() {
+        let n = member.as_str();
+        let r = root(&mut parent, i);
+        if topics_by_root.contains_key(&r) && starts.get(n) == Some(&Boundary::Isolated) {
+            starts.shift_remove(n);
+        }
+    }
+    assemble_units(host, members, &mut parent, &starts, &topics_by_root)
+}
+
+/// Join the nodes of every `block` coupling that has two or more members in
+/// `in_host` into one group of `parent`, and return each coupling's topic
+/// keyed by the root its group had when it was joined.
+fn join_couplings(
+    graph: &UnitGraph,
+    in_host: &IndexSet<&str>,
+    parent: &mut [usize],
+) -> IndexMap<usize, Vec<String>> {
+    let mut block_topics: IndexMap<usize, Vec<String>> = IndexMap::new();
+    for coupling in &graph.couplings {
+        let local: Vec<usize> = coupling
+            .nodes
+            .iter()
+            .filter_map(|n| in_host.get_index_of(n.as_str()))
+            .collect();
+        if local.len() < 2 {
+            continue;
+        }
+        for pair in local.windows(2) {
+            union(parent, pair[0], pair[1]);
+        }
+        let r = root(parent, local[0]);
+        block_topics
+            .entry(r)
+            .or_default()
+            .push(coupling.topic.clone());
+    }
+    block_topics
+}
+
+/// `block_topics` rekeyed by the current root of each group, for a `parent`
+/// that later unions may have changed.
+fn topics_by_final_root(
+    block_topics: IndexMap<usize, Vec<String>>,
+    parent: &mut [usize],
+) -> IndexMap<usize, Vec<String>> {
+    let mut topics_by_root: IndexMap<usize, Vec<String>> = IndexMap::new();
+    for (r, topics) in block_topics {
+        let fr = root(parent, r);
+        topics_by_root.entry(fr).or_default().extend(topics);
+    }
+    topics_by_root
+}
+
+/// One [`ExecutorUnit`] per group of `parent`, ordered by its first member,
+/// with the reasons in `starts` and the block topics of its root. A host whose
+/// members form one unit keeps its own name; otherwise each unit is named
+/// `<host>.<first node>`.
+fn assemble_units(
+    host: &str,
+    members: &[String],
+    parent: &mut [usize],
+    starts: &IndexMap<&str, Boundary>,
+    topics_by_root: &IndexMap<usize, Vec<String>>,
+) -> Vec<ExecutorUnit> {
+    let mut groups: IndexMap<usize, Vec<String>> = IndexMap::new();
+    for (i, member) in members.iter().enumerate() {
+        let r = root(parent, i);
+        groups.entry(r).or_default().push(member.clone());
+    }
+    let single = groups.len() == 1;
+    groups
+        .into_iter()
+        .map(|(r, nodes)| ExecutorUnit {
+            name: if single {
+                host.to_string()
+            } else {
+                format!("{host}.{}", nodes[0])
+            },
+            boundaries: nodes
+                .iter()
+                .filter_map(|n| starts.get(n.as_str()).map(|b| (n.clone(), b.clone())))
+                .collect(),
+            block_topics: topics_by_root.get(&r).cloned().unwrap_or_default(),
+            nodes,
+        })
+        .collect()
+}
+
+/// [`derive_units`] with a profile: every node starts alone and the profile
+/// merges links (this module's documentation).
+fn units_from_profile(
+    host: &str,
+    members: &[String],
+    graph: &UnitGraph,
+    profile: UnitProfile<'_>,
+) -> Vec<ExecutorUnit> {
+    let profile = Some(profile);
     let in_host: IndexSet<&str> = members.iter().map(String::as_str).collect();
     let index = |n: &str| in_host.get_index_of(n);
     let declared = |n: &str| graph.isolate.get(n).copied();
@@ -622,21 +867,7 @@ pub fn derive_units(
     // `isolate: false` join does: the feeds, ticks and deadlines below are
     // gathered per group, so a verdict counts every node a coupling puts in
     // the unit.
-    let mut block_topics: IndexMap<usize, Vec<String>> = IndexMap::new();
-    for coupling in &graph.couplings {
-        let local: Vec<usize> = coupling.nodes.iter().filter_map(|n| index(n)).collect();
-        if local.len() < 2 {
-            continue;
-        }
-        for pair in local.windows(2) {
-            union(&mut parent, pair[0], pair[1]);
-        }
-        let r = root(&mut parent, local[0]);
-        block_topics
-            .entry(r)
-            .or_default()
-            .push(coupling.topic.clone());
-    }
+    let block_topics = join_couplings(graph, &in_host, &mut parent);
 
     // The summed p50 tick and tightest `tick_within` of the unit rooted at
     // `r` so far (a node and every node `isolate: false` or a coupling joined
@@ -816,11 +1047,7 @@ pub fn derive_units(
         }
     }
 
-    let mut topics_by_root: IndexMap<usize, Vec<String>> = IndexMap::new();
-    for (r, topics) in block_topics {
-        let fr = root(&mut parent, r);
-        topics_by_root.entry(fr).or_default().extend(topics);
-    }
+    let topics_by_root = topics_by_final_root(block_topics, &mut parent);
     // A node in one unit with a node of this host that triggers it starts no
     // unit, so it carries no reason. A `block` flow keeps its nodes together
     // over `isolate: true`; such a node does not start a unit either, and the
@@ -839,29 +1066,7 @@ pub fn derive_units(
             starts.shift_remove(n);
         }
     }
-
-    let mut groups: IndexMap<usize, Vec<String>> = IndexMap::new();
-    for (i, member) in members.iter().enumerate() {
-        let r = root(&mut parent, i);
-        groups.entry(r).or_default().push(member.clone());
-    }
-    let single = groups.len() == 1;
-    groups
-        .into_iter()
-        .map(|(r, nodes)| ExecutorUnit {
-            name: if single {
-                host.to_string()
-            } else {
-                format!("{host}.{}", nodes[0])
-            },
-            boundaries: nodes
-                .iter()
-                .filter_map(|n| starts.get(n.as_str()).map(|b| (n.clone(), b.clone())))
-                .collect(),
-            block_topics: topics_by_root.get(&r).cloned().unwrap_or_default(),
-            nodes,
-        })
-        .collect()
+    assemble_units(host, members, &mut parent, &starts, &topics_by_root)
 }
 
 /// A graph's `process_groups:` rewritten to one group per executor unit.
@@ -1048,7 +1253,31 @@ mod tests {
         for (n, ms) in periods {
             g.period_ns.insert(n.to_string(), ms * 1_000_000);
         }
+        g.level = levels(&g);
         g
+    }
+
+    /// Longest-path levels over `g`'s trigger edges, as the graph's
+    /// levelization gives them: a node nothing triggers is at level 0. A cycle
+    /// stops after one relaxation per node.
+    fn levels(g: &UnitGraph) -> IndexMap<String, usize> {
+        let mut level: IndexMap<String, usize> = IndexMap::new();
+        for (p, c) in &g.trigger_edges {
+            level.entry(p.clone()).or_insert(0);
+            level.entry(c.clone()).or_insert(0);
+        }
+        for n in g.period_ns.keys() {
+            level.entry(n.clone()).or_insert(0);
+        }
+        for _ in 0..level.len() {
+            for (p, c) in &g.trigger_edges {
+                let next = level[p] + 1;
+                if level[c] < next {
+                    level.insert(c.clone(), next);
+                }
+            }
+        }
+        level
     }
 
     fn costs(p50: &[(&str, u64)], rates: &[(&str, &str, u64)]) -> PartitionCosts {
@@ -1088,26 +1317,201 @@ mod tests {
         graph(&[("cam", "det"), ("det", "track")], &[], &[("cam", 1)])
     }
 
-    // ---- Without a profile, every data-triggered node is its own unit.
+    /// `producer` (10 ms) publishes one topic that `relay` and `join` read,
+    /// and `join` also reads `relay`'s output: no edge is a chain link.
+    fn producer_relay_join() -> UnitGraph {
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        graph(
+            &[],
+            &[
+                ("producer", "relay", ChainBar::FanOut { consumers: 2 }),
+                ("producer", "join", join.clone()),
+                ("relay", "join", join),
+            ],
+            &[("producer", 10)],
+        )
+    }
+
+    fn prj() -> Vec<String> {
+        s(&["producer", "relay", "join"])
+    }
+
+    // ---- Without a profile, a process is one unit.
 
     #[test]
-    fn without_a_profile_every_data_triggered_node_is_its_own_unit() {
-        let units = derive_units("g", &s(&["cam", "det", "track"]), &chain3(), None);
-        assert_eq!(nodes(&units), [s(&["cam"]), s(&["det"]), s(&["track"])]);
-        assert_eq!(start_of(&units, "cam"), Some(&Boundary::Source));
+    fn without_a_profile_a_producer_a_relay_and_a_join_are_one_unit() {
+        let units = derive_units("g", &prj(), &producer_relay_join(), None);
+        assert_eq!(nodes(&units), [prj()]);
+        assert_eq!(units[0].name, "g", "one unit keeps its host's name");
         assert_eq!(
-            start_of(&units, "det"),
-            Some(&Boundary::Unprofiled {
-                producer: "cam".into()
-            })
+            units[0].boundaries,
+            [("producer".to_string(), Boundary::NoProfile)],
+            "the unit says why it is one unit"
+        );
+        assert!(units[0].block_topics.is_empty());
+    }
+
+    #[test]
+    fn without_a_profile_isolate_true_gives_that_node_alone_a_unit() {
+        // `join`, at the last level, declares isolate: true: it leaves the one
+        // unit and nothing else does.
+        let mut g = producer_relay_join();
+        g.isolate.insert("join".into(), true);
+        let units = derive_units("g", &prj(), &g, None);
+        assert_eq!(nodes(&units), [s(&["producer", "relay"]), s(&["join"])]);
+        assert_eq!(
+            units.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+            ["g.producer", "g.join"]
         );
         assert_eq!(
-            start_of(&units, "track"),
-            Some(&Boundary::Unprofiled {
-                producer: "det".into()
+            units[0].boundaries,
+            [("producer".to_string(), Boundary::NoProfile)]
+        );
+        assert_eq!(
+            units[1].boundaries,
+            [("join".to_string(), Boundary::Isolated)]
+        );
+    }
+
+    #[test]
+    fn without_a_profile_isolate_true_mid_graph_cuts_the_one_unit_past_its_level() {
+        // `relay` (level 1) declares isolate: true. `producer` (0) and `join`
+        // (2) in one unit would own levels 0 and 2 with level 1 outside it,
+        // which no unit may, so `join` starts a unit past relay's level.
+        let mut g = producer_relay_join();
+        g.isolate.insert("relay".into(), true);
+        let units = derive_units("g", &prj(), &g, None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["producer"]), s(&["relay"]), s(&["join"])]
+        );
+        assert_eq!(start_of(&units, "producer"), Some(&Boundary::NoProfile));
+        assert_eq!(start_of(&units, "relay"), Some(&Boundary::Isolated));
+        assert_eq!(
+            start_of(&units, "join"),
+            Some(&Boundary::AfterIsolatedLevel {
+                node: "relay".into(),
+                level: 1
             })
         );
     }
+
+    #[test]
+    fn without_a_profile_a_node_at_the_isolated_level_stays_below_the_cut() {
+        // `x` (level 1) declares isolate: true; `c`, also at level 1, stays in
+        // `producer`'s unit, and `join` (2) starts the band past level 1.
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let fan = ChainBar::FanOut { consumers: 3 };
+        let mut g = graph(
+            &[],
+            &[
+                ("producer", "x", fan.clone()),
+                ("producer", "c", fan.clone()),
+                ("producer", "join", fan),
+                ("x", "join", join),
+            ],
+            &[("producer", 10)],
+        );
+        g.isolate.insert("x".into(), true);
+        let units = derive_units("g", &s(&["producer", "x", "c", "join"]), &g, None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["producer", "c"]), s(&["x"]), s(&["join"])]
+        );
+        assert_eq!(
+            start_of(&units, "join"),
+            Some(&Boundary::AfterIsolatedLevel {
+                node: "x".into(),
+                level: 1
+            })
+        );
+    }
+
+    #[test]
+    fn without_a_profile_unknown_levels_cut_nothing() {
+        // A hand-built graph with no levels: the non-isolated members stay one
+        // unit whatever the isolated member's place.
+        let mut g = producer_relay_join();
+        g.level.clear();
+        g.isolate.insert("relay".into(), true);
+        let units = derive_units("g", &prj(), &g, None);
+        assert_eq!(nodes(&units), [s(&["producer", "join"]), s(&["relay"])]);
+    }
+
+    #[test]
+    fn without_a_profile_isolate_false_changes_nothing() {
+        let mut g = producer_relay_join();
+        g.isolate.insert("join".into(), false);
+        let units = derive_units("g", &prj(), &g, None);
+        assert_eq!(nodes(&units), [prj()]);
+        assert_eq!(
+            units[0].boundaries,
+            [("producer".to_string(), Boundary::NoProfile)]
+        );
+    }
+
+    #[test]
+    fn without_a_profile_every_node_declaring_isolate_true_is_a_unit_of_its_own() {
+        let mut g = producer_relay_join();
+        for n in prj() {
+            g.isolate.insert(n, true);
+        }
+        let units = derive_units("g", &prj(), &g, None);
+        assert_eq!(
+            nodes(&units),
+            [s(&["producer"]), s(&["relay"]), s(&["join"])]
+        );
+        assert!(units
+            .iter()
+            .all(|u| u.boundaries == [(u.nodes[0].clone(), Boundary::Isolated)]));
+    }
+
+    #[test]
+    fn with_a_profile_the_same_process_splits_at_every_edge_that_is_no_link() {
+        let c = costs(&[("producer", 1), ("relay", 1), ("join", 1)], &[]);
+        let units = derive_units("g", &prj(), &producer_relay_join(), profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["producer"]), s(&["relay"]), s(&["join"])]
+        );
+        assert_eq!(start_of(&units, "producer"), Some(&Boundary::Source));
+        assert_eq!(
+            start_of(&units, "join"),
+            Some(&Boundary::NotALink {
+                producer: "producer".into(),
+                bar: ChainBar::ConsumerJoin { trigger_edges: 2 }
+            })
+        );
+    }
+
+    #[test]
+    fn without_a_profile_a_linear_chain_is_one_unit() {
+        let units = derive_units("g", &s(&["cam", "det", "track"]), &chain3(), None);
+        assert_eq!(nodes(&units), [s(&["cam", "det", "track"])]);
+        assert_eq!(units[0].name, "g");
+        assert_eq!(
+            units[0].boundaries,
+            [("cam".to_string(), Boundary::NoProfile)]
+        );
+    }
+
+    #[test]
+    fn without_a_profile_isolate_true_mid_chain_cuts_the_chain_past_its_level() {
+        let mut g = chain3();
+        g.isolate.insert("det".into(), true);
+        let units = derive_units("g", &s(&["cam", "det", "track"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["cam"]), s(&["det"]), s(&["track"])]);
+        assert_eq!(start_of(&units, "det"), Some(&Boundary::Isolated));
+        assert_eq!(
+            start_of(&units, "track"),
+            Some(&Boundary::AfterIsolatedLevel {
+                node: "det".into(),
+                level: 1
+            })
+        );
+    }
+
+    // ---- With a profile, every node starts alone and the profile merges links.
 
     #[test]
     fn a_profiled_chain_under_budget_merges_into_one_unit_named_for_its_host() {
@@ -1922,9 +2326,10 @@ mod tests {
     }
 
     #[test]
-    fn without_a_profile_a_block_partner_names_no_reason() {
+    fn a_profile_that_holds_no_tick_for_a_block_partner_names_only_the_unit_it_starts() {
         // `b` shares `a`'s unit, so only `a` says why it starts one.
-        let units = derive_units("g", &s(&["h", "a", "b"]), &block_partner(), None);
+        let c = costs(&[("h", 10_000), ("a", 10_000)], &[]);
+        let units = derive_units("g", &s(&["h", "a", "b"]), &block_partner(), profile(&c));
         assert_eq!(nodes(&units), [s(&["h"]), s(&["a", "b"])], "{units:?}");
         assert_eq!(
             units[1].boundaries,
@@ -1935,6 +2340,17 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn without_a_profile_a_block_partner_shares_the_one_unit() {
+        let units = derive_units("g", &s(&["h", "a", "b"]), &block_partner(), None);
+        assert_eq!(nodes(&units), [s(&["h", "a", "b"])], "{units:?}");
+        assert_eq!(
+            units[0].boundaries,
+            [("h".to_string(), Boundary::NoProfile)]
+        );
+        assert_eq!(units[0].block_topics, s(&["/t/a/out"]));
     }
 
     #[test]
@@ -1953,7 +2369,8 @@ mod tests {
             topic: "t".into(),
             nodes: s(&["pace", "slow"]),
         });
-        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
+        let c = costs(&[("pace", 1), ("fast", 1), ("slow", 1)], &[]);
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["pace", "slow"]), s(&["fast"])]);
         assert_eq!(
             units[0].boundaries,
@@ -1971,16 +2388,48 @@ mod tests {
     #[test]
     fn a_consumer_a_block_coupling_keeps_with_its_isolated_producer_names_no_reason() {
         // `a` declares isolate: true and a `block` coupling keeps it with its
-        // consumer `b`: neither starts a unit.
+        // consumer `b`: with a profile neither starts a unit; without one the
+        // unit is the process's one unit and `b`, its first node that does not
+        // declare isolate: true, says so.
         let mut g = graph(&[("a", "b")], &[], &[("a", 10)]);
         g.isolate.insert("a".into(), true);
         g.couplings.push(Coupling {
             topic: "t".into(),
             nodes: s(&["a", "b"]),
         });
-        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        let c = costs(&[("a", 1), ("b", 1)], &[]);
+        let units = derive_units("g", &s(&["a", "b"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["a", "b"])]);
         assert!(units[0].boundaries.is_empty(), "{units:?}");
+
+        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["a", "b"])]);
+        assert_eq!(
+            units[0].boundaries,
+            [("b".to_string(), Boundary::NoProfile)]
+        );
+        assert_eq!(units[0].block_topics, s(&["t"]));
+    }
+
+    #[test]
+    fn without_a_profile_a_block_coupling_of_two_isolated_nodes_is_a_unit_of_its_own() {
+        // `b` and `c` declare isolate: true and a `block` coupling keeps them
+        // together, apart from the process's one unit, which `a` heads.
+        let mut g = graph(&[("a", "b"), ("b", "c")], &[], &[("a", 10)]);
+        g.isolate.insert("b".into(), true);
+        g.isolate.insert("c".into(), true);
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["b", "c"]),
+        });
+        let units = derive_units("g", &s(&["a", "b", "c"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["a"]), s(&["b", "c"])]);
+        assert_eq!(
+            units[0].boundaries,
+            [("a".to_string(), Boundary::NoProfile)]
+        );
+        assert!(units[1].boundaries.is_empty(), "{units:?}");
+        assert_eq!(units[1].block_topics, s(&["t"]));
     }
 
     #[test]
@@ -2066,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn isolate_false_merges_without_a_profile_across_a_fan_out_and_a_fan_in() {
+    fn isolate_false_merges_across_a_fan_out_and_a_fan_in_whatever_the_link_rules_say() {
         let mut g = graph(
             &[],
             &[
@@ -2076,7 +2525,8 @@ mod tests {
             &[("pace", 1)],
         );
         g.isolate.insert("fast".into(), false);
-        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
+        let c = costs(&[("pace", 1), ("fast", 1), ("slow", 1)], &[]);
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["pace", "fast"]), s(&["slow"])]);
 
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
@@ -2086,7 +2536,8 @@ mod tests {
             &[("a", 10), ("c", 10)],
         );
         j.isolate.insert("join".into(), false);
-        let units = derive_units("g", &s(&["a", "c", "join"]), &j, None);
+        let c = costs(&[("a", 1), ("c", 1), ("join", 1)], &[]);
+        let units = derive_units("g", &s(&["a", "c", "join"]), &j, profile(&c));
         assert_eq!(nodes(&units), [s(&["a", "c", "join"])]);
     }
 
@@ -2095,7 +2546,8 @@ mod tests {
         let mut g = graph(&[("a", "b")], &[], &[("a", 10)]);
         g.isolate.insert("a".into(), true);
         g.isolate.insert("b".into(), false);
-        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        let c = costs(&[("a", 1), ("b", 1)], &[]);
+        let units = derive_units("g", &s(&["a", "b"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["a"]), s(&["b"])]);
         assert_eq!(
             start_of(&units, "b"),
@@ -2119,7 +2571,8 @@ mod tests {
             topic: "t".into(),
             nodes: s(&["pace", "slow"]),
         });
-        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
+        let c = costs(&[("pace", 1), ("fast", 1), ("slow", 1)], &[]);
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["pace", "slow"]), s(&["fast"])]);
         assert_eq!(units[0].block_topics, s(&["t"]));
     }
@@ -2127,7 +2580,8 @@ mod tests {
     #[test]
     fn a_cycle_of_links_starts_a_unit_with_a_reason() {
         let g = graph(&[("a", "b"), ("b", "a")], &[], &[]);
-        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        let c = costs(&[("a", 1), ("b", 1)], &[]);
+        let units = derive_units("g", &s(&["a", "b"]), &g, profile(&c));
         assert_eq!(nodes(&units), [s(&["a"]), s(&["b"])]);
         assert!(units.iter().all(|u| !u.boundaries.is_empty()));
         assert_eq!(
@@ -2168,7 +2622,8 @@ mod tests {
     #[test]
     fn expansion_replaces_each_group_by_its_units_in_place() {
         let config = config_with_groups(&[("cam", &["cam"]), ("work", &["cam2", "det"])], &[]);
-        let g = graph(&[("cam2", "det")], &[], &[("cam2", 1)]);
+        let mut g = graph(&[("cam2", "det")], &[], &[("cam2", 1)]);
+        g.isolate.insert("det".into(), true);
         let plan = expand_process_groups(&config, &g, None, &IndexSet::new());
         let keys: Vec<&str> = plan.groups.keys().map(String::as_str).collect();
         assert_eq!(keys, ["cam", "work.cam2", "work.det"]);
@@ -2181,7 +2636,9 @@ mod tests {
     #[test]
     fn expansion_rewrites_the_declared_order() {
         let config = config_with_groups(&[("a", &["x", "y"]), ("b", &["z"])], &["b", "a"]);
-        let plan = expand_process_groups(&config, &UnitGraph::default(), None, &IndexSet::new());
+        let mut g = UnitGraph::default();
+        g.isolate.insert("y".into(), true);
+        let plan = expand_process_groups(&config, &g, None, &IndexSet::new());
         assert_eq!(plan.order, s(&["b", "a.x", "a.y"]));
     }
 
@@ -2198,24 +2655,21 @@ mod tests {
 
     #[test]
     fn a_group_whose_unit_name_collides_stays_one_unit() {
-        // `work`'s unit for `x` would be named `work.x`, which a declared
-        // group already is; under a key folding `.` to `_`, `a-b` and `a_b`
-        // collide too.
+        // `x` and `a_b` declare isolate: true. `work`'s unit for `x` would be
+        // named `work.x`, which a declared group already is; under a key
+        // folding `.` to `_`, `a-b` and `a_b` collide too.
+        let mut isolated = UnitGraph::default();
+        isolated.isolate.insert("x".into(), true);
+        isolated.isolate.insert("a_b".into(), true);
         let config = config_with_groups(&[("work", &["p", "x"]), ("work.x", &["y"])], &[]);
-        let plan = expand_process_groups(&config, &UnitGraph::default(), None, &IndexSet::new());
+        let plan = expand_process_groups(&config, &isolated, None, &IndexSet::new());
         assert_eq!(plan.name_collisions, s(&["work"]));
         assert_eq!(plan.groups["work"], s(&["p", "x"]));
         assert_eq!(plan.groups["work.x"], s(&["y"]));
 
         let config = config_with_groups(&[("g", &["a-b", "a_b"])], &[]);
         let fold = |n: &str| n.replace(['-', '.'], "_");
-        let plan = expand_process_groups_keyed(
-            &config,
-            &UnitGraph::default(),
-            None,
-            &IndexSet::new(),
-            &fold,
-        );
+        let plan = expand_process_groups_keyed(&config, &isolated, None, &IndexSet::new(), &fold);
         assert_eq!(plan.name_collisions, s(&["g"]));
         assert_eq!(plan.groups.len(), 1);
     }

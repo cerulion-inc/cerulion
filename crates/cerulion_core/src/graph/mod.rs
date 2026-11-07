@@ -310,9 +310,8 @@ pub fn adopt_file_stem_identity(config: &mut GraphConfig, stem: &str) {
 /// Refuse a node entry that carries the retired `fuse:` key, naming the node
 /// and the key that replaces it.
 ///
-/// `fuse: false` ended a fused chain at a node. Nodes in one process now run in
-/// executor units, and `isolate: true` is the key that keeps a node out of its
-/// producer's unit. The document is read as plain YAML first so the refusal can
+/// `fuse: false` ended a fused chain at a node. `isolate: true` is the key that
+/// runs a node in an executor unit of its own, out of its producer's unit. The document is read as plain YAML first so the refusal can
 /// name the node; a document that is not YAML is left to the typed parse,
 /// which reports it.
 fn refuse_retired_fuse_key(yaml: &str) -> TransportResult<()> {
@@ -333,10 +332,10 @@ fn refuse_retired_fuse_key(yaml: &str) -> TransportResult<()> {
         let shown = serde_yaml::to_string(value).unwrap_or_default();
         return Err(crate::error::TransportError::GraphError {
             reason: format!(
-                "node '{id}' declares `fuse: {}`, a retired key that is refused. Nodes \
-                 that share a process now run in executor units; to keep this node from \
-                 holding the nodes that feed it, write `isolate: true` in its place, or \
-                 delete the key (see `cerulion graph plan`)",
+                "node '{id}' declares `fuse: {}`, a retired key that is refused. \
+                 `isolate: true` runs a node in an executor unit of its own; to keep this \
+                 node from holding the nodes that feed it, write `isolate: true` in its \
+                 place, or delete the key (see `cerulion graph plan`)",
                 shown.trim()
             ),
         });

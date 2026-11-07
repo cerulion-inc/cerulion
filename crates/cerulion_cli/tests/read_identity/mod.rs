@@ -1300,8 +1300,9 @@ pub enum Placement {
     Declared,
     /// Every node in one process (`graph run --single-process`).
     SingleProcess,
-    /// Every node in one declared process group: one worker process of a
-    /// multi-process run, whose nodes run in executor units.
+    /// Every node in one declared process group, each declaring
+    /// `isolate: true`: one worker process of a multi-process run that runs
+    /// every node in an executor unit of its own.
     OneGroup,
 }
 
@@ -1945,6 +1946,11 @@ pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> Re
             let all: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
             config.process_groups = [("g_all".to_string(), all)].into_iter().collect();
             config.process_group_order = Vec::new();
+            // Without a profile the group would be one unit; each node opts
+            // into a unit of its own.
+            for node in &mut config.nodes {
+                node.isolate = Some(true);
+            }
         }
         write_graph(ws, &config);
         let reads = dir.path().join("live_reads");

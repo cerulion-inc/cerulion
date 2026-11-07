@@ -10778,8 +10778,8 @@ pub(crate) fn load_unit_profile(
                 graph = %graph_name,
                 profile = %path.display(),
                 error = %e,
-                "the graph's profile is present but unusable; executor units are split \
-                 from the graph's structure alone"
+                "the graph's profile is present but unusable; each process runs as one \
+                 executor unit, except a node that declares `isolate: true`"
             );
             None
         }
@@ -13450,8 +13450,9 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
 /// The groups are the graph's `process_groups:`, or, when it declares none,
 /// the partition `graph run` derives in memory (process per node, or the
 /// cost-fused groups when the graph has a profile). Each group is split into
-/// units by the same derivation the run uses, with the graph's profile (its
-/// `graphs/<name>.costs.yaml`) for the tick budget when one is present.
+/// units by the same derivation the run uses: with the graph's profile (its
+/// `graphs/<name>.costs.yaml`) the link rules and the tick budget; without
+/// one, one unit per process and one per node declaring `isolate: true`.
 /// `--single-process` and the lockstep execution mode are not modelled: the
 /// view is the default free run.
 pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
@@ -13534,12 +13535,15 @@ pub(crate) fn render_unit_plan(
     );
     let _ = writeln!(
         out,
-        "  tick budget: {}",
+        "  units: {}",
         match profile {
-            Some(label) => format!("from profile {label}"),
-            None =>
-                "no profile, so no chain merges: every data-triggered node is a unit of its own"
-                    .to_string(),
+            Some(label) => format!(
+                "from profile {label}: every node starts a unit, and a chain link merges where \
+                 the tick budget holds"
+            ),
+            None => "no profile, so each process runs as one unit; a node that declares \
+                     `isolate: true` runs in a unit of its own"
+                .to_string(),
         }
     );
     let whole: indexmap::IndexMap<&str, &str> = units
@@ -23533,6 +23537,172 @@ nodes:
         );
     }
 
+    /// Without a profile and without `isolate: true`, the nodes of a process
+    /// are ONE executor unit, as a process ran its nodes before units existed,
+    /// and `graph plan` says why. The case: one process group holding a 10 ms
+    /// producer, a relay it feeds and a join of both. With `isolate: true` on
+    /// the join, the join alone gets a unit of its own and the plan names the
+    /// key; on the relay, the join also starts a unit past the relay's level,
+    /// and the partition validator accepts every unit.
+    #[test]
+    fn graph_plan_shows_one_unit_per_process_without_a_profile_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "upj_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: upj
+prefix: upj
+nodes:
+  - id: src
+    type: producer
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: mid
+    type: relay
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: join
+    type: joiner
+    inputs:
+      - name: a
+        source: src/out
+      - name: b
+        source: mid/out
+process_groups:
+  p0: [src, mid, join]
+";
+        let graph_file = ws.root.join("graphs").join("upj.yaml");
+        std::fs::write(&graph_file, yaml).unwrap();
+        assert!(
+            !default_artifact_path(&ws.root, "upj").exists(),
+            "precondition: the graph has no profile"
+        );
+
+        let plan = graph_plan(&ws.root, "upj").unwrap();
+        eprintln!("plan without isolate:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 1 executor unit(s)",
+            "  units: no profile, so each process runs as one unit; a node that declares \
+             `isolate: true` runs in a unit of its own",
+            "process p0: 1 unit(s)",
+            "  unit p0: src, mid, join",
+            "    starts at src: no profile: every node of this process that does not declare \
+             `isolate: true` runs in this unit",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+
+        let no_profile = "    starts at src: no profile: every node of this process that does not \
+                          declare `isolate: true` runs in this unit";
+        let isolating = |node_type: &str| {
+            let entry = format!("    type: {node_type}\n");
+            std::fs::write(
+                &graph_file,
+                yaml.replace(&entry, &format!("{entry}    isolate: true\n")),
+            )
+            .unwrap();
+            graph_plan(&ws.root, "upj").unwrap()
+        };
+
+        // The join, at the last level, isolated: it alone leaves the unit.
+        let plan = isolating("joiner");
+        eprintln!("plan with the join isolated:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 2 executor unit(s)",
+            "process p0: 2 unit(s)",
+            "  unit p0.src: src, mid",
+            no_profile,
+            "  unit p0.join: join",
+            "    starts at join: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+
+        // The relay, between the source and the join, isolated: a unit runs a
+        // contiguous band of levels, so the join starts a unit past it.
+        let plan = isolating("relay");
+        eprintln!("plan with the relay isolated:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            no_profile,
+            "  unit p0.mid: mid",
+            "    starts at mid: isolate: true",
+            "  unit p0.join: join",
+            "    starts at join: no profile: past level 1 of mid, which declares isolate: true (a \
+             unit runs a contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
     /// A `tick_within_ms` declared in node SOURCE reaches every path that
     /// derives executor units from source: `graph plan`, `--single-process`
     /// and the run's recorded census, as it reaches the planner that reads the
@@ -23680,10 +23850,11 @@ process_groups:
     /// announces (the auto-partition default skipped, or the declared groups
     /// not executed) is announced where the units are hosted instead.
     ///
-    /// The case: a 100 ms source feeding a data-triggered sink, no profile, so
-    /// two units. Written with no `process_groups:`, then with a declared split
-    /// the run does not execute, then with the sink `isolate: false` (one unit,
-    /// which stays the monolith and says nothing here).
+    /// The case: a 100 ms source feeding a data-triggered sink that declares
+    /// `isolate: true`, so two units. Written with no `process_groups:`, then
+    /// with a declared split the run does not execute, then without the key
+    /// (no profile: one unit, which stays the monolith and says nothing here),
+    /// and with `isolate: false` in its place (still one unit).
     #[cfg(unix)]
     #[test]
     #[tracing_test::traced_test]
@@ -23731,6 +23902,7 @@ nodes:
         schema: geometry_msgs/Vector3
   - id: sink
     type: sink
+    isolate: true
     inputs:
       - name: inp
         source: src/out
@@ -23777,18 +23949,25 @@ nodes:
             "a declared split the run does not execute is named"
         );
 
-        let mut one_unit = cerulion_core::graph::parse_graph_raw(
-            &yaml.replace("    type: sink\n", "    type: sink\n    isolate: false\n"),
-        )
-        .unwrap();
-        assert!(
-            !single_process_hosts_units(&ws.root, &mut one_unit, TimeSource::Real, None).unwrap(),
-            "one unit: the monolith arm runs it and announces the opt-out itself"
-        );
-        assert!(
-            one_unit.process_groups.is_empty(),
-            "the monolith keeps the graph as written"
-        );
+        for (label, isolate) in [("no isolate key", ""), ("isolate: false", "false")] {
+            let line = if isolate.is_empty() {
+                String::new()
+            } else {
+                format!("    isolate: {isolate}\n")
+            };
+            let mut one_unit =
+                cerulion_core::graph::parse_graph_raw(&yaml.replace("    isolate: true\n", &line))
+                    .unwrap();
+            assert!(
+                !single_process_hosts_units(&ws.root, &mut one_unit, TimeSource::Real, None)
+                    .unwrap(),
+                "{label}: one unit, so the monolith arm runs it and announces the opt-out itself"
+            );
+            assert!(
+                one_unit.process_groups.is_empty(),
+                "{label}: the monolith keeps the graph as written"
+            );
+        }
     }
 
     /// Every sentence of the user-facing pages that calls a `--single-process`

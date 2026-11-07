@@ -2980,11 +2980,12 @@ fn host_has_a_doorbell_wake_word() -> bool {
 /// The hop between two executor units of one process, held by counters alone.
 ///
 /// One graph declares a producer and its data-triggered consumer in ONE process
-/// group. The executor-unit derivation the deployment planner runs
-/// (`UnitGraph::from_graph`, then `expand_process_groups`) is handed no
-/// profile, so no profile shows that the consumer may join its producer's unit:
-/// the group splits into two units, the producer's and the consumer's, the split
-/// every deployment without a profile takes. Each unit then runs the way a
+/// group, the consumer declaring `isolate: true`. The executor-unit derivation
+/// the deployment planner runs (`UnitGraph::from_graph`, then
+/// `expand_process_groups`) is handed no profile, so the process would be one
+/// unit, and the consumer's `isolate: true` gives it a unit of its own: the
+/// group splits into two units, the producer's and the consumer's. Each unit
+/// then runs the way a
 /// process hosting several units runs them: its own cut of the graph, its own
 /// transport node on the run's shared iceoryx2 config
 /// (`TransportManager::detached_with_config`, the hosted unit's transport), its
@@ -3002,8 +3003,8 @@ fn host_has_a_doorbell_wake_word() -> bool {
 /// Held, each against a value written here rather than read back from the code
 /// under test:
 ///
-/// - the planner puts the producer and the consumer in two units of the one
-///   process, each alone;
+/// - the planner puts the producer and the consumer (which declares
+///   `isolate: true`) in two units of the one process, each alone;
 /// - the producer arms the doorbell of the topic it publishes and never elides a
 ///   notify on it: the consumer's listener belongs to another unit's build, so
 ///   the producer's live listener count is above the count its own build owns;
@@ -3108,7 +3109,9 @@ fn a_consumer_in_another_executor_unit_is_woken_and_its_sleeping_slices_never_yi
                 }],
             },
             NodeDef {
-                isolate: None,
+                // Without a profile a process is one unit; this opts the
+                // consumer into a unit of its own.
+                isolate: Some(true),
                 params: Default::default(),
                 ros2: None,
                 id: "reader".to_string(),
@@ -3162,7 +3165,7 @@ fn a_consumer_in_another_executor_unit_is_woken_and_its_sleeping_slices_never_yi
     assert_eq!(
         members,
         vec![vec!["numberer".to_string()], vec!["reader".to_string()]],
-        "apparatus: without a profile the planner must put the producer and its consumer \
+        "apparatus: the consumer's `isolate: true` must put the producer and its consumer \
          in two executor units of the one process"
     );
     assert!(
@@ -3524,8 +3527,10 @@ impl StampedNumberer {
 ///
 /// One graph declares two numbering producers, on `A` and `B`, and a `Sync` node
 /// that joins the two topics, all in ONE process group. With no profile the
-/// planner starts a unit at every node: the join's trigger edges are no chain
-/// link. Each unit runs the way a process hosting several units runs it (its own
+/// process would be one unit; the join and the producer on `B` declare
+/// `isolate: true`, so the planner gives each a unit of its own and the producer
+/// on `A` is the process's remaining unit: three units, each holding one node.
+/// Each unit runs the way a process hosting several units runs it (its own
 /// cut of the graph, transport node, clock and runtime, under the park policy
 /// with the doorbell armed), the join's unit on its own thread.
 ///
@@ -3545,7 +3550,8 @@ impl StampedNumberer {
 /// frame, which completes the set. Phase one completes every set on `B`, phase
 /// two on `A`. Held, against values written here:
 ///
-/// - the planner puts the three nodes in three units of the one process;
+/// - the planner puts the three nodes in three units of the one process, as
+///   the two `isolate: true` declarations ask;
 /// - the join's unit maps a page for both inputs and arms `A`, the first one
 ///   declared;
 /// - the join reads every pair in order, `(1, 1)` to `(2 * SETS, 2 * SETS)`;
@@ -3600,8 +3606,10 @@ fn a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_inp
     let join_ready = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
 
-    let producer = |id: &str, topic: &str| NodeDef {
-        isolate: None,
+    // Without a profile a process is one unit; `isolate: true` opts a node
+    // into a unit of its own.
+    let producer = |id: &str, topic: &str, isolate: Option<bool>| NodeDef {
+        isolate,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -3634,10 +3642,10 @@ fn a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_inp
         identity: HOST.to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![
-            producer("numberer_a", A),
-            producer("numberer_b", B),
+            producer("numberer_a", A, None),
+            producer("numberer_b", B, Some(true)),
             NodeDef {
-                isolate: None,
+                isolate: Some(true),
                 params: Default::default(),
                 ros2: None,
                 id: "joiner".to_string(),
@@ -3713,8 +3721,8 @@ fn a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_inp
         assert_eq!(
             unit_of(node).nodes,
             vec![node.to_string()],
-            "apparatus: without a profile the planner must give {node} an executor unit of \
-             its own, got {:?}",
+            "apparatus: the planner must give {node} an executor unit of its own (the join \
+             and the producer on B declare `isolate: true`), got {:?}",
             units.iter().map(|u| &u.nodes).collect::<Vec<_>>()
         );
     }

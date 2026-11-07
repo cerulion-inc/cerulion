@@ -9,9 +9,10 @@
 //! contracts:
 //!
 //! 1. **mp happy path**: exit 0; ONE finalized bag; one rank per executor
-//!    unit with its manifest (lockstep: `rank0` = `[ticker,relay]`, `rank1` =
-//!    `[sink]`; a free run with no profile splits `p0` into `p0.ticker` and
-//!    `p0.relay`: `[ticker]`, `[relay]`, `[sink]`), the `rank4294967295`
+//!    unit with its manifest (with no profile each process is one unit:
+//!    `rank0` = `[ticker,relay]`, `rank1` = `[sink]`; the explicit free-run
+//!    arm declares `isolate: true` on `relay`, which splits `p0` into
+//!    `p0.ticker` and `p0.relay`: `[ticker]`, `[relay]`, `[sink]`), the `rank4294967295`
 //!    departure sentinel = `[]`; every trace record's `reserved` is a unit's rank, with
 //!    NO departure records (happy path); per-rank STEP-BOUNDARY streams
 //!    0-based gap-free + non-decreasing with fire ≤ boundary per step; the
@@ -30,7 +31,8 @@
 //! 4. **Departure path**: SIGKILL the `p1` worker under
 //!    `--peer-loss continue`: exit 0 (degraded), the bag carries kind-2
 //!    departure record(s) with `reserved` == u32::MAX + `node_idx` == p1's
-//!    rank (1 under lockstep, 2 on a free run), the
+//!    rank (1 under lockstep, 2 on the free run whose `relay` declares
+//!    `isolate: true`), the
 //!    survivor out-steps the dead rank, the sentinel manifest stays `[]`, and
 //!    EVERY ring name (the SIGKILLed worker's included) is swept.
 //! 5. **Killed bagd** — SIGKILL the bagd grandchild
@@ -125,19 +127,30 @@ impl RecordMode {
         }
     }
 
+    /// The `mpdemo` nodes this arm declares `isolate: true`. The explicit
+    /// free-run arm declares it on `relay`, so a process of that run hosts
+    /// two executor units; the default and lockstep arms run the graph as
+    /// written.
+    fn isolated_nodes(self) -> &'static [&'static str] {
+        match self {
+            Self::FreeRun => &["relay"],
+            Self::Lockstep | Self::Default => &[],
+        }
+    }
+
     /// The executor units `mpdemo` runs under this arm, in rank order, each with
     /// the nodes it runs (one bag rank per unit). The lockstep opt-out runs one
-    /// level loop per process; a free run executes each process in executor
-    /// units, and with no profile every data-triggered node is a unit of its
-    /// own, so `p0` records two ranks.
+    /// level loop per process, and so does a free run with no profile and no
+    /// `isolate: true`; the explicit free-run arm's `relay` declares
+    /// `isolate: true`, so `p0` records two ranks.
     fn recorded_units(self) -> Vec<(&'static str, Vec<String>)> {
         let nodes = |ids: &[&str]| ids.iter().map(|s| (*s).to_string()).collect();
         match self {
-            Self::Lockstep => vec![
+            Self::Lockstep | Self::Default => vec![
                 ("p0", nodes(&["ticker", "relay"])),
                 ("p1", nodes(&["sink"])),
             ],
-            Self::FreeRun | Self::Default => vec![
+            Self::FreeRun => vec![
                 ("p0.ticker", nodes(&["ticker"])),
                 ("p0.relay", nodes(&["relay"])),
                 ("p1", nodes(&["sink"])),
@@ -162,6 +175,7 @@ fn mp_record_contracts_under_signal(
 ) {
     let tmp = tempfile::tempdir().unwrap();
     build_mp_workspace(tmp.path(), prefix);
+    isolate_nodes(tmp.path(), "mpdemo", mode.isolated_nodes());
     // A free-run recording rank places its gating clock at a
     // `real_ns()` epoch read AFTER GO — so every rank's first boundary must
     // stamp a time at or after THIS read, taken before the supervisor even
@@ -760,8 +774,8 @@ fn mp_graph_record_with_virtual_clock_rejected() {
 /// and the bag carries the departure evidence:
 /// - ≥1 `RECORD_TYPE_DEPARTURE` record, `reserved` == u32::MAX (the departure
 ///   ring's header rank, bagd-stamped) and `node_idx` == the killed
-///   worker's plan rank (1 under lockstep; 2 on a free run, where `p0`
-///   records a rank per executor unit);
+///   worker's plan rank (1 under lockstep; 2 on the free run, whose `relay`
+///   declares `isolate: true`, so `p0` records a rank per executor unit);
 /// - the SURVIVING rank-0 stream kept going past the kill — under LOCKSTEP its
 ///   boundary stream runs strictly longer than the dead rank's (the barrier
 ///   couples them, so rank 0's lead is the post-kill window); under FREE-RUN the
@@ -795,6 +809,7 @@ fn mp_record_departure_lands_in_bag_under_peer_loss_continue_free_run() {
 fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
     let tmp = tempfile::tempdir().unwrap();
     build_mp_workspace(tmp.path(), prefix);
+    isolate_nodes(tmp.path(), "mpdemo", mode.isolated_nodes());
     let (mut guard, stdout_path, stderr_path) = spawn_mp_record_with_mode(
         tmp.path(),
         &["--peer-loss", "continue"],
@@ -803,8 +818,8 @@ fn departure_lands_in_bag(prefix: &str, mode: RecordMode) {
     );
     let _bagd_guard = BagdGuard::arm();
     let sup_pid = guard.id();
-    // `p1`'s rank: 1 under lockstep, 2 on a free run, where `p0` records one
-    // rank per executor unit (`p0.ticker`, `p0.relay`).
+    // `p1`'s rank: 1 under lockstep, 2 on the free run, whose isolated `relay`
+    // makes `p0` record one rank per executor unit (`p0.ticker`, `p0.relay`).
     let killed = mode.p1_rank();
     let n_ranks = mode.recorded_units().len() as u32;
 

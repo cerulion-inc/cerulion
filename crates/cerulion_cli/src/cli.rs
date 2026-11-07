@@ -1682,15 +1682,16 @@ pub enum GraphAction {
     /// Show the processes a free run of a graph starts and the executor units
     /// inside each (read-only).
     ///
-    /// Inside one process, nodes run in executor units, each on its own
-    /// thread, so a slow unit never holds another unit's fire. Without a
-    /// profile every data-triggered node is a unit of its own. A linear chain
-    /// of trigger edges merges into one unit only where the graph's profile
-    /// (`graphs/<NAME>.costs.yaml`) shows the unit's ticks stay under a
-    /// quarter of its period and of its nodes' `tick_within_ms`;
-    /// `isolate: true` and `isolate: false` override, except that a `block`
-    /// edge's producer and consumers always share a unit. Every unit is
-    /// printed with its nodes and the reason it starts.
+    /// Executor units are opt in. Without a profile a process runs its nodes
+    /// as one unit, as before, and a node that declares `isolate: true` runs
+    /// in a unit of its own, on its own thread, so its ticks never hold the
+    /// rest of the process. With the graph's profile
+    /// (`graphs/<NAME>.costs.yaml`) every node starts a unit, and a linear
+    /// chain of trigger edges merges into one unit where the profile shows
+    /// the unit's ticks stay under a quarter of its period and of its nodes'
+    /// `tick_within_ms`; `isolate: true` and `isolate: false` override. A
+    /// `block` edge's producer and consumers always share a unit. Every unit
+    /// is printed with its nodes and the reason it starts.
     Plan {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]

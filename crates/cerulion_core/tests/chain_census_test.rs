@@ -974,29 +974,39 @@ fn assert_chains_inside_units(census: &ChainCensus, plan: &UnitPlan) {
     }
 }
 
-/// Without a profile every data-triggered node is a unit of its own, so the
-/// census judged against the units fuses nothing; with a profile that makes
-/// the merge safe, the whole chain is one unit and the chain fuses inside it.
+/// Without a profile the process is one unit, so the chain fuses inside it;
+/// a profile that holds no tick for `relay` shows no merge safe, so every node
+/// is a unit of its own and the census judged against the units fuses
+/// nothing; with a profile that makes the merge safe, the whole chain is one
+/// unit and the chain fuses inside it.
 #[test]
 fn every_fused_chain_lies_inside_one_executor_unit() {
     let h = Harness::new(CHAIN_YAML, &chain_specs());
 
     let (census, plan) = unit_census(&h, None);
-    assert_eq!(plan.groups.len(), 3, "no profile: one unit per node");
-    assert!(chains(&census).is_empty());
+    assert_eq!(plan.groups.len(), 1, "no profile: the process is one unit");
+    assert_eq!(chains(&census), vec!["src->relay->sink"]);
     assert_chains_inside_units(&census, &plan);
 
-    let costs = PartitionCosts {
-        node_p50_ns: [("src", 1_000u64), ("relay", 1_000), ("sink", 1_000)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
+    let profiled = |nodes: &[(&str, u64)]| PartitionCosts {
+        node_p50_ns: nodes.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         edge_rate_mhz: BTreeMap::new(),
         hop: HopCosts {
             cross_ns: 0,
             intra_ns: 0,
         },
     };
+    let partial = profiled(&[("src", 1_000), ("sink", 1_000)]);
+    let (census, plan) = unit_census(&h, Some(&partial));
+    assert_eq!(
+        plan.groups.len(),
+        3,
+        "a profile without relay's tick: one unit per node"
+    );
+    assert!(chains(&census).is_empty());
+    assert_chains_inside_units(&census, &plan);
+
+    let costs = profiled(&[("src", 1_000), ("relay", 1_000), ("sink", 1_000)]);
     let (census, plan) = unit_census(&h, Some(&costs));
     assert_eq!(
         plan.groups.len(),

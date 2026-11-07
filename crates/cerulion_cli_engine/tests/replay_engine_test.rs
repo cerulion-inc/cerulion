@@ -40507,8 +40507,9 @@ fn ri_no_consumer_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
     factories(vec![("w1", writer(1.0)), ("w2", writer(2.0))])
 }
 
-/// Two writers and no consumer, one writer per rank: the bag of a process that
-/// runs each source in its own executor unit. No node wires a read stage, so
+/// Two writers and no consumer, one writer per rank: the bag of a multi-process
+/// run, or of a process whose sources each run in an executor unit of their own
+/// (`isolate: true`). No node wires a read stage, so
 /// no rank manifest states staging rows, and a `--verify` replay has no read to
 /// place: it is fed zero reads and passes.
 #[test]

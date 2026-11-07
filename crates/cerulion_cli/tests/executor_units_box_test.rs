@@ -7,8 +7,9 @@
 //! every `out` frame and records `(fire time, publish-to-fire latency)`; `slow`
 //! fires on every `side` frame and sleeps `ri_sleep_us` per fire. All three
 //! nodes are ONE declared process group, so one worker process hosts them.
-//! `pace` fans out to two nodes, so the process splits into three units:
-//! `pace`, `fast` and `slow`, each on its own thread.
+//! Without a profile a process is one unit; `fast` and `slow` declare
+//! `isolate: true`, so the process runs three units: `pace`, `fast` and
+//! `slow`, each on its own thread.
 //!
 //! ## The arms
 //!
@@ -27,14 +28,17 @@
 //!   leg with `CERULION_UNIT_COLLAPSE_MUTANT` set, which runs the process as
 //!   one level loop again. The SLOW bound must fail: at most half the baseline
 //!   rate.
-//! * `without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it`:
-//!   `pace -> fast -> slow` as one linear chain in one process, no profile.
-//!   Every data-triggered node is a unit of its own, so the SLOW bound holds;
-//!   `the_unprofiled_merge_mutant_is_caught` (`oracle-mutants`) merges the
-//!   chain without a profile and must fail it.
+//! * `a_slow_tail_the_profile_holds_no_tick_for_does_not_slow_the_chain_that_feeds_it`:
+//!   `pace -> fast -> slow` as one linear chain in one process, with a profile
+//!   (`graphs/<name>.costs.yaml`) that holds ticks for `pace` and `fast` and
+//!   none for `slow`. The profile merges `pace` and `fast` into one unit and
+//!   shows no merge of `slow` safe, so `slow` is a unit of its own and the
+//!   SLOW bound holds; `the_unprofiled_merge_mutant_is_caught`
+//!   (`oracle-mutants`) merges the link the profile does not cover and must
+//!   fail it.
 //! * `a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes`:
 //!   the fan-out and three-rank fixtures recorded with every node in one
-//!   process group, re-executed with `bag play --resim all`, and judged with the
+//!   process group, each node declaring `isolate: true`, re-executed with `bag play --resim all`, and judged with the
 //!   read-identity oracle. Every stream's first live read must be its writer's
 //!   first frame, and every stream that evicted nothing live must judge the
 //!   same as the same fixture recorded process per node, whose bag has the same
@@ -181,8 +185,9 @@ fn leg_numbers(dir: &Path) -> Leg {
     }
 }
 
-/// Run one leg with all three nodes in one process group and return the fast
-/// node's numbers. `env` adds variables to the run.
+/// Run one leg with all three nodes in one process group, `fast` and `slow`
+/// declaring `isolate: true`, and return the fast node's numbers. `env` adds
+/// variables to the run.
 fn run_leg(ws: &Workspace, leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
     let (graph, prefix) = unique_names("units");
     let slow_node = match slow {
@@ -204,11 +209,15 @@ fn run_leg(ws: &Workspace, leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg 
             &[("ri_sleep_us", ParamValue::UInt(us))],
         ),
     };
-    let nodes = vec![
+    let mut nodes = vec![
         node_def("pace", "ri_pace", &[], &["out", "side"], &[]),
         node_def("fast", "ri_fast", &[("inp", "pace/out")], &[], &[]),
         slow_node,
     ];
+    // Without a profile the group would be one unit.
+    for node in nodes.iter_mut().filter(|n| n.id != "pace") {
+        node.isolate = Some(true);
+    }
     let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
     let dir = scaffold_dir::ScaffoldDir::new("units_leg");
@@ -321,9 +330,11 @@ fn the_unit_collapse_mutant_is_caught() {
     );
 }
 
-/// Run one leg of the CHAIN shape, all three nodes in one process group and
-/// no profile: `pace -> fast -> slow` is one linear chain, so only the
-/// no-profile rule keeps `slow` off `fast`'s thread.
+/// Run one leg of the CHAIN shape, all three nodes in one process group:
+/// `pace -> fast -> slow` is one linear chain, and the graph's profile holds a
+/// tick for `pace` and `fast` and none for `slow` (as a profile run that never
+/// sampled `slow` enough writes it), so only the profile rule that merges no
+/// link it holds no tick for keeps `slow` off `fast`'s thread.
 fn run_chain_leg(ws: &Workspace, leg: &str, env: &[(&str, &Path)]) -> Leg {
     let (graph, prefix) = unique_names("units_chain");
     let nodes = vec![
@@ -348,6 +359,7 @@ fn run_chain_leg(ws: &Workspace, leg: &str, env: &[(&str, &Path)]) -> Leg {
     ];
     let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
+    write_profile_without_slow(ws, &graph);
     let dir = scaffold_dir::ScaffoldDir::new("units_leg");
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
@@ -367,12 +379,42 @@ fn run_chain_leg(ws: &Workspace, leg: &str, env: &[(&str, &Path)]) -> Leg {
     n
 }
 
-/// Without a profile every data-triggered node is a unit of its own, so a
-/// slow tail of a linear chain does not hold the fast node at its head.
+/// Write `graphs/<graph>.costs.yaml`: a 5 us p50 tick for `pace` and `fast`,
+/// and `slow` listed as isolated, with no tick. The 1 ms pacer's budget is a
+/// quarter of its period, so `pace` and `fast` merge into one unit.
+fn write_profile_without_slow(ws: &Workspace, graph: &str) {
+    use cerulion_cli_engine::graph_cmd::{
+        default_artifact_path, ProfileArtifact, PROFILE_ARTIFACT_VERSION,
+    };
+    let artifact = ProfileArtifact {
+        version: PROFILE_ARTIFACT_VERSION,
+        graph: graph.to_string(),
+        window_ns: 1_000_000_000,
+        nodes: [
+            ("pace".to_string(), 5_000u64),
+            ("fast".to_string(), 5_000u64),
+        ]
+        .into_iter()
+        .collect(),
+        edges: Vec::new(),
+        isolated: vec!["slow".to_string()],
+        hop: None,
+        derived_budget_ns: None,
+        profile_cores: None,
+    };
+    let path = default_artifact_path(&ws.root, graph);
+    let yaml = serde_yaml::to_string(&artifact).expect("RI_HARNESS: serialize the profile");
+    std::fs::write(&path, yaml)
+        .unwrap_or_else(|e| panic!("RI_HARNESS: write {}: {e}", path.display()));
+}
+
+/// A profile that holds no tick for `slow` shows no merge of `slow` safe, so a
+/// slow tail of a linear chain is a unit of its own and does not hold the fast
+/// node at its head.
 #[test]
 #[ignore = "needs a quiet Linux host: timing"]
 #[serial]
-fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
+fn a_slow_tail_the_profile_holds_no_tick_for_does_not_slow_the_chain_that_feeds_it() {
     let ws = read_identity::workspace();
     let base = baseline(&ws);
     let chain = run_chain_leg(&ws, "chain_slow", &[]);
@@ -386,8 +428,8 @@ fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
     }
 }
 
-/// The merge mutant joins a link no profile proves safe: the chain is one
-/// unit again, and the bound must fail.
+/// The merge mutant joins a link the profile does not show to be safe: the
+/// chain is one unit again, and the bound must fail.
 #[cfg(feature = "oracle-mutants")]
 #[test]
 #[ignore = "needs a quiet Linux host: timing"]
@@ -405,8 +447,8 @@ fn the_unprofiled_merge_mutant_is_caught() {
     );
     assert!(
         slow_within_bound(&base, &mutant).is_err(),
-        "the oracle passed with an unprofiled chain merged into one unit ({:.1} Hz against \
-         {:.1} Hz)",
+        "the oracle passed with a link the profile holds no tick for merged into one unit \
+         ({:.1} Hz against {:.1} Hz)",
         mutant.rate_hz,
         base.rate_hz
     );
