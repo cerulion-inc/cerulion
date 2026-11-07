@@ -13452,9 +13452,10 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
 /// cost-fused groups when the graph has a profile). Each group is split into
 /// units by the same derivation the run uses: with the graph's profile (its
 /// `graphs/<name>.costs.yaml`) the link rules and the tick budget; without
-/// one, one unit per process, one per node declaring `isolate: true`, and one
-/// for the nodes past an isolated node that no earlier unit feeds at the level
-/// below.
+/// one, one unit per process and one per node declaring `isolate: true`, and
+/// a node past an isolated node's level joins the earliest unit of the other
+/// nodes that starts at its level or feeds it at the level below, and
+/// otherwise starts a later unit.
 /// `--single-process` and the lockstep execution mode are not modelled: the
 /// view is the default free run.
 pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
@@ -13544,9 +13545,10 @@ pub(crate) fn render_unit_plan(
                  the tick budget holds"
             ),
             None => "no profile, so each process runs as one unit; a node that declares \
-                     `isolate: true` runs in a unit of its own, and a node past its level that \
-                     no earlier unit feeds at the level below starts another (a unit runs a \
-                     contiguous band of levels)"
+                     `isolate: true` runs in a unit of its own, and a node past an isolated \
+                     node's level joins the earliest unit of the other nodes that starts at its \
+                     level or feeds it at the level below, or else starts a later unit (a unit \
+                     runs a contiguous band of levels)"
                 .to_string(),
         }
     );
@@ -23642,8 +23644,9 @@ process_groups:
         for line in [
             "graph upj: 1 process(es), 1 executor unit(s)",
             "  units: no profile, so each process runs as one unit; a node that declares \
-             `isolate: true` runs in a unit of its own, and a node past its level that no earlier \
-             unit feeds at the level below starts another (a unit runs a contiguous band of \
+             `isolate: true` runs in a unit of its own, and a node past an isolated node's level \
+             joins the earliest unit of the other nodes that starts at its level or feeds it at \
+             the level below, or else starts a later unit (a unit runs a contiguous band of \
              levels)",
             "process p0: 1 unit(s)",
             "  unit p0: src, mid, join",
@@ -23700,8 +23703,8 @@ process_groups:
             "    starts at mid: isolate: true",
             "  unit p0.join: join",
             "    starts at join: no profile: past level 1 of mid, which declares isolate: true, \
-             and no node of an earlier unit feeds it at the level below (a unit runs a \
-             contiguous band of levels)",
+             and no node of an earlier unit that does not declare isolate: true feeds it at the \
+             level below (a unit runs a contiguous band of levels)",
         ] {
             assert!(
                 plan.lines().any(|l| l == line),

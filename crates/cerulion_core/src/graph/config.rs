@@ -738,14 +738,15 @@ pub struct NodeDef {
     /// of its own, on its own thread, with or without a profile (a `block`
     /// flow still keeps its producer and consumers together; a unit runs a
     /// contiguous band of levels, so without a profile a node past this
-    /// node's level that no node of the process's unit feeds at the level
-    /// below runs in a later unit). With the
-    /// graph's profile every node starts a unit and a linear chain of trigger
-    /// edges shares one unit where the profile shows the merge stays within
-    /// its tick budget; there `isolate: false` keeps this node in the unit of
-    /// the nodes that trigger it whatever those rules say. Without a profile
-    /// `isolate: false` changes nothing. Absent leaves the choice to those
-    /// rules. `cerulion graph plan` shows the units and why each one starts.
+    /// node's level runs in a later unit when no node of the process's unit
+    /// feeds it at the level below and that unit starts at a lower level).
+    /// With the graph's profile every node starts a unit and a linear chain
+    /// of trigger edges shares one unit where the profile shows the merge
+    /// stays within its tick budget; there `isolate: false` keeps this node
+    /// in the unit of the nodes that trigger it whatever those rules say.
+    /// Without a profile `isolate: false` changes nothing. Absent leaves the
+    /// choice to those rules. `cerulion graph plan` shows the units and why
+    /// each one starts.
     ///
     /// This key replaces `fuse: false`, which is refused at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]

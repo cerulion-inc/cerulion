@@ -13752,15 +13752,16 @@ impl GraphRuntime {
     /// of several such topics is NOT kernel-woken by a ring on a non-primary line;
     /// it observes that ring at the next pacing chunk through the record-only
     /// poll-all, as a host whose hardware monitor watches one line does. A linear
-    /// chain has one input topic per runtime and is entirely primary. A join is
-    /// not: the executor-unit planner gives a join a unit of its own when it
-    /// declares `isolate: true`; from a profile, at every join that no
-    /// `isolate: false` or `block` coupling keeps with its producers; and,
-    /// without one, when it runs past an isolated node's level in a later unit
-    /// that holds none of its producers. A join in a unit of its own takes the
-    /// kernel wake on its first armable input only and waits up to one pacing
-    /// chunk for a frame on any other, between two units of one process as
-    /// between two processes.
+    /// chain has one input topic per runtime and is entirely primary. A join
+    /// with two or more armable inputs is not. Inside one process a join has
+    /// two or more when, for example, the executor-unit planner places it in a
+    /// unit that holds none of its producers: it declares `isolate: true`; from
+    /// a profile, no `isolate: false` or `block` coupling keeps it with its
+    /// producers; without one, it runs past an isolated node's level in a later
+    /// unit that holds none of them, or its producers all declare
+    /// `isolate: true`. Such a join takes the kernel wake on its first
+    /// armable input only and waits up to one pacing chunk for a frame on any
+    /// other, between two units of one process as between two processes.
     /// `a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_input`
     /// in `monitor_wait_park_iox2_test` holds this.
     ///

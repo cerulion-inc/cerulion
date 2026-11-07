@@ -2650,12 +2650,13 @@ another unit or process writes, and sees a frame on any other input when its cur
 20 µs where the CPU has a monitor-wait instruction such as WAITPKG, within one event-stream period on
 an Arm host whose park is WFE (around 130 µs on an Orin-class board), and within one 100 µs recheck
 elsewhere, plus the kernel timer's overshoot. A linear chain has one such input per unit. A join (a
-node with several trigger edges, or a sync node) that is a unit of its own (it declares
-`isolate: true`; with a profile, no `isolate: false` or `block` edge keeps it with its producers;
-without one, it runs past an isolated node's level in a later unit that holds none of its
-producers, as the overrides below describe) is therefore woken at once only by its first input, and
-a frame that completes its set on another input can wait up to that bound
-([#755](https://github.com/cerulion-inc/cerulion/issues/755)). With a profile, `isolate: false` on the join
+node with several trigger edges, or a sync node) with two or more such inputs is therefore woken at
+once only by the first of them, and a frame that completes its set on another can wait up to that
+bound ([#755](https://github.com/cerulion-inc/cerulion/issues/755)). Inside one process a join has two
+or more when, for example, its unit holds none of its producers: it declares `isolate: true`; with a
+profile, no `isolate: false` or `block` edge keeps it with its producers; without one, it runs past
+an isolated node's level in a later unit that holds none of them, as the overrides below describe,
+or its producers all declare `isolate: true`. With a profile, `isolate: false` on the join
 keeps it in the unit of the nodes of its process that trigger it, with no hop from them (a producer
 that declares `isolate: true` keeps its own unit); without one, `isolate: false` changes nothing,
 and a join runs in its process's unit unless it declares `isolate: true` or the overrides below
@@ -2690,7 +2691,7 @@ unit starts it. Without a profile only the first four reasons occur; the others 
 | no profile | is the first node of the process's one unit: the graph has no profile, so every node of the process that does not declare `isolate: true` runs in it |
 | no profile, apart from units past an isolated level | is the first node of the process's first unit when an isolated node cuts the process: the nodes that do not declare `isolate: true` run in it, apart from those in a unit that starts past an isolated node's level |
 | `isolate: true` | declares it |
-| past an isolated level | is the first node, without a profile, of a unit past the level of a node that declares `isolate: true`: no node of an earlier unit feeds it at the level below, and a unit runs a contiguous band of the graph's levels, each node above the band's first level fed from inside the unit at the level below |
+| past an isolated level | is the first node, without a profile, of a unit past the level of a node that declares `isolate: true`: no node of an earlier unit that does not declare `isolate: true` feeds it at the level below, and a unit runs a contiguous band of the graph's levels, each node above the band's first level fed from inside the unit at the level below |
 | source | has no trigger input fed by a node of the same process (a period or external node, or a consumer of another process's topic) |
 | not a chain link | its trigger edge is no link: the census reason is printed (`fan-out`, `producer-branches`, `join`, `consumer-policy`, ...) |
 | after an isolated node | is fed by a node that declares `isolate: true` |
@@ -2714,8 +2715,10 @@ then cut at every node of that group, and only the cost rules can add another no
 **Overrides: `isolate:`.** `isolate: true` gives a node a unit of its own, with or without a profile.
 A unit runs a contiguous band of the graph's levels, and each of its nodes above the band's first
 level is fed from inside the unit at the level below, so without a profile a node past the isolated
-node's level stays in the process's unit when a node of that unit feeds it at the level below, and
-otherwise starts a later unit (`graph plan` prints `past level N of <node>`). Isolating the last node
+node's level stays in the process's unit when a node of that unit feeds it at the level below or
+that unit starts at its level, and otherwise runs in a later unit: the earliest that starts at its
+level or feeds it at the level below, or else one it starts (`graph plan` prints
+`past level N of <node>` for the node that starts it). Isolating the last node
 of a chain takes only that node out; isolating one in the middle of a chain also gives the nodes past
 it a unit of their own, while a node on another branch that the process's unit feeds level by level
 stays in that unit. With a profile, `isolate: false` keeps it in the unit of every node of its process that triggers it,

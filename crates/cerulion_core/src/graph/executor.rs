@@ -23,17 +23,21 @@
 //! [`Boundary::Isolated`]. A unit runs a contiguous band of the graph's
 //! levels, and the planner keeps a node above its band's first level in the
 //! unit only where a node of the unit feeds it at the level just below. An
-//! isolated node can be a node's only feeder at that level, so a node past an
-//! isolated node's level that no node of an earlier unit feeds at the level
-//! below starts a later unit, carrying [`Boundary::AfterIsolatedLevel`], and
+//! isolated node can be a node's only feeder at that level, and an isolated
+//! node that runs in a unit of its own takes no other node, so a node past an
+//! isolated node's level joins the earliest unit of the other nodes that
+//! starts at its level or holds a node feeding it at the level below, and
+//! otherwise starts a later unit, carrying [`Boundary::AfterIsolatedLevel`];
 //! the first unit then carries [`Boundary::NoProfileCut`] in place of
 //! [`Boundary::NoProfile`]. With a profile the rules below split and merge.
 //!
 //! A unit is woken by the kernel on ONE input, its first declared trigger or
 //! sync input another unit or process writes; a frame on any other input is
 //! seen when its current wait ends (`GraphRuntime::doorbell_wake_word_block`).
-//! A join that is a unit of its own therefore waits up to one recheck for a set
-//! that completes on another input
+//! A join with two or more such inputs, as one whose unit holds none of its
+//! producers (it is a unit of its own, or its producers in its process all
+//! declare `isolate: true`), therefore waits up to one recheck for a set that
+//! completes on any of them but the first
 //! (<https://github.com/cerulion-inc/cerulion/issues/755>).
 //!
 //! # With a profile, every node starts alone and the profile merges links
@@ -174,10 +178,11 @@ pub enum Boundary {
     /// first node that does not declare `isolate: true`.
     NoProfileCut,
     /// The graph has no profile, and this unit starts past an isolated node's
-    /// level with nodes that no node of an earlier unit feeds at the level
-    /// just below: a unit runs a contiguous band of the graph's levels, and a
-    /// node above its band's first level must be fed from inside the unit at
-    /// the level just below.
+    /// level with nodes that no node of an earlier unit that does not declare
+    /// `isolate: true` feeds at the level just below (an isolated node in a
+    /// unit of its own takes no other node): a unit runs a contiguous band of
+    /// the graph's levels, and a node above its band's first level must be
+    /// fed from inside the unit at the level just below.
     AfterIsolatedLevel {
         /// The isolated node at the highest level below this unit's first
         /// level.
@@ -223,8 +228,8 @@ impl Boundary {
                 .to_string(),
             Self::AfterIsolatedLevel { node, level } => format!(
                 "no profile: past level {level} of {node}, which declares isolate: true, and no \
-                 node of an earlier unit feeds it at the level below (a unit runs a contiguous \
-                 band of levels)"
+                 node of an earlier unit that does not declare isolate: true feeds it at the \
+                 level below (a unit runs a contiguous band of levels)"
             ),
         }
     }
