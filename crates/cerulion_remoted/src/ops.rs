@@ -138,7 +138,9 @@ impl OpsServing {
     /// an engage waiting for its lock is counted where the act verbs read it.
     /// A bare `Arc<Mutex<ControlLease>>` becomes an `EstopLease` with a count
     /// of its own; pass a clone of an `EstopLease` to share its count with
-    /// another plane, as the daemon does with the rcp plane.
+    /// another plane, as the daemon does with the rcp plane. This plane's
+    /// `engage-estop` sends no `estop` to rcpd: the daemon adds that send from
+    /// its rcp link ([`crate::rcp`]).
     /// `sessions` is the CPace fallback session store; `clock` is the robot's
     /// TRUSTED clock the pairing verbs verify against; `log_root` is the
     /// `log-tail` allow-list root; `receipt_path` is the audit log.
@@ -155,6 +157,7 @@ impl OpsServing {
         Self::for_host(
             OpsHost::Daemon {
                 lease: lease.into(),
+                rcpd: None,
             },
             shared,
             sessions,
@@ -342,14 +345,16 @@ fn verb_registry(
 ) -> VerbRegistry {
     let (restart, engage_estop, act_lease): (Box<dyn VerbHandler>, Box<dyn VerbHandler>, _) =
         match host {
-            OpsHost::Daemon { lease } => {
+            OpsHost::Daemon { lease, rcpd } => {
                 // One `EstopLease` for the plane: the e-stop verb engages through
-                // it and the act verbs read its count before each send.
-                (
-                    Box::new(RestartVerb::new()),
-                    Box::new(EngageEstopVerb::new(lease.clone())),
-                    Some(lease),
-                )
+                // it and the act verbs read its count before each send. With
+                // `rcpd`, the e-stop verb also sends an `estop` into rcpd.
+                let engage = EngageEstopVerb::new(lease.clone());
+                let engage = match rcpd {
+                    Some(rcpd) => engage.with_rcpd_estop(rcpd),
+                    None => engage,
+                };
+                (Box::new(RestartVerb::new()), Box::new(engage), Some(lease))
             }
             OpsHost::Embedded => (
                 Box::new(DaemonOnlyVerb::RESTART),

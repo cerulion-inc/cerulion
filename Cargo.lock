@@ -1712,6 +1712,7 @@ dependencies = [
  "cerulion_pairing",
  "cerulion_rcpd",
  "cerulion_remoted",
+ "cerulion_wireclient",
  "clap",
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
