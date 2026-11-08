@@ -18,12 +18,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cerulion_core::{SchemaServing, TransportManager};
 
 use crate::config::RemoteRelay;
 use crate::error::EmbedError;
+use crate::runtime::RemoteStatus;
 
 /// What a start hands the host to bind its plane.
 pub struct RemoteStart {
@@ -121,6 +122,18 @@ const PLANE_UNSTOPPED: u8 = 2;
 /// Whether a runtime in this process hosts a remote plane.
 static REMOTE_HOSTED: AtomicU8 = AtomicU8::new(PLANE_FREE);
 
+/// The plane that did not stop, with its stop error, for the status of
+/// every later start in this process.
+static UNSTOPPED: Mutex<Option<RemoteStatus>> = Mutex::new(None);
+
+/// The plane in this process that did not stop, if one did not.
+pub(crate) fn unstopped_plane() -> Option<RemoteStatus> {
+    UNSTOPPED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// The one remote plane a process hosts. Every runtime reads the same device
 /// key, so two planes would answer under one endpoint id for two different
 /// runs; a second runtime with the plane enabled is refused while one holds
@@ -177,14 +190,27 @@ impl HostedPlane {
     }
 
     /// Stop the plane, then free the lease. A plane that does not stop
-    /// cleanly keeps the process from binding another one.
+    /// cleanly keeps the process from binding another one, and
+    /// [`unstopped_plane`] names it.
     pub(crate) fn stop(self) -> Result<(), String> {
         let HostedPlane {
             plane,
             _lease: lease,
         } = self;
+        let endpoint_id = plane.endpoint_id();
+        let bound_sockets = plane
+            .bound_sockets()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let result = plane.stop();
-        if result.is_err() {
+        if let Err(error) = &result {
+            *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = Some(RemoteStatus {
+                endpoint_id,
+                bound_sockets,
+                stop_error: Some(error.clone()),
+                off_reason: None,
+            });
             lease.keep_unstopped();
         }
         result
@@ -201,10 +227,11 @@ pub(crate) fn hosted_for_test(plane: Box<dyn BoundRemote>) -> Result<HostedPlane
     })
 }
 
-/// TEST SEAM: free the process's remote plane lease, also after a plane
-/// failed to stop.
+/// TEST SEAM: free the process's remote plane lease and forget a plane
+/// that failed to stop.
 #[cfg(test)]
 pub(crate) fn free_lease_for_test() {
+    *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = None;
     REMOTE_HOSTED.store(PLANE_FREE, Ordering::Release);
 }
 

@@ -210,6 +210,11 @@ pub struct RemoteStatus {
     /// process. Left out of the status JSON while the plane serves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_error: Option<String>,
+    /// Why remote is off for this run: the start had `remote.enabled`, but
+    /// an earlier plane did not stop, so the graph starts without a plane.
+    /// Left out of the status JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -356,7 +361,9 @@ pub struct Status {
     pub node_failures: NodeFailures,
     /// The remote plane this start serves; `None` when it hosts none or the
     /// plane stopped. A plane that did not stop stays here with its
-    /// `stop_error`, also across a restart, until a later plane serves.
+    /// `stop_error`, also across a restart, for the life of the process; a
+    /// start with `remote.enabled` then runs with remote off and adds
+    /// `off_reason`.
     pub remote: Option<RemoteStatus>,
 }
 
@@ -773,12 +780,16 @@ impl EmbeddedRuntime {
             status.recorder = None;
             status.last_error = None;
             status.node_failures = NodeFailures::default();
-            // A plane that did not stop may still answer: it stays named
-            // until a later plane serves.
+            // A plane that did not stop may still answer: it stays named,
+            // and the build below adds why remote is off for this run.
             status.remote = status
                 .remote
                 .take()
-                .filter(|remote| remote.stop_error.is_some());
+                .filter(|remote| remote.stop_error.is_some())
+                .map(|remote| RemoteStatus {
+                    off_reason: None,
+                    ..remote
+                });
         }
         let planned = install_iceoryx_config(&self.files_dir)
             .and_then(|()| self.plan_start(config))
@@ -1504,20 +1515,9 @@ impl Run {
         let mut first_error = None;
         // The remote plane stops first, so no desk reads a run that is
         // going down.
-        if let Some(mut remote) = self.remote.take() {
-            let plane = remote.plane();
-            let endpoint_id = plane.endpoint_id();
-            let bound_sockets = plane
-                .bound_sockets()
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+        if let Some(remote) = self.remote.take() {
             if let Err(error) = remote.stop() {
-                self.unstopped_remote = Some(RemoteStatus {
-                    endpoint_id,
-                    bound_sockets,
-                    stop_error: Some(error.clone()),
-                });
+                self.unstopped_remote = crate::remote::unstopped_plane();
                 first_error.get_or_insert(EmbedError::Remote(error));
             }
         }
@@ -1639,14 +1639,23 @@ fn build_into(
     // 0. The remote plane loads its keys and trust state and binds, before
     //    any other component exists: a plane that is not provisioned fails
     //    the start with nothing built. It serves nothing until the commit.
+    //    After a plane in this process did not stop, the start goes on
+    //    with remote off: the old plane may still answer under the device
+    //    key, so none binds, and status names the stuck plane.
     if let Some(remote) = &plan.remote {
-        run.remote = Some(crate::remote::bind(RemoteStart {
-            state_root: remote.state_root.clone(),
-            robot: robot.to_string(),
-            relay: remote.relay.clone(),
-            manager: Arc::clone(&manager),
-            serving: remote.serving.clone(),
-        })?);
+        if let Some(mut stuck) = crate::remote::unstopped_plane() {
+            tracing::warn!("{REMOTE_OFF_REASON}");
+            stuck.off_reason = Some(REMOTE_OFF_REASON.to_string());
+            lock_status(status).remote = Some(stuck);
+        } else {
+            run.remote = Some(crate::remote::bind(RemoteStart {
+                state_root: remote.state_root.clone(),
+                robot: robot.to_string(),
+                relay: remote.relay.clone(),
+                manager: Arc::clone(&manager),
+                serving: remote.serving.clone(),
+            })?);
+        }
     }
     // 1. Own the gateway: the manager is now at the baseline and paired.
     //    A latched query surface (an earlier start created it) gets this
@@ -1942,6 +1951,7 @@ fn commit(
                         .map(ToString::to_string)
                         .collect(),
                     stop_error: None,
+                    off_reason: None,
                 })
             }
             None => None,
@@ -2496,22 +2506,26 @@ fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
 }
 
+/// `status.remote.off_reason` for a start with `remote.enabled` after a
+/// plane in this process did not stop.
+const REMOTE_OFF_REASON: &str = "remote is off for this run: an earlier remote plane in this \
+     process did not stop and may still answer under this device key; restart the app \
+     process to host the plane again";
+
 /// After a teardown, `status.remote` names the plane it could not stop, with
 /// the stop error. A plane that stopped leaves no `remote`; a plane stuck
-/// from an earlier run stays named.
+/// from an earlier run stays named, without the `off_reason` of the run
+/// that ended.
 fn record_remote_teardown(status: &Arc<Mutex<Status>>, run: &mut Run) {
     let mut status = lock_status(status);
-    match run.unstopped_remote.take() {
-        Some(stuck) => status.remote = Some(stuck),
-        None => {
-            if status
-                .remote
-                .as_ref()
-                .is_some_and(|remote| remote.stop_error.is_none())
-            {
-                status.remote = None;
-            }
-        }
+    if let Some(stuck) = run.unstopped_remote.take() {
+        status.remote = Some(stuck);
+        return;
+    }
+    match status.remote.as_mut() {
+        Some(remote) if remote.stop_error.is_some() => remote.off_reason = None,
+        Some(_) => status.remote = None,
+        None => {}
     }
 }
 
@@ -3761,6 +3775,7 @@ nodes:
             endpoint_id: "stuck".to_string(),
             bound_sockets: vec!["127.0.0.1:4433".to_string()],
             stop_error: Some("the endpoint did not close".to_string()),
+            off_reason: None,
         });
         assert_eq!(lock_status(&runtime.status).remote, stuck);
 
@@ -3802,6 +3817,7 @@ nodes:
                 endpoint_id: "served".to_string(),
                 bound_sockets: vec!["127.0.0.1:4433".to_string()],
                 stop_error: None,
+                off_reason: None,
             })
         );
         let (_, error) = run.shutdown();

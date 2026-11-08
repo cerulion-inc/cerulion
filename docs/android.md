@@ -1030,10 +1030,9 @@ While it serves, `status` reports it:
 An unspecified address (`0.0.0.0` or `[::]`) means every interface: a desk
 dials the device's own address with that port. A stop waits up to 5 seconds
 for the plane to close its endpoint; when the plane does not stop cleanly,
-`status` reports `state` `failed` with `last_error.code` 18, and every later
-start with `remote.enabled` in that process fails with code 18 too, since the
-old plane may still answer under the device key. Restart the app process to
-host the plane again.
+`status` reports `state` `failed` with `last_error.code` 18. The old plane
+may still answer under the device key, so no plane binds again in that
+process. Restart the app process to host the plane again.
 
 A plane that does not stop stays in `status.remote` with its stop error, so
 the app and a desk can see why remote access is down:
@@ -1043,9 +1042,19 @@ the app and a desk can see why remote access is down:
 ```
 
 This also applies when the plane does not stop at a restart. The restart does
-not fail because of it: a config without `remote.enabled` starts its graph,
-and `status.remote` keeps the stuck plane. `stop_error` is not in the JSON
-while a plane serves. A later plane that serves replaces the stuck entry.
+not fail because of it. A later start in that process, with or without
+`remote.enabled`, starts its graph, and local work runs. A start with
+`remote.enabled` starts with remote off for that run: it does not bind a
+plane, and `status.remote` names the stuck plane and adds `off_reason`, which
+says that remote is off because an earlier plane did not stop:
+
+```json
+"remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close", "off_reason": "remote is off for this run: an earlier remote plane in this process did not stop and may still answer under this device key; restart the app process to host the plane again"}
+```
+
+`off_reason` stays until that run stops. `stop_error` and `off_reason` are
+not in the JSON while a plane serves. Remote comes back after the app process
+restarts.
 
 While it binds, the plane's iroh endpoint lists the network interfaces
 through netlink and through `/sys/class/net`. Android refuses both to apps,

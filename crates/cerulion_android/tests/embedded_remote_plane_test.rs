@@ -281,7 +281,13 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
             endpoint_id: ENDPOINT.into(),
             bound_sockets: vec![SOCKET.into()],
             stop_error: None,
+            off_reason: None,
         })
+    );
+    // The status JSON of a serving plane has no stop or off fields.
+    assert_eq!(
+        serde_json::to_value(&running.remote).unwrap(),
+        json!({"endpoint_id": ENDPOINT, "bound_sockets": [SOCKET]})
     );
     // The plane takes no gateway: a start with no listen endpoints and no
     // connect locators leaves the LAN gateway free.
@@ -425,6 +431,7 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
         endpoint_id: ENDPOINT.into(),
         bound_sockets: vec![SOCKET.into()],
         stop_error: Some("the endpoint did not close".into()),
+        off_reason: None,
     });
     answer(&fake, Answer::BindStopFails);
     std::env::set_var("CER_PERIOD_REQUEST_SHUTDOWN", "1");
@@ -455,15 +462,39 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
         (stopped.state, stopped.remote),
         (RuntimeState::Stopped, stuck.clone())
     );
+    // A start with `remote.enabled` after a plane failed to stop starts
+    // with remote off for this run: the host is not asked to bind, local
+    // work runs, and `status.remote` names the stuck plane and says why
+    // remote is off.
     answer(&fake, Answer::Bind);
-    let error = runtime
-        .start(&config(&topics, enabled))
-        .expect_err("no plane binds after one failed to stop");
-    assert_eq!(error.code(), codes::REMOTE);
-    assert!(
-        error.to_string().contains("did not stop cleanly"),
-        "{error}"
-    );
+    let subscribed = json!({
+        "graph_yaml": topics.graph,
+        "publish": [{"topic": topics.cmd, "schema": VECTOR3}],
+        "subscribe": [{"topic": topics.echo, "schema": VECTOR3}],
+        "remote": enabled,
+    });
+    runtime
+        .start(&subscribed.to_string())
+        .expect("the graph starts with remote off while the old plane is stuck");
     assert_eq!(log(&fake), Vec::<String>::new());
+    let off = status(&runtime);
+    assert_eq!(off.state, RuntimeState::Running);
+    assert_eq!(off.last_error, None);
+    let mut remote = off.remote.expect("status names the stuck plane");
+    let reason = remote.off_reason.take().expect("status says remote is off");
+    assert!(reason.contains("did not stop"), "{reason}");
+    assert_eq!(Some(remote), stuck, "the stuck plane stays named");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        runtime
+            .publish(&topics.cmd, r#"{"x":1.0,"y":0.0,"z":0.0}"#)
+            .expect("local publish runs with remote off");
+        if runtime.poll(&topics.echo).expect("poll").is_some() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "a frame flows");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    runtime.stop().expect("this run hosts no plane");
     assert_eq!(status(&runtime).remote, stuck);
 }
