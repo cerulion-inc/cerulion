@@ -27,8 +27,9 @@
 //! error, after the authorizer has classified the caller as usual:
 //!
 //! - `restart` restarts a graph's systemd unit;
-//! - `engage-estop` engages the daemon's control lease and asks for an incident
-//!   capture. A host that served it would report an e-stop that stops nothing;
+//! - `engage-estop` engages the daemon's control lease, sends an `estop` to the
+//!   robot's `cerulion-rcpd` and asks for an incident capture. A host that
+//!   served it would report an e-stop that stops nothing;
 //! - `topic-publish` and `service-call` send through the process's transport
 //!   singleton only while the daemon's e-stop is clear, and a host serves no
 //!   e-stop that could stop them;
@@ -69,7 +70,8 @@ use crate::device_index::DeviceAccountIndex;
 use crate::error::RemotedError;
 use crate::estop_lease::EstopLease;
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
-use crate::rcp::RcpLink;
+use crate::rcp::{RcpLink, RcpdEstop};
+use crate::trust::SharedTrust;
 use crate::wire::WirePlane;
 
 /// The ops handshake name the daemon announces.
@@ -122,17 +124,24 @@ pub(crate) enum OpsHost {
     /// The `cerulion-remoted` daemon: every verb. `engage-estop` engages
     /// `lease`, the act verbs check it, and the rcp plane engages and checks
     /// a clone of it, so all of them share one latch and one engage count.
-    Daemon { lease: EstopLease },
+    /// With `rcpd`, each `engage-estop` also sends an `estop` to the robot's
+    /// rcpd until rcpd answers ([`crate::rcp`]).
+    Daemon {
+        lease: EstopLease,
+        rcpd: Option<Arc<RcpdEstop>>,
+    },
     /// A library host: `restart`, `engage-estop` and the act verbs are refused
-    /// by name, so it has no lease to engage.
+    /// by name, so it has no lease to engage and no rcpd to send to.
     Embedded,
 }
 
 impl OpsHost {
-    /// The daemon's verb set over a fresh control lease.
+    /// The daemon's verb set over a fresh control lease, sending nothing to
+    /// rcpd until [`OpsHost::with_rcpd_estop`] gives it a link.
     pub(crate) fn daemon() -> Self {
         OpsHost::Daemon {
             lease: EstopLease::new(Arc::new(Mutex::new(ControlLease::with_default_window()))),
+            rcpd: None,
         }
     }
 
@@ -140,7 +149,39 @@ impl OpsHost {
     /// count; `None` on a library host, which has none.
     pub(crate) fn estop_lease(&self) -> Option<EstopLease> {
         match self {
-            OpsHost::Daemon { lease } => Some(lease.clone()),
+            OpsHost::Daemon { lease, .. } => Some(lease.clone()),
+            OpsHost::Embedded => None,
+        }
+    }
+
+    /// The daemon's verb set whose `engage-estop` also sends an `estop` to
+    /// the rcpd of `link`, until rcpd answers, naming the engager's account
+    /// from `shared`, on the current tokio runtime. A library host, or a
+    /// daemon with no `link`, is returned as it is.
+    ///
+    /// # Panics
+    ///
+    /// When the daemon is given a `link` outside a tokio runtime.
+    pub(crate) fn with_rcpd_estop(self, link: Option<&RcpLink>, shared: &SharedTrust) -> Self {
+        match (self, link) {
+            (OpsHost::Daemon { lease, .. }, Some(link)) => OpsHost::Daemon {
+                lease,
+                rcpd: Some(Arc::new(RcpdEstop::new(
+                    link,
+                    shared.clone(),
+                    tokio::runtime::Handle::current(),
+                ))),
+            },
+            (host, _) => host,
+        }
+    }
+
+    /// The daemon's rcpd e-stop sender, which [`RcpdEstop::shut_down`] ends
+    /// when the daemon stops; `None` on a library host and on a daemon with
+    /// no rcp link.
+    pub(crate) fn rcpd_estop(&self) -> Option<Arc<RcpdEstop>> {
+        match self {
+            OpsHost::Daemon { rcpd, .. } => rcpd.clone(),
             OpsHost::Embedded => None,
         }
     }
@@ -451,7 +492,7 @@ mod tests {
         assert!(OpsHost::Embedded.estop_lease().is_none());
         let host = OpsHost::daemon();
         let lent = host.estop_lease().expect("the daemon has an e-stop lease");
-        let OpsHost::Daemon { lease } = &host else {
+        let OpsHost::Daemon { lease, .. } = &host else {
             unreachable!("OpsHost::daemon is the daemon")
         };
         // An engage through the lent clone, as the rcp plane makes, waits for

@@ -505,8 +505,10 @@ not read it): the ops plane's
 count of e-stop engages waiting for its lock). The daemon builds it once
 (`OpsHost::daemon`); `serve_core` hands it to `OpsServing` (for
 `engage-estop` and the act verbs) and a clone to `RcpPlane`, so both planes
-share the latch and the count. A library host has no lease and serves no rcp
-plane. The session reader engages it through `EstopLease::engage` for an
+share the latch and the count. `serve_core` also gives the daemon host an
+`rcp::RcpdEstop` over the same `RcpLink` (`OpsHost::with_rcpd_estop`), which
+`EngageEstopVerb` holds. A library host has no lease, no `RcpdEstop` and
+serves no rcp plane. The session reader engages it through `EstopLease::engage` for an
 authorized `RcpClass::Estop` message right after `rcp_authorize`, before the
 upstream check and the e-stop bound, so an unreachable rcpd or a spent bound
 still leaves it engaged; a forward failure never undoes it. The engage is
@@ -521,14 +523,37 @@ the robot's ops e-stop is engaged; it clears when cerulion-remoted
 restarts`. The lease guard is held only for that read or that state change,
 never across an `.await` and never with a connection, session, trust or
 receipt lock. The latch is read when a desk's message arrives and again on
-the open connection to rcpd just before the plane sends it. Nothing on the
-ops side reaches rcpd, so after an ops `engage-estop` a tool call sent to rcpd before
-it (one rcpd holds behind its serialized calls included) still runs and
-rcpd's own latch stays open. An rcp `estop` also closes
-rcpd's latch, which refuses the calls rcpd has accepted but not yet
-published. `ControlLease::clear_estop` has no caller, so the latch clears
-only when `cerulion-remoted` restarts; then rcpd's own latch clears through
-its `estop_clear` (`limits.estop_clear: agent`) or by deleting
+the open connection to rcpd just before the plane sends it. A call already
+sent to rcpd is stopped by rcpd's own latch, which an rcp `estop` closes in
+its stream and an ops `engage-estop` closes through `RcpdEstop::send`: after
+`EstopLease::engage` and its warning, the verb decodes the caller's device
+key and calls `send`, which returns at once. `send` takes the in-flight flag
+(one `AtomicBool`, compare-and-swap); when a delivery holds it, the engage
+starts none and logs that at info. Otherwise it spawns, on the runtime handle
+`serve_core` captured, a task that owns the flag's guard and runs
+`Delivery::run`, a loop of `estop_rcpd` attempts until one returns `Ok`.
+Each attempt reads the token through `load_token`, then sends `initialize`,
+`notifications/initialized` and `tools/call` `estop` with `reason`
+`rcp::OPS_ESTOP_REASON`, each POST on a fresh loopback connection with the
+headers `Upstream::request` builds (`x-cerulion-caller` is
+`caller_identity(key, account_for_key(key))`), its response head within
+`RcpLimits::head_timeout` and its answer within the target's answer timeout
+(`OPS_ESTOP_ANSWER`, 10 s) after it, then a `DELETE` of the session it
+opened. It returns `Ok` only when the call's result says `"estopped": true`
+(`estop_outcome`). After a failed attempt the loop sleeps `retry_in`
+(`OPS_ESTOP_RETRY_FIRST`, 100 ms, doubled after each failure up to
+`OPS_ESTOP_RETRY_CAP`, 2 s), logs the first failure at error with `reason`
+and then at most one line per `OPS_ESTOP_LOG_EVERY` (30 s) with `attempts`
+(rcpd's text through `sanitize_peer_text`), and logs the closed latch at
+warn. Both the attempt and the sleep race the stop flag, a `watch` that
+`RcpdEstop::shut_down` sets once `serve_planes` returns; `shut_down` then
+waits for the task within `CONNECT_TIMEOUT`, and a delivery cut short logs
+at warn. Nothing the delivery does reaches the verb's answer or the
+lease. rcpd refuses each mutating call it holds that it
+has not yet published once its latch closes; the one it is running was
+already published. `ControlLease::clear_estop` has no caller, so the latch
+clears only when `cerulion-remoted` restarts; then rcpd's own latch clears
+through its `estop_clear` (`limits.estop_clear: agent`) or by deleting
 `<receipts>.estop` and restarting rcpd.
 
 When rcpd answers HTTP 404 to a request that carried its session id (rcpd

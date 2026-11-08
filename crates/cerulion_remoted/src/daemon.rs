@@ -180,6 +180,11 @@ pub(crate) async fn serve_core(
     // `engage-estop` and act verbs use, so its latch and its engage count are
     // shared. A library host has none, and serves no rcp plane.
     let estop_lease = ops_host.estop_lease();
+    // On the daemon, `engage-estop` also sends an `estop` to the rcpd the rcp
+    // plane forwards to, over the same link, until rcpd answers; the delivery
+    // in flight ends when the planes stop.
+    let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
+    let rcpd_estop = ops_host.rcpd_estop();
     let ops = Arc::new(OpsServing::for_host(
         ops_host,
         shared,
@@ -251,6 +256,9 @@ pub(crate) async fn serve_core(
         shutdown,
     )
     .await;
+    if let Some(rcpd_estop) = rcpd_estop {
+        rcpd_estop.shut_down().await;
+    }
     poller.stop().await;
     served
 }
