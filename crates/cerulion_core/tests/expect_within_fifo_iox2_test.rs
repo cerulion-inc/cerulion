@@ -118,6 +118,7 @@ fn trigger_input(expect_within_ms: Option<u64>) -> InputMeta {
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms,
+        consume: Default::default(),
     }
 }
 
@@ -764,6 +765,7 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
                 depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(20),
+                consume: Default::default(),
             },
             InputMeta {
                 name: "ctx".to_string(),
@@ -772,6 +774,7 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
                 depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(30),
+                consume: Default::default(),
             },
         ],
         vec![],

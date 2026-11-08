@@ -1300,6 +1300,7 @@ fn closure_sync_graph(
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        consume: Default::default(),
     };
     let info = NodeInfo::with_meta(vec![meta("a"), meta("b")], vec![])
         .with_policy(MacroPolicy::Sync { window_ms: 500 });
@@ -1535,6 +1536,7 @@ fn degraded_sync_graph(
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        consume: Default::default(),
     };
     let info = NodeInfo::with_meta(vec![meta("a"), meta("b")], vec![])
         .with_policy(MacroPolicy::Sync { window_ms: 50 });

@@ -185,6 +185,10 @@ pub enum Decider {
     Sync,
     /// Per-message FIFO: fires per step against the read log's `popped`.
     FifoPop,
+    /// A `consume = latest` data trigger: at most one fire per step, and
+    /// exactly one on a step whose trigger drain popped a frame unless the
+    /// node is throttled.
+    LatestFire,
     /// The cross-rank `block` credit edge. **Never re-derived** — it appears
     /// only on [`StandDown`]s and [`ConservationFinding`]s, so a reader of a
     /// stand-down list can tell "we declined to judge this node's schedule
@@ -446,6 +450,7 @@ impl Decider {
             Self::Throttle => "throttle_ms gate",
             Self::Sync => "sync alignment",
             Self::FifoPop => "FIFO pop count",
+            Self::LatestFire => "consume = latest fire count",
             Self::BlockCredit => "block credit",
             Self::ReadLog => "the recorded read log",
         }
@@ -504,6 +509,11 @@ pub enum TriggerDecl {
     },
     /// A data-trigger node.
     Data {
+        /// The `#[input(trigger)]`-marked inputs, in declaration order.
+        trigger_inputs: Vec<String>,
+    },
+    /// A data-trigger node whose trigger input declares `consume = latest`.
+    DataLatest {
         /// The `#[input(trigger)]`-marked inputs, in declaration order.
         trigger_inputs: Vec<String>,
     },
@@ -1609,6 +1619,17 @@ pub(crate) fn verify(
                         &mut report,
                     );
                 }
+                TriggerDecl::DataLatest { trigger_inputs } => {
+                    verify_latest(
+                        node,
+                        steps,
+                        trigger_inputs,
+                        block_gated,
+                        trust,
+                        stops.stop_point(&node.node_id),
+                        &mut report,
+                    );
+                }
                 // Judged on wire stamps, a node aligned on capture stamps
                 // would be convicted on a healthy run: decline, loudly.
                 TriggerDecl::SyncOnCaptureTime { .. } => {
@@ -1684,7 +1705,10 @@ fn census_read_sites(
     }
     let mut pending: Vec<(String, Decider, Vec<String>)> = Vec::new();
     for f in &report.findings {
-        if !matches!(f.decider, Decider::Sync | Decider::FifoPop) {
+        if !matches!(
+            f.decider,
+            Decider::Sync | Decider::FifoPop | Decider::LatestFire
+        ) {
             continue;
         }
         let Some(node) = nodes.iter().find(|n| n.node_id == f.node_id) else {
@@ -1693,7 +1717,8 @@ fn census_read_sites(
         let inputs = match &node.trigger {
             TriggerDecl::Sync { trigger_inputs, .. }
             | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
-            | TriggerDecl::Data { trigger_inputs } => trigger_inputs.clone(),
+            | TriggerDecl::Data { trigger_inputs }
+            | TriggerDecl::DataLatest { trigger_inputs } => trigger_inputs.clone(),
             _ => continue,
         };
         pending.push((f.node_id.clone(), f.decider, inputs));
@@ -3044,6 +3069,94 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
     first_resumed && fires == popped.saturating_add(1)
 }
 
+/// The `consume = latest` data-trigger rule.
+///
+/// A latest node's step fires it at most once, and a step whose trigger drain
+/// popped a frame fires it exactly once: the read drains the queue to its
+/// newest frame, so no popped frame is owed a fire of its own. A step that
+/// popped nothing may still fire once, on a frame an earlier step popped and
+/// no tick read (a deferred fire, or a tick that never reached the input), so
+/// it is held to the bound alone. A `throttle_ms` node may defer a step that
+/// popped, so it too is held to the bound alone; the throttle rule judges its
+/// spacing. The stop and read-shape handling is [`verify_fifo`]'s.
+fn verify_latest(
+    node: &NodeDecl,
+    steps: &[RecordedStep],
+    trigger_inputs: &[String],
+    block_gated: bool,
+    trust: RoleTrust,
+    stop: Option<StopPoint>,
+    report: &mut RederivationReport,
+) {
+    if block_gated {
+        report.stand_downs.push(StandDown {
+            node_id: node.node_id.clone(),
+            decider: Decider::LatestFire,
+            reason: StandDownReason::BlockGated,
+        });
+        return;
+    }
+    for step in steps {
+        if stop.is_some_and(|s| step.step > s.step) {
+            if recorded_fire_after_stop(node, step, Decider::LatestFire, false, report) {
+                return;
+            }
+            continue;
+        }
+        let mut popped = 0u32;
+        for read in step
+            .reads
+            .iter()
+            .filter(|r| r.node_id == node.node_id && trigger_inputs.contains(&r.input))
+        {
+            if unproducible_read_shape(read, trust) {
+                report.stand_downs.push(StandDown {
+                    node_id: node.node_id.clone(),
+                    decider: Decider::LatestFire,
+                    reason: StandDownReason::ImpossibleReadShape,
+                });
+                return;
+            }
+            match read.kind {
+                ReadOutcomeKind::Truncated => {
+                    report.stand_downs.push(StandDown {
+                        node_id: node.node_id.clone(),
+                        decider: Decider::LatestFire,
+                        reason: StandDownReason::TruncatedReadLog,
+                    });
+                    return;
+                }
+                ReadOutcomeKind::Decimated => {
+                    report.stand_downs.push(StandDown {
+                        node_id: node.node_id.clone(),
+                        decider: Decider::LatestFire,
+                        reason: StandDownReason::DecimatedRead,
+                    });
+                    return;
+                }
+                ReadOutcomeKind::DrainedBatch if is_drain_site_read(read, trust) => {
+                    popped = popped.saturating_add(read.popped)
+                }
+                _ => {}
+            }
+        }
+        let recorded = recorded_fires(step, &node.node_id, false);
+        let owes_one =
+            popped > 0 && node.throttle_ns.is_none() && !stop.is_some_and(|s| s.step == step.step);
+        let expected = if owes_one { 1 } else { recorded.count.min(1) };
+        if recorded.count != expected {
+            report.findings.push(ScheduleFinding {
+                node_id: node.node_id.clone(),
+                step: step.step,
+                decider: Decider::LatestFire,
+                expected: StepFires::count(expected),
+                recorded,
+            });
+            return;
+        }
+    }
+}
+
 /// Which records on a `block` edge are pops of the subscriber the credit
 /// mirror is wired to.
 ///
@@ -3126,7 +3239,9 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
         return CreditBasis::Undecidable;
     };
     match &node.trigger {
-        TriggerDecl::Data { trigger_inputs } if trigger_inputs.contains(&edge.consumer_input) => {
+        TriggerDecl::Data { trigger_inputs } | TriggerDecl::DataLatest { trigger_inputs }
+            if trigger_inputs.contains(&edge.consumer_input) =>
+        {
             CreditBasis::BodyOnly
         }
         TriggerDecl::Sync { trigger_inputs, .. }
@@ -5377,6 +5492,103 @@ mod tests {
         assert!(resumed.is_clean(), "unexpected: {:?}", resumed.findings);
         let from_start = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert_eq!(from_start.findings.len(), 1, "{:?}", from_start.findings);
+    }
+
+    // -- consume = latest ---------------------------------------------------
+
+    fn latest_node() -> Vec<NodeDecl> {
+        vec![node(
+            "sink",
+            TriggerDecl::DataLatest {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )]
+    }
+
+    /// A latest node's drain pops a whole burst and fires ONCE; a step that
+    /// popped nothing fires at most once (a held frame re-offered).
+    #[test]
+    fn a_latest_node_fires_once_per_step_that_popped() {
+        let steps = vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: EPOCH,
+                fires: vec![fire("sink", EPOCH)],
+                reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 5, None)],
+            },
+            step(1, EPOCH + 1, vec![]),
+            step(2, EPOCH + 2, vec![fire("sink", EPOCH + 2)]),
+        ];
+        let report = verify_unrestored(&latest_node(), &steps, &[], RoleTrust::Declined);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        // The FIFO rule on the same log expects five fires at step 0: the
+        // declaration is what decides.
+        let fifo = vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )];
+        let as_fifo = verify_unrestored(&fifo, &steps, &[], RoleTrust::Declined);
+        assert_eq!(as_fifo.findings[0].expected, StepFires::count(5));
+    }
+
+    /// Both directions of the latest rule are caught: a second fire in one
+    /// step, and no fire on a step whose drain popped.
+    #[test]
+    fn a_latest_node_that_fires_twice_or_not_at_all_on_a_pop_is_caught() {
+        let popped = |fires| RecordedStep {
+            step: 0,
+            clock_ns: EPOCH,
+            fires,
+            reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 3, None)],
+        };
+        let twice = verify_unrestored(
+            &latest_node(),
+            &[popped(vec![fire("sink", EPOCH), fire("sink", EPOCH)])],
+            &[],
+            RoleTrust::Declined,
+        );
+        assert_eq!(twice.findings[0].decider, Decider::LatestFire);
+        assert_eq!(twice.findings[0].expected, StepFires::count(1));
+        assert_eq!(twice.findings[0].recorded, StepFires::count(2));
+
+        let none = verify_unrestored(&latest_node(), &[popped(vec![])], &[], RoleTrust::Declined);
+        assert_eq!(none.findings[0].expected, StepFires::count(1));
+        assert_eq!(none.findings[0].recorded, StepFires::count(0));
+
+        let mut held = step(0, EPOCH, vec![fire("sink", EPOCH), fire("sink", EPOCH)]);
+        held.reads.clear();
+        let twice_unpopped = verify_unrestored(&latest_node(), &[held], &[], RoleTrust::Declined);
+        assert_eq!(
+            twice_unpopped.findings[0].recorded,
+            StepFires::count(2),
+            "the bound holds on a step that popped nothing too"
+        );
+    }
+
+    /// A throttled latest node may defer a step that popped: it is held to the
+    /// one-fire bound only.
+    #[test]
+    fn a_throttled_latest_node_may_skip_a_step_that_popped() {
+        let mut nodes = latest_node();
+        nodes[0].throttle_ns = Some(5_000_000);
+        let steps = vec![RecordedStep {
+            step: 0,
+            clock_ns: EPOCH,
+            fires: vec![],
+            reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 2, None)],
+        }];
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.decider != Decider::LatestFire),
+            "{:?}",
+            report.findings
+        );
     }
 
     /// A truncated read log is a deterministic HOLE, so the pop-count rule

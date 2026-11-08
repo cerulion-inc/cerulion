@@ -3077,6 +3077,7 @@ mod tests {
             depth: 10,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: crate::graph::node::InputConsume::Fifo,
         };
         NodeInfo::with_meta(vec![inp], Vec::new()).with_policy(MacroPolicy::DataTrigger {
             input_name: "inp".to_string(),
@@ -3268,6 +3269,7 @@ process_groups:
             depth: 10,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: crate::graph::node::InputConsume::Fifo,
         };
         NodeInfo::with_meta(vec![input("ia"), input("ic")], Vec::new())
     }

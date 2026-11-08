@@ -204,6 +204,7 @@ fn preflight_passes_when_the_ingress_consumer_declares_a_schema() {
                 depth: 1,
                 backpressure: Default::default(),
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         ),

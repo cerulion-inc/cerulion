@@ -217,6 +217,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -373,6 +374,7 @@ fn block_input_meta() -> InputMeta {
         depth: 2,
         backpressure: BackpressurePolicy::Block,
         expect_within_ms: None,
+        consume: Default::default(),
     }
 }
 

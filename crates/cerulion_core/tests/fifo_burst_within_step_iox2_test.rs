@@ -134,6 +134,7 @@ fn recording_consumer(seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
             depth: CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -1196,6 +1197,7 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -1435,6 +1437,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )

@@ -674,6 +674,7 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -880,6 +881,7 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -1122,6 +1124,7 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -1292,6 +1295,7 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )

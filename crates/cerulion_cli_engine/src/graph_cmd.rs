@@ -13687,6 +13687,7 @@ pub(crate) fn source_entry_infos(
                     depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                     backpressure: *backpressure,
                     expect_within_ms: None,
+                    consume: Default::default(),
                 },
             )
             .collect();
@@ -17164,6 +17165,7 @@ mod chain_keeping_tests {
             depth: DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: cerulion_core::graph::node::InputConsume::Fifo,
         };
         let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
         infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));

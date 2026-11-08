@@ -274,8 +274,9 @@ what the demotion exists for.
 
 What still surfaces structurally: rank-LOCAL decisions the verifier can
 re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
-clock, `Sync` alignment, FIFO pop counts from the read log) are re-derived and
-positionally compared, so policy or declaration drift on those is still caught.
+clock, `Sync` alignment, FIFO pop counts from the read log, and a
+`consume = latest` node's one fire per step from the read log's drains) are
+re-derived and positionally compared, so policy or declaration drift on those is still caught.
 
 ### Divergence LOCALIZES to the producing rank
 
