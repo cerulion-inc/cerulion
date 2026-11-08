@@ -1224,9 +1224,10 @@ Declares an output port. Field type is the schema marker.
 
 Give every output a node declares an entry with its `schema:` under that
 node's `outputs:` in the graph YAML: the graph creates a publisher only for a
-listed output. `cerulion graph run` refuses a graph in which a node declares
-an output that its entry does not list. The error names the node and the
-output, and the graph does not start.
+listed output, and a `#[cerulion_node]` node fails every tick for an output
+with no publisher. `cerulion graph run` refuses a graph in which a
+`#[cerulion_node]` node declares an output that its entry does not list. The
+error names the node and the output, and the graph does not start.
 
 | Form | Meaning |
 |---|---|

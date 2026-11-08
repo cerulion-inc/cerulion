@@ -3156,45 +3156,117 @@ nodes:
     validate_graph(&ok).expect("native-only coverage is complete");
 }
 
-/// A node that declares an output its graph entry does not list has no
-/// publisher for it, so the build refuses the graph before any transport
-/// resource exists. The error names the node and the output, and says how to
-/// list the output. The embedded Android runtime refuses the same graph with
-/// the same words.
-#[test]
-fn test_graph_build_refuses_a_declared_output_the_graph_does_not_list() {
-    let prefix = unique_prefix("unlisted_output");
-    let yaml = format!(
-        r#"
-name: test
-prefix: {prefix}
-nodes:
-  - id: relay
-    type: test
-"#
-    );
+/// The graph build refuses an output a `#[cerulion_node]` node declares and
+/// its graph entry does not list, and starts every other kind of node.
+mod unlisted_declared_output {
+    use std::sync::Arc;
 
-    let config = parse_graph(&yaml).unwrap();
-    validate_graph(&config).unwrap();
+    use cerulion_core::clock::VirtualClock;
+    use cerulion_core::graph::node::{ClosureNodeEntry, DylibNodeEntry, NodeEntry, NodeInfo};
+    use cerulion_core::graph::{parse_graph, validate_graph, GraphRuntime};
+    use cerulion_core::prelude::{cerulion_node, cerulion_node_impl};
+    use cerulion_core::transport::TransportManager;
+    use cerulion_core::MacroPolicy;
+    use indexmap::IndexMap;
+    use native_ros2_messages::geometry_msgs::Vector3;
 
-    let mgr = TransportManager::get_or_init().expect("init");
-    let clock = Arc::new(VirtualClock::new());
+    use super::unique_prefix;
 
-    let node = ClosureNodeEntry::new(
-        NodeInfo::from_names(vec![], vec!["echo".to_string()])
-            .with_policy(MacroPolicy::Period { period_ms: 10 }),
-        |_ctx| Ok(()),
-    );
-    let mut nodes: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
-    nodes.insert("relay".to_string(), Box::new(node));
+    #[cerulion_node(period_ms = 10)]
+    #[derive(Default)]
+    struct EchoSource {
+        #[output]
+        echo: Vector3,
+    }
 
-    let Err(error) = GraphRuntime::build(config, nodes, &mgr, clock) else {
-        panic!("a declared output the graph does not list must fail the build");
-    };
-    assert_eq!(
-        error.to_string(),
-        "Graph validation error: node 'relay' output 'echo': the node declares this output \
-         and the graph does not list it, so the node has no publisher for it; add `- name: \
-         echo` with its `schema:` under the node's `outputs:`"
-    );
+    #[cerulion_node_impl]
+    impl EchoSource {
+        fn tick(&mut self) -> Result<(), NodeError> {
+            self.echo.x = 1.0;
+            Ok(())
+        }
+    }
+
+    /// A graph with one node, `relay`, whose entry lists no outputs.
+    fn graph_without_outputs(base: &str) -> cerulion_core::graph::config::GraphConfig {
+        let prefix = unique_prefix(base);
+        let config = parse_graph(&format!(
+            "name: test\nprefix: {prefix}\nnodes:\n  - id: relay\n    type: test\n"
+        ))
+        .unwrap();
+        validate_graph(&config).unwrap();
+        config
+    }
+
+    fn build(
+        config: cerulion_core::graph::config::GraphConfig,
+        node: Box<dyn NodeEntry>,
+    ) -> cerulion_core::TransportResult<GraphRuntime> {
+        let mgr = TransportManager::get_or_init().expect("init");
+        let clock = Arc::new(VirtualClock::new());
+        let mut nodes: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        nodes.insert("relay".to_string(), node);
+        GraphRuntime::build(config, nodes, &mgr, clock)
+    }
+
+    /// A `#[cerulion_node]` node fails every tick for which a declared output
+    /// has no publisher, so the build refuses the graph before any transport
+    /// resource exists. The error names the node and the output, and says how
+    /// to list the output. The embedded Android runtime refuses the same graph
+    /// with the same words.
+    #[test]
+    fn a_macro_node_output_the_graph_does_not_list_is_refused() {
+        let config = graph_without_outputs("unlisted_macro_output");
+        let Err(error) = build(config, Box::new(EchoSourceEntry::new())) else {
+            panic!("a macro node's unlisted declared output must fail the build");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Graph validation error: node 'relay' output 'echo': the node declares this output \
+             and the graph does not list it, so the node has no publisher for it; add `- name: \
+             echo` with its `schema:` under the node's `outputs:`"
+        );
+    }
+
+    /// A node that is not a `#[cerulion_node]` node (a Python node, a raw FFI
+    /// node or a hand-written entry) takes a publisher only for an output it
+    /// writes, so an unlisted declared output does not stop its graph.
+    #[test]
+    fn a_hand_written_node_output_the_graph_does_not_list_still_builds() {
+        let config = graph_without_outputs("unlisted_hand_written_output");
+        let node = ClosureNodeEntry::new(
+            NodeInfo::from_names(vec![], vec!["echo".to_string()])
+                .with_policy(MacroPolicy::Period { period_ms: 10 }),
+            |_ctx| Ok(()),
+        );
+        if let Err(error) = build(config, Box::new(node)) {
+            panic!("a hand-written node's unlisted output must not fail the build: {error}");
+        }
+    }
+
+    /// The macro marks its node in process and in its library info JSON. An
+    /// info block without the key (what a Python node and a raw FFI node
+    /// return) leaves the mark off.
+    #[test]
+    fn only_the_macro_marks_a_node_that_needs_a_publisher_for_every_output() {
+        let macro_info = EchoSourceEntry::new().info().expect("macro node info");
+        assert!(macro_info.publisher_for_every_output());
+
+        let marked = DylibNodeEntry::parse_info_json_labeled(
+            r#"{"inputs":[],"outputs":[{"name":"echo","schema_hash":7}],"publisher_for_every_output":true}"#,
+            "marked",
+        )
+        .expect("parse the marked info block");
+        assert!(marked.publisher_for_every_output());
+
+        let unmarked = DylibNodeEntry::parse_info_json_labeled(
+            r#"{"inputs":[],"outputs":[{"name":"echo","schema_hash":7}]}"#,
+            "unmarked",
+        )
+        .expect("parse the unmarked info block");
+        assert!(!unmarked.publisher_for_every_output());
+        assert!(
+            !NodeInfo::from_names(vec![], vec!["echo".to_string()]).publisher_for_every_output()
+        );
+    }
 }

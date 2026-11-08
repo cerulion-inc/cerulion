@@ -800,6 +800,7 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         "policy",
         "tick_within_ms",
         "throttle_ms",
+        "publisher_for_every_output",
     ];
     if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json) {
         if let Some(obj) = raw.as_object() {
@@ -811,7 +812,7 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
                         unknown_key = %key,
                         "unknown key in INFO_BYTES JSON — ignored; the node loads with the \
                          default for the intended field (accepted: inputs, outputs, policy, \
-                         tick_within_ms, throttle_ms)"
+                         tick_within_ms, throttle_ms, publisher_for_every_output)"
                     );
                 }
             }

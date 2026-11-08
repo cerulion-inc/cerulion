@@ -1227,11 +1227,19 @@ contributes name-only, and a layout change inside such a target is not caught.
   from Step 3a). If two instances need different policies, make them two
   node types. Stage the second instance with its own id:
   `cerulion node stage lidar_sensor -g obstacle_avoidance -i rear_sensor`.
+  The command writes the entry with its outputs. Each instance lists the
+  `scan` output that `lidar_sensor` declares:
   ```yaml
   - id: front_sensor
     type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
   - id: rear_sensor
     type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
   ```
 
 - **QoS deadlines:** Independent of trigger policy, every port + the node

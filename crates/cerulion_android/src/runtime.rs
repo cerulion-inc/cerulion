@@ -2208,8 +2208,10 @@ fn resolve_ingress(
 /// list.
 ///
 /// The rule and its words are the core graph build's
-/// (`cerulion_core::graph::check_declared_outputs_listed`), so the app and
-/// `graph run` refuse the same graphs with the same message.
+/// (`cerulion_core::graph::check_declared_outputs_listed`). The app applies
+/// it to every node; the core graph build applies it only to a
+/// `#[cerulion_node]` node. For such a node, the app and `graph run` refuse
+/// the same graphs with the same message.
 fn check_declared_outputs_listed(node: &NodeDef, info: &NodeInfo) -> Result<(), EmbedError> {
     cerulion_core::graph::check_declared_outputs_listed(node, info).map_err(EmbedError::Graph)
 }

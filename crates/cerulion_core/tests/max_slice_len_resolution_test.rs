@@ -226,9 +226,7 @@ fn test_tier2_yaml_output_name_mismatch_falls_through_to_tier3() {
     // Adversarial: the YAML declares an output named "data" but the
     // macro-emitted OutputMeta is keyed by name "image". The lookup
     // fails to find a matching entry, so tier-2 silently no-ops and
-    // tier-3 fires (DEFAULT + tracing::warn!). The YAML also lists
-    // "image", because the build refuses a declared output the graph
-    // does not list.
+    // tier-3 fires (DEFAULT + tracing::warn!).
     let yaml = r#"
 name: t5
 nodes:
@@ -236,8 +234,6 @@ nodes:
     type: stub
     outputs:
       - name: data
-        schema: test/Data
-      - name: image
         schema: test/Data
 "#;
     let output_meta = vec![OutputMeta::new(
