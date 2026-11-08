@@ -2177,6 +2177,7 @@ mod tests {
             depth,
             backpressure: policy,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 

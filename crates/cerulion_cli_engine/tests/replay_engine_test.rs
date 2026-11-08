@@ -198,6 +198,64 @@ impl RelayNode {
     }
 }
 
+/// The relay with a `consume = latest` trigger: each step that sees frames
+/// fires it once, on the newest.
+#[cerulion_node]
+#[derive(Default)]
+struct LatestRelayNode {
+    #[input(trigger, consume = latest)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl LatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// [`LatestRelayNode`] throttled to one fire per 12 ms: at the reference
+/// run's 5 ms step a frame arriving in the step after a fire is held through
+/// two deferred steps.
+#[cerulion_node(throttle_ms = 12)]
+#[derive(Default)]
+struct ThrottledLatestRelayNode {
+    #[input(trigger, consume = latest)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl ThrottledLatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// [`LatestRelayNode`] behind an 8 ms `sample` gate: at the 5 ms step the
+/// gate admits the newest frame of every other step.
+#[cerulion_node]
+#[derive(Default)]
+struct SampledLatestRelayNode {
+    #[input(trigger, consume = latest, backpressure = sample(8))]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl SampledLatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
 /// A period source at TWICE [`SourceNode`]'s period, so under the reference
 /// run's one-`SourceNode`-period step (`DELTA_MS`) it publishes on every OTHER
 /// step.
@@ -3196,6 +3254,213 @@ fn external_frames_are_reinjected_and_downstream_matches() {
     // (not diffed), so exactly one topic is checked.
     assert_eq!(outcome.topics_checked, 1);
     assert_eq!(outcome.topics_passed, 1);
+}
+
+fn latest_relay_yaml(node_type: &str) -> String {
+    format!(
+        "name: lrg\nprefix: lr\nnodes:\n\
+         \x20 - id: relay\n    type: {node_type}\n    inputs:\n      - name: inp\n        source: /lr/ext/cam\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    )
+}
+
+fn latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![("relay", Box::new(LatestRelayNodeEntry::new()))])
+}
+
+fn throttled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "relay",
+        Box::new(ThrottledLatestRelayNodeEntry::new()),
+    )])
+}
+
+fn sampled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "relay",
+        Box::new(SampledLatestRelayNodeEntry::new()),
+    )])
+}
+
+/// Record `per_step` bursts into a latest relay, anchor the recorded outputs
+/// to `oracle` (each the served frame plus 100), then replay the bag twice:
+/// both replays pass byte-exact with no schedule divergence and are
+/// byte-identical to each other. The same recording stamped free run is then
+/// judged by the fire re-derivation, and written as a fed `--verify` bag it is
+/// replayed with every read fed its recorded frames; a `sample(N)` relay's fed
+/// replay is refused instead, because its decimated read names none of the
+/// frames it popped.
+fn latest_relay_round_trip(
+    node_type: &str,
+    make: fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    per_step: Vec<Vec<f64>>,
+    oracle: &[f64],
+) {
+    let frames: usize = per_step.iter().map(Vec::len).sum();
+    let steps = per_step.len();
+    let externals = vec![ExternalDrive {
+        topic: "/lr/ext/cam".to_string(),
+        per_step,
+    }];
+    let yaml = latest_relay_yaml(node_type);
+    let rec = record_uniform_with_read_log(&yaml, make, &externals, steps);
+    let out: Vec<f64> = rec.messages["/lr/relay/out"]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(out, oracle, "{node_type}: the recorded outputs");
+    assert_eq!(
+        rec.messages["/lr/ext/cam"].len(),
+        frames,
+        "every external frame recorded"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("latest.mcap");
+    write_bag(&rec, &bag, None);
+    let a = replay(&bag, make, None, None).expect("replay runs");
+    assert_clean_verdict(&a, node_type);
+    assert!(
+        a.topics_checked >= 1 && a.topics_passed == a.topics_checked,
+        "{node_type}: every topic was compared and passed: {} of {}",
+        a.topics_passed,
+        a.topics_checked
+    );
+    assert!(
+        a.injection_stand_downs.is_empty(),
+        "{node_type}: no injection stood down: {:?}",
+        a.injection_stand_downs
+    );
+    let b = replay(&bag, make, None, None).expect("replay runs");
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+
+    // The same recording stamped free run: the fire re-derivation runs only
+    // on a free-run bag, so this is where the latest decider reads a real
+    // read log. A `LatestFire` finding surfaces as the trace divergence
+    // `assert_clean_verdict` requires to be absent.
+    let free = dir.path().join("latest_free_run.mcap");
+    write_bag_with_coordination(&rec, &free, replay_engine::CoordinationMode::FreeRun);
+    let f = replay(&free, make, None, None).expect("free-run replay runs");
+    assert_clean_verdict(&f, &format!("{node_type} (free run)"));
+    // A clean verdict also follows from the verifier standing aside, so the
+    // arm refuses every stand-down note: a whole-rank decline, a node whose
+    // metadata could not be read, a whole-node read-log stand-down and a
+    // stand-down of any decider. The one stand-down a healthy relay here
+    // carries is the sampled relay's `decimated_read`, which a decimated read
+    // causes by rule.
+    let sampled = node_type == "sampled_latest_relay_node";
+    let stood_aside: Vec<_> = f
+        .rederivation_notes
+        .iter()
+        .filter(|n| {
+            n.kind == replay_engine::RederivationNoteKind::StandDown
+                && !(sampled && n.code.as_deref() == Some("decimated_read"))
+        })
+        .collect();
+    assert!(
+        stood_aside.is_empty(),
+        "{node_type}: the verifier judged the free-run bag: {stood_aside:?}"
+    );
+
+    // The same recording as a fed `--verify` bag (the production free-run
+    // recorder stamp and the per-stage staging rows): every read is fed the
+    // frames its recorded read named. A burst drain is fed its batch frames
+    // and its served frame, and a boundary that re-offers a held frame pops
+    // nothing, so it is fed nothing. A decimated read names none of the
+    // frames it popped, so the sampled relay is refused by name.
+    let fed = dir.path().join("latest_fed.mcap");
+    ri_capped_bag(&rec, &fed);
+    let (fed_outcome, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
+    if sampled {
+        let err = fed_outcome.expect_err("a fed replay of a decimated latest read is refused");
+        let msg = err.to_string();
+        assert_eq!(err.exit_code(), 2, "{node_type}: {msg}");
+        assert!(
+            msg.contains("read_identity_decimated_unattributed"),
+            "{node_type}: {msg}"
+        );
+    } else {
+        let fed_outcome = fed_outcome.expect("the fed replay runs");
+        ri_assert_fed(&fed_outcome);
+        assert_clean_verdict(&fed_outcome, &format!("{node_type} (fed)"));
+        let stood_aside: Vec<_> = fed_outcome
+            .rederivation_notes
+            .iter()
+            .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
+            .collect();
+        assert!(
+            stood_aside.is_empty(),
+            "{node_type}: the verifier judged the fed replay: {stood_aside:?}"
+        );
+    }
+}
+
+/// A `consume = latest` relay fed BURSTS: one output per step that saw
+/// frames, the step's newest frame plus 100. As `fifo` the relay would
+/// publish one output per frame (eight), so the recording oracle catches the
+/// latest wiring being removed; the replay half pins that the replayed run
+/// reproduces the recorded reads and fires.
+#[test]
+#[serial]
+fn a_latest_relay_fed_bursts_replays_byte_exact() {
+    latest_relay_round_trip(
+        "latest_relay_node",
+        latest_relay_factories,
+        vec![
+            vec![1.0, 2.0, 3.0],
+            vec![],
+            vec![4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            vec![],
+        ],
+        &[103.0, 104.0, 108.0],
+    );
+}
+
+/// A DEFERRED latest fire replays byte-exact: frame 2 arrives in the step
+/// after a fire, is held through two throttled steps with nothing newer, and
+/// the fire that ends the window serves it.
+#[test]
+#[serial]
+fn a_held_latest_frame_replays_byte_exact() {
+    latest_relay_round_trip(
+        "throttled_latest_relay_node",
+        throttled_latest_relay_factories,
+        vec![vec![1.0], vec![2.0], vec![], vec![], vec![], vec![]],
+        &[101.0, 102.0],
+    );
+}
+
+/// A held frame SUPERSEDED during the defer replays byte-exact: frames 3 and
+/// 4 arrive while frame 2 is held, and the fire that ends the window serves
+/// frame 4.
+#[test]
+#[serial]
+fn a_superseded_latest_frame_replays_byte_exact() {
+    latest_relay_round_trip(
+        "throttled_latest_relay_node",
+        throttled_latest_relay_factories,
+        vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![], vec![]],
+        &[101.0, 104.0],
+    );
+}
+
+/// A `sample(8)` latest relay replays byte-exact: the gate sees each step's
+/// newest frame (2 at 0 ms, 3 at 5 ms, 5 at 10 ms) and admits the first and
+/// the third, the step between them decimated. A fed `--verify` replay of the
+/// same recording is refused, `read_identity_decimated_unattributed`.
+#[test]
+#[serial]
+fn a_sampled_latest_relay_replays_byte_exact() {
+    latest_relay_round_trip(
+        "sampled_latest_relay_node",
+        sampled_latest_relay_factories,
+        vec![vec![1.0, 2.0], vec![3.0], vec![4.0, 5.0], vec![]],
+        &[102.0, 105.0],
+    );
 }
 
 // ===========================================================================

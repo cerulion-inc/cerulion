@@ -240,6 +240,9 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
     let mut outputs = Vec::new();
     let mut single_trigger_input: Option<String> = None;
     let mut multiple_triggers = false;
+    // The inputs declaring `consume = latest`, checked against the node's
+    // policy once it is known.
+    let mut latest_inputs: Vec<String> = Vec::new();
     for field in &item_struct.fields {
         let Some(name_ident) = field.ident.as_ref() else {
             // Tuple-struct field; the macro rejects tuple structs
@@ -285,6 +288,7 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                     let mut expect_sample_group = false;
                     let mut accumulate =
                         crate::node_metadata_accumulate::AccumulateGrammar::default();
+                    let mut consume = crate::node_metadata_consume::ConsumeGrammar::default();
                     let accumulate_err = |why: String| {
                         CliError::Validation(format!(
                             "node `{node_type}` field `{port_name}`: {why}"
@@ -294,6 +298,9 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                         match tt {
                             t if accumulate.wants_token() => {
                                 accumulate.on_token(&t).map_err(accumulate_err)?;
+                            }
+                            t if consume.wants_token() => {
+                                consume.on_token(&t).map_err(accumulate_err)?;
                             }
                             TokenTree::Group(g) if expect_sample_group => {
                                 if g.delimiter() != proc_macro2::Delimiter::Parenthesis {
@@ -389,6 +396,13 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                 {
                                     // `accumulate` or `cap`, checked in full
                                     // once the attribute is read.
+                                } else if consume
+                                    .on_key(&ident.to_string())
+                                    .map_err(accumulate_err)?
+                                {
+                                    // `consume = <mode>`, its value read by the
+                                    // arm above and the trigger rule checked
+                                    // once the attribute is read.
                                 } else if !matches!(
                                     ident.to_string().as_str(),
                                     "depth" | "expect_within_ms"
@@ -396,7 +410,8 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                                     return Err(CliError::Validation(format!(
                                         "node `{node_type}` field `{port_name}`: unknown input \
                                          attribute `{ident}`. Supported: `trigger`, `depth`, \
-                                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`."
+                                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`, \
+                                         `consume`."
                                     )));
                                 }
                             }
@@ -446,6 +461,11 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
                     accumulate
                         .finish(is_trigger, &backpressure)
                         .map_err(accumulate_err)?;
+                    if consume.finish(is_trigger).map_err(accumulate_err)?
+                        == Some(cerulion_core::graph::node::InputConsume::Latest)
+                    {
+                        latest_inputs.push(port_name.clone());
+                    }
                 }
             } else if attr.path().is_ident("output") {
                 is_output = true;
@@ -620,6 +640,18 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
             single_trigger_input.map(|input_name| MacroPolicy::DataTrigger { input_name })
         }
     });
+    // The macro refuses `consume = latest` on any input of a Sync node.
+    if matches!(
+        policy,
+        Some(MacroPolicy::Sync { .. }) | Some(MacroPolicy::UnboundedSync)
+    ) {
+        if let Some(port) = latest_inputs.first() {
+            return Err(CliError::Validation(format!(
+                "node `{node_type}` field `{port}`: {}",
+                crate::node_metadata_consume::SYNC_CONSUME_LATEST_REFUSED
+            )));
+        }
+    }
 
     Ok(Some(NodeMetadata {
         node_type: node_type.to_string(),
@@ -3008,7 +3040,7 @@ struct BadNode {
             msg.contains("unknown input attribute `newest_first`")
                 && msg.contains(
                     "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, \
-                         `accumulate`, `cap`."
+                         `accumulate`, `cap`, `consume`."
                 ),
             "must mirror the macro's diagnostic — offending ident + accepted set; got: {msg}"
         );
@@ -3606,6 +3638,131 @@ struct FusionNode {
                     "`#[input({attr})]` names the accepted set: {err}"
                 );
             }
+        }
+    }
+
+    /// A data-triggered macro node whose one input carries `attr`.
+    fn parse_consume_attr(attr: &str) -> CliResult<NodeMetadata> {
+        let tmp = TempDir::new().unwrap();
+        let src = format!(
+            "use cerulion_core::prelude::*;\n\n#[cerulion_node]\n\
+             #[derive(Default)]\nstruct CamReader {{\n    #[input({attr})]\n    cam: u32,\n}}\n"
+        );
+        let node_dir = write_node(&tmp, "cam_reader", &src);
+        parse_node_metadata(&node_dir)
+    }
+
+    #[test]
+    fn parse_macro_node_accepts_every_consume_form_the_macro_compiles() {
+        for attr in [
+            "trigger, consume = latest",
+            "trigger, consume = fifo",
+            "consume = latest, trigger",
+            "trigger, consume = latest,",
+            "trigger, consume = latest, depth = 2, backpressure = block",
+            "trigger, backpressure = sample(5), consume = latest, expect_within_ms = 9",
+        ] {
+            let metadata = parse_consume_attr(attr)
+                .unwrap_or_else(|e| panic!("`#[input({attr})]` compiles, so it must parse: {e}"));
+            assert!(metadata.inputs[0].trigger, "{attr}");
+        }
+    }
+
+    #[test]
+    fn parse_macro_node_refuses_every_consume_form_the_macro_refuses() {
+        let cases: [(&str, &str); 6] = [
+            (
+                "consume = latest",
+                crate::node_metadata_consume::CONSUME_NEEDS_TRIGGER,
+            ),
+            (
+                "trigger, consume = lifo",
+                "unknown consume mode `lifo`, expected `consume = fifo` (the default) or \
+                 `consume = latest`.",
+            ),
+            (
+                "trigger, consume = 3",
+                "`consume` takes `consume = fifo` (the default) or `consume = latest`.",
+            ),
+            // The macro refuses these two with its own `=` / `,` diagnostics;
+            // the CLI refuses them with the accepted values.
+            (
+                "trigger, consume",
+                "`consume` takes `consume = fifo` (the default) or `consume = latest`.",
+            ),
+            (
+                "trigger, consume = latest fifo",
+                "`consume` takes `consume = fifo` (the default) or `consume = latest`.",
+            ),
+            (
+                "trigger, consume = latest, consume = fifo",
+                "`consume` given twice. Write `consume = fifo` (the default) or \
+                 `consume = latest`.",
+            ),
+        ];
+        for (attr, want) in cases {
+            let err = parse_consume_attr(attr)
+                .expect_err("the macro refuses this form, so the CLI must too")
+                .to_string();
+            assert!(
+                err.contains("node `cam_reader` field `cam`: ") && err.ends_with(want),
+                "`#[input({attr})]`: want `{want}`, got: {err}"
+            );
+        }
+    }
+
+    /// The CLI's refusal texts are the MACRO's, read out of the macro's own
+    /// source, so neither side can reword its half alone.
+    #[test]
+    fn the_consume_refusals_match_the_macro_source_word_for_word() {
+        let src = concat!(
+            include_str!("../../cerulion_macros/src/parse.rs"),
+            include_str!("../../cerulion_macros/src/validate.rs")
+        );
+        // Undo the source's `\` line continuations, the way the compiler does.
+        let mut joined = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find("\\\n") {
+            joined.push_str(&rest[..at]);
+            rest = rest[at + 2..].trim_start();
+        }
+        joined.push_str(rest);
+        for text in [
+            crate::node_metadata_consume::CONSUME_NEEDS_TRIGGER,
+            crate::node_metadata_consume::SYNC_CONSUME_LATEST_REFUSED,
+            "`consume = fifo` (the default) or `consume = latest`",
+        ] {
+            assert!(joined.contains(text), "the macro source must carry: {text}");
+        }
+    }
+
+    #[test]
+    fn parse_macro_node_refuses_latest_on_a_sync_node_as_the_macro_does() {
+        for (attr, fields) in [
+            ("sync_window_ms = 20", 2),
+            ("unbounded_sync", 2),
+            ("sync_window_ms = 20", 1),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let second = if fields == 2 {
+                "    #[input(trigger)]\n    right: u32,\n"
+            } else {
+                ""
+            };
+            let src = format!(
+                "use cerulion_core::prelude::*;\n\n#[cerulion_node({attr})]\n\
+                 #[derive(Default)]\nstruct Pair {{\n    #[input(trigger, consume = latest)]\n    \
+                 left: u32,\n{second}}}\n"
+            );
+            let node_dir = write_node(&tmp, "pair", &src);
+            let err = parse_node_metadata(&node_dir)
+                .expect_err("the macro refuses this node")
+                .to_string();
+            assert!(
+                err.contains("node `pair` field `left`: ")
+                    && err.ends_with(crate::node_metadata_consume::SYNC_CONSUME_LATEST_REFUSED),
+                "{attr} with {fields} trigger(s): {err}"
+            );
         }
     }
 

@@ -3111,6 +3111,7 @@ nodes:
             depth,
             backpressure: Default::default(),
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let infos = [("a", Some(depth_a)), ("b", Some(depth_b)), ("c", None)]
             .into_iter()

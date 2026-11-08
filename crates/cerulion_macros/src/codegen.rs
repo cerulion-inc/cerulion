@@ -846,6 +846,14 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 Some(ms) => quote! { ::std::option::Option::Some(#ms) },
                 None => quote! { ::std::option::Option::None },
             };
+            let consume_tok: TokenStream = match i.consume {
+                Some(crate::parse::ParsedConsume::Latest) => {
+                    quote! { #__cer_root::graph::node::InputConsume::Latest }
+                }
+                Some(crate::parse::ParsedConsume::Fifo) | None => {
+                    quote! { #__cer_root::graph::node::InputConsume::Fifo }
+                }
+            };
             quote! {
                 #__cer_root::graph::node::InputMeta {
                     name: #name.to_string(),
@@ -854,6 +862,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     depth: #depth_tok,
                     backpressure: #backpressure_tok,
                     expect_within_ms: #expect_within_tok,
+                    consume: #consume_tok,
                 }
             }
         })
@@ -1510,6 +1519,15 @@ fn gen_cdylib(
                     suffix.push_str(&format!(r#","backpressure":{{"sample":{n}}}"#));
                 }
                 None => {}
+            }
+            // The declared `consume`. ADDITIVE, like `wire_fixed_size` on the
+            // outputs: emitted only for `latest`, and an absent key is the
+            // host's `fifo` default, so a host that predates the key reads
+            // every node this macro emitted for `fifo` exactly as before.
+            // An explicit `consume = fifo` emits nothing, because it means
+            // the same as no declaration.
+            if i.consume == Some(crate::parse::ParsedConsume::Latest) {
+                suffix.push_str(r#","consume":"latest""#);
             }
             suffix
         })
@@ -3511,7 +3529,9 @@ mod advertised_attribute_parity_tests {
     //! ADVERTISE to the user, so the two halves cannot drift apart either.
 
     use super::gen_cdylib;
-    use crate::parse::{FieldInputAttr, FieldOutputAttr, NodeLevelAttrs, ParsedBackpressurePolicy};
+    use crate::parse::{
+        FieldInputAttr, FieldOutputAttr, NodeLevelAttrs, ParsedBackpressurePolicy, ParsedConsume,
+    };
     use std::collections::BTreeSet;
 
     /// Node-level attributes that are deliberately compile-time-only — they
@@ -3558,6 +3578,7 @@ mod advertised_attribute_parity_tests {
             backpressure: None,
             expect_within_ms: None,
             accumulate: None,
+            consume: None,
         }
     }
 
@@ -3751,6 +3772,16 @@ mod advertised_attribute_parity_tests {
                     ..base
                 },
                 r#""depth":51"#.to_string(),
+            ),
+            // `consume = latest` reaches the cdylib host as an additive key;
+            // the host's absent-key default is `fifo`.
+            "consume" => (
+                FieldInputAttr {
+                    trigger: true,
+                    consume: Some(ParsedConsume::Latest),
+                    ..base
+                },
+                r#""consume":"latest""#.to_string(),
             ),
             _ => return None,
         })

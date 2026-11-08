@@ -13059,6 +13059,7 @@ pub(crate) fn source_entry_infos(
                     depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                     backpressure: *backpressure,
                     expect_within_ms: None,
+                    consume: Default::default(),
                 },
             )
             .collect();
