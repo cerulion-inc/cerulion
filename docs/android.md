@@ -394,7 +394,7 @@ drops its oldest frames. The runtime creates each `publish` topic with a queue
 as deep as the deepest graph input that reads it, so any `depth` a node can
 declare, up to 64, holds that many frames, recorded or not. A node that
 reports a deeper input fails the start before the app creates any topic
-and before any node's `init` runs, so a refused start has no side effects:
+and before the `init` of any node in the graph runs:
 `status` reports `state` `failed` with `last_error.code` 5 and a message that
 names the input, its depth and the limit of 64. A plain `#[input]` on a
 `period_ms` node holds the latest frame: the node produces nothing until the
