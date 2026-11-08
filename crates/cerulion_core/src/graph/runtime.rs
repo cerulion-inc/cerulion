@@ -1083,6 +1083,10 @@ fn probe_trigger_body(
                 false,
                 "probed trigger binding node '{node_id}' absent from self.nodes"
             );
+            tracing::error!(
+                node_id = %node_id,
+                "probed trigger node absent; consume = latest body probe skipped"
+            );
             TriggerProbe::Unknown
         }
     }
@@ -9267,12 +9271,13 @@ impl GraphRuntime {
             tracing::warn!(
                 inputs = %latest_unprobed.join(","),
                 "consume = latest inputs read through two subscribers, each on a node \
-                 that cannot tell whether its read will find a frame (no \
-                 `cerulion_node_sync_head_op` export: a raw-FFI node library or a \
-                 hand-written entry). Each fires on every arrival its trigger \
-                 subscriber counts, including a frame an earlier read already took, \
-                 and that fire reads nothing. Build the node with `#[cerulion_node]` \
-                 to fire only on a frame its read will find."
+                 that cannot tell whether its read will find a frame. Each fires on \
+                 every arrival its trigger subscriber counts, including a frame an \
+                 earlier read already took, and that fire reads nothing. A node built \
+                 with `#[cerulion_node]` answers; a raw-FFI node library answers by \
+                 exporting `cerulion_node_sync_head_op` and answering op code 0; a \
+                 hand-written entry answers by implementing \
+                 `NodeEntry::probes_trigger_input` and `probe_trigger_input`."
             );
         }
         if !refill_incapable.is_empty() {
@@ -18682,7 +18687,7 @@ impl GraphRuntime {
                     // answer is behind the `(u64, Option<u64>)` FFI return the
                     // cdylib drain shares, so keying on it is an ABI change for
                     // a decision the pending count already makes correctly.
-                    // The SEPARATE discipline is untouched — it drains a
+                    // The SEPARATE discipline takes no such gate: it drains a
                     // dedicated subscriber that never re-offers, so its
                     // per-frame signals are per-frame truth. (A `consume =
                     // latest` input there mints only while its body subscriber

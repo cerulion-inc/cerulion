@@ -796,8 +796,8 @@ fn gap_runtime(
 /// 3. `idle` empty steps, then frame 3 and two steps: one fire reading 3.
 ///
 /// Oracle, from the rule that a frame a read drained is not counted again:
-/// reads `[2, 3]` in exactly 2 fires. Before the trigger and body views were
-/// kept consistent, step 2 fired once more on an empty queue: 3 fires.
+/// reads `[2, 3]` in exactly 2 fires. Without the body probe, step 2 fires
+/// once more on an empty queue: 3 fires.
 fn drive_gap(
     runtime: &mut GraphRuntime,
     ext: &SharedPublisher,
@@ -833,12 +833,17 @@ fn run_gap_closure(prefix: &str, c: Consumer, opt_out_of_unified: bool) -> (Vec<
 }
 
 /// Forced Separate, `drop_oldest`: a frame landing between the trigger drain
-/// and the read is served by that read and fires nothing more.
+/// and the read is served by that read and fires nothing more. The closure
+/// answers the probe, so the build names nothing.
 #[test]
 #[serial]
+#[tracing_test::traced_test]
 fn a_frame_landing_between_the_drains_is_read_once_and_fires_nothing_more() {
     let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
     let (observed, fired) = run_gap_closure("latgapsep", Consumer::latest(), false);
+    assert!(!logs_contain(
+        "cannot tell whether its read will find a frame"
+    ));
     assert_eq!(observed, vec![2, 3]);
     assert_eq!(
         fired,

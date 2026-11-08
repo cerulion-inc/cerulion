@@ -3086,10 +3086,12 @@ pub fn cdylib_platform_check() -> Result<(), String> {
 /// subscriber, the one the tick reads, still holds a frame for that arrival.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerProbe {
-    /// A read now would find a frame no read has taken yet.
+    /// The body subscriber holds a frame no read has taken yet. A read still
+    /// applies the input's own policy to it: `sample(N)` may decimate it and a
+    /// malformed frame is refused, so such a read can serve nothing.
     Unread,
-    /// A read now would find nothing: every frame delivered so far was taken
-    /// by an earlier read.
+    /// The body subscriber holds no frame: every frame delivered to it so far
+    /// was taken by an earlier read.
     Empty,
     /// The entry could not answer (no probe, a failed probe, a poisoned
     /// lock). The step treats the arrival as it would without a probe.
@@ -3489,9 +3491,9 @@ pub trait NodeEntry: Send {
     ///
     /// The default asks [`SyncHeadOp::ProbeNext`] when the entry
     /// [`Self::supports_sync_head_ops`]: the probe reports a staged next frame
-    /// or a non-empty subscriber queue, and a `consume = latest` input stages
-    /// nothing and holds no frozen slot between reads, so the answer is
-    /// whether its queue holds a frame. On a cdylib that probe crosses
+    /// or a non-empty subscriber queue. A `consume = latest` input read through
+    /// two subscribers stages nothing and has no frozen slot (its tick reads
+    /// the queue live), so the answer is whether its queue holds a frame. On a cdylib that probe crosses
     /// `cerulion_node_sync_head_op` as op code [`SYNC_HEAD_OP_PROBE_NEXT`],
     /// which every `#[cerulion_node]` cdylib exports. Without head ops the
     /// default answers [`TriggerProbe::Unknown`].
@@ -3858,9 +3860,8 @@ impl NodeEntry for ClosureNodeEntry {
     }
 
     // The probe reads the body subscriber's queue and touches no frozen slot,
-    // so it answers on BOTH settings of `unified_drain`: an opted-out closure
-    // reads its trigger through two subscribers, which is the shape the probe
-    // exists for.
+    // so it answers on BOTH settings of `unified_drain`, including an opted-out
+    // closure, whose trigger input is read through two subscribers.
     fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
         match self.context.as_mut() {
             Some(ctx) => trigger_probe_from(ctx.sync_head_op(input_name, SyncHeadOp::ProbeNext)),
