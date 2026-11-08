@@ -8,6 +8,8 @@
 # per case to serve the right bytes, wrong bytes, or an HTTP error, and every
 # URL the shim is asked for is logged. The shim answers only the two exact URL
 # shapes of the pinned version, so a changed route URL fails here too.
+# `curl --version` reports the version a case sets, and a curl older than 7.71
+# rejects `--retry-all-errors` as an unknown option, as a real one does.
 #
 # The installer under test is a copy whose three pinned checksums are replaced
 # by the fixtures' checksums; the real checksums name the real release, which
@@ -92,7 +94,19 @@ mkdir -p "$shim_bin"
 cat > "$shim_bin/curl" <<'SHIM'
 #!/bin/sh
 set -eu
+if [ "$*" = --version ]; then
+    printf 'curl %s (fixture) libcurl/%s\nProtocols: https\n' "$FIXTURE_CURL_VERSION" "$FIXTURE_CURL_VERSION"
+    exit 0
+fi
 printf '%s\n' "$*" >> "$FIXTURE_LOG"
+case " $* " in
+    *" --retry-all-errors "*)
+        if [ "$FIXTURE_CURL_OLD" = 1 ]; then
+            printf 'curl: option --retry-all-errors: is unknown\n' >&2
+            exit 2
+        fi
+        ;;
+esac
 url='' out=''
 for flag in --retry --connect-timeout --max-time --fail; do
     case " $* " in
@@ -134,7 +148,7 @@ esac
 SHIM
 chmod +x "$shim_bin/curl"
 
-export FIXTURE_DIR=$fixtures FIXTURE_VERSION=$version
+export FIXTURE_DIR=$fixtures FIXTURE_VERSION=$version FIXTURE_CURL_VERSION=8.7.1 FIXTURE_CURL_OLD=0
 
 primary_url=https://get.nexte.st/$version/$host_platform
 
@@ -157,6 +171,7 @@ run_case() {
         FIXTURE_LOG="$log" "$work/install_nextest.sh" "$@" > "$stdout" 2> "$stderr" || status=$?
     cat "$stdout" "$stderr" > "$out"
     unset FIXTURE_ODD
+    export FIXTURE_CURL_VERSION=8.7.1 FIXTURE_CURL_OLD=0
 }
 
 urls_requested() { awk '{for (i = 1; i < NF; i++) if ($i == "--url") print $(i + 1)}' "$log"; }
@@ -171,7 +186,27 @@ run_case primary-good good fail
 [ "$(installed_label)" = "$host_platform" ] || fail "primary good: the installed binary is not the $host_platform fixture" "$out"
 grep -q '^::' "$out" && fail "primary good: printed an annotation" "$out"
 [ "$(urls_requested)" = "$primary_url" ] || fail "primary good: requested $(urls_requested | tr '\n' ' ')" "$out"
+grep -q -- ' --retry-all-errors ' "$log" || fail "primary good: curl 8.7.1 was not given --retry-all-errors" "$out"
 printf 'primary route serves the pinned bytes: passed\n'
+
+# A curl older than 7.71, or one whose version does not parse, is given plain
+# --retry, and the install still succeeds; at 7.71 the option is passed.
+for curl_version in 7.70.0 7.68.0 7.7 unknown ""; do
+    export FIXTURE_CURL_VERSION=$curl_version FIXTURE_CURL_OLD=1
+    run_case "old-curl-${curl_version:-empty}" good fail
+    [ "$status" -eq 0 ] || fail "curl '$curl_version': exit $status" "$out"
+    [ "$(installed_label)" = "$host_platform" ] || fail "curl '$curl_version': nothing installed" "$out"
+    grep -q -- '--retry-all-errors' "$log" && fail "curl '$curl_version': --retry-all-errors was passed" "$out"
+    grep -q -- '--retry 5 ' "$log" || fail "curl '$curl_version': plain --retry was not passed" "$out"
+    grep -q 'does not report 7.71 or newer, so only its transient errors are retried' "$out" \
+        || fail "curl '$curl_version': the fallback was not reported" "$out"
+done
+export FIXTURE_CURL_VERSION=7.71.0
+run_case new-curl-7.71 good fail
+[ "$status" -eq 0 ] || fail "curl 7.71.0: exit $status" "$out"
+grep -q -- ' --retry-all-errors ' "$log" || fail "curl 7.71.0: --retry-all-errors was not passed" "$out"
+grep -q 'transient errors are retried' "$out" && fail "curl 7.71.0: reported as older than 7.71" "$out"
+printf 'curl older than 7.71 falls back to plain --retry: passed\n'
 
 # The primary fails to download: a warning, the fallback installs.
 run_case primary-fails fail good
@@ -216,7 +251,126 @@ unset NEXTEST_PRIMARY_URL
 [ "$status" -eq 0 ] || fail "escaped annotation: exit $status" "$out"
 grep -q "^::error::install_nextest: $primary_url?probe=100%25 served bytes" "$out" \
     || fail "escaped annotation: the % in the URL was not escaped" "$out"
+# CR and LF reach the workflow command as %0D and %0A, so the annotation stays
+# on one line.
+export NEXTEST_PRIMARY_URL="$primary_url?probe=a"$'\r'"b"$'\n'"c"
+run_case escaped-newlines wrong good
+unset NEXTEST_PRIMARY_URL
+[ "$status" -eq 0 ] || fail "escaped CR and LF: exit $status" "$out"
+grep -q "^::error::install_nextest: $primary_url?probe=a%0Db%0Ac served bytes" "$out" \
+    || fail "escaped CR and LF: the annotation is not one line with %0D and %0A" "$out"
 printf 'annotation text is escaped: passed\n'
+
+# --- the tarball cache -------------------------------------------------------
+asset_of() {
+    case "$1" in
+        linux) printf 'cargo-nextest-%s-x86_64-unknown-linux-gnu.tar.gz' "$version" ;;
+        linux-arm) printf 'cargo-nextest-%s-aarch64-unknown-linux-gnu.tar.gz' "$version" ;;
+        mac) printf 'cargo-nextest-%s-universal-apple-darwin.tar.gz' "$version" ;;
+    esac
+}
+host_asset=$(asset_of "$host_platform")
+
+# A cached tarball with the pinned bytes installs with no request.
+mkdir -p "$work/cache-hit/tarballs"
+cp "$fixtures/good-$host_platform.tar.gz" "$work/cache-hit/tarballs/$host_asset"
+export CERULION_TOOL_TARBALLS=$work/cache-hit/tarballs
+run_case cache-hit fail fail
+[ "$status" -eq 0 ] || fail "cache hit: exit $status" "$out"
+[ "$(installed_label)" = "$host_platform" ] || fail "cache hit: the cached tarball was not installed" "$out"
+[ ! -s "$log" ] || fail "cache hit: a download was requested" "$out"
+grep -q '^::' "$out" && fail "cache hit: printed an annotation" "$out"
+grep -q "verified (tarball cache $work/cache-hit/tarballs/$host_asset)" "$out" || fail "cache hit: the cache file was not named" "$out"
+printf 'a verified cached tarball installs without a download: passed\n'
+
+# A cached tarball with other bytes is an error, is replaced by the download,
+# and the install still succeeds.
+mkdir -p "$work/cache-wrong/tarballs"
+cp "$fixtures/wrong.tar.gz" "$work/cache-wrong/tarballs/$host_asset"
+export CERULION_TOOL_TARBALLS=$work/cache-wrong/tarballs
+run_case cache-wrong good fail
+[ "$status" -eq 0 ] || fail "cache wrong bytes: exit $status" "$out"
+[ "$(installed_label)" = "$host_platform" ] || fail "cache wrong bytes: the download was not installed" "$out"
+grep -q "^::error::install_nextest: the tarball cache file $work/cache-wrong/tarballs/$host_asset does not match the pinned sha256" "$out" \
+    || fail "cache wrong bytes: no error annotation naming the cache file" "$out"
+[ "$(sha256_of "$work/cache-wrong/tarballs/$host_asset")" = "$(sha256_of "$fixtures/good-$host_platform.tar.gz")" ] \
+    || fail "cache wrong bytes: the cache file was not replaced with the pinned bytes" "$out"
+printf 'a cached tarball that fails the checksum is an error and is replaced: passed\n'
+
+# A miss downloads and stores the verified tarball; a leading ~/ is $HOME.
+export CERULION_TOOL_TARBALLS=\~/tarballs
+run_case cache-miss good fail
+[ "$status" -eq 0 ] || fail "cache miss: exit $status" "$out"
+[ "$(sha256_of "$work/cache-miss/tarballs/$host_asset")" = "$(sha256_of "$fixtures/good-$host_platform.tar.gz")" ] \
+    || fail "cache miss: the downloaded tarball was not stored under \$HOME/tarballs" "$out"
+for leftover in "$work/cache-miss/tarballs"/*.partial.*; do
+    [ ! -e "$leftover" ] || fail "cache miss: a partial file was left in the cache" "$out"
+done
+printf 'a downloaded tarball is stored in the cache: passed\n'
+
+# A cache directory that cannot be written does not fail the install.
+: > "$work/not-a-directory"
+export CERULION_TOOL_TARBALLS=$work/not-a-directory
+run_case cache-unwritable good fail
+[ "$status" -eq 0 ] || fail "unwritable cache: exit $status" "$out"
+[ "$(installed_label)" = "$host_platform" ] || fail "unwritable cache: nothing installed" "$out"
+grep -q "could not write the tarball cache $work/not-a-directory" "$out" || fail "unwritable cache: not reported" "$out"
+printf 'an unwritable cache leaves the install to the download: passed\n'
+
+# --fill-cache: each named platform from its primary, nothing installed.
+export CERULION_TOOL_TARBALLS=$work/fill/tarballs
+run_case fill good fail --fill-cache linux mac
+[ "$status" -eq 0 ] || fail "fill: exit $status" "$out"
+for platform in linux mac; do
+    [ "$(sha256_of "$work/fill/tarballs/$(asset_of "$platform")")" = "$(sha256_of "$fixtures/good-$platform.tar.gz")" ] \
+        || fail "fill: $platform is not in the cache" "$out"
+done
+[ ! -e "$work/fill/tarballs/$(asset_of linux-arm)" ] || fail "fill: an unnamed platform was fetched" "$out"
+[ "$(urls_requested | wc -l | tr -d ' ')" -eq 2 ] || fail "fill: expected two requests" "$out"
+[ ! -e "$home/bin" ] || fail "fill: something was installed" "$out"
+printf 'fill mode fetches the named platforms into the cache: passed\n'
+
+# A full cache is left alone.
+run_case fill-warm fail fail --fill-cache linux mac
+[ "$status" -eq 0 ] || fail "fill, warm cache: exit $status" "$out"
+[ ! -s "$log" ] || fail "fill, warm cache: a download was requested" "$out"
+printf 'fill mode leaves a verified cache alone: passed\n'
+
+# Wrong bytes from one primary: the error annotation, then the fallback.
+export CERULION_TOOL_TARBALLS=$work/fill-wrong/tarballs FIXTURE_ODD=primary:mac:wrong
+run_case fill-wrong good good --fill-cache linux mac
+[ "$status" -eq 0 ] || fail "fill, wrong primary: exit $status" "$out"
+grep -q "^::error::install_nextest: https://get.nexte.st/$version/mac served bytes that do not match" "$out" \
+    || fail "fill, wrong primary: no error annotation" "$out"
+[ "$(sha256_of "$work/fill-wrong/tarballs/$(asset_of mac)")" = "$(sha256_of "$fixtures/good-mac.tar.gz")" ] \
+    || fail "fill, wrong primary: the fallback's bytes are not in the cache" "$out"
+printf 'fill mode falls back on wrong bytes: passed\n'
+
+# No source for a platform: nonzero, the platform named, and neither a file nor
+# a partial file left for it.
+export CERULION_TOOL_TARBALLS=$work/fill-fail/tarballs FIXTURE_ODD=primary:mac:fail
+run_case fill-fail good fail --fill-cache linux mac
+[ "$status" -ne 0 ] || fail "fill, no source: exit 0" "$out"
+grep -q 'no route delivered the pinned cargo-nextest [0-9.]* (mac): both downloads failed' "$out" \
+    || fail "fill, no source: not diagnosed" "$out"
+[ ! -e "$work/fill-fail/tarballs/$(asset_of mac)" ] || fail "fill, no source: a mac tarball was left in the cache" "$out"
+for leftover in "$work/fill-fail/tarballs"/*.partial.*; do
+    [ ! -e "$leftover" ] || fail "fill, no source: a partial file was left in the cache" "$out"
+done
+printf 'fill mode fails when no source delivers: passed\n'
+
+# Usage: fill needs a platform it knows and a cache directory.
+run_case fill-noplatform good good --fill-cache
+[ "$status" -ne 0 ] || fail "fill usage: no platform was accepted" "$out"
+run_case fill-badplatform good good --fill-cache windows
+[ "$status" -ne 0 ] || fail "fill usage: an unknown platform was accepted" "$out"
+[ ! -s "$log" ] || fail "fill usage: an unknown platform fetched something" "$out"
+unset CERULION_TOOL_TARBALLS
+run_case fill-nodir good good --fill-cache linux
+[ "$status" -ne 0 ] || fail "fill usage: no CERULION_TOOL_TARBALLS was accepted" "$out"
+grep -q 'CERULION_TOOL_TARBALLS, which is not set' "$out" || fail "fill usage: the missing directory was not named" "$out"
+[ ! -s "$log" ] || fail "fill usage: fetched without a cache directory" "$out"
+printf 'fill mode refuses bad arguments: passed\n'
 
 # Without shasum or sha256sum nothing is fetched, in either mode; a pinned
 # cargo-nextest already on PATH is still accepted, because that check needs no
@@ -271,6 +425,13 @@ run_case pins-agree good good --print-pins "$version"
 [ "$(urls_requested | wc -l | tr -d ' ')" -eq 6 ] || fail "pins agree: expected six requests" "$out"
 [ ! -e "$home/bin" ] || fail "pins agree: the recipe installed something" "$out"
 printf 'pin recipe prints the block when both routes agree: passed\n'
+
+# The recipe runs on a curl older than 7.71 too.
+export FIXTURE_CURL_VERSION=7.68.0 FIXTURE_CURL_OLD=1
+run_case pins-old-curl good good --print-pins "$version"
+[ "$status" -eq 0 ] || fail "pins, curl 7.68.0: exit $status" "$out"
+[ "$(cat "$stdout")" = "$expected_pins" ] || fail "pins, curl 7.68.0: stdout is not the pin block" "$out"
+printf 'pin recipe runs on curl older than 7.71: passed\n'
 
 # The block it prints is the block the installer reads: pasting it into the
 # fixture copy changes nothing.

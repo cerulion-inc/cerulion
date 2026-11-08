@@ -410,9 +410,10 @@ that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/
 the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
 the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
 crates.io script self-tests (the index wait, the publish retry, and the post-publish
-archive reader `release.yml` runs after an upload); the nextest and actionlint installer
-self-tests and the tool download check (`tools/scripts/check_tool_downloads.py`: every
-download in a workflow or a tool fetcher is retried, bounded and written to a file); the
+archive reader `release.yml` runs after an upload); the nextest, actionlint and cargo-deny
+installer self-tests, the tool tarball cache key self-test and the tool download check
+(`tools/scripts/check_tool_downloads.py`: every curl download in a workflow or a tool
+fetcher is retried, bounded and written to a file, and every fetcher holds one); the
 naming gate (pull requests only);
 `shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
@@ -496,7 +497,9 @@ status context on `main`, so a skipped one is simply absent from a pull request'
 They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
 from its PR-blocking view, so none of the five can credit pull-request coverage it does not
-provide.
+provide. `tool-tarballs` runs on push and `workflow_dispatch` only as well, by an `if:` that
+lists those two events; it fills and saves the pinned tool tarball cache (below) and runs no
+test.
 
 The MSRV check (`msrv`) runs on every pull request and every push to `main`, and carries
 `if: github.event_name != 'merge_group'` alone: a compiler-floor break found after the merge
@@ -691,7 +694,7 @@ The policy is two workflow-level `env` values, each defaulting from a repository
   `actions: write`, so the prune's delete would fail the job; the clause tests
   `github.event.pull_request.head.repo.full_name == github.repository`.
 
-Before every save of a lockfile-keyed archive (the machete tool cache is exempt, below)
+Before every save of a lockfile-keyed archive (the tool caches are exempt, below)
 `tools/scripts/ci_cache_prune.sh "<the save key>"` runs: it keeps exactly that key and deletes
 every other entry of the namespace (stale lockfile generations, `pr` scoped entries, legacy
 unqualified keys), so the store never holds two archives of one namespace and a lockfile change
@@ -754,11 +757,19 @@ one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-
 `restore-keys` to `cargo-Linux-main-`, the shards' archive;
 `test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
 
-Two exemptions, both narrow. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed on
-the pinned version and not on a lockfile hash) is a TOOL cache: a few MB with no lockfile
-generation for the prune to work from, so it carries no namespace gate and no prune step, only
-the cache-hit test and the merge-queue test. Gating it into a namespace the default never names
-meant the binary was never cached and `cargo install cargo-machete` ran on every push.
+Two exemptions, both narrow. The TOOL caches carry no lockfile generation for the prune to
+work from, so they carry no namespace gate and no prune step, only the cache-hit test and the
+merge-queue test. There are two. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed
+on the pinned version) is a few MB; gating it into a namespace the default never names meant the
+binary was never cached and `cargo install cargo-machete` ran on every push. The pinned tool
+tarball cache (`~/.cache/cerulion-tool-tarballs`, about 33 MB) holds the nextest tarballs for
+Linux x86_64 and macOS and the cargo-deny tarball for Linux x86_64, under the key
+`tools/scripts/tool_tarball_cache.sh key` derives from both installers' pins and the platform
+lists its `fill` fetches, so a moved pin is a new key. Only the `tool-tarballs` job saves it.
+`test-linux`, `test-macos`, `deps` and `advisories.yml` restore it and point
+`CERULION_TOOL_TARBALLS` at it; `install_nextest.sh` and `install_cargo_deny.sh` use a cached
+tarball only after the pinned checksum test a download faces, and a cached file that fails it
+is an `::error::` annotation, is deleted and is downloaded again.
 `release.yml` restores and never saves: a tag run's entry is restorable by no other ref, so
 saving one would only add to the store.
 

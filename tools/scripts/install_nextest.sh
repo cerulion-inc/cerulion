@@ -8,9 +8,18 @@
 # already publishes. So this fetches the OFFICIAL pre-built tarball from
 # nextest's own domain, which is the install route nextest documents for CI.
 # get.nexte.st answers with a redirect to the asset on nextest's GitHub release;
-# when get.nexte.st itself fails, the script fetches that same asset from the
-# GitHub release directly, and the one pinned checksum per platform below
-# verifies the bytes from either route.
+# when get.nexte.st fails to deliver, or delivers bytes that do not match the
+# pin, the script fetches that same asset from the GitHub release directly, and
+# the one pinned checksum per platform below verifies the bytes from either
+# route.
+#
+# TARBALL CACHE. When CERULION_TOOL_TARBALLS names a directory, a tarball of the
+# pinned release found there is used without a download, after the same
+# checksum test a download faces; a file there that fails it is an `::error::`
+# annotation, is deleted, and the routes are tried. A tarball a route delivers
+# is copied into the directory. `--fill-cache PLATFORM...` downloads only into
+# that directory, one tarball per named platform (`linux`, `linux-arm`, `mac`),
+# and installs nothing. A leading `~/` in the variable is read as $HOME.
 #
 # PINNED, never `latest`, and pinned BY CONTENT as well as by version. The
 # whole point of the fence in `.config/nextest.toml` is that the runner's
@@ -54,7 +63,7 @@ die() {
     exit 1
 }
 
-usage="usage: install_nextest.sh [--print-pins VERSION]"
+usage="usage: install_nextest.sh [--print-pins VERSION | --fill-cache PLATFORM...]"
 
 # annotate LEVEL MESSAGE prints a GitHub Actions workflow command, which the
 # runner turns into an annotation of that level (`warning` or `error`) on the
@@ -114,21 +123,52 @@ fallback_url_of() {
 # error page. `--location` follows get.nexte.st's redirect to the release
 # asset, and `--proto-redir '=https'` keeps every hop of it on HTTPS.
 #
-# `--retry-all-errors` widens `--retry` from curl's transient class (a timeout,
-# and HTTP 408, 429, 500, 502, 503 and 504) to every failure, including a
-# connection reset (`curl: (35) Recv failure: Connection reset by peer`), which
-# `--retry` alone gives up on. That is five retries at least five seconds
-# apart, longer when the server sends a Retry-After; curl discards a partial
-# file before each retry. `--connect-timeout` and `--max-time` bound one
-# attempt, and `--retry-max-time` starts no new attempt after 120 s, so a host
-# that stalls hands over to the next route.
+# `--retry 5 --retry-delay 5` retries curl's transient class (a timeout, and
+# HTTP 408, 429, 500, 502, 503 and 504) five times at least five seconds apart,
+# longer when the server sends a Retry-After; curl discards a partial file
+# before each retry. `--retry-all-errors` widens that to every failure,
+# including a connection reset (`curl: (35) Recv failure: Connection reset by
+# peer`), which `--retry` alone gives up on. It exists from curl 7.71.0 and an
+# older curl rejects the option before any transfer starts, so it is passed only
+# when `curl --version` reports 7.71 or newer; a version that does not parse
+# counts as older. `--connect-timeout` and `--max-time` bound one attempt, and
+# `--retry-max-time` starts no new attempt after 120 s, so a host that stalls
+# hands over to the next route.
+curl_retries_all_errors() {
+    local major minor
+    major=${1%%.*}
+    minor=${1#*.}
+    minor=${minor%%.*}
+    case "$major" in ''|*[!0-9]*) return 1 ;; esac
+    case "$minor" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$major" -gt 7 ] || { [ "$major" -eq 7 ] && [ "$minor" -ge 71 ]; }
+}
+
+# retry_all_errors holds `--retry-all-errors` or nothing; curl_checked records
+# that `curl --version` was read, which happens once, before the first download.
+retry_all_errors=()
+curl_checked=0
+check_curl() {
+    local version
+    [ "$curl_checked" -eq 0 ] || return 0
+    curl_checked=1
+    version=$(curl --version 2>/dev/null | awk 'NR == 1 {print $2}') || version=""
+    if curl_retries_all_errors "$version"; then
+        retry_all_errors=(--retry-all-errors)
+    else
+        printf 'install_nextest: curl %s does not report 7.71 or newer, so only its transient errors are retried\n' \
+            "${version:-(version unknown)}" >&2
+    fi
+}
+
 download() {
     local src=$1 out=$2
+    check_curl
     printf 'install_nextest: fetching %s\n' "$src" >&2
     rm -f "$out"
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
         --fail --silent --show-error --location \
-        --retry 5 --retry-delay 5 --retry-all-errors --retry-max-time 120 \
+        --retry 5 --retry-delay 5 ${retry_all_errors[@]+"${retry_all_errors[@]}"} --retry-max-time 120 \
         --connect-timeout 30 --max-time 180 --url "$src" -o "$out" && return 0
     printf 'install_nextest: download failed for %s\n' "$src" >&2
     rm -f "$out"
@@ -173,11 +213,19 @@ NEXTEST_SHA256_${platform//-/_}=$primary_sha"
     printf '%s\n' "$pins"
 }
 
+mode=install
+fill_platforms=()
 case "${1-}" in
     --print-pins)
         [ "$#" -eq 2 ] || die "$usage"
         print_pins "$2"
         exit 0
+        ;;
+    --fill-cache)
+        [ "$#" -ge 2 ] || die "$usage"
+        mode=fill
+        shift
+        fill_platforms=("$@")
         ;;
     *)
         [ "$#" -eq 0 ] || die "$usage"
@@ -202,6 +250,135 @@ A version and its checksums are ONE edit. To move the pin, change
 NEXTEST_PINNED_VERSION and regenerate all three hashes (the header shows how),
 then re-read the fence semantics in .config/nextest.toml — an upstream release
 can change how tests are SCHEDULED, which is the whole reason this is pinned."
+fi
+
+# expected_sha_of PLATFORM: the pinned checksum of PLATFORM's tarball.
+expected_sha_of() {
+    case "$1" in
+        linux)     printf '%s' "$NEXTEST_SHA256_linux" ;;
+        linux-arm) printf '%s' "$NEXTEST_SHA256_linux_arm" ;;
+        mac)       printf '%s' "$NEXTEST_SHA256_mac" ;;
+        *)         die "no pinned checksum is known for platform '$1'; the platforms are linux, linux-arm and mac" ;;
+    esac
+}
+
+# The tarball cache directory, empty when CERULION_TOOL_TARBALLS is unset. A
+# cached tarball carries its GitHub release asset name.
+cache_dir=${CERULION_TOOL_TARBALLS:-}
+case "$cache_dir" in
+    \~/*) cache_dir=$HOME/${cache_dir#\~/} ;;
+esac
+cached_path_of() {
+    printf '%s/cargo-nextest-%s-%s.tar.gz' "$cache_dir" "$NEXTEST_VERSION" "$(target_of "$1")"
+}
+
+# fetch_verified URL OUT EXPECTED: download URL to OUT and compare it with
+# EXPECTED. Returns 0 only when OUT holds those bytes. Otherwise it deletes OUT,
+# prints the reason on stderr and returns 1 when the download failed, 2 when the
+# bytes arrived and do not match.
+fetch_verified() {
+    local src=$1 out=$2 want=$3 actual
+    download "$src" "$out" || return 1
+    actual=$(sha256_of "$out")
+    if [ "$actual" != "$want" ]; then
+        printf 'install_nextest: checksum mismatch for %s\n  expected %s\n  actual   %s\n' \
+            "$src" "$want" "$actual" >&2
+        rm -f "$out"
+        return 2
+    fi
+    printf 'install_nextest: sha256 %s verified\n' "$actual"
+}
+
+# store_in_cache FILE PLATFORM: copy FILE into the tarball cache under a
+# temporary name and rename it into place, so a reader never sees half a file.
+# Returns nonzero when the directory cannot be written.
+store_in_cache() {
+    local cached partial
+    cached=$(cached_path_of "$2")
+    partial="$cached.partial.$$"
+    mkdir -p "$cache_dir" && cp "$1" "$partial" && mv -f "$partial" "$cached" && return 0
+    rm -f "$partial"
+    return 1
+}
+
+# deliver PLATFORM PRIMARY OUT: put the pinned tarball of PLATFORM in OUT, from
+# the tarball cache, then PRIMARY, then the GitHub release asset. Exits the
+# script when no source delivers it.
+#
+# A source that fails hands over to the next one, whose bytes face the same
+# pinned checksum, and the failures are reported at different levels: a failed
+# download (an outage, a 404) as a `warning`; bytes that arrived, or that the
+# cache held, and do not match the pinned checksum as an `error`. The error
+# annotation stays on the run's summary when a later source then delivers and
+# the job passes.
+deliver() {
+    local platform=$1 primary=$2 out=$3 want fallback cached actual primary_status fallback_status
+    want=$(expected_sha_of "$platform")
+    fallback=$(fallback_url_of "$NEXTEST_VERSION" "$platform")
+    if [ -n "$cache_dir" ]; then
+        cached=$(cached_path_of "$platform")
+        if [ -f "$cached" ]; then
+            actual=$(sha256_of "$cached")
+            if [ "$actual" = "$want" ]; then
+                cp "$cached" "$out"
+                printf 'install_nextest: sha256 %s verified (tarball cache %s)\n' "$actual" "$cached"
+                return 0
+            fi
+            annotate error "the tarball cache file $cached does not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform); deleting it and downloading"
+            rm -f "$cached"
+        fi
+    fi
+    primary_status=0
+    fetch_verified "$primary" "$out" "$want" || primary_status=$?
+    if [ "$primary_status" -ne 0 ]; then
+        if [ "$primary_status" -eq 2 ]; then
+            annotate error "$primary served bytes that do not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform); falling back to the GitHub release asset"
+        else
+            annotate warning "$primary did not deliver the pinned release; falling back to the GitHub release asset"
+        fi
+        fallback_status=0
+        fetch_verified "$fallback" "$out" "$want" || fallback_status=$?
+        if [ "$fallback_status" -eq 2 ]; then
+            annotate error "$fallback served bytes that do not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform)"
+        fi
+        if [ "$fallback_status" -ne 0 ]; then
+            if [ "$primary_status" -eq 2 ] || [ "$fallback_status" -eq 2 ]; then
+                die "no route delivered the pinned cargo-nextest $NEXTEST_VERSION ($platform) (errors above).
+If NEXTEST_PINNED_VERSION was just bumped, the pinned checksums in this script
+must be bumped with it (the header shows how to regenerate them). A checksum
+mismatch on a route means the bytes it offered are not the release this repo
+pinned: do not run them."
+            fi
+            die "no route delivered the pinned cargo-nextest $NEXTEST_VERSION ($platform): both downloads failed (see above)."
+        fi
+    fi
+    if [ -n "$cache_dir" ] && ! store_in_cache "$out" "$platform"; then
+        printf 'install_nextest: could not write the tarball cache %s\n' "$cache_dir" >&2
+    fi
+    return 0
+}
+
+# --fill-cache: every named platform's tarball verified into the cache, and
+# nothing installed. A platform no source delivers ends the run nonzero. Each
+# platform's first route is get.nexte.st; NEXTEST_PRIMARY_URL is read by the
+# install only.
+if [ "$mode" = fill ]; then
+    [ -n "$cache_dir" ] || die "--fill-cache writes into CERULION_TOOL_TARBALLS, which is not set"
+    for platform in "${fill_platforms[@]}"; do
+        expected_sha_of "$platform" >/dev/null
+    done
+    require_sha256
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    for platform in "${fill_platforms[@]}"; do
+        deliver "$platform" "$(primary_url_of "$NEXTEST_VERSION" "$platform")" "$tmp/$platform.tar.gz"
+        cached=$(cached_path_of "$platform")
+        if ! { [ -f "$cached" ] && [ "$(sha256_of "$cached")" = "$(expected_sha_of "$platform")" ]; }; then
+            die "could not write $cached"
+        fi
+        printf 'install_nextest: %s holds the pinned %s tarball\n' "$cached" "$platform"
+    done
+    exit 0
 fi
 
 # The version as a WHOLE FIELD, never a prefix.
@@ -233,12 +410,12 @@ fi
 case "$(uname -s)" in
     Linux)
         case "$(uname -m)" in
-            x86_64|amd64)   platform=linux;     expected=$NEXTEST_SHA256_linux ;;
-            aarch64|arm64)  platform=linux-arm; expected=$NEXTEST_SHA256_linux_arm ;;
+            x86_64|amd64)   platform=linux ;;
+            aarch64|arm64)  platform=linux-arm ;;
             *) die "unsupported Linux arch '$(uname -m)' — add it here or install cargo-nextest by hand" ;;
         esac
         ;;
-    Darwin) platform=mac; expected=$NEXTEST_SHA256_mac ;;
+    Darwin) platform=mac ;;
     *)      die "unsupported OS '$(uname -s)' — add it here or install cargo-nextest by hand" ;;
 esac
 
@@ -249,62 +426,19 @@ dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
 require_sha256
 
-# The checksum is the pinned one above for both routes; it is never read from
-# either host.
+# The checksum is the pinned one above for every source; it is never read from
+# a host or from the cache.
 #
 # NEXTEST_PRIMARY_URL replaces the first route. It changes where the bytes come
 # from, not what runs, because whatever it serves must still match the pinned
 # checksum. Pointing it at a closed port exercises the second route.
 primary_url="${NEXTEST_PRIMARY_URL:-$(primary_url_of "$NEXTEST_VERSION" "$platform")}"
-fallback_url=$(fallback_url_of "$NEXTEST_VERSION" "$platform")
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tarball="$tmp/nextest.tar.gz"
 
-# fetch_verified URL: download URL to $tarball and compare it with the pinned
-# checksum. Returns 0 only when $tarball holds the pinned release. Otherwise it
-# deletes the file, prints the reason on stderr and returns 1 when the download
-# failed, 2 when the bytes arrived and do not match the pinned checksum.
-fetch_verified() {
-    local src=$1 actual
-    download "$src" "$tarball" || return 1
-    actual=$(sha256_of "$tarball")
-    if [ "$actual" != "$expected" ]; then
-        printf 'install_nextest: checksum mismatch for %s\n  expected %s\n  actual   %s\n' \
-            "$src" "$expected" "$actual" >&2
-        rm -f "$tarball"
-        return 2
-    fi
-    printf 'install_nextest: sha256 %s verified\n' "$actual"
-}
-
-# Both kinds of failure hand over to the next route, whose bytes face the same
-# pinned checksum, and they are reported at different levels: a failed download
-# (an outage, a 404) as a `warning`, bytes that arrived and do not match the
-# pinned checksum as an `error`. The error annotation stays on the run's
-# summary when the fallback then succeeds and the job passes.
-primary_status=0
-fetch_verified "$primary_url" || primary_status=$?
-if [ "$primary_status" -ne 0 ]; then
-    if [ "$primary_status" -eq 2 ]; then
-        annotate error "$primary_url served bytes that do not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform); falling back to the GitHub release asset"
-    else
-        annotate warning "$primary_url did not deliver the pinned release; falling back to the GitHub release asset"
-    fi
-    fallback_status=0
-    fetch_verified "$fallback_url" || fallback_status=$?
-    if [ "$fallback_status" -eq 2 ]; then
-        annotate error "$fallback_url served bytes that do not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform)"
-    fi
-    if [ "$fallback_status" -ne 0 ]; then
-        die "no route delivered the pinned cargo-nextest $NEXTEST_VERSION (errors above).
-If NEXTEST_PINNED_VERSION was just bumped, the pinned checksums in this script
-must be bumped with it (the header shows how to regenerate them). A checksum
-mismatch on a route means the bytes it offered are not the release this repo
-pinned: do not run them."
-    fi
-fi
+deliver "$platform" "$primary_url" "$tarball"
 
 tar -xzf "$tarball" -C "$tmp" || die "the download was not a gzip tarball"
 [ -f "$tmp/cargo-nextest" ] || die "the tarball did not contain a cargo-nextest binary"

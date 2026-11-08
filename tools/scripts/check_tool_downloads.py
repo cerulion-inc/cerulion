@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_tool_downloads.py: every download in CI is retried and bounded.
+"""check_tool_downloads.py: curl downloads in the workflows and the tool fetchers are retried and bounded.
 
     python3 tools/scripts/check_tool_downloads.py
     python3 tools/scripts/check_tool_downloads.py PATH...
@@ -7,21 +7,29 @@
 
 With no PATH it reads every workflow under `.github/workflows` and the tool
 and toolchain fetchers under `tools/scripts` (`install_*.sh` and
-`build_*_container.sh`), relative to the repository this file sits in.
+`build_*_container.sh`), relative to the repository this file sits in. It
+reads no Dockerfile: a `curl` in a `RUN` line is outside what it checks.
 
-A DOWNLOAD is a `curl` command with a URL whose bytes are kept: written with
+A DOWNLOAD is a `curl` command whose bytes are kept: written with
 `-o`/`--output`/`-O`, or sent to stdout, a pipe or a command substitution. A
-curl whose output goes to /dev/null (a readiness probe) or that carries no URL
-(`curl --version`) is not one. Backslash continuations are joined first, so a
+`curl` word followed by a URL is one wherever it stands, behind `timeout N`,
+`env`, `sudo`, `docker run IMAGE` or a wrapper function as much as at the
+start of a command. One with no URL counts only at the start of a command,
+where its URL can come from `--config`, so the package name in
+`apt-get install -y curl` is not one. The script of `sh -c '...'` or
+`bash -c "..."` is read as commands too. A curl whose output goes to /dev/null
+(a readiness probe), or that carries neither a URL nor a kept output
+(`curl --version`), is not one. Backslash continuations are joined first, so a
 download split over several lines is read as one command.
 
 Rules, one line per violation:
 
   BOUNDED    a download carries `--retry`, `--connect-timeout` and `--max-time`
-             (or `-m`). `--retry` makes a transient failure, a timeout
-             included, a retry; the two timeouts bound one attempt, so a
-             connection that opens and then stops sending times out and is
-             retried instead of holding the job until the job's own timeout.
+             (or `-m`), none of them given a literal 0. `--retry` makes a
+             transient failure, a timeout included, a retry; the two timeouts
+             bound one attempt, so a connection that opens and then stops
+             sending times out and is retried instead of holding the job until
+             the job's own timeout.
   TO_A_FILE  a download writes its bytes with `-o`, `--output` or `-O`. curl
              discards a partial file it opened itself before a retry; bytes it
              already sent to stdout, into a pipe or a command substitution
@@ -29,6 +37,11 @@ Rules, one line per violation:
   PARSE      a curl command whose words cannot be split (an unbalanced quote).
              It is refused rather than skipped: a check that cannot read a
              command reports nothing about it.
+  FLOOR      every fetcher (`install_*.sh`, `build_*_container.sh`) holds at
+             least one download, except the ones NO_DOWNLOAD names, which must
+             hold none. A download moved into a shape this reader does not
+             know drops its file to zero and fails here, rather than leaving
+             the other files to keep the run green.
 
 Exit 0 every rule holds, 1 one line per violation on stdout, 2 usage, a file
 it cannot read, or no download found in the files it read.
@@ -80,17 +93,19 @@ def logical_lines(text):
         yield start + 1, cur
 
 
-def quote_state(line, end):
-    """The quote character open at index `end` of `line`, or None.
+def context_at(line, end):
+    """What index `end` of `line` sits in: None, ("comment", start), or
+    (quote character, index of the opening quote).
 
     A `$(` opens a command context again, inside double quotes too, so the
-    curl in `sum="$(curl URL)"` is a command and not quoted text.
+    curl in `sum="$(curl URL)"` is a command and not quoted text. An unquoted
+    `#` at the start of a word opens a comment that runs to the end of the line.
     """
     stack = []
     i = 0
     while i < end:
         ch = line[i]
-        top = stack[-1] if stack else None
+        top = stack[-1][0] if stack else None
         if top == "'":
             if ch == "'":
                 stack.pop()
@@ -100,21 +115,51 @@ def quote_state(line, end):
             i += 2
             continue
         if ch == "$" and line[i + 1:i + 2] == "(":
-            stack.append("(")
+            stack.append(("(", i))
             i += 2
             continue
         if top == '"':
             if ch == '"':
                 stack.pop()
         elif ch in "'\"":
-            stack.append(ch)
+            stack.append((ch, i))
         elif ch == "(":
-            stack.append("(")
+            stack.append(("(", i))
         elif ch == ")" and top == "(":
             stack.pop()
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return ("comment", i)
         i += 1
-    top = stack[-1] if stack else None
-    return top if top in ("'", '"') else None
+    if stack and stack[-1][0] in ("'", '"'):
+        return stack[-1]
+    return None
+
+
+# A quoted string that is the script of a shell's `-c`: `sh -c '...'`,
+# `bash -lc "..."`, `bash -euo pipefail -c '...'`.
+SHELL_C_RE = re.compile(r"(?<![\w./-])(?:ba|da|k|z)?sh(?:\s+\S+)*?\s+-[A-Za-z]*c\s*$")
+MAX_SHELL_C_DEPTH = 3
+
+
+def quoted_body(line, start):
+    """The text inside the quote that opens at `start`, unescaped."""
+    quote = line[start]
+    if quote == "'":
+        stop = line.find("'", start + 1)
+        return line[start + 1:] if stop < 0 else line[start + 1:stop]
+    out = []
+    i = start + 1
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line) and line[i + 1] in '"\\$`':
+            out.append(line[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def is_command_position(line, index):
@@ -171,11 +216,13 @@ def segment_from(line, index):
 
 
 def read_command(words):
-    """(has_url, outputs, writes_remote_name, stdout_null, flags) for a curl."""
+    """(has_url, outputs, writes_remote_name, stdout_null, flags, values) for
+    a curl; `values` maps each value-taking option to its last value."""
     outputs = []
     remote_name = False
     stdout_null = False
     flags = set()
+    values = {}
     positional = []
     i = 1
     while i < len(words):
@@ -198,6 +245,7 @@ def read_command(words):
                 if not eq:
                     i += 1
                     value = words[i] if i < len(words) else ""
+                values[name] = value
                 if name == "--output":
                     outputs.append(value)
                 elif name == "--url":
@@ -218,6 +266,7 @@ def read_command(words):
                     if value == "":
                         i += 1
                         value = words[i] if i < len(words) else ""
+                    values["-" + letter] = value
                     if letter == "o":
                         outputs.append(value)
                     break
@@ -227,7 +276,68 @@ def read_command(words):
         positional.append(word)
         i += 1
     has_url = any(re.match(r"^[a-z]+://", w) or "$" in w for w in positional)
-    return has_url, outputs, remote_name, stdout_null, flags
+    return has_url, outputs, remote_name, stdout_null, flags, values
+
+
+def is_zero(value):
+    """A literal 0 (`0`, `00`, `0.0`): no retry, or no limit on the attempt."""
+    return bool(re.match(r"^0+(?:\.0*)?$", value or ""))
+
+
+def check_line(path, lineno, line, depth=0):
+    problems = []
+    downloads = 0
+    read_quotes = set()
+    for mo in CURL_RE.finditer(line):
+        index = mo.start()
+        where = context_at(line, index)
+        if where is not None:
+            kind, start = where
+            # The script of `sh -c '...'` is read as its own command line,
+            # once per quoted string however many curls it holds.
+            if (kind in ("'", '"') and start not in read_quotes
+                    and depth < MAX_SHELL_C_DEPTH and SHELL_C_RE.search(line[:start])):
+                read_quotes.add(start)
+                found, count = check_line(path, lineno, quoted_body(line, start), depth + 1)
+                problems.extend(found)
+                downloads += count
+            continue
+        at_command = is_command_position(line, index)
+        before = line[:index].rstrip()
+        in_substitution = before.endswith("$(") or before.endswith("`")
+        segment, end = segment_from(line, index)
+        try:
+            words = shlex.split(segment, posix=True)
+        except ValueError as err:
+            problems.append("%s:%d: PARSE cannot split the curl command (%s): %s"
+                            % (path, lineno, err, segment.strip()))
+            continue
+        has_url, outputs, remote_name, stdout_null, flags, values = read_command(words)
+        kept = [o for o in outputs if o != "/dev/null"]
+        if not has_url and not (at_command and (kept or remote_name)):
+            continue
+        if outputs and not kept and not remote_name:
+            continue
+        if not outputs and not remote_name and stdout_null and end != "pipe":
+            continue
+        downloads += 1
+        missing = [f for f in ("--retry", "--connect-timeout", "--max-time")
+                   if f not in flags and not (f == "--max-time" and "-m" in flags)]
+        zero = [f for f in ("--retry", "--connect-timeout", "--max-time", "-m")
+                if f in values and is_zero(values[f])]
+        if missing:
+            problems.append("%s:%d: BOUNDED a download without %s: %s"
+                            % (path, lineno, ", ".join(missing), segment.strip()))
+        if zero:
+            problems.append("%s:%d: BOUNDED a download with %s given 0, which turns it off: %s"
+                            % (path, lineno, ", ".join(zero), segment.strip()))
+        if not kept and not remote_name:
+            sink = ("into a pipe" if end == "pipe"
+                    else "into a command substitution" if in_substitution
+                    else "to stdout")
+            problems.append("%s:%d: TO_A_FILE a download writes %s instead of a file "
+                            "named with -o: %s" % (path, lineno, sink, segment.strip()))
+    return problems, downloads
 
 
 def check_text(path, text):
@@ -236,42 +346,36 @@ def check_text(path, text):
     for lineno, line in logical_lines(text):
         if line.lstrip().startswith("#"):
             continue
-        for mo in CURL_RE.finditer(line):
-            index = mo.start()
-            if quote_state(line, index) is not None:
-                continue
-            if not is_command_position(line, index):
-                continue
-            before = line[:index].rstrip()
-            in_substitution = before.endswith("$(") or before.endswith("`")
-            segment, end = segment_from(line, index)
-            try:
-                words = shlex.split(segment, posix=True)
-            except ValueError as err:
-                problems.append("%s:%d: PARSE cannot split the curl command (%s): %s"
-                                % (path, lineno, err, segment.strip()))
-                continue
-            has_url, outputs, remote_name, stdout_null, flags = read_command(words)
-            if not has_url:
-                continue
-            kept = [o for o in outputs if o != "/dev/null"]
-            if outputs and not kept and not remote_name:
-                continue
-            if not outputs and not remote_name and stdout_null and end != "pipe":
-                continue
-            downloads += 1
-            missing = [f for f in ("--retry", "--connect-timeout", "--max-time")
-                       if f not in flags and not (f == "--max-time" and "-m" in flags)]
-            if missing:
-                problems.append("%s:%d: BOUNDED a download without %s: %s"
-                                % (path, lineno, ", ".join(missing), segment.strip()))
-            if not kept and not remote_name:
-                where = ("into a pipe" if end == "pipe"
-                         else "into a command substitution" if in_substitution
-                         else "to stdout")
-                problems.append("%s:%d: TO_A_FILE a download writes %s instead of a file "
-                                "named with -o: %s" % (path, lineno, where, segment.strip()))
+        found, count = check_line(path, lineno, line)
+        problems.extend(found)
+        downloads += count
     return problems, downloads
+
+
+# Fetchers that hold no download. They are read like every other fetcher and
+# must stay at zero.
+NO_DOWNLOAD = {"install_hooks.sh"}
+
+
+def is_fetcher(name):
+    return (name.startswith("install_") and name.endswith(".sh")) or (
+        name.startswith("build_") and name.endswith("_container.sh"))
+
+
+def check_floor(path, count):
+    name = os.path.basename(path)
+    if not is_fetcher(name):
+        return []
+    if name in NO_DOWNLOAD:
+        if count:
+            return ["%s: FLOOR %s is listed in NO_DOWNLOAD but holds %d download(s); "
+                    "remove it from the list" % (path, name, count)]
+        return []
+    if count == 0:
+        return ["%s: FLOOR a fetcher holds no download this reader can see; a download "
+                "in a shape it does not read is not checked, so teach the reader the shape "
+                "or add the file to NO_DOWNLOAD" % path]
+    return []
 
 
 def default_paths(root):
@@ -284,7 +388,7 @@ def default_paths(root):
     for name in sorted(os.listdir(scripts)):
         if not name.endswith(".sh"):
             continue
-        if name.startswith("install_") or (name.startswith("build_") and name.endswith("_container.sh")):
+        if is_fetcher(name):
             paths.append(os.path.join(scripts, name))
     return paths
 
@@ -342,6 +446,66 @@ SELF_TEST = [
      "# curl -fsSL https://example.com/x | sh\n", []),
     ("an unbalanced quote",
      'curl -fsSL -o x "$url\n', ["PARSE"]),
+    # A curl with a URL counts wherever it stands.
+    ("behind timeout N",
+     "timeout 300 curl -fsSL -o x https://example.com/x\n", ["BOUNDED"]),
+    ("behind env",
+     "env HOME=/tmp curl -fsSL -o x https://example.com/x\n", ["BOUNDED"]),
+    ("behind sudo -E",
+     'sudo -E curl -fsSL -o x "$url"\n', ["BOUNDED"]),
+    ("inside docker run IMAGE",
+     'docker run --rm img:1 curl -fsSL -o /out/x "$url"\n', ["BOUNDED"]),
+    ("behind a wrapper function",
+     'run_foreground curl -fsSL -o x "$url"\n', ["BOUNDED"]),
+    ("bounded behind timeout N",
+     "timeout 300 curl -fsSL --retry 5 --connect-timeout 30 --max-time 180 -o x https://example.com/x\n",
+     []),
+    ("the script of bash -c",
+     'bash -c "curl -fsSL -o x https://example.com/x"\n', ["BOUNDED"]),
+    ("the script of sh -c, piped",
+     "sh -c 'curl -sSf https://sh.rustup.rs | sh'\n", ["BOUNDED", "TO_A_FILE"]),
+    ("the script of bash -euo pipefail -c",
+     "bash -euo pipefail -c 'curl -fsSL --retry 5 --connect-timeout 30 --max-time 60 -o x \"$u\"'\n",
+     []),
+    ("an escaped quote inside bash -c",
+     'bash -lc "curl -fsSL -o \\"$out\\" https://example.com/x"\n', ["BOUNDED"]),
+    ("a command-position curl with no URL keeps its output",
+     "curl --config urls.conf -o x\n", ["BOUNDED"]),
+    ("an apt option after the package name",
+     "apt-get install -y curl -o Dpkg::Options::=--force-confold\n", []),
+    ("a trailing comment",
+     "echo done # curl -fsSL https://example.com/x | sh\n", []),
+    # Literal zero bounds turn the bound off.
+    ("--retry 0",
+     'curl -fsSL --retry 0 --connect-timeout 30 --max-time 180 -o x "$url"\n', ["BOUNDED"]),
+    ("--max-time 0",
+     'curl -fsSL --retry 5 --connect-timeout 30 --max-time 0 -o x "$url"\n', ["BOUNDED"]),
+    ("-m 0",
+     'curl -fsSL --retry 5 --connect-timeout 30 -m 0 -o x "$url"\n', ["BOUNDED"]),
+    ("--connect-timeout=0",
+     'curl -fsSL --retry 5 --connect-timeout=0 --max-time 9 -o x "$url"\n', ["BOUNDED"]),
+    ("a variable bound",
+     'curl -fsSL --retry "$n" --connect-timeout 30 --max-time 9 -o x "$url"\n', []),
+]
+
+GOOD_DOWNLOAD = 'curl -fsSL --retry 5 --connect-timeout 30 --max-time 180 -o x "$url"\n'
+
+# (name, texts, expected exit, a substring of the FLOOR line or None)
+FLOOR_TEST = [
+    ("every fetcher holds a download",
+     {"tools/scripts/install_a.sh": GOOD_DOWNLOAD, "tools/scripts/build_b_container.sh": GOOD_DOWNLOAD,
+      "tools/scripts/install_hooks.sh": "echo no download\n"}, 0, None),
+    ("a fetcher whose download the reader cannot see",
+     {"tools/scripts/install_a.sh": GOOD_DOWNLOAD,
+      "tools/scripts/install_b.sh": 'xargs -n 1 curl -fsSL -O < urls\n'}, 1, "install_b.sh: FLOOR"),
+    ("a container fetcher with no download",
+     {"tools/scripts/install_a.sh": GOOD_DOWNLOAD,
+      "tools/scripts/build_b_container.sh": "echo none\n"}, 1, "build_b_container.sh: FLOOR"),
+    ("a NO_DOWNLOAD file that gained a download",
+     {"tools/scripts/install_a.sh": GOOD_DOWNLOAD, "tools/scripts/install_hooks.sh": GOOD_DOWNLOAD},
+     1, "install_hooks.sh is listed in NO_DOWNLOAD"),
+    ("a workflow with no download is not a fetcher",
+     {"tools/scripts/install_a.sh": GOOD_DOWNLOAD, ".github/workflows/x.yml": "jobs: {}\n"}, 0, None),
 ]
 
 
@@ -360,10 +524,22 @@ def self_test():
     if run([], texts={"<empty>": "echo nothing here\n"}, say=lambda _line: None) != 2:
         failures += 1
         print("self-test FAIL: a run that found no download did not exit 2")
+    for name, texts, want_exit, want_line in FLOOR_TEST:
+        lines = []
+        got = run([], texts=texts, say=lines.append)
+        floor = [line for line in lines if ": FLOOR " in line]
+        ok = got == want_exit and (
+            (want_line is None and not floor) or
+            (want_line is not None and len(floor) == 1 and want_line in floor[0]))
+        if not ok:
+            failures += 1
+            print("self-test FAIL %r: expected exit %d and %s, got exit %d and %s"
+                  % (name, want_exit, want_line or "no FLOOR line", got, floor))
     if failures:
         print("check_tool_downloads self-test: %d case(s) failed" % failures)
         return 1
-    print("check_tool_downloads self-test: %d cases passed" % (len(SELF_TEST) + 1))
+    print("check_tool_downloads self-test: %d cases passed"
+          % (len(SELF_TEST) + 1 + len(FLOOR_TEST)))
     return 0
 
 
@@ -382,6 +558,7 @@ def run(paths, texts=None, say=print):
     for path, text in texts.items():
         found, count = check_text(path, text)
         problems.extend(found)
+        problems.extend(check_floor(path, count))
         downloads += count
     for p in problems:
         say(p)
