@@ -1615,15 +1615,11 @@ pub(crate) fn verify(
                         &mut report,
                     );
                 }
-                TriggerDecl::DataLatest {
-                    trigger_inputs,
-                    separate_drain,
-                } => {
+                TriggerDecl::DataLatest { trigger_inputs, .. } => {
                     verify_latest(
                         node,
                         steps,
                         trigger_inputs,
-                        *separate_drain,
                         block_gated,
                         trust,
                         stops.stop_point(&node.node_id),
@@ -3005,18 +3001,19 @@ fn verify_fifo(
 /// popped, so it too is held to the bound alone; the throttle rule judges its
 /// spacing. The stop and read-shape handling is [`verify_fifo`]'s.
 ///
-/// An input read through two subscribers (`separate_drain`) is held to the
-/// bound alone on every step. Its drain records are the trigger subscriber's
-/// pops, which include frames an earlier body read already drained, and the
-/// live step mints a fire only when its probe finds a frame in the body
-/// subscriber. The log records neither the probe's answer nor the body queue,
-/// and the live step carries an arrival whose frame reached the trigger queue
-/// before the body queue to a later step, so the log owes no such step a fire.
+/// An input read through two subscribers (the declaration's
+/// `separate_drain`) is held to the bound alone on every step. Its drain
+/// records are the trigger subscriber's pops, which include frames an earlier
+/// body read already drained, and the live step mints a fire only when its
+/// probe finds a frame in the body subscriber, or, where the entry cannot
+/// answer, on every counted arrival. The log records neither the probe's answer
+/// nor the body queue, and the live step carries an arrival whose frame reached
+/// the trigger queue before the body queue to a later step, so the log owes no
+/// such step a fire.
 fn verify_latest(
     node: &NodeDecl,
     steps: &[RecordedStep],
     trigger_inputs: &[String],
-    separate_drain: bool,
     block_gated: bool,
     trust: RoleTrust,
     stop: Option<StopPoint>,
@@ -3030,6 +3027,13 @@ fn verify_latest(
         });
         return;
     }
+    let separate_drain = matches!(
+        node.trigger,
+        TriggerDecl::DataLatest {
+            separate_drain: true,
+            ..
+        }
+    );
     for step in steps {
         if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::LatestFire, false, report) {
