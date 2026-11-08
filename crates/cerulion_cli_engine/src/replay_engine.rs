@@ -10429,8 +10429,10 @@ fn node_trigger_decl(
         },
         Some(MacroPolicy::DataTrigger { input_name }) => {
             if consumes_latest(info, &input_name) {
+                let separate_drain = reads_through_two_subscribers(info, &input_name);
                 replay_rederive::TriggerDecl::DataLatest {
                     trigger_inputs: vec![input_name],
+                    separate_drain,
                 }
             } else {
                 replay_rederive::TriggerDecl::Data {
@@ -10579,6 +10581,21 @@ fn consumes_latest(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
     info.input_meta()
         .iter()
         .any(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
+}
+
+/// Does this data-trigger input's declared backpressure keep it on two
+/// subscribers (`block` or `sample(N)`, the inputs `NodeInfo::unifies_data_trigger`
+/// refuses on policy)? The judge's latest rule reads it as
+/// `TriggerDecl::DataLatest::separate_drain`.
+fn reads_through_two_subscribers(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+    use cerulion_core::graph::node::BackpressurePolicy;
+    info.input_meta().iter().any(|m| {
+        m.name == input
+            && matches!(
+                m.backpressure,
+                BackpressurePolicy::Block | BackpressurePolicy::Sample(_)
+            )
+    })
 }
 
 /// Narrow a kind-6 record's `served_seq` slot to the `u32` the wire carries.
@@ -17018,14 +17035,14 @@ mod node_trigger_decl_tests {
     fn a_latest_data_trigger_is_declared_and_injected_as_latest() {
         use super::{input_consume_mode, replay_inject::ConsumeMode};
         use cerulion_core::graph::node::InputConsume;
-        let data = |consume| {
+        let data_with = |consume, backpressure| {
             NodeInfo::with_meta(
                 vec![InputMeta {
                     name: "cam".to_string(),
                     schema_hash: 0,
                     trigger: true,
                     depth: 4,
-                    backpressure: BackpressurePolicy::DropOldest,
+                    backpressure,
                     expect_within_ms: None,
                     consume,
                 }],
@@ -17035,6 +17052,7 @@ mod node_trigger_decl_tests {
                 input_name: "cam".to_string(),
             })
         };
+        let data = |consume| data_with(consume, BackpressurePolicy::DropOldest);
         let wired = vec![InputDef {
             name: "cam".to_string(),
             source: "/cam".to_string(),
@@ -17045,9 +17063,21 @@ mod node_trigger_decl_tests {
         assert_eq!(
             node_trigger_decl(&latest, &wired, None),
             TriggerDecl::DataLatest {
-                trigger_inputs: cam.clone()
+                trigger_inputs: cam.clone(),
+                separate_drain: false,
             }
         );
+        // `block` and `sample(N)` keep the input on two subscribers.
+        for backpressure in [BackpressurePolicy::Block, BackpressurePolicy::Sample(5)] {
+            assert_eq!(
+                node_trigger_decl(&data_with(InputConsume::Latest, backpressure), &wired, None),
+                TriggerDecl::DataLatest {
+                    trigger_inputs: cam.clone(),
+                    separate_drain: true,
+                },
+                "{backpressure:?}"
+            );
+        }
         assert_eq!(
             node_trigger_decl(&fifo, &wired, None),
             TriggerDecl::Data {

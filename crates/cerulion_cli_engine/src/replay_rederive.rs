@@ -508,6 +508,11 @@ pub enum TriggerDecl {
     DataLatest {
         /// The `#[input(trigger)]`-marked inputs, in declaration order.
         trigger_inputs: Vec<String>,
+        /// The trigger input declares `block` or `sample(N)`, which the live
+        /// graph reads through two subscribers (the separate drain
+        /// discipline). [`verify_latest`] also infers that discipline from
+        /// the log, for an input this flag cannot name.
+        separate_drain: bool,
     },
     /// A `sync_window_ms` node that aligns its trigger inputs on each
     /// message's `header.stamp` (capture time) instead of its wire stamp. The
@@ -1610,11 +1615,15 @@ pub(crate) fn verify(
                         &mut report,
                     );
                 }
-                TriggerDecl::DataLatest { trigger_inputs } => {
+                TriggerDecl::DataLatest {
+                    trigger_inputs,
+                    separate_drain,
+                } => {
                     verify_latest(
                         node,
                         steps,
                         trigger_inputs,
+                        *separate_drain,
                         block_gated,
                         trust,
                         stops.stop_point(&node.node_id),
@@ -1709,7 +1718,7 @@ fn census_read_sites(
             TriggerDecl::Sync { trigger_inputs, .. }
             | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
             | TriggerDecl::Data { trigger_inputs }
-            | TriggerDecl::DataLatest { trigger_inputs } => trigger_inputs.clone(),
+            | TriggerDecl::DataLatest { trigger_inputs, .. } => trigger_inputs.clone(),
             _ => continue,
         };
         pending.push((f.node_id.clone(), f.decider, inputs));
@@ -2995,10 +3004,23 @@ fn verify_fifo(
 /// it is held to the bound alone. A `throttle_ms` node may defer a step that
 /// popped, so it too is held to the bound alone; the throttle rule judges its
 /// spacing. The stop and read-shape handling is [`verify_fifo`]'s.
+///
+/// An input read through two subscribers (the separate drain discipline) is
+/// held to the bound alone on every step. Its drain records are the trigger
+/// subscriber's pops, and those include frames an earlier body read already
+/// drained; the live step fires only while the body subscriber still holds a
+/// frame, which the log does not record. The discipline is `separate_drain`
+/// (a declared `block` or `sample(N)`) or a `Served` read of the input
+/// anywhere in the log: the separate discipline's tick read drains the body
+/// subscriber live and records the frame it serves, where the unified
+/// discipline's tick serves the frame its boundary drain froze and records
+/// nothing. Inferring the discipline where it is absent only relaxes a step
+/// to the bound.
 fn verify_latest(
     node: &NodeDecl,
     steps: &[RecordedStep],
     trigger_inputs: &[String],
+    separate_drain: bool,
     block_gated: bool,
     trust: RoleTrust,
     stop: Option<StopPoint>,
@@ -3012,6 +3034,12 @@ fn verify_latest(
         });
         return;
     }
+    let separate = separate_drain
+        || steps.iter().flat_map(|s| s.reads.iter()).any(|r| {
+            r.node_id == node.node_id
+                && trigger_inputs.contains(&r.input)
+                && r.kind == ReadOutcomeKind::Served
+        });
     for step in steps {
         if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::LatestFire, false, report) {
@@ -3057,8 +3085,10 @@ fn verify_latest(
             }
         }
         let recorded = recorded_fires(step, &node.node_id, false);
-        let owes_one =
-            popped > 0 && node.throttle_ns.is_none() && !stop.is_some_and(|s| s.step == step.step);
+        let owes_one = popped > 0
+            && node.throttle_ns.is_none()
+            && !separate
+            && !stop.is_some_and(|s| s.step == step.step);
         let expected = if owes_one { 1 } else { recorded.count.min(1) };
         if recorded.count != expected {
             report.findings.push(ScheduleFinding {
@@ -3155,7 +3185,7 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
         return CreditBasis::Undecidable;
     };
     match &node.trigger {
-        TriggerDecl::Data { trigger_inputs } | TriggerDecl::DataLatest { trigger_inputs }
+        TriggerDecl::Data { trigger_inputs } | TriggerDecl::DataLatest { trigger_inputs, .. }
             if trigger_inputs.contains(&edge.consumer_input) =>
         {
             CreditBasis::BodyOnly
@@ -5282,6 +5312,7 @@ mod tests {
             "sink",
             TriggerDecl::DataLatest {
                 trigger_inputs: inputs(&["inp"]),
+                separate_drain: false,
             },
         )]
     }
@@ -5347,6 +5378,56 @@ mod tests {
             StepFires::count(2),
             "the bound holds on a step that popped nothing too"
         );
+    }
+
+    /// On the separate drain the trigger subscriber's pops include frames an
+    /// earlier body read already drained: step 0's read takes frames 1 and 2
+    /// (`Served`, popped 2) after the drain counted frame 1, and step 1's drain
+    /// pops frame 2 again with nothing left to read, so the step fires nothing.
+    /// The discipline is inferred from the `Served` read, or declared.
+    #[test]
+    fn a_separate_drain_latest_step_may_pop_a_frame_a_read_already_took() {
+        let gap = RecordedStep {
+            step: 1,
+            clock_ns: EPOCH + 1,
+            fires: vec![],
+            reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 1, None)],
+        };
+        let steps = vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: EPOCH,
+                fires: vec![fire("sink", EPOCH)],
+                reads: vec![
+                    read("sink", "inp", ReadOutcomeKind::DrainedBatch, 1, None),
+                    read("sink", "inp", ReadOutcomeKind::Served, 2, None),
+                ],
+            },
+            gap.clone(),
+        ];
+        let inferred = verify_unrestored(&latest_node(), &steps, &[], RoleTrust::Declined);
+        assert!(inferred.is_clean(), "unexpected: {:?}", inferred.findings);
+
+        let declared = vec![node(
+            "sink",
+            TriggerDecl::DataLatest {
+                trigger_inputs: inputs(&["inp"]),
+                separate_drain: true,
+            },
+        )];
+        let alone = verify_unrestored(&declared, &[gap.clone()], &[], RoleTrust::Declined);
+        assert!(alone.is_clean(), "unexpected: {:?}", alone.findings);
+
+        // The anti-tautology half: neither declared nor inferred, the same
+        // step owes its fire, and the bound still holds on the separate drain.
+        let unified = verify_unrestored(&latest_node(), &[gap], &[], RoleTrust::Declined);
+        assert_eq!(unified.findings[0].expected, StepFires::count(1));
+        assert_eq!(unified.findings[0].recorded, StepFires::count(0));
+        let mut twice = steps.clone();
+        twice[0].fires.push(fire("sink", EPOCH));
+        let bound = verify_unrestored(&latest_node(), &twice, &[], RoleTrust::Declined);
+        assert_eq!(bound.findings[0].decider, Decider::LatestFire);
+        assert_eq!(bound.findings[0].recorded, StepFires::count(2));
     }
 
     /// A throttled latest node may defer a step that popped: it is held to the
