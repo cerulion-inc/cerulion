@@ -788,20 +788,23 @@ One dependency, which is what `cargo add cerulion` writes:
 
 ```toml
 [dependencies]
-cerulion = "1.0.0"
+cerulion = "2.0.0"
 ```
 
 `cerulion` is an umbrella crate that re-exports the other three at a single
-version. A node written against it imports `cerulion::prelude::*` and takes
-its port types from `cerulion::msgs`.
+version. There is no 1.x release of it: use 2.0.0 or later. A node written
+against it imports `cerulion::prelude::*` and takes its port types from
+`cerulion::msgs`.
 
 Or the crates themselves, which is what `cerulion workspace create` scaffolds
-and what every example in this document uses:
+and what every example in this document uses. A released CLI pins them in the
+workspace manifest to its own exact version, and each node crate takes them
+with `{ workspace = true }`:
 
 ```toml
-[dependencies]
-cerulion_core = "1.0.0"
-native_ros2_messages = "1.0.0"
+[workspace.dependencies]
+cerulion_core = "=2.0.0"
+native_ros2_messages = "=2.0.0"
 ```
 
 Either works. The macros read the package's own `Cargo.toml` at expansion

@@ -11,6 +11,7 @@ on:
     paths:
       - '.cargo/config.toml'
       - 'crates/cerulion_android/**'
+      - 'crates/cerulion_android_remote/**'
       - 'crates/cerulion_bag/**'
       - 'crates/cerulion_bagd/**'
       - 'crates/cerulion_cli/**'
@@ -45,6 +46,7 @@ on:
     paths:
       - '.cargo/config.toml'
       - 'crates/cerulion_android/**'
+      - 'crates/cerulion_android_remote/**'
       - 'crates/cerulion_bag/**'
       - 'crates/cerulion_bagd/**'
       - 'crates/cerulion_cli/**'

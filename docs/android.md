@@ -258,7 +258,10 @@ checkout uses `path` dependencies, which no patch moves; take
 and `rev`. Once crates.io lists `cerulion_android`, a version requirement
 equal to the node workspace's pins replaces the git source and the two
 entries, for example `cerulion_android = "=2.0.0"` beside nodes made by
-`cerulion` 2.0.0.
+`cerulion` 2.0.0. An app that hosts the remote plane keeps the git or `path`
+source: `cerulion_android_remote` is not on crates.io, so it and
+`cerulion_android` come from the same `rev` or checkout (see
+[Host the paired remote plane](#host-the-paired-remote-plane)).
 
 Whatever the source of `cerulion_android`, crates.io included, an app
 copies two things into its own build from the Cerulion release or commit it
@@ -503,7 +506,8 @@ returns an error code if the runtime is not ready or the message cannot be
 encoded. When `start` returns `OK`, status has already transitioned to `starting`
 and may have advanced to `running` before the next read. `publish` can return `BUSY`
 while start or stop is in progress, including while the start worker is finishing
-its lifecycle after status first reports `running`; retry a `BUSY` publish rather
+its lifecycle after status first reports `running`. It also returns `BUSY` while
+another `publish` or a `poll` holds the runtime lock. Retry a `BUSY` publish rather
 than dropping it. A `stop` issued while startup is still in flight is accepted
 and runs once startup finishes. Starting again after a failure or a finished
 graph first stops what is left of the previous run and closes LAN access, even
@@ -810,8 +814,9 @@ above for subscribe schemas.
 ### Choose which topics leave the device
 
 An `open` gateway sends every topic the app serves. To open a desk connection
-while some topics stay on the device, list the topics a LAN peer may receive
-in `egress`:
+while some topics stay off the LAN, list the topics a LAN peer may receive
+in `egress`. The hosted remote plane is not limited by this list (see the end
+of this section):
 
 ```json
 {
@@ -1069,7 +1074,7 @@ Enable the feature on the dependency used by the app:
 
 ```toml
 [dependencies]
-cerulion_core = { version = "1", features = ["local-transport"] }
+cerulion_core = { version = "=2.0.0", features = ["local-transport"] }
 ```
 
 ## Emulator end-to-end test
@@ -1134,7 +1139,8 @@ The lane also checks the sample app's linked graph nodes:
   through the plane the app hosts;
 - no SELinux denial is logged for the app's domain in any run, except the two
   refusals of network interface listing (`netlink_route_socket` and
-  `sysfs_net`) that Android gives every app while the hosted plane binds.
+  `sysfs_net`) that Android gives every app. The hosted plane causes them
+  while it binds, but the lane accepts them in every run it scans.
 
 Run it locally with a booted API 30 emulator:
 
@@ -1163,7 +1169,8 @@ code of every echo (device and host timer, paired and open heartbeat, the
 app's timer and relay), the report of every demand probe run
 (`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`), the report of
 both remote metadata probe runs (`remoted-probe-served.txt`,
-`remoted-probe-absent.txt`), and the pulled
+`remoted-probe-absent.txt`), the hosted plane's start status and paired desk
+read (`hosted-status.txt`, `hosted-desk.txt`), and the pulled
 MCAP files (`phase-a.mcap`, `app.mcap`, `app-restart.mcap`) there. The script
 needs a dedicated device: it refuses to start while a `cerulion` or
 `cerulion-netd` process is running, and clears only its own directory
