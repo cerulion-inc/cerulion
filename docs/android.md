@@ -1048,11 +1048,15 @@ runtime, starts its graph, local work runs, and `status.remote` names the
 stuck plane. A start with `remote.enabled` starts with remote off for that
 run: it does not bind a plane, and `status.remote` adds `off_reason`, which
 says that remote is off because an earlier plane did not stop. This is also
-true when the plane of another runtime fails to stop while that start binds:
+true when the stop of another runtime has failed while that start binds:
 
 ```json
 "remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close", "off_reason": "remote is off for this run: an earlier remote plane in this process did not stop and may still answer under this device key; restart the app process to host the plane again"}
 ```
+
+Remote off applies once a stop has failed. While the stop of another runtime
+still runs, its plane is still up, so a start with `remote.enabled` fails with
+code 18. Try the start again when that stop ends.
 
 Every other bind failure keeps its code. `off_reason` stays until that run
 stops. `stop_error` and `off_reason` are not in the JSON while a plane serves.

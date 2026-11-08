@@ -167,11 +167,19 @@ impl RemoteLease {
                         .to_string(),
                 )
             }),
-            Err(_) => Err(EmbedError::Remote(
-                "another embedded runtime in this process hosts the remote plane; stop it \
-                 before starting a runtime with remote.enabled"
-                    .to_string(),
-            )),
+            // A stop that failed writes the record under its mutex before
+            // its Release store of PLANE_UNSTOPPED, so between the two the
+            // lease still reads held. The record is never cleared, so a
+            // record here means that plane did not stop. A stop that still
+            // runs has no record: its plane is still up, and the start can
+            // retry.
+            Err(_) => unstopped_plane().map(Acquired::Stuck).ok_or_else(|| {
+                EmbedError::Remote(
+                    "another embedded runtime in this process hosts the remote plane; stop it \
+                     before starting a runtime with remote.enabled"
+                        .to_string(),
+                )
+            }),
         }
     }
 
@@ -248,6 +256,13 @@ pub(crate) fn hosted_for_test(plane: Box<dyn BoundRemote>) -> Result<HostedPlane
 pub(crate) fn free_lease_for_test() {
     *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = None;
     REMOTE_HOSTED.store(PLANE_FREE, Ordering::Release);
+}
+
+/// TEST SEAM: write the process record of a plane that did not stop, and
+/// leave the lease as it is.
+#[cfg(test)]
+pub(crate) fn record_unstopped_for_test(stuck: RemoteStatus) {
+    *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = Some(stuck);
 }
 
 /// What [`bind`] gives a start.

@@ -365,10 +365,13 @@ pub struct Status {
     /// plane stopped. After a plane in this process did not stop, this names
     /// it with its `stop_error` for the life of the process: the failed
     /// teardown writes it, and every later start of any runtime in the
-    /// process writes it again from the process record. A start with
-    /// `remote.enabled` then runs with remote off and adds `off_reason`. A
-    /// teardown in an unwind writes no status, so this handle names that
-    /// plane from the next start; the status an app reads names it at once.
+    /// process writes it again from the process record, also a start that
+    /// its config refuses. A start with `remote.enabled` then runs with
+    /// remote off and adds `off_reason`. Remote off applies once a stop has
+    /// failed: a start while the stop of another runtime still runs fails
+    /// with code 18 and can retry. A teardown in an unwind writes no
+    /// status, so this handle names that plane from the next start; the
+    /// status an app reads names it at once.
     pub remote: Option<RemoteStatus>,
 }
 
@@ -746,14 +749,15 @@ impl EmbeddedRuntime {
         // recorder active behind the refusal.
         if let Some(mut run) = self.run.take() {
             let (_summary, teardown_error) = run.shutdown();
-            // The plane is stopped, even when the new config is refused
-            // below, or it stays named in status as stuck. Either way the
-            // restart goes on.
-            record_remote_teardown(&self.status);
             if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
         }
+        // Before the new config is checked, `status.remote` names only a
+        // plane in this process that did not stop, from the process record:
+        // the plane of the run above, or of any other runtime. A start that
+        // the config refuses below also names it, and the restart goes on.
+        record_remote_teardown(&self.status);
         let config = match EmbeddedConfig::parse(config_json) {
             Ok(config) => config,
             Err(error) => {
@@ -1638,9 +1642,11 @@ fn build_into(
     //    After a plane in this process did not stop, the start goes on
     //    with remote off: the old plane may still answer under the device
     //    key, so none binds, and status names the stuck plane. The bind
-    //    reads the lease and the process record in one step, so a stop
-    //    that fails in another runtime during this start also gives remote
-    //    off, not an error.
+    //    reads the process record when the lease is not free, so a stop in
+    //    another runtime that has failed during this start also gives
+    //    remote off, not an error. A stop there that still runs holds the
+    //    lease with its plane up: the start fails with code 18 and can
+    //    retry.
     if let Some(remote) = &plan.remote {
         match crate::remote::bind(RemoteStart {
             state_root: remote.state_root.clone(),
@@ -3893,6 +3899,80 @@ nodes:
         };
         crate::remote::free_lease_for_test();
         assert_eq!(outcome, Ok(stuck), "the bind gives remote off");
+    }
+
+    /// A stop in another runtime that failed has written the process
+    /// record but has not yet marked the lease unstopped: the lease still
+    /// reads held. A bind in that step gives remote off, not code 18.
+    #[test]
+    fn a_bind_sees_a_failed_stop_before_the_lease_is_marked() {
+        struct Plane;
+        impl crate::remote::BoundRemote for Plane {
+            fn endpoint_id(&self) -> String {
+                "held".to_string()
+            }
+            fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+                vec!["127.0.0.1:4433".parse().unwrap()]
+            }
+            fn serve(&mut self, _exit: crate::remote::RemoteExit) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let _serial = gateway_test_lock();
+        crate::remote::free_lease_for_test();
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let held = crate::remote::hosted_for_test(Box::new(Plane)).expect("the remote plane lease");
+        let stuck = RemoteStatus {
+            endpoint_id: "held".to_string(),
+            bound_sockets: vec!["127.0.0.1:4433".to_string()],
+            stop_error: Some("the endpoint did not close".to_string()),
+            off_reason: None,
+        };
+        crate::remote::record_unstopped_for_test(stuck.clone());
+
+        let bound = crate::remote::bind(RemoteStart {
+            state_root: temp.path().join("remote"),
+            robot: "t".to_string(),
+            relay: RemoteRelay::Disabled,
+            manager: local_manager("held_bind"),
+            serving: SchemaServing::default(),
+        });
+        let outcome = match bound {
+            Ok(Bound::Stuck(plane)) => Ok(Some(plane)),
+            Ok(Bound::Hosted(_)) => Ok(None),
+            Err(error) => Err(error.code()),
+        };
+        drop(held);
+        crate::remote::free_lease_for_test();
+        assert_eq!(outcome, Ok(Some(stuck)), "the bind gives remote off");
+    }
+
+    /// A start that its config refuses still names a plane in this process
+    /// that did not stop, from the process record.
+    #[test]
+    fn a_refused_start_names_a_plane_that_did_not_stop() {
+        let _serial = gateway_test_lock();
+        crate::remote::free_lease_for_test();
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let mut runtime =
+            EmbeddedRuntime::new(temp.path().to_path_buf(), "refused_start_test".into()).unwrap();
+        let stuck = RemoteStatus {
+            endpoint_id: "refused".to_string(),
+            bound_sockets: vec!["127.0.0.1:4433".to_string()],
+            stop_error: Some("the endpoint did not close".to_string()),
+            off_reason: None,
+        };
+        crate::remote::record_unstopped_for_test(stuck.clone());
+
+        let result = runtime.start_accepted("not json");
+
+        let remote = lock_status(&runtime.status).remote.clone();
+        crate::remote::free_lease_for_test();
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(remote, Some(stuck), "the refused start names the plane");
     }
 
     #[test]
