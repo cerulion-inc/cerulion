@@ -201,7 +201,7 @@ pub fn desk_key_path() -> Option<PathBuf> {
 ///
 /// A machine key that cannot be read, is the wrong size, or disagrees with the
 /// legacy `desk.key`.
-fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
+pub(crate) fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
     let Some(layout) = crate::auth::identity_layout() else {
         return Ok(None);
     };
@@ -221,7 +221,7 @@ fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
 
 /// Load the `~/.cerulion/robots.toml` name→eid map (empty if the file is absent
 /// or unreadable — a missing file is normal).
-fn load_robots() -> BTreeMap<String, String> {
+pub(crate) fn load_robots() -> BTreeMap<String, String> {
     let Some(path) = robots_toml_path() else {
         return BTreeMap::new();
     };

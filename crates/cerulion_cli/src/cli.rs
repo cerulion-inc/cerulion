@@ -2121,6 +2121,13 @@ pub enum BagAction {
         /// `--report`, the JSON gains a `record_out` field naming the path.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         record_out: Option<PathBuf>,
+        /// With `--resim --verify`: the bytes a fed replay's feed index is
+        /// charged (default 1073741824, 1 GiB): 40 per recorded frame the
+        /// replayed reads consume, up to `--duration` when it is given, and 40
+        /// per producer label of the topics they consume. A replay that needs
+        /// more is refused with exit 2 naming the size it needs.
+        #[arg(long, value_name = "BYTES")]
+        feed_index_budget: Option<u64>,
     },
     /// Show what a bag holds (topics, frame counts, schemas, time span) without
     /// publishing anything.

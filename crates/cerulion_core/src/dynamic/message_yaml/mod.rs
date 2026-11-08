@@ -58,6 +58,7 @@ mod scan;
 
 pub use decode::{yaml_to_message, yaml_to_message_with};
 pub use encode::{message_to_yaml, message_to_yaml_with, YamlEncodeOptions};
+pub use scan::find_anchor_or_alias;
 
 use crate::codegen::FieldType;
 

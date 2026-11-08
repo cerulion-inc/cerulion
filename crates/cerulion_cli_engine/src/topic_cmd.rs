@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod introspect;
+pub mod publish;
+pub mod snapshot;
 
 use crate::discovery_ladder::{DiscoveredPeer, DiscoveryRung};
 use crate::error::{CliError, CliResult};

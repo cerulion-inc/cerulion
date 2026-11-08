@@ -15,7 +15,8 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 ## 1. `cerulion bag play --resim`: exit-code contract
 
 The surface is `cerulion bag play <bag> --resim all [--verify] [-u|--duration D]
-[--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
+[--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance YAML]
+[--feed-index-budget BYTES]`. `resim_cmd.rs` owns flag legality and
 the neutral renderer, `replay_cmd.rs` the entry gates and the stable exit-code surface, and
 `replay_engine.rs` the deterministic re-execution itself. The bag is the golden: it carries
 the graph, env snapshot, recorded frames, and scheduler trace, and the run re-executes the
@@ -36,7 +37,9 @@ bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
 (`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic labelled
 with the schema the re-executed graph publishes, a partial file removed on any run that does not finish, and the
 engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
-REQUIRE `--verify`. Every misuse exits 2, never 1:
+REQUIRE `--verify`, and so does `--feed-index-budget`, the bytes a fed replay's frame
+index and the producer labels it reads are charged (`replay_feed::FeedNeed::check_budget`;
+default 1 GiB). Every misuse exits 2, never 1:
 under `--verify` 1 means "your code diverged", so a malformed invocation reported as 1
 would make CI announce a regression that does not exist.
 
@@ -995,6 +998,8 @@ own binary.
 | `topic_type_iox2_test.rs` | `topic type` error arms (silent topic, unnamed hash), the retry past a sample-less event, the typed listing's mirror recheck, its batches (more topics than one batch holds) and a topic that sends nothing, and `topic bw` on a publisher slower than one report a second (stamped apart from its send delay) and on two publishers whose clocks disagree | yes (process-global transport singleton) | none |
 | `topic_types_network_live_test.rs` | `topic list -t` / `find` remote typing from a loopback robot's catalog, and the `topic type` remote-walker ladder | no | none |
 | `topic_observer_iox2_test.rs` | `topic echo`/`hz` observer loops: multiplicity oracle, timeout drain, rate-line math, notify-flood pacing counter | yes (process-global transport singleton) | none |
+| `topic_pub_iox2_test.rs` | `topic pub` frames reach a live subscriber with the encoded body, consecutive sequences and the type's hash; a bad value opens no publisher | no (distinct topics per test) | none |
+| `service_call_iox2_test.rs` | `service call` against `cerulion_core`'s `ServiceServer` (the server `rmw_cerulion` wraps) built from the same ros2_control `.srv` files: request decoded by the server, response JSON, two calls from one process, a late answer to a stopped call not taken by the next call on its client id, no-server timeout exit class | no (distinct services per test) | none |
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
 | `convergence_adoption_test.rs` | Structural walk: the observer seams adopt the converged query verbs | no | none |
 | `bag_record_run_attach_test.rs` | `bag record --run` mid-run attach over a real lapped live trace ring | no | none |

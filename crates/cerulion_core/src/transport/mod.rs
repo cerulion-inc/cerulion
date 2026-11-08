@@ -92,6 +92,10 @@ pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
 #[cfg(feature = "local-transport")]
 pub(crate) use iceoryx2::service::local_threadsafe::Service as CerService;
 
+/// A topic's data-service factory on [`CerService`].
+pub(crate) type DataServiceFactory =
+    iceoryx2::service::port_factory::publish_subscribe::PortFactory<CerService, [u8], ()>;
+
 /// The `event_id_max_value` EVERY Cerulion event service is created with.
 ///
 /// The highest `EventId` the transport mints is
@@ -118,7 +122,7 @@ use publisher::{CerulionPublisher, CerulionPublisherConfig};
 use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 
 /// Maximum topic name length (255 - "/event" suffix = 249).
-const MAX_TOPIC_LEN: usize = 249;
+pub(crate) const MAX_TOPIC_LEN: usize = 249;
 
 /// Refuse node/transport startup when this process's iceoryx2 build lacks
 /// Android shared-memory support (stock iceoryx2 has no `shm_open` on
@@ -930,6 +934,33 @@ impl Default for TransportConfig {
     }
 }
 
+/// What a publisher's send does at a connected subscriber whose queue is
+/// full, on a topic whose data service was created with safe overflow
+/// disabled. On a service created with safe overflow enabled the send
+/// replaces the oldest queued sample under either value.
+///
+/// [`TransportManager::create_ingress_publisher_with`],
+/// [`TransportManager::create_ingress_injector_with`] and
+/// [`TransportManager::create_service_client_with`] take it; every other
+/// publisher constructor builds its port as [`FullQueueSend::ConfigDefault`]
+/// does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FullQueueSend {
+    /// The publisher port is built with no backpressure setting, so it takes
+    /// the strategy of the iceoryx2 config the node was built from
+    /// (`RetryUntilDelivered` in iceoryx2's defaults). Under
+    /// `RetryUntilDelivered` the send waits, with no deadline, until that
+    /// subscriber takes a sample, disconnects or closes its channel.
+    #[default]
+    ConfigDefault,
+    /// The publisher port is built with
+    /// `BackpressureStrategy::DiscardData` and no backpressure handler, so
+    /// iceoryx2 delivers to each subscriber with its non-waiting `try_send`:
+    /// the send skips a subscriber whose queue is full, and the recipient
+    /// count it returns leaves that subscriber out.
+    Discard,
+}
+
 /// Per-topic iceoryx2 SERVICE configuration,
 /// computed by the graph runtime from the topology.
 ///
@@ -1387,6 +1418,21 @@ pub enum PublisherProvisioning {
     Multi,
 }
 
+impl PublisherProvisioning {
+    /// The `max_publishers` a service provisioned this way is created with:
+    /// `None` for [`Self::External`] (the setter stays uncalled, so
+    /// iceoryx2's create default applies), `Some(1)` for
+    /// [`Self::SingleWriter`] and `Some(`[`MULTI_PUBLISHER_LOOSE_MAX`]`)` for
+    /// [`Self::Multi`].
+    pub(crate) const fn max_publishers(self) -> Option<usize> {
+        match self {
+            Self::External => None,
+            Self::SingleWriter => Some(1),
+            Self::Multi => Some(MULTI_PUBLISHER_LOOSE_MAX),
+        }
+    }
+}
+
 /// The `max_publishers` cap provisioned for every
 /// [`PublisherProvisioning::Multi`] topic. One shared constant across all
 /// Cerulion graphs — see the variant doc for why it is loose and why it
@@ -1484,12 +1530,11 @@ impl TopicServiceConfig {
         // for the Some arm: `None` imposes no open requirement, so a
         // graph value below iceoryx2's create-default can never fail a
         // default opener's OPEN-time check.)
-        let (max_subscribers, max_publishers) = match publisher_provisioning {
-            PublisherProvisioning::External => (None, None),
-            PublisherProvisioning::SingleWriter => (
-                Some(in_graph_subscribers.saturating_add(INTROSPECTION_SUBSCRIBER_HEADROOM)),
-                Some(1),
-            ),
+        let max_subscribers = match publisher_provisioning {
+            PublisherProvisioning::External => None,
+            PublisherProvisioning::SingleWriter => {
+                Some(in_graph_subscribers.saturating_add(INTROSPECTION_SUBSCRIBER_HEADROOM))
+            }
             // A multi-publisher topic is CROSS-GRAPH by
             // definition, so BOTH port caps must be graph-independent
             // shared constants — `Some(n)` provisions AND requires
@@ -1499,11 +1544,9 @@ impl TopicServiceConfig {
             // Cerulion graph requires the same two constants, so opens
             // pass by equality; the runtime fail-fasts at build when one
             // graph ALONE exceeds the subscriber cap.
-            PublisherProvisioning::Multi => (
-                Some(MULTI_SUBSCRIBER_LOOSE_MAX),
-                Some(MULTI_PUBLISHER_LOOSE_MAX),
-            ),
+            PublisherProvisioning::Multi => Some(MULTI_SUBSCRIBER_LOOSE_MAX),
         };
+        let max_publishers = publisher_provisioning.max_publishers();
         // The buffer ceiling is the third graph-dependent knob
         // that must be a shared constant on cross-graph (Multi) topics —
         // see MULTI_TOPIC_BUFFER_CEILING. The runtime fail-fasts at build
@@ -3259,6 +3302,25 @@ impl TransportManager {
         history_size: usize,
         topic_config: TopicServiceConfig,
     ) -> TransportResult<CerulionPublisher> {
+        self.create_publisher_sending(
+            topic,
+            max_slice_len,
+            history_size,
+            topic_config,
+            FullQueueSend::ConfigDefault,
+        )
+    }
+
+    /// [`Self::create_publisher_with_topic_config`] with the publisher port's
+    /// full-queue send set by `full_queue`.
+    fn create_publisher_sending(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        history_size: usize,
+        topic_config: TopicServiceConfig,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<CerulionPublisher> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::PublisherCreation {
             topic: topic_owned.clone(),
@@ -3273,6 +3335,7 @@ impl TransportManager {
             max_slice_len,
             history_size,
             topic_config,
+            full_queue,
             &map_err,
         )
     }
@@ -3306,6 +3369,7 @@ impl TransportManager {
         max_slice_len: MaxSliceLen,
         history_size: usize,
         topic_config: TopicServiceConfig,
+        full_queue: FullQueueSend,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionPublisher> {
         // Cross-graph same-topic guard: iceoryx2's port cap
@@ -3398,6 +3462,15 @@ impl TransportManager {
             // slice-ceiling slot per unit in this publisher's demand-paged
             // pool (see the field doc).
             publisher_builder = publisher_builder.max_loaned_samples(max_loaned);
+        }
+        match full_queue {
+            FullQueueSend::ConfigDefault => {}
+            // No backpressure handler is set, so iceoryx2 delivers through
+            // `try_send`, which returns at a full queue.
+            FullQueueSend::Discard => {
+                publisher_builder =
+                    publisher_builder.backpressure_strategy(BackpressureStrategy::DiscardData);
+            }
         }
         let publisher = publisher_builder.create().map_err(|e| {
             use iceoryx2::port::publisher::PublisherCreateError;
@@ -3629,6 +3702,7 @@ impl TransportManager {
             max_slice_len,
             history_size,
             topic_config,
+            FullQueueSend::ConfigDefault,
             &map_err,
         )
     }
@@ -3682,6 +3756,37 @@ impl TransportManager {
         topic: &str,
         max_slice_len: MaxSliceLen,
     ) -> TransportResult<CerulionPublisher> {
+        self.ingress_publisher_and_service(topic, max_slice_len, FullQueueSend::ConfigDefault)
+            .map(|(publisher, _data_service)| publisher)
+    }
+
+    /// [`Self::create_ingress_publisher`] with the publisher port's
+    /// full-queue send set by `full_queue`. With [`FullQueueSend::Discard`]
+    /// its `publish_raw` returns without waiting on a subscriber whose queue
+    /// is full, and the count it returns leaves that subscriber out.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_ingress_publisher`].
+    #[must_use = "publisher creation result must be checked"]
+    pub fn create_ingress_publisher_with(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<CerulionPublisher> {
+        self.ingress_publisher_and_service(topic, max_slice_len, full_queue)
+            .map(|(publisher, _data_service)| publisher)
+    }
+
+    /// The ingress publisher of [`Self::create_ingress_publisher`] and the
+    /// data service it was attached to.
+    fn ingress_publisher_and_service(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<(CerulionPublisher, DataServiceFactory)> {
         // Loop refusal: this gateway must not both ANNOUNCE (egress-tap) and
         // INGRESS the same topic (re-inject → tap → egress → a remote
         // re-injects → …).
@@ -3770,6 +3875,7 @@ impl TransportManager {
             max_slice_len,
             0, // history_size — ingress retains no late-joiner history
             topic_config,
+            full_queue,
             &map_err,
         )?;
         // A raw-INGRESS publisher wakes its FOREIGN consumers from
@@ -3786,7 +3892,7 @@ impl TransportManager {
         // route is not progress — and best-effort: a recording aid must never
         // be able to fail an ingress route (see `note_ingress_route_created`).
         self.note_ingress_route_created();
-        Ok(publisher)
+        Ok((publisher, data_service))
     }
 
     /// Report that ONE more runtime ingress route was created by this
@@ -3974,6 +4080,31 @@ impl TransportManager {
             expected_schema_hash,
             publisher,
         ))
+    }
+
+    /// [`Self::create_ingress_injector`] with the injection publisher built
+    /// by [`Self::create_ingress_publisher_with`] for `full_queue`. The
+    /// injector also holds the topic's data service, so
+    /// [`IngressInjector::subscriber_count`] reads how many subscribers the
+    /// topic has attached.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_ingress_injector`].
+    #[must_use = "ingress injector creation result must be checked"]
+    pub fn create_ingress_injector_with(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<IngressInjector> {
+        let (publisher, data_service) =
+            self.ingress_publisher_and_service(topic, max_slice_len, full_queue)?;
+        Ok(
+            IngressInjector::new(topic.to_string(), expected_schema_hash, publisher)
+                .with_data_service(data_service),
+        )
     }
 
     /// Create a network-sourced injector with required SHM mirror identity.
@@ -7429,7 +7560,7 @@ pub(crate) fn classify_node_name_refusal(raw: &str) -> NodeNameRefusal {
 }
 
 /// Validate that the topic name is within iceoryx2's service name limit.
-fn validate_topic_name(topic: &str) -> Result<(), String> {
+pub(crate) fn validate_topic_name(topic: &str) -> Result<(), String> {
     if topic.is_empty() {
         return Err("topic name cannot be empty".to_string());
     }
