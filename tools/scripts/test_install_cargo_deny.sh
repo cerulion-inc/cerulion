@@ -142,6 +142,9 @@ SHIM
 chmod +x "$shim_bin/curl"
 
 export FIXTURE_DIR=$fixtures FIXTURE_VERSION=$version FIXTURE_RELEASE=$release
+# The installer reads this from the environment; a caller's value would point
+# the cases at the caller's own cache.
+unset CERULION_TOOL_TARBALLS
 export FIXTURE_CURL_VERSION=8.7.1 FIXTURE_CURL_OLD=0
 
 # run_case NAME MODE [ARGS...]: run the copy in a fresh CARGO_HOME. Leaves the
@@ -239,6 +242,15 @@ grep -q "^::error::install_cargo_deny: the tarball cache file $work/cache-wrong/
     || fail "cache wrong bytes: the cache file was not replaced" "$out"
 printf 'a cached tarball that fails the checksum is an error and is replaced: passed\n'
 
+mkdir -p "$work/cache-wrong-nosource/tarballs"
+cp "$fixtures/wrong.tar.gz" "$work/cache-wrong-nosource/tarballs/$(asset_of "$host_platform")"
+export CERULION_TOOL_TARBALLS=$work/cache-wrong-nosource/tarballs
+run_case cache-wrong-nosource fail
+[ "$status" -ne 0 ] || fail "cache wrong bytes, download fails: exit 0" "$out"
+[ ! -e "$work/cache-wrong-nosource/tarballs/$(asset_of "$host_platform")" ] \
+    || fail "cache wrong bytes, download fails: the cache file that failed the checksum was kept" "$out"
+printf 'a cached tarball that fails the checksum is deleted: passed\n'
+
 export CERULION_TOOL_TARBALLS=\~/tarballs
 run_case cache-miss good
 [ "$status" -eq 0 ] || fail "cache miss: exit $status" "$out"
@@ -264,6 +276,11 @@ export CERULION_TOOL_TARBALLS=$work/fill-fail/tarballs
 run_case fill-fail fail --fill-cache linux
 [ "$status" -ne 0 ] || fail "fill, download fails: exit 0" "$out"
 [ -z "$(ls -A "$work/fill-fail/tarballs" 2>/dev/null)" ] || fail "fill, download fails: a file was left in the cache" "$out"
+: > "$work/not-a-directory"
+export CERULION_TOOL_TARBALLS=$work/not-a-directory
+run_case fill-unwritable good --fill-cache linux
+[ "$status" -ne 0 ] || fail "fill, unwritable cache: exit 0" "$out"
+grep -q "could not write $work/not-a-directory/$(asset_of linux)" "$out" || fail "fill, unwritable cache: not diagnosed" "$out"
 run_case fill-badplatform good --fill-cache windows
 [ "$status" -ne 0 ] || fail "fill: an unknown platform was accepted" "$out"
 [ ! -s "$log" ] || fail "fill: an unknown platform fetched something" "$out"

@@ -413,7 +413,8 @@ crates.io script self-tests (the index wait, the publish retry, and the post-pub
 archive reader `release.yml` runs after an upload); the nextest, actionlint and cargo-deny
 installer self-tests, the tool tarball cache key self-test and the tool download check
 (`tools/scripts/check_tool_downloads.py`: every curl download in a workflow or a tool
-fetcher is retried, bounded and written to a file, and every fetcher holds one); the
+fetcher is retried, bounded and written to a file, and every fetcher but
+`install_hooks.sh` holds one); the
 naming gate (pull requests only);
 `shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`

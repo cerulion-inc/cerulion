@@ -263,7 +263,8 @@ expected_sha_of() {
 }
 
 # The tarball cache directory, empty when CERULION_TOOL_TARBALLS is unset. A
-# cached tarball carries its GitHub release asset name.
+# cached tarball carries its GitHub release asset name; CACHE_LAYOUT in
+# tool_tarball_cache.sh names that layout and changes with it.
 cache_dir=${CERULION_TOOL_TARBALLS:-}
 case "$cache_dir" in
     \~/*) cache_dir=$HOME/${cache_dir#\~/} ;;

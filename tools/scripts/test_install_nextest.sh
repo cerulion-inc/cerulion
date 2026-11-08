@@ -149,6 +149,9 @@ SHIM
 chmod +x "$shim_bin/curl"
 
 export FIXTURE_DIR=$fixtures FIXTURE_VERSION=$version FIXTURE_CURL_VERSION=8.7.1 FIXTURE_CURL_OLD=0
+# The installer reads these from the environment; a caller's values would
+# point the cases at the caller's own cache or pin.
+unset CERULION_TOOL_TARBALLS NEXTEST_PRIMARY_URL NEXTEST_VERSION
 
 primary_url=https://get.nexte.st/$version/$host_platform
 
@@ -297,6 +300,17 @@ grep -q "^::error::install_nextest: the tarball cache file $work/cache-wrong/tar
     || fail "cache wrong bytes: the cache file was not replaced with the pinned bytes" "$out"
 printf 'a cached tarball that fails the checksum is an error and is replaced: passed\n'
 
+# A cached tarball that fails the checksum is deleted even when no route then
+# delivers.
+mkdir -p "$work/cache-wrong-nosource/tarballs"
+cp "$fixtures/wrong.tar.gz" "$work/cache-wrong-nosource/tarballs/$host_asset"
+export CERULION_TOOL_TARBALLS=$work/cache-wrong-nosource/tarballs
+run_case cache-wrong-nosource fail fail
+[ "$status" -ne 0 ] || fail "cache wrong bytes, no route: exit 0" "$out"
+[ ! -e "$work/cache-wrong-nosource/tarballs/$host_asset" ] \
+    || fail "cache wrong bytes, no route: the cache file that failed the checksum was kept" "$out"
+printf 'a cached tarball that fails the checksum is deleted: passed\n'
+
 # A miss downloads and stores the verified tarball; a leading ~/ is $HOME.
 export CERULION_TOOL_TARBALLS=\~/tarballs
 run_case cache-miss good fail
@@ -358,6 +372,14 @@ for leftover in "$work/fill-fail/tarballs"/*.partial.*; do
     [ ! -e "$leftover" ] || fail "fill, no source: a partial file was left in the cache" "$out"
 done
 printf 'fill mode fails when no source delivers: passed\n'
+
+# A cache that cannot be written fails the fill, so nothing saves an empty
+# archive under a valid key.
+export CERULION_TOOL_TARBALLS=$work/not-a-directory
+run_case fill-unwritable good good --fill-cache linux
+[ "$status" -ne 0 ] || fail "fill, unwritable cache: exit 0" "$out"
+grep -q "could not write $work/not-a-directory/$(asset_of linux)" "$out" || fail "fill, unwritable cache: not diagnosed" "$out"
+printf 'fill mode fails when the cache cannot be written: passed\n'
 
 # Usage: fill needs a platform it knows and a cache directory.
 run_case fill-noplatform good good --fill-cache

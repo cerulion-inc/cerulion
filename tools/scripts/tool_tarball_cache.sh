@@ -13,15 +13,20 @@
 #
 # `key` prints `key=tool-tarballs-nextest-<version>-cargo-deny-<version>-<digest>`,
 # the line form `$GITHUB_OUTPUT` reads. The digest is the SHA-256, cut to 16 hex
-# digits, of both installers' pin lines and the two platform lists below, so the
-# key changes whenever a pin or a list changes, and an archive restored under a
-# key holds exactly the tarballs `fill` put in it.
+# digits, of both installers' pin lines, the two platform lists and CACHE_LAYOUT
+# below, so the key changes whenever a pin, a list or the layout changes, and an
+# archive restored under a key holds exactly the tarballs `fill` put in it.
+#
+# CACHE_LAYOUT names the file names the installers give cached tarballs (the
+# release asset names, at the top of the directory). A change to those names
+# changes CACHE_LAYOUT with it.
 #
 # `fill` runs each installer's `--fill-cache` over its platform list.
 set -euo pipefail
 
 NEXTEST_PLATFORMS=(linux mac)
 CARGO_DENY_PLATFORMS=(linux)
+CACHE_LAYOUT=release-asset-names-v1
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
@@ -55,8 +60,9 @@ cmd_key() {
     deny_pins=$(pins_of "$script_dir/install_cargo_deny.sh" CARGO_DENY 5)
     nextest_version=$(printf '%s\n' "$nextest_pins" | sed -n 's/^NEXTEST_PINNED_VERSION=//p')
     deny_version=$(printf '%s\n' "$deny_pins" | sed -n 's/^CARGO_DENY_PINNED_VERSION=//p')
-    digest=$(printf '%s\n%s\nNEXTEST_PLATFORMS=%s\nCARGO_DENY_PLATFORMS=%s\n' \
-        "$nextest_pins" "$deny_pins" "${NEXTEST_PLATFORMS[*]}" "${CARGO_DENY_PLATFORMS[*]}" | sha256_text)
+    digest=$(printf '%s\n%s\nNEXTEST_PLATFORMS=%s\nCARGO_DENY_PLATFORMS=%s\nCACHE_LAYOUT=%s\n' \
+        "$nextest_pins" "$deny_pins" "${NEXTEST_PLATFORMS[*]}" "${CARGO_DENY_PLATFORMS[*]}" \
+        "$CACHE_LAYOUT" | sha256_text)
     printf 'key=tool-tarballs-nextest-%s-cargo-deny-%s-%s\n' "$nextest_version" "$deny_version" "${digest:0:16}"
 }
 

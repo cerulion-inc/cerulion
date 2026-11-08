@@ -14,9 +14,10 @@ A DOWNLOAD is a `curl` command whose bytes are kept: written with
 `-o`/`--output`/`-O`, or sent to stdout, a pipe or a command substitution. A
 `curl` word followed by a URL is one wherever it stands, behind `timeout N`,
 `env`, `sudo`, `docker run IMAGE` or a wrapper function as much as at the
-start of a command. One with no URL counts only at the start of a command,
-where its URL can come from `--config`, so the package name in
-`apt-get install -y curl` is not one. The script of `sh -c '...'` or
+start of a command; a word holding `$` counts as a URL. One with no URL
+counts only at the start of a command, where its URL can come from `--config`,
+so the package name in `apt-get install -y curl git` is not one. The script of
+`sh -c '...'` or
 `bash -c "..."` is read as commands too. A curl whose output goes to /dev/null
 (a readiness probe), or that carries neither a URL nor a kept output
 (`curl --version`), is not one. Backslash continuations are joined first, so a
@@ -39,9 +40,10 @@ Rules, one line per violation:
              command reports nothing about it.
   FLOOR      every fetcher (`install_*.sh`, `build_*_container.sh`) holds at
              least one download, except the ones NO_DOWNLOAD names, which must
-             hold none. A download moved into a shape this reader does not
-             know drops its file to zero and fails here, rather than leaving
-             the other files to keep the run green.
+             hold none. A fetcher whose only download moves into a shape this
+             reader does not know drops to zero and fails here, rather than
+             leaving the other files to keep the run green. A workflow has no
+             floor of its own.
 
 Exit 0 every rule holds, 1 one line per violation on stdout, 2 usage, a file
 it cannot read, or no download found in the files it read.

@@ -60,11 +60,12 @@ expect_moved deny-sha install_cargo_deny.sh 's/^\(CARGO_DENY_SHA256_linux=\).*/\
 expect_moved deny-version install_cargo_deny.sh 's/^CARGO_DENY_PINNED_VERSION=.*/CARGO_DENY_PINNED_VERSION=9.9.9/'
 expect_moved nextest-platforms tool_tarball_cache.sh 's/^NEXTEST_PLATFORMS=.*/NEXTEST_PLATFORMS=(linux)/'
 expect_moved deny-platforms tool_tarball_cache.sh 's/^CARGO_DENY_PLATFORMS=.*/CARGO_DENY_PLATFORMS=(linux mac-arm)/'
+expect_moved cache-layout tool_tarball_cache.sh 's/^CACHE_LAYOUT=.*/CACHE_LAYOUT=other/'
 case "$(key_of "$work/nextest-version")" in
     key=tool-tarballs-nextest-9.9.9-*) ;;
     *) fail "a moved nextest version is not named in the key" ;;
 esac
-printf 'every pin line and platform list moves the key: passed\n'
+printf 'every pin line, platform list and the cache layout move the key: passed\n'
 
 # A pin line the key cannot find is refused, not hashed as absent.
 dir=$(copy missing-pin)
