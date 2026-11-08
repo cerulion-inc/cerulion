@@ -3584,14 +3584,28 @@ fn collect_entry_infos_from_cache(
     Ok(entry_infos)
 }
 
+/// The text of [`KILL_SWITCH_SCOPE`], for `concat!`.
+macro_rules! kill_switch_scope {
+    () => {
+        "the network kill switch keeps Cerulion service traffic off (robots, relays, hosted \
+         Cerulion services and telemetry); signing in to your account still works"
+    };
+}
+
+/// What the network kill switch covers, in every notice it prints: Cerulion
+/// service traffic, not account sign-in. `pub` so tests pin the exact text.
+pub const KILL_SWITCH_SCOPE: &str = kill_switch_scope!();
+
 /// Kill-switch, blockless arm: under the permissive default,
 /// `--network off` on a blockless REAL-clock graph is not inert — it
 /// SUPPRESSES the open-by-default network exposure. This notice confirms the
 /// kill-switch ACTED (warn-level — the docs promise a loud kill-switch
 /// notice). `pub` so tests pin the exact text.
-pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str =
+pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str = concat!(
     "local execution selected: this run is LOCAL-ONLY; the permissive open-by-default network exposure \
-     is suppressed; no gateway is spawned and no zenoh session opens";
+     is suppressed; no gateway is spawned and no zenoh session opens; ",
+    kill_switch_scope!()
+);
 
 /// Kill-switch, replay-class arm: the one arm where `--network off`
 /// is GENUINELY redundant — a virtual/external-clock run is network-inert by
@@ -3610,7 +3624,7 @@ pub const NETWORK_OFF_REDUNDANT_NOTICE: &str =
 /// as `off` (an operator who set the kill-switch env at all intended
 /// local-only; failing open on a typo is the wrong direction for a security
 /// default). Empty/unset ⇒ no effect. Read inside [`resolve_run_network`].
-const NETWORK_ENV: &str = "CERULION_NETWORK";
+pub const NETWORK_ENV: &str = "CERULION_NETWORK";
 
 /// Resolve the robot's network
 /// IDENTITY — the value stamped identically into the announce keys' robot chunk,
@@ -3680,8 +3694,11 @@ impl NetworkEnvKill {
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
 ///
-/// The single source of truth for the kill-switch parse (trimmed, ASCII
-/// case-insensitive `off`; fails CLOSED on any other non-empty value). Pure
+/// The CLI's one kill-switch parse (trimmed, ASCII case-insensitive `off`;
+/// fails CLOSED on any other non-empty value).
+/// `cerulion_telemetry::kill_switch::engaged` is a copy of its blank decision
+/// for `cerulion-vizd`'s telemetry, and a `cerulion_cli` unit test holds the
+/// two equal. Pure
 /// over the environment — it emits NO log; each caller emits its own
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
@@ -3798,7 +3815,8 @@ pub fn remote_network_suppressed() -> bool {
                 value = %v,
                 "CERULION_NETWORK is set to an unrecognized value — the only accepted value is \
                  `off`; failing CLOSED and treating it as `off` (this remote query is \
-                 LOCAL-ONLY). Unset the variable to restore the default network behavior"
+                 LOCAL-ONLY). Unset the variable to restore the default network behavior; \
+                 {KILL_SWITCH_SCOPE}"
             );
             true
         }
@@ -3966,7 +3984,8 @@ pub fn resolve_run_network(
             value = %v,
             "CERULION_NETWORK is set to an unrecognized value — the only accepted \
              value is `off`; failing CLOSED and treating it as `off` (this run is \
-             LOCAL-ONLY). Unset the variable to restore the default network behavior"
+             LOCAL-ONLY). Unset the variable to restore the default network behavior; \
+             {KILL_SWITCH_SCOPE}"
         );
     }
     let env_off = env_kill.is_off();
@@ -3979,7 +3998,7 @@ pub fn resolve_run_network(
                 egress = net.egress.len(),
                 ingress = net.ingress.len(),
                 "local execution selected: the graph's declared egress/ingress \
-                 topics will NOT cross the machine boundary for this run"
+                 topics will NOT cross the machine boundary for this run; {KILL_SWITCH_SCOPE}"
             );
         } else if time_source == TimeSource::Real {
             // (b) blockless + real clock: the kill-switch ACTED — it
