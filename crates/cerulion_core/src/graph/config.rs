@@ -743,10 +743,12 @@ pub struct NodeDef {
     /// With the graph's profile every node starts a unit and a linear chain
     /// of trigger edges shares one unit where the profile shows the merge
     /// stays within its tick budget; there `isolate: false` keeps this node
-    /// in the unit of the nodes that trigger it whatever those rules say.
-    /// Without a profile `isolate: false` changes nothing. Absent leaves the
-    /// choice to those rules. `cerulion graph plan` shows the units and why
-    /// each one starts.
+    /// in the unit of the nodes that trigger it whatever those rules say,
+    /// where the joined unit keeps its band of levels: it joins only the
+    /// producers whose units keep it, and runs in a unit of its own when it
+    /// joins none. Without a profile `isolate: false` changes nothing. Absent
+    /// leaves the choice to those rules. `cerulion graph plan` shows the units
+    /// and why each one starts.
     ///
     /// This key replaces `fuse: false`, which is refused at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]

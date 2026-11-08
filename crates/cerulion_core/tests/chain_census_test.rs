@@ -1211,16 +1211,21 @@ fn without_a_profile_isolate_true_splits_off_only_what_a_band_of_levels_needs() 
 /// Every graph of trigger edges on four nodes (an edge runs only from a lower
 /// node index to a higher one; a node with no input is a 10 ms source, any
 /// other fires on each input), under its derived levels and under every
-/// `level_assignments:` block its edges allow, with every set of at most two
-/// nodes declaring `isolate: true`, split into units as one process with a
-/// profile under which every merge is within its tick budget (1 µs a tick,
-/// every edge at 100 Hz). For each split:
+/// `level_assignments:` block its edges allow, with each node declaring
+/// `isolate: true`, `isolate: false` or neither and at most two declaring
+/// `isolate: true`, split into units as one process with a profile under
+/// which every merge is within its tick budget (1 µs a tick, every edge at
+/// 100 Hz). For each split:
 ///
 /// - the partition validator accepts it;
 /// - each isolated node is alone in its unit;
 /// - the ends of a chain link whose consumer sits on the level right after
 ///   its producer's, neither isolated, share a unit, so the band of levels
-///   refuses only the links that skip a level.
+///   refuses only the links that skip a level;
+/// - a node that declares `isolate: false` shares a unit with each of its
+///   producers on the level right before its own that is not isolated, so
+///   the band of levels refuses only the joins that skip a level or leave a
+///   node unfed.
 ///
 /// Every violation is collected, so a failure reports how many splits break
 /// each rule.
@@ -1244,6 +1249,7 @@ fn with_a_profile_every_unit_keeps_a_band_of_levels_the_validator_accepts() {
     let mut violations: Vec<(&str, String)> = Vec::new();
     let mut splits = 0usize;
     let mut skipping_links = 0usize;
+    let mut refused_joins = 0usize;
     for mask in 0u32..(1 << pairs.len()) {
         let edges: Vec<(usize, usize)> = pairs
             .iter()
@@ -1300,16 +1306,25 @@ fn with_a_profile_every_unit_keeps_a_band_of_levels_the_validator_accepts() {
                 }
             };
             let level = |i: usize| h.levels.level_of(&ids[i]).expect("every node has a level");
-            for iso in 0u32..(1 << N) {
-                if iso.count_ones() > 2 {
+            // Each node's `isolate:` declaration: absent, `true` or `false`.
+            for code in 0..3usize.pow(N as u32) {
+                let declared: Vec<Option<bool>> = (0..N)
+                    .map(|i| match code / 3usize.pow(i as u32) % 3 {
+                        0 => None,
+                        1 => Some(true),
+                        _ => Some(false),
+                    })
+                    .collect();
+                if declared.iter().filter(|d| **d == Some(true)).count() > 2 {
                     continue;
                 }
                 splits += 1;
-                let isolated = |i: usize| iso & (1 << i) != 0;
+                let isolated = |i: usize| declared[i] == Some(true);
+                let joining = |i: usize| declared[i] == Some(false);
                 let mut one = h.config.clone();
                 for node in &mut one.nodes {
                     let i = ids.iter().position(|id| *id == node.id).expect("known id");
-                    node.isolate = isolated(i).then_some(true);
+                    node.isolate = declared[i];
                 }
                 one.process_groups = [("g".to_string(), ids.clone())].into_iter().collect();
                 let graph = UnitGraph::from_graph(&one, &h.infos, &h.topology, &h.trigger_edges);
@@ -1323,8 +1338,9 @@ fn with_a_profile_every_unit_keeps_a_band_of_levels_the_validator_accepts() {
                     &IndexSet::new(),
                 );
                 let case = format!(
-                    "edges {edges:?}, levels {assigned:?}, isolated {:?}",
-                    (0..N).filter(|&i| isolated(i)).collect::<Vec<_>>()
+                    "edges {edges:?}, levels {assigned:?}, isolated {:?}, isolate: false {:?}",
+                    (0..N).filter(|&i| isolated(i)).collect::<Vec<_>>(),
+                    (0..N).filter(|&i| joining(i)).collect::<Vec<_>>()
                 );
                 if let Err(e) = validate_partition(&plan.groups, &one, &h.infos, &h.trigger_edges) {
                     violations.push((
@@ -1371,15 +1387,36 @@ fn with_a_profile_every_unit_keeps_a_band_of_levels_the_validator_accepts() {
                         ));
                     }
                 }
+                for &(p, c) in edges.iter().filter(|(_, c)| joining(*c)) {
+                    if !isolated(p) && level(c) == level(p) + 1 && unit_of(p) != unit_of(c) {
+                        violations.push((
+                            "joined",
+                            format!(
+                                "{} declares isolate: false but does not share {}'s unit, one \
+                                 level below ({case})",
+                                ids[c], ids[p]
+                            ),
+                        ));
+                    }
+                }
+                refused_joins += (0..N)
+                    .filter(|&i| joining(i))
+                    .filter(|&i| {
+                        units
+                            .iter()
+                            .flat_map(|u| u.boundaries.iter())
+                            .any(|(n, b)| *n == ids[i] && matches!(b, Boundary::LevelBand { .. }))
+                    })
+                    .count();
             }
         }
     }
-    assert_eq!(splits, 8_360, "the sweep ran every split");
+    assert_eq!(splits, 54_720, "the sweep ran every split");
     assert!(
         skipping_links > 0,
         "the sweep reached a link that skips a level: {skipping_links}"
     );
-    let per_rule: Vec<String> = ["validator", "isolated", "link"]
+    let per_rule: Vec<String> = ["validator", "isolated", "link", "joined"]
         .iter()
         .map(|rule| {
             let n = violations.iter().filter(|(r, _)| r == rule).count();
@@ -1397,6 +1434,10 @@ fn with_a_profile_every_unit_keeps_a_band_of_levels_the_validator_accepts() {
             .map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    assert!(
+        refused_joins > 0,
+        "the sweep reached an isolate: false node kept apart for its band: {refused_joins}"
     );
 }
 

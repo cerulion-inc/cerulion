@@ -24125,13 +24125,17 @@ nodes:
     }
 
     /// A workspace whose graph `lb` holds one process group `p0`: `src`, a
-    /// 10 ms source, feeds `sink` across a chain link, and `beacon`, a 10 ms
-    /// period node that declares `isolate: true`, sits at level 1 between
-    /// them under `level_assignments:` (`src` 0, `beacon` 1, `sink` 2). The
-    /// profile holds 1 us a tick for each and 100 Hz on the link, so the tick
-    /// budget holds every merge. `sink_isolate` is the `isolate:` line of
-    /// `sink`, empty for none.
-    fn level_band_workspace(sink_isolate: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    /// 10 ms source, feeds `sink`, and `beacon`, a 10 ms period node, sits at
+    /// level 1 between them under `level_assignments:` (`src` 0, `beacon` 1,
+    /// `sink` 2). `sink_type` is `follower`, whose input is a chain link, or
+    /// `blocker`, whose input is a `block` edge that keeps `sink` with `src`;
+    /// `beacon` declares `isolate: true` when `beacon_isolated`. The profile
+    /// holds 1 us a tick for each and 100 Hz on the edge, so the tick budget
+    /// holds every merge.
+    fn level_band_workspace(
+        sink_type: &str,
+        beacon_isolated: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let ws = crate::workspace::workspace_create(tmp.path(), "lb_ws").unwrap();
         write_node_source(
@@ -24164,6 +24168,26 @@ struct FollowerNode {
 }
 "#,
         );
+        write_node_source(
+            &ws.nodes_dir,
+            "blocker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct BlockerNode {
+    #[input(trigger, backpressure = block, depth = 4)]
+    inp: Vector3,
+}
+"#,
+        );
+        let beacon_isolate = if beacon_isolated {
+            "    isolate: true\n"
+        } else {
+            ""
+        };
         let yaml = format!(
             "\
 name: lb
@@ -24179,14 +24203,13 @@ nodes:
       - name: out
         schema: geometry_msgs/Vector3
   - id: sink
-    type: follower
-{sink_isolate}    inputs:
+    type: {sink_type}
+    inputs:
       - name: inp
         source: src/out
   - id: beacon
     type: ticker
-    isolate: true
-    outputs:
+{beacon_isolate}    outputs:
       - name: out
         schema: geometry_msgs/Vector3
 process_groups:
@@ -24230,7 +24253,7 @@ process_groups:
     /// every unit, so the process is not kept whole.
     #[test]
     fn graph_plan_keeps_a_profiled_link_split_across_an_isolated_nodes_level() {
-        let (_tmp, root) = level_band_workspace("");
+        let (_tmp, root) = level_band_workspace("follower", true);
         let plan = graph_plan(&root, "lb").unwrap();
         eprintln!("plan:\n{plan}");
         for line in [
@@ -24255,13 +24278,14 @@ process_groups:
     }
 
     /// A split the partition validator refuses keeps the process as one unit,
-    /// and says so at WARN, naming the process and the refusal. The case: the
-    /// graph above with `sink` declaring `isolate: false`, which joins it to
-    /// `src` whatever the link rules say, so their unit skips level 1.
+    /// and says so at WARN, naming the process, the refusal and each node of
+    /// it that declares `isolate: true`. The case: the graph above with a
+    /// `block` edge from `src` to `sink`, which keeps them in one unit
+    /// whatever the other rules say, so their unit skips level 1.
     #[test]
     #[tracing_test::traced_test]
     fn a_refused_unit_split_keeps_the_process_whole_and_warns() {
-        let (_tmp, root) = level_band_workspace("    isolate: false\n");
+        let (_tmp, root) = level_band_workspace("blocker", true);
         let plan = graph_plan(&root, "lb").unwrap();
         eprintln!("plan:\n{plan}");
         assert!(
@@ -24285,16 +24309,213 @@ process_groups:
                 l.contains("executor units: the partition validator refuses this process's split")
                     && l.contains("process=p0")
                     && l.contains("owns non-adjacent")
+                    && l.contains("its nodes that declare `isolate: true` included")
+                    && l.contains("isolated=[\"beacon\"]")
             });
             if hits == 1 && named {
                 Ok(())
             } else {
                 Err(format!(
-                    "expected exactly 1 WARN-level refusal line naming p0 and the refusal, got \
-                     {hits} (named: {named})"
+                    "expected exactly 1 WARN-level refusal line naming p0, the refusal and \
+                     beacon, got {hits} (named: {named})"
                 ))
             }
         });
+    }
+
+    /// The refused split of a process in which no node declares
+    /// `isolate: true` warns without claiming one does.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_split_with_no_isolated_node_warns_without_naming_one() {
+        let (_tmp, root) = level_band_workspace("blocker", false);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        assert!(
+            plan.contains("process p0: 1 unit(s)"),
+            "the refused split keeps p0 whole; plan was:\n{plan}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let refusals: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(
+                        "executor units: the partition validator refuses this process's split",
+                    )
+                })
+                .collect();
+            let hits = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "executor units: the partition validator refuses this process's split",
+            );
+            let named = refusals.iter().all(|l| {
+                l.contains("process=p0")
+                    && !l.contains("`isolate: true`")
+                    && !l.contains("isolated=")
+            });
+            if hits == 1 && refusals.len() == 1 && named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly 1 WARN-level refusal line naming p0 and no isolated \
+                     node, got {hits}: {refusals:?}"
+                ))
+            }
+        });
+    }
+
+    /// A workspace whose graph `ij` holds one process group `p0`: `src`, a
+    /// 10 ms source, feeds `mid`, which declares `isolate: true`, and the
+    /// join `join`, which `mid` also feeds and which declares
+    /// `isolate: false`. Derived levels: `src` 0, `mid` 1, `join` 2. The
+    /// profile holds 1 us a tick for each node and 100 Hz on each edge.
+    fn isolated_middle_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "ij_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: ij
+prefix: ij
+nodes:
+  - id: src
+    type: producer
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: mid
+    type: relay
+    isolate: true
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: join
+    type: joiner
+    isolate: false
+    inputs:
+      - name: a
+        source: src/out
+      - name: b
+        source: mid/out
+process_groups:
+  p0: [src, mid, join]
+";
+        std::fs::write(ws.root.join("graphs").join("ij.yaml"), yaml).unwrap();
+        let edge = |producer: &str, consumer: &str| ProfileEdge {
+            producer: producer.to_string(),
+            consumer: consumer.to_string(),
+            rate_mhz: 100_000,
+        };
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "ij".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000u64),
+                ("mid".to_string(), 1_000u64),
+                ("join".to_string(), 1_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![edge("src", "mid"), edge("src", "join"), edge("mid", "join")],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "ij"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let root = ws.root.clone();
+        (tmp, root)
+    }
+
+    /// With a profile, a join that declares `isolate: false` is not joined to
+    /// a producer whose unit would leave the level of a node that declares
+    /// `isolate: true` out of the joined unit: it keeps a unit of its own and
+    /// `graph plan` names why, and the isolated node keeps its unit.
+    #[test]
+    #[tracing_test::traced_test]
+    fn graph_plan_keeps_an_isolate_false_join_apart_from_a_producer_past_an_isolated_level() {
+        let (_tmp, root) = isolated_middle_workspace();
+        let plan = graph_plan(&root, "ij").unwrap();
+        eprintln!("plan:\n{plan}");
+        for line in [
+            "graph ij: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "  unit p0.mid: mid",
+            "    starts at mid: isolate: true",
+            "  unit p0.join: join",
+            "    starts at join: joining src's unit would leave level 1 out of the unit while it \
+             runs levels below and above it (a unit runs a contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+        assert!(
+            !logs_contain("executor units: the partition validator refuses"),
+            "no split is refused"
+        );
     }
 
     /// Every sentence of the user-facing pages that calls a `--single-process`

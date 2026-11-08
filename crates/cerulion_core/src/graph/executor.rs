@@ -64,7 +64,11 @@
 //! breaks its band, they are walked again from the same start, and each merge
 //! whose merged unit would break its band is refused
 //! ([`Boundary::LevelBand`]); a host whose first walk forms only units that
-//! keep their band gets the units of that walk.
+//! keep their band gets the units of that walk. When a unit still breaks its
+//! band after the second walk, as one an `isolate: false` join (below) makes
+//! across a level, a third pass from the same start makes each such join only
+//! where the joined unit keeps its band, and then walks the links as the
+//! second walk does.
 //!
 //! A unit is fed at each member's own period, else through each trigger edge
 //! into the member: at the edge's profiled rate, or, when the profile does not
@@ -81,9 +85,9 @@
 //! edge that is no link (latest-value, fan-out, join, a period or sync
 //! consumer...), `isolate: true`, an isolated producer, an unprofiled merge, a
 //! merge into a unit fed at a rate the profile does not hold, a merge over
-//! budget, a merge that would break the unit's band of levels, or a cycle of
-//! links that no chain head reaches. A node in one unit
-//! with a node that triggers it starts no unit and carries no reason.
+//! budget, a merge or an `isolate: false` join that would break the unit's
+//! band of levels, or a cycle of links that no chain head reaches. A node in
+//! one unit with a node that triggers it starts no unit and carries no reason.
 //!
 //! # Overrides
 //!
@@ -93,7 +97,12 @@
 //! fan-in node merges its producers' units, a fan-out consumer shares the
 //! producer's unit, and the tick budget is not applied. When a producer
 //! declares `isolate: true` and its consumer `isolate: false`, the producer's
-//! declaration wins.
+//! declaration wins. The joins are made before any link is walked, and in the
+//! third pass (above) the nodes are taken lowest level first (member order
+//! breaking ties) and each node's producers nearest level first, and a join
+//! is made only where the joined unit keeps its band of levels. A node that
+//! joins none of its producers that way starts a unit of its own and carries
+//! [`Boundary::LevelBand`] for the first producer it could not join.
 //!
 //! A [`Coupling`] (every producer and consumer of a topic with a `block`
 //! consumer) merges its nodes into one unit whatever the other rules say: the
@@ -173,10 +182,11 @@ pub enum Boundary {
     },
     /// A link whose merge would put the unit over its tick budget.
     OverBudget(BudgetVerdict),
-    /// A link whose merge would leave the unit without the band of levels
-    /// the partition validator asks of every unit.
+    /// A link whose merge, or an `isolate: false` join, would leave the unit
+    /// without the band of levels the partition validator asks of every unit.
     LevelBand {
-        /// The producer across the link.
+        /// The producer across the link, or the first producer the
+        /// `isolate: false` node could not join.
         producer: String,
         /// How the merged unit would break its band.
         rule: BandRule,
@@ -986,6 +996,138 @@ fn assemble_units(
         .collect()
 }
 
+/// Make the joins `isolate: false` asks for: each `(node, producers)` of
+/// `joins` (member indices) joins the groups of `parent` that hold its
+/// producers in this host that do not declare `isolate: true`.
+///
+/// Without `checked` every join is made. With it (the third pass of
+/// `units_from_profile`), the nodes are taken lowest level first (member order
+/// breaking ties) and each node's producers nearest level first, and a join
+/// is made only where the joined group keeps its band of levels; a node that
+/// joins none of its producers starts a unit of its own and carries
+/// [`Boundary::LevelBand`] for the first producer it could not join.
+fn join_isolate_false<'m>(
+    joins: &[(usize, Vec<usize>)],
+    checked: Option<&Bands>,
+    members: &'m [String],
+    parent: &mut [usize],
+    starts: &mut IndexMap<&'m str, Boundary>,
+) {
+    let Some(bands) = checked else {
+        for (node, producers) in joins {
+            for &p in producers {
+                union(parent, *node, p);
+            }
+        }
+        return;
+    };
+    let mut order: Vec<&(usize, Vec<usize>)> = joins.iter().collect();
+    order.sort_by_key(|(node, _)| (bands.level[*node], *node));
+    for (node, producers) in order {
+        let node = *node;
+        let mut nearest = producers.clone();
+        nearest.sort_by_key(|&p| (std::cmp::Reverse(bands.level[p]), p));
+        let mut joined = false;
+        let mut refused: Option<Boundary> = None;
+        for p in nearest {
+            let roots = [root(parent, node), root(parent, p)];
+            if roots[0] == roots[1] {
+                joined = true;
+                continue;
+            }
+            let merged: Vec<usize> = (0..members.len())
+                .filter(|&i| roots.contains(&root(parent, i)))
+                .collect();
+            match bands.broken(&merged, members) {
+                Some(rule) => {
+                    if refused.is_none() {
+                        refused = Some(Boundary::LevelBand {
+                            producer: members[p].clone(),
+                            rule,
+                        });
+                    }
+                }
+                None => {
+                    union(parent, node, p);
+                    joined = true;
+                }
+            }
+        }
+        if let (false, Some(boundary)) = (joined, refused) {
+            starts.insert(members[node].as_str(), boundary);
+        }
+    }
+}
+
+/// What each group of `parent` is fed at, keyed by its root, from every
+/// member before the first link merge: the member's own period; else each
+/// trigger edge into it at the edge's profiled rate, or, for an edge the
+/// profile does not rate, at the feed of the producer's group when that is
+/// another group of this host and at an unknown rate when the producer is in
+/// another process. A member no graph node triggers, or one with a trigger
+/// input no graph node publishes, is also fed at its fire rate
+/// (`fire_period_ns`), unknown when the profile rates none of its edges out.
+fn group_feeds<'a>(
+    members: &'a [String],
+    graph: &UnitGraph,
+    costs: Option<&PartitionCosts>,
+    parent: &mut [usize],
+) -> IndexMap<usize, Feed<'a>> {
+    let in_host: IndexSet<&str> = members.iter().map(String::as_str).collect();
+    let mut fed: IndexMap<usize, Feed<'a>> = IndexMap::new();
+    let mut carried: Vec<(usize, usize)> = Vec::new();
+    for (i, member) in members.iter().enumerate() {
+        let n = member.as_str();
+        let r = root(parent, i);
+        if let Some(&period_ns) = graph.period_ns.get(n) {
+            feed(&mut fed, r, Feed::Every(period_ns));
+            continue;
+        }
+        let mut triggered = false;
+        for edge in graph.trigger_edges.iter().filter(|(_, c)| c == n) {
+            triggered = true;
+            if let Some(period_ns) = rated_period_ns(edge, costs) {
+                feed(&mut fed, r, Feed::Every(period_ns));
+                continue;
+            }
+            match in_host.get_index_of(edge.0.as_str()) {
+                Some(j) => {
+                    let from = root(parent, j);
+                    if from != r {
+                        carried.push((from, r));
+                    }
+                }
+                None => {
+                    feed(&mut fed, r, Feed::Unknown(n));
+                }
+            }
+        }
+        let from_outside = graph
+            .links
+            .iter()
+            .any(|e| e.consumer == n && e.bar == Some(ChainBar::NoInGraphProducer));
+        if !triggered || from_outside {
+            let fires = fire_period_ns(n, graph, costs).map_or(Feed::Unknown(n), Feed::Every);
+            feed(&mut fed, r, fires);
+        }
+    }
+    // Carry each group's feed across those edges until no feed changes. A
+    // change gives a group its first feed, shortens its period to one already
+    // in the map or makes it unknown, so this ends.
+    loop {
+        let mut changed = false;
+        for &(from, into) in &carried {
+            if let Some(&f) = fed.get(&from) {
+                changed |= feed(&mut fed, into, f);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    fed
+}
+
 /// [`derive_units`] with a profile: every node starts alone and the profile
 /// merges links (this module's documentation).
 fn units_from_profile(
@@ -1024,6 +1166,9 @@ fn units_from_profile(
     let mut starts: IndexMap<&str, Boundary> = IndexMap::new();
     // Members whose merge is decided by walking their chain.
     let mut candidates: IndexSet<&str> = IndexSet::new();
+    // Each `isolate: false` member and its producers in this host that do not
+    // declare `isolate: true`, by member index.
+    let mut joins: Vec<(usize, Vec<usize>)> = Vec::new();
     for node in members {
         let n = node.as_str();
         if declared(n) == Some(true) {
@@ -1036,19 +1181,17 @@ fn units_from_profile(
             continue;
         };
         if declared(n) == Some(false) {
-            let joinable: Vec<&str> = own
+            let joinable: Vec<usize> = own
                 .iter()
                 .copied()
                 .filter(|p| declared(p) != Some(true))
+                .filter_map(index)
                 .collect();
             if joinable.is_empty() {
                 let producer = own.first().map(|p| p.to_string()).unwrap_or_default();
                 starts.insert(n, Boundary::AfterIsolated { producer });
-            }
-            for p in joinable {
-                if let (Some(a), Some(b)) = (index(n), index(p)) {
-                    union(&mut parent, a, b);
-                }
+            } else if let Some(i) = index(n) {
+                joins.push((i, joinable));
             }
             continue;
         }
@@ -1083,10 +1226,10 @@ fn units_from_profile(
         candidates.insert(n);
     }
 
-    // A coupling joins its nodes before any link is judged, as an
-    // `isolate: false` join does: the feeds, ticks and deadlines below are
-    // gathered per group, so a verdict counts every node a coupling puts in
-    // the unit.
+    // A coupling joins its nodes before any link is judged, and before the
+    // `isolate: false` joins, which are judged against the groups couplings
+    // form: the feeds, ticks and deadlines below are gathered per group, so a
+    // verdict counts every node a coupling or a join puts in the unit.
     let block_topics = join_couplings(graph, &in_host, &mut parent);
 
     // The summed p50 tick and tightest `tick_within` of the unit rooted at
@@ -1121,74 +1264,21 @@ fn units_from_profile(
     let heads = |n: &str| {
         !candidates.contains(n) && link_out.get(n).is_some_and(|f| candidates.contains(*f))
     };
-    // What each group is fed at, keyed by its root, from every member before
-    // the first merge: the member's own period; else each trigger edge into
-    // it at the edge's profiled rate, or, for an edge the profile does not
-    // rate, at the feed of the producer's group when that is another group of
-    // this host and at an unknown rate when the producer is in another
-    // process. A member no graph node triggers, or one with a trigger input no
-    // graph node publishes, is also fed at its fire rate (`fire_period_ns`),
-    // unknown when the profile rates none of its edges out.
-    let mut fed: IndexMap<usize, Feed<'_>> = IndexMap::new();
-    let mut carried: Vec<(usize, usize)> = Vec::new();
-    for (i, member) in members.iter().enumerate() {
-        let n = member.as_str();
-        let r = root(&mut parent, i);
-        if let Some(&period_ns) = graph.period_ns.get(n) {
-            feed(&mut fed, r, Feed::Every(period_ns));
-            continue;
-        }
-        let mut triggered = false;
-        for edge in graph.trigger_edges.iter().filter(|(_, c)| c == n) {
-            triggered = true;
-            if let Some(period_ns) = rated_period_ns(edge, costs) {
-                feed(&mut fed, r, Feed::Every(period_ns));
-                continue;
-            }
-            match index(&edge.0) {
-                Some(j) => {
-                    let from = root(&mut parent, j);
-                    if from != r {
-                        carried.push((from, r));
-                    }
-                }
-                None => {
-                    feed(&mut fed, r, Feed::Unknown(n));
-                }
-            }
-        }
-        let from_outside = graph
-            .links
-            .iter()
-            .any(|e| e.consumer == n && e.bar == Some(ChainBar::NoInGraphProducer));
-        if !triggered || from_outside {
-            let fires = fire_period_ns(n, graph, costs).map_or(Feed::Unknown(n), Feed::Every);
-            feed(&mut fed, r, fires);
-        }
-    }
-    // Carry each group's feed across those edges until no feed changes. A
-    // change gives a group its first feed, shortens its period to one already
-    // in the map or makes it unknown, so this ends.
-    loop {
-        let mut changed = false;
-        for &(from, into) in &carried {
-            if let Some(&f) = fed.get(&from) {
-                changed |= feed(&mut fed, into, f);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
     // The band of levels each unit keeps, when every member's level is known.
     let bands = Bands::of(members, graph);
-    let start = (parent.clone(), starts.clone(), fed.clone());
+    let start = (parent.clone(), starts.clone());
     let mut walked: IndexSet<&str> = IndexSet::new();
-    // Walk each chain of candidate links from the node that heads it, growing
-    // one unit at a time: first without the band check, then, when a unit
-    // that walk formed breaks its band, again from the same start with it.
+    // Each pass makes the `isolate: false` joins, gathers each group's feed
+    // and walks each chain of candidate links from the node that heads it,
+    // growing one unit at a time. The first pass checks no band; when a unit
+    // it formed breaks its band, the next pass from the same start checks the
+    // band of each link merge (`checked`), and when a unit still breaks its
+    // band, a third checks the band of each join as well (`joins_checked`).
     let mut checked: Option<&Bands> = None;
+    let mut joins_checked: Option<&Bands> = None;
     loop {
+        join_isolate_false(&joins, joins_checked, members, &mut parent, &mut starts);
+        let mut fed = group_feeds(members, graph, costs, &mut parent);
         for node in members {
             let head = node.as_str();
             if !heads(head) {
@@ -1277,14 +1367,19 @@ fn units_from_profile(
                 at = next;
             }
         }
-        match bands.as_ref() {
-            Some(b) if checked.is_none() && b.breaks_any(members, &mut parent) => {
-                checked = Some(b);
-                (parent, starts, fed) = start.clone();
-                walked.clear();
-            }
-            _ => break,
+        let Some(b) = bands.as_ref() else {
+            break;
+        };
+        if joins_checked.is_some() || !b.breaks_any(members, &mut parent) {
+            break;
         }
+        if checked.is_none() {
+            checked = Some(b);
+        } else {
+            joins_checked = Some(b);
+        }
+        (parent, starts) = start.clone();
+        walked.clear();
     }
 
     // A candidate no walk reached sits on a cycle made only of links: it
@@ -2144,12 +2239,13 @@ mod tests {
     #[test]
     fn a_node_refused_over_budget_does_not_rejoin_through_a_later_member_of_that_unit() {
         // `s -> b -> y` is a chain at 100 Hz; the join `x`, triggered by `s`
-        // and `y`, declares isolate: false, so `s`, `x` and `y` share one unit
-        // (1.6 ms) before the walk. `b` brings 1 ms: 2.6 ms reaches a quarter
-        // of the 10 ms period, so `b` starts a unit. The profile measured
-        // `s -> b` at 90 Hz (an 11.1 ms period). The link `b -> y` would put
-        // the same 2.6 ms back into the unit `s` feeds every 10 ms, so `y`
-        // stays with `s` and says why.
+        // and `y`, declares isolate: false. Joined to both, `x`'s unit would
+        // hold `s` (level 0) and `y` (level 2) without `b` (level 1), and `b`
+        // brings 1 ms to their 1.6 ms, which reaches a quarter of the 10 ms
+        // period, so the unit would keep that gap; `x` joins `y` alone. `b`
+        // joins `s` at 2 ms (the profile measured `s -> b` at 90 Hz, an
+        // 11.1 ms period). The link `b -> y` would put 2.6 ms into the unit
+        // `s` feeds every 10 ms, so `y` stays with `x` and says why.
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
         let mut g = graph(
             &[("s", "b"), ("b", "y")],
@@ -2167,17 +2263,11 @@ mod tests {
             &[("s", "b", 90_000)],
         );
         let units = derive_units("g", &s(&["s", "b", "x", "y"]), &g, profile(&c));
-        assert_eq!(nodes(&units), [s(&["s", "x", "y"]), s(&["b"])], "{units:?}");
-        assert_eq!(
-            units[0].boundaries,
-            [
-                ("s".to_string(), Boundary::Source),
-                ("y".to_string(), over_period("y", 2_600_000, 10_000_000)),
-            ]
-        );
+        assert_eq!(nodes(&units), [s(&["s", "b"]), s(&["x", "y"])], "{units:?}");
+        assert_eq!(units[0].boundaries, [("s".to_string(), Boundary::Source)]);
         assert_eq!(
             units[1].boundaries,
-            [("b".to_string(), over_period("b", 2_600_000, 10_000_000))]
+            [("y".to_string(), over_period("y", 2_600_000, 10_000_000))]
         );
 
         // One hop later: `s -> b -> c -> y` with `x` joining `b` and `y`, so
@@ -2226,7 +2316,8 @@ mod tests {
         // 100 Hz source `h1`, declares isolate: false, so `y`, `h1` and `x`
         // share one unit (2.1 ms) fed every 10 ms. With `h2` the unit would
         // tick 4.1 ms: under a quarter of `h2`'s 20 ms period, over a quarter
-        // of `h1`'s 10 ms one.
+        // of `h1`'s 10 ms one. The levels (`h1` and `h2` 0, `y` 1, `x` 2) are
+        // assigned, where the band of levels asks only for a contiguous band.
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
         let mut g = graph(
             &[("h2", "y")],
@@ -2234,6 +2325,7 @@ mod tests {
             &[("h1", 10), ("h2", 20)],
         );
         g.isolate.insert("x".into(), false);
+        g.levels_assigned = true;
         let c = costs(
             &[
                 ("h2", 2_000_000),
@@ -2243,7 +2335,8 @@ mod tests {
             ],
             &[],
         );
-        let units = derive_units("g", &s(&["h2", "y", "h1", "x"]), &g, profile(&c));
+        let members = s(&["h2", "y", "h1", "x"]);
+        let units = derive_units("g", &members, &g, profile(&c));
         assert_eq!(
             nodes(&units),
             [s(&["h2"]), s(&["y", "h1", "x"])],
@@ -2255,6 +2348,22 @@ mod tests {
                 ("y".to_string(), over_period("y", 4_100_000, 10_000_000)),
                 ("h1".to_string(), Boundary::Source),
             ]
+        );
+
+        // On the same levels derived from the trigger edges, `y` at level 1
+        // needs a feeder at level 0 in its unit: joined to `h1` without `h2`,
+        // it has none, so `x` joins `y` alone, and `h2` brings 2 ms to their
+        // 0.6 ms, over a quarter of the 10 ms `h1` feeds `x` at.
+        g.levels_assigned = false;
+        let units = derive_units("g", &members, &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["h2"]), s(&["y", "x"]), s(&["h1"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            units[1].boundaries,
+            [("y".to_string(), over_period("y", 2_600_000, 10_000_000))]
         );
     }
 
@@ -2416,7 +2525,9 @@ mod tests {
         // `x`, which declares isolate: false, so `e`, `y` and `x` share one
         // unit. The profile rates `e`'s edge out at 50 Hz: the unit is fed
         // every 10 ms and `y` joins `h` at 1.8 ms. At 1 kHz the unit is fed
-        // every 1 ms and `y` stays out.
+        // every 1 ms and `y` stays out. The levels (`e` and `h` 0, `y` 1, `x`
+        // 2) are assigned, where the band of levels asks only for a
+        // contiguous band.
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
         let mut g = graph(
             &[("h", "y")],
@@ -2424,6 +2535,7 @@ mod tests {
             &[("h", 10)],
         );
         g.isolate.insert("x".into(), false);
+        g.levels_assigned = true;
         let p50 = [
             ("e", 200_000),
             ("h", 1_000_000),
@@ -2450,6 +2562,17 @@ mod tests {
         assert_eq!(
             start_of(&units, "y"),
             Some(&over_period("y", 1_800_000, 1_000_000))
+        );
+
+        // On the same levels derived from the trigger edges, `y` at level 1
+        // needs a feeder at level 0 in its unit, which `e` is not: with `y`
+        // out of `h`'s unit, `x` joins `y` alone.
+        g.levels_assigned = false;
+        let units = derive_units("g", &members, &g, profile(&fast));
+        assert_eq!(
+            nodes(&units),
+            [s(&["e"]), s(&["h"]), s(&["y", "x"])],
+            "{units:?}"
         );
 
         // A chain such a node heads merges at that rate. Without the rate the
@@ -2594,7 +2717,9 @@ mod tests {
         // triggered by `y` and `m`, declares isolate: false, so `y`, `x` and
         // `m` share one unit, fed through `m` from `f`'s group. `hA` (10 Hz)
         // links to `y`: with `hA` the unit ticks 1.6 ms, over a quarter of
-        // 1 ms. The members list `f` after the group `f`'s feed reaches.
+        // 1 ms. The members list `f` after the group `f`'s feed reaches. The
+        // levels (`hA` and `f` 0, `y` and `g` 1, `m` 2, `x` 3) are assigned,
+        // where the band of levels asks only for a contiguous band.
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
         let mut g = graph(
             &[("hA", "y"), ("f", "g"), ("g", "m")],
@@ -2602,6 +2727,7 @@ mod tests {
             &[("hA", 100), ("f", 1)],
         );
         g.isolate.insert("x".into(), false);
+        g.levels_assigned = true;
         let c = costs(
             &[
                 ("hA", 1_000_000),
@@ -2613,7 +2739,8 @@ mod tests {
             ],
             &[],
         );
-        let units = derive_units("g", &s(&["hA", "y", "x", "m", "g", "f"]), &g, profile(&c));
+        let members = s(&["hA", "y", "x", "m", "g", "f"]);
+        let units = derive_units("g", &members, &g, profile(&c));
         assert_eq!(
             nodes(&units),
             [s(&["hA"]), s(&["y", "x", "m"]), s(&["g", "f"])],
@@ -2625,6 +2752,23 @@ mod tests {
                 ("y".to_string(), over_period("y", 1_600_000, 1_000_000)),
                 ("m".to_string(), over_period("m", 620_000, 1_000_000)),
             ]
+        );
+
+        // On the same levels derived from the trigger edges, `m` at level 2
+        // needs a feeder at level 1 in its unit: joined to `y` without `g`,
+        // it has none, so `x` joins `m` alone and `y` joins `hA`. Joining
+        // `f`'s unit, `m` would bring `x` and tick 0.42 ms, over a quarter of
+        // 1 ms.
+        g.levels_assigned = false;
+        let units = derive_units("g", &members, &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["hA", "y"]), s(&["x", "m"]), s(&["g", "f"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "m"),
+            Some(&over_period("m", 420_000, 1_000_000))
         );
     }
 
@@ -3108,6 +3252,186 @@ process_groups:
         let c = costs(
             &[("w", 1_000), ("x", 1_000), ("y", 1_000), ("z", 1_000)],
             &[("w", "z", 100_000), ("x", "y", 100_000)],
+        );
+        let members = s(&["w", "x", "y", "z"]);
+        let units = derive_units("g", &members, &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["w", "x", "y", "z"])], "{units:?}");
+    }
+
+    /// A node woken by either of its inputs, `ia` and `ic`, with no macro
+    /// policy.
+    fn join_info() -> NodeInfo {
+        let input = |name: &str| crate::graph::node::InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: 10,
+            backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+        };
+        NodeInfo::with_meta(vec![input("ia"), input("ic")], Vec::new())
+    }
+
+    /// `a` (10 ms) feeds `c` and the join `j`, which `c` also feeds and which
+    /// declares `isolate: false`; `c` declares `isolate: true` when
+    /// `c_isolated`. Levels `a` 0, `c` 1, `j` 2, derived from the trigger
+    /// edges, or the same levels under `level_assignments:` when `assigned`.
+    /// One process group `g` holds all three.
+    fn join_past_a_middle_node(assigned: bool, c_isolated: bool) -> String {
+        let levels = if assigned {
+            "level_assignments:\n  a: 0\n  c: 1\n  j: 2\n"
+        } else {
+            ""
+        };
+        let c_isolate = if c_isolated {
+            "    isolate: true\n"
+        } else {
+            ""
+        };
+        format!(
+            "prefix: t
+{levels}nodes:
+  - id: a
+    type: a
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: c
+    type: c
+{c_isolate}    inputs:
+      - name: inp
+        source: a/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: j
+    type: j
+    isolate: false
+    inputs:
+      - name: ia
+        source: a/out
+      - name: ic
+        source: c/out
+process_groups:
+  g: [a, c, j]
+"
+        )
+    }
+
+    #[test]
+    fn an_isolate_false_join_that_would_skip_an_isolated_nodes_level_keeps_a_unit_of_its_own() {
+        // `j` declares isolate: false, and `a` is its one producer that does
+        // not declare isolate: true. Joined to `a`, `j` would make a unit that
+        // owns levels 0 and 2 and not 1, which the partition validator
+        // refuses, so `j` keeps a unit of its own, says why, and `c` keeps its
+        // unit, on derived levels and on the same levels assigned.
+        let infos = [("a", period_info()), ("c", data_info()), ("j", join_info())];
+        let c = costs(
+            &[("a", 1_000), ("c", 1_000), ("j", 1_000)],
+            &[
+                ("a", "c", 100_000),
+                ("a", "j", 100_000),
+                ("c", "j", 100_000),
+            ],
+        );
+        let band = Boundary::LevelBand {
+            producer: "a".into(),
+            rule: BandRule::Gap { level: 1 },
+        };
+        assert_eq!(
+            band.describe(),
+            "joining a's unit would leave level 1 out of the unit while it runs levels below \
+             and above it (a unit runs a contiguous band of levels)"
+        );
+        for assigned in [false, true] {
+            let (plan, verdict) =
+                validated_plan(&join_past_a_middle_node(assigned, true), &infos, &c);
+            let units = &plan.units["g"];
+            assert!(
+                verdict.is_ok(),
+                "assigned {assigned}: the validator accepts {units:?}: {verdict:?}"
+            );
+            assert_eq!(
+                nodes(units),
+                [s(&["a"]), s(&["c"]), s(&["j"])],
+                "assigned {assigned}"
+            );
+            assert_eq!(
+                start_of(units, "c"),
+                Some(&Boundary::Isolated),
+                "assigned {assigned}"
+            );
+            assert_eq!(start_of(units, "j"), Some(&band), "assigned {assigned}");
+
+            // `c` not isolated: `j` joins both its producers, and the unit
+            // keeps its band.
+            let (plan, verdict) =
+                validated_plan(&join_past_a_middle_node(assigned, false), &infos, &c);
+            let units = &plan.units["g"];
+            assert!(
+                verdict.is_ok(),
+                "assigned {assigned}: the validator accepts {units:?}: {verdict:?}"
+            );
+            assert_eq!(nodes(units), [s(&["a", "c", "j"])], "assigned {assigned}");
+        }
+    }
+
+    #[test]
+    fn an_isolate_false_node_joins_only_the_producers_whose_units_keep_the_band() {
+        // `b` (10 ms) feeds `p` and `q` (no link: a fan-out), and `n`, which
+        // declares isolate: false, is triggered by `p` and by `a` (10 ms).
+        // Derived levels: `a` and `b` 0, `p` and `q` 1, `n` 2. Joined to both,
+        // `n`'s unit would hold `p` at level 1 with no node of it feeding `p`
+        // at level 0, which the partition validator refuses; `n` joins `p`,
+        // its producer at the level just below, and not `a`.
+        let fan = ChainBar::FanOut { consumers: 2 };
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut g = graph(
+            &[],
+            &[
+                ("b", "p", fan.clone()),
+                ("b", "q", fan),
+                ("p", "n", join.clone()),
+                ("a", "n", join),
+            ],
+            &[("a", 10), ("b", 10)],
+        );
+        g.isolate.insert("n".into(), false);
+        let c = costs(
+            &[
+                ("a", 1_000),
+                ("b", 1_000),
+                ("p", 1_000),
+                ("q", 1_000),
+                ("n", 1_000),
+            ],
+            &[],
+        );
+        let units = derive_units("g", &s(&["a", "b", "p", "q", "n"]), &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["a"]), s(&["b"]), s(&["p", "n"]), s(&["q"])],
+            "{units:?}"
+        );
+        assert_eq!(start_of(&units, "n"), None, "n shares p's unit: {units:?}");
+    }
+
+    #[test]
+    fn isolate_false_joins_that_leave_every_unit_its_band_all_stand_through_a_passing_break() {
+        // `y` and `z` declare isolate: false; `x` (10 ms) triggers `y`, `w`
+        // (10 ms) triggers `z`, and a `block` coupling keeps `y` with `z`.
+        // Either join alone leaves the other node unfed at level 1; both
+        // together keep the band, so both stand.
+        let mut g = graph(&[("w", "z"), ("x", "y")], &[], &[("w", 10), ("x", 10)]);
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["y", "z"]),
+        });
+        g.isolate.insert("y".into(), false);
+        g.isolate.insert("z".into(), false);
+        let c = costs(
+            &[("w", 1_000), ("x", 1_000), ("y", 1_000), ("z", 1_000)],
+            &[],
         );
         let members = s(&["w", "x", "y", "z"]);
         let units = derive_units("g", &members, &g, profile(&c));

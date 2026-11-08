@@ -2763,7 +2763,8 @@ fn units_collapsed_by_mutant() -> bool {
 /// rendezvous is per process and per level, which is the level loop itself.
 /// A group whose split the partition validator refuses stays one unit, with
 /// the refusal recorded in [`DeploymentUnits::kept_whole`] and logged at warn,
-/// naming the process and the refusal.
+/// naming the process, the refusal and each node of it that declares
+/// `isolate: true`.
 pub fn plan_executor_units(
     config: &GraphConfig,
     entry_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
@@ -2795,6 +2796,16 @@ pub fn plan_executor_units(
     let topology = GraphTopology::build(config, entry_infos)?;
     let trigger_edges = build_trigger_edges(config, entry_infos);
     let graph = UnitGraph::from_graph(config, entry_infos, &topology, &trigger_edges);
+    // The nodes of `hosts` that declare `isolate: true`, in group order.
+    let isolated_in = |hosts: &[&String]| -> Vec<&str> {
+        hosts
+            .iter()
+            .filter_map(|h| config.process_groups.get(*h))
+            .flatten()
+            .filter(|n| graph.isolate.get(*n) == Some(&true))
+            .map(String::as_str)
+            .collect()
+    };
 
     let mut plan = expand(&graph, &keep);
     if let Err(first) = validate_partition(&plan.groups, config, entry_infos, &trigger_edges) {
@@ -2810,28 +2821,53 @@ pub fn plan_executor_units(
             only.extend(keep.iter().cloned());
             let trial = expand(&graph, &only);
             if let Err(e) = validate_partition(&trial.groups, config, entry_infos, &trigger_edges) {
-                tracing::warn!(
-                    graph = %config.identity(),
-                    process = %host,
-                    error = %e,
-                    "executor units: the partition validator refuses this process's split, so \
-                     the process runs as one unit on one level loop, a node in it that declares \
-                     `isolate: true` included"
-                );
+                let isolated = isolated_in(&[host]);
+                if isolated.is_empty() {
+                    tracing::warn!(
+                        graph = %config.identity(),
+                        process = %host,
+                        error = %e,
+                        "executor units: the partition validator refuses this process's split, \
+                         so the process runs as one unit on one level loop"
+                    );
+                } else {
+                    tracing::warn!(
+                        graph = %config.identity(),
+                        process = %host,
+                        isolated = ?isolated,
+                        error = %e,
+                        "executor units: the partition validator refuses this process's split, \
+                         so the process runs as one unit on one level loop, its nodes that \
+                         declare `isolate: true` included"
+                    );
+                }
                 keep.insert(host.clone());
                 kept_whole.push((host.clone(), format!("its split is refused: {e}")));
             }
         }
         plan = expand(&graph, &keep);
         if validate_partition(&plan.groups, config, entry_infos, &trigger_edges).is_err() {
-            tracing::warn!(
-                graph = %config.identity(),
-                processes = ?config.process_groups.keys().collect::<Vec<_>>(),
-                error = %first,
-                "executor units: the partition validator refuses the deployment's split, so \
-                 every process runs as one unit on one level loop, a node that declares \
-                 `isolate: true` included"
-            );
+            let processes: Vec<&String> = config.process_groups.keys().collect();
+            let isolated = isolated_in(&processes);
+            if isolated.is_empty() {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    processes = ?processes,
+                    error = %first,
+                    "executor units: the partition validator refuses the deployment's split, so \
+                     every process runs as one unit on one level loop"
+                );
+            } else {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    processes = ?processes,
+                    isolated = ?isolated,
+                    error = %first,
+                    "executor units: the partition validator refuses the deployment's split, so \
+                     every process runs as one unit on one level loop, its nodes that declare \
+                     `isolate: true` included"
+                );
+            }
             keep = config.process_groups.keys().cloned().collect();
             kept_whole = config
                 .process_groups
