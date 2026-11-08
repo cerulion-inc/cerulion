@@ -36,7 +36,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo build -p test_node_macro_consume_latest_cdylib
+//! cargo build -p test_node_macro_consume_latest_cdylib -p test_node_sync_op_fail_cdylib
 //! cargo nextest run -p cerulion_core --test consume_latest_iox2_test
 //! ```
 
@@ -53,7 +53,7 @@ use cerulion_core::graph::node::{
 use cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
-use cerulion_core::MacroPolicy;
+use cerulion_core::{MacroPolicy, SyncHeadOp, SyncOpAnswer};
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
@@ -892,21 +892,9 @@ fn an_entry_without_the_unified_drain_reads_a_gap_frame_once() {
     assert_eq!(fired, 2, "every fire reads a frame: reads {observed:?}");
 }
 
-/// Through a dlopen'd `#[cerulion_node]` cdylib under forced Separate: the
-/// body subscriber lives in the cdylib's own copy of the core, and the probe
-/// reaches it across the FFI. The node forwards each read frame to `cmd`, so
-/// the `cmd` stream is the read record.
-#[test]
-#[serial]
-fn a_cdylib_reads_a_gap_frame_once_on_the_separate_drain() {
-    use cerulion_core::graph::node::DylibNodeEntry;
-
-    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
-    let entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
-        "test_node_macro_consume_latest_cdylib",
-    ))
-    .expect("load consume-latest fixture cdylib");
-    let node = NodeDef {
+/// The `trigger_in` to `cmd` forwarder's node, id `node`, reading [`EXT`].
+fn forwarder_node() -> NodeDef {
+    NodeDef {
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -923,13 +911,18 @@ fn a_cdylib_reads_a_gap_frame_once_on_the_separate_drain() {
             history_size: 0,
             topic: None,
         }],
-    };
-    let (mut runtime, ext, gap) = gap_runtime("latgapdyl", Box::new(entry), node);
+    }
+}
+
+/// The gap schedule on a forwarder (each fire publishes the frame its tick
+/// read to `cmd`): returns the `cmd` stream, the read record, and the fires.
+fn run_gap_forwarder(prefix: &str, entry: Box<dyn NodeEntry>) -> (Vec<u64>, u64) {
+    let (mut runtime, ext, gap) = gap_runtime(prefix, entry, forwarder_node());
     let cmd_sub = runtime
         .test_transport()
         .expect("test transport parked")
-        .create_subscriber_open_only("/latgapdyl/node/cmd")
-        .expect("open the cdylib's cmd topic");
+        .create_subscriber_open_only(&format!("/{prefix}/node/cmd"))
+        .expect("open the forwarder's cmd topic");
     let fired = drive_gap(&mut runtime, &ext, &gap, "node", 4);
     let mut forwarded: Vec<u64> = Vec::new();
     cmd_sub
@@ -938,11 +931,192 @@ fn a_cdylib_reads_a_gap_frame_once_on_the_separate_drain() {
             forwarded.push(x as u64);
         })
         .expect("drain cmd stream");
+    (forwarded, fired)
+}
+
+/// Through a dlopen'd `#[cerulion_node]` cdylib under forced Separate: the
+/// body subscriber lives in the cdylib's own copy of the core, and the probe
+/// reaches it across the FFI. The node forwards each read frame to `cmd`, so
+/// the `cmd` stream is the read record.
+#[test]
+#[serial]
+fn a_cdylib_reads_a_gap_frame_once_on_the_separate_drain() {
+    use cerulion_core::graph::node::DylibNodeEntry;
+
+    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+    let entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
+        "test_node_macro_consume_latest_cdylib",
+    ))
+    .expect("load consume-latest fixture cdylib");
+    let (forwarded, fired) = run_gap_forwarder("latgapdyl", Box::new(entry));
     assert_eq!(forwarded, vec![2, 3]);
     assert_eq!(
         fired, 2,
         "every fire reads a frame: forwarded {forwarded:?}"
     );
+}
+
+/// The cdylib fixture's node, compiled into this test binary: an in-process
+/// `#[cerulion_node]` entry declares the probe through the macro.
+#[cerulion_node]
+#[derive(Default)]
+struct InProcessLatestNode {
+    #[input(trigger, consume = latest)]
+    trigger_in: Vector3,
+    #[output]
+    cmd: Vector3,
+}
+
+#[cerulion_node_impl]
+impl InProcessLatestNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.cmd.x = self.trigger_in.x;
+        Ok(())
+    }
+}
+
+/// An in-process `#[cerulion_node]` node under forced Separate reads a gap
+/// frame once, and the build names nothing.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_in_process_macro_node_reads_a_gap_frame_once_on_the_separate_drain() {
+    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+    let entry = InProcessLatestNodeEntry::new();
+    assert!(entry.probes_trigger_input(), "the macro declares the probe");
+    let (forwarded, fired) = run_gap_forwarder("latgapmac", Box::new(entry));
+    assert!(!logs_contain(
+        "cannot tell whether its read will find a frame"
+    ));
+    assert_eq!(forwarded, vec![2, 3]);
+    assert_eq!(
+        fired, 2,
+        "every fire reads a frame: forwarded {forwarded:?}"
+    );
+}
+
+/// The `block` arm's source: an absolute topic with an in-graph producer (a
+/// `block` input needs one) that `multi_publisher_topics` opens to a writer
+/// outside the graph, the test's publisher.
+const BLK: &str = "/latest/blk";
+
+/// The `block` arm's graph: `pace` (period 1 ms) produces [`BLK`] and never
+/// writes it, and writes one frame per tick on its `tick` output; `inj` fires
+/// on each `tick` frame (a `block` input, so it is in `sink`'s level and in its
+/// fused block group, which decides and ticks in graph order) and publishes
+/// `gap` (0 = nothing) onto [`BLK`] through the test's publisher; `sink` reads
+/// [`BLK`] through `entry`. `inj` ticks after the level's trigger drain and
+/// before `sink`'s read, the window between the two pops.
+fn block_gap_runtime(
+    prefix: &str,
+    sink: Box<dyn NodeEntry>,
+) -> (GraphRuntime, SharedPublisher, Arc<AtomicU64>) {
+    let ext: SharedPublisher = Arc::new(Mutex::new(None));
+    let gap = Arc::new(AtomicU64::new(0));
+    let pace_info = NodeInfo::from_names(vec![], vec!["out".to_string(), "tick".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 1 });
+    let pace = ClosureNodeEntry::new(pace_info, |ctx| {
+        if let Some(p) = ctx.publisher_mut("tick") {
+            let mut proxy = p.loan_proxy::<Vector3>()?;
+            proxy.x = 1.0;
+        }
+        Ok(())
+    })
+    .with_label("latest_block_pace");
+    let inj_info = NodeInfo::with_meta(
+        vec![InputMeta {
+            name: "tick".to_string(),
+            schema_hash: <Vector3 as ShmMessage>::SCHEMA_HASH,
+            trigger: true,
+            depth: DEFAULT_CONSUMER_DEPTH,
+            backpressure: BackpressurePolicy::Block,
+            expect_within_ms: None,
+            consume: InputConsume::Latest,
+        }],
+        vec![],
+    )
+    .with_policy(MacroPolicy::DataTrigger {
+        input_name: "tick".to_string(),
+    });
+    let (inj_ext, inj_gap) = (Arc::clone(&ext), Arc::clone(&gap));
+    let inj = ClosureNodeEntry::new(inj_info, move |ctx| {
+        if let Some(s) = ctx.subscriber_mut("tick") {
+            let _ = s.try_view::<Vector3, _>(|view| view.x);
+        }
+        let v = inj_gap.swap(0, Ordering::Relaxed);
+        if v != 0 {
+            if let Some(p) = inj_ext.lock().unwrap().as_mut() {
+                publish_all(p, [v]);
+            }
+        }
+        Ok(())
+    })
+    .with_label("latest_block_injector");
+    let output = |name: &str, topic: Option<&str>| OutputDef {
+        name: name.to_string(),
+        schema: "Vector3".to_string(),
+        max_slice_len: None,
+        history_size: 0,
+        topic: topic.map(str::to_string),
+    };
+    let nodes = vec![
+        NodeDef {
+            fuse: None,
+            params: Default::default(),
+            ros2: None,
+            id: "pace".to_string(),
+            node_type: "latest_block_pace".to_string(),
+            inputs: vec![],
+            outputs: vec![output("out", Some(BLK)), output("tick", None)],
+        },
+        NodeDef {
+            fuse: None,
+            params: Default::default(),
+            ros2: None,
+            id: "inj".to_string(),
+            node_type: "latest_block_injector".to_string(),
+            inputs: vec![InputDef {
+                name: "tick".to_string(),
+                source: "pace/tick".to_string(),
+            }],
+            outputs: vec![],
+        },
+        sink_node(BLK),
+    ];
+    let mut config = graph(prefix, nodes);
+    config.multi_publisher_topics = vec![BLK.to_string()];
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("pace".to_string(), Box::new(pace));
+    factories.insert("inj".to_string(), Box::new(inj));
+    factories.insert("sink".to_string(), sink);
+    let clock = Arc::new(VirtualClock::new());
+    let runtime =
+        GraphRuntime::build_for_test(config, factories, clock, 16).expect("build block gap graph");
+    let mgr = runtime.test_transport().expect("test transport parked");
+    *ext.lock().unwrap() = Some(
+        mgr.create_publisher(BLK, MaxSliceLen::const_new(64), 0)
+            .expect("a second publisher attaches to the multi-publisher topic"),
+    );
+    (runtime, ext, gap)
+}
+
+/// `block` keeps the separate discipline under the default build, and a
+/// frame landing between its trigger drain and its read is served by that
+/// read and fires nothing more. The queue never fills, so nothing is paced.
+#[test]
+#[serial]
+fn a_blocking_latest_input_reads_a_gap_frame_once() {
+    let c = Consumer {
+        backpressure: BackpressurePolicy::Block,
+        ..Consumer::latest()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, ext, gap) =
+        block_gap_runtime("latgapblk", Box::new(consumer_entry(c, Arc::clone(&seen))));
+    let fired = drive_gap(&mut runtime, &ext, &gap, "sink", 4);
+    let observed = seen.lock().unwrap().clone();
+    assert_eq!(observed, vec![2, 3]);
+    assert_eq!(fired, 2, "every fire reads a frame: reads {observed:?}");
 }
 
 /// A consumer whose body probe answers from `script` first and from its own
@@ -1063,4 +1237,348 @@ fn the_build_names_a_latest_input_whose_body_answers_no_probe() {
     assert!(logs_contain(
         "cannot tell whether its read will find a frame"
     ));
+}
+
+/// An entry that implements the per-set Sync head ops for its Sync inputs
+/// alone and answers `Nothing` for any other input, as a node library whose
+/// head-op export serves Sync inputs only may. It declares no body probe, and
+/// declares no unified drain, so its input is read through two subscribers.
+struct SyncOnlyHeadOps(ClosureNodeEntry);
+
+impl NodeEntry for SyncOnlyHeadOps {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        self.0.info()
+    }
+    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        self.0.init(context)
+    }
+    fn tick(&mut self) -> TransportResult<()> {
+        self.0.tick()
+    }
+    fn supports_sync_head_ops(&self) -> bool {
+        true
+    }
+    fn sync_head_op(&mut self, _input_name: &str, _op: SyncHeadOp) -> SyncOpAnswer {
+        SyncOpAnswer::Nothing
+    }
+}
+
+/// Head ops alone do not make the graph probe a latest input: the build names
+/// the input, and its counted arrival fires the node, which reads the frame.
+/// A probe through these head ops would answer `Empty` and never fire it.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn head_ops_for_sync_inputs_alone_leave_a_latest_input_unprobed_and_firing() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let entry = SyncOnlyHeadOps(consumer_entry(Consumer::latest(), Arc::clone(&seen)));
+    assert!(!entry.probes_trigger_input());
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("sink".to_string(), Box::new(entry));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test(
+        graph("latsynconly", vec![sink_node(EXT)]),
+        factories,
+        clock,
+        16,
+    )
+    .expect("build sync-only head-op graph");
+    assert!(logs_contain("sink.inp"), "the warn names node and input");
+    assert!(logs_contain(
+        "cannot tell whether its read will find a frame"
+    ));
+    let mgr = runtime.test_transport().expect("test transport parked");
+    let mut ext = mgr
+        .create_publisher(EXT, MaxSliceLen::const_new(64), 0)
+        .expect("external publisher attaches");
+    publish_all(&mut ext, [1]);
+    for _ in 0..3 {
+        runtime.step(Duration::from_millis(1));
+    }
+    assert_eq!(*seen.lock().unwrap(), vec![1]);
+    assert_eq!(fires(&runtime), 1, "one fire on the one arrival");
+}
+
+/// A cdylib declares the body probe through its own export, not through its
+/// head ops: the macro fixture exports `cerulion_node_probes_trigger_input`,
+/// and the raw-FFI fixture exports the head ops without it.
+#[test]
+#[serial]
+fn a_cdylib_declares_the_probe_apart_from_its_head_ops() {
+    use cerulion_core::graph::node::DylibNodeEntry;
+    use cerulion_core::testing::find_fixture_cdylib;
+
+    let latest = DylibNodeEntry::load(&find_fixture_cdylib(
+        "test_node_macro_consume_latest_cdylib",
+    ))
+    .expect("load consume-latest fixture cdylib");
+    assert!(latest.supports_sync_head_ops());
+    assert!(latest.probes_trigger_input());
+    let raw = DylibNodeEntry::load(&find_fixture_cdylib("test_node_sync_op_fail_cdylib"))
+        .expect("load raw head-op fixture cdylib");
+    assert!(raw.supports_sync_head_ops(), "it exports the head ops");
+    assert!(!raw.probes_trigger_input(), "and declares no body probe");
+}
+
+/// A failed body probe on a cdylib is reported in its own words, on its own
+/// latch. The raw-FFI fixture's armed fault fails every head op naming input
+/// `b`, the probe's op code 0 and the per-set Sync ops alike, without touching
+/// the node. Three failed probes give one loud line naming the probe, and the
+/// Sync op failing after them still gets its own loud line.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_failed_cdylib_body_probe_says_so_on_its_own_latch() {
+    use cerulion_core::graph::node::DylibNodeEntry;
+
+    let _fault = EnvVarGuard::set("CER_FAIL_MODE", "sync_op_fail");
+    let mut entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
+        "test_node_sync_op_fail_cdylib",
+    ))
+    .expect("load raw head-op fixture cdylib");
+    entry
+        .init(NodeContext::for_tests(IndexMap::new(), IndexMap::new()))
+        .expect("init the raw head-op fixture");
+    for _ in 0..3 {
+        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unknown);
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            entry.sync_head_op("b", SyncHeadOp::ProbeNext),
+            SyncOpAnswer::Failed
+        );
+    }
+    logs_assert(|lines: &[&str]| {
+        let probe_heads: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("ERROR") && l.contains("consume = latest body probe"))
+            .copied()
+            .collect();
+        if probe_heads.len() != 1 {
+            return Err(format!(
+                "one loud line for the failing probe, got {}: {probe_heads:?}",
+                probe_heads.len()
+            ));
+        }
+        if probe_heads[0].contains("alignment") {
+            return Err(format!(
+                "the probe line names the probe, not the Sync pass: {}",
+                probe_heads[0]
+            ));
+        }
+        let sync_heads = lines
+            .iter()
+            .filter(|l| l.contains("ERROR") && l.contains("per-set Sync alignment pass ends here"))
+            .count();
+        if sync_heads != 1 {
+            return Err(format!(
+                "the Sync op's first failure is loud on its own latch, got {sync_heads} lines"
+            ));
+        }
+        Ok(())
+    });
+}
+
+/// Wraps an entry and times each [`NodeEntry::probe_trigger_input`] call.
+struct TimedProbe<E> {
+    inner: E,
+    probe_ns: Arc<Mutex<Vec<u64>>>,
+}
+
+impl<E: NodeEntry> NodeEntry for TimedProbe<E> {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        self.inner.info()
+    }
+    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        self.inner.init(context)
+    }
+    fn tick(&mut self) -> TransportResult<()> {
+        self.inner.tick()
+    }
+    fn pump_history(&mut self) {
+        self.inner.pump_history()
+    }
+    fn shutdown(&mut self) -> TransportResult<()> {
+        self.inner.shutdown()
+    }
+    fn supports_sync_head_ops(&self) -> bool {
+        self.inner.supports_sync_head_ops()
+    }
+    fn sync_head_op(&mut self, input_name: &str, op: SyncHeadOp) -> SyncOpAnswer {
+        self.inner.sync_head_op(input_name, op)
+    }
+    fn probes_trigger_input(&self) -> bool {
+        self.inner.probes_trigger_input()
+    }
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        let t0 = std::time::Instant::now();
+        let answer = self.inner.probe_trigger_input(input_name);
+        let ns = t0.elapsed().as_nanos() as u64;
+        self.probe_ns.lock().unwrap().push(ns);
+        answer
+    }
+}
+
+/// Idle steps timed per phase.
+const MEASURE_STEPS: usize = 2000;
+/// Carried and cleared phases per run.
+const MEASURE_ROUNDS: usize = 10;
+
+/// Per-step wall times (ns) of a gap runtime's idle steps, carried phase and
+/// cleared phase, `MEASURE_ROUNDS` of each.
+///
+/// Each round arms the gap schedule's first two steps (frame 2 is read by the
+/// step-1 tick and counted by the step-2 trigger drain, whose probe answers
+/// `Empty` and carries the arrival), times `MEASURE_STEPS` idle steps, clears
+/// the carry with a fresh frame (its probe answers `Unread` and the node fires
+/// once), and times `MEASURE_STEPS` more idle steps.
+fn measure_phases(
+    prefix: &str,
+    entry: Box<dyn NodeEntry>,
+    def: NodeDef,
+    node: &str,
+) -> (Vec<u64>, Vec<u64>, u64) {
+    fn timed_steps(runtime: &mut GraphRuntime, out: &mut Vec<u64>) {
+        for _ in 0..MEASURE_STEPS {
+            let t0 = std::time::Instant::now();
+            runtime.step(Duration::from_millis(1));
+            out.push(t0.elapsed().as_nanos() as u64);
+        }
+    }
+    let (mut runtime, ext, gap) = gap_runtime(prefix, entry, def);
+    let mut carried = Vec::with_capacity(MEASURE_STEPS * MEASURE_ROUNDS);
+    let mut cleared = Vec::with_capacity(MEASURE_STEPS * MEASURE_ROUNDS);
+    for round in 0..MEASURE_ROUNDS as u64 {
+        gap.store(2 + 10 * round, Ordering::Relaxed);
+        publish_all(
+            ext.lock().unwrap().as_mut().expect("publisher"),
+            [1 + 10 * round],
+        );
+        runtime.step(Duration::from_millis(1));
+        runtime.step(Duration::from_millis(1));
+        timed_steps(&mut runtime, &mut carried);
+        publish_all(
+            ext.lock().unwrap().as_mut().expect("publisher"),
+            [3 + 10 * round],
+        );
+        runtime.step(Duration::from_millis(1));
+        timed_steps(&mut runtime, &mut cleared);
+    }
+    let fired = runtime.node_handle(node).unwrap().fire_count();
+    (carried, cleared, fired)
+}
+
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+fn report(label: &str, samples: &mut [u64]) -> (f64, u64) {
+    samples.sort_unstable();
+    let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
+    let p50 = percentile(samples, 0.50);
+    println!(
+        "{label}: n={} mean={mean:.0} ns p10={} p50={p50} p90={} p99={} ns",
+        samples.len(),
+        percentile(samples, 0.10),
+        percentile(samples, 0.90),
+        percentile(samples, 0.99),
+    );
+    (mean, p50)
+}
+
+fn closure_consumer() -> (ClosureNodeEntry, NodeDef) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    (
+        consumer_entry(Consumer::latest(), seen).with_unified_drain(false),
+        sink_node(EXT),
+    )
+}
+
+fn cdylib_forwarder() -> (cerulion_core::graph::node::DylibNodeEntry, NodeDef) {
+    let entry = cerulion_core::graph::node::DylibNodeEntry::load(
+        &cerulion_core::testing::find_fixture_cdylib("test_node_macro_consume_latest_cdylib"),
+    )
+    .expect("load consume-latest fixture cdylib");
+    (entry, forwarder_node())
+}
+
+/// The cost of a carried arrival: one body probe per step while the arrival
+/// is carried, on a closure and on a dlopen'd `#[cerulion_node]` cdylib,
+/// both on the separate drain.
+///
+/// Per entry it prints the idle-step wall time with the arrival carried and
+/// with it cleared (their difference is the probe's per-step cost, node lock
+/// and FFI included), and, through [`TimedProbe`], the probe call alone.
+///
+/// ```bash
+/// cargo build --release -p test_node_macro_consume_latest_cdylib
+/// cargo test --release -p cerulion_core --test consume_latest_iox2_test \
+///     -- --ignored --nocapture measure_the_carried_probe_cost
+/// ```
+#[test]
+#[serial]
+#[ignore = "measurement: prints the carried probe's per-step cost; run with --ignored --nocapture"]
+fn measure_the_carried_probe_cost() {
+    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+    let rounds = MEASURE_ROUNDS as u64;
+    for kind in ["closure", "cdylib"] {
+        let (entry, def, node): (Box<dyn NodeEntry>, NodeDef, &str) = match kind {
+            "closure" => {
+                let (e, d) = closure_consumer();
+                (Box::new(e), d, "sink")
+            }
+            _ => {
+                let (e, d) = cdylib_forwarder();
+                (Box::new(e), d, "node")
+            }
+        };
+        let (mut carried, mut cleared, fired) =
+            measure_phases(&format!("latmeas{kind}"), entry, def, node);
+        assert_eq!(fired, 2 * rounds, "{kind}: two fires per round");
+        let (carried_mean, carried_p50) =
+            report(&format!("{kind} idle step, carried"), &mut carried);
+        let (cleared_mean, cleared_p50) =
+            report(&format!("{kind} idle step, cleared"), &mut cleared);
+        println!(
+            "{kind} carried minus cleared: mean {:+.0} ns, p50 {:+} ns",
+            carried_mean - cleared_mean,
+            carried_p50 as i64 - cleared_p50 as i64
+        );
+
+        let probe_ns = Arc::new(Mutex::new(Vec::new()));
+        let (inner, def, node): (Box<dyn NodeEntry>, NodeDef, &str) = match kind {
+            "closure" => {
+                let (e, d) = closure_consumer();
+                (
+                    Box::new(TimedProbe {
+                        inner: e,
+                        probe_ns: Arc::clone(&probe_ns),
+                    }),
+                    d,
+                    "sink",
+                )
+            }
+            _ => {
+                let (e, d) = cdylib_forwarder();
+                (
+                    Box::new(TimedProbe {
+                        inner: e,
+                        probe_ns: Arc::clone(&probe_ns),
+                    }),
+                    d,
+                    "node",
+                )
+            }
+        };
+        let (_, _, fired) = measure_phases(&format!("latmeasw{kind}"), inner, def, node);
+        assert_eq!(fired, 2 * rounds, "{kind} wrapped: two fires per round");
+        let mut probes = probe_ns.lock().unwrap().clone();
+        assert_eq!(
+            probes.len() as u64,
+            rounds * (MEASURE_STEPS as u64 + 3),
+            "{kind}: per round, one probe per carried step plus the three counted \
+             arrivals' probes"
+        );
+        report(&format!("{kind} probe call"), &mut probes);
+    }
 }
