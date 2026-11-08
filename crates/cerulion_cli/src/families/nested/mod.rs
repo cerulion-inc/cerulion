@@ -24,6 +24,7 @@ use clap::{ArgMatches, Command};
 use crate::cli::VerbLogClass;
 
 mod topic_introspect;
+pub(crate) mod topic_message;
 
 /// A set of verbs added under one existing verb. See the module docs.
 ///
@@ -48,7 +49,10 @@ pub(crate) trait NestedVerbs: Sync {
 }
 
 /// Every registered nested-verb set. Adding a set is one line here.
-pub(crate) static NESTED: &[&dyn NestedVerbs] = &[&topic_introspect::TopicIntrospect];
+pub(crate) static NESTED: &[&dyn NestedVerbs] = &[
+    &topic_introspect::TopicIntrospect,
+    &topic_message::TopicMessage,
+];
 
 /// Every verb a derived `Subcommand` enum `S` defines, for
 /// [`NestedVerbs::commands`]. The derive adds them to a scratch command that

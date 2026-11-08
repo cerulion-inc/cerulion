@@ -21,6 +21,8 @@
 //! | `restart` / `deploy` | Normal | Role ≥ `OPERATOR` (a lifecycle mutation; no fine-grained cap models it, so the role IS the gate). |
 //! | `teleop` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR` — actuation. |
 //! | `cloud-access` | Normal | Role `OWNER`; the handler also requires a non-cloud owner row. |
+//! | `topic-publish` / `service-call` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR`: act on the robot's shared memory (`act_verbs`). |
+//! | `topic-snapshot` / `topic-echo-once` | Normal | `CAP_OBSERVE` (role ≥ `VIEWER`): read one frame. |
 //! | *any other* | — | **DENY** (deny-by-default; an unclassified verb is refused, never fail-open — a new mutating verb must be classified here). |
 //!
 //! Before the class is consulted, a key whose access is
@@ -32,11 +34,13 @@
 //!
 //! ## Accept-time plane routing
 //!
-//! [`PairingAuthorizer::classify_accept`] is the accept gate for the two ALPNs:
+//! [`PairingAuthorizer::classify_accept`] is the accept gate for the three ALPNs:
 //! the ops plane admits a paired key to the full surface and an unpaired /
 //! unclaimed key to the bootstrap surface only; the wire plane refuses an
 //! unpaired peer outright (catalog/demand require a paired `CAP_OBSERVE` account
 //! — the `cerulion_q` marker).
+//! The rcp plane admits only a paired key on the access list, and
+//! [`crate::rcp`] checks each MCP message it carries.
 
 use cerud::authz::{Authorizer, AuthzDecision};
 use cerud::transport::CallerIdentity;
@@ -100,6 +104,22 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
             required_caps: 0,
             max_role: Role::OWNER,
         }),
+        crate::act_verbs::TOPIC_PUBLISH => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        }),
+        crate::act_verbs::SERVICE_CALL => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        }),
+        crate::act_verbs::TOPIC_SNAPSHOT => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        }),
+        crate::act_verbs::TOPIC_ECHO_ONCE => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        }),
         _ => return None,
     })
 }
@@ -116,6 +136,9 @@ pub enum AcceptDecision {
     OpsBootstrapOnly,
     /// Wire plane admitted (a paired `CAP_OBSERVE` account).
     WireAdmit,
+    /// Rcp plane admitted (a paired key whose account is on the access list).
+    /// Every message is still checked per MCP method in [`crate::rcp`].
+    RcpAdmit,
     /// Refused outright (wire plane, unpaired/unclaimed) — close, serve nothing.
     Refuse {
         /// The diagnosable reason.
@@ -310,6 +333,13 @@ impl PairingAuthorizer {
             // (the cerulion_q marker). Unpaired → refuse outright.
             match wire_admittable(claimed, access) {
                 Ok(()) => AcceptDecision::WireAdmit,
+                Err(reason) => AcceptDecision::Refuse { reason },
+            }
+        } else if alpn == cerulion_link::alpn::RCP {
+            // Rcp plane: the rcp entry point's accept gate (a paired, allowed
+            // key); the per-message class check runs in the proxy.
+            match crate::rcp::authorize_key(&self.shared, remote_id, None) {
+                Ok(()) => AcceptDecision::RcpAdmit,
                 Err(reason) => AcceptDecision::Refuse { reason },
             }
         } else {

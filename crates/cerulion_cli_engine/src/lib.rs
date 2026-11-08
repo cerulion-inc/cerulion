@@ -50,6 +50,9 @@ pub(crate) mod child_signals;
 // argv + the `cerulion-connectd` sibling-binary path). The CLI stays iroh-free —
 // it spawns the resolved binary.
 pub mod connect_cmd;
+// The `cerulion rcp` verb's PURE resolution: the same robot resolution as
+// `connect`, spawning `cerulion-connectd rcp` with inherited stdio.
+pub mod rcp_cmd;
 // The value sources behind shell tab-completion — live topic / node /
 // graph / schema / robot names for a TAB press. Every source is an INSTANT
 // LOCAL read under a hard wall-clock budget: no process is ever spawned (netd
@@ -80,6 +83,8 @@ pub mod hostname_peers;
 pub mod ipc_cleanup;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
+/// Messages as JSON or YAML text for `topic pub` and `service call`.
+pub mod message_text;
 // The LOCAL ament harvest rung — a filesystem-only
 // `SchemaAcquirer` over the host's `$AMENT_PREFIX_PATH` ROS install.
 pub mod local_harvest;
@@ -92,6 +97,8 @@ pub mod node_params_info;
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
 // iroh-free; the CPace ceremony lives in the spawned sibling).
 pub mod pair_cmd;
+/// `--robot NAME` on `topic pub`, `topic snapshot` and `service call`.
+pub mod robot_act;
 // Login-gated ownership at install: `register_robot` (`POST
 // /v1/robots`) binds the logged-in account as THIS machine's owner and returns
 // the offline-verifiable owner grant. The install-funnel entry (a robot install,
@@ -256,6 +263,8 @@ pub mod ros2_graph;
 pub mod ros2_migrate;
 pub mod schema_cmd;
 pub mod schema_serve;
+/// `cerulion service call`.
+pub mod service_cmd;
 // The macOS `/tmp/*.shm_state` population — detect it, price it, and
 // reclaim only what is PROVABLY dead. `iceoryx2-pal-posix` keeps one such file
 // per SHM segment on a platform with no `/dev/shm`, a SIGKILLed owner leaks it
@@ -270,7 +279,7 @@ pub mod state_arm_attach;
 // The workspace `.msg` schema store reader
 // (`schemas/<pkg>/msg/<Type>.msg`), shared by attach's resolvability chain
 // and `schema list`/`info`. Pure (`parse_rosmsg`); no DDS, no transport.
-pub mod schema_store;
+pub use cerulion_msgio::schema_store;
 // OPTIONAL SYSTEM dependencies for node crates. A Cargo build script
 // cannot enable a feature of its own crate, so "link GStreamer if this machine
 // has it" cannot be expressed in Cargo at all — the probe lives here, and
