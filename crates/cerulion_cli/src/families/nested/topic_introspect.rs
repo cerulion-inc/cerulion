@@ -16,6 +16,7 @@ use cerulion_cli_engine::topic_cmd::{introspect, TopicScope};
 use super::NestedVerbs;
 use crate::cli::VerbLogClass;
 use crate::completion;
+use crate::network_switch::{NetworkRefusal, SwitchEnv};
 
 /// The verb these verbs are added under (read by the docs gate too).
 const PARENT: &str = "topic";
@@ -111,6 +112,12 @@ impl NestedVerbs for TopicIntrospect {
     /// Quiet like every `topic` verb: the output is the data.
     fn log_class(&self, _matches: &ArgMatches) -> VerbLogClass {
         VerbLogClass::OneShot
+    }
+
+    /// These verbs read this machine's topics, and a remote robot's only
+    /// while the switch is not engaged: under it they stay local and run.
+    fn network_refusal(&self, _matches: &ArgMatches, _env: &SwitchEnv) -> Option<NetworkRefusal> {
+        None
     }
 
     /// The same rule as every `topic` verb.

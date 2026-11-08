@@ -3,9 +3,10 @@
 //! already exists (a built-in `Commands` verb or a registered family), each
 //! set in its own module instead of the parent's action enum.
 //!
-//! A set owns its clap definition, log class, login-gate rule and dispatch,
-//! exactly like a [`VerbFamily`](super::VerbFamily) does for a top-level
-//! verb, and joins the binary through ONE line in [`NESTED`]. Its module
+//! A set owns its clap definition, log class, network kill-switch refusal,
+//! login-gate rule and dispatch, exactly like a
+//! [`VerbFamily`](super::VerbFamily) does for a top-level verb, and joins the
+//! binary through ONE line in [`NESTED`]. Its module
 //! declares `const PARENT: &str = "<parent>";` so the docs gate files its
 //! verbs under the parent.
 //!
@@ -22,6 +23,7 @@ use std::process::ExitCode;
 use clap::{ArgMatches, Command};
 
 use crate::cli::VerbLogClass;
+use crate::network_switch::{NetworkRefusal, SwitchEnv};
 
 mod topic_introspect;
 pub(crate) mod topic_message;
@@ -40,6 +42,12 @@ pub(crate) trait NestedVerbs: Sync {
 
     /// The default tracing filter class of the parsed invocation.
     fn log_class(&self, matches: &ArgMatches) -> VerbLogClass;
+
+    /// The refusal of the parsed invocation while the network kill switch in
+    /// `env` is engaged, or `None` when the switch does not refuse it,
+    /// consulted before the login gate as
+    /// [`VerbFamily::network_refusal`](super::VerbFamily::network_refusal) is.
+    fn network_refusal(&self, matches: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal>;
 
     /// Whether the login gate runs before [`NestedVerbs::run`].
     fn needs_identity(&self, matches: &ArgMatches) -> bool;
@@ -192,6 +200,9 @@ mod tests {
                 _ => VerbLogClass::OneShot,
             }
         }
+        fn network_refusal(&self, _: &ArgMatches, _: &SwitchEnv) -> Option<NetworkRefusal> {
+            None
+        }
         fn needs_identity(&self, _matches: &ArgMatches) -> bool {
             self.gated
         }
@@ -220,6 +231,7 @@ mod tests {
             &[],
             sets,
             &matches,
+            &SwitchEnv::default(),
             |c| class = Some(c),
             || {
                 gate_runs += 1;
@@ -284,6 +296,9 @@ mod tests {
             }
             fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
                 VerbLogClass::OneShot
+            }
+            fn network_refusal(&self, _: &ArgMatches, _: &SwitchEnv) -> Option<NetworkRefusal> {
+                None
             }
             fn needs_identity(&self, _: &ArgMatches) -> bool {
                 true
