@@ -11,6 +11,18 @@
 //! [`resolve_fixed_nested`] is the second phase between parsing and code
 //! generation. Given every schema in the build, it:
 //!
+//! 0. Writes the package into each bare reference of a packaged schema that
+//!    the own-package or `Header` step of the ladder below binds: a bare
+//!    `Type` in package `pkg` becomes `pkg/Type` when the set holds
+//!    `pkg/Type`, and a bare `Header` becomes `std_msgs/Header` when the set
+//!    holds that and not `pkg/Header`. The reference's spelling is hashed
+//!    ([`MessageSchema::schema_hash`]), and `rmw_cerulion` names every nested
+//!    member with the package of its rosidl introspection namespace, so a
+//!    `.msg` that spells same-package types bare (as upstream ROS files do)
+//!    hashes as the ROS 2 type does. This runs before the snapshot the
+//!    fixedness and target hashes are computed from, so an inlined target's
+//!    folded hash is its qualified one. A reference bound only through the
+//!    global bare namespace, or not at all, keeps its spelling.
 //! 1. Computes recursive fixedness per schema (a schema is fixed iff every
 //!    field is fixed; a `Nested` field is fixed iff its target schema is).
 //! 2. Rewrites each `Nested` reference whose target is recursively fixed,
@@ -106,6 +118,7 @@ impl From<ResolvedFixed> for NestedFixedInfo {
 /// escalate to a build failure; the runtime CLI path should
 /// `tracing::warn!` them — the inference must be loud, never silent.
 pub fn resolve_fixed_nested(schemas: &mut [MessageSchema]) -> Vec<String> {
+    qualify_bare_references(schemas);
     let mut resolver = Resolver::new(schemas);
 
     // Force-compute fixedness for every schema (fully populates the memo).
@@ -129,6 +142,67 @@ pub fn resolve_fixed_nested(schemas: &mut [MessageSchema]) -> Vec<String> {
     }
 
     resolver.warnings
+}
+
+/// Step 0 of [`resolve_fixed_nested`] (see the module docs): for each bare
+/// reference of a packaged schema, at any array depth, that
+/// [`NestedIndex::bind`] binds without the global bare namespace, write the
+/// bound schema's package into the reference. Package-less schemas and
+/// package-less targets are left as they are.
+fn qualify_bare_references(schemas: &mut [MessageSchema]) {
+    let index = NestedIndex::from_schemas(schemas);
+    let mut writes = Vec::new();
+    for (schema_idx, schema) in schemas.iter().enumerate() {
+        let Some(parent_package) = schema.package.as_deref() else {
+            continue;
+        };
+        for (field_idx, field) in schema.fields.iter().enumerate() {
+            let FieldType::Nested {
+                schema_name,
+                package: None,
+                ..
+            } = element_type_of(&field.field_type)
+            else {
+                continue;
+            };
+            if let Ok(Bound {
+                idx,
+                cross_package_bare: false,
+            }) = index.bind(None, schema_name, Some(parent_package))
+            {
+                if let Some(target_package) = &schemas[idx].package {
+                    writes.push((schema_idx, field_idx, target_package.clone()));
+                }
+            }
+        }
+    }
+    for (schema_idx, field_idx, target_package) in writes {
+        if let FieldType::Nested { package, .. } =
+            element_type_of_mut(&mut schemas[schema_idx].fields[field_idx].field_type)
+        {
+            *package = Some(target_package);
+        }
+    }
+}
+
+/// The element type under every array layer of `field_type`.
+fn element_type_of(field_type: &FieldType) -> &FieldType {
+    match field_type {
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            element_type_of(element_type)
+        }
+        other => other,
+    }
+}
+
+/// [`element_type_of`], mutable.
+fn element_type_of_mut(field_type: &mut FieldType) -> &mut FieldType {
+    match field_type {
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            element_type_of_mut(element_type)
+        }
+        other => other,
+    }
 }
 
 /// Internal state for one resolution run: the immutable pre-rewrite
@@ -692,6 +766,119 @@ mod tests {
         s.add_field(FieldDef::new("y", FieldType::F64));
         s.add_field(FieldDef::new("z", FieldType::F64));
         s
+    }
+
+    #[test]
+    fn resolution_writes_the_package_the_own_package_or_header_step_binds() {
+        let mut header = MessageSchema::new_in_package("Header", "std_msgs");
+        header.add_field(FieldDef::new("frame_id", FieldType::String));
+        let mut own_header = MessageSchema::new_in_package("Header", "own");
+        own_header.add_field(FieldDef::new("seq", FieldType::U32));
+        let mut other = MessageSchema::new_in_package("Other", "elsewhere");
+        other.add_field(FieldDef::new("n", FieldType::U8));
+        let mut reading = MessageSchema::new_in_package("Reading", "demo");
+        reading.add_field(FieldDef::new("header", nested("Header", None)));
+        reading.add_field(FieldDef::new("point", nested("Point", None)));
+        reading.add_field(FieldDef::new(
+            "points",
+            FieldType::FixedArray {
+                element_type: Box::new(nested("Point", None)),
+                length: 2,
+            },
+        ));
+        reading.add_field(FieldDef::new("other", nested("Other", None)));
+        reading.add_field(FieldDef::new("missing", nested("Missing", None)));
+        let mut tagged = MessageSchema::new_in_package("Tagged", "own");
+        tagged.add_field(FieldDef::new("header", nested("Header", None)));
+        let mut loose = MessageSchema::new("Loose");
+        loose.add_field(FieldDef::new("point", nested("Point", None)));
+        loose.add_field(FieldDef::new("header", nested("Header", None)));
+
+        let mut schemas = vec![
+            header,
+            own_header,
+            other,
+            point_schema("demo"),
+            reading,
+            tagged,
+            loose,
+        ];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        let package_of = |schema: &MessageSchema, field: &str| {
+            let field = schema.fields.iter().find(|f| f.name == field).unwrap();
+            let mut field_type = &field.field_type;
+            while let FieldType::FixedArray { element_type, .. }
+            | FieldType::DynamicArray { element_type } = field_type
+            {
+                field_type = element_type;
+            }
+            match field_type {
+                FieldType::Nested { package, .. } => package.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let reading = &schemas[4];
+        assert_eq!(package_of(reading, "header").as_deref(), Some("std_msgs"));
+        assert_eq!(package_of(reading, "point").as_deref(), Some("demo"));
+        assert_eq!(package_of(reading, "points").as_deref(), Some("demo"));
+        assert_eq!(
+            package_of(reading, "other"),
+            None,
+            "a cross-package bare binding keeps its spelling"
+        );
+        assert_eq!(package_of(reading, "missing"), None);
+        assert_eq!(
+            package_of(&schemas[5], "header").as_deref(),
+            Some("own"),
+            "a package's own Header comes first"
+        );
+        assert_eq!(
+            package_of(&schemas[6], "point"),
+            None,
+            "a package-less schema's reference keeps its spelling"
+        );
+        assert_eq!(
+            package_of(&schemas[6], "header"),
+            None,
+            "a package-less schema's bare Header keeps its spelling"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Reading.other") && w.contains("CROSS-PACKAGE")),
+            "{warnings:?}"
+        );
+    }
+
+    /// `Window { Span span }`, `Span { Level lo, Level hi }` and
+    /// `Level { uint8 value }`, spelled bare in package `demo`, hashed by ONE
+    /// resolution pass (a `LayoutResolver` over the parsed text). `Span` is
+    /// fixed, so its hash is computed from the resolver's snapshot and folded
+    /// into `Window`'s; it equals the hash of the same types with every nested
+    /// member named `demo/...`, as `rmw_cerulion` builds them, only when the
+    /// snapshot already holds the qualified `Span`.
+    #[test]
+    fn one_resolution_pass_folds_a_fixed_target_with_its_references_qualified() {
+        use crate::codegen::layout::LayoutResolver;
+        use crate::codegen::parse_rosmsg;
+        let window_hash = |schemas: Vec<MessageSchema>| {
+            let (mut resolver, warnings) = LayoutResolver::new(schemas);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            resolver.layout_of("demo/Window").unwrap().schema_hash
+        };
+        let parsed = vec![
+            parse_rosmsg("uint8 value\n", "Level", Some("demo")).unwrap(),
+            parse_rosmsg("Level lo\nLevel hi\n", "Span", Some("demo")).unwrap(),
+            parse_rosmsg("Span span\n", "Window", Some("demo")).unwrap(),
+        ];
+        let mut level = MessageSchema::new_in_package("Level", "demo");
+        level.add_field(FieldDef::new("value", FieldType::U8));
+        let mut span = MessageSchema::new_in_package("Span", "demo");
+        span.add_field(FieldDef::new("lo", nested("Level", Some("demo"))));
+        span.add_field(FieldDef::new("hi", nested("Level", Some("demo"))));
+        let mut window = MessageSchema::new_in_package("Window", "demo");
+        window.add_field(FieldDef::new("span", nested("Span", Some("demo"))));
+        assert_eq!(window_hash(parsed), window_hash(vec![level, span, window]));
     }
 
     #[test]

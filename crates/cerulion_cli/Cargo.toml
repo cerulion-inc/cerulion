@@ -31,6 +31,10 @@ workspace = true
 [[bin]]
 name = "cerulion"
 path = "src/main.rs"
+# The umbrella library crate is also named `cerulion`, and rustdoc writes both to
+# target/doc/cerulion. Under `cargo doc --workspace` the two outputs race and the docs
+# gate can fail with missing files (cargo issue 6313), so the binary is not documented.
+doc = false
 
 [dependencies]
 cerulion_cli_engine = { workspace = true }

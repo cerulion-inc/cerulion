@@ -99,9 +99,9 @@ fn lease() -> Arc<Mutex<ControlLease>> {
 /// WRITES it and one whose production code READS it.
 ///
 /// A file-local mutex rather than `#[serial]`: the serialization needed here is
-/// between two named arms over one named variable, and `serial_test` is not a
-/// dev-dep of this crate (the repo's other single-variable cases —
-/// `completion_wiring_tests`, `client_e2e_test` — take the same shape).
+/// between two named arms over one named variable, which a mutex local to this
+/// file gives on its own (the repo's other single-variable cases,
+/// `completion_wiring_tests` and `client_e2e_test`, take the same shape).
 ///
 /// POISON-TOLERANT (`into_inner`): a panic in one arm must fail THAT arm, never
 /// convert every later arm into a poisoned-lock panic that names the wrong test.

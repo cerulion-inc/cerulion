@@ -779,6 +779,10 @@ struct Recording {
     /// steering plane stands down — which is exactly what a shared-bus
     /// fixture with invented ids measures and mistakes for "a recording carries no annotations".
     publisher_ids: IndexMap<String, Vec<(String, u128)>>,
+    /// The reference runtime's own per-stage staging rows, as a recorder stamps
+    /// them into a manifest's `read_log_capacities`: `{node: [[input_idx, role
+    /// byte, capacity], ...]}`.
+    stage_rows: serde_json::Value,
 }
 
 /// One external-topic driver for the reference run: the absolute topic + the
@@ -1181,6 +1185,20 @@ fn record_reference_impl_fed(
     if let Some(feed) = in_step_feed {
         feed.slot.lock().expect("feed slot").take();
     }
+    let stage_rows = {
+        let mut map = serde_json::Map::new();
+        for id in &node_ids {
+            let rows: Vec<serde_json::Value> = runtime
+                .read_outcome_stage_capacities(id)
+                .iter()
+                .map(|c| serde_json::json!([c.input_idx, c.role.wire(), c.capacity]))
+                .collect();
+            if !rows.is_empty() {
+                map.insert(id.clone(), serde_json::Value::Array(rows));
+            }
+        }
+        serde_json::Value::Object(map)
+    };
     runtime.shutdown();
 
     Recording {
@@ -1191,6 +1209,7 @@ fn record_reference_impl_fed(
         input_names,
         pending_after,
         publisher_ids,
+        stage_rows,
     }
 }
 
@@ -1656,6 +1675,34 @@ fn write_producer_labels(
     resolved: &[u16],
     labels: &[ProducerLabel<'_>],
 ) -> cerulion_bag::BagResult<()> {
+    write_producer_labels_encoded(c, channel, resolved, labels, encode_label_as_recorded)
+}
+
+/// How a crafted bag encodes one producer label record onto the reserved
+/// channel.
+type LabelEncoder = fn(&cerulion_bag::ProducerRecord) -> Vec<u8>;
+
+/// A label record exactly as the recorder writes it.
+fn encode_label_as_recorded(record: &cerulion_bag::ProducerRecord) -> Vec<u8> {
+    record.encode().to_vec()
+}
+
+/// A label record as a newer Cerulion writes it: this build's layout under
+/// the next version byte, which this build's decoder refuses.
+fn encode_label_as_a_newer_version(record: &cerulion_bag::ProducerRecord) -> Vec<u8> {
+    let mut body = record.encode().to_vec();
+    body[0] = cerulion_bag::PRODUCER_RECORD_VERSION + 1;
+    body
+}
+
+/// [`write_producer_labels`] with each record's bytes from `encode`.
+fn write_producer_labels_encoded(
+    c: &mut cerulion_bag::ChunkScope<'_>,
+    channel: u16,
+    resolved: &[u16],
+    labels: &[ProducerLabel<'_>],
+    encode: LabelEncoder,
+) -> cerulion_bag::BagResult<()> {
     for (i, ((_, attribution, publisher_id), data_channel)) in
         labels.iter().zip(resolved).enumerate()
     {
@@ -1669,7 +1716,7 @@ fn write_producer_labels(
             i as u32,
             0,
             0,
-            &[&record.encode()[..]],
+            &[&encode(&record)[..]],
         )?;
     }
     Ok(())
@@ -1702,6 +1749,41 @@ fn write_bag_impl(
     producer_labels: Option<&[ProducerLabel<'_>]>,
     // The additive per-input staging-rim table.
     read_log_capacities: Option<serde_json::Value>,
+) {
+    write_bag_impl_encoded(
+        rec,
+        path,
+        env_json,
+        schema_name,
+        wire_fixed_size,
+        record_coverage,
+        inputs_json,
+        read_log_capacity,
+        recorder_json,
+        publishers_json,
+        producer_labels,
+        read_log_capacities,
+        encode_label_as_recorded,
+    );
+}
+
+/// [`write_bag_impl`] with each producer label record's bytes from
+/// `encode_label`.
+#[allow(clippy::too_many_arguments)]
+fn write_bag_impl_encoded(
+    rec: &Recording,
+    path: &std::path::Path,
+    env_json: Option<&[u8]>,
+    schema_name: &str,
+    wire_fixed_size: u32,
+    record_coverage: Option<&[u8]>,
+    inputs_json: Option<serde_json::Value>,
+    read_log_capacity: Option<serde_json::Value>,
+    recorder_json: Option<Vec<u8>>,
+    publishers_json: Option<serde_json::Value>,
+    producer_labels: Option<&[ProducerLabel<'_>]>,
+    read_log_capacities: Option<serde_json::Value>,
+    encode_label: LabelEncoder,
 ) {
     let topics: Vec<TopicSchema> = rec
         .messages
@@ -1740,7 +1822,7 @@ fn write_bag_impl(
         for (i, r) in rec.trace.iter().enumerate() {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
-        write_producer_labels(c, labels_channel, &label_channels, labels)?;
+        write_producer_labels_encoded(c, labels_channel, &label_channels, labels, encode_label)?;
         Ok(())
     })
     .unwrap();
@@ -2061,12 +2143,14 @@ fn replay_inner_with_transport(
         recorder,
         record_health,
         duration_bound_ns,
+        feed_index_budget: None,
         report_path,
         fire_tap,
         tolerance,
         strict_state,
         allow_param_change,
         record_out: None,
+        purpose: legacy_purpose(),
     };
     let factories = make_factories(&transport);
     let nodes = ReplayNodes::Injected {
@@ -2075,6 +2159,20 @@ fn replay_inner_with_transport(
         factories,
     };
     replay_engine::run_engine(inputs, nodes)
+}
+
+/// The purpose the arms of this file that predate read identity replay under.
+///
+/// They exercise the queue re-creation path (cross-rank injection, its
+/// steering and stand-downs, the read gate over real queues), which is the path
+/// a resim without `--verify` and every bag recorded before read identity take,
+/// so they run as a resim. `CER_REPLAY_TEST_PURPOSE=verify` runs them fed
+/// instead, to sweep the fed path over every shape this file records.
+fn legacy_purpose() -> replay_engine::ReplayPurpose {
+    match std::env::var("CER_REPLAY_TEST_PURPOSE").as_deref() {
+        Ok("verify") => replay_engine::ReplayPurpose::Verify,
+        _ => replay_engine::ReplayPurpose::Resim,
+    }
 }
 
 /// The TEST'S OWN resolver of a [`Recording`]'s FIRE records to canonical
@@ -2340,6 +2438,26 @@ fn sync_quiet_read_log_oracle(steps: u64) -> Vec<(u64, u32, u16, u16, u64, u32)>
 
 /// Two sources → one two-plain-input consumer (the
 /// two-EDGE verifier graph).
+/// [`source_relay_yaml`] with the relay's topic listed in
+/// `multi_publisher_topics`: one writer still, but an edge whose wire sequence
+/// the verifier may not attribute without a resolvable producer token, which is
+/// where an unresolvable one stands the edge down.
+fn source_relay_multi_writer_yaml() -> &'static str {
+    "name: srgraph\nprefix: sr\nmulti_publisher_topics:\n  - /sr/source/out\nnodes:\n\
+     \x20 - id: source\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: source/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// [`two_source_fusion_yaml`] with input `a`'s topic listed in
+/// `multi_publisher_topics`, so `a` is the edge an unresolvable token stands
+/// down and `b` is compared.
+fn two_source_fusion_a_multi_writer_yaml() -> &'static str {
+    "name: fugraph\nprefix: fu\nmulti_publisher_topics:\n  - /fu/sa/out\nnodes:\n\
+     \x20 - id: sa\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sb\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: fuse\n    type: fusion_node\n    inputs:\n      - name: a\n        source: sa/out\n      - name: b\n        source: sb/out\n"
+}
+
 fn two_source_fusion_yaml() -> &'static str {
     "name: fugraph\nprefix: fu\nnodes:\n\
      \x20 - id: sa\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
@@ -3166,7 +3284,11 @@ fn sampled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 /// Record `per_step` bursts into a latest relay, anchor the recorded outputs
 /// to `oracle` (each the served frame plus 100), then replay the bag twice:
 /// both replays pass byte-exact with no schedule divergence and are
-/// byte-identical to each other.
+/// byte-identical to each other. The same recording stamped free run is then
+/// judged by the fire re-derivation, and written as a fed `--verify` bag it is
+/// replayed with every read fed its recorded frames; a `sample(N)` relay's fed
+/// replay is refused instead, because its decimated read names none of the
+/// frames it popped.
 fn latest_relay_round_trip(
     node_type: &str,
     make: fn() -> IndexMap<String, Box<dyn NodeEntry>>,
@@ -3242,6 +3364,38 @@ fn latest_relay_round_trip(
         stood_aside.is_empty(),
         "{node_type}: the verifier judged the free-run bag: {stood_aside:?}"
     );
+
+    // The same recording as a fed `--verify` bag (the production free-run
+    // recorder stamp and the per-stage staging rows): every read is fed the
+    // frames its recorded read named. A burst drain is fed its batch frames
+    // and its served frame, and a boundary that re-offers a held frame pops
+    // nothing, so it is fed nothing. A decimated read names none of the
+    // frames it popped, so the sampled relay is refused by name.
+    let fed = dir.path().join("latest_fed.mcap");
+    ri_capped_bag(&rec, &fed);
+    let (fed_outcome, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
+    if sampled {
+        let err = fed_outcome.expect_err("a fed replay of a decimated latest read is refused");
+        let msg = err.to_string();
+        assert_eq!(err.exit_code(), 2, "{node_type}: {msg}");
+        assert!(
+            msg.contains("read_identity_decimated_unattributed"),
+            "{node_type}: {msg}"
+        );
+    } else {
+        let fed_outcome = fed_outcome.expect("the fed replay runs");
+        ri_assert_fed(&fed_outcome);
+        assert_clean_verdict(&fed_outcome, &format!("{node_type} (fed)"));
+        let stood_aside: Vec<_> = fed_outcome
+            .rederivation_notes
+            .iter()
+            .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
+            .collect();
+        assert!(
+            stood_aside.is_empty(),
+            "{node_type}: the verifier judged the fed replay: {stood_aside:?}"
+        );
+    }
 }
 
 /// A `consume = latest` relay fed BURSTS: one output per step that saw
@@ -3296,7 +3450,8 @@ fn a_superseded_latest_frame_replays_byte_exact() {
 
 /// A `sample(8)` latest relay replays byte-exact: the gate sees each step's
 /// newest frame (2 at 0 ms, 3 at 5 ms, 5 at 10 ms) and admits the first and
-/// the third, the step between them decimated.
+/// the third, the step between them decimated. A fed `--verify` replay of the
+/// same recording is refused, `read_identity_decimated_unattributed`.
 #[test]
 #[serial]
 fn a_sampled_latest_relay_replays_byte_exact() {
@@ -4811,6 +4966,9 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -4976,6 +5134,9 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -5598,6 +5759,9 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -5705,6 +5869,9 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         // would let it be silently absent.
         read_log_verdict: None,
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::FreeRun,
             inferred: false,
@@ -9940,11 +10107,13 @@ fn replay_probing_reader(
         recorder: None,
         record_health: RecordHealthReport::Absent,
         duration_bound_ns: None,
+        feed_index_budget: None,
         report_path: None,
         fire_tap: None,
         tolerance: None,
         strict_state: false,
         allow_param_change: false,
+        purpose: replay_engine::ReplayPurpose::Verify,
         record_out: None,
     };
     let nodes = ReplayNodes::Injected {
@@ -12621,6 +12790,9 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -13148,6 +13320,7 @@ fn coverage_naming(node: &str, version: u32, rings: usize, node_idx: Option<u32>
 /// head-step gate does when a recorder attaches mid-run.
 fn make_mid_run(rec: &Recording, first_step: u64) -> Recording {
     Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec
             .trace
@@ -14494,6 +14667,7 @@ fn make_mid_run_with_tap_attach(rec: &Recording, first_step: u64, attach_ns: u64
             .retain(|f| WireHeader::read_from_buf(f).is_some_and(|h| h.timestamp_ns >= attach_ns));
     }
     Recording {
+        stage_rows: serde_json::Value::Null,
         messages,
         trace: rec
             .trace
@@ -18912,13 +19086,58 @@ fn a_zero_delta_replay_is_deterministic_across_replays() {
 //    the STEPS records on the edge is tampered, so a per-record warn emits
 //    STEPS lines where the pin requires exactly ONE.
 
-/// The kind-6 records of a recording, decoded to (step, node_idx, input_idx,
-/// kind, served_seq, popped) — the test's OWN resolver (deliberately not the
-/// engine's).
+/// Re-bind every producer annotation to the read it precedes: an annotation
+/// REPEATS its read's served sequence (the join key), so an arm that tampers a
+/// read's sequence re-binds the annotation too, or the verifier reads the pair
+/// as a corrupt log and stands the edge down instead of comparing it.
+fn rebind_annotations(trace: &mut [TraceRingRecord]) {
+    for i in 0..trace.len() {
+        let r = trace[i];
+        if r.record_type != RECORD_TYPE_READ_OUTCOME
+            || unpack_read_outcome_meta(r.global_level).1
+                != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+        {
+            continue;
+        }
+        let input = unpack_read_outcome_meta(r.global_level).0;
+        if let Some(read) = trace[i + 1..].iter().find(|n| {
+            is_read_record(n)
+                && n.node_idx == r.node_idx
+                && unpack_read_outcome_meta(n.global_level).0 == input
+        }) {
+            trace[i].fire_time_ns = read.fire_time_ns;
+        }
+    }
+}
+
+/// Remove every producer annotation: the read log of a recorder that
+/// annotated no edge, for the arms that inject annotations of their own onto a
+/// recording and need it free of the ones every edge carries from
+/// `trace_format` 8 on.
+fn strip_annotations(rec: &mut Recording) {
+    rec.trace.retain(|r| {
+        r.record_type != RECORD_TYPE_READ_OUTCOME
+            || unpack_read_outcome_meta(r.global_level).1
+                != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+    });
+}
+
+/// A kind-6 record that is not a producer annotation.
+fn is_read_record(r: &TraceRingRecord) -> bool {
+    r.record_type == RECORD_TYPE_READ_OUTCOME
+        && unpack_read_outcome_meta(r.global_level).1
+            != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+}
+
+/// The kind-6 READ records of a recording, decoded to (step, node_idx,
+/// input_idx, kind, served_seq, popped), the test's OWN resolver (deliberately
+/// not the engine's). Producer annotations are left out: from `trace_format` 8
+/// every edge carries them, one per writer run, and the hand oracles below
+/// describe the reads ([`is_read_record`]).
 fn kind6_records(rec: &Recording) -> Vec<(u64, u32, u16, u16, u64, u32)> {
     rec.trace
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             (
@@ -19416,12 +19635,15 @@ fn read_log_tamper_is_the_exit_6_schedule_verdict() {
     // and fires are untouched, so ONLY the read log disagrees with the
     // re-execution.
     let mut tampered_count = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered_count += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert_eq!(
         tampered_count, steps,
         "every step's serving record tampered"
@@ -19591,12 +19813,15 @@ fn a_divergence_the_quarantine_excludes_renders_no_diverged_line_and_exits_0() {
          quarantines from: {k6:?}"
     );
     let mut tampered = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert_eq!(tampered, steps, "every step's serving record tampered");
 
     // ── LEG A: the divergence is outside every quarantine ⇒ DIVERGED, exit 6.
@@ -19618,9 +19843,11 @@ fn a_divergence_the_quarantine_excludes_renders_no_diverged_line_and_exits_0() {
 
     // ── LEG B: the same divergence, now inside a node quarantine's scope.
     let mut retagged = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == 3
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.node_idx == relay_idx && r.step == 3)
+    {
         let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
         assert_eq!(
             input_idx, 0,
@@ -19801,12 +20028,16 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
     write_bag_with_recorder_json(&rec, &stamped, production_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 7: the
-    // format that says every gated consult wrote a kind-6 record. The reason is
+    // This bag is recorded BY THIS BINARY, so it stamps 9
+    // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
+    // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
     // in this file that is fed by `production_recorder_json`; the arms that
     // stamp 4, 5 or 6 EXPLICITLY are the ones testing old-format reading.
-    assert_eq!(recorded_trace_format(&stamped), 7);
+    assert_eq!(
+        recorded_trace_format(&stamped),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o5 =
         replay(&stamped, source_relay_factories, None, None).expect("the format-5 bag replays");
     let rl = o5
@@ -19909,7 +20140,7 @@ fn read_log_popped_tamper_is_the_exit_6_schedule_verdict() {
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 2)
+        .find(|r| is_read_record(r) && r.step == 2)
         .expect("step-2 kind-6 record exists");
     assert_eq!(
         cerulion_core::trace_ring::unpack_read_outcome_popped(target.duration_ns),
@@ -20221,7 +20452,9 @@ fn read_log_missing_recorded_record_reports_recorded_none() {
     let before = rec.trace.len();
     rec.trace
         .retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 3));
-    assert_eq!(before - rec.trace.len(), 1, "exactly one record deleted");
+    // The edge has one writer, whose run opened with an annotation at its
+    // first read, so step 3 holds the read alone.
+    assert_eq!(before - rec.trace.len(), 1, "exactly one read deleted");
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("readlog_missing_rec.mcap");
     write_bag(&rec, &bag, None);
@@ -20265,7 +20498,7 @@ fn read_log_unknown_kind_is_labeled_and_is_the_exit_6_verdict() {
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 2)
+        .find(|r| is_read_record(r) && r.step == 2)
         .expect("step-2 kind-6 record exists");
     // Role-0 — this crafts a FOREIGN outcome KIND, and the
     // record's site is not what is under test.
@@ -20317,12 +20550,15 @@ fn read_log_two_edges_tampered_counts_edges_and_steps_distinctly() {
     assert!(k6.iter().any(|r| r.2 == 0) && k6.iter().any(|r| r.2 == 1));
     let mut rec = rec;
     let mut tampered = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert!(
         tampered >= 2,
         "both edges' real reads tampered ({tampered})"
@@ -20412,12 +20648,14 @@ fn read_log_two_rank_tamper_is_attributed_to_the_rank1_edge() {
         &bag,
         |per_rank| {
             let mut n = 0;
-            for r in per_rank[1].iter_mut().filter(|r| {
-                r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-            }) {
+            for r in per_rank[1]
+                .iter_mut()
+                .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+            {
                 r.fire_time_ns += 1000;
                 n += 1;
             }
+            rebind_annotations(&mut per_rank[1]);
             assert_eq!(n, steps, "every rank-1 serving kind-6 record tampered");
         },
     );
@@ -20744,14 +20982,14 @@ fn read_log_a_tampered_read_inside_the_window_still_diverges_on_a_ragged_bag() {
     let bag = dir.path().join("readlog_ragged_tamper.mcap");
     write_ragged_tail_read_log_bag(&rec, &bag, |rank1| {
         let mut n = 0;
-        for r in rank1.iter_mut().filter(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
-                && r.step == 0
-                && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-        }) {
+        for r in rank1
+            .iter_mut()
+            .filter(|r| is_read_record(r) && r.step == 0 && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+        {
             r.fire_time_ns += 1000; // the served seq
             n += 1;
         }
+        rebind_annotations(rank1);
         assert_eq!(n, 1, "exactly the step-0 serving kind-6 record is tampered");
     });
 
@@ -20926,7 +21164,9 @@ fn read_log_a_replayed_read_the_recording_lost_inside_the_window_still_diverges(
             // one position short of the replayed side at a step it still
             // covers.
             rank1.retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == lost_step));
-            assert_eq!(before - rank1.len(), 1, "exactly one record removed");
+            // The edge's one writer opened its run at the first read, so the
+            // step holds the read alone.
+            assert_eq!(before - rank1.len(), 1, "exactly one read removed");
         });
 
         let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -21090,7 +21330,7 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
     // Tamper A's step-0 and step-1 records (+1000 on the served seq).
     let mut tampered = 0;
     for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME
+        is_read_record(r)
             && r.node_idx == relay_idx
             && r.step <= 1
             && r.fire_time_ns != READ_OUTCOME_NO_FRAME
@@ -21098,6 +21338,7 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
         r.fire_time_ns += 1000;
         tampered += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert_eq!(tampered, 2, "relay's step-0/1 serving records tampered");
     // Empty B's manifest input list — the mixed-version hole.
     rec.input_names
@@ -21875,10 +22116,12 @@ fn the_fold_is_deterministic_across_runs() {
     let a = fold_burst_recording();
     let b = fold_burst_recording();
 
+    // Reads only: a producer annotation's aux word is a token over the run's
+    // own port ids, which are random per run by construction.
     let reads = |rec: &Recording| -> Vec<(u64, u32, u16, u16, u64, u64)> {
         rec.trace
             .iter()
-            .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+            .filter(|r| is_read_record(r))
             .map(|r| {
                 let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
                 (
@@ -21925,7 +22168,7 @@ fn a_recorded_run_longer_than_the_replayed_one_is_reported() {
     let target = rec
         .trace
         .iter_mut()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .find(|r| cerulion_core::trace_ring::unpack_read_outcome_run(r.duration_ns) >= 2)
         .expect("the fixture folds — see the premise in the sibling arm");
     let popped = cerulion_core::trace_ring::unpack_read_outcome_popped(target.duration_ns);
@@ -21980,7 +22223,7 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .find(|r| is_read_record(r))
         .expect("the recording carries read records");
     let popped = cerulion_core::trace_ring::unpack_read_outcome_popped(target.duration_ns);
     target.duration_ns = cerulion_core::trace_ring::pack_read_outcome_aux_run(popped, HOSTILE_RUN);
@@ -22065,13 +22308,13 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 7 on every
-/// bag this binary writes (every gated consult records), so every "corpus" bag
-/// elsewhere in this file is a format-**7** bag, a PRECONDITION that roles are
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 9 on every
+/// bag this binary writes (every gated consult, and every frame of each batch
+/// that fits its read stage's window, record), so every "corpus" bag elsewhere in this file is a format-**9** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 7, the consult term
-/// outranks the fold term). Reading an archived bag is a compatibility claim
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 9, the identity and
+/// consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
 /// recording stripped of the records those formats never wrote
@@ -23288,6 +23531,7 @@ fn write_free_run_skewed_bag_on(
     skewed_rank: u32,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23470,6 +23714,7 @@ fn write_free_run_ragged_head_bag(
     coordination: replay_engine::CoordinationMode,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23624,6 +23869,7 @@ fn free_run_per_rank_replay_is_deterministic() {
 /// an implementation that never installs the plan passes every other free-run arm.
 fn write_free_run_silent_last_step_bag(rec: &Recording, path: &std::path::Path, silent_step: u64) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23740,6 +23986,7 @@ fn write_free_run_ragged_tail_bag(
     coordination: replay_engine::CoordinationMode,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23902,6 +24149,7 @@ fn the_same_ragged_tail_is_still_tolerated_on_a_lockstep_bag() {
     // would be refused for (phase 2) — so the lockstep twin is written by the
     // same trimming with NO skew.
     let mut trimmed = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23994,6 +24242,7 @@ fn write_free_run_unmanifested_producer_bag(
     skew_ghost: bool,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -24165,6 +24414,7 @@ fn write_mid_run_bag(
     coordination: Option<replay_engine::CoordinationMode>,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec
             .trace
@@ -25159,6 +25409,7 @@ fn write_trailing_rank_frame_bag(
     coordination: replay_engine::CoordinationMode,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25356,7 +25607,7 @@ fn inject_before_first_read(
         .trace
         .iter()
         .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == node_idx
                 && unpack_read_outcome_meta(r.global_level).0 == input_idx
         })
@@ -25385,7 +25636,7 @@ fn inject_after_first_read(
         .trace
         .iter()
         .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == node_idx
                 && unpack_read_outcome_meta(r.global_level).0 == input_idx
         })
@@ -25426,9 +25677,9 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
     // not: the stamp came up because of the records, not because of the marker.
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
-        "a bag this binary records stamps 7 (roles, folded runs and a record at \
-         every consult), marker or no marker"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "a bag this binary records stamps the current format (roles, folded runs, \
+         a record at every consult, read identity and batch frames), marker or no marker"
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -25472,7 +25723,13 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
 fn a_resolvable_producer_token_verifies_clean() {
     const PUB_ID: u128 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10;
     let token = cerulion_core::wire::fnv1a_hash(&PUB_ID.to_le_bytes());
-    let mut rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], 6);
+    let mut rec = record_uniform_with_read_log(
+        source_relay_multi_writer_yaml(),
+        source_relay_factories,
+        &[],
+        6,
+    );
+    strip_annotations(&mut rec);
     let (_step, _served) = inject_before_first_read(&mut rec, 1, 0, |step, served| {
         TraceRingRecord::read_outcome_producer(
             step,
@@ -25494,12 +25751,12 @@ fn a_resolvable_producer_token_verifies_clean() {
         Some(serde_json::json!({ format!("{PUB_ID:032x}"): ["source", "out"] })),
     );
 
-    // 7: the consult records, not the annotation. What an annotation must
+    // 8: the consult records and read identity, not the annotation. What an annotation must
     // not do is push the RECORD-TYPE space, and it does not.
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
-        "a bag this binary records stamps 7, annotation or no annotation"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "a bag this binary records stamps the current format, annotation or no annotation"
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -25541,8 +25798,13 @@ fn foreign_publisher_token_stands_the_edge_down_and_never_guesses() {
         "the two spellings must differ, or the collision fixture is a single entry"
     );
     let build = |publishers: Option<serde_json::Value>, name: &str| {
-        let mut rec =
-            record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], 6);
+        let mut rec = record_uniform_with_read_log(
+            source_relay_multi_writer_yaml(),
+            source_relay_factories,
+            &[],
+            6,
+        );
+        strip_annotations(&mut rec);
         inject_before_first_read(&mut rec, 1, 0, |step, served| {
             TraceRingRecord::read_outcome_producer(
                 step,
@@ -25656,6 +25918,7 @@ fn a_producer_annotation_that_does_not_bind_to_its_read_stands_the_edge_down() {
     let build = |shape: &str, name: &str| {
         let mut rec =
             record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], 6);
+        strip_annotations(&mut rec);
         let key_of = |served: u64| (served != READ_OUTCOME_NO_FRAME).then_some(served as u32);
         match shape {
             "control" => {
@@ -25826,11 +26089,12 @@ fn a_stood_down_edge_scopes_a_clean_verification_rather_than_erasing_it() {
     let build = |publishers: Option<serde_json::Value>, name: &str| {
         let steps = 6;
         let mut rec = record_uniform_with_read_log(
-            two_source_fusion_yaml(),
+            two_source_fusion_a_multi_writer_yaml(),
             two_source_fusion_factories,
             &[],
             steps,
         );
+        strip_annotations(&mut rec);
         let fuse_idx = rec
             .node_ids
             .iter()
@@ -26060,6 +26324,7 @@ fn a_manifest_that_names_two_inputs_the_same_quarantines_the_node() {
             &[],
             steps,
         );
+        strip_annotations(&mut rec);
         let fuse_idx = rec
             .node_ids
             .iter()
@@ -26090,7 +26355,7 @@ fn a_manifest_that_names_two_inputs_the_same_quarantines_the_node() {
                 .trace
                 .iter()
                 .position(|r| {
-                    r.record_type == RECORD_TYPE_READ_OUTCOME
+                    is_read_record(r)
                         && r.node_idx == fuse_idx
                         && unpack_read_outcome_meta(r.global_level).0 == input_idx
                         && r.fire_time_ns != READ_OUTCOME_NO_FRAME
@@ -26655,6 +26920,9 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         // would let it be silently absent.
         read_log_verdict: None,
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: false,
@@ -26809,12 +27077,15 @@ fn divergence_classes_are_read_off_real_replays_not_only_a_hand_built_outcome() 
     let mut tampered =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
     let mut tampered_count = 0;
-    for r in tampered.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in tampered
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered_count += 1;
     }
+    rebind_annotations(&mut tampered.trace);
     assert_eq!(
         tampered_count, steps,
         "precondition: the recording really carries a read log to tamper (one \
@@ -26944,6 +27215,8 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         // on every COMPLETED run, so it never appears on a corpus bag; declared
         // so the key-set walk below knows it when a bag does abort.
         "aborted",
+        // How the replay fed its reads, serialized on every path.
+        "read_identity",
     ];
     /// The SUB-keys of the four blocks that carry the
     /// verdict's own structure, walked ONE level down.
@@ -27108,14 +27381,15 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         &bag_stamped,
         replay_engine::CoordinationMode::Lockstep,
     );
-    // The stamp is 7: every bag this binary writes records every gated
-    // consult, so the "with a stamp" case is a format-7 one. What this
+    // The stamp is 9: every bag this binary writes records every gated
+    // consult and every frame of each batch that fits its read stage's window,
+    // so the "with a stamp" case is a format-9 one. What this
     // precondition is FOR is unchanged: the corpus's stamped case must go down
     // the EXPLICIT-stamp branch (`inferred: false`) rather than the inferred
     // one, and it must be the same clean recording as the unstamped cases.
     assert_eq!(
         recorded_trace_format(&bag_stamped),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "precondition: a bag this binary stamps carries read-site roles, folds \
          runs and records every consult, so this really is the corpus recording \
          WITH an explicit stamp"
@@ -27130,8 +27404,13 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
     // every read-site rule down its pre-roles arm. A corpus gate whose whole
     // job is byte-exact back-compat has to keep it.
     let bag_archived = dir.path().join("corpus_archived_format3.mcap");
+    // An archived recorder annotated no single-writer edge, so the archived
+    // case carries no annotation: read at the archived width, an annotation's
+    // token would decode as a run count and stand the edge down instead.
+    let mut archived_rec = clean.clone();
+    strip_annotations(&mut archived_rec);
     write_bag_with_recorder_json(
-        &clean,
+        &archived_rec,
         &bag_archived,
         recorder_json_at_trace_format(replay_engine::CoordinationMode::Lockstep, 3),
     );
@@ -31481,7 +31760,7 @@ fn inject_peek_at_a_firing_step(rec: &mut Recording, role: ReadSiteRole) {
         .trace
         .iter()
         .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == SY_FUSION_NODE_IDX
                 && r.step == firing_step
                 && unpack_read_outcome_meta(r.global_level).0 == SY_INPUT_A_IDX
@@ -31511,7 +31790,7 @@ fn sy_latest_served_seq(rec: &Recording) -> u32 {
     rec.trace
         .iter()
         .filter(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == SY_FUSION_NODE_IDX
                 && unpack_read_outcome_meta(r.global_level).0 == SY_INPUT_A_IDX
                 && r.fire_time_ns != cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME
@@ -31613,8 +31892,8 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
     );
     assert_eq!(
         recorded_trace_format(&base_bag),
-        7,
-        "PRECONDITION: every bag this binary writes stamps 7"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "PRECONDITION: every bag this binary writes stamps the current format"
     );
     let base = replay(&base_bag, sy_bounded_factories, None, None).expect("the baseline replays");
     assert!(
@@ -31640,7 +31919,10 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
         &stamped,
         inject_duplicate_drain_batch,
     );
-    assert_eq!(recorded_trace_format(&stamped), 7);
+    assert_eq!(
+        recorded_trace_format(&stamped),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o5 = replay(&stamped, sy_bounded_factories, None, None).expect("the format-5 bag replays");
     assert!(
         has_stand_down(
@@ -31790,7 +32072,10 @@ fn a_pre_format_seven_sync_bag_replays_with_the_matchers_silence_adopted() {
         &modern,
         |_rec| {},
     );
-    assert_eq!(recorded_trace_format(&modern), 7);
+    assert_eq!(
+        recorded_trace_format(&modern),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o7 = replay(&modern, sy_bounded_factories, None, None)
         .expect("a format-7 per-set Sync bag replays");
     assert!(
@@ -31904,7 +32189,7 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
     );
     assert_eq!(
         recorded_trace_format(&unwritten),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: the stamp says roles MAY be believed, the only \
          configuration in which an unnamed role's handling is observable"
     );
@@ -31951,7 +32236,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &named,
         |_| {},
     );
-    assert_eq!(recorded_trace_format(&named), 7);
+    assert_eq!(
+        recorded_trace_format(&named),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let onamed = replay(&named, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&onamed),
@@ -31973,7 +32261,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &explicit,
         inject_duplicate_drain_batch,
     );
-    assert_eq!(recorded_trace_format(&explicit), 7);
+    assert_eq!(
+        recorded_trace_format(&explicit),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let oexp = replay(&explicit, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&oexp),
@@ -31992,7 +32283,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &impossible,
         inject_impossible_shape_read,
     );
-    assert_eq!(recorded_trace_format(&impossible), 7);
+    assert_eq!(
+        recorded_trace_format(&impossible),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let oimp = replay(&impossible, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&oimp),
@@ -32305,7 +32599,7 @@ fn a_finding_on_a_body_heavy_stream_carries_its_census_in_the_report() {
         |rec| {
             let mut relabelled = 0usize;
             for r in rec.trace.iter_mut() {
-                if r.record_type != RECORD_TYPE_READ_OUTCOME || r.node_idx != SY_FUSION_NODE_IDX {
+                if !is_read_record(r) || r.node_idx != SY_FUSION_NODE_IDX {
                     continue;
                 }
                 let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
@@ -32405,7 +32699,7 @@ fn a_per_set_sync_descent_is_folded_from_its_head_not_declined() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: the roles may be believed, or the arm proves nothing"
     );
     let outcome = replay(&bag, sy_bounded_factories, None, None)
@@ -32754,6 +33048,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
         "read_log_enforcement",
         // The PARTIAL-report marker, absent on a completed run.
         "aborted",
+        // How the replay fed its reads.
+        "read_identity",
     ];
 
     let dir = tempfile::tempdir().unwrap();
@@ -32765,8 +33061,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
-        "this 'corpus' bag is RECORDED BY THIS BINARY, so it stamps 7. \
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "this 'corpus' bag is RECORDED BY THIS BINARY, so it stamps the current format. \
          It is not an old-format arm: reading a genuinely older bag is pinned \
          by `a_format_5_bag_written_by_the_old_packer_still_replays`, which \
          crafts one through `pack_read_outcome_aux` (high half ZERO) and stamps 5"
@@ -32914,7 +33210,11 @@ fn a_body_role_batch_is_steered_to_the_body_queue() {
             &bag,
             |rec| inject_frame_neutral_batch_with_role(rec, role),
         );
-        assert_eq!(recorded_trace_format(&bag), 7, "{role:?}: role-stamped bag");
+        assert_eq!(
+            recorded_trace_format(&bag),
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            "{role:?}: role-stamped bag"
+        );
 
         let outcome = replay(&bag, sy_bounded_factories, None, None)
             .expect("the replay runs whatever the read log says");
@@ -33015,7 +33315,11 @@ fn a_truncated_marker_reaches_both_queues_under_every_role() {
                 );
             },
         );
-        assert_eq!(recorded_trace_format(&bag), 7, "role {wire}: stamped bag");
+        assert_eq!(
+            recorded_trace_format(&bag),
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            "role {wire}: stamped bag"
+        );
 
         let outcome = replay(&bag, sy_bounded_factories, None, None)
             .expect("a truncated read log never refuses the replay");
@@ -33088,7 +33392,10 @@ fn a_truncated_marker_reaches_both_queues_under_every_role() {
             );
         },
     );
-    assert_eq!(recorded_trace_format(&peek_bag), 7);
+    assert_eq!(
+        recorded_trace_format(&peek_bag),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let opeek = replay(&peek_bag, sy_bounded_factories, None, None)
         .expect("an impossible marker never refuses the replay");
     assert!(
@@ -33183,7 +33490,10 @@ fn a_peek_steers_to_the_drain_queue_and_an_unwritten_role_steers_by_kind() {
             );
         },
     );
-    assert_eq!(recorded_trace_format(&peek_bag), 7);
+    assert_eq!(
+        recorded_trace_format(&peek_bag),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let opeek = replay(&peek_bag, sy_bounded_factories, None, None)
         .expect("a peek-role record never refuses the replay");
     let sd = injection_stand_down(&opeek, SY_A_TOPIC).unwrap_or_else(|| {
@@ -33231,7 +33541,7 @@ fn a_peek_steers_to_the_drain_queue_and_an_unwritten_role_steers_by_kind() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the stamp says roles MAY be believed, the only configuration in which \
          an unnamed role's handling is observable"
     );
@@ -34882,7 +35192,7 @@ fn a_wiring_blocked_topic_with_no_recorded_read_replays_with_the_note() {
     for r in rec
         .trace
         .iter_mut()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx)
+        .filter(|r| is_read_record(r) && r.node_idx == sink_idx)
     {
         r.global_level = pack_read_outcome_meta(
             0,
@@ -37015,7 +37325,7 @@ fn a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence() {
     write_sy_single_rank_free_run_bag(rec, &bag, |_| {});
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: roles are on the wire and may be believed"
     );
 
@@ -37213,7 +37523,7 @@ fn steps_fired_on_silently_reoffered_heads(rec: &Recording, node: &str) -> Vec<u
         .trace
         .iter()
         .filter(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == idx
                 && matches!(
                     read_site_role(r.global_level),
@@ -37317,7 +37627,7 @@ fn c6_a_sync_node_with_a_late_context_input_replays_clean_on_carried_heads() {
     write_sy_single_rank_free_run_bag(rec, &bag, |_| {});
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: roles on the wire"
     );
 
@@ -37919,9 +38229,10 @@ fn a_diverged_read_log_is_the_exit_6_schedule_verdict_naming_edge_step_and_seque
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == TAMPERED_STEP)
+        .find(|r| is_read_record(r) && r.step == TAMPERED_STEP)
         .expect("the step-3 kind-6 record exists");
     target.fire_time_ns = CLAIMED_SEQ;
+    rebind_annotations(&mut rec.trace);
 
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("readlog_verdict.mcap");
@@ -38031,11 +38342,7 @@ fn an_uncovered_read_log_on_a_produced_edge_is_an_exit_2_refusal() {
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
     let mut restamped = 0;
-    for r in rec
-        .trace
-        .iter_mut()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
-    {
+    for r in rec.trace.iter_mut().filter(|r| is_read_record(r)) {
         // input_idx 0 (the relay's one input), the PRODUCER annotation kind, no
         // site claim: an annotation names the publisher of the read that follows
         // it and occupies no position in the pop stream.
@@ -38186,10 +38493,7 @@ fn a_bag_side_hole_on_rank_1_is_refused_before_rank_0_executes() {
         &bag,
         |per_rank| {
             let mut restamped = 0;
-            for r in per_rank[1]
-                .iter_mut()
-                .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
-            {
+            for r in per_rank[1].iter_mut().filter(|r| is_read_record(r)) {
                 // The PRODUCER annotation kind, no site claim: an annotation
                 // names the publisher of the read that follows it and occupies no
                 // position in the pop stream, so not one of rank 1's records
@@ -38368,9 +38672,7 @@ fn a_recorded_read_the_replay_never_performs_is_the_exit_6_never_arrived_verdict
     let at = rec
         .trace
         .iter()
-        .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == last
-        })
+        .position(|r| is_read_record(r) && r.node_idx == relay_idx && r.step == last)
         .expect("the record the oracle just read");
     let twin = rec.trace[at];
     rec.trace.insert(at + 1, twin);
@@ -38577,20 +38879,32 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
     let held = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP)
+        .find(|r| is_read_record(r) && r.step == HELD_STEP)
         .expect("the step-3 kind-6 record exists");
     held.global_level = pack_read_outcome_meta(0, READ_OUTCOME_HELD, ReadSiteRole::Body);
     held.fire_time_ns = HELD_STEP - 2;
     held.duration_ns = 0;
+    rebind_annotations(&mut rec.trace);
     // Step 4 then pops BOTH queued frames and serves the newer, which is what a
     // drain-to-latest read does with a one-frame backlog. Its served sequence is
-    // unchanged: the newer of the two IS the frame it already served.
+    // unchanged: the newer of the two IS the frame it already served. From
+    // `trace_format` 9 the recorder names the older frame, seq 2, in a
+    // `BatchFrame` record just before the read.
     let caught_up = rec
         .trace
-        .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP + 1)
+        .iter()
+        .position(|r| is_read_record(r) && r.step == HELD_STEP + 1)
         .expect("the step-4 kind-6 record exists");
-    caught_up.duration_ns = 2;
+    rec.trace[caught_up].duration_ns = 2;
+    let mut older = rec.trace[caught_up];
+    older.global_level = pack_read_outcome_meta(
+        0,
+        cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+        ReadSiteRole::Body,
+    );
+    older.fire_time_ns = HELD_STEP - 1;
+    older.duration_ns = 0;
+    rec.trace.insert(caught_up, older);
     assert_eq!(
         kind6_records(&rec),
         vec![
@@ -38598,6 +38912,14 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
             served(1),
             served(2),
             (3, 1, 0, READ_OUTCOME_HELD, 1, 0),
+            (
+                4,
+                1,
+                0,
+                cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+                2,
+                0
+            ),
             (4, 1, 0, READ_OUTCOME_SERVED, 3, 2),
             served(5),
         ],
@@ -38688,7 +39010,7 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
     let short = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHORT_STEP)
+        .find(|r| is_read_record(r) && r.step == SHORT_STEP)
         .expect("the step-4 kind-6 record exists");
     short.duration_ns = CLAIMED_POPS;
     assert_eq!(
@@ -38758,7 +39080,7 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
 ///
 /// 1. the RECORDING holds it: the hand oracle `quiet_relay_read_log_oracle`,
 ///    derived from the fixture's two rates, names one `none` record per EVEN step
-///    and one pop per ODD step, and the bag stamps 7;
+///    and one pop per ODD step, and the bag stamps 7 or later;
 /// 2. the replay is BYTE EXACT with it: the per-edge verifier pairs the empty
 ///    consults position for position and retains nothing, and the gate reports
 ///    `enforced` over the relay's one stage with no over-run;
@@ -38788,7 +39110,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
     write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the recorder stamps the format whose rule this bag was written under"
     );
 
@@ -38886,7 +39208,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
 ///
 /// 1. the RECORDING is what the rates say: the hand oracle
 ///    `sync_quiet_read_log_oracle` names three records per step and the bag
-///    stamps 7. The consumer FIRES on every odd step, so a refill align pass
+///    stamps 7 or later. The consumer FIRES on every odd step, so a refill align pass
 ///    really ran there, and its two empty fills are absent from the table;
 /// 2. the replay is BYTE EXACT and the two logs pair position for position;
 /// 3. the GATE is armed over the one gateable edge and reports no over-run: a
@@ -38943,7 +39265,7 @@ fn a_per_set_syncs_refill_align_pass_records_nothing_and_replays_byte_exact() {
     write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the recorder stamps the format whose rule this bag was written under"
     );
 
@@ -39436,12 +39758,13 @@ fn a_popped_record_that_names_no_sequence_is_an_exit_2_refusal() {
     let shapeless = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHAPELESS_STEP)
+        .find(|r| is_read_record(r) && r.step == SHAPELESS_STEP)
         .expect("the step-2 kind-6 record exists");
     shapeless.global_level =
         pack_read_outcome_meta(0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain);
     shapeless.fire_time_ns = READ_OUTCOME_NO_FRAME;
     shapeless.duration_ns = POPPED;
+    rebind_annotations(&mut rec.trace);
     assert_eq!(
         kind6_records(&rec)
             .into_iter()
@@ -39851,5 +40174,2239 @@ fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
     match &refused {
         Err(ReplayError::RecordingInconsistent { .. }) => {}
         other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+}
+
+// ===========================================================================
+// Read identity: every read fed exactly its recorded frames
+// ===========================================================================
+//
+// The ORACLE here is the consumers' own view, independent of every record the
+// product writes: each writer stamps its identity into the payload (`x` = the
+// writer, `y` = its own sequence, `z` = a value derived from both), and each
+// consumer appends what it observed at every fire to `RI_READS`. A replay
+// reproduces the reads exactly when every consumer's observation list equals
+// the live run's, element for element.
+
+/// What one consumer observed at one fire: `(consumer tag, x, y, z)` as f64
+/// bit patterns, so equality is exact.
+type RiRead = (u64, u64, u64, u64);
+
+static RI_READS: std::sync::Mutex<Vec<RiRead>> = std::sync::Mutex::new(Vec::new());
+
+fn ri_log(tag: f64, x: f64, y: f64, z: f64) {
+    RI_READS
+        .lock()
+        .unwrap()
+        .push((tag.to_bits(), x.to_bits(), y.to_bits(), z.to_bits()));
+}
+
+fn ri_take() -> Vec<RiRead> {
+    std::mem::take(&mut *RI_READS.lock().unwrap())
+}
+
+/// A writer that stamps its identity into every frame.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct RiWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// A SLOW latest-value consumer: it fires every third step on a depth-2 queue,
+/// so the live queue drops the oldest of the three frames published in between.
+#[cerulion_node(period_ms = 15)]
+#[derive(Default)]
+struct RiSlowSink {
+    #[input(depth = 2)]
+    inp: Vector3,
+    tag: f64,
+}
+
+#[cerulion_node_impl]
+impl RiSlowSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(self.tag, self.inp.x, self.inp.y, self.inp.z);
+        Ok(())
+    }
+}
+
+/// A per-message consumer: one fire per arriving frame.
+#[cerulion_node]
+#[derive(Default)]
+struct RiFifoSink {
+    #[input(trigger)]
+    inp: Vector3,
+    tag: f64,
+}
+
+#[cerulion_node_impl]
+impl RiFifoSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(self.tag, self.inp.x, self.inp.y, self.inp.z);
+        Ok(())
+    }
+}
+
+/// A per-message consumer on a queue deep enough to hold a whole capped burst.
+#[cerulion_node]
+#[derive(Default)]
+struct RiDeepFifoSink {
+    #[input(trigger, depth = 64)]
+    inp: Vector3,
+    tag: f64,
+}
+
+#[cerulion_node_impl]
+impl RiDeepFifoSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(self.tag, self.inp.x, self.inp.y, self.inp.z);
+        Ok(())
+    }
+}
+
+const RI_SLOW: f64 = 1.0;
+const RI_FAST: f64 = 2.0;
+const RI_SINK: f64 = 3.0;
+const RI_STEPS: usize = 60;
+/// The reads every consumer of an arm must make, live and replayed alike: a
+/// comparison over fewer is no evidence.
+const RI_MIN_READS: usize = 15;
+
+/// One writer fanned out to a SLOW latest consumer (live evictions) and a
+/// per-message consumer.
+fn ri_evict_yaml() -> &'static str {
+    "name: riev\nprefix: riev\nnodes:\n\
+     \x20 - id: src\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: slow\n    type: ri_slow_sink\n    inputs:\n      - name: inp\n        source: src/out\n\
+     \x20 - id: fast\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: src/out\n"
+}
+
+fn ri_evict_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "src",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 1.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "slow",
+            Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+                tag: RI_SLOW,
+                ..Default::default()
+            })),
+        ),
+        (
+            "fast",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_FAST,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// Three writers on ONE `multi_publisher_topics` topic, read per message.
+fn ri_multi_writer_yaml() -> &'static str {
+    "name: rimw\nprefix: rimw\nmulti_publisher_topics:\n  - /rimw/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimw/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimw/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimw/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /rimw/bus\n"
+}
+
+fn ri_multi_writer_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        ("w2", writer(2.0)),
+        ("w3", writer(3.0)),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A live run, recorded with its read log, and what each consumer observed.
+struct RiLive {
+    rec: Recording,
+    reads: Vec<RiRead>,
+}
+
+fn ri_record(yaml: &str, make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>) -> RiLive {
+    ri_take();
+    let rec = record_reference_impl(yaml, make, &[], &vec![DELTA_MS; RI_STEPS], 16, true);
+    RiLive {
+        rec,
+        reads: ri_take(),
+    }
+}
+
+/// The writer node of a recorded frame, read off the frame's own `x`.
+fn ri_writer_node(frame: &[u8]) -> String {
+    format!("w{}", frame_x(frame) as u64)
+}
+
+/// The publisher table of every output `rec` published.
+fn ri_publishers(rec: &Recording) -> serde_json::Value {
+    let mut writers: Vec<(String, String)> = Vec::new();
+    for (node, outputs) in &rec.publisher_ids {
+        for (output, _) in outputs {
+            writers.push((node.clone(), output.clone()));
+        }
+    }
+    let writer_refs: Vec<(&str, &str)> = writers
+        .iter()
+        .map(|(n, o)| (n.as_str(), o.as_str()))
+        .collect();
+    publishers_table(rec, &writer_refs)
+}
+
+/// One producer label per frame of every topic `rec` recorded from several
+/// writers, the writer read off the frame's own `x`.
+fn ri_frame_label_rows(rec: &Recording) -> Vec<(String, cerulion_bag::ProducerAttribution, u128)> {
+    let mut label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = Vec::new();
+    for (topic, frames) in &rec.messages {
+        let distinct: std::collections::BTreeSet<u64> =
+            frames.iter().map(|f| frame_x(f) as u64).collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        for (i, f) in frames.iter().enumerate() {
+            label_rows.push((
+                topic.clone(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(rec, &ri_writer_node(f), "out"),
+            ));
+        }
+    }
+    label_rows
+}
+
+/// Write `live` as a single-rank free-run bag the way a recorder does: the
+/// production `recorder.json`, the stage rows, the publisher table and, on a
+/// topic with several writers, one producer label per frame.
+fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
+    let label_rows = ri_frame_label_rows(rec);
+    let labels: Vec<ProducerLabel<'_>> = label_rows
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(recorder_json),
+        Some(ri_publishers(rec)),
+        Some(&labels),
+        Some(rec.stage_rows.clone()),
+    );
+}
+
+/// Write `live` as a two-rank free-run bag: the nodes `on_rank1` names on rank
+/// 1, every other node on rank 0, each rank declaring the stage rows of its own
+/// nodes, with the publisher table and the per-frame producer labels
+/// [`ri_bag`] writes.
+fn ri_two_rank_bag(rec: &Recording, path: &std::path::Path, on_rank1: fn(&str) -> bool) {
+    let rank_of = |id: &str| u32::from(on_rank1(id));
+    let stage_rows = rec.stage_rows.clone();
+    let staging = move |rank: u32| -> Option<serde_json::Value> {
+        let rows: serde_json::Map<String, serde_json::Value> = stage_rows
+            .as_object()?
+            .iter()
+            .filter(|(node, _)| u32::from(on_rank1(node)) == rank)
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        // A rank with no read stage declares no table: a present-but-empty one
+        // is refused as declaring nothing.
+        (!rows.is_empty()).then(|| serde_json::json!({ "capacities": rows }))
+    };
+    let label_rows = ri_frame_label_rows(rec);
+    let labels: Vec<ProducerLabel<'_>> = label_rows
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        path,
+        |_| {},
+        None,
+        Some(ri_free_run_recorder_json()),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(ri_publishers(rec)),
+            labels: &labels,
+        },
+        Some(&staging),
+        &[],
+    );
+}
+
+fn ri_free_run_recorder_json() -> Vec<u8> {
+    production_recorder_json(replay_engine::CoordinationMode::FreeRun)
+}
+
+/// The production `recorder.json` restamped at an older `trace_format`.
+fn ri_recorder_json_at(format: u32) -> Vec<u8> {
+    let mut v: serde_json::Value = serde_json::from_slice(&ri_free_run_recorder_json()).unwrap();
+    v["trace_format"] = serde_json::json!(format);
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// Replay `bag` under `purpose`, returning the outcome and what every consumer
+/// observed.
+fn ri_replay(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_bounded(bag, make, purpose, None, None)
+}
+
+/// [`ri_replay`] under a `--duration` bound and a feed index budget.
+fn ri_replay_bounded(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_take();
+    let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(bag);
+    let clock = Arc::new(VirtualClock::new());
+    let transport = cerulion_core::transport::TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: "cerulion_ri_replay".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("isolated replay transport");
+    let inputs = ReplayInputs {
+        ros2_entries_skipped: Vec::new(),
+        config,
+        trace,
+        node_ids,
+        recorded_messages,
+        env_json,
+        recorder,
+        record_health: RecordHealthReport::Absent,
+        duration_bound_ns,
+        feed_index_budget,
+        report_path: None,
+        fire_tap: None,
+        tolerance: None,
+        strict_state: false,
+        allow_param_change: false,
+        record_out: None,
+        purpose,
+    };
+    let outcome = replay_engine::run_engine(
+        inputs,
+        ReplayNodes::Injected {
+            transport,
+            clock,
+            factories: make(),
+        },
+    );
+    (outcome, ri_take())
+}
+
+/// Per consumer, its observations in order.
+fn ri_by_consumer(reads: &[RiRead]) -> std::collections::BTreeMap<u64, Vec<(u64, u64, u64)>> {
+    let mut out: std::collections::BTreeMap<u64, Vec<(u64, u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for (tag, x, y, z) in reads {
+        out.entry(*tag).or_default().push((*x, *y, *z));
+    }
+    out
+}
+
+/// The judge: every consumer in `tags` made at least [`RI_MIN_READS`] reads on
+/// both sides, and its replayed reads equal its live reads. `Err` names the
+/// first difference.
+fn ri_judge(live: &[RiRead], replayed: &[RiRead], tags: &[f64]) -> Result<usize, String> {
+    let live = ri_by_consumer(live);
+    let replayed = ri_by_consumer(replayed);
+    let mut compared = 0;
+    for tag in tags {
+        let key = tag.to_bits();
+        let l = live.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let r = replayed.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        assert!(
+            l.len() >= RI_MIN_READS,
+            "consumer {tag} made {} live reads, below the floor {RI_MIN_READS}",
+            l.len()
+        );
+        if let Some(i) = (0..l.len().max(r.len())).find(|&i| l.get(i) != r.get(i)) {
+            let show = |v: Option<&(u64, u64, u64)>| {
+                v.map(|(x, y, z)| (f64::from_bits(*x), f64::from_bits(*y), f64::from_bits(*z)))
+            };
+            return Err(format!(
+                "consumer {tag}: read {i} differs: live {:?}, replayed {:?} ({} live, {} replayed)",
+                show(l.get(i)),
+                show(r.get(i)),
+                l.len(),
+                r.len()
+            ));
+        }
+        compared += l.len();
+    }
+    Ok(compared)
+}
+
+/// The live run of the eviction fixture really evicted and really fanned out.
+fn ri_assert_evict_premise(live: &RiLive) {
+    let by = ri_by_consumer(&live.reads);
+    let slow: Vec<f64> = by[&RI_SLOW.to_bits()]
+        .iter()
+        .map(|(_, y, _)| f64::from_bits(*y))
+        .collect();
+    let fast = &by[&RI_FAST.to_bits()];
+    assert!(
+        slow.windows(2).any(|w| w[1] - w[0] > 1.0),
+        "PREMISE: the slow consumer skips sequences the live queue evicted: {slow:?}"
+    );
+    assert!(
+        fast.len() > slow.len(),
+        "PREMISE: two consumers read one topic at different rates (fan-out): fast {} slow {}",
+        fast.len(),
+        slow.len()
+    );
+    // A multi-frame read is exercised: some slow read popped two frames.
+    let popped_two = live.rec.trace.iter().any(|r| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME
+            && unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_SERVED
+            && unpack_read_outcome_popped(r.duration_ns) >= 2
+    });
+    assert!(
+        popped_two,
+        "PREMISE: a slow read popped more than one frame"
+    );
+}
+
+fn ri_assert_fed(outcome: &ReplayOutcome) -> (usize, usize) {
+    match &outcome.read_identity {
+        replay_engine::ReadIdentityReport::Fed { reads, frames } => {
+            assert!(
+                *reads > 0 && *frames >= *reads,
+                "{:?}",
+                outcome.read_identity
+            );
+            (*reads, *frames)
+        }
+        other => panic!("a --verify replay of a format-9 free-run bag is fed: {other:?}"),
+    }
+}
+
+/// One consumer read site's share of a recording's read log.
+#[derive(Debug, Default, Clone, Copy)]
+struct RiSiteRecords {
+    /// Producer annotations staged at the site.
+    annotations: usize,
+    /// Read records of the site.
+    reads: usize,
+    /// Read records of the site that name a served frame: each carried its own
+    /// annotation under the per-read rule writer runs replaced.
+    serving: usize,
+}
+
+/// Per (consumer node, input index, read site), its read-log records.
+fn ri_site_records(
+    rec: &Recording,
+) -> std::collections::BTreeMap<(String, u16, usize), RiSiteRecords> {
+    let mut out: std::collections::BTreeMap<(String, u16, usize), RiSiteRecords> =
+        std::collections::BTreeMap::new();
+    for r in rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        let node = rec.node_ids[r.node_idx as usize].clone();
+        let site = cerulion_core::read_outcome::writer_run_site(
+            cerulion_core::trace_ring::read_site_role(r.global_level),
+        );
+        let input = unpack_read_outcome_meta(r.global_level).0;
+        let entry = out.entry((node, input, site)).or_default();
+        if is_read_record(r) {
+            entry.reads += 1;
+            if r.fire_time_ns != READ_OUTCOME_NO_FRAME {
+                entry.serving += 1;
+            }
+        } else {
+            entry.annotations += 1;
+        }
+    }
+    out
+}
+
+/// The read log's record count, and what the per-read rule would have staged:
+/// one more record per serving read.
+fn ri_record_sizes(rec: &Recording) -> (usize, usize) {
+    let sites = ri_site_records(rec);
+    let now: usize = sites.values().map(|s| s.reads + s.annotations).sum();
+    let per_read: usize = sites.values().map(|s| s.reads + s.serving).sum();
+    (now, per_read)
+}
+
+/// A single-writer edge stages ONE producer annotation per read site for the
+/// whole recording: the annotation opens the writer's run and every later read
+/// of the site is that writer's.
+#[test]
+#[serial]
+fn a_single_writer_edge_records_one_annotation_per_run() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let sites = ri_site_records(&live.rec);
+    for consumer in ["slow", "fast"] {
+        let of: Vec<(&(String, u16, usize), &RiSiteRecords)> = sites
+            .iter()
+            .filter(|((n, _, _), _)| n == consumer)
+            .collect();
+        let serving: usize = of.iter().map(|(_, s)| s.serving).sum();
+        assert!(
+            serving >= RI_MIN_READS,
+            "PREMISE: {consumer} served enough reads to make one annotation evidence: {of:?}"
+        );
+        for (key, site) in of {
+            let want = usize::from(site.serving > 0);
+            assert_eq!(
+                site.annotations, want,
+                "{key:?}: one writer, one run, one annotation: {site:?}"
+            );
+        }
+    }
+    let (now, per_read) = ri_record_sizes(&live.rec);
+    println!("RI_RECORDS evict: read_log_records={now} per_read_rule={per_read}");
+    assert!(
+        now < per_read,
+        "writer runs stage fewer records ({now} vs {per_read})"
+    );
+}
+
+/// Live evictions and fan-out: every replayed read equals the live read.
+#[test]
+#[serial]
+fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_evict.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    let (reads, frames) = ri_assert_fed(&outcome);
+    assert!(
+        frames > reads,
+        "a slow read popped two frames, so more frames than reads were fed ({frames} vs {reads})"
+    );
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    println!("RI_ORACLE evict: compared={compared} fed_reads={reads} fed_frames={frames}");
+    assert!(
+        outcome.passed,
+        "the fed replay passes: {:?}",
+        outcome.violations
+    );
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("reads: fed by recorded identity"),
+        "the verdict says how reads were fed: {verdict}"
+    );
+}
+
+/// The feed index bytes a fed replay of `bag` needs, read off the refusal a
+/// zero budget answers.
+fn ri_feed_index_need(bag: &std::path::Path, duration_bound_ns: Option<u64>) -> u64 {
+    let (outcome, _) = ri_replay_bounded(
+        bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        duration_bound_ns,
+        Some(0),
+    );
+    let msg = outcome
+        .expect_err("a zero feed index budget is refused")
+        .to_string();
+    let rest = msg
+        .split("need a feed index of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the refusal names the bytes needed: {msg}"));
+    rest.split(' ').next().unwrap().parse().unwrap()
+}
+
+fn ri_evict_bag(dir: &std::path::Path) -> std::path::PathBuf {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let bag = dir.join("ri_budget.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    bag
+}
+
+/// A feed index budget well above what the reads need: the replay is fed and
+/// passes.
+#[test]
+#[serial]
+fn a_fed_replay_under_its_feed_index_budget_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    assert!(
+        need > 0 && need.is_multiple_of(cerulion_cli_engine::replay_feed::FEED_INDEX_ENTRY_BYTES),
+        "{need}"
+    );
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(need * 4),
+    );
+    let outcome = outcome.expect("the fed replay runs under its budget");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// A feed index budget exactly equal to what the reads need is enough.
+#[test]
+#[serial]
+fn a_fed_replay_at_exactly_its_feed_index_budget_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(need),
+    );
+    let outcome = outcome.expect("the fed replay runs at exactly its budget");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// A feed index budget one entry below what the reads need refuses the replay
+/// with exit 2, naming the budget, the need and the flag that raises it.
+#[test]
+#[serial]
+fn a_fed_replay_over_its_feed_index_budget_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    let budget = need - cerulion_cli_engine::replay_feed::FEED_INDEX_ENTRY_BYTES;
+    let (outcome, replayed) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(budget),
+    );
+    let err = outcome.expect_err("a replay over its feed index budget is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_feed_index_budget".to_string(),
+        format!("need a feed index of {need} bytes"),
+        format!("feed index budget of {budget} bytes"),
+        "--feed-index-budget".to_string(),
+    ] {
+        assert!(msg.contains(&part), "the refusal names `{part}`: {msg}");
+    }
+    assert!(replayed.is_empty(), "no step ran: {replayed:?}");
+}
+
+/// A `--duration` bound covering part of the bag indexes only the frames the
+/// steps inside it read.
+#[test]
+#[serial]
+fn a_short_duration_indexes_fewer_frames_than_the_whole_bag() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let whole = ri_feed_index_need(&bag, None);
+    let quarter_ns = (RI_STEPS as u64 / 4) * DELTA_MS * 1_000_000;
+    let bounded = ri_feed_index_need(&bag, Some(quarter_ns));
+    assert!(
+        bounded > 0 && bounded * 2 < whole,
+        "a quarter of the bag needs well under half its index ({bounded} vs {whole})"
+    );
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        Some(quarter_ns),
+        Some(bounded),
+    );
+    let outcome = outcome.expect("the bounded fed replay runs under the bounded need");
+    ri_assert_fed(&outcome);
+    // The bound re-executes the first quarter of the steps, so the source's
+    // topic is short by the rest and that is the outcome's one violation; the
+    // reads inside the bound are fed and the read log stays clean.
+    match outcome.violations.as_slice() {
+        [v] if v.topic == "/riev/src/out" => match v.class {
+            ViolationClass::MissingMessages { recorded, replayed } => {
+                assert_eq!((recorded, replayed), (RI_STEPS, RI_STEPS / 4), "{v:?}");
+            }
+            ref other => panic!("expected MissingMessages, got {other:?}"),
+        },
+        other => panic!("one truncation violation on the source's topic: {other:?}"),
+    }
+    assert!(
+        outcome.trace_divergence.is_none() && outcome.read_log_divergence.is_none(),
+        "{:?} {:?}",
+        outcome.trace_divergence,
+        outcome.read_log_divergence
+    );
+}
+
+/// Two fed replays of graphs with identical node names run at the same time on
+/// ONE shared iceoryx2 config. Each private feed service carries
+/// its replay's identifier, so neither replay attaches to the other's feeds and
+/// both are fed and pass.
+#[test]
+#[serial]
+fn two_concurrent_fed_replays_sharing_an_iceoryx2_config_do_not_cross_feeds() {
+    // Two graphs with the same node ids (src, slow, fast) under different
+    // prefixes: their own topics differ, so the only names the two replays could
+    // share are the private feed services, which carry the node id.
+    let dir = tempfile::tempdir().unwrap();
+    let mut bags = Vec::new();
+    for prefix in ["riev", "rievb"] {
+        let yaml = ri_evict_yaml().replacen("prefix: riev", &format!("prefix: {prefix}"), 1);
+        let live = ri_record(&yaml, ri_evict_factories);
+        ri_assert_evict_premise(&live);
+        let bag = dir.path().join(format!("ri_concurrent_{prefix}.mcap"));
+        ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+        bags.push(bag);
+    }
+    let shared = cerulion_core::testing::iceoryx_test_config();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let run = |name: &'static str, bag: &std::path::Path| {
+        let bag = bag.to_path_buf();
+        let shared = shared.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let (config, trace, node_ids, recorded_messages, env_json, recorder) =
+                load_inputs(&bag);
+            let clock = Arc::new(VirtualClock::new());
+            let transport = cerulion_core::transport::TransportManager::init_for_test(
+                cerulion_core::transport::TransportConfig {
+                    node_name: name.into(),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                shared,
+            )
+            .expect("replay transport on the shared config");
+            barrier.wait();
+            replay_engine::run_engine(
+                ReplayInputs {
+                    ros2_entries_skipped: Vec::new(),
+                    config,
+                    trace,
+                    node_ids,
+                    recorded_messages,
+                    env_json,
+                    recorder,
+                    record_health: RecordHealthReport::Absent,
+                    duration_bound_ns: None,
+                    feed_index_budget: None,
+                    report_path: None,
+                    fire_tap: None,
+                    tolerance: None,
+                    strict_state: false,
+                    allow_param_change: false,
+                    record_out: None,
+                    purpose: replay_engine::ReplayPurpose::Verify,
+                },
+                ReplayNodes::Injected {
+                    transport,
+                    clock,
+                    factories: ri_evict_factories(),
+                },
+            )
+        })
+    };
+    let a = run("cerulion_ri_concurrent_a", &bags[0]);
+    let b = run("cerulion_ri_concurrent_b", &bags[1]);
+    for outcome in [a.join().unwrap(), b.join().unwrap()] {
+        let outcome = outcome.expect("each concurrent fed replay runs");
+        ri_assert_fed(&outcome);
+        assert!(
+            outcome.passed,
+            "a concurrent fed replay is fed only its own frames: {:?}",
+            outcome.violations
+        );
+    }
+    ri_take();
+}
+
+/// A consumer whose node id is 230 characters long. Every private feed name
+/// carries a fixed-width digest of the node id, so the name stays inside the
+/// transport's topic limit, the fed replay builds its feeds, and every replayed
+/// read equals the live read.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_node_with_a_230_character_id_builds_its_feeds() {
+    let long = format!("slow_{}", "z".repeat(225));
+    assert_eq!(long.len(), 230);
+    let yaml = ri_evict_yaml().replacen("id: slow", &format!("id: {long}"), 1);
+    let make = || {
+        let mut f = ri_evict_factories();
+        let entry = f
+            .shift_remove("slow")
+            .expect("the evict fixture has a slow sink");
+        f.insert(long.clone(), entry);
+        f
+    };
+    let live = ri_record(&yaml, make);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_long_node.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = outcome.expect("the fed replay of a long node id builds its feeds");
+    ri_assert_fed(&outcome);
+    ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    assert!(
+        outcome.passed,
+        "the fed replay passes: {:?}",
+        outcome.violations
+    );
+}
+
+/// Two ranks, the consumers' rank built FIRST: its fed inputs read a topic only
+/// the second rank produces, so no port of the first pass created that topic's
+/// service. The fed build opens no real subscriber on it and still stands up its
+/// liveliness probe, and every replayed read equals the live read.
+#[test]
+#[serial]
+fn a_fed_consumer_rank_built_before_its_producer_rank_reproduces_its_reads() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_two_rank.mcap");
+    // Rank 0 = the consumers, rank 1 = the writer.
+    let rank_of = |id: &str| u32::from(id == "src");
+    let stage_rows = live.rec.stage_rows.clone();
+    let staging = move |rank: u32| -> Option<serde_json::Value> {
+        let rows: serde_json::Map<String, serde_json::Value> = stage_rows
+            .as_object()?
+            .iter()
+            .filter(|(node, _)| u32::from(node.as_str() == "src") == rank)
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        // A rank with no read stage (the writer's) declares no table: a
+        // present-but-empty one is refused as declaring nothing.
+        (!rows.is_empty()).then(|| serde_json::json!({ "capacities": rows }))
+    };
+    let mut writers: Vec<(String, String)> = Vec::new();
+    for (node, outputs) in &live.rec.publisher_ids {
+        for (output, _) in outputs {
+            writers.push((node.clone(), output.clone()));
+        }
+    }
+    let writer_refs: Vec<(&str, &str)> = writers
+        .iter()
+        .map(|(n, o)| (n.as_str(), o.as_str()))
+        .collect();
+    write_multi_rank_bag_impl(
+        &live.rec,
+        rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(ri_free_run_recorder_json()),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(publishers_table(&live.rec, &writer_refs)),
+            labels: &[],
+        },
+        Some(&staging),
+        &[],
+    );
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the two-rank fed replay builds and runs");
+    ri_assert_fed(&outcome);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    println!("RI_ORACLE two_rank: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// Three writers on one topic: every replayed read equals the live read, by
+/// writer and sequence.
+#[test]
+#[serial]
+fn identity_fed_replay_reproduces_reads_of_three_writers_on_one_topic() {
+    let live = ri_record(ri_multi_writer_yaml(), ri_multi_writer_factories);
+    let by = ri_by_consumer(&live.reads);
+    let writers: std::collections::BTreeSet<u64> =
+        by[&RI_SINK.to_bits()].iter().map(|(x, _, _)| *x).collect();
+    assert_eq!(writers.len(), 3, "PREMISE: the sink read all three writers");
+    let (now, per_read) = ri_record_sizes(&live.rec);
+    println!("RI_RECORDS three_writers: read_log_records={now} per_read_rule={per_read}");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_three_writers.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_multi_writer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE three_writers: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// MUTANT: the recorded identity dropped from the bag. On a single-writer
+/// edge one annotation opens the writer's run, so dropping it leaves every
+/// read of the run unattributed. The replay refuses by name (node, input,
+/// writer, sequence) at the first of them, before its first step.
+#[test]
+#[serial]
+fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let slow_idx = live.rec.node_ids.iter().position(|n| n == "slow").unwrap() as u32;
+    // The slow consumer's run-opening annotation, whose read POPPED a frame,
+    // and the served sequence of that read. From `trace_format` 9 the
+    // annotation can precede the `BatchFrame` records of a read that popped
+    // several frames, which sit between it and the read.
+    let trace = &live.rec.trace;
+    let is_slow_read =
+        |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == slow_idx;
+    let (pos, named) = (0..trace.len())
+        .filter(|&i| {
+            is_slow_read(&trace[i])
+                && unpack_read_outcome_meta(trace[i].global_level).1
+                    == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+        })
+        .find_map(|i| {
+            let read = trace[i + 1..]
+                .iter()
+                .filter(|r| is_slow_read(r))
+                .find(|r| !is_batch_frame_record(r))?;
+            (unpack_read_outcome_meta(read.global_level).1 == READ_OUTCOME_SERVED
+                && unpack_read_outcome_popped(read.duration_ns) > 0)
+                .then_some((i, read.fire_time_ns))
+        })
+        .expect("the slow consumer's run opens with an annotation");
+    live.rec.trace.remove(pos);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_dropped_identity.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a read with no recorded identity is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_absent",
+        "node 'slow'",
+        "input 'inp'",
+        "writer none",
+        &format!("sequence {named}"),
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// MUTANT: one recorded identity dropped on the three-writer topic, where the
+/// writers' sequences run in step so the read before it names the same
+/// sequence of another writer. A multi-writer edge carries an annotation
+/// before every read, so the read is refused by name as having no writer
+/// rather than fed the previous read's writer's frame.
+#[test]
+#[serial]
+fn a_dropped_read_identity_on_three_writers_is_refused_by_name() {
+    let mut live = ri_record(ri_multi_writer_yaml(), ri_multi_writer_factories);
+    let sink_idx = live.rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let trace = &live.rec.trace;
+    let is_sink_read =
+        |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx;
+    let pos = (0..trace.len())
+        .filter(|&i| {
+            is_sink_read(&trace[i])
+                && unpack_read_outcome_meta(trace[i].global_level).1
+                    == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+        })
+        .filter(|&i| {
+            // The read before this pair names the same sequence: the shape a
+            // carry by byte equality would misattribute.
+            let prev = trace[..i]
+                .iter()
+                .rev()
+                .find(|r| is_read_record(r) && is_sink_read(r));
+            let next = trace[i + 1..]
+                .iter()
+                .find(|r| is_read_record(r) && is_sink_read(r));
+            matches!((prev, next), (Some(p), Some(n))
+                if p.fire_time_ns == n.fire_time_ns
+                    && unpack_read_outcome_popped(n.duration_ns) > 0)
+        })
+        .nth(2)
+        .expect("PREMISE: back-to-back sink reads of one sequence from two writers");
+    let named = live.rec.trace[pos].fire_time_ns;
+    live.rec.trace.remove(pos);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_three_writers_dropped_identity.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_multi_writer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a read with no recorded identity is refused");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    for part in [
+        "read_identity_absent",
+        "node 'sink'",
+        "writer none",
+        &format!("sequence {named}"),
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// Three writers on one topic read by a SLOW latest-value consumer, so a read
+/// pops the newest two frames, of two different writers.
+fn ri_multi_writer_batch_yaml() -> &'static str {
+    "name: rimb\nprefix: rimb\nmulti_publisher_topics:\n  - /rimb/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimb/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimb/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimb/bus\n\
+     \x20 - id: sink\n    type: ri_slow_sink\n    inputs:\n      - name: inp\n        source: /rimb/bus\n"
+}
+
+fn ri_multi_writer_batch_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        ("w2", writer(2.0)),
+        ("w3", writer(3.0)),
+        (
+            "sink",
+            Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+                tag: RI_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The multi-writer batch recording: some sink read popped more than one
+/// frame, and the read log names the frames it did not serve in `BatchFrame`
+/// records.
+fn ri_multi_writer_batch_live() -> RiLive {
+    let live = ri_record(
+        ri_multi_writer_batch_yaml(),
+        ri_multi_writer_batch_factories,
+    );
+    let popped_two = live.rec.trace.iter().any(|r| {
+        is_read_record(r)
+            && unpack_read_outcome_popped(r.duration_ns) >= 2
+            && r.fire_time_ns != READ_OUTCOME_NO_FRAME
+    });
+    assert!(popped_two, "PREMISE: a read popped more than one frame");
+    assert!(
+        live.rec.trace.iter().any(is_batch_frame_record),
+        "PREMISE: the read log names a batch's other frames"
+    );
+    live
+}
+
+/// A `BatchFrame` record: one frame a read consumed and did not serve.
+fn is_batch_frame_record(r: &TraceRingRecord) -> bool {
+    r.record_type == RECORD_TYPE_READ_OUTCOME
+        && unpack_read_outcome_meta(r.global_level).1
+            == cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME
+}
+
+/// A read that popped several frames on a topic with several writers names
+/// each frame it did not serve in a `BatchFrame` record under that frame's
+/// own writer annotation, so the fed replay feeds every frame of the batch
+/// by `(writer, sequence)` and each replayed read equals the live read.
+#[test]
+#[serial]
+fn a_batch_on_a_multi_writer_edge_is_fed_each_frame_under_its_writer() {
+    let live = ri_multi_writer_batch_live();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_multi_writer_batch.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_multi_writer_batch_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("a batch on several writers is fed");
+    let (reads, frames) = ri_assert_fed(&outcome);
+    assert!(
+        frames > reads,
+        "the batches' other frames are fed: {reads} reads, {frames} frames"
+    );
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE multi_writer_batch: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+// ---------------------------------------------------------------------------
+// Writers whose sequences run apart on one bus: a fed consumer's drop_oldest
+// probe keeps one baseline per recorded writer, as the live probe keeps one
+// per writer port.
+// ---------------------------------------------------------------------------
+
+/// A writer at five frames per step: its wire sequence runs five times as fast
+/// as a once-per-step writer's on the same bus.
+#[cerulion_node(period_ms = 1)]
+#[derive(Default)]
+struct RiFastWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiFastWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// How one consumer's eviction accounting rides its read log entry: the events
+/// its `#[on_event]` handler saw, times this, plus the loss count the last
+/// event carried.
+const RI_EVENT_SCALE: f64 = 1_000_000.0;
+
+/// A per-message `drop_oldest` consumer whose queue holds a whole step (16
+/// frames per writer, the deepest a `multi_publisher_topics` bus admits), so the
+/// live queue evicts nothing. Its handler counts eviction events and keeps the
+/// last event's loss count; every fire logs both beside the frame it read.
+#[cerulion_node]
+#[derive(Default)]
+struct RiDeepEventSink {
+    #[input(trigger, backpressure = drop_oldest, depth = 16)]
+    inp: Vector3,
+    tag: f64,
+    events: f64,
+    lost: f64,
+}
+
+#[cerulion_node_impl]
+impl RiDeepEventSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(
+            self.tag,
+            self.inp.x,
+            self.inp.y,
+            self.events * RI_EVENT_SCALE + self.lost,
+        );
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, e: BackpressureEvent) {
+        self.events += 1.0;
+        self.lost = e.count_total as f64;
+    }
+}
+
+/// The same consumer on a depth-two queue, so the live queue evicts the fast
+/// writer's oldest frames every step.
+#[cerulion_node]
+#[derive(Default)]
+struct RiShallowEventSink {
+    #[input(trigger, backpressure = drop_oldest, depth = 2)]
+    inp: Vector3,
+    tag: f64,
+    events: f64,
+    lost: f64,
+}
+
+#[cerulion_node_impl]
+impl RiShallowEventSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(
+            self.tag,
+            self.inp.x,
+            self.inp.y,
+            self.events * RI_EVENT_SCALE + self.lost,
+        );
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, e: BackpressureEvent) {
+        self.events += 1.0;
+        self.lost = e.count_total as f64;
+    }
+}
+
+const RI_DEEP: f64 = 4.0;
+const RI_SHALLOW: f64 = 5.0;
+
+/// Three writers on one bus, the middle one five times as fast, read per
+/// message by a deep and a shallow `drop_oldest` consumer.
+fn ri_writer_baseline_yaml() -> &'static str {
+    "name: riwb\nprefix: riwb\nmulti_publisher_topics:\n  - /riwb/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: w2\n    type: ri_fast_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: deep\n    type: ri_deep_event_sink\n    inputs:\n      - name: inp\n        source: /riwb/bus\n\
+     \x20 - id: shallow\n    type: ri_shallow_event_sink\n    inputs:\n      - name: inp\n        source: /riwb/bus\n"
+}
+
+fn ri_writer_baseline_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        (
+            "w2",
+            Box::new(RiFastWriterNodeEntry::with_state(RiFastWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        ("w3", writer(3.0)),
+        (
+            "deep",
+            Box::new(RiDeepEventSinkEntry::with_state(RiDeepEventSink {
+                tag: RI_DEEP,
+                ..Default::default()
+            })),
+        ),
+        (
+            "shallow",
+            Box::new(RiShallowEventSinkEntry::with_state(RiShallowEventSink {
+                tag: RI_SHALLOW,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// `(events, loss count)` as one consumer's read logged them.
+fn ri_event_accounting(z: u64) -> (u64, u64) {
+    let z = f64::from_bits(z);
+    let events = (z / RI_EVENT_SCALE).floor();
+    (events as u64, (z - events * RI_EVENT_SCALE) as u64)
+}
+
+/// The hand oracle over one side's reads, live or replayed.
+///
+/// Per step, writers 1 and 3 publish one frame each and writer 2 publishes
+/// five, read in turn by both consumers.
+///
+/// * The deep consumer's queue holds a whole step, so it never loses a frame:
+///   every read logs no event and a loss count of 0.
+/// * The shallow consumer's queue keeps the newest two frames per writer, so
+///   each step evicts exactly three of writer 2's five, seen by the first of
+///   its two writer 2 reads; writers 1 and 3 lose nothing, so the reads
+///   between two steps' evictions are clean and every eviction opens a new
+///   event. Every read therefore logs a loss count of exactly three per event.
+///
+/// A probe that took the three writers for one stream reads, at the shallow
+/// consumer, writer 1's first frame followed by writer 2's fourth as two lost
+/// frames: an event and a loss count the live run never had. From there on
+/// writer 2's sequence leads, and writers 1 and 3 read as re-delivery.
+fn ri_assert_per_writer_accounting(side: &str, reads: &[RiRead]) {
+    let by = ri_by_consumer(reads);
+    let deep = by
+        .get(&RI_DEEP.to_bits())
+        .unwrap_or_else(|| panic!("{side}: the deep consumer read"));
+    assert!(
+        deep.len() >= RI_MIN_READS,
+        "{side}: deep made {} reads",
+        deep.len()
+    );
+    for (i, (_, _, z)) in deep.iter().enumerate() {
+        assert_eq!(
+            ri_event_accounting(*z),
+            (0, 0),
+            "{side}: deep read {i} saw an eviction event its queue never had"
+        );
+    }
+    let shallow = by
+        .get(&RI_SHALLOW.to_bits())
+        .unwrap_or_else(|| panic!("{side}: the shallow consumer read"));
+    assert!(
+        shallow.len() >= RI_MIN_READS,
+        "{side}: shallow made {} reads",
+        shallow.len()
+    );
+    for (i, (_, _, z)) in shallow.iter().enumerate() {
+        let (events, lost) = ri_event_accounting(*z);
+        assert_eq!(
+            lost,
+            3 * events,
+            "{side}: shallow read {i}: {events} events must carry {} lost frames, not {lost}",
+            3 * events
+        );
+    }
+    let (events, _) = ri_event_accounting(shallow.last().expect("shallow read").2);
+    assert!(
+        events as usize >= RI_MIN_READS,
+        "{side}: one eviction event per step, {events} over {RI_STEPS} steps"
+    );
+}
+
+/// Three writers whose wire sequences run apart on one bus, read through two
+/// `drop_oldest` consumers with an `#[on_event]` handler each: every replayed
+/// read, its event count and its loss count included, equals the live read.
+/// The fed replay publishes every writer's frames through one feed port, and
+/// the consumers' probes still count each recorded writer's sequence apart.
+#[test]
+#[serial]
+fn a_fed_replay_counts_evictions_per_recorded_writer_on_one_bus() {
+    let live = ri_record(ri_writer_baseline_yaml(), ri_writer_baseline_factories);
+    let writers: std::collections::BTreeSet<u64> = ri_by_consumer(&live.reads)
+        [&RI_SHALLOW.to_bits()]
+        .iter()
+        .map(|(x, _, _)| *x)
+        .collect();
+    assert_eq!(
+        writers.len(),
+        3,
+        "PREMISE: the shallow consumer read all three writers"
+    );
+    ri_assert_per_writer_accounting("live", &live.reads);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_writer_baselines.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_writer_baseline_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    ri_assert_per_writer_accounting("replayed", &replayed);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
+    println!("RI_ORACLE writer_baselines: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// The same three writers and two consumers split over two ranks, the writers
+/// on rank 1 and the consumers on rank 0. Rank 0's subgraph writes nothing on
+/// the bus, so its own view of the bus names no publisher slots, while the
+/// live consumers read the bus at its `multi_publisher_topics` slots of 16.
+/// The fed consumers' feeds hold those 16, so each recorded writer keeps its
+/// baseline and every replayed read, its event count and its loss count
+/// included, equals the live read against the same hand oracle.
+#[test]
+#[serial]
+fn a_fed_consumer_rank_counts_evictions_of_three_writers_on_another_rank() {
+    let live = ri_record(ri_writer_baseline_yaml(), ri_writer_baseline_factories);
+    ri_assert_per_writer_accounting("live", &live.reads);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_writer_baselines_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id.starts_with('w'));
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_writer_baseline_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the two-rank fed replay runs");
+    ri_assert_fed(&outcome);
+    ri_assert_per_writer_accounting("replayed", &replayed);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
+    println!("RI_ORACLE writer_baselines_two_rank: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// Remove every `BatchFrame` record and the producer annotation staged with it
+/// (the record just before it, on the same node and input); returns the
+/// `(batch frames, annotations)` removed.
+fn strip_batch_frames(trace: &mut Vec<TraceRingRecord>) -> (usize, usize) {
+    let mut keep = vec![true; trace.len()];
+    let (mut frames, mut annotations) = (0, 0);
+    for i in 0..trace.len() {
+        if !is_batch_frame_record(&trace[i]) {
+            continue;
+        }
+        keep[i] = false;
+        frames += 1;
+        let input = unpack_read_outcome_meta(trace[i].global_level).0;
+        if let Some(prev) = i.checked_sub(1) {
+            let p = &trace[prev];
+            if p.record_type == RECORD_TYPE_READ_OUTCOME
+                && p.node_idx == trace[i].node_idx
+                && unpack_read_outcome_meta(p.global_level)
+                    == (input, cerulion_core::trace_ring::READ_OUTCOME_PRODUCER)
+            {
+                keep[prev] = false;
+                annotations += 1;
+            }
+        }
+    }
+    let mut kept = keep.into_iter();
+    trace.retain(|_| kept.next().unwrap_or(true));
+    (frames, annotations)
+}
+
+/// The same recording with its `BatchFrame` records and their annotations
+/// removed, which is the read log of a recorder below `trace_format` 9 and of
+/// a batch deeper than its read stage's window: a read that popped several
+/// frames names only its newest. The fed replay refuses it by name rather than
+/// feed frames counted back from the served one.
+#[test]
+#[serial]
+fn a_batch_whose_frames_are_not_named_is_refused_by_name() {
+    let mut live = ri_multi_writer_batch_live();
+    let (frames, annotations) = strip_batch_frames(&mut live.rec.trace);
+    assert_eq!(
+        frames, annotations,
+        "PREMISE: an edge that annotates every read stages each batch frame with its annotation"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_multi_writer_batch_unnamed.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_multi_writer_batch_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a batch whose frames are not named is refused");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_batch_unattributed") && msg.contains("node 'sink'"),
+        "{msg}"
+    );
+}
+
+/// A bag recorded below `trace_format` 9 holds no `BatchFrame` records, and a
+/// `--verify` replay of it stages none either, so the two read logs hold the
+/// same positions and the replay passes: the multi-writer batch recording with
+/// its batch frames and their annotations removed, stamped as a format 8
+/// lockstep bag and as a format 7 free-run bag, both replayed on the queue
+/// re-creation path. The control is the same recording unstripped at format 9
+/// lockstep, whose recorded batch frames the replay stages too.
+#[test]
+#[serial]
+fn a_batch_recorded_below_format_nine_replays_clean_under_verify() {
+    let live = ri_multi_writer_batch_live();
+    let lockstep = replay_engine::CoordinationMode::Lockstep;
+    let fixtures = [
+        (
+            "format9_lockstep_control",
+            false,
+            production_recorder_json(lockstep),
+        ),
+        (
+            "format8_lockstep",
+            true,
+            recorder_json_at_trace_format(lockstep, 8),
+        ),
+        ("format7_free_run", true, ri_recorder_json_at(7)),
+    ];
+    for (name, strip, recorder_json) in fixtures {
+        let mut rec = live.rec.clone();
+        if strip {
+            let (frames, annotations) = strip_batch_frames(&mut rec.trace);
+            assert!(
+                frames > 0 && frames == annotations,
+                "PREMISE {name}: batch frames removed with their annotations: \
+                 {frames} frames, {annotations} annotations"
+            );
+        } else {
+            assert!(
+                rec.trace.iter().any(is_batch_frame_record),
+                "PREMISE {name}: the control keeps its batch frames"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ri_batch_{name}.mcap"));
+        ri_bag(&rec, &bag, recorder_json);
+        let (outcome, _) = ri_replay(
+            &bag,
+            ri_multi_writer_batch_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{name}: the bag replays: {e}"));
+        assert!(
+            matches!(
+                outcome.read_identity,
+                replay_engine::ReadIdentityReport::BestEffort { .. }
+            ),
+            "{name}: replayed on the queue re-creation path: {:?}",
+            outcome.read_identity
+        );
+        println!(
+            "RI_BELOW_NINE {name}: passed={} violations={:?} read_log={:?}",
+            outcome.passed, outcome.violations, outcome.read_log_divergence
+        );
+        assert!(
+            outcome.passed && outcome.read_log_divergence.is_none(),
+            "{name}: the replay stages the batch frames its recording staged: {:?} {:?}",
+            outcome.violations,
+            outcome.read_log_divergence
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A burst that fires the cap with a frame left over: the live burst's refill
+// after its last fire pops that frame and freezes it unfired, and the next
+// step's first fire serves it.
+// ---------------------------------------------------------------------------
+
+const RC_TOPIC: &str = "/ricap/ext/cam";
+const RC_STEPS: usize = 4;
+
+fn ri_capped_yaml() -> &'static str {
+    "name: ricap\nprefix: ricap\nnodes:\n\
+     \x20 - id: sink\n    type: ri_deep_fifo_sink\n    inputs:\n      - name: inp\n        source: /ricap/ext/cam\n"
+}
+
+fn ri_capped_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "sink",
+        Box::new(RiDeepFifoSinkEntry::with_state(RiDeepFifoSink {
+            tag: RI_SINK,
+            ..Default::default()
+        })),
+    )])
+}
+
+/// The capped-burst recording: one cap of frames at each of the first two
+/// steps, a few after, its read log then carrying the trailing refill. The
+/// recorder of a consumer whose queue refills during its burst pops the next
+/// step's first frame at the cap step's end; this in-process recording stages
+/// no arrival inside a burst, so its next step's first pop record (and the
+/// annotation before it) is moved to the end of the cap step, which is the
+/// read log that recorder writes for the same frames and the same fires.
+fn ri_capped_live() -> RiLive {
+    let cap = usize::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap();
+    let mut x = 0.0;
+    let per_step: Vec<Vec<f64>> = (0..RC_STEPS)
+        .map(|k| {
+            let n = if k < 2 { cap } else { 3 };
+            (0..n)
+                .map(|_| {
+                    x += 1.0;
+                    x
+                })
+                .collect()
+        })
+        .collect();
+    ri_take();
+    let mut rec = record_reference_impl(
+        ri_capped_yaml(),
+        ri_capped_factories,
+        &[ExternalDrive {
+            topic: RC_TOPIC.to_string(),
+            per_step,
+        }],
+        &[DELTA_MS; RC_STEPS],
+        cap,
+        true,
+    );
+    let reads = ri_take();
+    let sink_idx = rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let sink_record =
+        |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx;
+    let fires_at = |rec: &Recording, step: u64| {
+        rec.trace
+            .iter()
+            .filter(|r| {
+                r.record_type == RECORD_TYPE_FIRE && r.node_idx == sink_idx && r.step == step
+            })
+            .count()
+    };
+    let pops_at = |rec: &Recording, step: u64| {
+        rec.trace
+            .iter()
+            .filter(|r| sink_record(r) && is_read_record(r) && r.step == step)
+            .map(|r| unpack_read_outcome_popped(r.duration_ns) as usize)
+            .sum::<usize>()
+    };
+    for step in 0..2 {
+        assert_eq!(
+            (fires_at(&rec, step), pops_at(&rec, step)),
+            (cap, cap),
+            "PREMISE: step {step} fires the cap, one pop per fire"
+        );
+    }
+    {
+        // Step 1's first pop: its annotation and its read.
+        let first = rec
+            .trace
+            .iter()
+            .position(|r| sink_record(r) && r.step == 1)
+            .expect("PREMISE: step 1 reads");
+        assert!(
+            !is_read_record(&rec.trace[first]) && is_read_record(&rec.trace[first + 1]),
+            "PREMISE: a read of a producer-less external topic is preceded by its own annotation"
+        );
+        let mut moved: Vec<TraceRingRecord> = rec.trace.drain(first..first + 2).collect();
+        for r in &mut moved {
+            r.step = 0;
+        }
+        let last0 = rec
+            .trace
+            .iter()
+            .rposition(|r| sink_record(r) && r.step == 0)
+            .expect("PREMISE: step 0 reads");
+        for (i, r) in moved.into_iter().enumerate() {
+            rec.trace.insert(last0 + 1 + i, r);
+        }
+        assert_eq!(
+            pops_at(&rec, 0),
+            cap + 1,
+            "the cap step holds the trailing pop"
+        );
+        assert_eq!(pops_at(&rec, 1), cap - 1);
+    }
+    RiLive { rec, reads }
+}
+
+/// The capped-burst bag: no producer labels (one external writer).
+fn ri_capped_bag(rec: &Recording, path: &std::path::Path) {
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        None,
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+}
+
+/// A burst that fired the cap and carried one frame into the next step
+/// replays read for read under `--verify`: the trace-driven burst drives the
+/// trailing refill the recording holds, so the next step's first fire serves
+/// the carried frame. The pop-count re-derivation reads both steps clean, and
+/// a neutral resim of the same bag reports no fire-schedule divergence.
+#[test]
+#[serial]
+fn a_capped_burst_carries_its_trailing_frame_and_replays_read_for_read() {
+    let live = ri_capped_live();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_capped.mcap");
+    ri_capped_bag(&live.rec, &bag);
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_capped_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE capped_burst: compared={compared}");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{:?}", outcome.violations);
+
+    let (neutral, _) = ri_replay(
+        &bag,
+        ri_capped_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let neutral = neutral.expect("the neutral resim runs");
+    let verdict = replay_engine::render_verdict(&neutral, &bag);
+    assert!(
+        !verdict.contains("FIFO pop count"),
+        "a capped burst's trailing pop is no fire-schedule divergence: {verdict}"
+    );
+}
+
+/// MUTANT: the trace-driven burst drops the trailing refill. The carried frame
+/// is never fed at the cap step and every later read of the consumer is one
+/// frame early, which the oracle catches.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_a_dropped_trailing_refill() {
+    let live = ri_capped_live();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_capped_mutant.mcap");
+    ri_capped_bag(&live.rec, &bag);
+    let guard = cerulion_core::replay_feed::mutants::drop_trailing_refills();
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_capped_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    drop(guard);
+    let outcome = outcome.expect("the mutant replay runs: it refuses nothing up front");
+    let judged = ri_judge(&live.reads, &replayed, &[RI_SINK]);
+    println!(
+        "RI_MUTANT drop_trailing_refills: passed={} judged={judged:?}",
+        outcome.passed
+    );
+    assert!(
+        judged.is_err(),
+        "the oracle caught no read divergence without the trailing refill"
+    );
+    assert!(!outcome.passed, "and the replay verdict is not a pass");
+}
+
+/// MUTANT: the bag lost one frame a read consumed. Refused by name.
+#[test]
+#[serial]
+fn a_frame_missing_from_the_bag_is_refused_by_name() {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let topic = "/riev/src/out";
+    let lost = live.rec.messages[topic].remove(20);
+    let lost_seq = WireHeader::read_from_buf(&lost).unwrap().sequence;
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_lost_frame.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a consumed frame missing from the bag is refused");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_frame_missing")
+            && msg.contains(&format!("sequence {lost_seq}")),
+        "{msg}"
+    );
+}
+
+/// A second writer's port id for the shared-topic arms below: no node of the
+/// eviction fixture publishes under it.
+const RI_SECOND_WRITER: u128 = 0x0B0B_0B0B_0B0B_0B0B_0B0B_0B0B_0B0B_0B0B;
+
+/// One producer label a recording carries: topic, attribution, writer port id.
+type RiLabelRow = (String, cerulion_bag::ProducerAttribution, u128);
+
+/// The eviction recording made a SHARED topic: the frame `src` published at
+/// one consumed sequence is replaced by a second writer's frame at that same
+/// sequence, and the topic carries the labels a recorder writes once a second
+/// writer appears (one `FrameLabel` per frame, naming its writer). Every read
+/// still names `src`, so `src`'s frame at that sequence is missing and the
+/// second writer's frame is the only frame there. Returns the recording, its
+/// labels and that sequence.
+fn ri_second_writer_live() -> (RiLive, Vec<RiLabelRow>, u32) {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let topic = "/riev/src/out";
+    let src = real_publisher_id(&live.rec, "src", "out");
+    let frames = live
+        .rec
+        .messages
+        .get_mut(topic)
+        .expect("PREMISE: src's topic is recorded");
+    let swapped = 20;
+    let seq = WireHeader::read_from_buf(&frames[swapped])
+        .unwrap()
+        .sequence;
+    frames[swapped][WireHeader::SIZE..WireHeader::SIZE + 8].copy_from_slice(&2.0f64.to_le_bytes());
+    let labels = (0..frames.len())
+        .map(|i| {
+            let writer = if i == swapped { RI_SECOND_WRITER } else { src };
+            (
+                topic.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                writer,
+            )
+        })
+        .collect();
+    (live, labels, seq)
+}
+
+/// Write the shared-topic recording as a single-rank free-run bag, as
+/// [`ri_bag`] does, with its label records' bytes from `encode`.
+fn ri_second_writer_bag(
+    rec: &Recording,
+    labels: &[RiLabelRow],
+    path: &std::path::Path,
+    encode: LabelEncoder,
+) {
+    let labels: Vec<ProducerLabel<'_>> = labels
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl_encoded(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(rec)),
+        Some(&labels),
+        Some(rec.stage_rows.clone()),
+        encode,
+    );
+}
+
+/// A shared topic whose reads name only one writer, whose labels this build
+/// cannot decode, is refused by name rather than fed the other writer's frame
+/// at the sequence a read names.
+///
+/// With readable labels the read whose frame is missing is refused as missing
+/// (the control: the second writer's frame sits at that sequence and the
+/// labeled lookup does not take it). With every label record at a newer
+/// version, the labels read as absent, and a frame found by its sequence alone
+/// would be the second writer's, fed as `src`'s.
+#[test]
+#[serial]
+fn a_shared_topic_whose_labels_cannot_be_read_is_refused_not_fed_by_sequence() {
+    let (live, labels, seq) = ri_second_writer_live();
+    let topic = "/riev/src/out";
+    let dir = tempfile::tempdir().unwrap();
+
+    let readable = dir.path().join("ri_second_writer_readable.mcap");
+    ri_second_writer_bag(&live.rec, &labels, &readable, encode_label_as_recorded);
+    let (outcome, _) = ri_replay(
+        &readable,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("PREMISE: src's frame at the swapped sequence is missing");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_frame_missing") && msg.contains(&format!("sequence {seq}")),
+        "PREMISE: with readable labels the missing frame is refused as missing: {msg}"
+    );
+
+    let unreadable = dir.path().join("ri_second_writer_unreadable.mcap");
+    ri_second_writer_bag(
+        &live.rec,
+        &labels,
+        &unreadable,
+        encode_label_as_a_newer_version,
+    );
+    let (outcome, replayed) = ri_replay(
+        &unreadable,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = match outcome {
+        Err(err) => err,
+        Ok(outcome) => panic!(
+            "a fed replay ran over labels it could not read (read identity {:?}, passed {}); \
+             the reads compared to live: {:?}",
+            outcome.read_identity,
+            outcome.passed,
+            ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST])
+        ),
+    };
+    let msg = err.to_string();
+    println!("RI_REFUSAL labels_unread: {msg}");
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    for part in [
+        "read_identity_labels_unread",
+        &format!("topic '{topic}'"),
+        "this build cannot decode",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// A bag recorded before read identity keeps the queue re-creation path, and
+/// its verdict says the reads were replayed best effort.
+#[test]
+#[serial]
+fn a_bag_recorded_before_read_identity_replays_best_effort_and_says_so() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_format_seven.mcap");
+    ri_bag(&live.rec, &bag, ri_recorder_json_at(7));
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("an older bag still replays");
+    match &outcome.read_identity {
+        replay_engine::ReadIdentityReport::BestEffort { reason } => {
+            assert!(reason.contains("below trace format 8"), "{reason}")
+        }
+        other => panic!("an older bag is not fed: {other:?}"),
+    }
+    assert!(replay_engine::render_verdict(&outcome, &bag)
+        .contains("reads: best effort, no read identity"));
+}
+
+/// A neutral resim keeps the queue re-creation, so the candidate's frames reach
+/// its in-rank consumers; its verdict says the reads were not fed.
+#[test]
+#[serial]
+fn a_neutral_resim_keeps_the_queues_and_is_not_fed() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_neutral.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("a neutral resim runs");
+    match &outcome.read_identity {
+        replay_engine::ReadIdentityReport::BestEffort { reason } => {
+            assert!(reason.contains("--verify"), "{reason}")
+        }
+        other => panic!("a neutral resim is not fed: {other:?}"),
+    }
+    assert!(
+        !replayed.is_empty(),
+        "the neutral resim re-executed the consumers"
+    );
+}
+
+/// MUTANT (`oracle-mutants`): the feed serves each read by recorded timestamp
+/// instead of by identity. The oracle must see the reads diverge.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_a_feed_by_timestamp() {
+    for (name, yaml, make, tags) in [
+        (
+            "evict",
+            ri_evict_yaml(),
+            ri_evict_factories as fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+            vec![RI_SLOW, RI_FAST],
+        ),
+        (
+            "three_writers",
+            ri_multi_writer_yaml(),
+            ri_multi_writer_factories as fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+            vec![RI_SINK],
+        ),
+    ] {
+        let live = ri_record(yaml, make);
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ri_mutant_{name}.mcap"));
+        ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+        let guard = cerulion_cli_engine::replay_feed::mutants::feed_by_timestamp();
+        let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+        drop(guard);
+        let _ = outcome;
+        let verdict = ri_judge(&live.reads, &replayed, &tags);
+        println!("RI_MUTANT by_timestamp {name}: {verdict:?}");
+        assert!(
+            verdict.is_err(),
+            "the oracle caught no divergence on {name} under the timestamp feed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-writer edges keep an annotation before every read, under every trace
+// format: a replay stages the recording's records on such an edge, so both
+// sides truncate at the same rim whatever the writers' token sequence.
+// ---------------------------------------------------------------------------
+
+/// The read-log stage rim the multi-writer fixture declares for the relay's
+/// input: the floor, which a window of three annotated reads (six records)
+/// overflows.
+const OB_RIM: u32 = 4;
+const OB_STEPS: usize = 8;
+const OB_BURST: usize = 3;
+
+/// The writer id the fixture's frame `i` is labelled with: one writer, or two
+/// external writers alternating frame by frame.
+fn ob_writer(i: usize, two_writers: bool) -> u128 {
+    if two_writers && i % 2 == 1 {
+        LBL_OTHER
+    } else {
+        LBL_WRITER
+    }
+}
+
+/// The relay's recorded read stream rewritten to what a recorder stages on a
+/// multi-writer edge at a rim of [`OB_RIM`]: per step window, an annotation
+/// before every serving read naming its frame's writer, pairs admitted both or
+/// neither at the rim, and one overflow marker carrying the window's dropped
+/// records. Returns the records dropped.
+fn ob_every_read_trace(rec: &mut Recording, two_writers: bool) -> usize {
+    let relay_idx = rec.node_ids.iter().position(|id| id == "relay").unwrap() as u32;
+    let mut out: Vec<TraceRingRecord> = Vec::with_capacity(rec.trace.len() * 2);
+    let mut window: Vec<TraceRingRecord> = Vec::new();
+    let mut dropped_total = 0usize;
+    let mut frame_ordinal = 0usize;
+    let mut flush = |window: &mut Vec<TraceRingRecord>, out: &mut Vec<TraceRingRecord>| {
+        let Some(first) = window.first().copied() else {
+            return;
+        };
+        let mut staged = 0u32;
+        let mut dropped = 0u32;
+        for r in window.drain(..) {
+            let serving = unpack_read_outcome_popped(r.duration_ns) > 0
+                && r.fire_time_ns != READ_OUTCOME_NO_FRAME;
+            let need = if serving { 2 } else { 1 };
+            let writer = ob_writer(frame_ordinal, two_writers);
+            if serving {
+                frame_ordinal += 1;
+            }
+            if staged + need > OB_RIM {
+                dropped += need;
+                continue;
+            }
+            if serving {
+                out.push(TraceRingRecord::read_outcome_producer(
+                    r.step,
+                    relay_idx,
+                    unpack_read_outcome_meta(r.global_level).0,
+                    Some(r.fire_time_ns as u32),
+                    cerulion_core::wire::fnv1a_hash(&writer.to_le_bytes()),
+                    cerulion_core::trace_ring::read_site_role(r.global_level),
+                ));
+            }
+            out.push(r);
+            staged += need;
+        }
+        if dropped > 0 {
+            dropped_total += dropped as usize;
+            out.push(TraceRingRecord::read_outcome_truncated(
+                first.step,
+                relay_idx,
+                unpack_read_outcome_meta(first.global_level).0,
+                dropped,
+                cerulion_core::read_outcome::ReadSiteRole::Body,
+            ));
+        }
+    };
+    for r in &rec.trace {
+        let relay_read = r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx;
+        if relay_read && !is_read_record(r) {
+            continue;
+        }
+        if relay_read {
+            if window.first().is_some_and(|w| w.step != r.step) {
+                flush(&mut window, &mut out);
+            }
+            window.push(*r);
+            continue;
+        }
+        flush(&mut window, &mut out);
+        out.push(*r);
+    }
+    flush(&mut window, &mut out);
+    rec.trace = out;
+    dropped_total
+}
+
+/// A bag of the external relay on a `multi_publisher_topics` topic, three
+/// frames per step, its read log in the shape a recorder stages on that edge,
+/// stamped by `recorder_json`. Returns the records the rim dropped.
+fn ob_multi_writer_bag(path: &std::path::Path, recorder_json: Vec<u8>, two_writers: bool) -> usize {
+    let per_step: Vec<Vec<f64>> = (0..OB_STEPS)
+        .map(|k| (0..OB_BURST).map(|i| (k * 10 + i + 1) as f64).collect())
+        .collect();
+    let mut rec = record_uniform_with_read_log(
+        lbl_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive {
+            topic: LBL_TOPIC.to_string(),
+            per_step,
+        }],
+        OB_STEPS,
+    );
+    let frames = rec.messages[LBL_TOPIC].len();
+    assert_eq!(
+        frames,
+        OB_STEPS * OB_BURST,
+        "PREMISE: every burst frame recorded"
+    );
+    let dropped = ob_every_read_trace(&mut rec, two_writers);
+    let mut rows = serde_json::Map::new();
+    rows.insert(
+        "relay".to_string(),
+        serde_json::json!([[
+            0,
+            cerulion_core::read_outcome::ReadStageRole::Body.wire(),
+            OB_RIM
+        ]]),
+    );
+    let labels: Vec<ProducerLabel<'_>> = (0..frames)
+        .map(|i| {
+            (
+                LBL_TOPIC,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                ob_writer(i, two_writers),
+            )
+        })
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        &rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(recorder_json),
+        Some(lbl_publishers()),
+        Some(&labels),
+        Some(serde_json::Value::Object(rows)),
+    );
+    dropped
+}
+
+/// The production lockstep `recorder.json`, at this build's trace format.
+fn ob_lockstep_recorder_json() -> Vec<u8> {
+    production_recorder_json(replay_engine::CoordinationMode::Lockstep)
+}
+
+/// The two multi-writer fixtures: a format 7 free-run bag with one external
+/// writer, and a format 8 lockstep bag (replayed on the queue re-creation path,
+/// not fed) with two external writers that the replay's one publisher stands
+/// in for.
+fn ob_fixtures() -> [(&'static str, Vec<u8>, bool); 2] {
+    [
+        ("format7_one_writer", ri_recorder_json_at(7), false),
+        (
+            "format8_lockstep_two_writers",
+            ob_lockstep_recorder_json(),
+            true,
+        ),
+    ]
+}
+
+/// A multi-writer edge whose stage truncated at its recorded rim replays under
+/// `--verify` with the read log equal: the replay stages an annotation before
+/// every read on it, as the recorder did, whatever writer serves the replayed
+/// frames, and truncates where the recording did.
+#[test]
+#[serial]
+fn a_truncated_multi_writer_stage_replays_its_truncation_under_verify() {
+    for (name, recorder_json, two_writers) in ob_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ob_{name}.mcap"));
+        let dropped = ob_multi_writer_bag(&bag, recorder_json, two_writers);
+        assert!(
+            dropped >= OB_STEPS,
+            "PREMISE {name}: every window overflowed the rim ({dropped} dropped)"
+        );
+        let (outcome, _) = ri_replay(
+            &bag,
+            ext_relay_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{name}: the bag replays: {e}"));
+        println!(
+            "OB_COMPAT {name}: passed={} dropped={dropped} violations={:?}",
+            outcome.passed, outcome.violations
+        );
+        assert!(
+            outcome.passed,
+            "{name}: the replay truncates at the recording's rim: {:?}",
+            outcome.violations
+        );
+    }
+}
+
+/// MUTANT: the runtime stages writer runs on multi-writer edges. The replayed
+/// stage then holds every window of the relay's reads, so the recorded overflow
+/// markers have no partner and the read log diverges, on both fixtures.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_writer_runs_on_a_multi_writer_edge() {
+    for (name, recorder_json, two_writers) in ob_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ob_mutant_{name}.mcap"));
+        ob_multi_writer_bag(&bag, recorder_json, two_writers);
+        let guard = cerulion_core::replay_feed::mutants::writer_runs_on_multi_writer_edges();
+        let (outcome, _) = ri_replay(
+            &bag,
+            ext_relay_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        drop(guard);
+        let caught = match &outcome {
+            Ok(o) => !o.passed,
+            Err(_) => true,
+        };
+        println!(
+            "RI_MUTANT writer_runs_on_multi_writer_edges {name}: {:?}",
+            outcome.as_ref().map(|o| (o.passed, &o.violations))
+        );
+        assert!(caught, "{name}: the read log caught no divergence");
     }
 }

@@ -1562,10 +1562,11 @@ fn park_horizon_from_env() -> (cerulion_core::monitor_wait::EnvFlag, ParkHorizon
 /// CPU monitor-wait primitive the park arms is watching the doorbell line the
 /// ring stores into; on a Linux host whose CPU carries no such primitive this
 /// wait takes [`ParkHorizon::NoPark`] anyway. Android maps the real ring counter
-/// but has no wake primitive for this park. macOS maps a real doorbell page and a real wake word, but
-/// this wait has no kernel block on that word, so a park here would trade the
-/// fd block's instant wake for a 100 µs recheck cadence and buy nothing; the
-/// macOS wake-word block is the native live loop's rung
+/// but has no CPU monitor-wait primitive for this park. Android, macOS and a
+/// Linux host without the primitive map a real doorbell page with a real wake
+/// word, but this wait has no kernel block on that word, so a park there would
+/// trade the fd block's instant wake for a 100 µs recheck cadence and buy
+/// nothing; the wake-word block is the native live loop's rung
 /// (`cerulion_core::doorbell::wake_word_block_primitive_available`). Every
 /// other target has neither.
 const RING_WAKES_THE_PARK: bool = cfg!(target_os = "linux");

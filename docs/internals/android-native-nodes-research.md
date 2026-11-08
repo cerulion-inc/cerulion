@@ -46,7 +46,9 @@ at run time, and the parity is single-process only. Gates 2 and 3 below do not a
 the transport stays in process and only one iceoryx2 config exists. The emulator lane
 (`W/tools/scripts/android_emulator_e2e.sh`, described in `../android.md`) covers gate 1: a
 stop and a new start in one process, and a start after `am force-stop`. It also checks that
-the app's domain logs no SELinux denial. `W/tools/scripts/android_jnilibs_gate.sh` checks
+the app's domain logs no SELinux denial, except the two refusals of network interface listing
+(`netlink_route_socket` and `sysfs_net`) that Android gives every app; the lane accepts those
+two in every run. `W/tools/scripts/android_jnilibs_gate.sh` checks
 that every `LOAD` segment of the app library is aligned to 16 KB. API 36 and a physical
 device are not part of the lane.
 

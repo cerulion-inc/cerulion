@@ -529,8 +529,9 @@ struct MonitorWaitInputs<'a> {
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
     /// consumer KERNEL-BLOCK on a doorbell's wake word on this host? True on
-    /// macOS with the Apple os_sync family resolved, false on every other target
-    /// and wherever that family is absent, latched or killed. A SECOND,
+    /// Linux and Android (a shared futex) and on macOS with the Apple os_sync
+    /// family resolved; false on other targets and on macOS wherever that family
+    /// is absent, latched or killed. A SECOND,
     /// INDEPENDENT fact from `primitive_available`, read only by arm 2 (on arm 3
     /// the CPU monitor-wait primitive already hears the ring on the same line).
     data_wake_available: bool,
@@ -569,8 +570,9 @@ struct MonitorWaitInputs<'a> {
 ///    `monitor_wait` and with
 ///    `cerulion_core::doorbell::wake_word_block_primitive_available`, the host
 ///    fact that a consumer can kernel-block on a doorbell wake word: true on
-///    macOS with the Apple os_sync family resolved, false on every other target
-///    and wherever that family is absent, latched or killed. Where it is false a
+///    Linux and Android (a shared futex) and on macOS with the Apple os_sync
+///    family resolved; false on other targets and on macOS wherever that family
+///    is absent, latched or killed. Where it is false a
 ///    ring is still observed, but only by the recheck poll that already polls the
 ///    listener, so an armed doorbell buys nothing and is FORCED OFF.
 ///    A near-miss `CERULION_DOORBELL` value warns via the shared ladder and
@@ -661,8 +663,8 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     // (15-54µs p50). `monitor_wait` rides the SAME flag ladder as arm 3;
     // `doorbell` rides it too and is then ANDed with `monitor_wait` and with the
     // host's wake-word fact, so on this tier a doorbell never coerces the park
-    // ON. It arms where a consumer can kernel-block on a doorbell (macOS with the
-    // os_sync family resolved, which is what
+    // ON. It arms where a consumer can kernel-block on a doorbell (Linux and
+    // Android, and macOS with the os_sync family resolved, which is what
     // `wake_word_block_primitive_available` reports) and is FORCED OFF elsewhere,
     // where a ring would be seen no sooner than the recheck poll already sees the
     // listener.
@@ -673,9 +675,10 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         // doorbell's wake word on this host? Where the answer is no, a ring is
         // still observed, but by the park's own recheck poll, which the listener
         // poll beside it already runs at the same cadence: an armed doorbell would
-        // buy nothing and it stays FORCED OFF. Where the answer is yes (macOS with
-        // the os_sync family resolved) the park BLOCKS on the wake word instead of
-        // pacing and a producer's publish wakes the consumer directly.
+        // buy nothing and it stays FORCED OFF. Where the answer is yes (Linux and
+        // Android, and macOS with the os_sync family resolved) the park BLOCKS on
+        // the wake word instead of pacing and a producer's publish wakes the
+        // consumer directly.
         //
         // The doorbell is ANDed with `monitor_wait`, which is arm 2's
         // long-standing difference from arm 3: arm 3 lets `doorbell ⇒
@@ -16376,7 +16379,11 @@ pub fn render_recorder_json(
         // records carry READ-SITE ROLES; v6 marks a stream whose kind-6 aux
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
-        // binary writes. A replaying binary that supports a LOWER version
+        // binary writes; v8 marks a stream in which every edge names its frames'
+        // writers by run, and v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, both also
+        // every bag this binary writes.
+        // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
         // v1 (back-compat).
@@ -16393,8 +16400,13 @@ pub fn render_recorder_json(
             // makes: it does, at every consult that found its queue empty but
             // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
             // replay never runs, so no replay re-derives those consults), so
-            // every bag it writes stamps 7.
+            // every bag it writes stamps at least 7.
             crate::replay_engine::recorder_stamps_consult_records(),
+            // Whether every edge carries its frames' writers, one annotation per
+            // writer run, and every multi-frame read whose batch fits its read
+            // stage's window names each frame it consumed: it does, so every bag
+            // this binary writes stamps 9.
+            crate::replay_engine::recorder_records_read_identity(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -27074,16 +27086,17 @@ nodes:
                 crate::replay_engine::recorder_stream_needs_v4(),
                 crate::replay_engine::recorder_stamps_read_site_roles(),
                 cerulion_core::read_outcome::fold_enabled(),
-                crate::replay_engine::recorder_stamps_consult_records()
+                crate::replay_engine::recorder_stamps_consult_records(),
+                crate::replay_engine::recorder_records_read_identity()
             )
         );
         assert_eq!(
-            v["trace_format"], 7,
-            "every bag this binary writes carries read-site roles, folds runs \
-             AND records an empty consult a replay also makes, and the consult \
-             record is the strongest claim: a reader below 7 convicts the empty \
-             drain's NoFrame record as an impossible shape and plans no position \
-             for it"
+            v["trace_format"], 9,
+            "every bag this binary writes carries read-site roles, folds runs, \
+             records an empty consult a replay also makes AND names the writer and \
+             sequence of every frame each read consumed when its batch fits the \
+             read stage's window: a reader below 9 does not know the per-frame \
+             record, so the stamp makes it refuse the bag"
         );
     }
 
@@ -27093,12 +27106,13 @@ nodes:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, and the consult record to the 7 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
+    /// per-frame batch identity to the 9 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_seven() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value =
@@ -27106,10 +27120,11 @@ nodes:
                 .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
-        // folding overrides both. 7, not 6: the consult record is tested
-        // first of all (`stamp_trace_format`'s hand table pins the whole
-        // matrix).
-        assert_eq!(v["trace_format"], 7);
+        // folding overrides both. 7, not 6: the consult record overrides
+        // folding. 8, not 7: read identity rides the consult record. 9, not 8:
+        // every consumed frame of a batch is named (`stamp_trace_format`'s
+        // hand table pins the whole matrix).
+        assert_eq!(v["trace_format"], 9);
     }
 
     /// The ONE resolution point, and the rule it decides: a

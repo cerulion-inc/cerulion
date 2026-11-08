@@ -468,6 +468,10 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion node stage::graph",
         "cerulion node stage::node_type",
         "cerulion pair::robot",
+        "cerulion rcp::robot",
+        "cerulion service call::robot",
+        "cerulion topic pub::robot",
+        "cerulion topic snapshot::robot",
         // The one arg whose source needs a LIVE iceoryx2 topic — behaviourally
         // unreachable in a hermetic test, so the structural pin is what covers
         // it. A live positive is in `topic hz`'s own e2e transcript.
@@ -475,9 +479,13 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion topic echo::topic",
         "cerulion topic hz::topic",
         "cerulion topic info::topic",
+        "cerulion topic pub::topic",
+        "cerulion topic snapshot::topic",
         "cerulion topic type::topic",
-        // `topic find` offers the known type names (`schema info`'s set).
+        // `topic find` and `topic pub` offer the known type names (`schema
+        // info`'s set).
         "cerulion topic find::type_name",
+        "cerulion topic pub::type_name",
         "cerulion schema delete::name",
         "cerulion schema info::name",
         "cerulion viz::robot",
@@ -639,11 +647,14 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion pair::account",
         "cerulion pair::code",
         "cerulion pair::eid",
+        "cerulion rcp::eid",
         // ---- Network locators, URLs and interface addresses.
         "cerulion connect::addrs",
         "cerulion connect::relay_url",
         "cerulion pair::addrs",
         "cerulion pair::relay_url",
+        "cerulion rcp::addrs",
+        "cerulion rcp::relay_url",
         "cerulion ros2 attach::iface",
         "cerulion topic find::connect",
         "cerulion topic find::listen",
@@ -654,6 +665,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // ---- Free-form policy / filter / mode strings behind a custom parser
         // rather than an enumerable `value_parser` list.
         "cerulion connect::network",
+        "cerulion rcp::network",
         "cerulion graph run::record_cpu",
         "cerulion node create::policy",
         "cerulion node modify::policy",
@@ -709,6 +721,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // BAG-TIME bounds in seconds, not paths. (They replace
         // `--max-ticks`, which is deleted outright — no alias, no shim.)
         "cerulion bag play::duration",
+        "cerulion bag play::feed_index_budget",
         "cerulion bag play::rate",
         "cerulion bag play::start_offset",
         "cerulion bag record::duration",
@@ -721,6 +734,20 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion ros2 attach::timeout",
         "cerulion topic echo::truncate_length",
         "cerulion topic bw::window",
+        "cerulion topic pub::times",
+        "cerulion topic pub::rate",
+        "cerulion topic pub::wait_subscribers",
+        "cerulion topic snapshot::timeout",
+        "cerulion topic snapshot::quality",
+        "cerulion service call::timeout",
+        // ---- Message text and service names. A message is JSON or YAML the
+        // user writes; a service's request topic is only knowable by opening
+        // the iceoryx2 service directory, and its `.srv` type is a
+        // `pkg/srv/Type` name no message-schema source lists.
+        "cerulion topic pub::message",
+        "cerulion service call::request",
+        "cerulion service call::service",
+        "cerulion service call::type_name",
         "cerulion trace inspect::limit",
         // ---- `cerulion bagd` (the recorder daemon `graph run --record`
         // spawns). Its args live in `cerulion_bagd::BagdArgs`, so wiring a

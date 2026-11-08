@@ -29,6 +29,7 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 use super::{Check, Context, Outcome, Reading, Status};
+use crate::topic_cmd::sanitize_display;
 
 pub(super) const UDP: Check = Check {
     id: "net.udp",
@@ -227,7 +228,10 @@ pub(super) fn decide(probed: &[Probed]) -> Outcome {
         }
     };
     for p in probed {
-        let e = &p.endpoint;
+        // An endpoint can come from a workspace graph file and an error from the
+        // resolver or the OS, so both print through `sanitize_display`: neither
+        // can put terminal escapes into the summary.
+        let e = sanitize_display(&p.endpoint);
         match &p.result {
             EndpointResult::Probed(UdpReachability::Answered { rtt, .. }) => {
                 answered.push(format!("{e} ({} ms)", rtt.as_millis()));
@@ -247,11 +251,11 @@ pub(super) fn decide(probed: &[Probed]) -> Outcome {
                 );
             }
             EndpointResult::Probed(UdpReachability::SendFailed(err)) => {
-                problems.push(format!("{e} (send failed: {err})"));
+                problems.push(format!("{e} (send failed: {})", sanitize_display(err)));
                 fix("check that this machine has a route to that address");
             }
             EndpointResult::Unresolved(err) => {
-                problems.push(format!("{e} (cannot resolve: {err})"));
+                problems.push(format!("{e} (cannot resolve: {})", sanitize_display(err)));
                 fix("check the host name, or name the endpoint by its IP address");
             }
             EndpointResult::Unfinished => {
@@ -563,6 +567,30 @@ mod tests {
             .fix
             .unwrap()
             .starts_with("start the quic/ or udp/...?rel=1 listener"));
+    }
+
+    #[test]
+    fn a_control_character_in_an_endpoint_or_error_never_reaches_the_summary() {
+        let graph = ["quic/robot\u{1b}[2J:7447".to_string()];
+        let endpoints = targets(&graph, &[]);
+        assert_eq!(endpoints, ["robot\u{1b}[2J:7447"]);
+        let o = decide(&[
+            probed(
+                &endpoints[0],
+                EndpointResult::Unresolved("lookup\u{7}\rfailed".to_string()),
+            ),
+            probed(
+                "10.0.0.5:7447",
+                EndpointResult::Probed(UdpReachability::SendFailed("no\u{9b}route".to_string())),
+            ),
+        ]);
+        assert!(!o.summary.chars().any(char::is_control), "{:?}", o.summary);
+        assert!(o
+            .summary
+            .contains("robot\u{FFFD}[2J:7447 (cannot resolve: lookup\u{FFFD}\u{FFFD}failed)"));
+        assert!(o
+            .summary
+            .contains("10.0.0.5:7447 (send failed: no\u{FFFD}route)"));
     }
 
     #[test]

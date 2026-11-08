@@ -1484,6 +1484,98 @@ fn a_workspace_parent_of_a_shadowed_builtin_is_skipped_with_it() {
 }
 
 #[test]
+fn a_bare_store_reference_hashes_as_ros_2_introspection_names_it() {
+    // ROS 2 reads `Level`, written without a package in a demo_msgs file, as
+    // `demo_msgs/Level`, and a bare `Header` in a package without one as
+    // `std_msgs/Header`. The oracle is the schema rmw_cerulion builds from
+    // the introspection members (`type_bridge::collect_schemas`): every
+    // nested member carries its package, hashed over a `LayoutResolver`.
+    use crate::codegen::layout::LayoutResolver;
+    use crate::codegen::{FieldDef, FieldType, MessageSchema};
+    let builtins = vec![
+        parse_rosmsg(
+            "int32 sec\nuint32 nanosec\n",
+            "Time",
+            Some("builtin_interfaces"),
+        )
+        .expect("Time"),
+        parse_rosmsg(
+            "builtin_interfaces/Time stamp\nstring frame_id\n",
+            "Header",
+            Some("std_msgs"),
+        )
+        .expect("Header"),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("schemas/demo_msgs/msg")).expect("mkdir");
+    std::fs::write(ws.join("schemas/demo_msgs/msg/Level.msg"), "uint8 value\n").expect("Level");
+    std::fs::write(
+        ws.join("schemas/demo_msgs/msg/Reading.msg"),
+        "Header header\nLevel level\nLevel[3] last\n",
+    )
+    .expect("Reading");
+    let (set, warnings) = SchemaSet::from_workspace_with_builtins(ws, builtins).expect("loads");
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let nested = |package: &str, name: &str| FieldType::Nested {
+        schema_name: name.to_string(),
+        package: Some(package.to_string()),
+        fixed: None,
+    };
+    let message = |package: &str, name: &str, members: Vec<(&str, FieldType)>| {
+        let mut schema = MessageSchema::new_in_package(name, package);
+        for (field, field_type) in members {
+            schema.add_field(FieldDef::new(field, field_type));
+        }
+        schema
+    };
+    let introspected = vec![
+        message(
+            "builtin_interfaces",
+            "Time",
+            vec![("sec", FieldType::I32), ("nanosec", FieldType::U32)],
+        ),
+        message(
+            "std_msgs",
+            "Header",
+            vec![
+                ("stamp", nested("builtin_interfaces", "Time")),
+                ("frame_id", FieldType::String),
+            ],
+        ),
+        message("demo_msgs", "Level", vec![("value", FieldType::U8)]),
+        message(
+            "demo_msgs",
+            "Reading",
+            vec![
+                ("header", nested("std_msgs", "Header")),
+                ("level", nested("demo_msgs", "Level")),
+                (
+                    "last",
+                    FieldType::FixedArray {
+                        element_type: Box::new(nested("demo_msgs", "Level")),
+                        length: 3,
+                    },
+                ),
+            ],
+        ),
+    ];
+    let (mut resolver, resolver_warnings) = LayoutResolver::new(introspected);
+    assert!(resolver_warnings.is_empty(), "{resolver_warnings:?}");
+    let expected = resolver
+        .layout_of("demo_msgs/Reading")
+        .expect("the oracle lays out")
+        .schema_hash;
+    assert_eq!(
+        set.layout("demo_msgs/Reading")
+            .expect("demo_msgs/Reading")
+            .schema_hash,
+        expected
+    );
+}
+
+#[test]
 fn a_msg_store_override_of_a_builtin_keeps_every_parent_bound_to_it() {
     // `schemas/pkg/msg/Inner.msg` replaces the built-in `pkg/Inner` under the
     // SAME `(package, name)` key, so every parent that bound `Inner` in `pkg`,

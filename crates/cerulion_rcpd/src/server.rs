@@ -22,6 +22,7 @@ use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::task::AbortHandle;
 
+use crate::caller::CALLER_HEADER;
 use crate::manifest::StateResource;
 use crate::observer::GraphFeed;
 use crate::tools::ToolHost;
@@ -86,6 +87,39 @@ fn graph_resource() -> Resource {
         .with_mime_type(GRAPH_MIME)
 }
 
+/// The [`CALLER_HEADER`] of the HTTP request behind `context`. `None` when
+/// the request carries none (or did not arrive over HTTP).
+///
+/// # Errors
+///
+/// `invalid_params` when the header appears more than once or fails
+/// [`crate::caller::valid_caller`].
+fn remote_caller(context: &RequestContext<RoleServer>) -> Result<Option<String>, ErrorData> {
+    match context.extensions.get::<hyper::http::request::Parts>() {
+        Some(parts) => caller_from_headers(&parts.headers),
+        None => Ok(None),
+    }
+}
+
+/// The [`CALLER_HEADER`] in `headers`; see `remote_caller`.
+fn caller_from_headers(headers: &hyper::HeaderMap) -> Result<Option<String>, ErrorData> {
+    let mut values = headers.get_all(CALLER_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let caller = value
+        .to_str()
+        .ok()
+        .filter(|c| values.next().is_none() && crate::caller::valid_caller(c));
+    match caller {
+        Some(c) => Ok(Some(c.to_string())),
+        None => Err(ErrorData::invalid_params(
+            "the caller header is repeated or malformed",
+            None,
+        )),
+    }
+}
+
 fn unknown_resource(uri: &str) -> ErrorData {
     ErrorData::resource_not_found("unknown resource", Some(serde_json::json!({ "uri": uri })))
 }
@@ -141,12 +175,16 @@ impl ServerHandler for RcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let Some(host) = self.tools.as_ref() else {
             return Err(ErrorData::invalid_params("this server has no tools", None));
         };
-        Ok(host.call(&request.name, request.arguments).await.into())
+        let call = host.call(&request.name, request.arguments);
+        match remote_caller(&context)? {
+            Some(caller) => Ok(crate::caller::scope(caller, call).await.into()),
+            None => Ok(call.await.into()),
+        }
     }
 
     async fn read_resource(
@@ -271,5 +309,35 @@ impl ServerHandler for RcpServer {
         }
         self.replace_legacy_subscription(None);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::header::HeaderValue;
+
+    #[test]
+    fn the_caller_header_is_absent_one_valid_value_or_refused() {
+        let mut h = hyper::HeaderMap::new();
+        assert_eq!(caller_from_headers(&h).ok(), Some(None));
+        h.insert(
+            CALLER_HEADER,
+            HeaderValue::from_static("iroh:ab/account:cd"),
+        );
+        assert_eq!(
+            caller_from_headers(&h).ok(),
+            Some(Some("iroh:ab/account:cd".to_string()))
+        );
+        h.append(CALLER_HEADER, HeaderValue::from_static("iroh:ef"));
+        assert!(
+            caller_from_headers(&h).is_err(),
+            "a repeated header is refused"
+        );
+        for bad in ["a b", "", "x;y"] {
+            let mut h = hyper::HeaderMap::new();
+            h.insert(CALLER_HEADER, HeaderValue::from_str(bad).unwrap());
+            assert!(caller_from_headers(&h).is_err(), "{bad:?}");
+        }
     }
 }

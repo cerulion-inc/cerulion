@@ -9,6 +9,9 @@ members = [
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",
+    # Messages as text on local shared memory (publish, service call, snapshot,
+    # decode), shared by the CLI engine and cerulion-remoted.
+    "crates/cerulion_msgio",
     "crates/cerulion_android",
     # Local Studio workspace engine daemon. It links cli_engine, so it inherits
     # the workspace AGPL license rather than being a proprietary client library.
@@ -363,6 +366,7 @@ default-members = [
     "crates/cerulion_hygiene",
     # Pulls mdns-sd only (already in this tree via cerulion_cli_engine).
     "crates/cerulion_mdns",
+    "crates/cerulion_msgio",
     "crates/cerulion_cli_engine",
     "crates/cerulion_wsd",
     "crates/cerulion_cli",
@@ -535,6 +539,7 @@ cerulion_discovery = { path = "crates/cerulion_discovery", version = "=2.0.0" }
 cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=2.0.0" }
 cerulion_link = { path = "crates/cerulion_link", version = "=2.0.0" }
 cerulion_mdns = { path = "crates/cerulion_mdns", version = "=2.0.0" }
+cerulion_msgio = { path = "crates/cerulion_msgio", version = "=2.0.0" }
 cerulion_netd = { path = "crates/cerulion_netd", version = "=2.0.0", default-features = false }
 cerulion_pairing = { path = "crates/cerulion_pairing", version = "=2.0.0" }
 cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=2.0.0" }
