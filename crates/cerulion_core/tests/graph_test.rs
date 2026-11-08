@@ -3155,3 +3155,46 @@ nodes:
     let ok = parse_graph(&format!("{base}level_assignments:\n  a: 0\n")).expect("parses");
     validate_graph(&ok).expect("native-only coverage is complete");
 }
+
+/// A node that declares an output its graph entry does not list has no
+/// publisher for it, so the build refuses the graph before any transport
+/// resource exists. The error names the node and the output, and says how to
+/// list the output. The embedded Android runtime refuses the same graph with
+/// the same words.
+#[test]
+fn test_graph_build_refuses_a_declared_output_the_graph_does_not_list() {
+    let prefix = unique_prefix("unlisted_output");
+    let yaml = format!(
+        r#"
+name: test
+prefix: {prefix}
+nodes:
+  - id: relay
+    type: test
+"#
+    );
+
+    let config = parse_graph(&yaml).unwrap();
+    validate_graph(&config).unwrap();
+
+    let mgr = TransportManager::get_or_init().expect("init");
+    let clock = Arc::new(VirtualClock::new());
+
+    let node = ClosureNodeEntry::new(
+        NodeInfo::from_names(vec![], vec!["echo".to_string()])
+            .with_policy(MacroPolicy::Period { period_ms: 10 }),
+        |_ctx| Ok(()),
+    );
+    let mut nodes: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    nodes.insert("relay".to_string(), Box::new(node));
+
+    let Err(error) = GraphRuntime::build(config, nodes, &mgr, clock) else {
+        panic!("a declared output the graph does not list must fail the build");
+    };
+    assert_eq!(
+        error.to_string(),
+        "Graph validation error: node 'relay' output 'echo': the node declares this output \
+         and the graph does not list it, so the node has no publisher for it; add `- name: \
+         echo` with its `schema:` under the node's `outputs:`"
+    );
+}

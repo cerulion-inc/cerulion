@@ -2207,26 +2207,11 @@ fn resolve_ingress(
 /// Fail the start when `node` declares an output its graph entry does not
 /// list.
 ///
-/// The graph creates a publisher only for each output the YAML lists, so a
-/// node has none for an output it declares and the YAML leaves out. The
-/// refusal applies to every node: a `#[cerulion_node]` node would otherwise
-/// fail every tick before its body runs, and the graph would report running
-/// while it does nothing. The first such output, in the node's declaration
-/// order, is named.
+/// The rule and its words are the core graph build's
+/// (`cerulion_core::graph::check_declared_outputs_listed`), so the app and
+/// `graph run` refuse the same graphs with the same message.
 fn check_declared_outputs_listed(node: &NodeDef, info: &NodeInfo) -> Result<(), EmbedError> {
-    let unlisted = info
-        .output_names()
-        .iter()
-        .find(|declared| !node.outputs.iter().any(|listed| listed.name == **declared));
-    match unlisted {
-        None => Ok(()),
-        Some(output) => Err(EmbedError::Graph(format!(
-            "node '{}' output '{output}': the node declares this output and the graph does \
-             not list it, so the node has no publisher for it; add `- name: {output}` with \
-             its `schema:` under the node's `outputs:`",
-            node.id
-        ))),
-    }
+    cerulion_core::graph::check_declared_outputs_listed(node, info).map_err(EmbedError::Graph)
 }
 
 /// The deepest queue the graph's inputs declare on each topic they read.
