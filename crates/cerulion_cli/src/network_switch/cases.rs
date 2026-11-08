@@ -226,6 +226,7 @@ pub(crate) static CASES: &[Case] = &[
     gated(&["graph", "levels"], &["graph", "levels", "demo"]),
     gated(&["graph", "profile"], &["graph", "profile", "demo"]),
     gated(&["graph", "partition"], &["graph", "partition", "demo"]),
+    gated(&["graph", "plan"], &["graph", "plan", "demo"]),
     gated(&["graph", "pause"], &["graph", "pause", "run-1"]),
     gated(&["graph", "resume"], &["graph", "resume", "run-1"]),
     gated(&["topic", "list"], &["topic", "list"]),

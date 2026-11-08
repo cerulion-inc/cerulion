@@ -121,7 +121,7 @@ fn consumer_entry(c: Consumer, seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
 
 fn sink_node(source: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "sink".to_string(),
@@ -479,7 +479,7 @@ fn run_block(prefix: &str, throttle_ms: u64) -> (Vec<u64>, u64, u64) {
         ..Consumer::latest()
     };
     let producer_node = NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "producer".to_string(),
@@ -579,7 +579,7 @@ fn a_cdylib_declaring_latest_forwards_only_the_newest_frame() {
     );
 
     let node = NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "node".to_string(),

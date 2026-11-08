@@ -46,7 +46,7 @@ fn graph_config(node_id: &str, source_id: Option<&str>) -> GraphConfig {
     let mut nodes = Vec::new();
     if let Some(src) = source_id {
         nodes.push(NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: src.to_string(),
@@ -62,7 +62,7 @@ fn graph_config(node_id: &str, source_id: Option<&str>) -> GraphConfig {
         });
     }
     nodes.push(NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: node_id.to_string(),
@@ -192,7 +192,7 @@ fn sync_window_ms_with_two_trigger_inputs_no_silent_ignore_warn() {
         identity: "sync_2trig".to_string(),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
