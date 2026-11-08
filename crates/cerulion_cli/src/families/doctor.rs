@@ -13,6 +13,7 @@ use clap::{ArgMatches, Args, Command, FromArgMatches, Subcommand};
 
 use super::VerbFamily;
 use crate::cli::VerbLogClass;
+use crate::network_switch::{NetworkRefusal, SwitchEnv};
 
 // The family's one verb, declared as a one-variant `Subcommand` whose
 // arguments are a separate `Args` struct, so `run` parses the family's own
@@ -110,6 +111,11 @@ impl VerbFamily for Doctor {
 
     fn log_class(&self, _matches: &ArgMatches) -> VerbLogClass {
         VerbLogClass::OneShot
+    }
+
+    /// Under the switch the network checks are skipped and the rest run.
+    fn network_refusal(&self, _matches: &ArgMatches, _env: &SwitchEnv) -> Option<NetworkRefusal> {
+        None
     }
 
     /// The verb diagnoses a machine that has never signed in, among others,

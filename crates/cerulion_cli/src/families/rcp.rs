@@ -17,6 +17,7 @@ use cerulion_cli_engine::{connect_cmd, rcp_cmd};
 
 use super::VerbFamily;
 use crate::cli::VerbLogClass;
+use crate::network_switch::{NetworkRefusal, SwitchEnv};
 
 // The family's one verb, declared as a one-variant `Subcommand` whose
 // arguments are a separate `Args` struct, so `run` parses the family's own
@@ -73,15 +74,6 @@ struct RcpCliArgs {
 /// The `rcp` verb family.
 pub(crate) struct Rcp;
 
-/// The kill-switch refusal of the parsed invocation `matches`, read from its
-/// `--network` value and `CERULION_NETWORK` ([`rcp_cmd::network_refusal`]).
-fn refusal(matches: &ArgMatches) -> Option<String> {
-    rcp_cmd::network_refusal(
-        matches.get_one::<String>("network").map(String::as_str),
-        std::env::var("CERULION_NETWORK").ok(),
-    )
-}
-
 impl VerbFamily for Rcp {
     fn name(&self) -> &'static str {
         "rcp"
@@ -100,22 +92,30 @@ impl VerbFamily for Rcp {
         VerbLogClass::LongRunning
     }
 
-    /// The login gate runs unless the kill-switch refuses the invocation: a
-    /// refused `cerulion rcp` exits 2 in [`VerbFamily::run`] without the gate,
-    /// so it never contacts the account service or asks for a sign-in.
-    fn needs_identity(&self, matches: &ArgMatches) -> bool {
-        refusal(matches).is_none()
+    /// `cerulion rcp` reaches the robot, so `CERULION_NETWORK` or its own
+    /// `--network` refuses it with exit 2 ([`rcp_cmd::network_refusal`]). The
+    /// registry gives the refusal before the login gate and before
+    /// [`VerbFamily::run`], so a refused `cerulion rcp` never contacts the
+    /// account service, asks for a sign-in, resolves the robot, reads the key
+    /// or spawns the helper.
+    fn network_refusal(&self, matches: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal> {
+        rcp_cmd::network_refusal(
+            matches.get_one::<String>("network").map(String::as_str),
+            env.network.clone(),
+        )
+        .map(|refusal| NetworkRefusal::error(refusal, rcp_cmd::EXIT_NETWORK_REFUSED))
     }
 
-    /// Exits 2 under the kill-switch, before the robot is resolved, the key
-    /// read or the helper spawned; otherwise spawns `cerulion-connectd rcp`
-    /// with inherited stdio (the MCP stream) and forwards its exit code.
-    /// Errors go to stderr; stdout stays MCP-only.
+    /// The same rule as `connect` and `pair`.
+    fn needs_identity(&self, _matches: &ArgMatches) -> bool {
+        true
+    }
+
+    /// Spawns `cerulion-connectd rcp` with inherited stdio (the MCP stream)
+    /// and forwards its exit code; the kill switch has not refused the
+    /// invocation by now ([`VerbFamily::network_refusal`]). Errors go to
+    /// stderr; stdout stays MCP-only.
     fn run(&self, matches: &ArgMatches) -> ExitCode {
-        if let Some(refusal) = refusal(matches) {
-            eprintln!("Error: {refusal}");
-            return ExitCode::from(rcp_cmd::EXIT_NETWORK_REFUSED);
-        }
         let cli = RcpCliArgs::from_arg_matches(matches).unwrap_or_else(|e| e.exit());
         let args = rcp_cmd::RcpArgs {
             robot: cli.robot,

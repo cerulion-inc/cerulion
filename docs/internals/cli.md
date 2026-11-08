@@ -1036,6 +1036,8 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
 | `tests/verb_family_golden_test.rs` | The `schema` family byte for byte against its capture from before it moved onto the verb-family registry: root and family help, usage errors, a representative run of each verb, the `-v` log path, and completion (registration script and candidates) for all five shells. A diff is a user-visible change: fix the code, never re-capture | no | none |
 | `src/families/mod.rs` (unit tests) | The verb-family registry with a test-only family: one registration puts it in help, completion and dispatch with its own log class; `route` applies the class, runs the gate only for a family that needs an identity and returns a refusal without running the family; duplicate names, a shadowed built-in name, alias or `help`, a taken family alias, an unknown listing anchor, every wrong `augment` and a rewritten root help are each refused; run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
+| `tests/network_switch_sweep_test.rs` | Every row of `src/network_switch/cases.rs` it can spawn (`login`, the `ros2` pass-throughs and the internal processes are not spawned, and their rows name why), over the real binary on a never-signed-in home, with the account service, the telemetry host and the relay at a listener that records each connection: a refused row on a pseudo-terminal exits with its own refusal, prints no sign-in text and connects to none of the three (and without the switch meets the gate); a gated row shows that the gate runs and that no usage event is sent, and does not run the verb; an ungated row runs; the listener sees only those three, not mDNS, DDS or zenoh traffic; the local forms of `topic pub`, `topic snapshot` and `service call` run on a signed-in home | no | none |
+| `src/network_switch/tests.rs` | The table names every verb of the command tree (hidden ones too) and every `--robot` form; each row's in-process decision under every spelling of `CERULION_NETWORK` (and the daemon switches for `viz --robot`); a refusal is given before the gate; telemetry's view of the switch, where `--local` counts on `graph run` and `node run` only and every other verb with `--local` is named; run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
 | `src/completion_wiring_tests.rs` | Wired-completer inventory (set equality + spelled-out create-verb guard), free-form inventory walk, `.mcap` path filter; run via `cargo test -p cerulion_cli --bin cerulion` | file-local mutex | none |
 | `src/clean_diagnostic_tests.rs` | `cerulion clean`'s wiring as a source walk (the real thing deletes from the developer's `/tmp`): the state-file diagnostic is called, sweep-before-diagnostic order, the convergence gate as a whole expression, the refusal listing between breakdown and unclassified arm, the single dead-node sweep with the verb's mode threaded into it and that sweep's convergence handed to the gate, the report-only fork placed after the registry block and returning before the summary, plus hand-oracle pins of the three pure renderers and a call-count seam over `sweep_one_node` proving a report never calls the removal. Run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
@@ -1211,6 +1213,33 @@ store (`cerulion logout` or Studio's "Sign out": `logged_in_ever` kept, no
 tokens) loads as `LoadedAuth::SignedOut` and the gate treats it like a machine
 that never signed in, with its own refusal text.
 
+The network kill switch answers BEFORE the gate. A verb that would reach a robot
+or a daemon over the network refuses while `CERULION_NETWORK` (or its own
+`--network off`) is engaged, and that refusal comes first because the gate, on a
+machine that never signed in, starts a sign-in against the account service.
+`network_switch::refuse_or_gate` in `crates/cerulion_cli/src/network_switch.rs` is
+the one function the gate is called from: `families::route` hands it the family's
+or nested verb's `network_refusal` and `dispatch` hands it
+`command_network_refusal`, an exhaustive match over `Commands`. Each refusal is built
+from the engine function the verb's own path refuses with, so its text and exit code
+are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
+`service call`, and `rcp` (exit 2), `viz --robot` and `pair` (exit 1). The `rcp`
+family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
+and `pair` do. `connect` prints a
+`warning:` line of its own and exits 0, as its helper does, on the exact value `off`
+the helper reads, without resolving the robot or spawning the helper. A refusal now
+comes before the verb's other argument checks; `viz --robot` with no TOPIC is the one
+usage refusal hoisted above it (`viz_refusal`, beside the Android refusal). The
+engine's own checks stay where they are.
+A verb the switch does not refuse returns `None` and meets the gate as
+before; the gate itself is unchanged, so a local verb on a never-signed-in machine
+at a terminal still starts the sign-in. `telemetry::CommandRun::start` sends
+nothing while `network_switch::engaged`: `CERULION_NETWORK`, or the invocation's
+own `--network` value, under the run and query parse, or `--local` on `graph run`
+and `node run`, read from the verb path, so the answer is the same in every build
+profile. A first login in such a run carries no id and leaves the join to the next
+run that sends, as the notice run does.
+
 The gate is on in every build, released or built from source. One escape exists
 for this repository's own runs: `CERULION_LOGIN_GATE` set to exactly `off`. The
 match is byte for byte, so `0`, `false` and `OFF` leave the gate on. It is set
@@ -1230,8 +1259,19 @@ pinned there in both directions: `cerulion clean --report-only` under an empty
 home exits 0 and prints its report, and `cerulion topic list` under the same home
 prints the whole refusal and exits 7. The family dispatch is pinned the same way:
 `cerulion schema list` (a verb family) under an empty home prints the whole refusal,
-exits 7 and writes nothing to stdout, and under a seeded home it runs. A test that needs an
-identity rather than an absent one provisions it:
+exits 7 and writes nothing to stdout, and under a seeded home it runs. The kill-switch
+order is pinned for every verb of the command tree: `src/network_switch/cases.rs`
+holds one invocation per verb and per `--robot` form, `network_switch::tests` fails
+when the command tree has a verb or a `--robot` flag the table does not name and
+checks the in-process decision for every row under each spelling of the switch, and
+`tests/network_switch_sweep_test.rs` runs each row it can spawn over the real binary
+(`login`, the `ros2` pass-throughs and the internal processes are not spawned, and
+their rows name why) with the account service, the telemetry host and the relay
+pointed at a listener that records each connection. A refused row (on a pseudo-terminal, where the gate would sign in) exits
+with its own refusal, prints no sign-in text and connects to none of the three. A
+gated row shows that the gate runs and that no usage event is sent; it does not run
+the verb. The listener sees only those three, not mDNS, DDS or zenoh traffic. A
+test that needs an identity rather than an absent one provisions it:
 `cerulion_cli_engine::auth::seed_logged_in_at` from Rust, or
 `tools/ci/seed_test_login.sh <dir>` from a shell, both writing the `auth.json`
 a real sign-in writes, with `CERULION_HOME` pointed at the directory.
@@ -1267,6 +1307,13 @@ at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
      sees the root command, so it cannot change a built-in verb, a root argument or the
      root's help text.
    - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
+   - `network_refusal`: the refusal of an invocation that would reach a robot or a
+     daemon over the network while the kill switch in the `SwitchEnv` is engaged, built
+     from the engine's own refusal so the text and exit code match; `None` for a verb
+     the switch does not refuse. Routed before the login gate (section 12). It
+     has no default, so a new family decides it; add the family's verbs to
+     `src/network_switch/cases.rs`, which `network_switch::tests` holds against the
+     command tree.
    - `needs_identity`: `true` unless the verb must work on a machine that never signed
      in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
    - `run`: parse the action with `FromArgMatches`, run it, return the exit code;
@@ -1279,8 +1326,8 @@ at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
    and output only, like the rest of this crate.
 
 `main` routes a registered family through `families::route` before the `Commands`
-parse: logging with the family's class, the iceoryx2 bridge, the login gate when
-`needs_identity`, then `run`. No edit to `Commands`, `log_verb_class`, `main`'s
+parse: logging with the family's class, the iceoryx2 bridge, the kill-switch refusal
+when `network_refusal` gives one, the login gate when `needs_identity`, then `run`. No edit to `Commands`, `log_verb_class`, `main`'s
 dispatch or the completion code is needed. `families::build` refuses, at command build
 time, two families with one name, a family whose name or alias already selects a verb
 (a built-in name or alias, clap's `help`, an earlier family), an unknown
@@ -1300,14 +1347,14 @@ new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `f
 1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";`, the verbs as
    ONE `#[derive(Subcommand)]` enum, and a unit struct implementing `NestedVerbs`:
    `parent`, `commands` (`nested::derived_verbs::<YourVerbs>()`), `log_class`,
-   `needs_identity` and `run`. Each method that takes matches gets the PARENT's
+   `network_refusal`, `needs_identity` and `run`. Each method that takes matches gets the PARENT's
    sub-matches, so `YourVerbs::from_arg_matches` parses them.
 2. Register it: `mod <set>;` and one entry in `NESTED` in `families/nested/mod.rs`.
 3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
    for a family.
 
 `families::route` tries the nested sets first, then the families, with the same
-logging, bridge and login-gate order. A set hands over its verbs and never sees the
+logging, bridge, kill-switch and login-gate order. A set hands over its verbs and never sees the
 parent, so it cannot change a built-in verb or the parent's help. `nested::attach`
 refuses, when the command is built, a parent that is not a verb, a verb with no name
 and a verb name the parent already selects (a built-in name or alias, `help`, an
