@@ -60,8 +60,10 @@ const WRITER_STOP_GRACE: Duration = Duration::from_millis(250);
 const CATALOG_PEEK_BUDGET: Duration = Duration::from_millis(750);
 
 /// One demanded topic's live handle: the shared channel plus the two half-lives
-/// (the drain thread + the writer task). Dropping it does NOT stop the halves —
-/// call [`Self::stop`] to tear down cleanly (releasing the SHM slot).
+/// (the drain thread + the writer task). Dropping it signals both halves to
+/// stop (see the `Drop` impl below), but it does not wait for them. Call
+/// [`Self::stop`] to also wait for the teardown: it joins the drain thread,
+/// so the SHM slot is released before it returns, and it reaps the writer.
 struct DemandedTopic {
     channel: Arc<ForwardChannel>,
     drain: Option<JoinHandle<()>>,
@@ -99,9 +101,20 @@ impl DemandedTopic {
             Ok(_) => {} // healthy writer finished
             Err(_) => {
                 self.writer.abort();
-                let _ = self.writer.await; // reap the aborted (Cancelled) task
+                let _ = (&mut self.writer).await; // reap the aborted (Cancelled) task
             }
         }
+    }
+}
+
+/// A topic dropped without [`DemandedTopic::stop`] still ends its drain thread
+/// (within one poll), so the thread cannot outlive the plane and keep its SHM
+/// subscriber slot. That happens when the async runtime is shut down while a
+/// connection task still holds its taps, as a process that hosts the plane and
+/// keeps running does on its stop.
+impl Drop for DemandedTopic {
+    fn drop(&mut self) {
+        self.channel.stop();
     }
 }
 
@@ -441,7 +454,38 @@ pub fn peek_schema_hash(manager: &TransportManager, topic: &str, deadline: Insta
 mod tests {
     use super::*;
     use crate::forward::WanDropLevel;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tracing_test::traced_test;
+
+    /// A demanded topic dropped without `stop` (its connection task dropped by
+    /// a runtime shutdown) ends its drain thread.
+    #[tokio::test]
+    async fn a_dropped_topic_ends_its_drain_thread() {
+        let channel = Arc::new(ForwardChannel::new());
+        let drain_channel = channel.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let drain_exited = exited.clone();
+        let drain = std::thread::spawn(move || {
+            while !drain_channel.is_stopped() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drain_exited.store(true, Ordering::SeqCst);
+        });
+        let writer = task::spawn(std::future::pending::<()>());
+        drop(DemandedTopic {
+            channel,
+            drain: Some(drain),
+            writer,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !exited.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the drain thread is still running"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 
     /// The once-per-regime WAN-drop warn EMISSION (the flood-latch pin at the
     /// tracing surface). A sustained-drop regime (Warn then N Debug) followed by a

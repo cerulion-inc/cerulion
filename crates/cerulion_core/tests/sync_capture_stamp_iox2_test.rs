@@ -82,6 +82,7 @@ fn fusion_parts(
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
         accumulate: false,
+        consume: Default::default(),
     };
     let mut info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
         .with_policy(MacroPolicy::Sync { window_ms: 10 });
@@ -130,7 +131,7 @@ fn fusion_parts(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             params: Default::default(),
-            fuse: None,
+            isolate: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "capture_fuse".to_string(),

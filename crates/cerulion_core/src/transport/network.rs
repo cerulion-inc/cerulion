@@ -42,6 +42,7 @@ use super::discovery::{
 };
 use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use super::gateway::is_reserved_topic;
+use super::hosted_runs::{HostedRuns, HostedServe};
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
 use super::run_registry;
@@ -256,7 +257,7 @@ pub struct NetworkConfig {
     /// `None` (the default) is fine for sessions that never announce
     /// (discovery queries, ingress-only bridges).
     pub robot_identity: Option<String>,
-    /// Certificate files for `quic/` locators, set as zenoh's
+    /// Certificate files for `quic/` and `tls/` locators, set as zenoh's
     /// `transport/link/tls/*` keys by `NetworkManager::build_zenoh_config`.
     /// `None` (the default) sets none of them.
     pub tls: Option<NetworkTls>,
@@ -1140,12 +1141,17 @@ impl GetDemandState {
 /// Principle-#3 accessors.
 #[derive(Default)]
 pub struct DemandGetState {
-    /// canonical ingress topics to demand each pass (fixed at gateway boot).
+    /// canonical ingress topics to demand each pass.
     topics: Mutex<Vec<String>>,
     /// producer robot identities harvested from the announce space - targets the
     /// EXPLICIT GETs. Empty ⇒ the WILDCARD fallback (`cerulion_q/*/demand{topic}`,
     /// which intersects every producer's `cerulion_q/{robot}/**` queryable).
     identities: Mutex<BTreeSet<String>>,
+    /// Bumped, under the `identities` lock, each time the last topic leaves
+    /// and the identities are forgotten. A pass records it before its harvest
+    /// query and stores what it harvested only if it is unchanged, so a pass
+    /// of an earlier demand lifecycle cannot refill the forgotten set.
+    identity_epoch: AtomicU64,
     /// cumulative demand-GET passes run.
     passes: AtomicU64,
     /// cumulative replies acking "enabled".
@@ -1175,20 +1181,12 @@ pub struct DemandGetState {
 }
 
 impl DemandGetState {
-    /// Build a demander state for a fixed set of canonical ingress topics.
-    pub fn from_topics(topics: Vec<String>) -> Self {
-        Self {
-            topics: Mutex::new(topics),
-            ..Default::default()
-        }
-    }
-
     /// Add a canonical ingress topic to the DYNAMIC demand set (idempotent -
     /// a duplicate is a no-op). The background demand-GET loop re-reads the topic
     /// set every pass, so a topic added while the loop runs is demanded on the very
     /// next pass. This is the seam that lets a PURE-INGRESS demander
     /// (`cerulion-netd`) grow its keepalive set as consumers demand new mirrors,
-    /// versus the gateway's fixed boot set ([`Self::from_topics`]).
+    /// and a gateway add its ingress topics at boot.
     pub fn add_topic(&self, canonical: String) {
         let mut topics = self
             .topics
@@ -1202,12 +1200,59 @@ impl DemandGetState {
     /// Remove a canonical ingress topic from the DYNAMIC demand set (a
     /// mirror's last consumer left, the bridge is torn down). The loop stops
     /// GETting it on the next pass. A topic that was never present is a no-op.
+    /// Removing the last topic also forgets the harvested producer
+    /// identities: the next user of the set (a gateway started again on the
+    /// same manager) starts from the wildcard GET and harvests its own peers,
+    /// so a peer that left is never the only one asked.
     pub fn remove_topic(&self, canonical: &str) {
         let mut topics = self
             .topics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         topics.retain(|t| t != canonical);
+        if topics.is_empty() {
+            let mut identities = self
+                .identities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            identities.clear();
+            self.identity_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The identity epoch a pass records before its harvest query.
+    fn identity_epoch(&self) -> u64 {
+        self.identity_epoch.load(Ordering::Acquire)
+    }
+
+    /// Store the producer identities a harvest started at `epoch` learned,
+    /// leaving out `self_identity`. Dropped whole when the identities were
+    /// forgotten since `epoch`: they belong to an earlier demand lifecycle.
+    fn record_harvest(
+        &self,
+        epoch: u64,
+        robots: impl IntoIterator<Item = String>,
+        self_identity: Option<&str>,
+    ) {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.identity_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        // Belt and suspenders: NEVER demand from OURSELVES. A Strict gateway
+        // announces its own identity, so the harvest would otherwise learn
+        // self and emit a `cerulion_q/{self}/demand{...}` self-query every
+        // pass - including for its own INGRESS topics, which the grant-side
+        // self-ingress guard already refuses without warning. Dropping self
+        // here avoids the wasted self round-trip entirely (the wildcard-`*`
+        // fallback residual stays covered by that grant-side guard).
+        identities.extend(
+            robots
+                .into_iter()
+                .filter(|robot| self_identity != Some(robot.as_str())),
+        );
     }
 
     /// Observable state (Principle #3): the number of canonical topics currently demanded.
@@ -2251,31 +2296,39 @@ fn handle_runs_verb(
 
 /// The runs-serve DECISION: the demand-authorization gate FIRST
 /// (the same access boundary `demand`/`catalog`/`schema` consult), then the
-/// serve-time gather + run-directory read. Extracted so the sync test seam runs
-/// the EXACT decision the real callback runs, minus the reply.
+/// serve-time gather + run-directory read, then the runs this host serves from
+/// memory ([`RunSource::hosted`]). Extracted so the sync test seam runs the
+/// EXACT decision the real callback runs, minus the reply.
 ///
 /// # Three answers, and none of them is a confident empty
 ///
 /// 1. **Refused** - [`cerulion_q::RunsReply::refused`]: no runs, an `error`
 ///    reason, and a NON-settled verdict, so a denied desk cannot read the empty
-///    list as "this robot is running nothing".
-/// 2. **Gather failed** - empty runs +
+///    list as "this robot is running nothing". The hosted slot is never read.
+/// 2. **Gather failed** - only the hosted runs +
 ///    [`cerulion_q::RunsCompleteness::not_established`] and NO `error`. A failed
 ///    gather is not a refusal (the `error` field means exactly "the robot refused
 ///    you"), so it is reported as the non-claim it is: the desk renders "could not
 ///    establish the running graph". A LOUD `warn!` carries the cause, because a
-///    gateway that cannot reach its own machine's registry is a real fault.
-/// 3. **Gathered** - whatever the registry established, with the gather's OWN
-///    completeness verdict carried through unchanged. That passthrough is the
-///    whole reason [`cerulion_q::RunsCompleteness`] exists: a windowed LISTEN that
-///    expired with live writers unheard produces the SAME empty list a genuinely
-///    idle machine produces, and only the verdict tells them apart (the same
-///    lesson the discovery marker and the checked mirror gather taught).
+///    gateway that cannot reach its own machine's registry is a real fault. The
+///    hosted runs are still served: they come from this process's memory, not
+///    from the registry that failed.
+/// 3. **Gathered** - whatever the registry established plus the hosted runs,
+///    with the gather's OWN completeness verdict carried through unchanged. That
+///    passthrough is the whole reason [`cerulion_q::RunsCompleteness`] exists: a
+///    windowed LISTEN that expired with live writers unheard produces the SAME
+///    empty list a genuinely idle machine produces, and only the verdict tells
+///    them apart (the same lesson the discovery marker and the checked mirror
+///    gather taught). A served hosted run does not change the verdict: the host
+///    knows it exactly.
 ///
 /// Runs whose directory could not be read are SKIPPED with a named reason (see
 /// [`run_artifacts::collect_run_entries`]) rather than served as entries carrying
 /// empty documents - and each skip is logged, because a run present in the
-/// registry and absent from the answer is otherwise an unexplained hole.
+/// registry and absent from the answer is otherwise an unexplained hole. A hosted
+/// entry that fails the served-entry checks is named the same way (see
+/// [`HostedRuns::host`]), and either kind of withheld run demotes a settled
+/// verdict, because the list is then a strict subset.
 fn runs_serve_decision(
     runs: &RunSource,
     authorizer: &dyn DemandAuthorizer,
@@ -2288,8 +2341,22 @@ fn runs_serve_decision(
         return cerulion_q::RunsReply::refused(robot, reason);
     }
     note_lan_authorized(authorizer, "runs GET", RUNS_QUERY_RESOURCE);
-    let gather = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
-        Ok(gather) => gather,
+    let gathered = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
+        Ok(gather) => {
+            let fold = run_artifacts::collect_run_entries(&gather.records);
+            for skip in &fold.skipped {
+                tracing::warn!(
+                    robot = %robot,
+                    run_id = %cerulion_q::format_run_id(skip.run_id),
+                    run_dir = %skip.run_dir,
+                    reason = %skip.reason,
+                    "runs GET: skipping a live run whose directory could not be read; \
+                     an entry carrying an empty document would render desk-side as a graph \
+                     with no nodes"
+                );
+            }
+            Some((fold, gather.completeness.into()))
+        }
         Err(e) => {
             tracing::warn!(
                 robot = %robot,
@@ -2297,43 +2364,61 @@ fn runs_serve_decision(
                 "runs GET: the run registry could not be gathered; answering \
                  'could not establish', never 'no runs'"
             );
-            return cerulion_q::build_runs_reply(
-                robot,
-                Vec::new(),
-                Vec::new(),
-                cerulion_q::RunsCompleteness::not_established(),
-            );
+            None
         }
     };
-    let fold = run_artifacts::collect_run_entries(&gather.records);
-    for skip in &fold.skipped {
-        tracing::warn!(
-            robot = %robot,
-            run_id = %cerulion_q::format_run_id(skip.run_id),
-            run_dir = %skip.run_dir,
-            reason = %skip.reason,
-            "runs GET: skipping a live run whose directory could not be read; \
-             an entry carrying an empty document would render desk-side as a graph with \
-             no nodes"
-        );
-    }
-    cerulion_q::build_runs_reply(
-        robot,
-        fold.entries,
-        fold.skipped
-            .iter()
-            .map(run_artifacts::SkippedRun::to_wire)
-            .collect(),
-        gather.completeness.into(),
-    )
+    assemble_runs_reply(robot, gathered, runs.hosted.served())
+}
+
+/// Build an authorized runs reply from the registry's answer (`None` when the
+/// gather could not run) and what the host serves from memory, through the ONE
+/// reply builder.
+///
+/// One run id carries one verdict, because a desk refuses the whole reply
+/// otherwise. The builder's `run_id` dedup is the only dedup of entries, so a
+/// hosted run that is also gathered is served once; on a tie the gathered entry,
+/// supplied first, survives. A run that either side describes is served and is
+/// not also named undescribable, and a run that both sides withhold is named
+/// once, with the gathered reason.
+fn assemble_runs_reply(
+    robot: &str,
+    gathered: Option<(run_artifacts::RunFold, cerulion_q::RunsCompleteness)>,
+    hosted: HostedServe,
+) -> cerulion_q::RunsReply {
+    let (gathered_entries, gathered_withheld, completeness) = match gathered {
+        Some((fold, completeness)) => (
+            fold.entries,
+            fold.skipped
+                .iter()
+                .map(run_artifacts::SkippedRun::to_wire)
+                .collect(),
+            completeness,
+        ),
+        None => (
+            Vec::new(),
+            Vec::new(),
+            cerulion_q::RunsCompleteness::not_established(),
+        ),
+    };
+    let entries: Vec<cerulion_q::RunEntry> =
+        gathered_entries.into_iter().chain(hosted.entries).collect();
+    // hot-path-alloc-ok: cold, one set of run ids per remote runs GET on the
+    // control plane.
+    let mut named: BTreeSet<String> = entries.iter().map(|e| e.run_id.clone()).collect();
+    let undescribable = gathered_withheld
+        .into_iter()
+        .chain(hosted.undescribable)
+        .filter(|withheld| named.insert(withheld.run_id.clone()))
+        .collect();
+    cerulion_q::build_runs_reply(robot, entries, undescribable, completeness)
 }
 
 /// The shared, thread-safe source the `catalog` verb reads to build a
 /// [`cerulion_q::CatalogReply`]. The GATEWAY owns the writers - it drains the
 /// runtime-registration control channel into `hashes`, and `boot_topics` is set
 /// at boot (and by a host restart's `SchemaServingHandles::replace`) - while the query-surface callback (on the zenoh callback thread) reads
-/// them + the live bridge manager to answer a catalog GET. Cheap to clone (three
-/// `Arc`s).
+/// them + the live bridge manager to answer a catalog GET. Cheap to clone
+/// (reference-counted handles only).
 #[derive(Clone)]
 pub struct CatalogSource {
     /// Canonical runtime-registered topic → the `schema_hash` the producing
@@ -2382,8 +2467,9 @@ pub struct CatalogSource {
     pub producer_probe: Option<Weak<TransportManager>>,
     /// The shared DATA-FLOW liveness table
     /// ([`TopicLivenessObserver::table`](super::liveness::TopicLivenessObserver::table))
-    /// the gateway's observer writes on its drive thread and this serve reads on
-    /// the zenoh callback thread. Stamps each entry's
+    /// the running gateway's observer writes on its drive thread (a gateway
+    /// rebuilt under this latched surface writes the same table) and this serve
+    /// reads on the zenoh callback thread. Stamps each entry's
     /// [`CatalogEntry::liveness`](super::cerulion_q::CatalogEntry::liveness).
     ///
     /// This exists because [`Self::producer_probe`] answers the WRONG question
@@ -2467,7 +2553,7 @@ pub struct SchemaSource {
 /// serves `demand`, so a runs GET delays a concurrent demand GET by its own
 /// duration.
 ///
-/// Cheap to clone (one `Arc` + a `Duration`), mirroring [`CatalogSource`].
+/// Cheap to clone (two `Arc`s + a `Duration`), mirroring [`CatalogSource`].
 #[derive(Clone)]
 pub struct RunSource {
     /// The gateway host's own iceoryx2 namespace - the one its
@@ -2478,6 +2564,12 @@ pub struct RunSource {
     /// fast path), so this is paid only when a writer is live and has not yet
     /// been heard from.
     pub gather_window: Duration,
+    /// The runs this host serves from memory (an embedded runtime has no run
+    /// registry record and no run directory). A gateway fills it with its
+    /// [`NetworkManager::hosted_runs`], so the query surface serves what the
+    /// host put there. Absence stays exact: a hosted run is listed only while
+    /// its [`HostedRunGuard`](super::hosted_runs::HostedRunGuard) lives.
+    pub hosted: HostedRuns,
 }
 
 /// Assemble a catalog reply from the LIVE gateway state - the bridge
@@ -2898,25 +2990,14 @@ fn run_demand_get_pass_on_session(
     //    working direction). The producer announces its egress topics + a bare
     //    identity token, so this learns the producer's robot chunk. A failure is
     //    non-fatal - the wildcard fallback still reaches every producer.
+    let epoch = demand_state.identity_epoch();
     match query_announce_entries(session, DEMAND_IDENTITY_WINDOW) {
         Ok(entries) => {
-            let mut ids = demand_state
-                .identities
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (robot, _topic) in entries {
-                // Belt and suspenders: NEVER demand from OURSELVES. A
-                // Strict gateway announces its own identity, so the harvest would
-                // otherwise learn self and emit a `cerulion_q/{self}/demand{...}`
-                // self-query every pass - including for its own INGRESS topics,
-                // which the grant-side self-ingress guard already refuses without
-                // warning. Dropping self here avoids the wasted self round-trip
-                // entirely (the wildcard-`*` fallback residual stays covered by
-                // that grant-side guard).
-                if self_identity != Some(robot.as_str()) {
-                    ids.insert(robot);
-                }
-            }
+            demand_state.record_harvest(
+                epoch,
+                entries.into_iter().map(|(robot, _topic)| robot),
+                self_identity,
+            );
         }
         Err(e) => tracing::debug!(
             error = %e,
@@ -3288,6 +3369,10 @@ pub struct IngressInjector {
     /// First-of-regime warn latch (flood-suppression), shared with the
     /// rate-conscious rejection/re-inject-failure loggers.
     warn: IngressWarnLatch,
+    /// The topic's data service, which [`Self::subscriber_count`] reads;
+    /// held only by an injector from
+    /// [`TransportManager::create_ingress_injector_with`].
+    data_service: Option<super::DataServiceFactory>,
     // Dropped LAST: remote identity must outlive the injection publisher.
     _origin: Option<super::mirror_origin::MirrorOrigin>,
 }
@@ -3320,8 +3405,28 @@ impl IngressInjector {
             publisher: Mutex::new(publisher),
             counters: Arc::new(IngressCounters::default()),
             warn: IngressWarnLatch::default(),
+            data_service: None,
             _origin: origin,
         }
+    }
+
+    /// This injector holding `data_service`, the topic's data service, for
+    /// [`Self::subscriber_count`].
+    pub(crate) fn with_data_service(mut self, data_service: super::DataServiceFactory) -> Self {
+        self.data_service = Some(data_service);
+        self
+    }
+
+    /// How many subscribers the topic's data service has attached now, from
+    /// every process on this host: the dynamic config's subscriber count, one
+    /// shared-memory read. `None` for an injector that holds no data service
+    /// (every constructor but
+    /// [`TransportManager::create_ingress_injector_with`]).
+    pub fn subscriber_count(&self) -> Option<usize> {
+        use iceoryx2::service::port_factory::PortFactory as _;
+        self.data_service
+            .as_ref()
+            .map(|service| service.dynamic_config().number_of_subscribers())
     }
 
     /// The canonical topic this injector re-injects into.
@@ -3577,9 +3682,11 @@ pub struct NetworkManager {
     reconciler: Mutex<BgThreadState>,
     /// Queryable inversion: the DEMANDER-side background DEMAND-GET loop
     /// thread's lifecycle state - re-issues demand GETs every
-    /// `DEMAND_GET_INTERVAL` for every registered ingress topic. Started by
-    /// [`Self::start_demand_get_loop`] (once, from the gateway); stopped by
-    /// `stop_bg_thread` in [`Drop`].
+    /// `DEMAND_GET_INTERVAL` for every topic of the demand set it was started
+    /// over. Started by [`Self::start_demand_get_loop`] once per manager,
+    /// through the first gateway boot with ingress or the first
+    /// [`Self::ensure_ingress_demand_keepalive`]; stopped by `stop_bg_thread`
+    /// in [`Drop`].
     demand_get: Mutex<BgThreadState>,
     /// The unified query surface: the PRODUCER-side retained verb-dispatched
     /// QUERYABLE (`cerulion_q/{robot}/**`) - serves both the `demand` verb
@@ -3696,19 +3803,15 @@ pub struct NetworkManager {
     /// demand. `None` on a manager that is not a gateway (no probe installed) —
     /// both paths then serve registered topics only.
     permissive_probe: Mutex<Option<Arc<PermissiveShmProbe>>>,
-    /// The DYNAMIC demand set for a PURE-INGRESS demander's self-heal
-    /// keepalive loop (`cerulion-netd`). A gateway builds its OWN
-    /// [`DemandGetState`] from its fixed boot ingress list and passes it to
-    /// [`Self::start_demand_get_loop`]; a pure-ingress demander instead calls
-    /// [`Self::ensure_ingress_demand_keepalive`] per demanded topic, which grows
-    /// THIS shared set and start-once-drives the SAME loop over it. Both share the
-    /// manager's single `demand_get` thread slot (start-once, idempotent), and a
-    /// manager is only ever ONE role - a gateway (fixed set) or a pure-ingress
-    /// demander (this dynamic set) - so they never contend. The self-heal is the
-    /// dialer→accepter demand GET (the wire direction that survives a
-    /// strict connect-only link AND re-crosses after a restarted robot gateway
-    /// reconnects), which the gateway-only wiring never started for the
-    /// pure-ingress netd path (the silent-black-hole root cause).
+    /// The manager's one DYNAMIC demand set, read by the single `demand_get`
+    /// loop. A pure-ingress demander (`cerulion-netd`) adds each demanded
+    /// topic through [`Self::ensure_ingress_demand_keepalive`]; a gateway adds
+    /// its ingress topics the same way at boot, and whoever stops the gateway
+    /// removes them with [`Self::remove_ingress_demand_keepalive`]. So a later
+    /// gateway on the same manager is demanded its own topics. The demand GET
+    /// is the dialer→accepter query (the wire direction that survives a strict
+    /// connect-only link AND re-crosses after a restarted robot gateway
+    /// reconnects).
     ingress_demand_state: Arc<DemandGetState>,
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
@@ -3728,6 +3831,11 @@ pub struct NetworkManager {
     /// authorizer is [`AllowAllAuthorizer`]; the posture comes from
     /// [`LanAccess::from_env`].
     demand_authorizer: Arc<Mutex<Arc<dyn DemandAuthorizer>>>,
+    /// The runs this process serves from memory through the `runs` verb.
+    /// Created with the manager, so it exists before the latched query surface
+    /// that reads it (the surface outlives the gateway construction that
+    /// started it).
+    hosted_runs: HostedRuns,
 }
 
 impl NetworkManager {
@@ -3791,7 +3899,20 @@ impl NetworkManager {
                 lan_access,
                 inner_authorizer,
             )))),
+            hosted_runs: HostedRuns::default(),
         }
+    }
+
+    /// The runs this process serves from memory through the `runs` verb. Every
+    /// call returns a handle onto the same set; a run hosted through it is
+    /// served by this manager's query surface until its guard drops.
+    ///
+    /// Only a declared query surface serves it ([`Self::has_query_surface`]). A
+    /// gateway declares one when it has egress topics or an `AllowAll` policy; a
+    /// deny-all, ingress-only gateway declares none, so a desk's `runs` GET to
+    /// such a robot gets no reply, hosted runs included.
+    pub fn hosted_runs(&self) -> HostedRuns {
+        self.hosted_runs.clone()
     }
 
     /// Record the LAN demand bridge manager and apply the current posture.
@@ -5538,6 +5659,10 @@ impl NetworkManager {
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.hashes),
             Arc::clone(&catalog.boot_topics),
+            // A surface started without a liveness table (a test seam)
+            // serves no liveness, so a later gateway records into a table
+            // nothing reads, matching what this surface serves.
+            catalog.liveness.clone().unwrap_or_default(),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -5607,7 +5732,7 @@ impl NetworkManager {
     /// `start_query_surface` no-ops on the latch), so a caller merging serving
     /// into "what the catalog/schema verbs serve" MUST merge through these —
     /// handles taken from a later gateway object name maps the callback never
-    /// reads. Cheap (three `Arc`s).
+    /// reads. Cheap (`Arc`s only).
     pub fn query_surface_serving_handles(
         &self,
     ) -> Option<crate::transport::gateway::SchemaServingHandles> {
@@ -5627,8 +5752,10 @@ impl NetworkManager {
     ///
     /// Lifecycle mirrors [`Self::start_demand_reconciler`]: a dedicated
     /// `"cerulion-demand-get"` thread stopped by `stop_bg_thread` at
-    /// [`Drop`]. IDEMPOTENT - one loop per gateway. An empty `topics` set skips
-    /// the thread (a pure-egress gateway has no ingress to demand).
+    /// [`Drop`]. IDEMPOTENT - one loop per manager: a call while the loop
+    /// runs leaves it on the state it started with and ignores
+    /// `demand_state`. An empty `topics` set skips the thread (a pure-egress
+    /// gateway has no ingress to demand).
     ///
     /// # Errors
     ///
@@ -5660,7 +5787,7 @@ impl NetworkManager {
                 reason: "demand-get loop state mutex poisoned".to_string(),
             })?;
         if state.handle.is_some() {
-            // Already running - one loop per gateway (idempotent).
+            // Already running - one loop per manager (idempotent).
             return Ok(());
         }
 
@@ -5704,10 +5831,10 @@ impl NetworkManager {
 
     /// Register `topic` in the DYNAMIC demand-keepalive set and ensure the
     /// background demand-GET loop is running over it - the PURE-INGRESS demander's
-    /// self-heal wiring (`cerulion-netd`). A gateway starts its own loop from a
-    /// fixed boot set ([`Self::start_demand_get_loop`]); a pure-ingress demander
-    /// (which only ever calls [`crate::transport::TransportManager::register_ingress_topic`],
-    /// never boots a gateway) instead calls THIS per demanded topic so the
+    /// self-heal wiring (`cerulion-netd`), and a gateway's for its ingress
+    /// topics at boot. A pure-ingress demander (which only ever calls
+    /// [`crate::transport::TransportManager::register_ingress_topic`], never
+    /// boots a gateway) calls THIS per demanded topic so the
     /// re-affirming GET keepalive runs - the dialer→accepter query that
     /// (a) crosses a strict connect-only link the demand-token declaration cannot,
     /// and (b) RE-AFFIRMS egress within one pass after a restarted robot gateway's
@@ -5732,6 +5859,13 @@ impl NetworkManager {
         // and the running loop re-reads the grown topic set every pass - so the
         // newly-added topic is demanded on the very next pass without a restart.
         self.start_demand_get_loop(Arc::clone(&self.ingress_demand_state))
+    }
+
+    /// The DYNAMIC demand-keepalive set itself: the topics and counters the
+    /// manager's one demand-GET loop reads once a keepalive or a gateway
+    /// started it.
+    pub(crate) fn ingress_demand_state(&self) -> Arc<DemandGetState> {
+        Arc::clone(&self.ingress_demand_state)
     }
 
     /// Remove `topic` from the DYNAMIC demand-keepalive set (its mirror's
@@ -6115,39 +6249,19 @@ impl NetworkManager {
     }
 }
 
-/// Set zenoh's `transport/link/tls/*` keys from `tls`. Each file is read here
-/// and must hold a PEM block (`-----BEGIN `), so a wrong, unreadable or non-PEM
-/// path fails the session open naming it, rather than a QUIC listener that
-/// fails inside zenoh or a connect that zenoh retries in the background. Whether
-/// the PEM is the right certificate or key is zenoh's check, at handshake, with
-/// one exception read here: a listener certificate marked CA:TRUE (see
-/// [`refuse_ca_listener_certificate`]).
+/// Set zenoh's `transport/link/tls/*` keys from `tls`, after
+/// [`check_tls_files`](super::carrier::check_tls_files) has read each file: a
+/// wrong, unreadable or non-PEM path, or a listener certificate marked
+/// `CA:TRUE`, fails the session open naming the `tls.*` setting and the path,
+/// rather than a `quic/` or `tls/` listener that fails inside zenoh or a
+/// connect that zenoh retries in the background.
 fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()> {
-    let refuse = |path: &std::path::Path, key: &str, why: String| TransportError::SessionCreation {
-        reason: format!("tls file '{}' for {key} {why}", path.display()),
-    };
+    super::carrier::check_tls_files(tls, &super::carrier::CarrierSettingNames::GRAPH)
+        .map_err(|reason| TransportError::SessionCreation { reason })?;
     for (key, path) in tls.file_keys() {
-        if !path.is_absolute() {
-            return Err(refuse(path, key, "is not an absolute path".to_string()));
-        }
-        let bytes =
-            std::fs::read(path).map_err(|e| refuse(path, key, format!("cannot be read: {e}")))?;
-        if !bytes.windows(11).any(|w| w == b"-----BEGIN ") {
-            return Err(refuse(
-                path,
-                key,
-                "holds no PEM block (-----BEGIN ...)".to_string(),
-            ));
-        }
-        if key == "transport/link/tls/listen_certificate" {
-            refuse_ca_listener_certificate(&bytes).map_err(|why| refuse(path, key, why))?;
-        }
-        let Some(utf8) = path.to_str() else {
-            return Err(TransportError::SessionCreation {
-                reason: format!("tls file '{}' for {key} is not valid UTF-8", path.display()),
-            });
-        };
-        let json = serde_json::to_string(utf8).map_err(|e| TransportError::SessionCreation {
+        // `check_tls_files` has refused a path that is not UTF-8.
+        let utf8 = path.to_string_lossy();
+        let json = serde_json::to_string(&utf8).map_err(|e| TransportError::SessionCreation {
             reason: format!("failed to serialize {key}: {e}"),
         })?;
         config
@@ -6164,35 +6278,6 @@ fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()
         .map_err(|e| TransportError::SessionCreation {
             reason: format!("failed to set transport/link/tls/verify_name_on_connect: {e}"),
         })?;
-    Ok(())
-}
-
-/// A `quic/` or `tls/` listener's certificate (the first CERTIFICATE block of the file)
-/// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
-/// which rejects a CA certificate presented as the end entity
-/// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the
-/// listener's log while the connector retries. `openssl req -x509` writes
-/// `CA:TRUE` unless told otherwise, so the error names the flag that fixes it.
-fn refuse_ca_listener_certificate(pem: &[u8]) -> Result<(), String> {
-    let block = x509_parser::pem::Pem::iter_from_buffer(pem)
-        .filter_map(Result::ok)
-        .find(|p| p.label == "CERTIFICATE")
-        .ok_or_else(|| "holds no CERTIFICATE PEM block".to_string())?;
-    let cert = block
-        .parse_x509()
-        .map_err(|e| format!("holds a CERTIFICATE block that does not parse: {e}"))?;
-    let is_ca = cert
-        .basic_constraints()
-        .map_err(|e| format!("has an unreadable basicConstraints extension: {e}"))?
-        .is_some_and(|bc| bc.value.ca);
-    if is_ca {
-        return Err(
-            "is marked CA:TRUE, and a quic/ peer refuses a CA certificate as the \
-                    listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
-                    e.g. add `-addext basicConstraints=critical,CA:FALSE` to `openssl req -x509`"
-                .to_string(),
-        );
-    }
     Ok(())
 }
 
@@ -6769,6 +6854,7 @@ mod tests {
             snapshot_lock,
             Arc::clone(&catalog.hashes),
             Arc::clone(&catalog.boot_topics),
+            Default::default(),
         );
 
         // The restart: the next run serves /run_two/cam only.
@@ -6864,6 +6950,7 @@ mod tests {
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.hashes),
             Arc::clone(&catalog.boot_topics),
+            Default::default(),
         );
         handles.merge(&crate::transport::gateway::SchemaServing {
             topic_schemas: vec![crate::transport::gateway::TopicSchema {
@@ -7210,6 +7297,53 @@ mod tests {
     // -----------------------------------------------------------------------
     // Queryable inversion - pure oracle tests (no transport, no clock)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn demand_get_forgets_its_peers_once_its_last_topic_leaves() {
+        // A later user of the manager's demand set (a gateway started again)
+        // must not GET only the peers an earlier one learned: with no
+        // identity the pass falls back to the wildcard that reaches any peer.
+        let state = DemandGetState::default();
+        state.add_topic("/run_one/a".to_string());
+        state.add_topic("/run_one/b".to_string());
+        state
+            .identities
+            .lock()
+            .unwrap()
+            .insert("departed_desk".to_string());
+
+        state.remove_topic("/run_one/a");
+        assert_eq!(
+            state.identities.lock().unwrap().len(),
+            1,
+            "a topic is still demanded, so its peers stay"
+        );
+
+        // A pass that started its harvest before the reset finishes after it.
+        let in_flight = state.identity_epoch();
+        state.remove_topic("/run_one/b");
+        assert!(state.identities.lock().unwrap().is_empty());
+        state.record_harvest(in_flight, ["departed_desk".to_string()], None);
+        assert!(
+            state.identities.lock().unwrap().is_empty(),
+            "a harvest of the earlier lifecycle does not refill the set"
+        );
+        state.add_topic("/run_two/c".to_string());
+        assert_eq!(
+            demand_get_selectors("/run_two/c", &state.identities.lock().unwrap()),
+            vec![cerulion_q::demand_selector("*", "/run_two/c")]
+        );
+        // A harvest of the new lifecycle is stored, without our own name.
+        state.record_harvest(
+            state.identity_epoch(),
+            ["new_desk".to_string(), "self".to_string()],
+            Some("self"),
+        );
+        assert_eq!(
+            *state.identities.lock().unwrap(),
+            BTreeSet::from(["new_desk".to_string()])
+        );
+    }
 
     /// `demand_get_selectors` - WILDCARD when no identity is
     /// harvested (reaches every producer's `cerulion_q/{robot}/**` queryable),
@@ -7929,5 +8063,647 @@ mod tests {
         record_reinject_failure(&counters, &latch, "/t", None);
         assert_eq!(counters.reinject_failure_drops.load(Ordering::Relaxed), 4);
         assert!(latch.reinject_failure_warned.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod hosted_runs_serve_tests {
+    use super::*;
+    use crate::transport::cerulion_q::{
+        decode_runs_reply, encode_runs_reply, RunEntry, RunEntryState, RunsCompleteness, RunsReply,
+        UndescribableRun,
+    };
+    use crate::transport::hosted_runs::{HostedRun, HostedRunGuard};
+    use crate::transport::run_artifacts::{RunFold, SkippedRun};
+    use crate::transport::run_registry::{
+        RunHandle, RunRecord, RunState, RunWatcher, RUN_GATHER_WINDOW, RUN_REGISTRY_MAX_READERS,
+    };
+
+    const ROBOT: &str = "temi";
+    const RUN: u128 = 0x5d1c_0000_0000_0000_0000_0000_0000_9e02;
+    const RUN_TEXT: &str = "0x5d1c0000000000000000000000009e02";
+    const BAD_RUN: u128 = 0x0bad;
+    const BAD_RUN_TEXT: &str = "0x00000000000000000000000000000bad";
+    const STARTED_AT_NS: u64 = 1_762_264_931_000_000_000;
+    const GRAPH_YAML: &str = "name: temi\nprefix: temi\n";
+    const RUN_JSON: &str = "{\"version\":1,\"host\":\"embedded\"}\n";
+    const IDLE_LEGACY_BYTES: &str =
+        r#"{"version":1,"robot":"temi","runs":[],"completeness":{"kind":"settled"}}"#;
+    const HEARD_CEILING: Duration = Duration::from_secs(10);
+    /// Set to the parent test's process id in the child it spawns, so a value
+    /// inherited from a shell never takes the child arm.
+    const GATHERED_CHILD_ENV: &str = "CERULION_HOSTED_RUNS_GATHERED_CHILD";
+    const GATHERED_CHILD_DONE: &str = "<<<gathered child done>>>";
+    const GATHERED_YAML: &str = "# gathered\nname: perception\nprefix: /percep\n";
+    const GATHERED_JSON: &str = "{\"version\":1,\"graph_name\":\"perception\"}\n";
+
+    struct DenyAll;
+    impl DemandAuthorizer for DenyAll {
+        fn authorize_demand(&self, _subject: &DemandSubject, resource: &str) -> DemandDecision {
+            DemandDecision::deny(format!("test: no access to {resource}"))
+        }
+    }
+
+    fn source_on(iox_config: iceoryx2::config::Config) -> RunSource {
+        RunSource {
+            iox_config: Arc::new(iox_config),
+            gather_window: RUN_GATHER_WINDOW,
+            hosted: HostedRuns::default(),
+        }
+    }
+
+    fn idle_source() -> RunSource {
+        source_on(crate::testing::iceoryx_test_config())
+    }
+
+    fn host(source: &RunSource, live: bool) -> (HostedRunGuard, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(live));
+        let entry = RunEntry::new(
+            RUN,
+            "temi",
+            STARTED_AT_NS,
+            RunState::Live,
+            GRAPH_YAML,
+            RUN_JSON,
+        )
+        .expect("a well-formed entry");
+        let guard = source.hosted.host(
+            RUN,
+            HostedRun {
+                entry,
+                live: Arc::clone(&flag),
+            },
+        );
+        (guard, flag)
+    }
+
+    fn bad_hosted_run() -> HostedRun {
+        HostedRun {
+            entry: RunEntry {
+                run_id: BAD_RUN_TEXT.to_string(),
+                graph_name: "temi".to_string(),
+                run_started_at_ns: STARTED_AT_NS,
+                state: RunEntryState::Live,
+                graph_yaml: String::new(),
+                run_json: RUN_JSON.to_string(),
+            },
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn withheld(run_id_text: &str, reason: &str) -> UndescribableRun {
+        UndescribableRun {
+            run_id: run_id_text.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Serve through the decision until `done` holds, or panic with the last
+    /// reply once [`HEARD_CEILING`] passes.
+    fn serve_until(source: &RunSource, done: impl Fn(&RunsReply) -> bool) -> RunsReply {
+        let deadline = Instant::now() + HEARD_CEILING;
+        loop {
+            let reply = runs_serve_decision_for_test(source, &AllowAllAuthorizer, ROBOT);
+            if done(&reply) {
+                return reply;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no matching runs reply within {HEARD_CEILING:?}; last {reply:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn expected_hosted(state: RunEntryState) -> RunEntry {
+        RunEntry {
+            run_id: RUN_TEXT.to_string(),
+            graph_name: "temi".to_string(),
+            run_started_at_ns: STARTED_AT_NS,
+            state,
+            graph_yaml: GRAPH_YAML.to_string(),
+            run_json: RUN_JSON.to_string(),
+        }
+    }
+
+    fn served_reply(runs: Vec<RunEntry>, completeness: RunsCompleteness) -> RunsReply {
+        RunsReply {
+            version: 1,
+            robot: ROBOT.to_string(),
+            runs,
+            completeness,
+            undescribable: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn entry_named(graph_name: &str, started_at_ns: u64) -> RunEntry {
+        RunEntry::new(
+            RUN,
+            graph_name,
+            started_at_ns,
+            RunState::Live,
+            GRAPH_YAML,
+            RUN_JSON,
+        )
+        .expect("a well-formed entry")
+    }
+
+    fn hosted_entries(entries: Vec<RunEntry>) -> HostedServe {
+        HostedServe {
+            entries,
+            undescribable: Vec::new(),
+        }
+    }
+
+    fn bytes(reply: &RunsReply) -> String {
+        String::from_utf8(encode_runs_reply(reply)).expect("runs replies are JSON text")
+    }
+
+    #[test]
+    fn with_an_empty_slot_an_idle_machine_answers_the_legacy_bytes() {
+        let reply = runs_serve_decision_for_test(&idle_source(), &AllowAllAuthorizer, ROBOT);
+        assert_eq!(bytes(&reply), IDLE_LEGACY_BYTES);
+    }
+
+    #[test]
+    fn with_an_empty_slot_a_gathered_fold_answers_the_legacy_bytes() {
+        let fold = RunFold {
+            entries: vec![RunEntry::new(
+                0x2a,
+                "perception",
+                1_700_000_000_000_000_000,
+                RunState::Live,
+                "name: perception\n",
+                "{\"k\":1}\n",
+            )
+            .expect("a well-formed entry")],
+            skipped: vec![SkippedRun {
+                run_id: 0x2b,
+                run_dir: "/runs/perception-1".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            HostedServe::default(),
+        );
+
+        assert_eq!(
+            bytes(&reply),
+            concat!(
+                r#"{"version":1,"robot":"temi","runs":[{"run_id":"0x0000000000000000000000000000002a","#,
+                r#""graph_name":"perception","run_started_at_ns":1700000000000000000,"state":"live","#,
+                r#""graph_yaml":"name: perception\n","run_json":"{\"k\":1}\n"}],"#,
+                r#""completeness":{"kind":"incomplete","live_writers":0,"writers_heard":0},"#,
+                r#""undescribable":[{"run_id":"0x0000000000000000000000000000002b","#,
+                r#""reason":"run directory holds no readable graph.yaml"}]}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn a_hosted_run_is_served_beside_an_idle_registry() {
+        let source = idle_source();
+        let (_guard, _live) = host(&source, true);
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        let expected = served_reply(
+            vec![expected_hosted(RunEntryState::Live)],
+            RunsCompleteness::Settled,
+        );
+        assert_eq!(reply, expected);
+        assert_eq!(
+            decode_runs_reply(&encode_runs_reply(&reply)),
+            Ok(expected),
+            "a desk decodes the hosted entry through the wire gate unchanged"
+        );
+    }
+
+    #[test]
+    fn a_hosted_run_whose_live_flag_cleared_is_served_as_ending() {
+        let source = idle_source();
+        let (_guard, live) = host(&source, true);
+        live.store(false, Ordering::Release);
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        assert_eq!(
+            reply,
+            served_reply(
+                vec![expected_hosted(RunEntryState::Ending)],
+                RunsCompleteness::Settled
+            )
+        );
+    }
+
+    #[test]
+    fn dropping_the_guard_withdraws_the_hosted_run_and_the_legacy_bytes_return() {
+        let source = idle_source();
+        let (guard, _live) = host(&source, true);
+        let before = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        assert_eq!(before.runs.len(), 1);
+
+        drop(guard);
+
+        let after = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        assert_eq!(bytes(&after), IDLE_LEGACY_BYTES);
+    }
+
+    #[test]
+    fn a_failed_gather_still_serves_the_hosted_run_and_claims_nothing() {
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let (_guard, _live) = host(&source, true);
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: 0x77,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 1,
+                state: RunState::Live,
+                graph_name: "unreachable".to_string(),
+                run_dir: "/nonexistent/unreachable".to_string(),
+            },
+        )
+        .expect("publish a live registry writer");
+        // The gather works while a reader slot is free: it hears the writer and
+        // reports its run as undescribable (its directory does not exist).
+        let deadline = Instant::now() + HEARD_CEILING;
+        let mut heard = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        while heard.undescribable.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            heard = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+        }
+        assert_eq!(
+            heard
+                .undescribable
+                .iter()
+                .map(|u| u.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0x00000000000000000000000000000077"],
+            "precondition: the gather hears the live writer"
+        );
+        let _hogs: Vec<RunWatcher> = (0..RUN_REGISTRY_MAX_READERS)
+            .map(|i| {
+                RunWatcher::open_on_config(&namespace, 0x77).unwrap_or_else(|e| {
+                    panic!("reader slot {i} of {RUN_REGISTRY_MAX_READERS} must be claimable: {e}")
+                })
+            })
+            .collect();
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        assert_eq!(
+            reply,
+            served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established()
+            ),
+            "a failed gather serves the runs this process knows from memory, and its \
+             verdict claims nothing about the rest of the machine"
+        );
+        reply.validate().expect("a well-formed reply");
+    }
+
+    #[test]
+    fn a_denied_runs_get_never_reads_the_hosted_slot() {
+        let source = idle_source();
+        let (_guard, _live) = host(&source, true);
+        let held = source.hosted.hold_lock_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let serving = source.clone();
+        let server = std::thread::spawn(move || {
+            let _ = tx.send(runs_serve_decision_for_test(&serving, &DenyAll, ROBOT));
+        });
+
+        let answer = rx.recv_timeout(HEARD_CEILING);
+        drop(held);
+        server.join().expect("the serve thread");
+
+        let reply = answer.expect(
+            "a denied runs GET completed while the hosted slot was locked, so it never read it",
+        );
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: Vec::new(),
+                completeness: RunsCompleteness::not_established(),
+                undescribable: Vec::new(),
+                error: Some("test: no access to <runs: live runs + graphs>".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hosted_run_and_its_gathered_twin_are_served_once() {
+        let fold = |started_at_ns| RunFold {
+            entries: vec![entry_named("gathered", started_at_ns)],
+            skipped: Vec::new(),
+        };
+        let served_name = |gathered_at: u64, hosted_at: u64| {
+            let reply = assemble_runs_reply(
+                ROBOT,
+                Some((fold(gathered_at), RunsCompleteness::Settled)),
+                hosted_entries(vec![entry_named("hosted", hosted_at)]),
+            );
+            assert_eq!(reply.runs.len(), 1, "one run id, one served entry");
+            reply.runs[0].graph_name.clone()
+        };
+
+        assert_eq!(served_name(10, 20), "hosted", "the later start survives");
+        assert_eq!(served_name(20, 10), "gathered", "the later start survives");
+        assert_eq!(
+            served_name(10, 10),
+            "gathered",
+            "on a tie the gathered entry, supplied first, survives"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_no_gather_serves_only_the_hosted_entries_as_not_established() {
+        let reply = assemble_runs_reply(
+            ROBOT,
+            None,
+            hosted_entries(vec![entry_named("temi", STARTED_AT_NS)]),
+        );
+        assert_eq!(
+            reply,
+            served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established()
+            )
+        );
+    }
+
+    #[test]
+    fn hosted_entries_do_not_lift_a_withheld_runs_demotion() {
+        let fold = RunFold {
+            entries: Vec::new(),
+            skipped: vec![SkippedRun {
+                run_id: 0x2b,
+                run_dir: "/runs/perception-1".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            hosted_entries(vec![entry_named("temi", STARTED_AT_NS)]),
+        );
+        assert_eq!(
+            reply,
+            RunsReply {
+                undescribable: vec![UndescribableRun {
+                    run_id: "0x0000000000000000000000000000002b".to_string(),
+                    reason: "run directory holds no readable graph.yaml".to_string(),
+                }],
+                ..served_reply(
+                    vec![expected_hosted(RunEntryState::Live)],
+                    RunsCompleteness::not_established()
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn a_hosted_entry_new_would_refuse_is_named_undescribable_and_the_desk_still_decodes_the_reply()
+    {
+        let source = idle_source();
+        let (_good_guard, _live_good) = host(&source, true);
+        let _bad_guard = source.hosted.host(BAD_RUN, bad_hosted_run());
+
+        let reply = runs_serve_decision_for_test(&source, &AllowAllAuthorizer, ROBOT);
+
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                BAD_RUN_TEXT,
+                "the hosted entry carries an empty graph.yaml",
+            )],
+            ..served_reply(
+                vec![expected_hosted(RunEntryState::Live)],
+                RunsCompleteness::not_established(),
+            )
+        };
+        assert_eq!(reply, expected);
+        assert_eq!(
+            decode_runs_reply(&encode_runs_reply(&reply)),
+            Ok(expected),
+            "one bad hosted entry must not make the desk refuse the whole reply"
+        );
+    }
+
+    #[test]
+    fn every_hosted_runs_handle_of_a_manager_is_the_same_set() {
+        let manager = NetworkManager::new(NetworkConfig::default());
+        let source = RunSource {
+            hosted: manager.hosted_runs(),
+            ..idle_source()
+        };
+        let (guard, _live) = host(&source, true);
+        assert_eq!(
+            manager.hosted_runs().served().entries,
+            vec![expected_hosted(RunEntryState::Live)]
+        );
+        drop(guard);
+        assert!(manager.hosted_runs().served().entries.is_empty());
+    }
+
+    #[test]
+    fn a_hosted_run_whose_gathered_twin_is_withheld_is_served_once_as_the_hosted_entry() {
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let (_guard, _live) = host(&source, true);
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: RUN,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 1,
+                state: RunState::Live,
+                graph_name: "temi".to_string(),
+                run_dir: "/nonexistent/unreachable".to_string(),
+            },
+        )
+        .expect("publish a live registry writer");
+
+        // Settled only once the gather heard the writer; an unheard live writer
+        // answers incomplete.
+        let reply = serve_until(&source, |reply| reply.completeness.is_settled());
+
+        let expected = served_reply(
+            vec![expected_hosted(RunEntryState::Live)],
+            RunsCompleteness::Settled,
+        );
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    #[test]
+    fn a_run_both_sides_withhold_is_named_once_with_the_gathered_reason() {
+        let fold = RunFold {
+            entries: Vec::new(),
+            skipped: vec![SkippedRun {
+                run_id: RUN,
+                run_dir: "/runs/temi".to_string(),
+                reason: "run directory holds no readable graph.yaml".to_string(),
+            }],
+        };
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((fold, RunsCompleteness::Settled)),
+            HostedServe {
+                entries: Vec::new(),
+                undescribable: vec![withheld(
+                    RUN_TEXT,
+                    "the hosted entry carries an empty graph.yaml",
+                )],
+            },
+        );
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                RUN_TEXT,
+                "run directory holds no readable graph.yaml",
+            )],
+            ..served_reply(Vec::new(), RunsCompleteness::not_established())
+        };
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    #[test]
+    fn a_withheld_hosted_run_whose_gathered_twin_is_described_is_served_as_the_gathered_entry() {
+        let gathered = entry_named("gathered", STARTED_AT_NS);
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((
+                RunFold {
+                    entries: vec![gathered.clone()],
+                    skipped: Vec::new(),
+                },
+                RunsCompleteness::Settled,
+            )),
+            HostedServe {
+                entries: Vec::new(),
+                undescribable: vec![withheld(
+                    RUN_TEXT,
+                    "the hosted entry carries an empty graph.yaml",
+                )],
+            },
+        );
+        let expected = served_reply(vec![gathered], RunsCompleteness::Settled);
+        assert_eq!(reply, expected);
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+    }
+
+    /// The fold reads `CERULION_HOME` at serve time, so the arm that needs a
+    /// readable run directory runs in a child process with its own environment;
+    /// setting the variable here would race every other test in this binary.
+    #[cfg(unix)]
+    #[test]
+    fn through_the_decision_a_gathered_run_is_served_beside_the_hosted_runs_and_deduped_once() {
+        let parent = std::os::unix::process::parent_id().to_string();
+        if std::env::var_os(GATHERED_CHILD_ENV).is_some_and(|v| v == parent.as_str()) {
+            gathered_beside_hosted_in_this_process();
+            println!("{GATHERED_CHILD_DONE}");
+            return;
+        }
+        let home_dir = tempfile::tempdir().expect("a temp CERULION_HOME");
+        let home = std::fs::canonicalize(home_dir.path()).expect("canonicalize CERULION_HOME");
+        std::fs::create_dir_all(home.join("runs")).expect("the runs root");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "transport::network::hosted_runs_serve_tests::\
+                 through_the_decision_a_gathered_run_is_served_beside_the_hosted_runs_and_deduped_once",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(GATHERED_CHILD_ENV, std::process::id().to_string())
+            .env("CERULION_HOME", &home)
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(GATHERED_CHILD_DONE),
+            "the child failed or never ran its arm ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn gathered_beside_hosted_in_this_process() {
+        let run_dir = run_registry::run_dir_root()
+            .expect("the child's CERULION_HOME")
+            .join("perception");
+        std::fs::create_dir_all(&run_dir).expect("the run directory");
+        std::fs::write(run_dir.join(run_artifacts::GRAPH_YAML_FILE), GATHERED_YAML)
+            .expect("write graph.yaml");
+        std::fs::write(run_dir.join(run_artifacts::RUN_JSON_FILE), GATHERED_JSON)
+            .expect("write run.json");
+        let namespace = crate::testing::iceoryx_test_config();
+        let source = source_on(namespace.clone());
+        let _writer = RunHandle::publish_on_config(
+            &namespace,
+            RunRecord {
+                run_id: RUN,
+                supervisor_pid: std::process::id(),
+                run_started_at_ns: 20,
+                state: RunState::Live,
+                graph_name: "perception".to_string(),
+                run_dir: run_dir.to_string_lossy().into_owned(),
+            },
+        )
+        .expect("publish a live registry writer");
+        let host_twin = |started_at_ns| {
+            source.hosted.host(
+                RUN,
+                HostedRun {
+                    entry: entry_named("hosted", started_at_ns),
+                    live: Arc::new(AtomicBool::new(true)),
+                },
+            )
+        };
+        let gathered = RunEntry {
+            run_id: RUN_TEXT.to_string(),
+            graph_name: "perception".to_string(),
+            run_started_at_ns: 20,
+            state: RunEntryState::Live,
+            graph_yaml: GATHERED_YAML.to_string(),
+            run_json: GATHERED_JSON.to_string(),
+        };
+
+        let bad = source.hosted.host(BAD_RUN, bad_hosted_run());
+        let _earlier_twin = host_twin(10);
+        let reply = serve_until(&source, |reply| {
+            reply.runs.iter().any(|e| e.graph_name == "perception")
+        });
+        let expected = RunsReply {
+            undescribable: vec![withheld(
+                BAD_RUN_TEXT,
+                "the hosted entry carries an empty graph.yaml",
+            )],
+            ..served_reply(vec![gathered], RunsCompleteness::not_established())
+        };
+        assert_eq!(
+            reply, expected,
+            "the gathered run started later, so it survives its hosted twin, and the bad \
+             hosted entry hides nothing"
+        );
+        assert_eq!(decode_runs_reply(&encode_runs_reply(&reply)), Ok(expected));
+
+        drop(bad);
+        let _later_twin = host_twin(30);
+        let reply = serve_until(&source, |reply| reply.completeness.is_settled());
+        assert_eq!(
+            reply,
+            served_reply(vec![entry_named("hosted", 30)], RunsCompleteness::Settled),
+            "the hosted twin started later, so it survives the gathered run"
+        );
     }
 }

@@ -2534,6 +2534,7 @@ nodes:
         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
         expect_within_ms: None,
         accumulate: false,
+        consume: Default::default(),
     };
     let join = ClosureNodeEntry::new(
         NodeInfo::with_meta(vec![sync_meta("l"), sync_meta("r")], vec![])
@@ -2814,6 +2815,7 @@ nodes:
         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
         expect_within_ms: None,
         accumulate: false,
+        consume: Default::default(),
     };
     let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
     infos.insert(

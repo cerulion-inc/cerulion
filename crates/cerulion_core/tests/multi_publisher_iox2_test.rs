@@ -77,7 +77,7 @@ fn producer_only_graph(
         identity: format!("{prefix}_{node_id}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: node_id.to_string(),
@@ -163,7 +163,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
         prefix: "gb".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "bc_b".to_string(),
@@ -178,7 +178,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "listener".to_string(),
@@ -219,6 +219,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
             accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -376,6 +377,7 @@ fn block_input_meta() -> InputMeta {
         backpressure: BackpressurePolicy::Block,
         expect_within_ms: None,
         accumulate: false,
+        consume: Default::default(),
     }
 }
 
@@ -407,7 +409,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
         prefix: "dc".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
@@ -422,7 +424,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
@@ -437,7 +439,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -656,7 +658,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
         prefix: "ba".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
@@ -671,7 +673,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
@@ -686,7 +688,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "stalled".to_string(),
@@ -806,7 +808,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
         prefix: "ev".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "quiet".to_string(),
@@ -821,7 +823,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -979,7 +981,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
         prefix: "dp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "quiet".to_string(),
@@ -994,7 +996,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "deep".to_string(),
@@ -1039,7 +1041,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
     // LISTENERs are provisioned on the EVENT service (`extra_event_listeners`),
     // not as subscriber slots, so they don't enter this subscriber-axis sum.
     let mut nodes = vec![NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "quiet".to_string(),
@@ -1063,7 +1065,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
     for i in 0..over_cap {
         let id = format!("sink_{i}");
         nodes.push(NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: id.clone(),
@@ -1150,7 +1152,7 @@ fn quiet_listed_graph_with(
     consumers: &[(&str, &str)],
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let mut nodes = vec![NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "quiet".to_string(),
@@ -1168,7 +1170,7 @@ fn quiet_listed_graph_with(
     factories.insert("quiet".to_string(), Box::new(QuietProducerEntry::new()));
     for (id, node_type) in consumers {
         nodes.push(NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: (*id).to_string(),
@@ -1301,7 +1303,7 @@ fn listed_provisioning_warns_and_infos_are_pinned() {
         identity: "consumed".to_string(),
         prefix: "co".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),

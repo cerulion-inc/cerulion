@@ -6,7 +6,8 @@
 //! results topic, and one subscriber per `robot://state/{name}` topic. Every
 //! frame is a `std_msgs/String` holding JSON.
 //!
-//! A call is published as `{"call_id", "tool", "args"}`. The graph answers on
+//! A call is published as `{"call_id", "tool", "args"}`, plus `"caller"` when a
+//! remote caller is in scope ([`crate::caller`]). The graph answers on
 //! the results topic with a JSON object carrying the same `call_id`. The
 //! thread never blocks on an answer: it keeps every published call in a
 //! pending table, reads EVERY frame on the results topic in arrival order, and
@@ -152,9 +153,18 @@ impl Journal {
         }
     }
 
-    /// The serialized frame for one call, as it will be published.
+    /// The serialized frame for one call, as it will be published. Inside a
+    /// [`crate::caller::scope`] the frame also carries `"caller"`.
     pub fn frame(call_id: u64, tool: &str, args: &Value) -> String {
-        serde_json::json!({ "call_id": call_id, "tool": tool, "args": args }).to_string()
+        match crate::caller::remote() {
+            Some(caller) => serde_json::json!({
+                "call_id": call_id, "tool": tool, "args": args, "caller": caller
+            })
+            .to_string(),
+            None => {
+                serde_json::json!({ "call_id": call_id, "tool": tool, "args": args }).to_string()
+            }
+        }
     }
 
     /// Publish one call and wait for the graph's answer to it. A
@@ -290,7 +300,7 @@ const MIN_STRING_PAYLOAD: usize = RosString::WIRE_FIXED_SIZE + 8 * RosString::VA
 /// or not 8-byte aligned, so both are refused first; anything else the reader
 /// panics on is caught, so a malformed frame from any local publisher costs
 /// that frame, never the journal thread.
-fn decode_string(payload: &[u8]) -> Result<String, String> {
+pub(crate) fn decode_string(payload: &[u8]) -> Result<String, String> {
     if payload.len() < MIN_STRING_PAYLOAD {
         return Err(format!(
             "payload of {} bytes is shorter than the {MIN_STRING_PAYLOAD} a String needs",
@@ -310,7 +320,30 @@ fn decode_string(payload: &[u8]) -> Result<String, String> {
 }
 
 /// Decode every frame queued on `subscriber`, oldest first.
-fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
+pub(crate) fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
+    drain_stamped_strings(subscriber, topic)
+        .into_iter()
+        .map(|frame| frame.text)
+        .collect()
+}
+
+/// One decoded `std_msgs/String` frame with its wire metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct StampedString {
+    /// The text.
+    pub(crate) text: String,
+    /// The wire timestamp (`timestamp_ns`) its publisher stamped.
+    pub(crate) wire_ns: u64,
+    /// Its publisher's id ([`cerulion_core::ReceivedMessage::origin`]).
+    pub(crate) origin: u128,
+}
+
+/// Decode every frame queued on `subscriber`, oldest first, each with its
+/// wire timestamp and its publisher's id.
+pub(crate) fn drain_stamped_strings(
+    subscriber: &CerulionSubscriber,
+    topic: &str,
+) -> Vec<StampedString> {
     let mut out = Vec::new();
     let read = subscriber.try_receive(|message| {
         if message.header().schema_hash != RosString::SCHEMA_HASH {
@@ -318,7 +351,11 @@ fn drain_strings(subscriber: &CerulionSubscriber, topic: &str) -> Vec<String> {
             return;
         }
         match decode_string(message.payload()) {
-            Ok(text) => out.push(text),
+            Ok(text) => out.push(StampedString {
+                text,
+                wire_ns: message.header().timestamp_ns,
+                origin: message.origin(),
+            }),
             Err(reason) => tracing::warn!(topic, %reason, "dropped a malformed frame"),
         }
     });

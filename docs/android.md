@@ -19,17 +19,17 @@ and `cerulion_dds`.
 | CLI topic list, echo, info, hz | Yes | Yes | Remote access uses the netd gateway. |
 | CLI bag record, info, play | Yes | Yes | Recordings are standard MCAP files. |
 | Recorder | Yes | Yes | App and graph recording use the same recorder. |
-| netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint. |
+| netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint, and an app can dial a `tcp/` locator. |
 | mDNS discovery | Yes | Yes | Android needs a multicast lock and a LAN-dialable nonzero TCP listen port for its beacon. |
 | LAN access default | Open | Paired | The device identity remains discoverable, but topic announcements are withheld and LAN catalog, schema, and data requests are refused. |
 | wsd | Yes | Yes | Android control sockets use the abstract namespace. |
 | Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
 | viz | Yes | No | The visualization daemon requires a desktop. |
-| App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade. |
+| App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade: publish into topics and poll subscribed topics as JSON. |
 | Native nodes in an embedded app runtime | Not applicable | Yes | Link the node crates into the app's native library and list them with `cerulion_android::embed_nodes!`. Nodes are not loaded from separate libraries in an app. |
 | local-transport | Yes | Yes | It is for one app process and not for process groups. |
 | Robust mutexes | Yes | No | Android cannot recover a lock held by an exited process. |
-| Remote plane in an app | Yes | Not hosted | An app can expose its gateway but does not host the paired remote plane. |
+| Remote plane in an app | Yes | Yes | An app hosts the paired remote plane in its own process with the `remote` key and a linked host; see [Host the paired remote plane](#host-the-paired-remote-plane). A desk reads through it and cannot write. |
 | ROS 2 `rmw_cerulion` | Yes | Builds | Compiles for Android; `cerulion ros2 run` needs a ROS 2 installation on the device. |
 
 ## Toolchain
@@ -233,28 +233,78 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-cerulion_android = "1"
+cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 timer = { path = "../nodes/timer", default-features = false }
 printer = { path = "../nodes/printer", default-features = false }
-```
-
-Copy the iceoryx2 `[patch.crates-io]` block from the node workspace's
-`Cargo.toml` into this file too: a patch applies only in the workspace that
-declares it. `cerulion_android`, `cerulion_core` and `native_ros2_messages`
-must resolve from one source; a split fails to compile with two different
-`NodeEntry` traits. When `cerulion_android` comes from git or a local
-checkout, take the other two from the same place:
-
-```toml
-[dependencies]
-cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 
 [patch.crates-io]
 cerulion_core = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 native_ros2_messages = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 ```
 
-Its `src/lib.rs` is one macro call that maps each graph YAML `type:` to the
+Take `cerulion_android` from git at one commit, `<rev>`, until crates.io
+lists it: check `https://crates.io/crates/cerulion_android` before you use
+a version requirement. `cerulion_android`, `cerulion_core` and
+`native_ros2_messages` (and `cerulion_android_remote`, when the app hosts the
+remote plane) must resolve from one source; a split fails to compile with two
+different `NodeEntry` traits. A node workspace made by a released
+`cerulion` pins `cerulion_core` and `native_ros2_messages` from crates.io at
+that release's exact version, and the two `[patch.crates-io]` entries move
+them to `<rev>` only when `<rev>` carries that same version: pick the commit
+of the release your `cerulion` is, or a later commit with the same
+workspace version. A node workspace made by a `cerulion` built from a
+checkout uses `path` dependencies, which no patch moves; take
+`cerulion_android` from that same checkout with `path =` in place of `git`
+and `rev`. Once crates.io lists `cerulion_android`, a version requirement
+equal to the node workspace's pins replaces the git source and the two
+entries, for example `cerulion_android = "=2.0.0"` beside nodes made by
+`cerulion` 2.0.0. An app that hosts the remote plane keeps the git or `path`
+source: `cerulion_android_remote` is not on crates.io, so it and
+`cerulion_android` come from the same `rev` or checkout (see
+[Host the paired remote plane](#host-the-paired-remote-plane)).
+
+Whatever the source of `cerulion_android`, crates.io included, an app
+copies two things into its own build from the Cerulion release or commit it
+depends on:
+
+1. The iceoryx2 `[patch.crates-io]` entries. Add the `iceoryx2*` entries from
+   the `[patch.crates-io]` table in the root `Cargo.toml` of that release or
+   commit under the `[patch.crates-io]` header this file already has; a second
+   header makes the file fail to parse. Leave out the table's other entries,
+   such as `re_grpc_server`, which an app does not need. (The
+   `[patch.crates-io]` table that `cerulion workspace create` writes into a
+   node workspace's `Cargo.toml` holds only these `iceoryx2*` entries, so you
+   can copy them from there.) A patch applies only in the workspace that
+   declares it, and a published crate carries none, so a crates.io dependency
+   does not bring it along. Without them the library links upstream iceoryx2,
+   which has no Android shared-memory support.
+2. The Java facade, `com.cerulion.android.CerulionRuntime`. It is Java
+   source in the `java/` directory of `cerulion_android`, and the app compiles
+   it into its own classes. Use the copy from the same release or commit as
+   the Rust crate, because its native method declarations must match the
+   library.
+
+Three places hold that `java/` directory:
+
+- A GitHub release that carries `cerulion_android` attaches it as
+  `cerulion-android-java-<version>.tar.gz`, with its checksum in the
+  release's `SHA256SUMS`. The archive holds `java/` and the crate's
+  `LICENSE` under one `cerulion-android-java-<version>/` directory.
+- Cargo unpacks a git source under
+  `$CARGO_HOME/git/checkouts/cerulion-<hash>/<short rev>/crates/cerulion_android/java`
+  and a crates.io source under
+  `$CARGO_HOME/registry/src/index.crates.io-<hash>/cerulion_android-<version>/java`
+  (`CARGO_HOME` is `~/.cargo` unless you set it). `cargo metadata` prints the
+  exact manifest path; `java/` is beside it:
+
+  ```sh
+  cargo metadata --format-version 1 --manifest-path runtime/Cargo.toml \
+    | jq -r '.packages[] | select(.name == "cerulion_android") | .manifest_path'
+  ```
+
+- A local checkout of Cerulion has it at `crates/cerulion_android/java`.
+
+The runtime crate's `src/lib.rs` is one macro call that maps each graph YAML `type:` to the
 node's generated entry type:
 
 ```rust
@@ -276,8 +326,8 @@ runtime. `tools/scripts/android_jnilibs_gate.sh <jniLibs> myapp_runtime`
 checks the result: exactly one library per ABI, built for that ABI, every
 `LOAD` segment aligned to 16 KB, `JNI_OnLoad` exported and no node export such as
 `cerulion_node_info`. In `app/build.gradle`, set `minSdk 30`, the
-`abiFilters` you built, and add the `java/` directory of `cerulion_android`
-to `sourceSets.main.java.srcDirs`. Ship the graph as
+`abiFilters` you built, and add the facade's `java/` directory (one of the
+three places above) to `sourceSets.main.java.srcDirs`. Ship the graph as
 `app/src/main/assets/graph.yaml` with an explicit `prefix:`, because without
 one the runtime names the topics after the device's host name, and pass its
 text as `graph_yaml` in the start configuration.
@@ -302,6 +352,140 @@ error code 5; `start` still returns `OK` because it only queues the start, and
 that names the type and the linked types. `status` lists the linked types in
 `linked_nodes`.
 
+Give every output a node declares (each `#[output]` field) an entry with its
+`schema:` under that node's `outputs:` in the graph YAML: the graph creates a
+publisher only for a listed output. A node that declares an output the graph
+does not list fails the start with error code 5: `status` reports `state`
+`failed` with `last_error.code` 5 and a message that names the node and the
+output, so the graph never reports running while the node cannot publish.
+
+The runtime keeps a record of each node fire in memory, and keeps only the
+newest 100 000 fires, the same default as `cerulion graph run --trace-limit`.
+An older fire drops out when a new one arrives, so a graph that runs for days
+does not grow its memory with the number of fires.
+
+To send app events into a linked node, publish them on an app topic and read
+that topic in the graph through an absolute `source:` (a name that starts with
+`/`). No node in the graph produces the topic, so the graph attaches to the
+topic the app publishes. Here `logic` is a node type listed in the library's
+`embed_nodes!`:
+
+```json
+{
+  "graph_yaml": "<the text of graph.yaml>",
+  "publish": [{"topic": "/myapp/taps", "schema": "geometry_msgs/Vector3"}]
+}
+```
+
+```yaml
+prefix: myapp
+nodes:
+  - id: logic
+    type: logic
+    inputs:
+      - name: taps
+        source: /myapp/taps
+    outputs:
+      - name: state
+        schema: geometry_msgs/Vector3
+```
+
+Each `CerulionRuntime.publish("/myapp/taps", ...)` call is one frame on the
+node's input. A trigger input (`#[input(trigger)]`) ticks the node once per
+frame, in publish order; a burst larger than the input's `depth` (default 10)
+drops its oldest frames. The runtime creates each `publish` topic with a queue
+as deep as the deepest graph input that reads it, so any `depth` a node can
+declare, up to 64, holds that many frames, recorded or not. A node that
+reports a deeper input fails the start before the app creates any topic:
+`status` reports `state` `failed` with `last_error.code` 5 and a message that
+names the input, its depth and the limit of 64. A plain `#[input]` on a
+`period_ms` node holds the latest frame: the node produces nothing until the
+first publish, and then reads the newest value on each tick. The runtime
+creates every `publish` topic with room for a node that holds its latest
+value, so both kinds of input start.
+
+Each frame `publish` sends is stamped with the runtime clock, the clock the
+graph runs on and the frames of its nodes are stamped with: nanoseconds of
+`CLOCK_MONOTONIC`, the clock `System.nanoTime()` reads on Android. `SystemClock.elapsedRealtimeNanos()` is another clock: it
+also counts deep sleep. A recording keeps the stamp as the log time of each
+message. To stamp a frame with the time an event happened, not the time of
+the call, give that time to `publishStamped`:
+
+```java
+long tappedAt = System.nanoTime(); // read when the tap lands
+int code = CerulionRuntime.publishStamped(
+        "/myapp/taps", "{\"x\":1.5,\"y\":0.0,\"z\":2.0}", tappedAt);
+```
+
+A stamp in the past is taken as is. A negative stamp returns
+`INVALID_ARGUMENT` (3) at once. Otherwise `publishStamped` first checks the
+runtime state and the topic as `publish` does, with the same codes. Then a
+stamp more than one second ahead of the runtime clock returns
+`INVALID_ARGUMENT` (3) before the message is read, so a message `publish`
+refuses with `ENCODE` returns `INVALID_ARGUMENT` when its stamp is also too
+far ahead. A refused call sends nothing.
+
+To read a node's output in the app, list the topic under `subscribe` and
+call `CerulionRuntime.poll`. It takes the next message off the
+subscription's queue without waiting and appends it to a `StringBuilder` as
+the same JSON object text `publish` takes:
+
+```json
+{
+  "graph_yaml": "<the text of graph.yaml>",
+  "publish": [{"topic": "/myapp/taps", "schema": "geometry_msgs/Vector3"}],
+  "subscribe": [{"topic": "/myapp/logic/state", "schema": "geometry_msgs/Vector3", "depth": 10}]
+}
+```
+
+```java
+StringBuilder message = new StringBuilder();
+int code = CerulionRuntime.poll("/myapp/logic/state", message);
+if (code == CerulionRuntime.OK) {
+    JSONObject state = new JSONObject(message.toString()); // {"x":1.5,"y":0.0,"z":2.0}
+} else if (code == CerulionRuntime.EMPTY) {
+    // No new message: poll again later, for example on the next frame.
+} else if (code == CerulionRuntime.BUSY) {
+    // A start, a stop, or another publish or poll is in flight: retry.
+}
+```
+
+Only `OK` appends to the builder. A subscription's queue holds `depth`
+messages from each publisher of the topic; a graph output has one publisher,
+so it holds `depth` messages. When a publisher's part is full, its oldest
+message is dropped. Messages from one publisher come out oldest first;
+messages from different publishers keep no order between them. `status` counts
+each subscription under `subscribed`: `polled` messages `poll` returned,
+`dropped` messages missing from a publisher's message sequence, most often
+the full queue dropping its oldest, and also a send that failed after the
+publisher numbered it, and `undecodable` messages `poll` refused with
+`DECODE`. A frame too short for its wire header is skipped by the
+transport with a logged warning before `poll` sees it. It is never counted
+as `undecodable`, but when its publisher numbered it, the gap it leaves
+adds 1 to `dropped` at the next message from that publisher. A dropped message
+is counted from the gap in its publisher's message sequence, so a message
+dropped before the first one the subscription receives from that publisher
+is not counted. A message that
+does not decode, for example one of another schema, is still taken off the
+queue, so the next poll reads the one after it. The runtime creates every
+subscription after the graph build, which runs each node's `init`, and
+before the first tick, so a subscription receives every message a node
+sends from `tick`, from the first one on. A message a node sends from `init`
+is not in the queue unless the node's output declares `history_size` (see
+the [graph YAML reference](user-api.md#graph-yaml-reference)): the node's
+publisher then delivers its last `history_size` messages, up to the
+subscription's `depth`, at the graph's next loop pass, as to any late
+joiner, as long as the node keeps its publisher and forwards the history
+pump. A node made with the node macros does both. A hand-written
+`NodeEntry` must forward `pump_history` and `pump_history_at` to its
+`NodeContext`, because their default does nothing. A
+subscription can read a graph output, an app `publish` topic, or a
+topic another publisher in the process sends; a start logs a warning for a
+subscribe topic that is neither an app `publish` topic nor a graph output,
+because a misspelled topic polls `EMPTY` forever. `poll` reads a run that
+is `running`, and also one that is `finished`, until `stop`, so the last
+messages of a graph that ended can still be read.
+
 The app's graph topics are served by its gateway. A host sees them with
 `adb forward tcp:7683 tcp:7683` and
 `cerulion topic list --connect tcp/127.0.0.1:7683`. A `cerulion topic list`
@@ -322,7 +506,8 @@ returns an error code if the runtime is not ready or the message cannot be
 encoded. When `start` returns `OK`, status has already transitioned to `starting`
 and may have advanced to `running` before the next read. `publish` can return `BUSY`
 while start or stop is in progress, including while the start worker is finishing
-its lifecycle after status first reports `running`; retry a `BUSY` publish rather
+its lifecycle after status first reports `running`. It also returns `BUSY` while
+another `publish` or a `poll` holds the runtime lock. Retry a `BUSY` publish rather
 than dropping it. A `stop` issued while startup is still in flight is accepted
 and runs once startup finishes. Starting again after a failure or a finished
 graph first stops what is left of the previous run and closes LAN access, even
@@ -415,33 +600,66 @@ The configuration keys are:
 |---|---|
 | `graph_yaml` | Optional graph YAML text. |
 | `node_lib_dir` | Optional absolute path to node libraries, for a host runtime on the cross-process transport. A node type linked into the library wins over a library in this directory. The in-process transport an Android app uses refuses it for a graph with native nodes, with error code 5. |
-| `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
+| `listen` | Gateway listen endpoints. Defaults to `[]`. With an empty `listen` and an empty `connect`, the gateway is disabled. |
+| `connect` | Optional array of `tcp/<host>:<port>` locators the app dials, the mirror of `listen`. Defaults to `[]`. A peer that is not up yet does not fail the start: the app dials it again in the background. A locator that is not a well-formed `tcp/` locator (`quic/` and `tls/` included), a duplicate, or a value that is not an array of strings is rejected with error code 3. See [Dial a desk](#dial-a-desk). |
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
+| `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
-| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
+| `egress` | Optional array of canonical topics: the only topics the gateway sends to a LAN peer under `"lan_access": "open"`. `[]` sends none. Without the key, an `open` gateway sends every topic. Each topic must be a graph output or a publish topic. A non-canonical, duplicate or unknown topic, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` nothing is sent either way. See [Choose which topics leave the device](#choose-which-topics-leave-the-device). |
+| `ingress` | Optional array of canonical topics a LAN peer may publish into under `"lan_access": "open"`. Defaults to `[]`. Each topic must be read by a graph input and must be neither a graph output nor a publish topic; each frame must carry the schema hash of the inputs that read it. A non-canonical, duplicate or unread topic, a topic with another writer, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` no frame gets in. See [Let a LAN peer publish into the graph](#let-a-lan-peer-publish-into-the-graph). |
+| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon, and neither do `connect` locators. Defaults to `true`. Android passes multicast to the app only while it holds a `WifiManager.MulticastLock`, which needs the `android.permission.CHANGE_WIFI_MULTICAST_STATE` permission; see [Discovery and access](#discovery-and-access). |
+| `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
+| `remote` | Optional object `{ "enabled", "relay", "state_dir" }` that hosts the paired remote plane. `enabled` is required. `relay` is `"public"` (the default, for development only), `"disabled"`, or an array of relay URLs. `state_dir` defaults to `"remote"` and is a relative path inside the app files directory, without `.` or `..`. A missing `enabled`, an unknown key, another `relay` value, an empty relay list or a `state_dir` outside the files directory is rejected with error code 3. See [Host the paired remote plane](#host-the-paired-remote-plane). |
 
 Omitting `record.topics` records all graph output and app-published topics.
 Topics use canonical names with a leading `/`. Publish schemas must be known
 built-in schemas or available under `files/schemas/`; duplicate publish topics
 are rejected. `max_payload_bytes` defaults to 4096 and must be from 1 to
-1048576. JSON publish values support `Bool`, `I8` through `U64`, `F32`, `F64`,
-`String`, `Bytes`, and `StringFixed(n)`. `Bytes` uses an array of integers from
-0 to 255. The top-level publish value must be an object; unknown fields and
-unsupported field types are rejected. Missing fields use zero or empty values.
-The JSON text is limited to `max_payload_bytes * 8 + 65536` bytes before it is
-parsed. This allows for escaped strings, byte arrays, field names, and
-whitespace while bounding the input size.
+1048576. Publish reads JSON with the reader `cerulion` uses for a message typed
+as text (JSON is YAML; see [Message YAML](user-api.md#message-yaml)), so it takes
+every field type a schema declares, nested messages and arrays included: a
+`std_msgs/Header` field is `{"stamp": {"sec": 1, "nanosec": 2}, "frame_id":
+"map"}`, and `bytes` and `uint8[]` are arrays of integers from 0 to 255. The
+top-level publish value must be a JSON object, and unknown fields are rejected.
+A field the JSON leaves out, at any depth, is written as its zero value: `0`,
+`false`, an empty string or array, or a fixed array of zero values. An error
+names the field path, for example `pose.position.x: expected float64, got
+string`. The text must be strict JSON (no comments, `NaN`, unquoted keys
+or a number past the `float64` range), and a duplicate key is refused. A
+bare `-0` reads as `0`; write `-0.0` for a negative zero float. The JSON text
+is limited to `max_payload_bytes * 8 + 65536` bytes before it is parsed. This
+allows for escaped strings, byte arrays, field names, and whitespace while
+bounding the input size. A message is refused as soon as it passes
+`max_payload_bytes` while it is built, so a short text that leaves out many
+fields cannot build a large message. Publish allocates for each message: it
+is the app's convenience path, not the zero-copy path a node publishes on.
+
+Subscribe schemas must have only the field types poll reads: `Bool`, `I8`
+through `U64`, `F32`, `F64`, `String`, `Bytes`, and `StringFixed(n)`; a schema
+with a nested message or an array other than bytes is rejected with error
+code 3. `depth` defaults to 10 and must be from
+1 to 16. Duplicate subscribe topics are rejected, and so is a subscribe topic
+the app publishes or the graph outputs under a different schema. `poll`
+writes the fixed-size fields first and then the strings and byte arrays,
+each group in schema order. `Bytes` reads as an array of integers, a
+`StringFixed(n)` value ends at its first NUL byte, and a NaN or infinite
+float reads as `null`.
 
 The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
 `6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
-`11 BUSY`, `12 PANIC`, and `13 SPAWN`.
+`11 BUSY`, `12 PANIC`, `13 SPAWN`, `14 DECODE`, `15 EMPTY`, `16 RECEIVE`,
+`17 REMOTE_NOT_PROVISIONED`, and `18 REMOTE`. `EMPTY` is the `poll` result for
+an empty queue, not an error. `RECEIVE` means the transport refused to create a
+subscription (from `start`, in `last_error`) or to receive from one (from
+`poll`). `REMOTE_NOT_PROVISIONED` and `REMOTE` come from the paired remote
+plane; see [Host the paired remote plane](#host-the-paired-remote-plane).
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
-`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`, and
-`last_error`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
-`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+`lan_access`, `mdns_advertised`, `record_path`, `published`, `subscribed`,
+`recorder`, `last_error`, `node_failures`, and `remote`. State is `idle`, `starting`, `running`,
+`stopping`, `finished`, `stopped`, or `failed`; `last_error` is null or an object with a stable code and
 message. `finished` means a graph ended on its own after a node requested
 shutdown. Call `stop` to finalize its recording, then start again. Before
 initialization, the state is `uninitialized`. With recording disabled, a
@@ -458,15 +676,58 @@ snapshot can look like this:
   "mdns_advertised": true,
   "record_path": null,
   "published": {"/app/heartbeat": 2},
+  "subscribed": {},
   "recorder": null,
-  "last_error": null
+  "last_error": null,
+  "node_failures": [],
+  "remote": null
 }
 ```
+
+`node_failures` lists each graph node whose tick panicked, in graph order,
+as an object with the node's graph `node_id` and its first panic `message`.
+The runtime contains the panic: that node does not run again, the rest of
+the graph keeps running, and `state` stays `running`. A node is listed once.
+The list stays readable after `stop`. The next `start` whose config parses
+and passes its path checks clears it, also when that start then fails, for
+example on a node type that is not linked. A node that returns an error
+from its tick is not listed.
 
 The `recorder` summary is available after stop and includes message, channel,
 byte, per-topic, and output-path totals. App files are private to the app:
 recordings are stored in `files/bags/`, and custom schemas are read from
 `files/schemas/`.
+
+### Logs in logcat
+
+The runtime's own `tracing` lines, and those of every node linked into the
+app library, go to logcat under the tag `Cerulion`:
+
+```sh
+adb logcat -s Cerulion
+```
+
+Each line reads `<target>: <message> <field>=<value>...`, for example
+`cerulion_android::runtime: mDNS beacon registered port=7683`; span fields
+are not included. An `error` line has logcat priority `E`, `warn` has `W`,
+`info` has `I`, `debug` has `D` and `trace` has `V`.
+
+`embed_nodes!` installs the logcat subscriber when Java loads the library,
+so a node registration error reaches logcat too; `CerulionRuntime.init`
+installs it when the load did not. To keep your own `tracing` subscriber,
+write your own `JNI_OnLoad`, set your subscriber there as the global
+default, then call `cerulion_android::nodes::register`. The runtime then
+writes nothing to logcat, and `log_level` has no effect.
+
+The `log_level` start key sets the lowest level written, `info` unless set.
+Each start sets it again, so a start without the key returns to `info`. A
+start sets it just before it builds the graph and its components, so the
+lines of that build use it, and a start that fails after that puts the
+previous level back. A start refused earlier, for example because the
+runtime is already running or its config fails to parse or fails its path
+checks, never changes it. A release build of the app library keeps only `info` and
+above: its `debug` and `trace` lines are compiled out, whatever `log_level`
+says.
 
 ## Discovery and access
 
@@ -499,9 +760,9 @@ Choose the posture at runtime startup with the app's `lan_access` key. A start
 keeps access paired while it builds the gateway and opens the configured posture
 only once every component is ready; an `open` start announces its topics at that
 moment. A LAN peer
-carries no paired identity, and an app does not host the paired remote plane (see
-[remote access](remote_plane.md)), so under `paired` the app's topic data stays
-on the device. For local development on
+carries no paired identity, so under `paired` the app's topic data leaves the
+device only through the paired remote plane, when the app hosts it (see
+[Host the paired remote plane](#host-the-paired-remote-plane)). For local development on
 a trusted network, set `"lan_access": "open"`; the sample app honors the
 `lan_access` launch intent extra only in debuggable builds:
 
@@ -520,7 +781,9 @@ paired default. A non-Unicode `CERULION_LAN_ACCESS` value also fails closed to
 Stopping the runtime, or a start that fails, closes LAN access, withdraws every
 topic announcement, drops every registered bridge grant and empties the served
 catalog and schemas, so demand workers cannot restore grants from an earlier
-open run and no LAN peer sees the topics of a run that is not running.
+open run and no LAN peer sees the topics of a run that is not running. The
+next start's catalog lists that run's topics, schemas and observed frames
+only, never an earlier run's.
 
 The Android emulator's network sits behind NAT and does not pass multicast to
 the host, so test discovery from the device itself or from a physical device
@@ -533,16 +796,261 @@ written file in `record_path`; substitute its basename:
 adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
 ```
 
-Listen endpoints and the robot name are fixed for the process lifetime by the
-first start. A later start with a different robot name returns `BAD_STATE`.
-A first start with an empty `listen` fixes the gateway as disabled for the
-process; restart the app process to change either setting. One runtime at a
-time owns the gateway: while it runs, another runtime's start with a non-empty
-`listen` returns `BAD_STATE`; stop the first runtime before starting it.
+Listen endpoints, connect locators and the robot name are fixed for the
+process lifetime by the first start. A later start with a different `listen`,
+`connect` or robot name returns `BAD_STATE`. A first start with an empty
+`listen` and an empty `connect` fixes the gateway as disabled for the
+process; restart the app process to change any of these settings. One runtime
+at a time owns the gateway: while it runs, another runtime's start with a
+non-empty `listen` or `connect` returns `BAD_STATE`; stop the first runtime
+before starting it.
 App publish topics must not collide with graph output topics because graph
 topics are single-writer; a conflicting start returns `INVALID_ARGUMENT`.
-The gateway does not forward incoming topics to the app. JSON publishing
-supports only the field types listed above.
+`subscribe` reads topics of the app's own process: the gateway forwards no
+incoming topic to the app except the `ingress` topics, which go to the graph
+inputs that read them. JSON polling supports only the field types listed
+above for subscribe schemas.
+
+### Choose which topics leave the device
+
+An `open` gateway sends every topic the app serves. To open a desk connection
+while some topics stay off the LAN, list the topics a LAN peer may receive
+in `egress`. The hosted remote plane is not limited by this list (see the end
+of this section):
+
+```json
+{
+  "listen": ["tcp/127.0.0.1:7683"],
+  "lan_access": "open",
+  "egress": ["/app/state"],
+  "publish": [
+    {"topic": "/app/state", "schema": "std_msgs/String"},
+    {"topic": "/app/notes", "schema": "std_msgs/String"}
+  ]
+}
+```
+
+A demand for a listed topic is served. A demand for any other topic is
+refused: the demand GET is answered `refused` and no frame of the topic
+reaches that peer. An empty
+list refuses every topic. The catalog still names every topic the app serves,
+with its schema and liveness, so a desk can see that `/app/notes` exists but
+cannot receive it. A start with `egress` and an empty `listen` and `connect`
+builds no gateway, so the list has no effect and the start logs a warning.
+
+`egress` limits LAN peers only. With `remote` on, the plane the app hosts
+serves every topic to a paired desk with observe access (see
+[Host the paired remote plane](#host-the-paired-remote-plane)).
+
+### Let a LAN peer publish into the graph
+
+A graph input can read a topic that a desk or another device publishes. Give
+the input an absolute `source:`, list the topic in `ingress`, and set
+`"lan_access": "open"`:
+
+```json
+{
+  "listen": ["tcp/127.0.0.1:7683"],
+  "lan_access": "open",
+  "graph_yaml": "<a graph whose input reads source: /desk/cmd>",
+  "ingress": ["/desk/cmd"]
+}
+```
+
+The gateway checks each frame against the schema hash of the graph inputs
+that read the topic. A frame with another schema hash is dropped, and the
+first drop of a series logs a warning. A frame with the right hash
+reaches the inputs as a frame of an app publisher does. A desk sends such a
+topic from a graph that lists it under `network: egress:` (see
+[The egress/ingress model](networking.md#the-egressingress-model)), and the
+app demands it from the desk as a graph run does.
+
+Each `ingress` topic must be read by at least one graph input that declares
+its schema, as a `#[cerulion_node]` input does, and the inputs that declare a
+schema must declare the same one. An input that declares none, as a node
+entry written by hand can, is not checked against the others and gets the
+frames the declared schema lets in. The topic must be neither a graph output
+nor a publish topic, because a topic has one writer. A start that breaks one of
+these rules fails with error code 3, or with error code 5 for a schema no input
+declares or the inputs do not agree on, and the error names the topic.
+
+Under `"paired"` the gateway opens no ingress: it subscribes to no `ingress`
+topic on the LAN and demands none, so it refuses every frame a LAN peer
+publishes, and the start logs a warning. A start with `ingress` and an empty
+`listen` and `connect` builds no gateway, so the list has no effect and the
+start logs a warning too.
+
+Ingress has no sender identity. Under `open`, any host that reaches the
+gateway can publish into every `ingress` topic, and the app cannot tell one
+host from another. The paired remote plane an app can host checks who reads,
+but it takes no writes, so it is no way in for a desk either. Keep the list to
+the topics a desk must write. For a desk on USB, keep the listener on the
+loopback address, as the next section shows. The recording does not hold the
+frames of an `ingress` topic: `record.topics` takes graph outputs and publish
+topics only.
+
+### Reach a desk over USB with adb forward
+
+The configuration above listens on the device's loopback address only. Use it
+to serve a desk on USB without opening the app to the Wi-Fi network: no host on
+the network can reach `127.0.0.1` on the device, and a loopback endpoint raises
+no mDNS beacon, so `mdns_advertised` reads `false` and the app is not announced
+either. Other processes on the device can still reach a loopback listener, so
+keep the `egress` and `ingress` lists to the topics the desk needs. On the desk:
+
+```sh
+adb forward tcp:7683 tcp:7683
+cerulion topic list --connect tcp/127.0.0.1:7683
+```
+
+### Dial a desk
+
+Some networks block multicast or connections into the device, so a desk can
+neither discover the app nor dial it. When the app can still reach the desk,
+it can dial the desk instead: list the desk's locator in `connect`. The desk must listen on that locator, for
+example through a desk network daemon started with `CERULION_NETD_LISTEN` (see
+[Making a robot discoverable](networking.md#making-a-robot-discoverable)).
+
+```json
+{
+  "connect": ["tcp/192.0.2.20:7690"],
+  "lan_access": "open",
+  "egress": ["/app/state"],
+  "publish": [{"topic": "/app/state", "schema": "std_msgs/String"}]
+}
+```
+
+With an empty `listen` the app opens no port of its own and raises no beacon.
+The `lan_access` posture and the `egress` and `ingress` lists apply to a desk
+the app dials as they do to a desk that dials the app: under `paired` the
+desk's catalog request and topic demands are refused and no frame it publishes
+gets in, and under `open` only the `egress` topics are sent and only the
+`ingress` topics take its frames. A desk that is not listening yet does not fail the start; the app
+dials it again in the background, a few seconds apart. The app dials `tcp/`
+locators only. Like `listen`, `connect` is fixed for the process lifetime by the
+first start.
+
+The sample app reads a `connect` launch intent extra in debuggable builds only,
+as it does `lan_access`. The sample keeps its own `listen` entry, so the extra
+adds a dialed link next to its listener. For a desk on USB, `adb reverse` maps a port on the
+device's loopback address to the desk, and the app dials that port:
+
+```sh
+adb reverse tcp:7690 tcp:7690
+adb shell am start -n com.cerulion.sample/.MainActivity --es lan_access open --es connect tcp/127.0.0.1:7690
+```
+
+### Host the paired remote plane
+
+An app can host the paired remote plane in its own process: the iroh plane a
+`cerulion-remoted` robot serves (see [remote access](remote_plane.md)). A desk
+that the plane's access list pairs then reads the app's catalog, schemas and
+topics from another network, while `lan_access` stays `paired`. Every
+connection is checked against the plane's trust store; an unpaired desk is
+refused.
+
+The plane links iroh, so it lives in its own crate, `cerulion_android_remote`.
+That crate is not published to crates.io, because it links `cerulion_remoted`,
+which is not published either. Take it from git at the same `rev` as
+`cerulion_android`, or by `path` from the same checkout, so both resolve from
+one source; an app that hosts the plane therefore takes `cerulion_android`
+from git or a checkout too, with the `[patch.crates-io]` entries shown in
+[Graph nodes in an app](#graph-nodes-in-an-app):
+
+```toml
+[dependencies]
+cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+cerulion_android_remote = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+```
+
+The runtime crate lists the plane's host first in `embed_nodes!` (the node
+list may then be empty):
+
+```rust
+cerulion_android::embed_nodes! {
+    remote: cerulion_android_remote::Host,
+    "timer" => timer::TimerNodeEntry,
+}
+```
+
+The start enables it with the `remote` key:
+
+```json
+{
+  "remote": {"enabled": true, "relay": "public", "state_dir": "remote"},
+  "publish": [{"topic": "/app/state", "schema": "std_msgs/String"}]
+}
+```
+
+`relay` decides how a desk reaches the plane. `"public"` uses the public
+relays and discovery service of the iroh project, so a desk dials the app by
+its endpoint id alone; use it for development only, because the project runs
+them as a public service with no availability promise. `"disabled"` uses no
+relay and no discovery, so a desk dials the device's address with the port in
+`status`. A list of
+URLs uses relays you run. A URL that does not parse fails the start with error
+code 18.
+
+The plane reads its keys and trust state from `remoted/` under `state_dir`:
+`device_key` (the 32-byte device secret, whose public half is the endpoint
+id), `trust_store.mac_key`, `trust_store` and, once a desk is paired,
+`device_index.json`, the same files `cerulion-remoted` keeps under its state
+root. The plane never creates the keys or the trust store; without a device
+index no desk is paired yet, and a desk pairs through the plane as it does
+with a robot. Provision them on a host you trust and stream each one straight into
+the app's private files directory, for example with `adb` and a debuggable
+build:
+
+```sh
+adb shell run-as com.example.app mkdir -p files/remote/remoted
+for file in device_key trust_store.mac_key trust_store device_index.json; do
+  [ -f "remoted/$file" ] || continue
+  adb exec-in run-as com.example.app sh -c "cat > files/remote/remoted/$file" < "remoted/$file"
+done
+```
+
+Do not stage the keys in a shared directory such as `/data/local/tmp` on the
+way: another process that can read it could copy them and answer as the
+device.
+
+A start reads them before it builds anything else. When a key or the trust
+store is missing, or a file does not verify (a fresh install, a trust store
+bound to another device key, an empty `trust_store.mac_key` beside a trust
+store; the error names the file and the fix is to stream the real key again),
+the start fails: `status` reports `state` `failed` with `last_error.code` 17
+(`REMOTE_NOT_PROVISIONED`), nothing runs and nothing is served. Any other
+plane failure is code 18 (`REMOTE`): an app library that links no host, an
+endpoint that cannot bind, a second runtime in the same process with
+`remote.enabled` while another runtime's plane serves (one process hosts one
+plane, since both would answer under one device key), or a plane that stops
+serving on its own while the app runs, which also sets `state` to `failed`. The plane serves only once the
+start completes, and `stop` stops it before any other component.
+
+While it serves, `status` reports it:
+
+```json
+"remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"]}
+```
+
+An unspecified address (`0.0.0.0` or `[::]`) means every interface: a desk
+dials the device's own address with that port. A stop waits up to 5 seconds
+for the plane to close its endpoint; when the plane does not stop cleanly,
+`status` reports `state` `failed` with `last_error.code` 18, and every later
+start with `remote.enabled` in that process fails with code 18 too, since the
+old plane may still answer under the device key. Restart the app process to
+host the plane again.
+
+While it binds, the plane's iroh endpoint lists the network interfaces
+through netlink and through `/sys/class/net`. Android refuses both to apps,
+so logcat can show an `avc: denied` line for `netlink_route_socket`
+(`nlmsg_readpriv`) or for `sysfs_net`; the plane works without them.
+
+The plane reads the app's topics on the app's own transport, so the app runs
+no network daemon. It serves every topic of the app's transport to a paired
+desk; `egress` applies to LAN peers only. A desk can read; it cannot publish
+into the app. The plane refuses the `restart` and `engage-estop` verbs and the
+act verbs (`topic-publish`, `service-call`, `topic-snapshot`,
+`topic-echo-once`), which only the `cerulion-remoted` daemon serves.
 
 ## Single-process apps
 
@@ -566,7 +1074,7 @@ Enable the feature on the dependency used by the app:
 
 ```toml
 [dependencies]
-cerulion_core = { version = "1", features = ["local-transport"] }
+cerulion_core = { version = "=2.0.0", features = ["local-transport"] }
 ```
 
 ## Emulator end-to-end test
@@ -578,7 +1086,11 @@ sends a heartbeat data demand directly, without reading the catalog first,
 through a host probe (`crates/test_fixtures/android_e2e_demand_probe`). The
 paired app must refuse that demand twice in a row and send no frame. The open
 app must grant the same demand and deliver frames, which shows that the paired
-refusal comes from the posture and not from the topic or the allow-list. When
+refusal comes from the posture and not from the topic or the allow-list. A
+last run starts the open app in a new process with the `connect` extra behind
+`adb reverse`: the probe listens on the host and dials nothing, and the demand
+must be granted and frames delivered over the link the app dialed. The
+emulator passes no multicast, so the lane checks no mDNS discovery. When
 the probe expects `std_msgs/Int32`, the open app's frames must all be dropped
 on the schema hash. In every run the probe's ingress must lose no frame to a
 decode error, a local re-injection failure or its own LAN posture. No host
@@ -620,7 +1132,15 @@ The lane also checks the sample app's linked graph nodes:
   second, finalized recording with both topics;
 - a start after `am force-stop` succeeds in a new process over the files the
   killed process left;
-- no SELinux denial is logged for the app's domain in any run.
+- a `tracing` line from the runtime reaches logcat under the `Cerulion` tag;
+- with `remote` on, a fresh install fails its start with `REMOTE_NOT_PROVISIONED`
+  (17); after provisioning, a `paired` start reports its endpoint, and a
+  paired desk reads the app's catalog and one frame of `/app/heartbeat`
+  through the plane the app hosts;
+- no SELinux denial is logged for the app's domain in any run, except the two
+  refusals of network interface listing (`netlink_route_socket` and
+  `sysfs_net`) that Android gives every app. The hosted plane causes them
+  while it binds, but the lane accepts them in every run it scans.
 
 Run it locally with a booted API 30 emulator:
 
@@ -649,7 +1169,8 @@ code of every echo (device and host timer, paired and open heartbeat, the
 app's timer and relay), the report of every demand probe run
 (`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`), the report of
 both remote metadata probe runs (`remoted-probe-served.txt`,
-`remoted-probe-absent.txt`), and the pulled
+`remoted-probe-absent.txt`), the hosted plane's start status and paired desk
+read (`hosted-status.txt`, `hosted-desk.txt`), and the pulled
 MCAP files (`phase-a.mcap`, `app.mcap`, `app-restart.mcap`) there. The script
 needs a dedicated device: it refuses to start while a `cerulion` or
 `cerulion-netd` process is running, and clears only its own directory
@@ -696,8 +1217,11 @@ abstract socket access depend on process ownership and SELinux policy. Native
 node libraries are built on a host and retain their target-triple directory
 when copied to a device. An Android app runs only the graph nodes linked into
 its native library, cannot run a graph with `process_groups` (error code 5),
-cannot host the paired remote plane, and cannot run `cerulion viz`. A `tracing`
-line logged by a node in an app does not reach logcat. A `cerulion topic list`
-run on the device cannot see an app's topics; read them from a host through
-the app's gateway. Emulator networking does not pass multicast to the host, so
-test mDNS from a physical device or from the device itself.
+and cannot run `cerulion viz`. A desk cannot publish into an app through the
+paired remote plane, and the plane an app hosts refuses `restart`,
+`engage-estop` and the act verbs. A line
+logged through the `log` crate instead of `tracing` does not reach logcat. A
+`cerulion topic list` run on the device cannot see an app's topics; read them
+from a host through the app's gateway. Emulator networking does not pass
+multicast to the host, so test mDNS from a physical device or from the device
+itself.

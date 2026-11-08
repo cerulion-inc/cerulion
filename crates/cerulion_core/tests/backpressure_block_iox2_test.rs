@@ -82,7 +82,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "bp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -97,7 +97,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -211,6 +211,7 @@ fn block_input_meta(depth: usize) -> InputMeta {
         backpressure: BackpressurePolicy::Block,
         expect_within_ms: None,
         accumulate: false,
+        consume: Default::default(),
     }
 }
 
@@ -242,7 +243,7 @@ fn draining_block_graph(
         prefix: "dbp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -257,7 +258,7 @@ fn draining_block_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -434,7 +435,7 @@ fn mixed_block_dropoldest_block_consumer_still_defers() {
         prefix: "mbp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -449,7 +450,7 @@ fn mixed_block_dropoldest_block_consumer_still_defers() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "blocker".to_string(),
@@ -462,7 +463,7 @@ fn mixed_block_dropoldest_block_consumer_still_defers() {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
@@ -567,7 +568,7 @@ fn block_declared_depth_honored_beyond_global_default() {
         prefix: "depbp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -582,7 +583,7 @@ fn block_declared_depth_honored_beyond_global_default() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -704,7 +705,7 @@ fn mixed_topic_block_consumer_stays_lossless_under_a_flood() {
         prefix: "mdp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -719,7 +720,7 @@ fn mixed_topic_block_consumer_stays_lossless_under_a_flood() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "blocker".to_string(),
@@ -732,7 +733,7 @@ fn mixed_topic_block_consumer_stays_lossless_under_a_flood() {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
@@ -981,7 +982,7 @@ fn a_trace_driven_plan_reaches_the_block_and_non_block_level_seams() {
     let (mut config, mut factories) = block_graph();
     config.prefix = "bpplan".to_string();
     config.nodes.push(NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "solo".to_string(),
@@ -1076,7 +1077,7 @@ fn the_graph_runtime_pause_wrappers_drive_the_seam_on_the_fused_block_path() {
     // level seam in the same step and pins the report's insertion order across
     // the two seams (`producer` idx 0, `consumer` idx 1, `solo` idx 2).
     config.nodes.push(NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "solo".to_string(),
@@ -1365,7 +1366,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
         prefix: "pausedeliv".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -1380,7 +1381,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
                 ros2: None,
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 id: "listener".to_string(),
                 node_type: "drain_all_listener".to_string(),
@@ -1406,6 +1407,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
             accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )

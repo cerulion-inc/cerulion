@@ -295,7 +295,7 @@ fn build_watcher(obs: Arc<CrashObs>) -> GraphRuntime {
         identity: "liveliness_crash_test".to_string(),
         prefix: "lcr".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "cons".to_string(),

@@ -375,9 +375,10 @@ pub struct NetworkBlock {
     /// (validated at graph-load).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<String>,
-    /// Certificate files for `quic/` locators in `listen` / `connect`.
-    /// Graph-load validation refuses the block on a graph with no `quic/`
-    /// locator, and a `quic/` locator without the files it needs.
+    /// Certificate files for `quic/` and `tls/` locators in `listen` /
+    /// `connect`. Graph-load validation refuses a block that sets no file,
+    /// each file without the `quic/` or `tls/` locator that reads it, and a
+    /// `quic/` or `tls/` locator without the files it needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<NetworkTls>,
     /// The put reliability of every `egress` entry that sets no
@@ -743,26 +744,29 @@ pub struct NodeDef {
     /// in v1). Mutually exclusive with `type:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ros2: Option<Ros2NodeDef>,
-    /// OPTIONAL per-node execution opt-out: `fuse: false` ENDS any fused
-    /// chain at this node.
+    /// OPTIONAL per-node executor override, read when a process hosts more
+    /// than one node.
     ///
-    /// Absent means the node does not end a chain, which is the default for
-    /// every node that does not say otherwise. `true` is accepted and means
-    /// the same as absent, so a graph may state the default explicitly
-    /// without that reading as a request for something different.
+    /// Executor units are opt in: without a profile the nodes of a process
+    /// run as one unit, one level loop. `isolate: true` gives this node a unit
+    /// of its own, on its own thread, with or without a profile (a `block`
+    /// flow still keeps its producer and consumers together; a unit runs a
+    /// contiguous band of levels, so without a profile a node past this
+    /// node's level runs in a later unit when no node of the process's unit
+    /// feeds it at the level below and that unit starts at a lower level).
+    /// With the graph's profile every node starts a unit and a linear chain
+    /// of trigger edges shares one unit where the profile shows the merge
+    /// stays within its tick budget; there `isolate: false` keeps this node
+    /// in the unit of the nodes that trigger it whatever those rules say,
+    /// where the joined unit keeps its band of levels: it joins only the
+    /// producers whose units keep it, and runs in a unit of its own when it
+    /// joins none. Without a profile `isolate: false` changes nothing. Absent
+    /// leaves the choice to those rules. `cerulion graph plan` shows the units
+    /// and why each one starts.
     ///
-    /// The opt-out is per INSTANCE rather than per node TYPE because whether
-    /// a consumer should pull its producer's period along with it is a
-    /// property of the deployment, not of the code: the same logger type is a
-    /// best-effort tail in one graph and a control node in another. Fusion
-    /// converts consumer lag into head-node period slip, which is what a
-    /// control chain wants and a best-effort tail does not.
-    ///
-    /// NOTHING in the executor reads this yet: an opted-out node appears in
-    /// the resolved decision that is logged at graph build and in no
-    /// execution path.
+    /// This key replaces `fuse: false`, which is refused at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuse: Option<bool>,
+    pub isolate: Option<bool>,
     /// OPTIONAL per-instance values for the node type's `#[param]` fields:
     /// a flat map of param name to scalar (`params: {gain: 2.5, frame_id:
     /// left}`). Absent names keep the macro default. Resolved ONCE at graph

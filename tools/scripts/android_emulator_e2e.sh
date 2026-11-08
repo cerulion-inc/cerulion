@@ -25,7 +25,8 @@ build() {
   # The remote metadata probe runs on the device beside its netd. It is a
   # separate invocation: the example builds with cerulion_remoted's dev
   # dependencies, whose features must not reach the CLI and netd binaries.
-  cargo ndk -t "$ABI" --platform 30 build -p cerulion_remoted --example android_e2e_remoted_probe
+  cargo ndk -t "$ABI" --platform 30 build -p cerulion_remoted --example android_e2e_remoted_probe \
+    --example android_e2e_hosted_desk
   (cd "$ROOT/examples/basic_timer" && cargo ndk -t "$ABI" --platform 30 build)
   # The app ships ONE native library: the sample runtime library, which
   # links cerulion_android and the graph's nodes. `cargo ndk -o` would also
@@ -139,6 +140,7 @@ HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
 DEV_REMOTED_PROBE="$DEV/android_e2e_remoted_probe"
+DEV_HOSTED_DESK="$DEV/android_e2e_hosted_desk"
 GRAPH_PID="$DEV/graph.pid"
 NETD_PID="$DEV/netd.pid"
 CHECKS=0
@@ -149,6 +151,7 @@ started_graph=0
 started_app=0
 created_dev=0
 added_forward=0
+added_reverse=0
 # The host netd can only be spawned by this run's own CLI invocations into
 # this run's private HOST_STATE, so its pid file alone proves ownership;
 # no separate flag is needed.
@@ -222,6 +225,9 @@ APP_IDENTITY="$(sed -nE 's/.*CerulionRuntime\.init\(getFilesDir\(\)\.getAbsolute
 [[ -n "$APP_IDENTITY" ]] ||
   fail "app identity" "could not read the robot name the sample app passes to CerulionRuntime.init"
 PROBE_ENDPOINT=tcp/127.0.0.1:7683
+# The host port the connect run's probe listens on. `adb reverse` maps the
+# same port on the device's loopback to it, and the app dials that.
+CONNECT_PORT=7690
 # probe_refuses LABEL WANT ARG...: the probe refuses a bad argument, or an
 # endpoint its session cannot open, before it demands anything, so this needs
 # no device: exit 1, WANT in its output, and no report line.
@@ -236,12 +242,17 @@ probe_refuses() {
   fi
 }
 probe_argument_error() { probe_refuses "probe argument errors" "$@"; }
-# run_probe LABEL EXPECT SCHEMA FILE: one direct data demand for the heartbeat
-# over a 10 s window, judged by android_e2e_probe_verdict.sh. `topic echo`
-# reads the catalog before it demands data; the probe demands without one.
+# run_probe LABEL EXPECT SCHEMA FILE [--listen LOCATOR]: one direct data
+# demand for the heartbeat over a 10 s window, judged by
+# android_e2e_probe_verdict.sh. `topic echo` reads the catalog before it
+# demands data; the probe demands without one. The probe dials the app at
+# PROBE_ENDPOINT, or with `--listen` it listens on LOCATOR for the app to dial.
 run_probe() {
   local label=$1 expect=$2 schema=$3 file=$4 rc=0 out verdict
-  out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$PROBE" "$PROBE_ENDPOINT" /app/heartbeat \
+  shift 4
+  local -a endpoint=("$PROBE_ENDPOINT")
+  (( $# == 0 )) || endpoint=("$@")
+  out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$PROBE" "${endpoint[@]}" /app/heartbeat \
     "$schema" 10)" || rc=$?
   printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
   (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
@@ -318,6 +329,8 @@ cleanup() {
   done
   (( added_forward == 1 )) &&
     "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
+  (( added_reverse == 1 )) &&
+    "${ADB[@]}" reverse --remove "tcp:$CONNECT_PORT" >/dev/null 2>&1
   HOST_NETD_OWNED && kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1
   "${ADB[@]}" shell logcat -d > "$OUT/logcat.txt" 2>&1
   device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"%s\\n\" \"--- \$f ---\"; cat \"\$f\"; done' sh {} +" \
@@ -362,7 +375,9 @@ probe_argument_error "window 'ten' is not a whole number of seconds" "$PROBE_END
   /app/heartbeat std_msgs/String ten
 probe_argument_error 'window must be at least one second' "$PROBE_ENDPOINT" /app/heartbeat \
   std_msgs/String 0
-pass "probe argument errors" "cases=6 rc=1 no report"
+probe_argument_error 'usage: android-e2e-demand-probe' --listen "$PROBE_ENDPOINT" /app/heartbeat \
+  std_msgs/String
+pass "probe argument errors" "cases=7 rc=1 no report"
 # A connect endpoint zenoh cannot parse: the probe's session does not open.
 probe_refuses "probe setup error" "the probe's session did not open" not-an-endpoint \
   /app/heartbeat std_msgs/String 1
@@ -406,6 +421,7 @@ device "mkdir -p '$DEV/home/.cerulion' && printf '%s' '{\"account_id\":\"0011223
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/examples/android_e2e_remoted_probe" "$DEV_REMOTED_PROBE" >/dev/null
+"${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/examples/android_e2e_hosted_desk" "$DEV_HOSTED_DESK" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/Cargo.toml" "$DEV/basic_timer/Cargo.toml" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/graphs" "$DEV/basic_timer/graphs" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/nodes" "$DEV/basic_timer/nodes" >/dev/null
@@ -648,6 +664,14 @@ if ! grep -q '"nodes":3' <<<"$open_status" ||
   fail "app linked nodes" "status=${open_status:-none}"
 fi
 pass "app linked nodes" "nodes=3 linked_nodes=printer,relay,timer pid=$open_pid (paired run pid=$paired_pid)"
+# The runtime's own `tracing` lines reach logcat under the Cerulion tag: the
+# open run listens on a fixed TCP port, so the runtime logs whether its mDNS
+# beacon was raised, at info or warn.
+runtime_line="$(device logcat -d --pid="$open_pid" -s Cerulion:V 2>/dev/null | tr -d '\r' |
+  grep -m1 'cerulion_android::runtime: mDNS beacon' || true)"
+[[ -n "$runtime_line" ]] ||
+  fail "runtime line in logcat" "no Cerulion-tagged mDNS beacon line from pid $open_pid"
+pass "runtime line in logcat" "$runtime_line"
 pass "app start after kill" "start=0 in pid $open_pid after force-stop of pid $paired_pid, stale files tolerated"
 # The open `host_list` and `host_echo` spawned a new host netd: stop it too.
 stop_host_netd
@@ -792,11 +816,120 @@ printf '%s\n' "$restart_info" > "$OUT/app-restart-bag-info.txt"
 assert_node_rows "app restart bag node frames" "$restart_info" $((restart_stopped_ms - restart_started_ms))
 pass "app restart same process" "start=0 and stop=0 twice in pid $open_pid, second bag $restart_bag"
 
+# Connect: an open app in a new process dials the host (connect locators are
+# fixed for the process lifetime). The probe listens on the host and dials
+# nothing, and `adb reverse` carries the app's dial of the device's loopback
+# to it, so the only link is the one the app opens. The restart echo spawned
+# a host netd: stop it, so the app is the only peer left to answer.
+stop_host_netd
+rev_rc=0
+rev_out="$("${ADB[@]}" reverse --no-rebind "tcp:$CONNECT_PORT" "tcp:$CONNECT_PORT" 2>&1)" || rev_rc=$?
+(( rev_rc == 0 )) ||
+  fail "adb reverse" "tcp:$CONNECT_PORT failed (--no-rebind refuses to replace an existing reverse): $rev_out"
+added_reverse=1
+device "am force-stop '$APP'"
+device "am start -n '$APP/.MainActivity' --es lan_access open --es connect 'tcp/127.0.0.1:$CONNECT_PORT'" >/dev/null
+connect_pid=
+connect_ready=0
+deadline=$((SECONDS + 30))
+while (( SECONDS < deadline )); do
+  connect_pid="$(device "pidof '$APP'" 2>/dev/null | tr -d '\r' || true)"
+  connect_log=
+  if [[ "$connect_pid" =~ ^[0-9]+$ && "$connect_pid" != "$open_pid" ]]; then
+    connect_log="$(device logcat -d --pid="$connect_pid" -s CerulionSample:I 2>/dev/null |
+      tr -d '\r' || true)"
+  fi
+  if grep -q 'start=0' <<<"$connect_log"; then
+    connect_ready=1
+    break
+  fi
+  sleep 1
+done
+(( connect_ready == 1 )) ||
+  fail "connect app start" "no start=0 from a new app process: pid=${connect_pid:-none} log=${connect_log:-none}"
+pass "connect app start" "start=0 in pid $connect_pid, dialing tcp/127.0.0.1:$CONNECT_PORT"
+run_probe "connect direct demand" connect std_msgs/String connect-demand-probe.txt \
+  --listen "tcp/127.0.0.1:$CONNECT_PORT"
+
+# Hosted remote plane: the app hosts the paired plane in its own process,
+# with the relay disabled and LAN access left paired. A fresh install (no
+# files/remote) must fail the start: status reports failed with
+# REMOTE_NOT_PROVISIONED (17) and no plane. Once the desk tool provisions
+# the plane's files and they are copied into the app, a paired desk on the
+# device reads the catalog and a heartbeat frame over loopback.
+hosted_line=
+# hosted_start <label> <pattern>: a new app process with the remote extra;
+# sets hosted_line to its first sample log line matching the pattern.
+hosted_start() {
+  local label=$1 want=$2 pid deadline
+  hosted_line=
+  device "am force-stop '$APP'"
+  device "am start -n '$APP/.MainActivity' --es remote disabled" >/dev/null
+  deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    pid="$(device "pidof '$APP'" 2>/dev/null | tr -d '\r' || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      hosted_line="$(device logcat -d --pid="$pid" -s CerulionSample:V 2>/dev/null |
+        tr -d '\r' | grep -E -m1 "$want" || true)"
+      [[ -n "$hosted_line" ]] && return 0
+    fi
+    sleep 1
+  done
+  fail "$label" "no app log line matching '$want'"
+}
+device "run-as '$APP' rm -rf files/remote"
+# `start` only queues the start: its result is the status the sample logs.
+hosted_start "hosted plane, fresh install" '"last_error":\{"code":17,'
+if ! grep -q '"state":"failed"' <<<"$hosted_line" || ! grep -q '"remote":null' <<<"$hosted_line"; then
+  fail "hosted plane, fresh install" "the failed start reports another state or a plane: $hosted_line"
+fi
+pass "hosted plane, fresh install" "state=failed last_error.code=17 (REMOTE_NOT_PROVISIONED) remote=null"
+# The desk tool's keys come from fixed seeds and serve this test only, so
+# writing them under the device scratch directory first is harmless.
+desk_out="$(device "'$DEV_HOSTED_DESK' provision '$DEV/hosted-state'" 2>&1)" ||
+  fail "hosted plane provisioning" "$desk_out"
+device "run-as '$APP' mkdir -p files/remote/remoted"
+for file in device_key trust_store.mac_key trust_store device_index.json; do
+  device "cat '$DEV/hosted-state/remoted/$file' | run-as '$APP' sh -c 'cat > files/remote/remoted/$file'"
+done
+device "rm -rf '$DEV/hosted-state'"
+pass "hosted plane provisioning" "$(tr -d '\r' <<<"$desk_out")"
+hosted_start "hosted plane start" '"remote":\{"endpoint_id"'
+printf '%s\n' "$hosted_line" > "$OUT/hosted-status.txt"
+grep -q '"lan_access":"paired"' <<<"$hosted_line" ||
+  fail "hosted plane start" "LAN access is not paired: $hosted_line"
+hosted_eid="$(grep -oE '"endpoint_id":"[0-9a-f]{64}"' <<<"$hosted_line" | cut -d'"' -f4)"
+hosted_socket="$(grep -oE '"bound_sockets":\["[^"]+"' <<<"$hosted_line" | cut -d'"' -f4)"
+hosted_port="${hosted_socket##*:}"
+[[ -n "$hosted_eid" && "$hosted_port" =~ ^[0-9]+$ ]] ||
+  fail "hosted plane start" "no endpoint id and port in: $hosted_line"
+pass "hosted plane start" "endpoint=$hosted_eid socket=$hosted_socket lan_access=paired"
+desk_rc=0
+desk_out="$(device "'$DEV_HOSTED_DESK' read '$hosted_eid' '$hosted_port' /app/heartbeat std_msgs/String" 2>&1)" ||
+  desk_rc=$?
+printf 'rc=%s\n%s\n' "$desk_rc" "$desk_out" > "$OUT/hosted-desk.txt"
+desk_fact="$(tr -d '\r' <<<"$desk_out" | grep '^hosted_desk mode=read ' || true)"
+if (( desk_rc != 0 )) || [[ "$desk_fact" != 'hosted_desk mode=read topic=/app/heartbeat catalog_schema=std_msgs/String frames=1 endpoint=provisioned' ]]; then
+  fail "hosted plane paired read" "rc=$desk_rc output=$desk_out"
+fi
+pass "hosted plane paired read" "${desk_fact#hosted_desk }"
+device "am force-stop '$APP'"
+device "run-as '$APP' rm -rf files/remote"
+
 "${ADB[@]}" logcat -d > "$OUT/logcat-open.txt" 2>&1
 app_log="$(tr -d '\r' < "$OUT/logcat-open.txt")"
 grep -q 'start=0' <<<"$app_log" || fail "app start" "start=0 absent"
-denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
+# Android refuses apps two ways of listing the network interfaces: the
+# netlink link dump (RTM_GETLINK, its own tag b/155595000) and the
+# /sys/class/net tree (label sysfs_net). The hosted remote plane's iroh
+# endpoint tries both while it binds and works without them, as the paired
+# read above shows. Audit logs whichever it records first, so those two, and
+# only those two (the sysfs one for reading permissions only), are expected.
+interface_listing='avc: denied \{ nlmsg_readpriv \} .*tclass=netlink_route_socket|avc: denied \{ ((search|getattr|open|read) )+\} .*tcontext=u:object_r:sysfs_net:s0 '
+app_denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
   grep 'avc: denied' | grep 'scontext=u:r:untrusted_app' | grep -v 'runas_app' || true)"
+denials="$(grep -Ev "$interface_listing" <<<"$app_denials" || true)"
+listing_refusals="$(grep -cE "$interface_listing" <<<"$app_denials" || true)"
 [[ -z "$denials" ]] || fail "app SELinux" "untrusted_app denial was logged: $denials"
-pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open and restart runs (no dlopen or execute denial)"
+pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open, restart, connect and hosted runs (no dlopen or execute denial; interface listings refused as Android does for apps: $listing_refusals)"
 echo "android e2e: $CHECKS checks passed"

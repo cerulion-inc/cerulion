@@ -120,7 +120,7 @@ fn run_degrade() -> (u64, u64) {
         prefix: "cbd".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -129,7 +129,7 @@ fn run_degrade() -> (u64, u64) {
                 outputs: vec![vec3_out("out"), vec3_out("aux_out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "depth_consumer".to_string(),
@@ -149,7 +149,7 @@ fn run_degrade() -> (u64, u64) {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),

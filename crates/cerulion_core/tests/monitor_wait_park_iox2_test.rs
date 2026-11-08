@@ -216,7 +216,7 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         identity: "mwp_ticker".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
@@ -264,7 +264,7 @@ fn in_process_chain_graph(
         prefix: "mwp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -279,7 +279,7 @@ fn in_process_chain_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -328,7 +328,7 @@ fn consumer_graph(
         identity: "mwp_consumer".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
@@ -633,7 +633,7 @@ fn mixed_rank_graph(
         prefix: "mwp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -648,7 +648,7 @@ fn mixed_rank_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "local_consumer".to_string(),
@@ -661,7 +661,7 @@ fn mixed_rank_graph(
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ext_consumer".to_string(),
@@ -705,9 +705,11 @@ fn mixed_rank_graph(
 /// runtime's own resolved state, the one site the wait policy line also reads,
 /// never from that line's text.
 ///
-/// The data-wake term below is host-gated: off macOS it is false for every graph,
-/// so what carries this arm there is the armed-topic assertion and the registry
-/// assertion beside it, rather than the rung's own verdict.
+/// The data-wake term below is host-gated: it is false for every graph on a host
+/// with no doorbell wake word (macOS before 14.4 or with the os_sync tier off, and
+/// targets other than Linux, Android and macOS), so what carries this arm there
+/// is the armed-topic assertion and the registry assertion beside it, rather
+/// than the rung's own verdict.
 #[test]
 #[serial]
 fn triggers_produced_in_process_resolve_no_primary_and_no_data_wake() {
@@ -834,7 +836,7 @@ fn sync_input_rank_graph(
         prefix: "mwp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -849,7 +851,7 @@ fn sync_input_rank_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "local_consumer".to_string(),
@@ -862,7 +864,7 @@ fn sync_input_rank_graph(
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "pairer".to_string(),
@@ -951,7 +953,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
         identity: "mwp_xg_producer".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "feeder".to_string(),
@@ -1015,7 +1017,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
         identity: "mwp_xg_consumer".to_string(),
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "watcher".to_string(),
@@ -1212,10 +1214,12 @@ fn a_multi_publisher_topic_this_runtime_also_writes_is_armable() {
 /// alone. Zero on its own would not say much: it is also what a host with no wake
 /// word and a removed rung produce. So the same drive runs twice, once on the
 /// chain and once on a graph whose trigger has a writer that is not a node of
-/// this runtime and really rings, and the chain's zero is read against that graph's nonzero. The pair is
-/// macOS-only: off macOS there is no rung to judge and only the park-entry
-/// premise runs. On macOS it is skipped, with a recorded reason, where the host
-/// carries no usable os_sync backend.
+/// this runtime and really rings, and the chain's zero is read against that graph's nonzero. The pair
+/// runs where the park reaches the rung: on Linux and Android without a CPU
+/// monitor-wait primitive, and on macOS with a usable os_sync backend. Elsewhere
+/// it is skipped with a recorded reason (a hardware park performs every slice,
+/// so the rung is never reached), and on targets with no wake word only the
+/// park-entry premise runs.
 #[test]
 #[serial]
 fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
@@ -1239,16 +1243,19 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
         "the parked live drive must route its idle through the park, or the \
          counter below is zero for the wrong reason"
     );
-    #[cfg(target_os = "macos")]
-    if !cerulion_core::doorbell::wake_word_block_primitive_available() {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    if !cerulion_core::doorbell::wake_word_block_primitive_available()
+        || cerulion_core::monitor_wait::monitor_wait_available()
+    {
         eprintln!(
-            "SKIP: no usable os_sync backend on this host, so a zero block count \
-             says nothing about the producer term"
+            "SKIP: this park never reaches the doorbell rung on this host (no wake \
+             word, or a CPU monitor-wait primitive performs every slice), so a zero \
+             block count says nothing about the producer term"
         );
         runtime.shutdown();
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     assert_eq!(
         runtime.park_wake_word_block_count_for_test(),
         0,
@@ -1262,7 +1269,7 @@ fn an_in_process_chain_takes_no_wake_word_block_from_the_doorbell_rung() {
     // by a thread that is not a node of this runtime, with that thread ringing.
     // Its nonzero count is what makes the zero above a decision rather than an
     // absent capability.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     {
         let ns = mwp_ns("chainctl");
         let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
@@ -1346,7 +1353,7 @@ fn a_publisher_arms_every_topic_it_publishes_and_reports_the_planned_set() {
         nodes: vec!["ta", "tb"]
             .into_iter()
             .map(|id| NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
@@ -1529,34 +1536,40 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
         0,
         "rings carry no data — the wake is record-only and must not fire the consumer"
     );
-    // On macOS the park has no CPU monitor-wait primitive, so its idle is a
-    // KERNEL BLOCK on the doorbell's wake word rather than a pacing nap. This
-    // graph carries no barrier participant and no credit edge, so the shared
-    // wake-word block counter is attributable to the doorbell rung alone, which
-    // makes it the seam that fails if that rung is removed or the macOS ring
-    // goes back to being a no-op stub.
+    // Without a CPU monitor-wait primitive (macOS always; Linux and Android
+    // hosts without WAITPKG or WFE) the park's idle is a KERNEL BLOCK on the
+    // doorbell's wake word rather than a pacing nap. This graph carries no
+    // barrier participant and no credit edge, so the shared wake-word block
+    // counter is attributable to the doorbell rung alone, which makes it the seam
+    // that fails if that rung is removed or the ring goes back to bumping only
+    // its counter.
     //
-    // Asserted in BOTH directions against the host fact the rung is gated on,
-    // so a host without the Apple os_sync family (macOS before 14.4, or
-    // CERULION_DOORBELL_OS_SYNC=0 in the invoking shell) is a judged arm rather
-    // than a skipped one: the counter must then be exactly 0, which is what a
-    // rung that ignored its own gate would fail.
-    #[cfg(target_os = "macos")]
+    // Asserted in BOTH directions against the host facts the rung is gated on,
+    // so a host whose park never reaches the rung (macOS before 14.4 or
+    // CERULION_DOORBELL_OS_SYNC=0; a CPU that carries the primitive, whose
+    // hardware park performs every slice) is a judged arm rather than a skipped
+    // one: the counter must then be exactly 0, which is what a rung that ignored
+    // its own gate would fail.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     {
         let blocks = runtime.park_wake_word_block_count_for_test();
-        if cerulion_core::doorbell::wake_word_block_primitive_available() {
+        if cerulion_core::doorbell::wake_word_block_primitive_available()
+            && !cerulion_core::monitor_wait::monitor_wait_available()
+        {
             assert!(
                 blocks > 0,
-                "the macOS park must KERNEL-BLOCK on the doorbell wake word, not \
-                 pace on its recheck nap - no barrier and no credit edge exist \
-                 here, so this counter can only have come from the doorbell rung"
+                "a park without a CPU monitor-wait primitive must KERNEL-BLOCK on the \
+                 doorbell wake word, not pace on its recheck nap - no barrier and no \
+                 credit edge exist here, so this counter can only have come from the \
+                 doorbell rung"
             );
         } else {
             assert_eq!(
                 blocks, 0,
-                "with no wake word on this host the doorbell rung must not run \
-                 at all, and no sibling rung exists in this graph to bump the \
-                 shared counter"
+                "a park that never reaches the doorbell rung on this host (no wake \
+                 word, or a hardware park performing every slice) must take no \
+                 wake-word block, and no sibling rung exists in this graph to bump \
+                 the shared counter"
             );
         }
     }
@@ -1772,6 +1785,16 @@ fn run_live_emits_wait_policy_line_with_active_park() {
     assert!(
         logs_contain("live loop park telemetry"),
         "run_live must emit the exit park-telemetry summary line"
+    );
+    // It reports completed slices and loop-bottom yields under two keys: a
+    // slice that slept issues no yield, so one count cannot stand for both.
+    assert!(
+        logs_contain("park_slices=") && logs_contain("park_core_yields="),
+        "the exit telemetry line must carry park_slices and park_core_yields"
+    );
+    assert!(
+        !logs_contain("park_yields="),
+        "the exit telemetry line must not report slices under a yield key"
     );
     runtime.shutdown();
 }
@@ -2186,7 +2209,8 @@ fn degraded_nap_tier_matches_the_resolved_os_sync_availability() {
 }
 
 // ===========================================================================
-// The park loop's per-slice YIELD (the same-core starvation defense).
+// The park loop's YIELD after a hardware slice (the same-core starvation
+// defense).
 //
 // A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS scheduler, so a park
 // that slices without yielding holds its core for the whole idle — a
@@ -2195,36 +2219,44 @@ fn degraded_nap_tier_matches_the_resolved_os_sync_availability() {
 // the rmw park, same primitive: p50 6.997ms RTT with both ping-pong
 // processes pinned to one CPU, vs 17µs on the kernel-sleeping tier). So
 // (mirroring rmw's `park_block`) the hardware arm slices at the
-// shared 20µs `monitor_wait::PARK_RECHECK` and EVERY park-loop iteration
-// ends with `std::thread::yield_now()` (counted by `park_yields`).
+// shared 20µs `monitor_wait::PARK_RECHECK` and every hardware slice ends
+// with `std::thread::yield_now()` (counted by `park_core_yields`); a slice
+// that slept issues no yield, and every completed slice is counted by
+// `park_slices`.
 //
 // Three pins, deliberately layered:
 //  - the COUNTER pin (below, every tier incl. macOS): a parked run
-//    completes + counts slices; a never-parked run counts exactly 0.
-//  - the STRUCTURAL pin: the counter pin alone passes a variant that keeps the
-//    `park_yields` bump but deletes the `yield_now()` itself (the two are
-//    output-equivalent on an idle machine), so the source walk requires the call
-//    — comment-stripped, so prose cannot satisfy it.
+//    completes + counts slices, and its yields are exactly its slices that
+//    were not naps (all of them on a hardware tier, none on a sleeping tier);
+//    a never-parked run counts exactly 0 of both.
+//  - the STRUCTURAL pin: the counters cannot see a `yield_now()` deleted while
+//    its bump stays, or a second one added outside the counted branch (each is
+//    output-equivalent on an idle machine), so the source walk requires exactly
+//    ONE call, inside the `if performed` branch that counts it,
+//    comment-stripped so prose cannot satisfy it.
 //  - the hardware-only same-core arm (`box_same_core`, Linux `--ignored`): the
 //    behavioral kill — park ON, both threads pinned to one CPU, RTT p50
 //    < 100µs; removing the yield (unsliced) reads ~ms (one CFS granularity
 //    per hop).
 // ===========================================================================
 
-/// Counter pin: every completed park-loop slice yields and is
-/// counted by `park_yields`, on EVERY tier (macOS runs the degraded
+/// Counter pin: every completed park-loop slice is
+/// counted by `park_slices`, on EVERY tier (macOS runs the degraded
 /// sleep tier; a WAITPKG/WFE machine runs the hardware tier — both slice, both
-/// count). The park-OFF control is the anti-tautology arm: the counter lives
+/// count), and only the hardware slices yield: this source-less ticker has no
+/// doorbell, barrier or credit word, so every slice is a hardware park or a
+/// nap, and `park_core_yields == park_slices - park_recheck_naps` on every
+/// tier. The park-OFF control is the anti-tautology arm: the counters live
 /// on the park loop's bottom and NOWHERE else, so a never-parked runtime
 /// must read exactly 0.
 #[test]
 #[serial]
-fn park_slices_yield_and_are_counted_on_every_tier() {
+fn park_slices_are_counted_on_every_tier_and_only_hardware_slices_yield() {
     const ITERS: usize = 6;
 
     /// One live-driven ticker run under `policy`; returns
-    /// `(park_entries, park_yields, park_recheck_naps)`.
-    fn run_counters(policy: MonitorWaitPolicy, iters: usize) -> (u64, u64, u64) {
+    /// `(park_entries, park_slices, park_recheck_naps, park_core_yields)`.
+    fn run_counters(policy: MonitorWaitPolicy, iters: usize) -> (u64, u64, u64, u64) {
         let fires = Arc::new(AtomicU64::new(0));
         let (config, factories) = ticker_graph(Arc::clone(&fires));
         let clock = Arc::new(VirtualClock::new());
@@ -2238,8 +2270,9 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
         }
         let out = (
             runtime.park_entry_count_for_test(),
-            runtime.park_yield_count_for_test(),
+            runtime.park_slice_count_for_test(),
             runtime.park_recheck_nap_count_for_test(),
+            runtime.park_core_yield_count_for_test(),
         );
         runtime.shutdown();
         out
@@ -2249,7 +2282,7 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
     // made of slices (20µs hardware / ~100µs degraded nap). A window is
     // hundreds of slices even on the slowest tier, so `> 0` is a huge-margin
     // floor, not a timing race.
-    let (entries, yields, naps) = run_counters(
+    let (entries, slices, naps, core_yields) = run_counters(
         MonitorWaitPolicy::new(true, false, mwp_ns("yieldcount")),
         ITERS,
     );
@@ -2258,26 +2291,46 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
         "apparatus: every live step must enter monitor_wait_block exactly once"
     );
     assert!(
-        yields > 0,
-        "a parked run that idled to its timeouts must have completed (and \
-         yielded after) at least one park slice — park_yields == 0 means the \
-         loop-bottom yield/counter is gone (the per-slice yield is missing)"
+        slices > 0,
+        "a parked run that idled to its timeouts must have completed at least \
+         one park slice: park_slices == 0 means the loop-bottom slice counter \
+         is gone"
     );
     assert!(
-        yields >= naps,
-        "every degraded nap chunk is followed by exactly one loop-bottom \
-         yield, so park_yields ({yields}) must be >= park_recheck_naps \
-         ({naps}) on every tier (hardware tiers nap 0 times)"
+        slices >= naps,
+        "every degraded nap chunk is a completed slice, so park_slices \
+         ({slices}) must be >= park_recheck_naps ({naps}) on every tier \
+         (hardware tiers nap 0 times)"
     );
+    assert_eq!(
+        core_yields,
+        slices - naps,
+        "the loop bottom yields once after every hardware slice and never after \
+         a nap, so park_core_yields must equal park_slices - park_recheck_naps \
+         ({slices} - {naps}); got {core_yields}"
+    );
+    if !cerulion_core::monitor_wait::monitor_wait_available() {
+        assert_eq!(
+            core_yields, 0,
+            "without a CPU monitor-wait primitive every slice is a nap, so the \
+             park must not yield at all"
+        );
+    }
 
     // Anti-tautology control: a park-OFF, barrier-less runtime NEVER enters
-    // monitor_wait_block (it takes the heartbeat path), so its yield counter
-    // must stay EXACTLY 0 — a regression counting yields from anywhere but
-    // the park loop's bottom fails here.
-    let (off_entries, off_yields, _) = run_counters(MonitorWaitPolicy::off(), ITERS);
+    // monitor_wait_block (it takes the heartbeat path), so both counters
+    // must stay EXACTLY 0: a regression counting slices or yields from
+    // anywhere but the park loop's bottom fails here.
+    let (off_entries, off_slices, _, off_core_yields) =
+        run_counters(MonitorWaitPolicy::off(), ITERS);
     assert_eq!(off_entries, 0, "park-OFF control must never park");
     assert_eq!(
-        off_yields, 0,
+        off_slices, 0,
+        "park-OFF control must count ZERO slices (the counter lives on the \
+         park loop's bottom and nowhere else)"
+    );
+    assert_eq!(
+        off_core_yields, 0,
         "park-OFF control must count ZERO yields (the counter lives on the \
          park loop's bottom and nowhere else)"
     );
@@ -2286,19 +2339,19 @@ fn park_slices_yield_and_are_counted_on_every_tier() {
 /// Wake-exit pin: the counter pin above
 /// drives only TIMEOUT-exiting parks (a source-less ticker), so it cannot
 /// see a variant that leaves the EVENT-return branch (`listener_got || …`)
-/// exiting without the yield/bump accounting — the exact path a
+/// exiting without the slice accounting, the exact path a
 /// data-flowing robot rides all day. This drives a park that exits via a
 /// real LISTENER wake (an external publisher lands a frame MID-PARK) and
-/// pins that the slices completed BEFORE the wake still yielded+counted:
+/// pins that the slices completed BEFORE the wake were still counted:
 /// during a park attributed to a listener/doorbell wake (and NOT to the
-/// timeout), `park_yields` must have advanced. Scheduling-robust: if the
+/// timeout), `park_slices` must have advanced. Scheduling-robust: if the
 /// publish races the park entry (the loop-top poll returns before any
-/// slice ran — a wake attribution with a zero yield delta), the attempt is
+/// slice ran: a wake attribution with a zero slice delta), the attempt is
 /// retried rather than misread; a persistent zero across all attempts is
 /// the real regression.
 #[test]
 #[serial]
-fn park_wake_exit_still_yields_its_completed_slices() {
+fn park_wake_exit_still_counts_its_completed_slices() {
     const ATTEMPTS: usize = 5;
     /// The publisher's mid-park delay: long enough that the driving thread
     /// is parked (µs away) by the time the frame lands, short enough to
@@ -2331,7 +2384,7 @@ fn park_wake_exit_still_yields_its_completed_slices() {
     let mut proven = false;
     for attempt in 0..ATTEMPTS {
         let (entries0, listener0, doorbell0, timeout0) = runtime.park_wake_counts();
-        let yields0 = runtime.park_yield_count_for_test();
+        let slices0 = runtime.park_slice_count_for_test();
         let helper = std::thread::spawn(move || {
             std::thread::sleep(MID_PARK_DELAY);
             publish_one(&mut pubr, 1.0 + attempt as f64);
@@ -2340,7 +2393,7 @@ fn park_wake_exit_still_yields_its_completed_slices() {
         runtime.run_live_step_once_for_test(Duration::from_millis(400));
         pubr = helper.join().expect("mid-park publisher thread");
         let (entries1, listener1, doorbell1, timeout1) = runtime.park_wake_counts();
-        let yields1 = runtime.park_yield_count_for_test();
+        let slices1 = runtime.park_slice_count_for_test();
         assert_eq!(entries1 - entries0, 1, "one live step parks exactly once");
         let woke = listener1 + doorbell1 > listener0 + doorbell0;
         let timed_out = timeout1 > timeout0;
@@ -2351,12 +2404,12 @@ fn park_wake_exit_still_yields_its_completed_slices() {
             // accounting was skipped — unless the publish raced the
             // park entry (loop-top poll returned with ZERO completed
             // slices), which the retry absorbs.
-            if yields1 > yields0 {
+            if slices1 > slices0 {
                 proven = true;
                 break;
             }
             eprintln!(
-                "wake-exit attempt {attempt}: wake with zero yield delta \
+                "wake-exit attempt {attempt}: wake with zero slice delta \
                  (publish likely raced the park entry) — retrying"
             );
         } else {
@@ -2369,20 +2422,24 @@ fn park_wake_exit_still_yields_its_completed_slices() {
     runtime.shutdown();
     assert!(
         proven,
-        "across {ATTEMPTS} attempts, no LISTENER-woken park showed a yield \
-         delta — the event-return path is exiting without yielding/counting \
-         its completed slices (wake-exit regression)"
+        "across {ATTEMPTS} attempts, no LISTENER-woken park showed a slice \
+         delta: the event-return path is exiting without counting its \
+         completed slices (wake-exit regression)"
     );
 }
 
 /// STRUCTURAL pin (mirrors rmw's `the_park_slice_yields_the_core`
 /// in `guard_wait.rs`): the counter pin above passes a variant that keeps the
-/// `park_yields` bump but deletes the `yield_now()` call — the two are
-/// output-equivalent on an idle machine (the cost is a ~7ms same-core wall only
-/// on an oversubscribed one), and the behavioral kill (`box_same_core`) is
-/// hardware-only. So walk the SOURCE of `monitor_wait_block` — comment-stripped,
-/// so a call mentioned in prose or commented out cannot satisfy it — for the
-/// yield, its counter, and the shared 20µs hardware slice.
+/// `park_core_yields` bump but deletes the `yield_now()` call, and one that
+/// adds a second, uncounted `yield_now()` (after every slice that slept, say);
+/// each is output-equivalent on an idle machine (the cost shows only on an
+/// oversubscribed one: a ~7ms same-core wall without the hardware yield, up to
+/// a 10 ms macOS priority depression with the extra one), and the behavioral
+/// kill (`box_same_core`) is hardware-only. So walk the SOURCE of
+/// `monitor_wait_block` (comment-stripped, so a call mentioned in prose or
+/// commented out cannot satisfy it) for exactly one yield, inside the `if
+/// performed` branch that counts it, the slice counter, and the shared 20µs
+/// hardware slice.
 #[test]
 fn the_native_park_slice_yields_the_core() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/graph/runtime.rs"))
@@ -2437,9 +2494,16 @@ fn the_native_park_slice_yields_the_core() {
     assert!(
         loop_body.contains("std::thread::yield_now()"),
         "monitor_wait_block must yield the core INSIDE the recheck loop, \
-         after every park slice (a UMWAIT/WFE-parked thread is \
+         after every hardware park slice (a UMWAIT/WFE-parked thread is \
          RUNNING to the scheduler, so a non-yielding park starves a \
          co-located peer for a CFS tick)"
+    );
+    assert_eq!(
+        body.matches("std::thread::yield_now()").count(),
+        1,
+        "monitor_wait_block must call std::thread::yield_now() exactly ONCE: \
+         the counted yield after a hardware slice. A second call is a yield \
+         park_core_yields does not see"
     );
     assert!(
         !body[..loop_at].contains("std::thread::yield_now()"),
@@ -2452,21 +2516,64 @@ fn the_native_park_slice_yields_the_core() {
          brace — the loop only exits by `return`, so a post-loop yield never \
          runs on the park path at all"
     );
-    // The counter bump rides the yield, inside the loop too — and it is
+    // The slice counter bump sits inside the loop too, and it is
     // GATED on a genuinely-completed wait (`if parked_slice`): the addr
     // park's RingPending lost-wakeup fast path performs no wait and must not
     // count. (rustfmt splits receiver/call across lines, so compare
     // whitespace-free.)
     let compact_loop: String = loop_body.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        compact_loop.contains("ifparked_slice{self.park_yields.fetch_add(1"),
-        "…and count it (park_yields) inside the loop, GATED on a completed \
+        compact_loop.contains("ifparked_slice{self.park_slices.fetch_add(1"),
+        "…and count it (park_slices) inside the loop, GATED on a completed \
          wait (`if parked_slice {{ … }}`) — an unconditional bump counts the \
          lost-wakeup fast path as a phantom slice"
     );
+    // The yield is gated on a slice the CPU monitor-wait primitive performed: a
+    // slice that slept already released the core, and on macOS a sched_yield
+    // with another thread runnable depresses the caller's priority for up to a
+    // 10 ms scheduler quantum, so an ungated yield delays every woken consumer.
+    let gate = "ifperformed{std::thread::yield_now();";
+    let gate_at = compact_loop.find(gate).unwrap_or_else(|| {
+        panic!(
+            "the loop-bottom yield must be gated on a performed hardware slice \
+             (`if performed {{ std::thread::yield_now(); ... }}`)"
+        )
+    });
+    // The gated branch, brace-matched from its opening `{`, holds the one
+    // yield AND its counter bump, so `park_core_yields` counts every yield the
+    // loop issues.
+    let open = gate_at + "ifperformed".len();
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, b) in compact_loop.bytes().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let gated = &compact_loop[open..close.expect("the `if performed` branch closes")];
+    assert!(
+        gated.contains("self.park_core_yields.fetch_add(1"),
+        "the yield's branch must count it (park_core_yields), so the counter \
+         and the call cannot drift apart"
+    );
+    assert_eq!(
+        compact_loop
+            .matches("self.park_core_yields.fetch_add(1")
+            .count(),
+        1,
+        "park_core_yields must be bumped once, in the yield's branch"
+    );
     let compact_after: String = after_loop.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        !compact_after.contains("self.park_yields.fetch_add(1"),
+        !compact_after.contains("self.park_slices.fetch_add(1"),
         "…and the bump must not sit after the loop either — unreachable on \
          the park path, so the counter would read 0 forever"
     );
@@ -2476,6 +2583,1437 @@ fn the_native_park_slice_yields_the_core() {
          monitor_wait::PARK_RECHECK (not the 100µs pacing chunk) — the slice \
          bound is the other half of the same-core starvation defense"
     );
+}
+
+/// A publisher that numbers its frames 1, 2, 3, ... so a consumer in another
+/// runtime can be held to the exact sequence it was sent.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct Numberer {
+    #[output]
+    out: Vector3,
+    fires: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl Numberer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let n = self.fires.fetch_add(1, Ordering::Relaxed) + 1;
+        self.out.x = n as f64;
+        Ok(())
+    }
+}
+
+/// Two runtimes, each built from its own graph and run on its own thread of
+/// this process, joined by one topic. Each runtime owns its own build, so the
+/// consumer's listeners are foreign to the producer's listener count the same
+/// way a consumer's in another process are, and the consumer reaches each frame
+/// the way one in another process does: its park wakes on the producer's notify
+/// and doorbell ring. The consumer parks between frames and the producer
+/// publishes while it is parked.
+///
+/// Held, each against a value written here rather than read back from the
+/// code under test:
+///
+/// - the producer never elides a notify on the topic: its live listener count
+///   is above the count its own build owns, so every publish notifies;
+/// - the consumer reads the exact sequence the producer sent. The producer
+///   sends at most one frame more than `FRAMES`, which is below the consumer's
+///   queue depth (`DEFAULT_CONSUMER_DEPTH`), so no frame is evicted however the
+///   two threads are scheduled;
+/// - the consumer is woken for its frames: while a frame is still due, every
+///   park it takes ends on a data wake (the notify or the doorbell ring) and
+///   none ends on its park timeout, which is longer than the producer's whole
+///   run, so a consumer nothing wakes fails here instead of reading its frames
+///   late;
+/// - on a host with no CPU monitor-wait primitive and a doorbell wake word (a
+///   shared futex on Linux and Android, os_sync on macOS 14.4 and later), the
+///   consumer kernel-blocks on its doorbell wake word rather than pacing its
+///   recheck nap. That a ring ends such a block before the block's own cap is
+///   held in `doorbell.rs`: on Linux and Android by
+///   `a_ring_on_one_mapping_wakes_a_futex_park_on_another`, which rings only
+///   once the consumer's claim shows through the producer's mapping of the page
+///   and takes a ring that reached the word before the block as a ring in hand;
+///   on macOS by `a_ring_wakes_a_kernel_blocked_consumer_well_inside_the_cap`,
+///   which hands the ring over only once the consumer holds the parked gate and
+///   retries a ring that missed the block. Here the producer's wake syscall
+///   counts are printed, not asserted, because a ring that lands outside a
+///   kernel block issues no wake syscall (no claim is held between two blocks)
+///   or issues one that finds nobody (the claim is held and the consumer is not
+///   yet in the kernel), without anything being wrong;
+/// - on a host without a CPU monitor-wait primitive every park slice sleeps (a
+///   kernel block on the doorbell wake word or a timed nap) and the loop bottom
+///   calls `std::thread::yield_now()` zero times. A yield after a slice that
+///   slept hands the core away a second time, and on macOS `sched_yield` with
+///   another thread runnable on the processor depresses the caller's priority
+///   for up to one scheduler quantum (10 ms), so a consumer a ring has just
+///   woken waits out that quantum before it polls the frame. On a host with the
+///   primitive the slices are hardware parks and each one yields, so the yields
+///   are at least the slices that were not naps.
+#[test]
+#[serial]
+fn a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield() {
+    const FEED: &str = "/mwp/tworuntime/feed";
+    /// Frames the producer is driven to send. A producer step can fire one
+    /// frame more than asked, and `FRAMES + 1` stays below the consumer's
+    /// queue depth, so the queue cannot evict a frame.
+    const FRAMES: u64 = 8;
+    const _: () =
+        assert!(FRAMES as usize + 1 < cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH);
+    /// The consumer's park timeout while a frame is still due: longer than the
+    /// producer's whole run (`FRAMES` steps 3 ms apart), so a park that ends on
+    /// it was ended by no frame.
+    const DUE_PARK_TIMEOUT: Duration = Duration::from_secs(2);
+    let ns = mwp_ns("tworuntime");
+    let sent = Arc::new(AtomicU64::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let consumer_fires = Arc::new(AtomicU64::new(0));
+    let consumer_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The PRODUCER runtime, built first on this thread, so the topic's service
+    // exists with the producer's provisioning before the consumer opens it.
+    let producer_config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_tworuntime_producer".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: "numberer".to_string(),
+            node_type: "numberer".to_string(),
+            inputs: vec![],
+            outputs: vec![OutputDef {
+                name: "out".to_string(),
+                schema: "geometry_msgs/Vector3".to_string(),
+                max_slice_len: None,
+                history_size: 0,
+                topic: Some(FEED.to_string()),
+            }],
+        }],
+    };
+    let mut producer_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    producer_factories.insert(
+        "numberer".to_string(),
+        Box::new(NumbererEntry::with_state(Numberer {
+            fires: Arc::clone(&sent),
+            ..Default::default()
+        })),
+    );
+    // One iceoryx2 config for both runtimes and one transport node each, the
+    // way two graph processes on one host each open their own node on the
+    // same iceoryx2 domain.
+    let ix_config = cerulion_core::testing::iceoryx_test_config();
+    let transport = |name: &str, ix: iceoryx2::config::Config| {
+        TransportManager::init_for_test(
+            cerulion_core::transport::TransportConfig {
+                node_name: name.into(),
+                clock: Arc::new(VirtualClock::new()),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            ix,
+        )
+        .expect("create a transport node on the shared iceoryx2 config")
+    };
+    let producer_mgr = transport("mwp_tworuntime_producer", ix_config.clone());
+    let producer_drive = Arc::new(VirtualClock::new());
+    let producer_clock: Arc<dyn cerulion_core::clock::Clock> = producer_drive.clone();
+    let mut producer = GraphRuntime::build_live_with_schema_hashes_and_policy(
+        producer_config,
+        producer_factories,
+        &producer_mgr,
+        producer_clock,
+        None,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+    )
+    .expect("build the producer runtime");
+    // The CONSUMER runtime, built and run on its own thread: a data trigger on
+    // FEED, a topic it does not publish.
+    let consumer = {
+        let ns = ns.clone();
+        let ix_config = ix_config.clone();
+        let observed = Arc::clone(&observed);
+        let consumer_fires = Arc::clone(&consumer_fires);
+        let consumer_ready = Arc::clone(&consumer_ready);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let config = GraphConfig {
+                level_assignments: None,
+                network: None,
+                process_groups: Default::default(),
+                process_group_order: Default::default(),
+                multi_publisher_topics: Vec::new(),
+                name: None,
+                identity: "mwp_tworuntime_consumer".to_string(),
+                prefix: "mwp".to_string(),
+                nodes: vec![NodeDef {
+                    isolate: None,
+                    params: Default::default(),
+                    ros2: None,
+                    id: "reader".to_string(),
+                    node_type: "consumer".to_string(),
+                    inputs: vec![InputDef {
+                        name: "inp".to_string(),
+                        source: FEED.to_string(),
+                        ..Default::default()
+                    }],
+                    outputs: vec![],
+                }],
+            };
+            let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+            factories.insert(
+                "reader".to_string(),
+                Box::new(ConsumerEntry::with_state(Consumer {
+                    observed,
+                    fires: Arc::clone(&consumer_fires),
+                    ..Default::default()
+                })),
+            );
+            let consumer_mgr = transport("mwp_tworuntime_consumer", ix_config);
+            let mut runtime = GraphRuntime::build_live_with_schema_hashes_and_policy(
+                config,
+                factories,
+                &consumer_mgr,
+                Arc::new(VirtualClock::new()),
+                None,
+                MonitorWaitPolicy::new(true, true, ns),
+            )
+            .expect("build the consumer runtime");
+            let (_, listener_before, doorbell_before, _) = runtime.park_wake_counts();
+            consumer_ready.store(true, Ordering::Release);
+            // While a frame is still due, each park gets the long timeout and its
+            // timeout exits are counted: a park a frame ends is a data wake.
+            let mut timeouts_while_due = 0u64;
+            while consumer_fires.load(Ordering::Relaxed) < FRAMES && !stop.load(Ordering::Acquire) {
+                let (_, _, _, timeouts_before) = runtime.park_wake_counts();
+                runtime.run_live_step_once_for_test(DUE_PARK_TIMEOUT);
+                let (_, _, _, timeouts_after) = runtime.park_wake_counts();
+                timeouts_while_due += timeouts_after - timeouts_before;
+            }
+            let (_, listener_after, doorbell_after, _) = runtime.park_wake_counts();
+            // The frame a producer step may send beyond FRAMES is read here.
+            while !stop.load(Ordering::Acquire) {
+                runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+            }
+            let counts = ConsumerCounts {
+                entries: runtime.park_entry_count_for_test(),
+                slices: runtime.park_slice_count_for_test(),
+                naps: runtime.park_recheck_nap_count_for_test(),
+                core_yields: runtime.park_core_yield_count_for_test(),
+                wake_word_blocks: runtime.park_wake_word_block_count_for_test(),
+                data_wakes_while_due: (listener_after - listener_before)
+                    + (doorbell_after - doorbell_before),
+                timeouts_while_due,
+            };
+            runtime.shutdown();
+            drop(consumer_mgr);
+            counts
+        })
+    };
+    let spun_up = std::time::Instant::now();
+    while !consumer_ready.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(20),
+            "the consumer runtime never finished building"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // One numbered frame per producer step, each published after a pause long
+    // enough that the consumer is parked in a slice when it lands.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    let wakes_before = cerulion_core::doorbell::wake_syscall_counts();
+    while sent.load(Ordering::Relaxed) < FRAMES {
+        std::thread::sleep(Duration::from_millis(3));
+        producer_drive.advance(5_000_000);
+        producer.run_live_step_once_for_test(Duration::from_millis(1));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while consumer_fires.load(Ordering::Relaxed) < sent.load(Ordering::Relaxed)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    let wakes_after = cerulion_core::doorbell::wake_syscall_counts();
+    stop.store(true, Ordering::Release);
+    let c = consumer.join().expect("consumer thread panicked");
+    let elided = producer.notify_elided_count_for_test(FEED);
+    let total = sent.load(Ordering::Relaxed);
+    producer.shutdown();
+    drop(producer_mgr);
+    eprintln!(
+        "two-runtime park: {total} frames, consumer {} park entries, {} slices, {} naps, \
+         {} yields, {} wake-word blocks, {} data wakes and {} timeouts while due",
+        c.entries,
+        c.slices,
+        c.naps,
+        c.core_yields,
+        c.wake_word_blocks,
+        c.data_wakes_while_due,
+        c.timeouts_while_due
+    );
+
+    assert_eq!(
+        elided, 0,
+        "the consumer's listeners belong to another runtime, so the producer's live \
+         listener count is above the count its own build owns and every publish must \
+         notify"
+    );
+    assert!(
+        (FRAMES..=FRAMES + 1).contains(&total),
+        "apparatus: the producer was driven to send {FRAMES} frames and sent {total}"
+    );
+    let expected: Vec<f64> = (1..=total).map(|n| n as f64).collect();
+    assert_eq!(
+        *observed.lock().unwrap(),
+        expected,
+        "the consumer must read every frame the producer sent, in order (no frame \
+         can be evicted: the consumer's queue is deeper than the frames sent)"
+    );
+    assert!(
+        c.entries > 0 && c.slices > 0,
+        "apparatus: the consumer must have parked and completed park slices \
+         (entries {}, slices {})",
+        c.entries,
+        c.slices
+    );
+    assert_eq!(
+        c.timeouts_while_due, 0,
+        "every park the consumer took while a frame was due must end on a data wake \
+         (the producer's notify or doorbell ring), never on its {DUE_PARK_TIMEOUT:?} \
+         park timeout: {} parks timed out, so nothing woke the consumer for a frame",
+        c.timeouts_while_due
+    );
+    assert!(
+        c.data_wakes_while_due > 0,
+        "the consumer's parks while a frame was due must have ended on data wakes \
+         (got {})",
+        c.data_wakes_while_due
+    );
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    if !cerulion_core::monitor_wait::monitor_wait_available()
+        && cerulion_core::doorbell::wake_word_block_primitive_available()
+    {
+        let issued = wakes_after.0 - wakes_before.0;
+        let found_nobody = wakes_after.1 - wakes_before.1;
+        eprintln!(
+            "two-runtime park: the producer's rings issued {issued} wake syscalls, \
+             {found_nobody} found nobody"
+        );
+        assert!(
+            c.wake_word_blocks > 0,
+            "without a CPU monitor-wait primitive the consumer's park must kernel-block \
+             on its doorbell wake word, not pace its recheck nap (got {} blocks over {} \
+             completed slices)",
+            c.wake_word_blocks,
+            c.slices
+        );
+    }
+    if cerulion_core::monitor_wait::monitor_wait_available() {
+        assert!(
+            c.core_yields > 0 && c.core_yields + c.naps >= c.slices,
+            "with a CPU monitor-wait primitive the slices are hardware parks, and a \
+             hardware-parked thread is running to the scheduler, so each slice that \
+             was not a nap must yield the core (got {} yields over {} slices, {} naps)",
+            c.core_yields,
+            c.slices,
+            c.naps
+        );
+    } else {
+        assert_eq!(
+            c.core_yields, 0,
+            "without a CPU monitor-wait primitive every slice slept, so the loop \
+             bottom must not yield: {} yields over {} completed slices",
+            c.core_yields, c.slices
+        );
+    }
+}
+
+/// What the consumer thread of
+/// `a_consumer_in_another_runtime_is_woken_and_its_sleeping_slices_never_yield`
+/// and of
+/// `a_consumer_in_another_executor_unit_is_woken_and_its_sleeping_slices_never_yield`
+/// reports back from its runtime.
+struct ConsumerCounts {
+    entries: u64,
+    slices: u64,
+    naps: u64,
+    core_yields: u64,
+    wake_word_blocks: u64,
+    data_wakes_while_due: u64,
+    timeouts_while_due: u64,
+}
+
+/// Whether a consumer on this host can kernel-block on a doorbell's wake word,
+/// read from the platform rather than from the code under test: a shared futex
+/// on Linux and Android, and on macOS the os_sync family, which macOS 14.4 and
+/// later export, unless the doorbell's kill switch
+/// (`CERULION_DOORBELL_OS_SYNC=0`) turns it off.
+fn host_has_a_doorbell_wake_word() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .expect("sw_vers -productVersion must run on macOS");
+        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut parts = ver.split('.');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(
+            major > 0,
+            "unparseable macOS version from sw_vers -productVersion: {ver:?}"
+        );
+        let killed =
+            std::env::var(cerulion_core::doorbell::DOORBELL_OS_SYNC_ENV).as_deref() == Ok("0");
+        (major, minor) >= (14, 4) && !killed
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// The hop between two executor units of one process, held by counters alone.
+///
+/// One graph declares a producer and its data-triggered consumer in ONE process
+/// group, the consumer declaring `isolate: true`. The executor-unit derivation
+/// the deployment planner runs (`UnitGraph::from_graph`, then
+/// `expand_process_groups`) is handed no profile, so the process would be one
+/// unit, and the consumer's `isolate: true` gives it a unit of its own: the
+/// group splits into two units, the producer's and the consumer's. Each unit
+/// then runs the way a
+/// process hosting several units runs them: its own cut of the graph, its own
+/// transport node on the run's shared iceoryx2 config
+/// (`TransportManager::detached_with_config`, the hosted unit's transport), its
+/// own clock, and its own runtime (`GraphRuntime::build_live_free_run`) built and
+/// stepped on its own thread, both under the park policy with the doorbell
+/// armed. A frame crosses from one unit to the other through the topic's
+/// iceoryx2 queue, its listener notify and the topic's doorbell page, exactly as
+/// it crosses between two processes.
+///
+/// The producer sends `FRAMES` numbered frames, one producer step at a time.
+/// Before each step it waits until the consumer unit has read every frame sent
+/// so far and then pauses, so each frame lands while the consumer unit is
+/// parked, and no more frames are ever unread than one step sends.
+///
+/// Held, each against a value written here rather than read back from the code
+/// under test:
+///
+/// - the planner puts the producer and the consumer (which declares
+///   `isolate: true`) in two units of the one process, each alone;
+/// - the producer arms the doorbell of the topic it publishes and never elides a
+///   notify on it: the consumer's listener belongs to another unit's build, so
+///   the producer's live listener count is above the count its own build owns;
+/// - the consumer unit reads the exact sequence the producer sent. No frame can
+///   be evicted: the most frames one producer step sent is below the consumer's
+///   queue depth (`DEFAULT_CONSUMER_DEPTH`), and every earlier frame had been
+///   read before that step;
+/// - while a frame is still due, every park the consumer unit takes ends on a
+///   data wake (the notify or the doorbell ring) and none ends on its park
+///   timeout, which is longer than the producer's whole run, so a consumer unit
+///   nothing wakes fails here instead of reading its frames late;
+/// - on a host with no CPU monitor-wait primitive, every slice the consumer
+///   unit's park completes sleeps, and the loop bottom yields zero times: a
+///   yield after a slice that slept hands the core away a second time, and on
+///   macOS `sched_yield` with another thread runnable depresses the caller's
+///   priority for up to one 10 ms scheduler quantum, which the consumer unit
+///   would wait out on every hop before it polls the frame;
+/// - on such a host with a doorbell wake word (macOS 14.4 and later, Linux and
+///   Android, read by `host_has_a_doorbell_wake_word` from the platform), the
+///   consumer unit's doorbell rung applies, its park kernel-blocks on the wake
+///   word instead of pacing its recheck nap, and the producer's rings issue the
+///   kernel wake on that word. One ring issues the wake only when the consumer
+///   holds its claim on the word at that moment. The claim is taken before each
+///   block and released after it, so the consumer holds it for all of each
+///   park but the loop-top polls between blocks, and over `FRAMES` frames that
+///   each land on a parked consumer at least one ring finds the claim. A run in
+///   which no ring issues the wake has a publish path that wakes no consumer
+///   blocked on the word, which leaves the consumer to its 100 us block cap on
+///   every hop. Whether each wake found the consumer still in the kernel is
+///   printed, not asserted: a consumer whose block cap expired holds its claim
+///   until it runs again;
+/// - on a host with the primitive the slices are hardware parks, and each one
+///   that was not a nap yields.
+#[test]
+#[serial]
+fn a_consumer_in_another_executor_unit_is_woken_and_its_sleeping_slices_never_yield() {
+    use cerulion_core::graph::node::NodeInfo;
+    use cerulion_core::graph::topology::{GraphTopology, DEFAULT_CONSUMER_DEPTH};
+    use cerulion_core::graph::{
+        build_trigger_edges, expand_process_groups, CrossProcessWiring, ExecutorUnit,
+        SiblingConsumedTopics, SiblingProducedTopics, UnitGraph,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// The process group the two nodes are declared in, also the graph's
+    /// identity.
+    const HOST: &str = "mwp_units";
+    /// The topic between the two units, written absolute on both ends, so a
+    /// unit's cut of the graph keeps the consumer's source as written.
+    const FEED: &str = "/mwp/units/feed";
+    /// Frames the producer is driven to send.
+    const FRAMES: u64 = 32;
+    /// The consumer unit's park timeout while a frame is still due: longer than
+    /// the producer's whole run (`FRAMES` frames `PACE` apart, each sent once the
+    /// previous one was read), so a park that ends on it was ended by no frame.
+    const DUE_PARK_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The pause before each producer step, in which the consumer unit, having
+    /// read every frame sent so far, parks again.
+    const PACE: Duration = Duration::from_millis(3);
+    /// How long the producer waits for the consumer unit to read a frame before
+    /// it reports the apparatus broken. A park that timed out still reads its
+    /// frame, so this outlasts one due park timeout.
+    const READ_BOUND: Duration = Duration::from_secs(30);
+
+    let ns = mwp_ns("units");
+    let sent = Arc::new(AtomicU64::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let consumer_fires = Arc::new(AtomicU64::new(0));
+    let due_timeouts = Arc::new(AtomicU64::new(0));
+    let consumer_ready = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // ONE graph: the producer and its consumer declared in one process group.
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: [(
+            HOST.to_string(),
+            vec!["numberer".to_string(), "reader".to_string()],
+        )]
+        .into_iter()
+        .collect(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: HOST.to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: "numberer".to_string(),
+                node_type: "numberer".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: Some(FEED.to_string()),
+                }],
+            },
+            NodeDef {
+                // Without a profile a process is one unit; this opts the
+                // consumer into a unit of its own.
+                isolate: Some(true),
+                params: Default::default(),
+                ros2: None,
+                id: "reader".to_string(),
+                node_type: "consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: FEED.to_string(),
+                    ..Default::default()
+                }],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "numberer".to_string(),
+        Box::new(NumbererEntry::with_state(Numberer {
+            fires: Arc::clone(&sent),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "reader".to_string(),
+        Box::new(ConsumerEntry::with_state(Consumer {
+            observed: Arc::clone(&observed),
+            fires: Arc::clone(&consumer_fires),
+            ..Default::default()
+        })),
+    );
+
+    // The executor units of the one process, derived the way the deployment
+    // planner derives them, with no profile.
+    let infos: IndexMap<String, NodeInfo> = factories
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.info().expect("a macro node's info")))
+        .collect();
+    let trigger_edges = build_trigger_edges(&config, &infos);
+    let topology = GraphTopology::build(&config, &infos).expect("the graph's topology");
+    let unit_graph = UnitGraph::from_graph(&config, &infos, &topology, &trigger_edges);
+    let plan = expand_process_groups(&config, &unit_graph, None, &indexmap::IndexSet::new());
+    let units: &[ExecutorUnit] = plan.units.get(HOST).expect("the declared group's units");
+    for unit in units {
+        for (node, boundary) in &unit.boundaries {
+            eprintln!(
+                "executor unit {}: {node} starts it: {}",
+                unit.name,
+                boundary.describe()
+            );
+        }
+    }
+    let members: Vec<Vec<String>> = units.iter().map(|u| u.nodes.clone()).collect();
+    assert_eq!(
+        members,
+        vec![vec!["numberer".to_string()], vec!["reader".to_string()]],
+        "apparatus: the consumer's `isolate: true` must put the producer and its consumer \
+         in two executor units of the one process"
+    );
+    assert!(
+        units
+            .iter()
+            .all(|u| plan.hosts.get(&u.name).map(String::as_str) == Some(HOST)),
+        "apparatus: both units must be hosted by the one process ({HOST}), got {:?}",
+        plan.hosts
+    );
+    // Each unit's cut of the graph: its own members, no process groups. The
+    // topic is absolute on both ends, so the consumer's source needs no rewrite.
+    let cut = |unit: &ExecutorUnit| {
+        let mut sub = config.clone();
+        sub.nodes.retain(|n| unit.nodes.contains(&n.id));
+        sub.process_groups = IndexMap::new();
+        sub.process_group_order = Vec::new();
+        sub.identity = format!("{HOST}_{}", unit.nodes[0]);
+        sub
+    };
+    let producer_config = cut(&units[0]);
+    let consumer_config = cut(&units[1]);
+    let mut unit_factories = |unit: &ExecutorUnit| -> IndexMap<String, Box<dyn NodeEntry>> {
+        unit.nodes
+            .iter()
+            .map(|id| {
+                let entry = factories
+                    .shift_remove(id)
+                    .expect("each node has one factory");
+                (id.clone(), entry)
+            })
+            .collect()
+    };
+    let producer_factories = unit_factories(&units[0]);
+    let consumer_factories = unit_factories(&units[1]);
+
+    // One iceoryx2 config for the run, and one transport node per unit on it,
+    // each carrying its unit's own clock.
+    let ix_config = cerulion_core::testing::iceoryx_test_config();
+    let unit_transport =
+        |name: &str, clock: Arc<dyn cerulion_core::clock::Clock>, ix: iceoryx2::config::Config| {
+            TransportManager::detached_with_config(
+                cerulion_core::transport::TransportConfig {
+                    node_name: name.into(),
+                    clock,
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                ix,
+            )
+            .expect("create a unit's transport node on the run's iceoryx2 config")
+        };
+
+    // The PRODUCER unit, built first on this thread, so the topic's service
+    // exists with the producer's provisioning before the consumer unit opens it.
+    let feed_read_by_sibling: SiblingConsumedTopics = [FEED.to_string()].into_iter().collect();
+    let producer_drive = Arc::new(VirtualClock::new());
+    let producer_clock: Arc<dyn cerulion_core::clock::Clock> = producer_drive.clone();
+    let producer_mgr = unit_transport(
+        "mwp_units_numberer",
+        Arc::clone(&producer_clock),
+        ix_config.clone(),
+    );
+    let mut producer = GraphRuntime::build_live_free_run(
+        producer_config,
+        producer_factories,
+        &producer_mgr,
+        producer_clock,
+        None,
+        MonitorWaitPolicy::new(true, true, ns.clone()),
+        CrossProcessWiring::requirements_only(None)
+            .with_sibling_consumed_topics(&feed_read_by_sibling),
+    )
+    .expect("build the producer unit's runtime");
+
+    // The CONSUMER unit, built and stepped on its own thread.
+    let consumer = {
+        let ns = ns.clone();
+        let ix_config = ix_config.clone();
+        let consumer_fires = Arc::clone(&consumer_fires);
+        let due_timeouts = Arc::clone(&due_timeouts);
+        let consumer_ready = Arc::clone(&consumer_ready);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let feed_from_sibling: SiblingProducedTopics = [FEED.to_string()].into_iter().collect();
+            let clock: Arc<dyn cerulion_core::clock::Clock> = Arc::new(VirtualClock::new());
+            let consumer_mgr = unit_transport("mwp_units_reader", Arc::clone(&clock), ix_config);
+            let mut runtime = GraphRuntime::build_live_free_run(
+                consumer_config,
+                consumer_factories,
+                &consumer_mgr,
+                clock,
+                None,
+                MonitorWaitPolicy::new(true, true, ns),
+                CrossProcessWiring::requirements_only(None).with_sibling_topics(&feed_from_sibling),
+            )
+            .expect("build the consumer unit's runtime");
+            let data_wake_rung = runtime.data_wake_rung_for_test();
+            let (_, listener_before, doorbell_before, _) = runtime.park_wake_counts();
+            consumer_ready.store(true, Ordering::Release);
+            // While a frame is still due, each park gets the long timeout and its
+            // timeout exits are counted: a park a frame ends is a data wake.
+            let mut timeouts_while_due = 0u64;
+            while consumer_fires.load(Ordering::Acquire) < FRAMES && !stop.load(Ordering::Acquire) {
+                let (_, _, _, timeouts_before) = runtime.park_wake_counts();
+                runtime.run_live_step_once_for_test(DUE_PARK_TIMEOUT);
+                let (_, _, _, timeouts_after) = runtime.park_wake_counts();
+                timeouts_while_due += timeouts_after - timeouts_before;
+                due_timeouts.store(timeouts_while_due, Ordering::Release);
+            }
+            let (_, listener_after, doorbell_after, _) = runtime.park_wake_counts();
+            // The frame a producer step may send beyond FRAMES is read here.
+            while !stop.load(Ordering::Acquire) {
+                runtime.run_live_step_once_for_test(PERIOD_PARK_TIMEOUT);
+            }
+            let counts = ConsumerCounts {
+                entries: runtime.park_entry_count_for_test(),
+                slices: runtime.park_slice_count_for_test(),
+                naps: runtime.park_recheck_nap_count_for_test(),
+                core_yields: runtime.park_core_yield_count_for_test(),
+                wake_word_blocks: runtime.park_wake_word_block_count_for_test(),
+                data_wakes_while_due: (listener_after - listener_before)
+                    + (doorbell_after - doorbell_before),
+                timeouts_while_due,
+            };
+            runtime.shutdown();
+            drop(consumer_mgr);
+            (counts, data_wake_rung)
+        })
+    };
+    /// Sets `stop` when dropped, so an assertion that unwinds this thread also
+    /// ends the consumer unit's loop at its next park exit.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _stop_on_unwind = StopOnDrop(Arc::clone(&stop));
+    let spun_up = std::time::Instant::now();
+    while !consumer_ready.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(20),
+            "the consumer unit's runtime never finished building"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // One numbered frame per producer step, each sent once the consumer unit
+    // has read every frame before it, after a pause in which it parks again.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    let wakes_before = cerulion_core::doorbell::wake_syscall_counts();
+    let mut most_frames_one_step_sent = 0u64;
+    while sent.load(Ordering::Relaxed) < FRAMES && due_timeouts.load(Ordering::Acquire) == 0 {
+        let waiting = std::time::Instant::now();
+        while consumer_fires.load(Ordering::Acquire) < sent.load(Ordering::Relaxed) {
+            assert!(
+                waiting.elapsed() < READ_BOUND,
+                "apparatus: the consumer unit never read frame {} ({} read)",
+                sent.load(Ordering::Relaxed),
+                consumer_fires.load(Ordering::Acquire)
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        std::thread::sleep(PACE);
+        let before = sent.load(Ordering::Relaxed);
+        producer_drive.advance(5_000_000);
+        producer.run_live_step_once_for_test(Duration::from_millis(1));
+        most_frames_one_step_sent =
+            most_frames_one_step_sent.max(sent.load(Ordering::Relaxed) - before);
+    }
+    let waiting = std::time::Instant::now();
+    while consumer_fires.load(Ordering::Acquire) < sent.load(Ordering::Relaxed)
+        && waiting.elapsed() < READ_BOUND
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    let wakes_after = cerulion_core::doorbell::wake_syscall_counts();
+    stop.store(true, Ordering::Release);
+    let (c, data_wake_rung) = consumer.join().expect("consumer unit thread panicked");
+    let elided = producer.notify_elided_count_for_test(FEED);
+    let producer_doorbells = producer.producer_doorbells_armed_for_test();
+    let total = sent.load(Ordering::Relaxed);
+    producer.shutdown();
+    drop(producer_mgr);
+    eprintln!(
+        "executor-unit hop: {total} frames, at most {most_frames_one_step_sent} per producer \
+         step, consumer unit {} park entries, {} slices, {} naps, {} yields, {} wake-word \
+         blocks, {} data wakes and {} timeouts while due, data-wake rung {data_wake_rung}",
+        c.entries,
+        c.slices,
+        c.naps,
+        c.core_yields,
+        c.wake_word_blocks,
+        c.data_wakes_while_due,
+        c.timeouts_while_due
+    );
+
+    assert_eq!(
+        elided, 0,
+        "the consumer's listener belongs to another unit's build, so the producer's live \
+         listener count is above the count its own build owns and every publish must \
+         notify"
+    );
+    assert!(
+        (FRAMES..=FRAMES + 1).contains(&total),
+        "apparatus: the producer was driven to send {FRAMES} frames and sent {total}"
+    );
+    assert!(
+        (most_frames_one_step_sent as usize) < DEFAULT_CONSUMER_DEPTH,
+        "apparatus: one producer step sent {most_frames_one_step_sent} frames, not below the \
+         consumer's queue depth {DEFAULT_CONSUMER_DEPTH}"
+    );
+    let expected: Vec<f64> = (1..=total).map(|n| n as f64).collect();
+    assert_eq!(
+        *observed.lock().unwrap(),
+        expected,
+        "the consumer unit must read every frame the producer unit sent, in order (no frame \
+         can be evicted: no more were ever unread than one producer step sent, below the \
+         consumer's queue depth)"
+    );
+    assert!(
+        c.entries > 0 && c.slices > 0,
+        "apparatus: the consumer unit must have parked and completed park slices (entries \
+         {}, slices {})",
+        c.entries,
+        c.slices
+    );
+    assert_eq!(
+        c.timeouts_while_due, 0,
+        "every park the consumer unit took while a frame was due must end on a data wake \
+         (the producer's notify or doorbell ring), never on its {DUE_PARK_TIMEOUT:?} park \
+         timeout: {} parks timed out, so nothing woke the consumer unit for a frame",
+        c.timeouts_while_due
+    );
+    assert!(
+        c.data_wakes_while_due > 0,
+        "the consumer unit's parks while a frame was due must have ended on data wakes \
+         (got {})",
+        c.data_wakes_while_due
+    );
+    if cerulion_core::monitor_wait::monitor_wait_available() {
+        assert!(
+            c.core_yields > 0 && c.core_yields + c.naps >= c.slices,
+            "with a CPU monitor-wait primitive the slices are hardware parks, and a \
+             hardware-parked thread is running to the scheduler, so each slice that was not \
+             a nap must yield the core (got {} yields over {} slices, {} naps)",
+            c.core_yields,
+            c.slices,
+            c.naps
+        );
+    } else {
+        if host_has_a_doorbell_wake_word() {
+            assert!(
+                c.wake_word_blocks > 0,
+                "without a CPU monitor-wait primitive the consumer unit's park must \
+                 kernel-block on its doorbell wake word, not pace its recheck nap (got {} \
+                 blocks over {} completed slices)",
+                c.wake_word_blocks,
+                c.slices
+            );
+            assert!(
+                data_wake_rung,
+                "without a CPU monitor-wait primitive, on a host with a doorbell wake word, \
+                 the consumer unit's doorbell rung must apply: the policy arms the doorbell \
+                 and the topic is written from another unit"
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            {
+                let issued = wakes_after.0 - wakes_before.0;
+                let found_nobody = wakes_after.1 - wakes_before.1;
+                eprintln!(
+                    "executor-unit hop: the producer unit's rings issued {issued} wake \
+                     syscalls, {found_nobody} found nobody"
+                );
+                assert!(
+                    issued > 0,
+                    "the producer unit's rings must issue the kernel wake on the consumer \
+                     unit's wake word: the consumer holds its claim on the word for all of \
+                     each park but the polls between blocks, and none of {total} rings \
+                     issued a wake, so a publish wakes no consumer blocked on the word"
+                );
+            }
+        }
+        assert_eq!(
+            c.core_yields, 0,
+            "without a CPU monitor-wait primitive every slice slept, so the loop bottom must \
+             not yield: {} yields over {} completed slices",
+            c.core_yields, c.slices
+        );
+    }
+    assert_eq!(
+        producer_doorbells, 1,
+        "the producer unit must arm the doorbell of the one topic it publishes: the park \
+         policy arms the doorbell"
+    );
+}
+
+/// Nanoseconds since the first call in this test process, read by a node's tick
+/// and by the thread driving it, so one subtraction gives the time from a publish
+/// to the fire it completed.
+fn since_test_epoch_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
+
+/// A `Sync` join of two topics: it fires once a frame has arrived on each of
+/// `a` and `b`, records the pair it joined and stamps the time of the fire.
+#[cerulion_node(unbounded_sync)]
+#[derive(Default)]
+struct Joiner {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+    joined: Arc<Mutex<Vec<(f64, f64)>>>,
+    fires: Arc<AtomicU64>,
+    fired_at_ns: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl Joiner {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.fired_at_ns
+            .store(since_test_epoch_ns(), Ordering::Release);
+        self.joined.lock().unwrap().push((self.a.x, self.b.x));
+        self.fires.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// A publisher that numbers its frames 1, 2, 3, ... like [`Numberer`] and stamps
+/// the time of each tick, which returns just before its frame is published.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct StampedNumberer {
+    #[output]
+    out: Vector3,
+    fires: Arc<AtomicU64>,
+    ticked_at_ns: Arc<AtomicU64>,
+}
+
+#[cerulion_node_impl]
+impl StampedNumberer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let n = self.fires.fetch_add(1, Ordering::Relaxed) + 1;
+        self.out.x = n as f64;
+        self.ticked_at_ns
+            .store(since_test_epoch_ns(), Ordering::Release);
+        Ok(())
+    }
+}
+
+/// A join that runs as an executor unit of its own is kernel-woken by its first
+/// armable input only.
+///
+/// One graph declares two numbering producers, on `A` and `B`, and a `Sync` node
+/// that joins the two topics, all in ONE process group. With no profile the
+/// process would be one unit; the join and the producer on `B` declare
+/// `isolate: true`, so the planner gives each a unit of its own and the producer
+/// on `A` is the process's remaining unit: three units, each holding one node.
+/// Each unit runs the way a process hosting several units runs it (its own
+/// cut of the graph, transport node, clock and runtime, under the park policy
+/// with the doorbell armed), the join's unit on its own thread.
+///
+/// The join's unit opens the doorbell pages of both inputs and arms its kernel
+/// wake on ONE of them, the first declared input written from outside the unit.
+/// A unit blocks on one address, so a ring on the other input reaches no blocked
+/// waiter, and the unit observes that frame when its current block or hardware
+/// slice ends: at most one recheck later (20 us in hardware, up to 100 us
+/// without a CPU monitor-wait primitive, one event-stream period on aarch64).
+/// That limit is stated in `docs/user-api.md` (Executor units),
+/// `docs/deployment_tuning.md` (Data-wake doorbell) and the doc of
+/// `GraphRuntime::doorbell_wake_word_block`; this test holds it, so a change
+/// that wakes a unit on every input fails here and those texts change with it.
+///
+/// Each set is sent one input at a time: the first input's frame, a pause in
+/// which the join's unit drains it and parks again, then the second input's
+/// frame, which completes the set. Phase one completes every set on `B`, phase
+/// two on `A`. Held, against values written here:
+///
+/// - the planner puts the three nodes in three units of the one process, as
+///   the two `isolate: true` declarations ask;
+/// - the join's unit maps a page for both inputs and arms `A`, the first one
+///   declared;
+/// - the join reads every pair in order, `(1, 1)` to `(2 * SETS, 2 * SETS)`;
+/// - while a set is due, no park of the join's unit ends on its park timeout,
+///   which is longer than the whole run;
+/// - no ring that completes a set on `B` issues a wake syscall: the unit holds
+///   no claim on `B`'s page;
+/// - on a host with no CPU monitor-wait primitive and a doorbell wake word, the
+///   rings that complete a set on `A` do issue the kernel wake (the same
+///   reasoning as the executor-unit hop test above).
+///
+/// The time from the completing producer's tick, which returns just before its
+/// frame is published, to the join's fire is printed per phase, not asserted.
+#[test]
+#[serial]
+fn a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_input() {
+    use cerulion_core::graph::node::NodeInfo;
+    use cerulion_core::graph::topology::GraphTopology;
+    use cerulion_core::graph::{
+        build_trigger_edges, expand_process_groups, CrossProcessWiring, ExecutorUnit,
+        SiblingConsumedTopics, SiblingProducedTopics, UnitGraph,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// The process group the three nodes are declared in, also the graph's
+    /// identity.
+    const HOST: &str = "mwp_join";
+    /// The join's two inputs, absolute on both ends so a unit's cut keeps each
+    /// source as written. `A` is declared first.
+    const A: &str = "/mwp/join/a";
+    const B: &str = "/mwp/join/b";
+    /// Sets per phase.
+    const SETS: u64 = 16;
+    /// The join unit's park timeout while a set is due: longer than the whole
+    /// run, so a park that ends on it was ended by no frame.
+    const DUE_PARK_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The pause before each producer step, in which the join's unit drains
+    /// what it has and parks again.
+    const PACE: Duration = Duration::from_millis(3);
+    /// How long the driver waits for the join to fire a set before it reports
+    /// the apparatus broken.
+    const READ_BOUND: Duration = Duration::from_secs(30);
+
+    let ns = mwp_ns("join");
+    let sent_a = Arc::new(AtomicU64::new(0));
+    let sent_b = Arc::new(AtomicU64::new(0));
+    let ticked_a = Arc::new(AtomicU64::new(0));
+    let ticked_b = Arc::new(AtomicU64::new(0));
+    let joined = Arc::new(Mutex::new(Vec::<(f64, f64)>::new()));
+    let join_fires = Arc::new(AtomicU64::new(0));
+    let fired_at_ns = Arc::new(AtomicU64::new(0));
+    let join_ready = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Without a profile a process is one unit; `isolate: true` opts a node
+    // into a unit of its own.
+    let producer = |id: &str, topic: &str, isolate: Option<bool>| NodeDef {
+        isolate,
+        params: Default::default(),
+        ros2: None,
+        id: id.to_string(),
+        node_type: "stamped_numberer".to_string(),
+        inputs: vec![],
+        outputs: vec![OutputDef {
+            name: "out".to_string(),
+            schema: "geometry_msgs/Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: Some(topic.to_string()),
+        }],
+    };
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: [(
+            HOST.to_string(),
+            vec![
+                "numberer_a".to_string(),
+                "numberer_b".to_string(),
+                "joiner".to_string(),
+            ],
+        )]
+        .into_iter()
+        .collect(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: HOST.to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            producer("numberer_a", A, None),
+            producer("numberer_b", B, Some(true)),
+            NodeDef {
+                isolate: Some(true),
+                params: Default::default(),
+                ros2: None,
+                id: "joiner".to_string(),
+                node_type: "joiner".to_string(),
+                inputs: vec![
+                    InputDef {
+                        name: "a".to_string(),
+                        source: A.to_string(),
+                        ..Default::default()
+                    },
+                    InputDef {
+                        name: "b".to_string(),
+                        source: B.to_string(),
+                        ..Default::default()
+                    },
+                ],
+                outputs: vec![],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "numberer_a".to_string(),
+        Box::new(StampedNumbererEntry::with_state(StampedNumberer {
+            fires: Arc::clone(&sent_a),
+            ticked_at_ns: Arc::clone(&ticked_a),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "numberer_b".to_string(),
+        Box::new(StampedNumbererEntry::with_state(StampedNumberer {
+            fires: Arc::clone(&sent_b),
+            ticked_at_ns: Arc::clone(&ticked_b),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "joiner".to_string(),
+        Box::new(JoinerEntry::with_state(Joiner {
+            joined: Arc::clone(&joined),
+            fires: Arc::clone(&join_fires),
+            fired_at_ns: Arc::clone(&fired_at_ns),
+            ..Default::default()
+        })),
+    );
+
+    // The executor units of the one process, derived the way the deployment
+    // planner derives them, with no profile.
+    let infos: IndexMap<String, NodeInfo> = factories
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.info().expect("a macro node's info")))
+        .collect();
+    let trigger_edges = build_trigger_edges(&config, &infos);
+    let topology = GraphTopology::build(&config, &infos).expect("the graph's topology");
+    let unit_graph = UnitGraph::from_graph(&config, &infos, &topology, &trigger_edges);
+    let plan = expand_process_groups(&config, &unit_graph, None, &indexmap::IndexSet::new());
+    let units: &[ExecutorUnit] = plan.units.get(HOST).expect("the declared group's units");
+    for unit in units {
+        for (node, boundary) in &unit.boundaries {
+            eprintln!(
+                "executor unit {}: {node} starts it: {}",
+                unit.name,
+                boundary.describe()
+            );
+        }
+    }
+    let unit_of = |node: &str| -> &ExecutorUnit {
+        units
+            .iter()
+            .find(|u| u.nodes.iter().any(|n| n == node))
+            .unwrap_or_else(|| panic!("apparatus: no executor unit holds {node}"))
+    };
+    for node in ["numberer_a", "numberer_b", "joiner"] {
+        assert_eq!(
+            unit_of(node).nodes,
+            vec![node.to_string()],
+            "apparatus: the planner must give {node} an executor unit of its own (the join \
+             and the producer on B declare `isolate: true`), got {:?}",
+            units.iter().map(|u| &u.nodes).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        units
+            .iter()
+            .all(|u| plan.hosts.get(&u.name).map(String::as_str) == Some(HOST)),
+        "apparatus: every unit must be hosted by the one process ({HOST}), got {:?}",
+        plan.hosts
+    );
+    let cut = |unit: &ExecutorUnit| {
+        let mut sub = config.clone();
+        sub.nodes.retain(|n| unit.nodes.contains(&n.id));
+        sub.process_groups = IndexMap::new();
+        sub.process_group_order = Vec::new();
+        sub.identity = format!("{HOST}_{}", unit.nodes[0]);
+        sub
+    };
+    let mut take = |node: &str| -> IndexMap<String, Box<dyn NodeEntry>> {
+        let entry = factories
+            .shift_remove(node)
+            .expect("each node has one factory");
+        [(node.to_string(), entry)].into_iter().collect()
+    };
+    let a_factories = take("numberer_a");
+    let b_factories = take("numberer_b");
+    let join_factories = take("joiner");
+    let a_config = cut(unit_of("numberer_a"));
+    let b_config = cut(unit_of("numberer_b"));
+    let join_config = cut(unit_of("joiner"));
+
+    let ix_config = cerulion_core::testing::iceoryx_test_config();
+    let unit_transport =
+        |name: &str, clock: Arc<dyn cerulion_core::clock::Clock>, ix: iceoryx2::config::Config| {
+            TransportManager::detached_with_config(
+                cerulion_core::transport::TransportConfig {
+                    node_name: name.into(),
+                    clock,
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                ix,
+            )
+            .expect("create a unit's transport node on the run's iceoryx2 config")
+        };
+
+    // The two PRODUCER units, built first on this thread, so each topic's
+    // service exists with its producer's provisioning before the join opens it.
+    let build_producer = |unit_config: GraphConfig,
+                          unit_factories: IndexMap<String, Box<dyn NodeEntry>>,
+                          topic: &str,
+                          drive: &Arc<VirtualClock>| {
+        let read_by_sibling: SiblingConsumedTopics = [topic.to_string()].into_iter().collect();
+        let clock: Arc<dyn cerulion_core::clock::Clock> = drive.clone();
+        let mgr = unit_transport(&unit_config.identity, Arc::clone(&clock), ix_config.clone());
+        let runtime = GraphRuntime::build_live_free_run(
+            unit_config,
+            unit_factories,
+            &mgr,
+            clock,
+            None,
+            MonitorWaitPolicy::new(true, true, ns.clone()),
+            CrossProcessWiring::requirements_only(None)
+                .with_sibling_consumed_topics(&read_by_sibling),
+        )
+        .expect("build a producer unit's runtime");
+        (runtime, mgr)
+    };
+    let a_drive = Arc::new(VirtualClock::new());
+    let b_drive = Arc::new(VirtualClock::new());
+    let (mut a_runtime, a_mgr) = build_producer(a_config, a_factories, A, &a_drive);
+    let (mut b_runtime, b_mgr) = build_producer(b_config, b_factories, B, &b_drive);
+
+    // The JOIN unit, built and stepped on its own thread.
+    let join_thread = {
+        let ns = ns.clone();
+        let ix_config = ix_config.clone();
+        let join_fires = Arc::clone(&join_fires);
+        let join_ready = Arc::clone(&join_ready);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let from_siblings: SiblingProducedTopics =
+                [A.to_string(), B.to_string()].into_iter().collect();
+            let clock: Arc<dyn cerulion_core::clock::Clock> = Arc::new(VirtualClock::new());
+            let mgr = unit_transport("mwp_join_joiner", Arc::clone(&clock), ix_config);
+            let mut runtime = GraphRuntime::build_live_free_run(
+                join_config,
+                join_factories,
+                &mgr,
+                clock,
+                None,
+                MonitorWaitPolicy::new(true, true, ns),
+                CrossProcessWiring::requirements_only(None).with_sibling_topics(&from_siblings),
+            )
+            .expect("build the join unit's runtime");
+            let primary = runtime
+                .doorbell_primary_topic_for_test()
+                .map(str::to_string);
+            let pages = runtime.doorbell_topics_for_test();
+            let data_wake_rung = runtime.data_wake_rung_for_test();
+            join_ready.store(true, Ordering::Release);
+            let mut timeouts_while_due = 0u64;
+            while join_fires.load(Ordering::Acquire) < 2 * SETS && !stop.load(Ordering::Acquire) {
+                let (_, _, _, before) = runtime.park_wake_counts();
+                runtime.run_live_step_once_for_test(DUE_PARK_TIMEOUT);
+                let (_, _, _, after) = runtime.park_wake_counts();
+                timeouts_while_due += after - before;
+            }
+            let wake_word_blocks = runtime.park_wake_word_block_count_for_test();
+            runtime.shutdown();
+            drop(mgr);
+            (
+                primary,
+                pages,
+                data_wake_rung,
+                timeouts_while_due,
+                wake_word_blocks,
+            )
+        })
+    };
+    /// Sets `stop` when dropped, so an assertion that unwinds this thread also
+    /// ends the join unit's loop at its next park exit.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _stop_on_unwind = StopOnDrop(Arc::clone(&stop));
+    let spun_up = std::time::Instant::now();
+    while !join_ready.load(Ordering::Acquire) {
+        assert!(
+            spun_up.elapsed() < Duration::from_secs(20),
+            "the join unit's runtime never finished building"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    /// One producer step on a virtual period boundary: exactly one numbered
+    /// frame, or the apparatus is broken.
+    fn step_once(
+        name: &str,
+        drive: &VirtualClock,
+        runtime: &mut GraphRuntime,
+        sent: &AtomicU64,
+        expect: u64,
+    ) {
+        drive.advance(5_000_000);
+        runtime.run_live_step_once_for_test(Duration::from_millis(1));
+        assert_eq!(
+            sent.load(Ordering::Relaxed),
+            expect,
+            "apparatus: one step of {name} must send exactly one frame"
+        );
+    }
+
+    // Wake syscalls issued and found-nobody by the completing rings, and the
+    // time from each completing publish to the join's fire, per phase.
+    let mut completed_on = [
+        (0u64, 0u64, Vec::<f64>::new()),
+        (0u64, 0u64, Vec::<f64>::new()),
+    ];
+    let mut sets = 0u64;
+    for (phase, a_last) in [false, true].into_iter().enumerate() {
+        for _ in 0..SETS {
+            let waiting = std::time::Instant::now();
+            while join_fires.load(Ordering::Acquire) < sets {
+                assert!(
+                    waiting.elapsed() < READ_BOUND,
+                    "apparatus: the join never fired set {sets} ({} fired)",
+                    join_fires.load(Ordering::Acquire)
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            std::thread::sleep(PACE);
+            if a_last {
+                step_once("numberer_b", &b_drive, &mut b_runtime, &sent_b, sets + 1);
+            } else {
+                step_once("numberer_a", &a_drive, &mut a_runtime, &sent_a, sets + 1);
+            }
+            std::thread::sleep(PACE);
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            let before = cerulion_core::doorbell::wake_syscall_counts();
+            if a_last {
+                step_once("numberer_a", &a_drive, &mut a_runtime, &sent_a, sets + 1);
+            } else {
+                step_once("numberer_b", &b_drive, &mut b_runtime, &sent_b, sets + 1);
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            {
+                let after = cerulion_core::doorbell::wake_syscall_counts();
+                completed_on[phase].0 += after.0 - before.0;
+                completed_on[phase].1 += after.1 - before.1;
+            }
+            let published_ns = if a_last { &ticked_a } else { &ticked_b }.load(Ordering::Acquire);
+            sets += 1;
+            let waiting = std::time::Instant::now();
+            while join_fires.load(Ordering::Acquire) < sets {
+                assert!(
+                    waiting.elapsed() < READ_BOUND,
+                    "apparatus: the join never fired set {sets} ({} fired)",
+                    join_fires.load(Ordering::Acquire)
+                );
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            let fired = fired_at_ns.load(Ordering::Acquire);
+            completed_on[phase]
+                .2
+                .push(fired.saturating_sub(published_ns) as f64 / 1000.0);
+        }
+    }
+    stop.store(true, Ordering::Release);
+    let (primary, pages, data_wake_rung, timeouts_while_due, wake_word_blocks) =
+        join_thread.join().expect("join unit thread panicked");
+    a_runtime.shutdown();
+    b_runtime.shutdown();
+    drop(a_mgr);
+    drop(b_mgr);
+
+    for (phase, input) in [(0usize, "B"), (1usize, "A")] {
+        let (issued, found_nobody, latencies) = &completed_on[phase];
+        let mut sorted = latencies.clone();
+        sorted.sort_by(f64::total_cmp);
+        eprintln!(
+            "join unit, sets completed on {input}: {issued} wake syscalls issued, \
+             {found_nobody} found nobody; publish to fire p50 {:.2} us, max {:.2} us",
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1]
+        );
+    }
+    eprintln!(
+        "join unit: armed {primary:?}, pages {pages:?}, data-wake rung {data_wake_rung}, \
+         {wake_word_blocks} wake-word blocks, {timeouts_while_due} timeouts while due"
+    );
+
+    assert_eq!(
+        pages,
+        Some(vec![A.to_string(), B.to_string()]),
+        "the join's unit must map a doorbell page for both inputs: each is written from \
+         another unit"
+    );
+    assert_eq!(
+        primary.as_deref(),
+        Some(A),
+        "the join's unit must arm its kernel wake on its first declared input written from \
+         outside it"
+    );
+    let expected: Vec<(f64, f64)> = (1..=2 * SETS).map(|n| (n as f64, n as f64)).collect();
+    assert_eq!(
+        *joined.lock().unwrap(),
+        expected,
+        "the join must read every pair in order"
+    );
+    assert_eq!(
+        timeouts_while_due, 0,
+        "no park of the join's unit may end on its {DUE_PARK_TIMEOUT:?} timeout while a set \
+         is due: a frame on either input is observed by the next recheck at the latest"
+    );
+    assert_eq!(
+        completed_on[0].0, 0,
+        "a ring on the join's second input reaches no blocked waiter: its unit blocks on one \
+         address, the first input's, and holds no claim on the second input's page. If a \
+         ring here now issues a wake, a unit is woken by every input, and the limit stated \
+         in docs/user-api.md (Executor units), docs/deployment_tuning.md (Data-wake \
+         doorbell) and GraphRuntime::doorbell_wake_word_block must change with this test"
+    );
+    if !cerulion_core::monitor_wait::monitor_wait_available() && host_has_a_doorbell_wake_word() {
+        assert!(
+            data_wake_rung && wake_word_blocks > 0,
+            "without a CPU monitor-wait primitive, on a host with a doorbell wake word, the \
+             join's unit must kernel-block on its armed input's wake word (rung \
+             {data_wake_rung}, {wake_word_blocks} blocks)"
+        );
+        assert!(
+            completed_on[1].0 > 0,
+            "the rings that complete a set on the armed input must issue the kernel wake on \
+             the join unit's wake word, and none of {SETS} did"
+        );
+    }
 }
 
 /// Strip `//` line comments and (nesting) `/* */` block comments, so the
@@ -2668,7 +4206,7 @@ mod box_same_core {
     /// backstop is max(1ms, the platform bound), so a large-quantum machine
     /// stays coherent. A SECOND, load-robust oracle pins the geometry
     /// directly: park slices completed per MEASURED round (a live
-    /// `park_yields` snapshot over exactly the measured window — the
+    /// `park_slices` snapshot over exactly the measured window; the
     /// post-stop tail parks up to one whole 50ms timeout window, which
     /// would smear thousands of unrelated slices into a naive total/rounds
     /// figure) must stay <= MAX_SLICES_PER_ROUND (6): "the park wakes at
@@ -2740,7 +4278,7 @@ mod box_same_core {
             identity: "same_core_ponger_ctx".to_string(),
             prefix: "samecoreg".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ponger".to_string(),
@@ -2781,12 +4319,12 @@ mod box_same_core {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_a = Arc::clone(&stop);
-        // Live snapshot of the parker's cumulative `park_yields`, published
+        // Live snapshot of the parker's cumulative `park_slices`, published
         // after every live-step iteration — lets the driver read the slice
         // count over EXACTLY the measured window (see the fn doc's
         // slice-geometry oracle).
-        let yields_live = Arc::new(AtomicU64::new(0));
-        let yields_live_parker = Arc::clone(&yields_live);
+        let slices_live = Arc::new(AtomicU64::new(0));
+        let slices_live_parker = Arc::clone(&slices_live);
         let parker = std::thread::spawn(move || {
             assert!(
                 pin_current_thread(cpu),
@@ -2794,12 +4332,12 @@ mod box_same_core {
             );
             while !stop_a.load(Ordering::Relaxed) {
                 runtime.run_live_step_once_for_test(Duration::from_millis(50));
-                yields_live_parker.store(runtime.park_yield_count_for_test(), Ordering::Relaxed);
+                slices_live_parker.store(runtime.park_slice_count_for_test(), Ordering::Relaxed);
             }
-            let yields = runtime.park_yield_count_for_test();
+            let slices = runtime.park_slice_count_for_test();
             let naps = runtime.park_recheck_nap_count_for_test();
             runtime.shutdown();
-            (yields, naps)
+            (slices, naps)
         });
         assert!(pin_current_thread(cpu), "pin the driver to cpu{cpu}");
 
@@ -2807,14 +4345,14 @@ mod box_same_core {
         // one ping in flight at a time, the driver COOPERATIVE (yield per
         // poll) so only the park under test can hold the core.
         let mut rtts: Vec<Duration> = Vec::with_capacity(ROUNDS);
-        let mut yields_at_measure_start = 0u64;
+        let mut slices_at_measure_start = 0u64;
         for round in 0..(WARMUP_ROUNDS + ROUNDS) {
             if round == WARMUP_ROUNDS {
                 // The slice-geometry window opens here: the last warm-up
                 // pong is in and the parker has published its cumulative
                 // count (modulo one in-flight iteration — noise at the
                 // /ROUNDS scale).
-                yields_at_measure_start = yields_live.load(Ordering::Relaxed);
+                slices_at_measure_start = slices_live.load(Ordering::Relaxed);
             }
             let t0 = Instant::now();
             publish_one(&mut pinger, round as f64);
@@ -2836,11 +4374,11 @@ mod box_same_core {
                 rtts.push(t0.elapsed());
             }
         }
-        let yields_at_measure_end = yields_live.load(Ordering::Relaxed);
+        let slices_at_measure_end = slices_live.load(Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
-        let (parker_yields, parker_naps) = parker.join().expect("join the parked live loop");
+        let (parker_slices, parker_naps) = parker.join().expect("join the parked live loop");
         let slices_per_round =
-            (yields_at_measure_end - yields_at_measure_start) as f64 / ROUNDS as f64;
+            (slices_at_measure_end - slices_at_measure_start) as f64 / ROUNDS as f64;
 
         rtts.sort();
         let pct = |q: f64| rtts[((rtts.len() - 1) as f64 * q) as usize];
@@ -2848,12 +4386,12 @@ mod box_same_core {
         let max = rtts[rtts.len() - 1];
         eprintln!(
             "same-core native park (cpu{cpu}): p50 {p50:?} p90 {p90:?} \
-             p99 {p99:?} max {max:?} over {ROUNDS} rounds; parker slices/yields \
-             {parker_yields} total, {slices_per_round:.2}/round in the measured \
+             p99 {p99:?} max {max:?} over {ROUNDS} rounds; parker slices \
+             {parker_slices} total, {slices_per_round:.2}/round in the measured \
              window; platform bound {threshold:?}{quantum_note}"
         );
         assert!(
-            parker_yields > 0,
+            parker_slices > 0,
             "apparatus: the parked loop must have completed (and yielded after) \
              park slices while idling between pings"
         );

@@ -602,8 +602,8 @@ pub(crate) struct CerulionPublisherConfig {
     /// from the SERVICE's static config, not from the request
     /// (`iceoryx2-0.9.1/src/port/publisher.rs`:
     /// `Queue::new(static_config.history_size)`). Such a publisher really
-    /// retains 16, MEASURED by a late joiner in
-    /// `rmw_transient_local_ceiling_test.rs`.
+    /// retains 16; a late joiner takes up to its own history request from
+    /// that ring.
     ///
     /// Read back from `static_config()` at construction, so it is right for
     /// a CREATE (where it equals the request) and for an OPEN (where it may
@@ -997,6 +997,16 @@ impl CerulionPublisher {
         self.event_service.dynamic_config().number_of_listeners()
     }
 
+    /// Test-only: the backpressure strategy this publisher's iceoryx2 port
+    /// was built with, which sets what a send does at a full queue on a
+    /// service created without safe overflow.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn backpressure_strategy_for_test(
+        &self,
+    ) -> iceoryx2::port::backpressure_strategy::BackpressureStrategy {
+        self.publisher.backpressure_strategy()
+    }
+
     /// `block`: record that one frame was published to this topic
     /// — bump every registered consumer's outstanding counter (each
     /// subscriber's queue just gained one sample). Called on every
@@ -1109,14 +1119,14 @@ impl CerulionPublisher {
     }
 
     /// The history depth this publisher's service ACTUALLY
-    /// provides — the number of past frames a late joiner really receives,
-    /// which the rmw bridge reports as an endpoint's QoS `depth`.
+    /// provides: the number of past frames this publisher's port retains.
+    /// A late joiner receives at most that many, and fewer when its own
+    /// history request is smaller.
     ///
     /// Not the same as the request whenever the publisher OPENED a service
     /// someone else created deeper: iceoryx2's open verification is
     /// at-least, and the port it returns is sized from the service's static
-    /// config. Reporting the ask there would understate what late joiners
-    /// receive (Principle #3).
+    /// config.
     ///
     /// [`Self::has_history`] deliberately still keys on the REQUEST: it
     /// gates the SentHistory wake, and changing what that gate means is a

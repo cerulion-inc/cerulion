@@ -110,6 +110,118 @@ pub(crate) const ROS_TOPIC_CREATE_PUBLISHERS: usize = 32;
 /// [`TopicServiceConfig::create_subscriber_floor`]: cerulion_core::transport::TopicServiceConfig::create_subscriber_floor
 pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
 
+/// The native history every rmw endpoint CREATES a ROS topic's iceoryx2
+/// service with, whatever its own QoS, and the most a TRANSIENT_LOCAL
+/// publisher retains (its depth is clamped to `1..=` this). Applied as
+/// [`TopicServiceConfig::create_history_floor`], which also raises the
+/// created buffer ceiling to `(16 * 4).div_ceil(3)` = 22. The publisher and
+/// the subscription both carry it, so the first opener of a topic creates the
+/// service any later rmw opener needs, and open order cannot refuse a deeper
+/// TRANSIENT_LOCAL publisher. A late joiner's share of the retained frames is
+/// set per subscription by its history request (see `rmw_create_subscription`).
+/// Types whose slice ceiling exceeds [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`] take
+/// [`ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH`] instead; see
+/// [`ros_topic_history_depth`].
+///
+/// [`TopicServiceConfig::create_history_floor`]: cerulion_core::transport::TopicServiceConfig::create_history_floor
+pub(crate) const ROS_TOPIC_HISTORY_DEPTH: usize = 16;
+
+/// The history limit for types whose slice ceiling exceeds
+/// [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`]: 12 is the deepest history the default
+/// subscriber buffer of 16 holds (`16 * 3 / 4`), so the created buffer ceiling
+/// is not raised.
+pub(crate) const ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH: usize = 12;
+
+/// The largest slice ceiling that takes [`ROS_TOPIC_HISTORY_DEPTH`]: the
+/// 16 MiB tier. At the 128 MiB tier (8 subscriber slots, 2 borrowed samples
+/// each, or 4 for a loan-take type such as `sensor_msgs/Image`, and 4 loaned
+/// samples) one publisher's segment is `8 * (22 + 2) + 16 + 4` = 212 slices
+/// (26.5 GiB of address space) at history 16, and `8 * (16 + 2) + 12 + 4` =
+/// 160 slices (20 GiB) at history 12; with 4 borrowed samples, 228 slices
+/// (28.5 GiB) and 176 slices (22 GiB).
+pub(crate) const ROS_TOPIC_FULL_HISTORY_MAX_SLICE: u32 = 16 * 1024 * 1024;
+
+/// The history limit of a ROS topic whose slices are `slice_len` bytes:
+/// [`ROS_TOPIC_HISTORY_DEPTH`] up to [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`],
+/// [`ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH`] above it. Every rmw endpoint of a
+/// topic derives it from the same type, so they all create the same service.
+pub(crate) fn ros_topic_history_depth(slice_len: MaxSliceLen) -> usize {
+    if slice_len.get() <= ROS_TOPIC_FULL_HISTORY_MAX_SLICE {
+        ROS_TOPIC_HISTORY_DEPTH
+    } else {
+        ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH
+    }
+}
+
+/// How many retained messages a TRANSIENT_LOCAL endpoint asks for: a
+/// publisher's history, or what a subscription takes when it connects.
+/// KEEP_ALL does not bound history by depth, so it asks for the topic's
+/// `limit`; every other history policy (KEEP_LAST, SYSTEM_DEFAULT, UNKNOWN)
+/// asks for its depth clamped to `[1, limit]`. The core caps a subscription's
+/// request to the service history and its port buffer.
+pub(crate) fn transient_local_history(history_policy: u32, depth: usize, limit: usize) -> usize {
+    if history_policy == ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL {
+        limit
+    } else {
+        depth.clamp(1, limit)
+    }
+}
+
+/// Whether a TRANSIENT_LOCAL endpoint's depth sets the history it asks for and
+/// reports, so a history that differs from the depth is a clamp worth
+/// reporting: false for KEEP_ALL, whose depth is not its ask.
+pub(crate) fn depth_sets_history(history_policy: u32) -> bool {
+    history_policy != ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL
+}
+
+/// `RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE` where this build's rmw headers
+/// declare it (Iron and later), `None` where they do not (Foxy, Galactic,
+/// Humble), so the resolvers below compile to the same code on every distro
+/// and rcl there can never pass the value.
+#[cfg(cerulion_has_durability_best_available)]
+pub(crate) const DURABILITY_BEST_AVAILABLE: Option<u32> =
+    Some(ffi::RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE);
+/// `None`: this distro's rmw headers have no BEST_AVAILABLE durability.
+#[cfg(not(cerulion_has_durability_best_available))]
+pub(crate) const DURABILITY_BEST_AVAILABLE: Option<u32> = None;
+
+/// Whether `durability` is BEST_AVAILABLE on this build's distro.
+pub(crate) fn is_best_available_durability(durability: u32) -> bool {
+    Some(durability) == DURABILITY_BEST_AVAILABLE
+}
+
+/// The durability an rmw PUBLISHER is created with: BEST_AVAILABLE becomes
+/// TRANSIENT_LOCAL, as `rmw_dds_common` resolves it for a publisher, so the
+/// publisher retains its depth and carries the retaining mark. Every other
+/// value is returned unchanged.
+pub(crate) fn resolve_publisher_durability(requested: u32) -> u32 {
+    if is_best_available_durability(requested) {
+        ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
+    } else {
+        requested
+    }
+}
+
+/// The durability an rmw SUBSCRIPTION is created with, from what it asked
+/// for and one flag per publisher live on the topic when it is created
+/// (`true` when that publisher carries
+/// [`cerulion_core::transport::RETAINING_PUBLISHER_NAME`], in any process).
+///
+/// BEST_AVAILABLE becomes TRANSIENT_LOCAL when there is at least one flag and
+/// every flag is set, and VOLATILE otherwise, an empty slice included; the
+/// mark stands for "offers TRANSIENT_LOCAL". This matches `rmw_dds_common` on
+/// Jazzy and later; Iron resolves the zero-publisher case to TRANSIENT_LOCAL.
+/// Every other value is returned unchanged, whatever the flags say.
+pub(crate) fn resolve_subscription_durability(requested: u32, publishers_retain: &[bool]) -> u32 {
+    if !is_best_available_durability(requested) {
+        requested
+    } else if !publishers_retain.is_empty() && publishers_retain.iter().all(|&retains| retains) {
+        ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
+    } else {
+        ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE
+    }
+}
+
 /// The slice bytes the subscriber floor may account for, summed over the
 /// floor's slots: [`ros_topic_create_subscribers`] divides it by the topic's
 /// slice ceiling. 1 GiB gives 8 slots at the 128 MiB tier (`sensor_msgs/Image`,
@@ -509,41 +621,54 @@ pub unsafe extern "C" fn rmw_create_publisher(
             }
         };
         // Transient-local durability maps to Cerulion history (late-joiner
-        // replay); the requested depth is clamped to [1, 16] (floor 1 so a
-        // TRANSIENT_LOCAL request always retains at least one frame; cap 16 is
-        // an rmw policy choice — Cerulion core accepts a larger `history_size`,
-        // it just warns when history exceeds 75% of the subscriber buffer,
-        // which the ceiling raise below neutralizes by provisioning that buffer up).
-        // VOLATILE (and any non-TRANSIENT_LOCAL durability) retains nothing
-        // (history = 0).
+        // replay), and so does BEST_AVAILABLE, which a publisher resolves to
+        // TRANSIENT_LOCAL (`resolve_publisher_durability`); the requested depth
+        // is clamped to [1, limit] (KEEP_ALL asks for the limit itself, see
+        // `transient_local_history`), where the limit
+        // is the type's `ros_topic_history_depth` (16, or 12 above the 16 MiB
+        // slice tier). Floor 1 so a TRANSIENT_LOCAL request always retains at
+        // least one frame; the cap is the history every rmw endpoint creates
+        // the topic with, so a clamped request always opens. Cerulion core
+        // warns when history exceeds 75% of the subscriber buffer; the create
+        // floor provisions a buffer that holds the limit, and the ceiling raise
+        // below sets this publisher's open requirement to match.
+        // VOLATILE (and any durability that does not resolve to
+        // TRANSIENT_LOCAL) asks for no history of its own (history = 0).
         //
         // `depth_governs_retention` rides the SAME branch on purpose (the
-        // retention-depth reporting rule): only a TRANSIENT_LOCAL
-        // ask participates in the retention at all. Every other durability
+        // retention-depth reporting rule): only an ask that resolves to
+        // TRANSIENT_LOCAL participates in the retention at all. Every other durability
         // retains 0 BECAUSE OF THE POLICY the caller chose — that is what
         // VOLATILE MEANS, not a divergence from the ask — so its create must
         // not warn. Deriving the flag here rather than re-testing the
         // durability at the warn site is what keeps the two from drifting: a
         // future retaining durability cannot be added without visiting this
         // tuple, and the clamp constant can move without touching the gate.
+        // The per-type slice ceiling also sets the topic's history limit
+        // (`ros_topic_history_depth`), the clamp below and the create floor.
+        let slice_len = slice_len_for(&bridge);
+        let history_limit = ros_topic_history_depth(slice_len);
+        let durability = resolve_publisher_durability((*qos).durability);
         let (history, depth_governs_retention) =
-            if (*qos).durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
-                ((*qos).depth.clamp(1, 16), true)
+            if durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
+                (
+                    transient_local_history((*qos).history, (*qos).depth, history_limit),
+                    depth_sets_history((*qos).history),
+                )
             } else {
                 (0, false)
             };
-        // The retention-depth reporting rule:
-        // the provisioned depth endpoint info reports is HISTORY / RETENTION —
-        // the frames this publisher actually keeps — NOT the subscriber-slot
-        // ceiling `topic_config.subscriber_max_buffer_size` computed below.
-        //
-        // A TRANSIENT_LOCAL depth-1000 publisher therefore reports 16 (the
-        // clamp), a depth-5 one reports 5, and a VOLATILE one reports 0. The
-        // ceiling (22 for a clamped history 16) is a slot BUDGET, not a depth
-        // anything retains: reporting it would make a depth-5 publisher claim
-        // 16 while retaining 5. The 22 ceiling stays pinned where
-        // it belongs, by the require-N probes in
-        // `rmw_transient_local_ceiling_test.rs`.
+        // The depth endpoint info reports is this publisher's clamped ask
+        // (`history`), NOT the subscriber-slot ceiling
+        // `topic_config.subscriber_max_buffer_size` computed below and NOT
+        // the service history. A TRANSIENT_LOCAL depth-1000 publisher of a
+        // small type reports 16 (the clamp), a depth-5 one reports 5, and a
+        // VOLATILE one reports 0. The service history is the topic's limit for
+        // every publisher (iceoryx2 sizes a publisher's retained ring from the
+        // service), and a late joiner takes up to its own history request from
+        // that ring, so a subscription deeper than this publisher's depth can
+        // receive more than the reported depth. The 22 ceiling stays pinned by
+        // the require-N probes in `rmw_transient_local_ceiling_test.rs`.
         let requested_depth = (*qos).depth;
         // A TRANSIENT_LOCAL publisher makes its own history request SATISFIABLE
         // by provisioning the
@@ -551,8 +676,9 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // history down or touching the core warn). cerulion_core warns when
         //   history_size > subscriber_max_buffer_size * 3 / 4
         // (transport/mod.rs — CORRECT and left untouched), so a latched
-        // /rosout-class topic (rclpy asks TRANSIENT_LOCAL depth 1000 → clamped
-        // to 16) would trip it on EVERY rclpy process. Raise the ceiling to the
+        // /rosout-class topic (rclpy asks TRANSIENT_LOCAL depth 1000, clamped
+        // to the type's limit: 12 for `rcl_interfaces/Log`, which takes the
+        // 128 MiB catch-all tier) would trip it on EVERY rclpy process. Raise the ceiling to the
         // smallest `c` with `history <= c*3/4` in that integer expression:
         // `c*3/4 >= history` ⇔ `c >= 4*history/3` ⇔ `c = ceil(4*history/3) =
         // (history*4).div_ceil(3)`. Then late-joiners CAN hold the full
@@ -562,6 +688,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // 1 <= default*3/4).
         let mut topic_config = rt.transport.default_topic_config();
         topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
+        topic_config.create_history_floor = Some(history_limit);
         topic_config.history_size = history;
         if history > 0 {
             topic_config.subscriber_max_buffer_size = topic_config
@@ -595,7 +722,6 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // create-time answer is the port's answer for its whole life. The
         // geometry is cached on the handle so the per-call paths never
         // recompute eligibility.
-        let slice_len = slice_len_for(&bridge);
         topic_config.create_subscriber_floor = Some(ros_topic_create_subscribers(slice_len));
         let windowed_geo = windowed_borrow_geometry(
             &bridge,
@@ -646,21 +772,22 @@ pub unsafe extern "C" fn rmw_create_publisher(
                 return std::ptr::null_mut();
             }
         };
+        // The publisher gid is its iceoryx2 port id (`crate::gid`), the id
+        // every sample this port sends carries as its origin, so a take in
+        // any process reports this gid as the message's publisher gid.
+        let gid = crate::gid::publisher_gid(publisher.publisher_id());
 
-        // The depth this endpoint really
-        // retains, READ BACK from the service the publisher just opened rather
-        // than assumed equal to `history`. The two diverge whenever this create
-        // ATTACHED to a service someone else made deeper — iceoryx2's
-        // `.history_size(N)` open verification is at-least, and the port is
-        // sized from the service's static config, so a depth-5 request on a
-        // depth-16 topic really retains 16 (MEASURED by a late joiner in
-        // `rmw_transient_local_ceiling_test.rs`). Reporting the ask there would
-        // understate what late joiners receive — the exact inversion of this
-        // decision. On a fresh CREATE the read-back equals `history`, so every
-        // decided value is unchanged: TL-1000 ⇒ 16, TL-5 ⇒ 5, VOLATILE ⇒ 0
-        // (iceoryx2's own default `publisher_history_size` is 0, and Cerulion
-        // only calls `.history_size()` when the request is nonzero).
-        let provisioned_depth = publisher.provisioned_history_size();
+        // The depth this endpoint reports is its clamped ask: TRANSIENT_LOCAL
+        // depth-N reports N clamped to the type's limit (KEEP_ALL reports the
+        // limit), VOLATILE reports 0.
+        // Every rmw endpoint creates the service at that limit
+        // (`create_history_floor`), so the retained ring is that deep whatever
+        // this publisher asked; what a late joiner takes from it is its own
+        // history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth or, when
+        // KEEP_ALL, the limit), set in
+        // `rmw_create_subscription`. The open requirement is at-least, so an
+        // opened service always holds at least `history` frames.
+        let provisioned_depth = history;
 
         // Say LOUDLY, at create time, that the ask was not what the
         // endpoint got — naming BOTH numbers, so a ROS user asking for
@@ -682,8 +809,9 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // on every create of the ordinary ROS path (rclcpp's default QoS is
         // KeepLast(10) + VOLATILE) that says only "you chose VOLATILE". So the
         // gate is `depth_governs_retention`: it fires only where the CALLER'S
-        // DEPTH really was clamped — TRANSIENT_LOCAL above the ceiling
-        // (depth 1000 ⇒ 16) or below the floor (the degenerate depth 0 ⇒ 1).
+        // DEPTH really was clamped, TRANSIENT_LOCAL above the type's limit
+        // (depth 1000 ⇒ 16 for a small type) or below the floor (the
+        // degenerate depth 0 ⇒ 1).
         if depth_governs_retention && requested_depth != provisioned_depth {
             tracing::warn!(
                 topic = %topic,
@@ -700,12 +828,6 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // end of this function defends (see `register_dynamic_egress`).
         #[cfg(feature = "test-seams")]
         crate::test_seams::maybe_panic_after_publisher_transport_create();
-
-        // Deterministic gid: entity counter + schema hash (never random).
-        let entity = runtime::next_entity_id();
-        let mut gid = [0u8; 16];
-        gid[..8].copy_from_slice(&entity.to_le_bytes());
-        gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         let can_loan = bridge.can_loan();
@@ -2367,8 +2489,8 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // The subscriber-slot reporting rule: `create_subscriber` forwards
         // the transport DEFAULTS — the caller's `depth`/`history` are read
         // exactly once, below, to fill an introspection record, and are never
-        // applied to the iceoryx2 queue (the depth-honoring
-        // `create_subscriber_with_buffers` is not used on this path). So the
+        // applied to the iceoryx2 queue (the port buffer passed below is the
+        // transport default; the depth only sizes the history request). So the
         // depth this endpoint really got is the transport's default subscriber
         // buffer, and that is what endpoint info reports instead of
         // echoing an ask that changed nothing.
@@ -2386,8 +2508,43 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // subscription carries the publisher's floors too, the subscriber
         // floor from the same per-type slice ceiling the publisher uses.
         topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
-        topic_config.create_subscriber_floor =
-            Some(ros_topic_create_subscribers(slice_len_for(&bridge)));
+        let slice_len = slice_len_for(&bridge);
+        let history_limit = ros_topic_history_depth(slice_len);
+        topic_config.create_subscriber_floor = Some(ros_topic_create_subscribers(slice_len));
+        // The same history floor the publisher carries, so a subscription
+        // that creates the topic first creates the service any TRANSIENT_LOCAL
+        // publisher of this type can open.
+        topic_config.create_history_floor = Some(history_limit);
+        // The retained frames this subscription takes when it connects: a
+        // VOLATILE subscription takes none, a TRANSIENT_LOCAL one up to its
+        // depth, or up to the topic's limit when it keeps all history (DDS
+        // durability; `transient_local_history`). The core clamps the request to the service
+        // history and this port's buffer. BEST_AVAILABLE is resolved here,
+        // once, from the retain mark of every publisher live on the topic in
+        // any process (`resolve_subscription_durability`); a later publisher
+        // does not change it. A publisher list the probe cannot read counts
+        // as one publisher without the mark.
+        let marks = if is_best_available_durability((*qos).durability) {
+            rt.transport
+                .topic_publisher_retain_marks(&topic)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        topic = %topic,
+                        error = %error,
+                        "BEST_AVAILABLE subscription: the topic's publishers could not be \
+                         read, so it resolves VOLATILE and takes no retained messages"
+                    );
+                    vec![false]
+                })
+        } else {
+            Vec::new()
+        };
+        let durability = resolve_subscription_durability((*qos).durability, &marks);
+        let history_request = if durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
+            transient_local_history((*qos).history, (*qos).depth, history_limit)
+        } else {
+            0
+        };
         // The take-side gate (fixed types AND forgeable-
         // sequence types) — distinct from the publisher's `can_loan`.
         let can_loan_take = bridge.can_loan_take();
@@ -2421,10 +2578,11 @@ pub unsafe extern "C" fn rmw_create_subscription(
         } else if can_loan_take {
             topic_config.create_borrow_floor = Some(RMW_TAKE_LOAN_BORROW_BUDGET);
         }
-        let subscriber = match rt.transport.create_subscriber_with_buffers(
+        let subscriber = match rt.transport.create_subscriber_with_history_request(
             &topic,
             topic_config,
             provisioned_depth,
+            history_request,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -2498,14 +2656,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
             );
         }
 
-        // Deterministic gid: entity counter + schema hash (never random) —
-        // mirrors the publisher; the endpoint id reported by
-        // rmw_get_subscriptions_info_by_topic and the registry deregister
-        // key. Read the bridge BEFORE it moves into `data`.
-        let entity = runtime::next_entity_id();
-        let mut gid = [0u8; 16];
-        gid[..8].copy_from_slice(&entity.to_le_bytes());
-        gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
+        // The entity gid (`crate::gid`): the endpoint id
+        // rmw_get_subscriptions_info_by_topic reports and the registry
+        // deregister key.
+        let gid = crate::gid::mint_gid();
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         // Adopt-take hot path: the
@@ -2782,7 +2936,9 @@ unsafe fn serve_recorded_message(
         }
         *taken = true;
         if !message_info.is_null() {
-            // The same fill as the live take, from the recorded values.
+            // The live take's fill, from the recorded values, except the
+            // publisher gid: the log does not record it, so its 16 bytes
+            // stay zero.
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
             info.source_timestamp = rec.source_ts;
             info.received_timestamp = rec.received_ts;
@@ -2851,11 +3007,12 @@ unsafe fn take_impl_live(
     }
     let mut result = RMW_RET_OK;
     let mut took = false;
-    let mut info_out: Option<(u64, u64)> = None;
+    let mut info_out: Option<(u64, u64, u128)> = None;
     // ONE message per call (the rmw take contract): try_receive_one,
     // never the drain-everything path — extra drained frames would be
     // silently lost (Principle #6).
     let receive = inner.subscriber.try_receive_one(|msg| {
+        let origin = msg.origin();
         let header = msg.header();
         // The DECISION lives in `take_gate` — one pure
         // function, one legal mutation target, shared by all three take
@@ -2916,7 +3073,7 @@ unsafe fn take_impl_live(
         }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
+            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             crate::replay::capture_take_body(
                 msg.payload(),
                 header.sequence as i64,
@@ -2954,7 +3111,7 @@ unsafe fn take_impl_live(
         *taken = true;
         if !message_info.is_null() {
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-            if let Some((ts, seq)) = info_out {
+            if let Some((ts, seq, _)) = info_out {
                 info.source_timestamp = ts as i64;
                 info.received_timestamp = match runtime::runtime() {
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -2962,7 +3119,7 @@ unsafe fn take_impl_live(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            super::stamp_publisher_gid(&mut info, info_out.map(|(_, _, origin)| origin));
             info.from_intra_process = false;
             *message_info = info;
         }
@@ -3270,6 +3427,7 @@ unsafe fn take_adopted(
         // Empty queue — `taken` stays false.
         return RMW_RET_OK;
     };
+    let origin = owned.origin();
     // `owned.wire_header()` returns the header the read entry stored when it took
     // the frame: `try_receive_one_owned` serves a frame only through
     // `OwnedInboundSample::with_header`, handing it the header its own loop
@@ -3826,7 +3984,7 @@ unsafe fn take_adopted(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+        super::stamp_publisher_gid(&mut info, Some(origin));
         info.from_intra_process = false;
         *message_info = info;
     }
@@ -4047,6 +4205,7 @@ unsafe fn take_loaned_impl(
         }
         return RMW_RET_OK;
     };
+    let origin = owned.origin();
     // `owned.wire_header()` returns the header the read entry stored when it took
     // the frame: `try_receive_one_owned` serves a frame only through
     // `OwnedInboundSample::with_header`, handing it the header its own loop
@@ -4299,7 +4458,7 @@ unsafe fn take_loaned_impl(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+        super::stamp_publisher_gid(&mut info, Some(origin));
         info.from_intra_process = false;
         *message_info = info;
     }
@@ -4982,5 +5141,152 @@ mod slice_ceiling_tests {
             SMALL_TIER
         );
         assert_eq!(slice_len_with_overrides(&colons, &narrowed).get(), 1024);
+    }
+}
+
+/// The durability resolvers against hand-written verdicts: BEST_AVAILABLE by
+/// the `rmw_dds_common` rule of Jazzy and later (no publisher resolves
+/// VOLATILE), every other value passed through.
+#[cfg(test)]
+mod durability_resolution_tests {
+    use super::*;
+
+    const TL: u32 = ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+    const VOLATILE: u32 = ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE;
+    const SYSTEM_DEFAULT: u32 = ffi::RMW_QOS_POLICY_DURABILITY_SYSTEM_DEFAULT;
+    const UNKNOWN: u32 = ffi::RMW_QOS_POLICY_DURABILITY_UNKNOWN;
+
+    #[cfg(cerulion_has_durability_best_available)]
+    const BA: u32 = ffi::RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE;
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn best_available_is_the_iron_header_value() {
+        assert_eq!(DURABILITY_BEST_AVAILABLE, Some(4));
+        assert!(is_best_available_durability(4));
+        for other in [0, 1, 2, 3, 5, u32::MAX] {
+            assert!(!is_best_available_durability(other), "{other}");
+        }
+    }
+
+    #[cfg(not(cerulion_has_durability_best_available))]
+    #[test]
+    fn without_the_iron_headers_no_value_is_best_available() {
+        assert_eq!(DURABILITY_BEST_AVAILABLE, None);
+        for value in 0..=8 {
+            assert!(!is_best_available_durability(value), "{value}");
+            assert_eq!(resolve_subscription_durability(value, &[]), value);
+            assert_eq!(resolve_publisher_durability(value), value);
+        }
+    }
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn a_best_available_subscription_is_transient_local_only_when_every_publisher_retains() {
+        let all_retain = [true; 64];
+        let mut last_does_not = [true; 65];
+        last_does_not[64] = false;
+        let cases: [(&[bool], u32); 9] = [
+            // No publisher: VOLATILE; the one-retaining-publisher row below is
+            // its nonzero control.
+            (&[], VOLATILE),
+            (&[true], TL),
+            (&[true, true, true], TL),
+            (&all_retain, TL),
+            (&[false], VOLATILE),
+            (&[false, false], VOLATILE),
+            (&[true, false], VOLATILE),
+            (&[false, true], VOLATILE),
+            (&last_does_not, VOLATILE),
+        ];
+        for (marks, want) in cases {
+            assert_eq!(
+                resolve_subscription_durability(BA, marks),
+                want,
+                "{} publishers, {} retaining",
+                marks.len(),
+                marks.iter().filter(|&&m| m).count()
+            );
+        }
+    }
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn a_best_available_publisher_is_transient_local() {
+        assert_eq!(resolve_publisher_durability(BA), TL);
+    }
+
+    #[cfg(cerulion_has_durability_best_available)]
+    #[test]
+    fn the_resolution_is_the_same_on_every_call() {
+        for marks in [&[][..], &[true, true], &[true, false]] {
+            let first = resolve_subscription_durability(BA, marks);
+            for _ in 0..3 {
+                assert_eq!(resolve_subscription_durability(BA, marks), first);
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_durability_is_returned_unchanged_whatever_the_publishers() {
+        let mark_sets: [&[bool]; 4] = [&[], &[true], &[false], &[true, false]];
+        for requested in [TL, VOLATILE, SYSTEM_DEFAULT, UNKNOWN, 99, u32::MAX] {
+            for marks in mark_sets {
+                assert_eq!(
+                    resolve_subscription_durability(requested, marks),
+                    requested,
+                    "{requested} with {marks:?}"
+                );
+            }
+            assert_eq!(resolve_publisher_durability(requested), requested);
+        }
+    }
+}
+
+/// The TRANSIENT_LOCAL history request against hand-written values: KEEP_ALL
+/// asks for the topic's limit, every other policy for its clamped depth.
+#[cfg(test)]
+mod transient_local_history_tests {
+    use super::*;
+
+    const KEEP_LAST: u32 = ffi::RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    const KEEP_ALL: u32 = ffi::RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+    const SYSTEM_DEFAULT: u32 = ffi::RMW_QOS_POLICY_HISTORY_SYSTEM_DEFAULT;
+    const UNKNOWN: u32 = ffi::RMW_QOS_POLICY_HISTORY_UNKNOWN;
+
+    #[test]
+    fn keep_all_asks_for_the_limit_and_every_other_policy_for_its_clamped_depth() {
+        // (policy, depth, limit, history asked for)
+        let cases = [
+            (KEEP_LAST, 0, 16, 1),
+            (KEEP_LAST, 1, 16, 1),
+            (KEEP_LAST, 5, 16, 5),
+            (KEEP_LAST, 16, 16, 16),
+            (KEEP_LAST, 17, 16, 16),
+            (KEEP_LAST, 1000, 16, 16),
+            (KEEP_LAST, 1000, 12, 12),
+            (KEEP_ALL, 0, 16, 16),
+            (KEEP_ALL, 7, 16, 16),
+            (KEEP_ALL, 1000, 16, 16),
+            (KEEP_ALL, 0, 12, 12),
+            (SYSTEM_DEFAULT, 0, 16, 1),
+            (SYSTEM_DEFAULT, 5, 16, 5),
+            (UNKNOWN, 5, 16, 5),
+        ];
+        for (policy, depth, limit, want) in cases {
+            assert_eq!(
+                transient_local_history(policy, depth, limit),
+                want,
+                "policy {policy}, depth {depth}, limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_keep_all_depth_does_not_set_the_history() {
+        assert!(!depth_sets_history(KEEP_ALL));
+        for policy in [KEEP_LAST, SYSTEM_DEFAULT, UNKNOWN, 99] {
+            assert!(depth_sets_history(policy), "{policy}");
+        }
     }
 }

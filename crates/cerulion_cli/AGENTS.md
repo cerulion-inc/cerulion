@@ -8,8 +8,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
-- Never gate `Completions` or `Clean` behind `command_needs_identity` - a shell rc file
-  and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
+- Never gate `Completions`, `Clean` or the `doctor` family behind `command_needs_identity` -
+  a shell rc file and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.

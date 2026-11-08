@@ -92,6 +92,7 @@ fn capture_consumer(sink: Arc<Mutex<Vec<TfTransform>>>) -> ClosureNodeEntry {
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
             accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )

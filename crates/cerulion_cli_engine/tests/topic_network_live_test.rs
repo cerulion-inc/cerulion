@@ -56,6 +56,7 @@ fn runs_source_for_a_zenoh_only_surface() -> cerulion_core::transport::network::
     cerulion_core::transport::network::RunSource {
         iox_config: std::sync::Arc::new(cerulion_core::testing::iceoryx_test_config()),
         gather_window: cerulion_core::transport::run_registry::RUN_GATHER_WINDOW,
+        hosted: cerulion_core::transport::hosted_runs::HostedRuns::default(),
     }
 }
 

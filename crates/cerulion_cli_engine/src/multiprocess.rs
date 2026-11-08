@@ -1080,6 +1080,13 @@ pub struct WorkerPlan {
     /// ignores the key it does not know.
     #[serde(default)]
     pub pause_tag: Option<String>,
+    /// The process that hosts this plan, when that process hosts more than one
+    /// executor unit: the declared process group the unit was split from.
+    /// `None` = the plan is its own process. Plans that name one host run as
+    /// threads of one `graph run-worker` process, each with its own runtime,
+    /// step counter, clock and ring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// The serde default for [`WorkerPlan::trace_limit`] — the single-source
@@ -2273,6 +2280,7 @@ pub fn plan_deployment(
             // post-plan, like `wedge_page`: a page is a real SHM object, which a
             // pure planner must not create.
             pause_tag: None,
+            host: None,
         });
     }
 
@@ -2734,6 +2742,192 @@ pub fn planning_ix_config(graph: &str, nonce: &str) -> TransportResult<iceoryx2:
     Ok(config)
 }
 
+/// A deployment's executor units: the graph with `process_groups:` rewritten
+/// to one group per unit, and how it was derived.
+#[derive(Debug, Clone)]
+pub struct DeploymentUnits {
+    /// The graph to plan: one process group per executor unit.
+    pub config: GraphConfig,
+    /// The units of every declared group, and which process hosts each one.
+    pub plan: cerulion_core::graph::UnitPlan,
+    /// Declared groups kept as one unit, each with why.
+    pub kept_whole: Vec<(String, String)>,
+}
+
+/// Under the `oracle-mutants` feature, setting this variable keeps every
+/// declared group as one unit: the level loop over the whole process.
+#[cfg(feature = "oracle-mutants")]
+pub const UNIT_COLLAPSE_MUTANT_ENV: &str = "CERULION_UNIT_COLLAPSE_MUTANT";
+
+fn units_collapsed_by_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        if std::env::var_os(UNIT_COLLAPSE_MUTANT_ENV).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Split every declared process group into executor units
+/// ([`cerulion_core::graph::executor`]).
+///
+/// Under [`ExecutionMode::Lockstep`] every group stays one unit: the barrier
+/// rendezvous is per process and per level, which is the level loop itself.
+/// A group whose split the partition validator refuses stays one unit, with
+/// the refusal recorded in [`DeploymentUnits::kept_whole`] and logged at warn,
+/// naming the process, the refusal and each node of it that declares
+/// `isolate: true`.
+pub fn plan_executor_units(
+    config: &GraphConfig,
+    entry_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    execution_mode: ExecutionMode,
+    real_clock: bool,
+    profile: Option<cerulion_core::graph::UnitProfile<'_>>,
+) -> TransportResult<DeploymentUnits> {
+    use cerulion_core::graph::{
+        build_trigger_edges, expand_process_groups_keyed, validate_partition, GraphTopology,
+        UnitGraph,
+    };
+    let expand = |graph: &UnitGraph, keep: &indexmap::IndexSet<String>| {
+        expand_process_groups_keyed(config, graph, profile, keep, &|name| sanitize_ns(name))
+    };
+    let mut keep: indexmap::IndexSet<String> = indexmap::IndexSet::new();
+    let mut kept_whole: Vec<(String, String)> = Vec::new();
+    let whole_reason = match execution_mode {
+        ExecutionMode::Lockstep => Some("lockstep execution mode"),
+        ExecutionMode::FreeRun if !real_clock => Some("a time source other than the real clock"),
+        ExecutionMode::FreeRun if units_collapsed_by_mutant() => Some("unit-collapse mutant"),
+        ExecutionMode::FreeRun => None,
+    };
+    if let Some(reason) = whole_reason {
+        for host in config.process_groups.keys() {
+            keep.insert(host.clone());
+            kept_whole.push((host.clone(), reason.to_string()));
+        }
+    }
+    let topology = GraphTopology::build(config, entry_infos)?;
+    let trigger_edges = build_trigger_edges(config, entry_infos);
+    let graph = UnitGraph::from_graph(config, entry_infos, &topology, &trigger_edges);
+    // The nodes of `hosts` that declare `isolate: true`, in group order.
+    let isolated_in = |hosts: &[&String]| -> Vec<&str> {
+        hosts
+            .iter()
+            .filter_map(|h| config.process_groups.get(*h))
+            .flatten()
+            .filter(|n| graph.isolate.get(*n) == Some(&true))
+            .map(String::as_str)
+            .collect()
+    };
+
+    let mut plan = expand(&graph, &keep);
+    if let Err(first) = validate_partition(&plan.groups, config, entry_infos, &trigger_edges) {
+        // Find the hosts whose own split is refused, keep those whole.
+        let split: Vec<String> = plan.split_hosts().map(|(h, _)| h.to_string()).collect();
+        for host in &split {
+            let mut only: indexmap::IndexSet<String> = config
+                .process_groups
+                .keys()
+                .filter(|h| *h != host)
+                .cloned()
+                .collect();
+            only.extend(keep.iter().cloned());
+            let trial = expand(&graph, &only);
+            if let Err(e) = validate_partition(&trial.groups, config, entry_infos, &trigger_edges) {
+                let isolated = isolated_in(&[host]);
+                if isolated.is_empty() {
+                    tracing::warn!(
+                        graph = %config.identity(),
+                        process = %host,
+                        error = %e,
+                        "executor units: the partition validator refuses this process's split, \
+                         so the process runs as one unit on one level loop"
+                    );
+                } else {
+                    tracing::warn!(
+                        graph = %config.identity(),
+                        process = %host,
+                        isolated = ?isolated,
+                        error = %e,
+                        "executor units: the partition validator refuses this process's split, \
+                         so the process runs as one unit on one level loop, its nodes that \
+                         declare `isolate: true` included"
+                    );
+                }
+                keep.insert(host.clone());
+                kept_whole.push((host.clone(), format!("its split is refused: {e}")));
+            }
+        }
+        plan = expand(&graph, &keep);
+        if validate_partition(&plan.groups, config, entry_infos, &trigger_edges).is_err() {
+            let processes: Vec<&String> = config.process_groups.keys().collect();
+            let isolated = isolated_in(&processes);
+            if isolated.is_empty() {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    processes = ?processes,
+                    error = %first,
+                    "executor units: the partition validator refuses the deployment's split, so \
+                     every process runs as one unit on one level loop"
+                );
+            } else {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    processes = ?processes,
+                    isolated = ?isolated,
+                    error = %first,
+                    "executor units: the partition validator refuses the deployment's split, so \
+                     every process runs as one unit on one level loop, its nodes that declare \
+                     `isolate: true` included"
+                );
+            }
+            keep = config.process_groups.keys().cloned().collect();
+            kept_whole = config
+                .process_groups
+                .keys()
+                .map(|h| {
+                    (
+                        h.clone(),
+                        format!("the split partition is refused: {first}"),
+                    )
+                })
+                .collect();
+            plan = expand(&graph, &keep);
+        }
+    }
+    for host in &plan.name_collisions {
+        kept_whole.push((
+            host.clone(),
+            "a unit name would collide with another group's or unit's file name".to_string(),
+        ));
+    }
+    Ok(DeploymentUnits {
+        config: plan.apply(config),
+        plan,
+        kept_whole,
+    })
+}
+
+/// Stamp every plan whose unit shares a process with its host's name.
+pub fn stamp_hosts(plan: &mut DeploymentPlan, hosts: &IndexMap<String, String>) {
+    for w in &mut plan.workers {
+        w.host = hosts.get(&w.group).cloned();
+    }
+}
+
+/// The processes to spawn: each entry is one process and the indices (into
+/// `plan.workers`) of the plans it runs, in spawn order. A plan without a
+/// host is its own process; the plans of one host run in one process.
+pub fn host_spawn_order(plan: &DeploymentPlan) -> Vec<(String, Vec<usize>)> {
+    let mut out: IndexMap<String, Vec<usize>> = IndexMap::new();
+    for idx in spawn_order(plan) {
+        let w = &plan.workers[idx];
+        let key = w.host.clone().unwrap_or_else(|| w.group.clone());
+        out.entry(key).or_default().push(idx);
+    }
+    out.into_iter().collect()
+}
+
 #[cfg(test)]
 mod go_sentinel_tests {
     use super::*;
@@ -2831,7 +3025,7 @@ mod tests {
     /// One node: id, (input_name, source) pairs, output names.
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: id.to_string(),
@@ -2886,6 +3080,7 @@ mod tests {
             backpressure: cerulion_core::graph::node::BackpressurePolicy::Block,
             expect_within_ms: None,
             accumulate: false,
+            consume: Default::default(),
         }
     }
 
@@ -2899,6 +3094,7 @@ mod tests {
             backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
             accumulate: false,
+            consume: Default::default(),
         }
     }
 
@@ -4550,7 +4746,7 @@ mod tests {
             identity: "abs".to_string(),
             prefix: PREFIX.to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -5672,7 +5868,7 @@ mod tests {
     /// publish the SAME topic).
     fn abs_node(id: &str, inputs: &[(&str, &str)], out_topic: Option<&str>) -> NodeDef {
         NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: id.to_string(),
@@ -5734,6 +5930,7 @@ mod tests {
                         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
                         expect_within_ms: None,
                         accumulate: false,
+                        consume: Default::default(),
                     })
                     .collect();
                 let mut info = NodeInfo::with_meta(input_meta, Vec::new());
@@ -7150,6 +7347,7 @@ mod tests {
                             .unwrap_or_default(),
                         expect_within_ms: None,
                         accumulate: false,
+                        consume: Default::default(),
                     })
                     .collect();
                 (

@@ -70,6 +70,9 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod codegen;
+// Resolves the crate root every generated path hangs off, so that a package
+// naming only the umbrella crate builds a node. See the module header.
+mod crate_root;
 // MUST stay private (`mod`, not `pub mod`): a `proc-macro = true` crate cannot
 // export any item other than its macros — `pub mod determinism;` is a HARD
 // COMPILE ERROR here ("proc-macro crate types currently cannot export any items
@@ -125,7 +128,33 @@ use syn::{parse_macro_input, DeriveInput};
 #[proc_macro_derive(CerulionState, attributes(cerulion))]
 pub fn derive_cerulion_state(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
-    state_derive::derive(&input).into()
+    let expansion = state_derive::derive(&input);
+    with_root_diagnostic(expansion, input.ident.span())
+}
+
+/// Hand back the expansion, with the missing-dependency diagnostic in front
+/// of it when the crate root did not resolve.
+///
+/// The expansion is returned untouched in the ordinary case, so a package
+/// whose generated paths start `::cerulion_core` gets the tokens, spans
+/// included, that it got before the root was resolvable at all.
+///
+/// The diagnostic goes BESIDE the expansion rather than instead of it.
+/// Generated paths fall back to the pre-resolver spelling, so the compiler
+/// still reports what it always did for such a package; this adds one named
+/// error in front of that, pointing at the manifest rather than at a path the
+/// user never wrote.
+fn with_root_diagnostic(
+    expansion: proc_macro2::TokenStream,
+    span: proc_macro2::Span,
+) -> TokenStream {
+    match crate_root::unresolved_diagnostic(span) {
+        None => expansion.into(),
+        Some(diagnostic) => TokenStream::from(quote! {
+            #diagnostic
+            #expansion
+        }),
+    }
 }
 
 /// Prepare the user's struct for re-emission on an ERROR path.
@@ -231,7 +260,7 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// | `sync_window_ms = N` | once per complete aligned set: every `#[input(trigger)]` field has a message, and the set's timestamps lie within `N` ms of each other |
 /// | `unbounded_sync` | once per complete set: as soon as every `#[input(trigger)]` field has an unconsumed message, with no timing bound. Not recommended for control loops: the worst-case fire latency is the slowest publisher's interval, and unbounded if that publisher stops |
 /// | `external` | when its own `external_source()` signals (a device fd or a blocking SDK call). See [`macro@cerulion_node_impl`] |
-/// | none of these | each time a message arrives on the ONE field marked `#[input(trigger)]` |
+/// | none of these | each time a message arrives on the ONE field marked `#[input(trigger)]`; with `consume = latest` on that field, at most once per scheduler step, on the newest queued message |
 ///
 /// Under both sync policies each trigger message is consumed by at most one
 /// set, so a burst holding several complete sets gives one fire per set, in
@@ -270,6 +299,9 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// - A zero value for `period_ms`, `sync_window_ms`, `tick_within_ms`,
 ///   `throttle_ms`, `expect_within_ms` or `promise_within_ms`.
 /// - `depth` outside `1..=64`.
+/// - `consume` on an input that is not `#[input(trigger)]`, a `consume` mode
+///   other than `fifo` or `latest`, and `consume = latest` on any input of a
+///   `sync_window_ms` or `unbounded_sync` node.
 /// - A duplicate port name, a struct with no `#[input]` / `#[output]` field,
 ///   and the macro on anything that is not a struct.
 /// - `type_name`, `inputs(...)` and `outputs(...)` as macro arguments. The
@@ -299,6 +331,8 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// | `backpressure = sample(N)` | Admit at most one message per `N` ms, by the message's own timestamp |
 /// | `backpressure = block` | Lossless: the producer's tick is deferred while this consumer's queue is full. Each `block` consumer has its own credit slot, so the topic's other consumers may declare any policy; a deferred producer defers its whole node. The graph's `inputs[].backpressure`, `depth` and `block_timeout_ms` keys override this attribute |
 /// | `expect_within_ms = N` | Arrival watchdog. If `N` ms pass with no new message, `expect_within_missed_count` increments and a `warn` is logged. Independent of `trigger` |
+/// | `consume = fifo` | Default, `trigger` only. One fire per queued message, in arrival order |
+/// | `consume = latest` | `trigger` only, not on a sync node. At most one fire per scheduler step; that fire's read drains the queue and serves the newest message, and the older ones it drained are not served. A message no fire has read yet (the fire was deferred by `throttle_ms` or a `block` gate) is kept until a newer one arrives |
 ///
 /// An input that is not a trigger is a latest-value read: `tick` sees the most
 /// recent message, held across steps, and until the first message arrives the
@@ -408,10 +442,13 @@ pub fn cerulion_node(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => {
             let error_tokens = e.to_compile_error();
             let salvaged = salvage_struct_for_error_path(&input);
-            return TokenStream::from(quote! {
-                #salvaged
-                #error_tokens
-            });
+            return with_root_diagnostic(
+                quote! {
+                    #salvaged
+                    #error_tokens
+                },
+                input.ident.span(),
+            );
         }
     };
 
@@ -425,13 +462,22 @@ pub fn cerulion_node(attr: TokenStream, item: TokenStream) -> TokenStream {
         let error_tokens = combined.to_compile_error();
         // Emit original struct to prevent cascading "cannot find type" errors
         let salvaged = salvage_struct_for_error_path(&input);
-        return TokenStream::from(quote! {
-            #salvaged
-            #error_tokens
-        });
+        return with_root_diagnostic(
+            quote! {
+                #salvaged
+                #error_tokens
+            },
+            input.ident.span(),
+        );
     }
 
-    codegen::generate(&node_attr, &field_attrs, &input).into()
+    // Emitted BESIDE the expansion, never instead of it. When the root does
+    // not resolve, generated paths fall back to the spelling this crate used
+    // before it was resolvable, so the compiler reports exactly what it
+    // always did, with one named diagnostic in front of it saying which
+    // dependency is missing.
+    let expansion = codegen::generate(&node_attr, &field_attrs, &input);
+    with_root_diagnostic(expansion, input.ident.span())
 }
 
 /// Declares a node's behaviour. Goes on the `impl` block of a
@@ -533,5 +579,15 @@ pub fn cerulion_node_impl(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    impl_macro::cerulion_node_impl(attr, item)
+    let expansion = impl_macro::cerulion_node_impl(attr, item);
+    match crate_root::unresolved_diagnostic(proc_macro2::Span::call_site()) {
+        None => expansion,
+        Some(diagnostic) => {
+            let expansion = proc_macro2::TokenStream::from(expansion);
+            TokenStream::from(quote! {
+                #diagnostic
+                #expansion
+            })
+        }
+    }
 }

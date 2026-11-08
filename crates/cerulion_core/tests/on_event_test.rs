@@ -113,7 +113,7 @@ fn sample_graph(regimes: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<d
         prefix: "obp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -128,7 +128,7 @@ fn sample_graph(regimes: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<d
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),

@@ -217,8 +217,10 @@ fi
 # Depends: what the shipped ELF objects link against. The rmw library NEEDs
 # libstdc++ and libgcc_s (its std::string shim is compiled C++); it links no
 # ROS library, because it is dlopened by a ROS 2 process that already
-# carries rcutils. The heap hook links libc alone (glibc 2.34 or newer by
-# design; the 2.35 floor below already covers it). ROS 2 itself is therefore a Suggests, not a Depends (that
+# carries rcutils. The release binaries and the heap hook are built on
+# Ubuntu 20.04 and require no glibc symbol newer than 2.31, the floor below;
+# the heap hook interposes the malloc family by LD_PRELOAD load order and
+# reads no glibc malloc hook variable. ROS 2 itself is therefore a Suggests, not a Depends (that
 # would refuse the CLI on every host without the ROS apt repository) and not
 # a Recommends (apt installs those by default, which would pull all of ROS 2
 # base into every install on a host that has the repository configured).
@@ -234,7 +236,7 @@ Section: devel
 Priority: optional
 Maintainer: Cerulion <packaging@cerulion.com>
 Homepage: https://cerulion.com
-Depends: libc6 (>= 2.35), libstdc++6, libgcc-s1
+Depends: libc6 (>= 2.31), libstdc++6, libgcc-s1
 Recommends: cerulion-archive-keyring, build-essential, git, curl
 Suggests: ros-jazzy-ros-base
 Description: Zero-copy deterministic communication for real-time robotics

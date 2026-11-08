@@ -265,7 +265,7 @@ fn credit_ns(tag: &str) -> String {
 /// One node's `NodeDef`.
 fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -2562,6 +2562,86 @@ fn prc_an_unblocked_producer_is_not_woken_by_a_peer_drain() {
         "an UNBLOCKED producer must take ZERO credit wakes however busy its peer is — \
          the predicate is gated on was-full-at-park-entry precisely so that credit \
          contributes no wake source at all when this producer is not waiting on one"
+    );
+}
+
+/// A FULL park baseline on an edge whose credit is already free wakes the park
+/// at its first loop top, and the park never takes a pass that neither blocks,
+/// naps nor yields.
+///
+/// A drain lowers `outstanding` and then bumps `wake_seq`. A park entry that
+/// reads the word while a drain sits between those two writes can therefore
+/// pair a full baseline with an edge that already has room and an epoch that
+/// has not moved yet. The kernel-block arm skips its block for exactly that
+/// state (`outstanding < threshold`), so the loop top must wake on it as well:
+/// a skip the loop top does not answer leaves a pass with no block, no nap and
+/// no yield, and the loop repeats that pass until the park deadline.
+///
+/// The state is set by hand rather than raced: the edge is EMPTY, so its credit
+/// is free, and the seam forces the park-entry `baseline_full` to true while the
+/// epoch baseline is the word's own. No thread touches the word during the
+/// park, so the result does not depend on scheduling.
+#[test]
+#[serial]
+fn prc_a_full_baseline_with_credit_already_free_wakes_without_an_unslept_pass() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("freedfirst", "consumer", "inp", DEPTH as u32);
+    let clock = Arc::new(VirtualClock::new());
+    let bind = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Producer,
+    )];
+    let mgr = manager("cb_freedfirst_p", ix, Arc::clone(&clock));
+    let (cfg, fac) = producer_graph("cbff");
+    let mut rt = GraphRuntime::build_live_free_run(
+        cfg,
+        fac,
+        &mgr,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        None,
+        forced_park_policy(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .expect("build the producer context with its credit binding");
+    assert!(
+        !w.producer_side.is_full(),
+        "precondition: the edge has room, so its credit is already free"
+    );
+    rt.set_credit_park_baseline_full_for_test(Some(true));
+
+    let entries_before = rt.park_entry_count_for_test();
+    let unslept_before = rt.park_unslept_pass_count_for_test();
+    let credit_before = rt.park_wakes_credit_count_for_test();
+    let (_, _, _, timeout_before) = rt.park_wake_counts();
+    rt.run_live_step_once_for_test(Duration::from_millis(PARK_WINDOW_MS));
+    let entries = rt.park_entry_count_for_test() - entries_before;
+    let unslept = rt.park_unslept_pass_count_for_test() - unslept_before;
+    let credit = rt.park_wakes_credit_count_for_test() - credit_before;
+    let (_, _, _, timeout_after) = rt.park_wake_counts();
+    rt.set_credit_park_baseline_full_for_test(None);
+    rt.shutdown();
+
+    assert_eq!(
+        entries, 1,
+        "APPARATUS: the live step must enter the park exactly once"
+    );
+    assert_eq!(
+        unslept, 0,
+        "the park took {unslept} passes with no block, no nap and no yield: the \
+         credit arm skipped its block because the credit was already free, and the \
+         loop top did not wake on that state, so the loop re-polled without sleeping"
+    );
+    assert_eq!(
+        credit, 1,
+        "a full baseline whose credit is already free is a credit wake, taken at \
+         the first loop top (park_wakes_credit moved by {credit})"
+    );
+    assert_eq!(
+        timeout_after, timeout_before,
+        "the park must end on the credit wake, not at its deadline"
     );
 }
 

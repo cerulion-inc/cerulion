@@ -20,18 +20,27 @@
 //! | `inventory` / `log-tail` | Normal | `CAP_OBSERVE` (role ≥ `VIEWER`) — read-only observation. |
 //! | `restart` / `deploy` | Normal | Role ≥ `OPERATOR` (a lifecycle mutation; no fine-grained cap models it, so the role IS the gate). |
 //! | `teleop` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR` — actuation. |
+//! | `cloud-access` | Normal | Role `OWNER`; the handler also requires a non-cloud owner row. |
+//! | `topic-publish` / `service-call` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR`: act on the robot's shared memory (`act_verbs`). |
+//! | `topic-snapshot` / `topic-echo-once` | Normal | `CAP_OBSERVE` (role ≥ `VIEWER`): read one frame. |
 //! | *any other* | — | **DENY** (deny-by-default; an unclassified verb is refused, never fail-open — a new mutating verb must be classified here). |
+//!
+//! Before the class is consulted, a key whose access is
+//! [`KeyAccess::CloudRefused`] (a cloud row while the allow-from-cloud switch
+//! is OFF) is denied for every verb, bootstrap and e-stop included.
 //!
 //! "Role ≥ X" means numerically ≤ X's value — a lower `Role` value is higher
 //! privilege (`OWNER=1 < OPERATOR=2 < VIEWER=3`).
 //!
 //! ## Accept-time plane routing
 //!
-//! [`PairingAuthorizer::classify_accept`] is the accept gate for the two ALPNs:
+//! [`PairingAuthorizer::classify_accept`] is the accept gate for the three ALPNs:
 //! the ops plane admits a paired key to the full surface and an unpaired /
 //! unclaimed key to the bootstrap surface only; the wire plane refuses an
 //! unpaired peer outright (catalog/demand require a paired `CAP_OBSERVE` account
 //! — the `cerulion_q` marker).
+//! The rcp plane admits only a paired key on the access list, and
+//! [`crate::rcp`] checks each MCP message it carries.
 
 use cerud::authz::{Authorizer, AuthzDecision};
 use cerud::transport::CallerIdentity;
@@ -89,6 +98,28 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
             required_caps: Scope::CAP_TELEOP,
             max_role: Role::OPERATOR,
         }),
+        // Owner-only robot setting; the handler also requires the caller's
+        // account to be the claimed owner through a non-cloud row.
+        verbs::CLOUD_ACCESS => VerbClass::Normal(AccessRequirement {
+            required_caps: 0,
+            max_role: Role::OWNER,
+        }),
+        crate::act_verbs::TOPIC_PUBLISH => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        }),
+        crate::act_verbs::SERVICE_CALL => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        }),
+        crate::act_verbs::TOPIC_SNAPSHOT => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        }),
+        crate::act_verbs::TOPIC_ECHO_ONCE => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        }),
         _ => return None,
     })
 }
@@ -105,6 +136,9 @@ pub enum AcceptDecision {
     OpsBootstrapOnly,
     /// Wire plane admitted (a paired `CAP_OBSERVE` account).
     WireAdmit,
+    /// Rcp plane admitted (a paired key whose account is on the access list).
+    /// Every message is still checked per MCP method in [`crate::rcp`].
+    RcpAdmit,
     /// Refused outright (wire plane, unpaired/unclaimed) — close, serve nothing.
     Refuse {
         /// The diagnosable reason.
@@ -175,6 +209,12 @@ impl PairingAuthorizer {
         // 3. One torn-free read of (claimed, access) for this key.
         let (claimed, access) = self.shared.snapshot_for_key(&device_key);
 
+        // 3a. A cloud row on a robot whose allow-from-cloud switch is OFF is
+        // refused for EVERY verb class, the bootstrap and e-stop verbs included.
+        if let Some(reason) = cloud_refusal(access) {
+            return AuthzDecision::deny(format!("verb '{verb}' refused: {reason}"));
+        }
+
         // 4. UNCLAIMED robot: ONLY `claim` is admissible.
         if !claimed {
             return if matches!(class, VerbClass::Bootstrap) && verb == verbs::CLAIM {
@@ -210,6 +250,9 @@ impl PairingAuthorizer {
                      allowed, but this desk was cut"
                         .to_string(),
                 ),
+                KeyAccess::CloudRefused => AuthzDecision::deny(
+                    "e-stop floor: cloud access is off on this robot".to_string(),
+                ),
                 KeyAccess::Unpaired => AuthzDecision::deny(
                     "e-stop floor requires a PAIRED account; this device key is unpaired \
                      (only bootstrap verbs are admissible)"
@@ -219,6 +262,9 @@ impl PairingAuthorizer {
 
             // Normal verb: paired AND meets the capability + role requirement.
             VerbClass::Normal(req) => match access {
+                KeyAccess::CloudRefused => AuthzDecision::deny(format!(
+                    "verb '{verb}' refused: cloud access is off on this robot"
+                )),
                 KeyAccess::Unpaired => AuthzDecision::deny(format!(
                     "device key is unpaired: verb '{verb}' requires a paired account \
                      (only bootstrap verbs are admissible)"
@@ -262,6 +308,15 @@ impl PairingAuthorizer {
         remote_id: &[u8; 32],
     ) -> (AcceptDecision, bool) {
         let (claimed, access) = self.shared.snapshot_for_key(remote_id);
+        // Every ALPN, served or not, refuses a cloud row while the switch is OFF.
+        if let Some(reason) = cloud_refusal(access) {
+            return (
+                AcceptDecision::Refuse {
+                    reason: reason.to_string(),
+                },
+                false,
+            );
+        }
         let unpaired =
             alpn == cerulion_link::alpn::WIRE && claimed && matches!(access, KeyAccess::Unpaired);
         let decision = if alpn == cerulion_link::alpn::OPS {
@@ -280,6 +335,13 @@ impl PairingAuthorizer {
                 Ok(()) => AcceptDecision::WireAdmit,
                 Err(reason) => AcceptDecision::Refuse { reason },
             }
+        } else if alpn == cerulion_link::alpn::RCP {
+            // Rcp plane: the rcp entry point's accept gate (a paired, allowed
+            // key); the per-message class check runs in the proxy.
+            match crate::rcp::authorize_key(&self.shared, remote_id, None) {
+                Ok(()) => AcceptDecision::RcpAdmit,
+                Err(reason) => AcceptDecision::Refuse { reason },
+            }
         } else {
             AcceptDecision::UnknownAlpn {
                 alpn: alpn.to_vec(),
@@ -296,9 +358,22 @@ impl PairingAuthorizer {
     }
 }
 
+/// The refusal for a cloud row on a robot whose allow-from-cloud switch is OFF
+/// ([`KeyAccess::CloudRefused`], produced by `TrustStore::cloud_allowed` in
+/// [`SharedTrust::snapshot_for_key`]); `None` for every other access state.
+/// Accept, every verb, and the wire plane's demand and sweep checks call it.
+pub fn cloud_refusal(access: KeyAccess) -> Option<&'static str> {
+    matches!(access, KeyAccess::CloudRefused).then_some(
+        "this robot does not allow access from the cloud (its allow-from-cloud switch is off)",
+    )
+}
+
 /// Whether a key may be admitted to the wire plane (paired + `CAP_OBSERVE`) given
 /// a torn-free `(claimed, access)` read.
 fn wire_admittable(claimed: bool, access: KeyAccess) -> Result<(), String> {
+    if let Some(reason) = cloud_refusal(access) {
+        return Err(format!("wire plane refused: {reason}"));
+    }
     if !claimed {
         return Err(
             "wire plane refused: robot is UNCLAIMED (catalog/demand require a \
@@ -326,6 +401,7 @@ fn wire_admittable(claimed: bool, access: KeyAccess) -> Result<(), String> {
              epoch — this desk was cut"
                 .to_string(),
         ),
+        KeyAccess::CloudRefused => Err("wire plane refused: cloud access is off".to_string()),
         KeyAccess::Allowed(scope) => {
             if (scope.caps & Scope::CAP_OBSERVE) == 0 {
                 Err(

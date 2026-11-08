@@ -61,7 +61,7 @@ The events:
 | `pair_completed` | `cerulion pair` | `is_success` |
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
 | `vizd_heartbeat` | the vizd daemon, every 15 minutes | `uptime_minutes` |
-| `$create_alias` | a first login's own run, or, when that run sent nothing, the next run outside CI that sends (see below) | `alias`: the random id being joined to the account |
+| `$create_alias` | a first login's own run, or, when that run sent nothing (the notice run, or a run under the network kill switch), the next run outside CI that sends (see below) | `alias`: the random id being joined to the account |
 
 The command's name (`verb` and `subverb` above) is the only part of a command
 line that is sent. Never sent: command arguments, file or directory names,
@@ -76,12 +76,22 @@ A CI run uses neither: it sends under its own random id (see below).
 
 When a machine that has never signed in runs its first login, the login
 request carries the random id so the events from before the login are joined
-to the account; the CLI also sends a `$create_alias` event for the join. A
-CI run never joins: its login carries no id and sends no alias. Nothing else
-is added to the login. A machine that signed out keeps its account on record
+to the account; the CLI also sends a `$create_alias` event for the join.
+Events sent under the random id carry `$process_person_profile: false`, so
+PostHog keeps no person profile for them; the alias still attributes them to
+the account's person. PostHog's person processing describes how a later
+`$identify` links personless events to a person through a person override
+(https://posthog.com/handbook/engineering/person-processing); its ingestion
+pipeline handles `$create_alias` almost the same way as `$identify`
+(https://posthog.com/docs/how-posthog-works/ingestion-pipeline), and its
+identify guide says an alias merges past and future events into one user
+(https://posthog.com/docs/product-analytics/identify). A CI run never
+joins: its login carries no id and sends no alias. Nothing else is added to
+the login. A machine that signed out keeps its account on record
 and carries nothing. If that first login happens in the run that printed the
-notice, which sends nothing, an empty `telemetry_alias_pending` file next to
-the consent file marks the join as owed, and the next run outside CI that
+notice, or in a run under the network kill switch, both of which send
+nothing, an empty `telemetry_alias_pending` file next to the consent file
+marks the join as owed, and the next run outside CI that
 sends makes it and deletes the file. Only a hosted account id is joined this
 way; the events of any other account stay under the random id. A
 `telemetry_anon_account` file next to the consent file records the account
@@ -90,7 +100,8 @@ id, and the account is written into it once the login completes. A login
 that fails after that request keeps it: the account service may have joined
 the id anyway, so the id is never carried again and is replaced when an
 account next signs in. A run that sends while signed in records the account
-too, CI included, and a run that sends nothing records nothing. A random id
+too, CI included, and a run that sends nothing records nothing unless its
+first login leaves the join owed. A random id
 with a record is never carried into a later login, even after the sign-in
 state is removed. When a different account signs in on the same machine, the
 random id is replaced, so later anonymous events are never joined to the
@@ -100,13 +111,19 @@ These commands record no event at all: `cerulion telemetry`, `cerulion
 completions`, `cerulion bagd` (the recorder daemon), and the internal
 subprocesses a command starts for itself.
 
+No CLI command sends a usage event, or shows the notice below, while the
+network kill switch is engaged: `CERULION_NETWORK` set to `off` or to any
+other value that is not blank (which fails closed), or a command run with
+`--network off` (on `cerulion connect` and `cerulion rcp`, any `--network`
+value that is not blank) or with `--local` on `graph run` and `node run`.
+
 ## The first-run notice
 
 The first command that could send, run with stderr on a terminal, prints one
 line on stderr, and the CLI sends nothing in that run:
 
 ```text
-Cerulion sends usage telemetry; turn it off with `cerulion telemetry off` (details: `cerulion telemetry status`).
+Cerulion sends usage telemetry; turn it off with `cerulion telemetry off` (details: https://cerulion.com/telemetry).
 ```
 
 Later commands send. The notice is shown once per machine: it is saved as
@@ -117,8 +134,9 @@ terminal prints no notice and sends as usual; the notice is then printed by
 the first command that could send, run on a terminal. The vizd daemon prints
 no notice of its own and sends nothing until the CLI has shown it on the
 machine (or under CI), so a `cerulion viz` that prints the notice may start
-a daemon that sends. `cerulion telemetry status` prints the link to this
-page.
+a daemon that sends. The notice and `cerulion telemetry status` link to
+this page at https://cerulion.com/telemetry; `cerulion telemetry status`
+also prints the local setting.
 
 ## CI runs
 

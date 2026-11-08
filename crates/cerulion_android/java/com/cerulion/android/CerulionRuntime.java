@@ -17,6 +17,11 @@ public final class CerulionRuntime {
     public static final int BUSY = 11;
     public static final int PANIC = 12;
     public static final int SPAWN = 13;
+    public static final int DECODE = 14;
+    public static final int EMPTY = 15;
+    public static final int RECEIVE = 16;
+    public static final int REMOTE_NOT_PROVISIONED = 17;
+    public static final int REMOTE = 18;
 
     private static String loadedLibrary;
 
@@ -72,10 +77,55 @@ public final class CerulionRuntime {
         return nativeStart(configJson);
     }
 
-    /** Publish without waiting for startup or shutdown. Returns a stable error code. */
+    /**
+     * Publish without waiting for startup or shutdown. Returns a stable error
+     * code. The frame is stamped with the runtime clock's time.
+     */
     public static int publish(String topic, String json) {
         ensureLoaded();
         return nativePublish(topic, json);
+    }
+
+    /**
+     * Publish like {@link #publish(String, String)}, with the frame stamped
+     * {@code stampNs}: nanoseconds on the runtime clock's base. The runtime
+     * clock is {@code CLOCK_MONOTONIC}, the clock {@link System#nanoTime()}
+     * reads on Android. A stamp in the past is taken as is. A negative stamp
+     * returns {@link #INVALID_ARGUMENT} at once. Otherwise the call first
+     * checks the runtime state and the topic as
+     * {@link #publish(String, String)} does, with the same codes. Then a
+     * stamp more than one second ahead of the runtime clock returns
+     * {@link #INVALID_ARGUMENT} before the message is read, so a message
+     * {@code publish} refuses with {@link #ENCODE} returns
+     * {@link #INVALID_ARGUMENT} when its stamp is also too far ahead. A
+     * refused call sends nothing.
+     */
+    public static int publishStamped(String topic, String json, long stampNs) {
+        ensureLoaded();
+        return nativePublishStamped(topic, json, stampNs);
+    }
+
+    /**
+     * Take the next message of a {@code subscribe} topic without waiting
+     * and append it to {@code out} as JSON object text, for example
+     * {@code {"data":"hello"}}. Returns {@link #OK} after appending, or
+     * {@link #EMPTY} when the queue holds no message; any other value is a
+     * stable error code, and only {@link #OK} appends. {@link #BUSY} means a
+     * start, a stop, or another publish or poll is in flight, so retry. {@link #DECODE} means the message
+     * did not decode; it was still taken, so the next poll reads the one
+     * after it. The queue holds {@code depth} messages from each publisher
+     * of the topic; when a publisher's part is full, its oldest message is
+     * dropped, and {@link #status()} counts it under {@code subscribed}.
+     * Messages from one publisher come out oldest first; messages from
+     * different publishers keep no order between them. A frame a node sends
+     * from {@code init} is in the queue only when its output declares
+     * {@code history_size} and the node forwards the history pump (see
+     * docs/android.md). A run whose graph is
+     * {@code finished} can still be polled until {@link #stop()}.
+     */
+    public static int poll(String topic, StringBuilder out) {
+        ensureLoaded();
+        return nativePoll(topic, out);
     }
 
     /** Return the latest JSON status snapshot without waiting for runtime work. */
@@ -99,6 +149,10 @@ public final class CerulionRuntime {
     private static native int nativeStart(String configJson);
 
     private static native int nativePublish(String topic, String json);
+
+    private static native int nativePublishStamped(String topic, String json, long stampNs);
+
+    private static native int nativePoll(String topic, StringBuilder out);
 
     private static native String nativeStatus();
 

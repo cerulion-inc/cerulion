@@ -11,17 +11,20 @@ use cerulion_bagd::{run_bagd, BagdConfig, BagdSummary, RecordedTopic, RECORDED_T
 use cerulion_cli_engine::graph_cmd::{cdylib_name, resolve_recorded_topics};
 use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
-use cerulion_core::dynamic::{SchemaSet, WireLayout};
+use cerulion_core::dynamic::{FrameWalker, SchemaSet, WireLayout};
 use cerulion_core::graph::{
-    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
+    parse_graph, resolve_ingress_schema_hash, resolve_output_topic, DylibNodeEntry, GraphConfig,
+    GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
+    GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
+    TopicSchema,
 };
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
-    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
+    TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, SUBSCRIBER_MAX_BORROWED_HELD,
+    TRANSPORT_KIND,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{CerulionPublisher, GraphRuntime, LanAccess};
@@ -30,11 +33,19 @@ use iceoryx2::config::Config as IoxConfig;
 use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
 
-use crate::config::{validate_robot_name, EmbeddedConfig};
-use crate::encode::encode_json_into;
+use crate::config::{validate_robot_name, EmbeddedConfig, RemoteRelay};
+use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
+use crate::remote::{HostedPlane, RemoteStart};
+use crate::subscribe::{Subscription, SubscriptionCounts};
 
-type ProcessTransportIdentity = (Vec<String>, String);
+/// The listen endpoints, connect locators and robot name the first start
+/// fixed for the process.
+struct ProcessTransportIdentity {
+    listen: Vec<String>,
+    connect: Vec<String>,
+    robot: String,
+}
 
 static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
     OnceLock::new();
@@ -49,8 +60,8 @@ static GATEWAY_OWNED: AtomicBool = AtomicBool::new(false);
 /// announcements and bridge flags carry no owner. A gateway start resets
 /// all of them to the quiescent baseline (see [`quiesce`]), which is correct
 /// only when no other runtime has a live gateway on that manager, so a
-/// second runtime with listen endpoints is refused while one holds this
-/// lease.
+/// second runtime with listen endpoints or connect locators is refused while
+/// one holds this lease.
 struct GatewayLease(());
 
 impl GatewayLease {
@@ -60,7 +71,7 @@ impl GatewayLease {
             .map(|_| Self(()))
             .map_err(|_| {
                 EmbedError::BadState(
-                    "another embedded runtime in this process owns the network gateway; stop it before starting a runtime with listen endpoints".to_string(),
+                    "another embedded runtime in this process owns the network gateway; stop it before starting a runtime with listen endpoints or connect locators".to_string(),
                 )
             })
     }
@@ -85,17 +96,31 @@ pub fn gateway_owned_for_test() -> bool {
 /// no other runtime can start a gateway before the reset is done.
 struct GatewayOwnership {
     manager: Arc<TransportManager>,
+    /// The ingress topics this run's gateway bridges. The gateway leaves
+    /// each bridge registered on the manager when it stops, so the release
+    /// unregisters them before a later start registers its own. A topic
+    /// another user of the manager bridged before the lease is left out: the
+    /// gateway cannot register it, and the release must not take it away.
+    ingress: Vec<String>,
     // Declared last: fields drop in declaration order, so the lease is
     // released after everything else this hold owns.
     _lease: GatewayLease,
 }
 
 impl GatewayOwnership {
-    fn acquire(manager: &Arc<TransportManager>) -> Result<Self, EmbedError> {
+    fn acquire(manager: &Arc<TransportManager>, ingress: Vec<String>) -> Result<Self, EmbedError> {
         let lease = GatewayLease::acquire()?;
         quiesce(manager);
+        let ingress = match manager.network() {
+            Some(network) => ingress
+                .into_iter()
+                .filter(|topic| !network.is_ingress_registered(topic))
+                .collect(),
+            None => ingress,
+        };
         Ok(Self {
             manager: Arc::clone(manager),
+            ingress,
             _lease: lease,
         })
     }
@@ -104,12 +129,32 @@ impl GatewayOwnership {
 impl Drop for GatewayOwnership {
     fn drop(&mut self) {
         quiesce(&self.manager);
+        release_ingress(&self.manager, &self.ingress);
+    }
+}
+
+/// Unregister each ingress bridge in `topics` and take the topic out of the
+/// manager's demand GETs. A topic with no bridge (a build that failed before
+/// the gateway registered it) is skipped. Logs a failure and never returns
+/// one, so it can run on every teardown path.
+fn release_ingress(manager: &TransportManager, topics: &[String]) {
+    let Some(network) = manager.network() else {
+        return;
+    };
+    for topic in topics {
+        network.remove_ingress_demand_keepalive(topic);
+        if network.is_ingress_registered(topic) {
+            if let Err(error) = manager.unregister_ingress_topic(topic) {
+                tracing::warn!(topic = %topic, error = %error, "could not release an ingress bridge");
+            }
+        }
     }
 }
 
 /// Reset the manager-wide gateway state to the quiescent baseline: LAN
 /// access paired, no egress topic announced (the bare robot-identity token
-/// stays), no bridge flag registered and the latched schema serving empty.
+/// stays), no bridge flag registered and the latched catalog serving empty
+/// (schemas, hashes, boot topics and observed frames).
 /// Idempotent; it logs a failure and never returns one, so it can run on
 /// every teardown path. Call it only while no gateway drives the manager.
 fn quiesce(manager: &TransportManager) {
@@ -153,12 +198,106 @@ pub enum RuntimeState {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// The remote plane a running start hosts.
+pub struct RemoteStatus {
+    /// The endpoint id desks dial and authenticate.
+    pub endpoint_id: String,
+    /// The local sockets the endpoint is bound to. An unspecified address
+    /// (`0.0.0.0` or `[::]`) means every interface.
+    pub bound_sockets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// The last error exposed in runtime status.
 pub struct LastError {
     /// Stable error code.
     pub code: i32,
     /// Human-readable error message.
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// A graph node whose tick panicked. The graph runtime contains the panic:
+/// the node does not run again, and the rest of the graph keeps running.
+pub struct NodeFailure {
+    /// The node's graph id.
+    pub node_id: String,
+    /// The node's first panic message.
+    pub message: String,
+}
+
+/// The nodes of the current graph whose tick panicked, in graph order.
+///
+/// Read while the graph runs: [`Self::list`] and the status JSON read the
+/// graph runtime's records at the time of the read. A clone keeps the list
+/// as it was when cloned, so a cloned [`Status`] is a snapshot. The records
+/// stay readable after `stop`; the next start whose config parses and
+/// passes its path checks clears them, also when that start then fails.
+#[derive(Default)]
+pub struct NodeFailures {
+    source: FailureSource,
+}
+
+enum FailureSource {
+    /// The records the graph's tick callbacks write.
+    Live(NodeTickPanicRecords),
+    /// A fixed list: empty before a graph is built, or the list a clone read.
+    Snapshot(Vec<NodeFailure>),
+}
+
+impl Default for FailureSource {
+    fn default() -> Self {
+        Self::Snapshot(Vec::new())
+    }
+}
+
+impl NodeFailures {
+    fn live(records: NodeTickPanicRecords) -> Self {
+        Self {
+            source: FailureSource::Live(records),
+        }
+    }
+
+    /// The failed nodes, in graph order.
+    pub fn list(&self) -> Vec<NodeFailure> {
+        match &self.source {
+            FailureSource::Live(records) => records
+                .snapshot()
+                .into_iter()
+                .map(|(node_id, message)| NodeFailure { node_id, message })
+                .collect(),
+            FailureSource::Snapshot(list) => list.clone(),
+        }
+    }
+}
+
+impl Clone for NodeFailures {
+    fn clone(&self) -> Self {
+        Self {
+            source: FailureSource::Snapshot(self.list()),
+        }
+    }
+}
+
+impl PartialEq for NodeFailures {
+    fn eq(&self, other: &Self) -> bool {
+        // Two reads of one live view could straddle a new panic.
+        std::ptr::eq(self, other) || self.list() == other.list()
+    }
+}
+
+impl Eq for NodeFailures {}
+
+impl std::fmt::Debug for NodeFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.list()).finish()
+    }
+}
+
+impl Serialize for NodeFailures {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.list().serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -201,10 +340,18 @@ pub struct Status {
     pub record_path: Option<String>,
     /// Successful publish count by topic.
     pub published: BTreeMap<String, u64>,
+    /// Poll counts by subscribed topic.
+    pub subscribed: BTreeMap<String, SubscriptionCounts>,
     /// Recorder totals, available after stop.
     pub recorder: Option<RecorderSummary>,
     /// Most recent runtime error.
     pub last_error: Option<LastError>,
+    /// Graph nodes whose tick panicked, in graph order. The state stays
+    /// `running`: the graph keeps running without them.
+    pub node_failures: NodeFailures,
+    /// The remote plane this start serves; `None` when it hosts none or the
+    /// plane stopped.
+    pub remote: Option<RemoteStatus>,
 }
 
 impl Status {
@@ -220,8 +367,11 @@ impl Status {
             mdns_advertised: false,
             record_path: None,
             published: BTreeMap::new(),
+            subscribed: BTreeMap::new(),
             recorder: None,
             last_error: None,
+            node_failures: NodeFailures::default(),
+            remote: None,
         }
     }
 }
@@ -230,27 +380,61 @@ impl Status {
 #[cfg(any(test, feature = "test-helpers"))]
 type BeforeCommitHook = Box<dyn FnOnce(&TransportManager) + Send>;
 
+/// A hook a test runs on the graph thread, with the execution trace the
+/// run kept, once the graph loop has returned.
+#[cfg(any(test, feature = "test-helpers"))]
+type GraphExitHook = Box<dyn FnOnce(&[cerulion_core::TraceEntry]) + Send>;
+
+/// How far ahead of the runtime clock a caller stamp may be, in
+/// nanoseconds (one second). [`EmbeddedRuntime::publish_stamped`] refuses a
+/// stamp further ahead.
+pub const MAX_PUBLISH_STAMP_LEAD_NS: u64 = 1_000_000_000;
+
+/// The wire stamp of an app frame published at clock time `now_ns`: the
+/// caller's `stamp_ns` when it is given, else `now_ns`. A caller stamp more
+/// than [`MAX_PUBLISH_STAMP_LEAD_NS`] ahead of `now_ns` is refused.
+fn frame_stamp(now_ns: u64, stamp_ns: Option<u64>) -> Result<u64, EmbedError> {
+    match stamp_ns {
+        None => Ok(now_ns),
+        Some(stamp) if stamp <= now_ns.saturating_add(MAX_PUBLISH_STAMP_LEAD_NS) => Ok(stamp),
+        Some(stamp) => Err(EmbedError::InvalidArgument(format!(
+            "publish stamp {stamp} ns is more than {MAX_PUBLISH_STAMP_LEAD_NS} ns ahead of the runtime clock ({now_ns} ns)"
+        ))),
+    }
+}
+
 /// Synchronous owner of embedded graph, gateway, recorder, and publisher resources.
 /// Dropping it stops and joins whatever is still running.
 pub struct EmbeddedRuntime {
     files_dir: PathBuf,
     robot_name: String,
     status: Arc<Mutex<Status>>,
+    /// The clock a start gives the process transport manager when it
+    /// creates it. Every frame published in this process, by a graph node
+    /// or by the app, takes its wire stamp from the manager's clock, and the
+    /// graph runs on it. A frame from a LAN peer keeps its sender's stamp.
+    clock: Arc<dyn Clock>,
     /// The committed run. A start builds its run off to the side and stores
     /// it here only once the commit succeeds.
     run: Option<Run>,
     #[cfg(any(test, feature = "test-helpers"))]
     before_commit: Option<BeforeCommitHook>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    graph_exit: Option<GraphExitHook>,
 }
 
 /// Every component one start owns. A start fills it step by step; the
 /// teardown in [`Run::shutdown`] (also run by `Drop`, so a panic mid-build
 /// tears down too) stops whatever was filled in a safe order.
 struct Run {
+    /// The remote plane: bound by the build, served by the commit, stopped
+    /// first by the teardown.
+    remote: Option<HostedPlane>,
     graph: Option<GraphWorker>,
     gateway: Option<GatewayWorker>,
     recorder: Option<RecorderWorker>,
     publishers: BTreeMap<String, PublisherState>,
+    subscriptions: BTreeMap<String, Subscription>,
     /// Only `ownership` must drop after the workers: `shutdown` takes it
     /// last, and its own fields release the lease after the reset.
     ownership: Option<GatewayOwnership>,
@@ -363,23 +547,35 @@ impl Drop for RecordingReservation {
 
 struct PublisherState {
     publisher: CerulionPublisher,
-    layout: WireLayout,
+    /// The transport clock, which stamps graph node frames too: each app
+    /// frame takes its wire stamp from it.
+    clock: Arc<dyn Clock>,
+    /// The schemas of the start, shared by its publishers: publish reads
+    /// the JSON against `schema` in them.
+    walker: Arc<FrameWalker>,
+    schema: String,
     max_payload_bytes: usize,
     sequence: u32,
-    /// Reused encode buffer: cleared per publish, its capacity kept (the JSON
-    /// facade is an encoding boundary, not the zero-copy typed path).
-    frame: Vec<u8>,
-    /// Reused length scratch for the same reason.
-    lengths: Vec<usize>,
 }
 
 struct ResolvedPublish {
     topic: String,
     schema: String,
-    layout: WireLayout,
     schema_hash: u64,
     wire_fixed_size: u32,
     max_payload_bytes: usize,
+    /// The deepest queue a graph input that reads this topic declares; 0
+    /// when no graph input reads it.
+    input_depth: usize,
+}
+
+struct ResolvedSubscribe {
+    topic: String,
+    schema: String,
+    layout: WireLayout,
+    depth: usize,
+    /// An app publisher or a graph output of this run produces the topic.
+    produced_in_run: bool,
 }
 
 struct GraphInputs {
@@ -395,11 +591,39 @@ struct StartPlan {
     nodes: usize,
     schemas: SchemaSet,
     publishes: Vec<ResolvedPublish>,
+    subscribes: Vec<ResolvedSubscribe>,
     recorded_topics: Option<HashSet<String>>,
     recorded_graph_topics: Option<HashSet<String>>,
     listen: Vec<String>,
+    connect: Vec<String>,
+    /// `egress` is set but `listen` and `connect` are empty, so no gateway
+    /// reads the list.
+    inert_egress: bool,
+    /// `ingress` is set, but the start builds no gateway or the gateway is
+    /// paired, so no LAN frame reaches the listed topics.
+    inert_ingress: Option<InertIngress>,
+    /// Number of `ingress` topics, for the inert-ingress warning.
+    ingress_topics: usize,
     gateway: Option<GatewayStartPlan>,
+    remote: Option<RemotePlan>,
     recorder: Option<RecorderPlan>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    graph_exit: Option<GraphExitHook>,
+}
+
+struct RemotePlan {
+    state_root: PathBuf,
+    relay: RemoteRelay,
+    serving: SchemaServing,
+}
+
+/// Why the `ingress` list of a start lets no LAN frame in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InertIngress {
+    /// `listen` and `connect` are empty: the start builds no gateway.
+    NoGateway,
+    /// `lan_access` is `paired`: the gateway opens no ingress bridge.
+    Paired,
 }
 
 struct GatewayStartPlan {
@@ -437,9 +661,12 @@ impl EmbeddedRuntime {
             files_dir,
             status: Arc::new(Mutex::new(Status::new(robot_name.clone()))),
             robot_name,
+            clock: Arc::new(RealClock),
             run: None,
             #[cfg(any(test, feature = "test-helpers"))]
             before_commit: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            graph_exit: None,
         })
     }
 
@@ -456,6 +683,16 @@ impl EmbeddedRuntime {
         self.start_accepted(config_json)
     }
 
+    /// TEST SEAM: give `clock`, in place of the real monotonic clock, to the
+    /// process transport manager when a later start of this runtime creates
+    /// it. The manager is process wide and keeps its first clock, so every
+    /// runtime of a test binary shares one clock.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
     /// TEST SEAM: run `hook` once, on the next start, after every component
     /// is built and ready and before the start commits (opens LAN access,
     /// replays announces, raises the beacon and reports Running).
@@ -468,6 +705,22 @@ impl EmbeddedRuntime {
         self.before_commit = Some(Box::new(hook));
     }
 
+    /// TEST SEAM: run `hook` once, for the next start's graph, on the graph
+    /// thread after its loop returns and its exit is recorded, with the
+    /// execution trace that run kept. `stop()` joins the graph thread, so the
+    /// hook has run when it returns. The first start that gets past its plan
+    /// takes the hook; when that start spawns no graph thread (no graph, or a
+    /// failure before the spawn), the hook is dropped unrun. A start refused
+    /// before its plan leaves the hook for the next start.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_graph_exit_hook_for_test(
+        &mut self,
+        hook: impl FnOnce(&[cerulion_core::TraceEntry]) + Send + 'static,
+    ) {
+        self.graph_exit = Some(Box::new(hook));
+    }
+
     pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
         // A component of a failed run or a finished graph may have left
         // siblings running; tear them down BEFORE the new config is
@@ -475,6 +728,8 @@ impl EmbeddedRuntime {
         // recorder active behind the refusal.
         if let Some(mut run) = self.run.take() {
             let (_summary, teardown_error) = run.shutdown();
+            // The plane is stopped, even when the new config is refused below.
+            lock_status(&self.status).remote = None;
             if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
@@ -490,6 +745,7 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
+        let log_level = config.log_level;
         {
             let mut status = lock_status(&self.status);
             status.state = RuntimeState::Starting;
@@ -502,12 +758,15 @@ impl EmbeddedRuntime {
             status.mdns_advertised = false;
             status.record_path = None;
             status.published.clear();
+            status.subscribed.clear();
             status.recorder = None;
             status.last_error = None;
+            status.node_failures = NodeFailures::default();
+            status.remote = None;
         }
         let planned = install_iceoryx_config(&self.files_dir)
             .and_then(|()| self.plan_start(config))
-            .and_then(|plan| Ok((self.transport_manager(&plan.listen)?, plan)));
+            .and_then(|plan| Ok((self.transport_manager(&plan.listen, &plan.connect)?, plan)));
         let (manager, mut plan) = match planned {
             Ok(planned) => planned,
             Err(error) => {
@@ -515,7 +774,17 @@ impl EmbeddedRuntime {
                 return Err(error);
             }
         };
-        let mut run = match build(&mut plan, manager, &self.status) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            plan.graph_exit = self.graph_exit.take();
+        }
+        // Set just before the build, so the build's lines use it. A start
+        // refused before this point never touches the process-wide level; a
+        // later failure (another runtime owns the gateway, a recording file
+        // exists) drops `level`, which returns to the last kept level. A
+        // restart without the key returns to `info`.
+        let level = crate::log::set_level(log_level);
+        let mut run = match build(&mut plan, manager, &self.status, &self.robot_name) {
             Ok(run) => run,
             Err(failure) => {
                 let StartFailure { error, summary } = *failure;
@@ -540,6 +809,9 @@ impl EmbeddedRuntime {
             return Err(error);
         }
         self.run = Some(run);
+        if let Some(level) = level {
+            level.keep();
+        }
         Ok(())
     }
 
@@ -557,8 +829,23 @@ impl EmbeddedRuntime {
             .run
             .as_ref()
             .and_then(|run| run.publishers.get(topic))
-            .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
+            .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
         Ok(crate::encode::max_publish_json_len(state.max_payload_bytes))
+    }
+
+    /// Refuse `stamp_ns` for a publish on `topic` when it is more than
+    /// [`MAX_PUBLISH_STAMP_LEAD_NS`] ahead of the clock, the same check
+    /// [`publish_stamped`](Self::publish_stamped) makes. The JNI layer runs it
+    /// after [`publish_json_limit`](Self::publish_json_limit) and before it
+    /// reads the message, so a stamped publish checks the state, the topic,
+    /// the stamp and then the message.
+    pub(crate) fn check_publish_stamp(&self, topic: &str, stamp_ns: u64) -> Result<(), EmbedError> {
+        let state = self
+            .run
+            .as_ref()
+            .and_then(|run| run.publishers.get(topic))
+            .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
+        frame_stamp(state.clock.now_ns(), Some(stamp_ns)).map(drop)
     }
 
     /// Test seam: the publish-decision test needs a running status without a
@@ -568,8 +855,35 @@ impl EmbeddedRuntime {
         set_state(&self.status, RuntimeState::Running);
     }
 
-    /// Publish a JSON object and return its wire sequence number.
+    /// Publish a JSON object and return its wire sequence number. The frame
+    /// is stamped with the runtime clock's time.
     pub fn publish(&mut self, topic: &str, json: &str) -> Result<u32, EmbedError> {
+        self.publish_with_stamp(topic, json, None)
+    }
+
+    /// Publish a JSON object stamped `stamp_ns` and return its wire sequence
+    /// number. `stamp_ns` is in nanoseconds on the runtime clock's base, the
+    /// base of the stamp [`publish`](Self::publish) takes. A stamp in the
+    /// past is taken as is; one more than [`MAX_PUBLISH_STAMP_LEAD_NS`] ahead
+    /// of the clock is refused with [`EmbedError::InvalidArgument`] and
+    /// sends nothing.
+    pub fn publish_stamped(
+        &mut self,
+        topic: &str,
+        json: &str,
+        stamp_ns: u64,
+    ) -> Result<u32, EmbedError> {
+        self.publish_with_stamp(topic, json, Some(stamp_ns))
+    }
+
+    /// Publish a JSON object stamped with `stamp_ns`, or with the runtime
+    /// clock's time when it is `None`.
+    pub(crate) fn publish_with_stamp(
+        &mut self,
+        topic: &str,
+        json: &str,
+        stamp_ns: Option<u64>,
+    ) -> Result<u32, EmbedError> {
         if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
             return Err(EmbedError::BadState(
                 "publish requires a running runtime".to_string(),
@@ -579,19 +893,17 @@ impl EmbeddedRuntime {
             .run
             .as_mut()
             .and_then(|run| run.publishers.get_mut(topic))
-            .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
-        let timestamp = cerulion_core::clock::real_ns();
+            .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
+        let timestamp = frame_stamp(state.clock.now_ns(), stamp_ns)?;
         let sequence = state.sequence;
-        encode_json_into(
-            &state.layout,
+        let frame = encode_json(
+            &state.walker,
+            &state.schema,
             json,
             state.max_payload_bytes,
             timestamp,
             sequence,
-            &mut state.frame,
-            &mut state.lengths,
         )?;
-        let frame = &state.frame;
         let mut loan = state
             .publisher
             .loan_raw_uninit(frame.len())
@@ -613,6 +925,31 @@ impl EmbeddedRuntime {
         let mut status = lock_status(&self.status);
         *status.published.entry(topic.to_string()).or_default() += 1;
         Ok(sequence)
+    }
+
+    /// Take the next message of the subscription on `topic` and return it
+    /// as JSON object text, or `None` when its queue is empty. A message that
+    /// does not decode is still taken: the error is DECODE and the next poll
+    /// reads the message after it. A graph that finished keeps the run's
+    /// subscriptions until `stop`, so its last messages can still be read.
+    pub fn poll(&mut self, topic: &str) -> Result<Option<&str>, EmbedError> {
+        let readable = matches!(
+            lock_status(&self.status).state,
+            RuntimeState::Running | RuntimeState::Finished
+        );
+        let Some(run) = self.run.as_mut().filter(|_| readable) else {
+            return Err(EmbedError::BadState(
+                "poll requires a running or finished runtime".to_string(),
+            ));
+        };
+        let subscription = run.subscriptions.get_mut(topic).ok_or_else(|| {
+            EmbedError::UnknownTopic(format!("unknown subscribe topic '{topic}'"))
+        })?;
+        let (counts, result) = subscription.poll();
+        if let Some(total) = lock_status(&self.status).subscribed.get_mut(topic) {
+            *total = counts;
+        }
+        result
     }
 
     /// Return the shared runtime status handle.
@@ -641,6 +978,7 @@ impl EmbeddedRuntime {
             return Ok(None);
         };
         let (summary, error) = run.shutdown();
+        lock_status(&self.status).remote = None;
         // A teardown error keeps Failed: the stopped state must mean every
         // resource actually released, not that the teardown was attempted.
         match &error {
@@ -679,6 +1017,11 @@ impl EmbeddedRuntime {
         let graph_inputs = graph
             .map(|graph| self.load_graph(graph, &config))
             .transpose()?;
+        let input_depths = graph_inputs
+            .as_ref()
+            .map(input_depths_by_topic)
+            .transpose()?
+            .unwrap_or_default();
         let publishes = config
             .publish
             .iter()
@@ -698,12 +1041,18 @@ impl EmbeddedRuntime {
                 Ok(ResolvedPublish {
                     topic: publish.topic.clone(),
                     schema: publish.schema.clone(),
-                    layout: layout.clone(),
                     schema_hash: layout.schema_hash,
                     wire_fixed_size,
                     max_payload_bytes: publish.max_payload_bytes,
+                    input_depth: input_depths.get(&publish.topic).copied().unwrap_or(0),
                 })
             })
+            .collect::<Result<Vec<_>, EmbedError>>()?;
+
+        let subscribes = config
+            .subscribe
+            .iter()
+            .map(|subscribe| resolve_subscribe(subscribe, &schemas, &config, graph_inputs.as_ref()))
             .collect::<Result<Vec<_>, EmbedError>>()?;
 
         let graph_topics = graph_inputs
@@ -720,22 +1069,46 @@ impl EmbeddedRuntime {
                 "publish topic '{topic}' is a graph output; graph topics are single-writer"
             )));
         }
-        let publish_topics: HashSet<&str> =
-            publishes.iter().map(|item| item.topic.as_str()).collect();
-        if let Some(record) = &config.record {
-            let known: HashSet<&str> = graph_topics
-                .iter()
-                .map(String::as_str)
-                .chain(publish_topics.iter().copied())
-                .collect();
-            if let Some(topics) = &record.topics {
-                if let Some(topic) = topics.iter().find(|topic| !known.contains(topic.as_str())) {
-                    return Err(EmbedError::InvalidArgument(format!(
-                        "record topic '{topic}' is neither a graph output nor a publish topic"
-                    )));
-                }
+        let known: HashSet<&str> = graph_topics
+            .iter()
+            .map(String::as_str)
+            .chain(publishes.iter().map(|item| item.topic.as_str()))
+            .collect();
+        if let Some(topics) = config
+            .record
+            .as_ref()
+            .and_then(|record| record.topics.as_ref())
+        {
+            if let Some(topic) = topics.iter().find(|topic| !known.contains(topic.as_str())) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "record topic '{topic}' is neither a graph output nor a publish topic"
+                )));
             }
         }
+        if let Some(egress) = &config.egress {
+            // A misspelled name would leave the topic it meant unsent with no
+            // sign, so every listed topic must be one this start serves.
+            if let Some(topic) = egress.iter().find(|topic| !known.contains(topic.as_str())) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "egress topic '{topic}' is neither a graph output nor a publish topic"
+                )));
+            }
+        }
+        // Resolved under every posture, so a misdeclared topic fails the
+        // first start and not only the first `open` one.
+        let ingress = config
+            .ingress
+            .iter()
+            .map(|topic| {
+                resolve_ingress(
+                    topic,
+                    &publishes,
+                    &graph_topic_set,
+                    &input_depths,
+                    graph_inputs.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<_>, EmbedError>>()?;
 
         // The recorded-topic set is resolved BEFORE the graph
         // build so the runtime can provision the tap raise at service
@@ -765,9 +1138,24 @@ impl EmbeddedRuntime {
                 .collect()
         });
 
-        // Only a start with listen endpoints builds the gateway and changes
-        // manager-wide LAN state; a listen-less start leaves both alone.
-        let gateway = (!config.listen.is_empty()).then(|| {
+        // Only a start with listen endpoints or connect locators builds the
+        // gateway and changes manager-wide LAN state; a start with neither
+        // leaves both alone.
+        let networked = !config.listen.is_empty() || !config.connect.is_empty();
+        let lan_access = LanAccess::from(config.lan_access);
+        let inert_ingress = inert_ingress(!ingress.is_empty(), networked, lan_access);
+        let ingress_topics = ingress.len();
+        let remote = config.remote.as_ref().filter(|remote| remote.enabled);
+        // The served set names EVERY served topic, including schema-less
+        // outputs, which carry no topic_schemas binding.
+        let mut announce = graph_topics.clone();
+        for publish in &publishes {
+            if !announce.contains(&publish.topic) {
+                announce.push(publish.topic.clone());
+            }
+        }
+        // The gateway and the remote plane serve the same schemas.
+        let serving = (networked || remote.is_some()).then(|| {
             let extra = publishes
                 .iter()
                 .map(|publish| TopicSchema {
@@ -780,23 +1168,37 @@ impl EmbeddedRuntime {
                 &schema_dir,
                 &extra,
             );
-            // The served set names EVERY served topic, including schema-less
-            // outputs, which carry no topic_schemas binding.
-            let mut announce = graph_topics.clone();
-            for publish in &publishes {
-                if !announce.contains(&publish.topic) {
-                    announce.push(publish.topic.clone());
-                }
-            }
             serving.served_topics = announce.clone();
+            serving
+        });
+        let remote = remote
+            .zip(serving.clone())
+            .map(|(remote, serving)| RemotePlan {
+                state_root: self.files_dir.join(&remote.state_dir),
+                relay: remote.relay.clone(),
+                serving,
+            });
+        let gateway = serving.filter(|_| networked).map(|serving| {
             GatewayStartPlan {
                 plan: GatewayPlan {
-                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    // The catalog still names every served topic; the list
+                    // decides which of them a LAN peer may receive.
+                    egress_policy: config.egress.clone().map_or(
+                        GatewayEgressPolicy::AllowAll,
+                        GatewayEgressPolicy::AllowList,
+                    ),
                     announce,
-                    ingress: Vec::new(),
+                    // Under `paired` the gateway opens no ingress bridge at
+                    // all: no LAN subscriber, no demand token and no demand
+                    // GET exists for a topic, so no frame can reach it.
+                    ingress: if lan_access == LanAccess::Open {
+                        ingress
+                    } else {
+                        Vec::new()
+                    },
                 },
                 serving,
-                lan_access: LanAccess::from(config.lan_access),
+                lan_access,
                 mdns: config.mdns,
             }
         });
@@ -812,11 +1214,19 @@ impl EmbeddedRuntime {
             graph: graph_inputs,
             schemas,
             publishes,
+            subscribes,
             recorded_topics,
             recorded_graph_topics,
+            inert_egress: config.egress.is_some() && !networked,
+            inert_ingress,
+            ingress_topics,
             listen: config.listen,
+            connect: config.connect,
             gateway,
+            remote,
             recorder,
+            #[cfg(any(test, feature = "test-helpers"))]
+            graph_exit: None,
         })
     }
 
@@ -856,6 +1266,7 @@ impl EmbeddedRuntime {
             let info = entry
                 .info()
                 .map_err(|error| EmbedError::Graph(error.to_string()))?;
+            check_declared_outputs_listed(node, &info)?;
             infos.insert(node.id.clone(), info);
             factories.insert(node.id.clone(), entry);
         }
@@ -866,16 +1277,30 @@ impl EmbeddedRuntime {
         })
     }
 
-    fn transport_manager(&self, listen: &[String]) -> Result<Arc<TransportManager>, EmbedError> {
+    fn transport_manager(
+        &self,
+        listen: &[String],
+        connect: &[String],
+    ) -> Result<Arc<TransportManager>, EmbedError> {
         let identity = PROCESS_TRANSPORT_IDENTITY.get_or_init(|| Mutex::new(None));
         let mut identity = identity.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some((existing_listen, existing_robot)) = identity.as_ref() {
-            if existing_listen != listen {
+        let fixed = || ProcessTransportIdentity {
+            listen: listen.to_vec(),
+            connect: connect.to_vec(),
+            robot: self.robot_name.clone(),
+        };
+        if let Some(existing) = identity.as_ref() {
+            if existing.listen != listen {
                 return Err(EmbedError::BadState(
                     "network listen endpoints are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
                 ));
             }
-            if existing_robot != &self.robot_name {
+            if existing.connect != connect {
+                return Err(EmbedError::BadState(
+                    "network connect locators are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
+                ));
+            }
+            if existing.robot != self.robot_name {
                 return Err(EmbedError::BadState(
                     "the transport identity (robot name) is fixed for the process lifetime by the first start; restart the app process to change it".to_string(),
                 ));
@@ -885,24 +1310,28 @@ impl EmbeddedRuntime {
         // Another party may have initialized the process manager first
         // (before any runtime start); it carries no runtime identity yet.
         // Reusing it silently would drop this start's network config, so
-        // only a listen-less start may share it.
+        // only a start with no listen endpoints and no connect locators may
+        // share it.
         if let Ok(existing) = TransportManager::get() {
-            if !listen.is_empty() {
+            if !listen.is_empty() || !connect.is_empty() {
                 return Err(EmbedError::Network(
-                    "the process transport manager is already initialized without this start's network listen endpoints; initialize it through the embedded runtime or restart the app process".to_string(),
+                    "the process transport manager is already initialized without this start's network listen endpoints or connect locators; initialize it through the embedded runtime or restart the app process".to_string(),
                 ));
             }
-            *identity = Some((listen.to_vec(), self.robot_name.clone()));
+            *identity = Some(fixed());
             return Ok(existing);
         }
-        let network = (!listen.is_empty()).then(|| NetworkConfig {
+        // A peer that is not up yet does not fail the start: the session
+        // dials each connect locator again in the background until it answers.
+        let network = (!listen.is_empty() || !connect.is_empty()).then(|| NetworkConfig {
             listen_endpoints: listen.to_vec(),
+            connect_endpoints: connect.to_vec(),
             robot_identity: Some(self.robot_name.clone()),
             ..NetworkConfig::default()
         });
         let manager = TransportManager::init(TransportConfig {
             node_name: format!("{}_app", self.robot_name),
-            clock: Arc::new(RealClock),
+            clock: Arc::clone(&self.clock),
             network,
             ..TransportConfig::default()
         })
@@ -913,7 +1342,7 @@ impl EmbeddedRuntime {
         if let Some(network) = manager.network() {
             network.set_lan_access(LanAccess::Paired);
         }
-        *identity = Some((listen.to_vec(), self.robot_name.clone()));
+        *identity = Some(fixed());
         Ok(manager)
     }
 
@@ -1011,6 +1440,7 @@ impl Drop for EmbeddedRuntime {
         };
         set_state(&self.status, RuntimeState::Stopping);
         let (summary, error) = run.shutdown();
+        lock_status(&self.status).remote = None;
         match error {
             None => {
                 set_state(&self.status, RuntimeState::Stopped);
@@ -1027,10 +1457,12 @@ impl Drop for EmbeddedRuntime {
 impl Run {
     fn empty(manager: Arc<TransportManager>) -> Self {
         Self {
+            remote: None,
             graph: None,
             gateway: None,
             recorder: None,
             publishers: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             ownership: None,
             manager,
             commit_gate: Arc::new(Mutex::new(())),
@@ -1044,7 +1476,7 @@ impl Run {
     fn shutdown(&mut self) -> (Option<RecorderSummary>, Option<EmbedError>) {
         // Close LAN access before any join: a join that blocks must not
         // leave an open gateway serving LAN peers. Only the gateway owner
-        // may: a listen-less runtime sharing the manager leaves the owner's
+        // may: a runtime with no gateway sharing the manager leaves the owner's
         // posture alone.
         if self.ownership.is_some() {
             if let Some(network) = self.manager.network() {
@@ -1052,6 +1484,13 @@ impl Run {
             }
         }
         let mut first_error = None;
+        // The remote plane stops first, so no desk reads a run that is
+        // going down.
+        if let Some(remote) = self.remote.take() {
+            if let Err(error) = remote.stop() {
+                first_error.get_or_insert(EmbedError::Remote(error));
+            }
+        }
         if let Some(graph) = self.graph.take() {
             graph.running.store(false, Ordering::Relaxed);
             match graph.thread.join() {
@@ -1090,6 +1529,7 @@ impl Run {
             .take()
             .and_then(|recorder| recorder.stop(&mut first_error));
         self.publishers.clear();
+        self.subscriptions.clear();
         // Resets the manager to the quiescent baseline, then frees the lease.
         drop(self.ownership.take());
         (summary, first_error)
@@ -1143,9 +1583,10 @@ fn build(
     plan: &mut StartPlan,
     manager: Arc<TransportManager>,
     status: &Arc<Mutex<Status>>,
+    robot: &str,
 ) -> Result<Run, Box<StartFailure>> {
     let mut run = Run::empty(manager);
-    match build_into(&mut run, plan, status) {
+    match build_into(&mut run, plan, status, robot) {
         Ok(()) => Ok(run),
         Err(error) => {
             let (summary, teardown_error) = run.shutdown();
@@ -1161,14 +1602,33 @@ fn build_into(
     run: &mut Run,
     plan: &mut StartPlan,
     status: &Arc<Mutex<Status>>,
+    robot: &str,
 ) -> Result<(), EmbedError> {
     let manager = Arc::clone(&run.manager);
+    // 0. The remote plane loads its keys and trust state and binds, before
+    //    any other component exists: a plane that is not provisioned fails
+    //    the start with nothing built. It serves nothing until the commit.
+    if let Some(remote) = &plan.remote {
+        run.remote = Some(crate::remote::bind(RemoteStart {
+            state_root: remote.state_root.clone(),
+            robot: robot.to_string(),
+            relay: remote.relay.clone(),
+            manager: Arc::clone(&manager),
+            serving: remote.serving.clone(),
+        })?);
+    }
     // 1. Own the gateway: the manager is now at the baseline and paired.
     //    A latched query surface (an earlier start created it) gets this
     //    run's serving before the constructor records any runtime hash;
     //    a first start seeds the surface through the constructor.
     if let Some(gateway) = &plan.gateway {
-        run.ownership = Some(GatewayOwnership::acquire(&manager)?);
+        let ingress = gateway
+            .plan
+            .ingress
+            .iter()
+            .map(|entry| entry.topic.clone())
+            .collect();
+        run.ownership = Some(GatewayOwnership::acquire(&manager, ingress)?);
         if let Some(live) = manager
             .network()
             .and_then(|network| network.query_surface_serving_handles())
@@ -1180,6 +1640,7 @@ fn build_into(
     // 2. App publishers.
     create_publishers(
         &plan.publishes,
+        &plan.schemas,
         &manager,
         plan.recorded_topics.as_ref(),
         &mut run.publishers,
@@ -1187,7 +1648,9 @@ fn build_into(
 
     // 3. The graph, built but not yet running.
     let graph_runtime = if let Some(inputs) = plan.graph.as_mut() {
-        let clock: Arc<dyn Clock> = Arc::new(RealClock);
+        // The graph runs on the transport clock, the clock that stamps its
+        // nodes' frames and the app's.
+        let clock = manager.clock_arc();
         let schema_hashes = schema_hash_map(&plan.schemas);
         let mut graph_runtime = GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
             inputs.config.clone(),
@@ -1199,11 +1662,36 @@ fn build_into(
             plan.recorded_graph_topics.as_ref(),
         )
         .map_err(|error| EmbedError::Graph(error.to_string()))?;
+        // The trace keeps the newest fires up to `graph run`'s default
+        // `--trace-limit`, so the trace of a graph that runs for days stops
+        // growing.
+        graph_runtime.set_trace_limit(cerulion_cli_engine::graph_cmd::PRODUCTION_TRACE_LIMIT);
         graph_runtime.set_live_transport(Arc::clone(&manager));
+        // The graph thread takes the runtime: status keeps this reader.
+        lock_status(status).node_failures =
+            NodeFailures::live(graph_runtime.node_tick_panic_records());
         Some(graph_runtime)
     } else {
         None
     };
+
+    // 3b. App subscriptions. They attach after the graph build, which ran
+    //     every node's `init`, and before the graph thread starts, so a
+    //     subscription holds every frame a node sends from `tick`. A frame
+    //     a node sends from `init` reaches it only through the output's
+    //     `history_size`, which the node's publisher delivers at the live
+    //     loop's history pump while the node keeps that publisher. A frame
+    //     outlives the drop of the publisher that sent it only over an
+    //     established connection: one the subscriber opened while that
+    //     publisher was alive. iceoryx2 keeps such a connection while it
+    //     holds undelivered data, which is what lets `poll` read a run that
+    //     finished. A subscriber opens a connection to each publisher that
+    //     exists when it is created, which here includes every app publisher and
+    //     every publisher the graph build made. It opens a connection to a
+    //     later publisher only when `poll` reads. A frame from a publisher
+    //     that is created and dropped between two reads can be lost, even
+    //     though the subscriber exists.
+    create_subscriptions(&plan.subscribes, &manager, &mut run.subscriptions)?;
 
     // 4. The recorder runs before any producer, as `armed_before_producers`
     //    requires.
@@ -1299,6 +1787,8 @@ fn build_into(
         let thread_ready = Arc::clone(&ready);
         let thread_status = Arc::clone(status);
         let thread_gate = Arc::clone(&run.commit_gate);
+        #[cfg(any(test, feature = "test-helpers"))]
+        let graph_exit = plan.graph_exit.take();
         let thread = thread::Builder::new()
             .name("cerulion-graph".to_string())
             .spawn(move || {
@@ -1319,6 +1809,10 @@ fn build_into(
                 {
                     let _commit = lock_gate(&thread_gate);
                     record_graph_exit(&thread_status, &thread_running, &result);
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = graph_exit {
+                    hook(graph_runtime.trace());
                 }
                 result
             })
@@ -1367,13 +1861,16 @@ fn build_into(
     Ok(())
 }
 
-/// Make a built run visible: open LAN access to the configured posture,
-/// replay the announces the paired build withheld, report the run and raise
-/// the beacon. The only step of a start that does so. On an error the
-/// caller shuts the run down, which closes LAN access first.
+/// Make a built run visible: start the bound remote plane serving, open LAN
+/// access to the configured posture, replay the announces the paired build
+/// withheld, report the run and raise the beacon. The only step of a
+/// start that does so. On an error the caller shuts the run down, which
+/// stops the remote plane and closes LAN access first.
 ///
 /// The run's commit gate is held from the last worker-failure check through
-/// the posture write, the announce replay and the switch to Running. A
+/// the remote plane's serve, the posture write, the announce replay and the
+/// switch to Running; a plane that ends on its own records its failure under
+/// the same gate, so its exit never runs inside `serve`. A
 /// worker records its failure under that same gate, so a failure either
 /// lands first (the commit refuses and LAN access never opens) or lands
 /// after the run is Running (a failure of a started run). A failed start
@@ -1395,6 +1892,34 @@ fn commit(
                 return Err(recorded_failure(&status));
             }
         }
+        // The paired plane serves before LAN access opens: a plane that
+        // refuses to serve fails the start while the LAN is still paired.
+        let remote = match run.remote.as_mut().map(HostedPlane::plane) {
+            Some(remote) => {
+                let thread_status = Arc::clone(status);
+                let thread_gate = Arc::clone(&gate);
+                remote
+                    .serve(Box::new(move |reason| {
+                        let _commit = lock_gate(&thread_gate);
+                        lock_status(&thread_status).remote = None;
+                        set_thread_error(
+                            &thread_status,
+                            codes::REMOTE,
+                            &format!("the remote plane stopped serving: {reason}"),
+                        );
+                    }))
+                    .map_err(EmbedError::Remote)?;
+                Some(RemoteStatus {
+                    endpoint_id: remote.endpoint_id(),
+                    bound_sockets: remote
+                        .bound_sockets()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                })
+            }
+            None => None,
+        };
         if let Some(gateway) = &plan.gateway {
             let network = run.manager.network().ok_or_else(|| {
                 EmbedError::Network("the gateway's transport manager has no network".to_string())
@@ -1424,6 +1949,11 @@ fn commit(
         }
         status.graph = plan.graph_name.clone();
         status.nodes = plan.nodes;
+        status.subscribed = plan
+            .subscribes
+            .iter()
+            .map(|subscribe| (subscribe.topic.clone(), SubscriptionCounts::default()))
+            .collect();
         status.listen = plan.listen.clone();
         status.lan_access = plan
             .gateway
@@ -1433,12 +1963,43 @@ fn commit(
             .recorder
             .as_ref()
             .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
+        status.remote = remote;
+    }
+    // Another publisher in the process may send such a topic, so it is
+    // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
+    // Logged once the start goes ahead, at its own level.
+    for subscribe in plan.subscribes.iter().filter(|item| !item.produced_in_run) {
+        tracing::warn!(
+            topic = %subscribe.topic,
+            schema = %subscribe.schema,
+            "subscribe topic is neither an app publish topic nor a graph output"
+        );
+    }
+    match plan.inert_ingress {
+        None => {}
+        Some(InertIngress::NoGateway) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
+            "ingress is set but listen and connect are empty: this start builds no gateway, so \
+             no LAN frame reaches the ingress topics"
+        ),
+        Some(InertIngress::Paired) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
+            "ingress is set but lan_access is paired: the gateway refuses every frame a LAN \
+             peer publishes into the ingress topics"
+        ),
+    }
+    if plan.inert_egress {
+        tracing::warn!(
+            "egress is set but listen and connect are empty: this start builds no gateway, so \
+             the list has no effect"
+        );
     }
     // mDNS registration does I/O: raise it with no lock held. The beacon
     // names only the device, never a topic, and a gateway that stops
-    // closes its slot, so a beacon raised after it stopped is dropped.
+    // closes its slot, so a beacon raised after it stopped is dropped. A
+    // gateway that only dials has no port to announce.
     if let Some(gateway) = &plan.gateway {
-        if gateway.mdns {
+        if gateway.mdns && !plan.listen.is_empty() {
             let beacon = advertise_beacon(robot, &plan.listen);
             if let Some(worker) = &run.gateway {
                 drop(install_beacon(&worker.beacon, status, beacon));
@@ -1450,10 +2011,12 @@ fn commit(
 
 fn create_publishers(
     config: &[ResolvedPublish],
+    schemas: &SchemaSet,
     manager: &TransportManager,
     recorded_topics: Option<&HashSet<String>>,
     publishers: &mut BTreeMap<String, PublisherState>,
 ) -> Result<(), EmbedError> {
+    let walker = Arc::new(schemas.walker().clone());
     for item in config {
         let slot_len = WireHeader::SIZE
             .checked_add(item.max_payload_bytes)
@@ -1464,33 +2027,230 @@ fn create_publishers(
                     "publisher slot size exceeds the wire transport limit".to_string(),
                 )
             })?;
-        // A RECORDED app topic gets the same tap
-        // provisioning the graph build applies to recorded graph outputs;
-        // a non-recorded publisher keeps the default config.
-        let publisher = if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
-            manager.create_publisher_with_topic_config(
-                &item.topic,
-                slot_len,
-                0,
-                recorded_publisher_config(manager.default_topic_config(), slot_len),
-            )
-        } else {
-            manager.create_publisher(&item.topic, slot_len, 0)
+        // The app creates its topics before the graph builds, and a topic's
+        // limits are fixed when it is created, so each one is created with
+        // what the graph inputs that read it (an absolute `source:`) need to
+        // open it: the borrow floor a graph output gets, for a node that holds
+        // the topic as a latest-value input, and a queue limit as deep as the
+        // deepest input, the rule the graph applies to the topics it creates.
+        // A RECORDED app topic also gets the tap provisioning the graph build
+        // applies to recorded graph outputs.
+        let mut topic_config = manager.default_topic_config();
+        topic_config.create_borrow_floor = Some(SUBSCRIBER_MAX_BORROWED_HELD);
+        topic_config.subscriber_max_buffer_size = topic_config
+            .subscriber_max_buffer_size
+            .max(item.input_depth);
+        if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
+            topic_config = recorded_publisher_config(topic_config, slot_len);
         }
-        .map_err(|error| EmbedError::Publish(error.to_string()))?;
+        let publisher = manager
+            .create_publisher_with_topic_config(&item.topic, slot_len, 0, topic_config)
+            .map_err(|error| EmbedError::Publish(error.to_string()))?;
         publishers.insert(
             item.topic.clone(),
             PublisherState {
                 publisher,
-                layout: item.layout.clone(),
+                clock: manager.clock_arc(),
+                walker: Arc::clone(&walker),
+                schema: item.schema.clone(),
                 max_payload_bytes: item.max_payload_bytes,
                 sequence: 0,
-                frame: Vec::new(),
-                lengths: Vec::new(),
             },
         );
     }
     Ok(())
+}
+
+fn create_subscriptions(
+    config: &[ResolvedSubscribe],
+    manager: &TransportManager,
+    subscriptions: &mut BTreeMap<String, Subscription>,
+) -> Result<(), EmbedError> {
+    let topic_config = manager.default_topic_config();
+    for item in config {
+        if item.depth > topic_config.subscriber_max_buffer_size {
+            return Err(EmbedError::InvalidArgument(format!(
+                "depth {} for '{}' exceeds the subscription queue limit {}",
+                item.depth, item.topic, topic_config.subscriber_max_buffer_size
+            )));
+        }
+        let subscriber = manager
+            .create_subscriber_with_buffers(&item.topic, topic_config, item.depth)
+            .map_err(|error| EmbedError::Receive(error.to_string()))?;
+        subscriptions.insert(
+            item.topic.clone(),
+            Subscription::new(subscriber, item.layout.clone()),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a `subscribe` entry against the schemas, and refuse one that
+/// could never decode: a schema with a field poll cannot read, or a topic
+/// the app or the graph produces under another schema.
+fn resolve_subscribe(
+    subscribe: &crate::config::SubscribeConfig,
+    schemas: &SchemaSet,
+    config: &EmbeddedConfig,
+    graph: Option<&GraphInputs>,
+) -> Result<ResolvedSubscribe, EmbedError> {
+    let layout = schemas.layout(&subscribe.schema).ok_or_else(|| {
+        EmbedError::InvalidArgument(format!("unknown subscribe schema '{}'", subscribe.schema))
+    })?;
+    if let Some((name, field_type)) = crate::decode::unsupported_field(layout) {
+        return Err(EmbedError::InvalidArgument(format!(
+            "subscribe schema '{}' field {name} has type {field_type:?}, which poll does not support",
+            subscribe.schema
+        )));
+    }
+    let published = config
+        .publish
+        .iter()
+        .filter(|publish| publish.topic == subscribe.topic)
+        .map(|publish| ("the app publishes", publish.schema.as_str()));
+    let produced = graph.into_iter().flat_map(|graph| {
+        graph.config.nodes.iter().flat_map(|node| {
+            node.outputs
+                .iter()
+                .filter(|output| {
+                    resolve_output_topic(&graph.config.prefix, &node.id, output) == subscribe.topic
+                })
+                .map(|output| ("a graph output declares", output.schema.as_str()))
+        })
+    });
+    let producers = published.chain(produced).collect::<Vec<_>>();
+    if let Some((producer, schema)) = producers
+        .iter()
+        .find(|(_, schema)| !schema.is_empty() && *schema != subscribe.schema)
+    {
+        return Err(EmbedError::InvalidArgument(format!(
+            "subscribe topic '{}' has schema '{}', but {producer} '{schema}'",
+            subscribe.topic, subscribe.schema
+        )));
+    }
+    // The graph text can name one schema while the node sends another (the
+    // build only warns), so check the hash the node itself reports too.
+    if let Some(graph) = graph {
+        for node in &graph.config.nodes {
+            let Some(info) = graph.infos.get(&node.id) else {
+                continue;
+            };
+            for output in node.outputs.iter().filter(|output| {
+                resolve_output_topic(&graph.config.prefix, &node.id, output) == subscribe.topic
+            }) {
+                let sent = info
+                    .output_meta()
+                    .iter()
+                    .find(|meta| meta.name == output.name)
+                    .map(|meta| meta.schema_hash);
+                // 0 is a node that reports no hash for the output.
+                if sent.is_some_and(|hash| hash != 0 && hash != layout.schema_hash) {
+                    return Err(EmbedError::InvalidArgument(format!(
+                        "subscribe topic '{}' has schema '{}', but node '{}' sends output '{}' with another schema",
+                        subscribe.topic, subscribe.schema, node.id, output.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(ResolvedSubscribe {
+        topic: subscribe.topic.clone(),
+        schema: subscribe.schema.clone(),
+        layout: layout.clone(),
+        depth: subscribe.depth,
+        produced_in_run: !producers.is_empty(),
+    })
+}
+
+/// Why a start's `ingress` list lets no LAN frame in, or `None` when it
+/// does: the gateway takes LAN frames only when the start builds one (a
+/// `listen` endpoint or a `connect` locator) and its posture is `open`.
+fn inert_ingress(
+    has_ingress: bool,
+    networked: bool,
+    lan_access: LanAccess,
+) -> Option<InertIngress> {
+    match (has_ingress, networked, lan_access) {
+        (false, _, _) | (true, true, LanAccess::Open) => None,
+        (true, false, _) => Some(InertIngress::NoGateway),
+        (true, true, LanAccess::Paired) => Some(InertIngress::Paired),
+    }
+}
+
+/// Resolve one `ingress` topic to the schema hash its frames are checked
+/// against: the hash the graph inputs that read it declare. A topic with
+/// another writer in the run, or one no graph input reads, fails the start.
+fn resolve_ingress(
+    topic: &str,
+    publishes: &[ResolvedPublish],
+    graph_topics: &HashSet<&str>,
+    input_depths: &BTreeMap<String, usize>,
+    graph: Option<&GraphInputs>,
+) -> Result<GatewayIngressEntry, EmbedError> {
+    if publishes.iter().any(|publish| publish.topic == topic) {
+        return Err(EmbedError::InvalidArgument(format!(
+            "ingress topic '{topic}' is a publish topic; a topic has one writer"
+        )));
+    }
+    if graph_topics.contains(topic) {
+        return Err(EmbedError::InvalidArgument(format!(
+            "ingress topic '{topic}' is a graph output; graph topics are single-writer"
+        )));
+    }
+    let Some(graph) = graph.filter(|_| input_depths.contains_key(topic)) else {
+        return Err(EmbedError::InvalidArgument(format!(
+            "ingress topic '{topic}' is not read by any graph input"
+        )));
+    };
+    let schema_hash = resolve_ingress_schema_hash(topic, &graph.config, &graph.infos)
+        .map_err(|error| EmbedError::Graph(error.to_string()))?;
+    Ok(GatewayIngressEntry {
+        topic: topic.to_string(),
+        schema_hash,
+    })
+}
+
+/// Fail the start when `node` declares an output its graph entry does not
+/// list.
+///
+/// The graph creates a publisher only for each output the YAML lists, so a
+/// node has none for an output it declares and the YAML leaves out. The
+/// refusal applies to every node: a `#[cerulion_node]` node would otherwise
+/// fail every tick before its body runs, and the graph would report running
+/// while it does nothing. The first such output, in the node's declaration
+/// order, is named.
+fn check_declared_outputs_listed(node: &NodeDef, info: &NodeInfo) -> Result<(), EmbedError> {
+    let unlisted = info
+        .output_names()
+        .iter()
+        .find(|declared| !node.outputs.iter().any(|listed| listed.name == **declared));
+    match unlisted {
+        None => Ok(()),
+        Some(output) => Err(EmbedError::Graph(format!(
+            "node '{}' output '{output}': the node declares this output and the graph does \
+             not list it, so the node has no publisher for it; add `- name: {output}` with \
+             its `schema:` under the node's `outputs:`",
+            node.id
+        ))),
+    }
+}
+
+/// The deepest queue the graph's inputs declare on each topic they read.
+///
+/// The graph's own topology check runs here, before the app creates a
+/// topic, so a depth above `MAX_CONSUMER_DEPTH` (64) fails the start with
+/// the error the graph build gives and no topic is created at that depth.
+fn input_depths_by_topic(graph: &GraphInputs) -> Result<BTreeMap<String, usize>, EmbedError> {
+    let topology = GraphTopology::build(&graph.config, &graph.infos)
+        .and_then(|topology| topology.validate().map(|()| topology))
+        .map_err(|error| EmbedError::Graph(error.to_string()))?;
+    Ok(topology
+        .topics()
+        .filter_map(|flow| {
+            let depth = flow.consumers.iter().map(|edge| edge.depth).max()?;
+            Some((flow.topic.clone(), depth))
+        })
+        .collect())
 }
 
 /// Wait for bagd's ready marker. A recorder that exits first is joined here
@@ -1532,7 +2292,8 @@ fn wait_recorder_ready(
 
 /// The topic service config an app publisher on a
 /// RECORDED topic creates the service with: the graph build's recorded-topic
-/// raise applied to a default-opener base, so the bagd tap gets the same
+/// raise applied to `base` (the caller passes the default config with the
+/// app topics' borrow floor set), so the bagd tap gets the same
 /// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
 /// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
 fn recorded_publisher_config(
@@ -1566,6 +2327,8 @@ fn recorded_failure(status: &Status) -> EmbedError {
         Some(codes::NETWORK) => EmbedError::Network(message),
         Some(codes::RECORDER) => EmbedError::Recorder(message),
         Some(codes::SPAWN) => EmbedError::Spawn(message),
+        Some(codes::REMOTE_NOT_PROVISIONED) => EmbedError::RemoteNotProvisioned(message),
+        Some(codes::REMOTE) => EmbedError::Remote(message),
         Some(code) => EmbedError::Panic(format!("component failure (code {code}): {message}")),
         None => EmbedError::Panic(message),
     }
@@ -1757,11 +2520,12 @@ mod tests {
 
     /// A process-global transport manager another party initialized (no
     /// runtime identity latched) must not be silently reused by a start that
-    /// asked for network listen endpoints - that start's listen config would
-    /// be dropped. Assert the clear error, then that a listen-less start MAY
-    /// share it (which latches the identity for the rest of the binary).
+    /// asked for network listen endpoints or connect locators - that start's
+    /// network config would be dropped. Assert the clear error for each, then
+    /// that a start with neither MAY share it (which latches the identity for
+    /// the rest of the binary).
     #[test]
-    fn an_existing_transport_manager_without_network_refuses_a_listen_start() {
+    fn an_existing_transport_manager_without_network_refuses_a_listen_or_connect_start() {
         let temp = tempfile::tempdir().expect("temporary files directory");
         let runtime =
             EmbeddedRuntime::new(temp.path().to_path_buf(), "tm_reuse_test".into()).unwrap();
@@ -1773,19 +2537,22 @@ mod tests {
         });
         // If some earlier test latched an identity this still exercises the
         // same contract: an existing manager the start cannot configure.
-        let error = match runtime.transport_manager(&["tcp/127.0.0.1:7447".to_string()]) {
-            Ok(_) => panic!("a listen start cannot reuse an unconfigured manager"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(error, EmbedError::Network(_) | EmbedError::BadState(_)),
-            "expected a clear failure, got {error}"
-        );
-        // A listen-less start may share it (latches identity last).
+        let locator = ["tcp/127.0.0.1:7447".to_string()];
+        for (listen, connect) in [(&locator[..], &[][..]), (&[][..], &locator[..])] {
+            let error = match runtime.transport_manager(listen, connect) {
+                Ok(_) => panic!("a networked start cannot reuse an unconfigured manager"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, EmbedError::Network(_) | EmbedError::BadState(_)),
+                "expected a clear failure, got {error}"
+            );
+        }
+        // A start with neither may share it (latches identity last).
         if TransportManager::get().is_ok() && PROCESS_TRANSPORT_IDENTITY.get().is_none() {
             runtime
-                .transport_manager(&[])
-                .expect("a listen-less start shares the existing manager");
+                .transport_manager(&[], &[])
+                .expect("a start with no listen and no connect shares the existing manager");
         }
     }
 
@@ -1901,9 +2668,14 @@ mod tests {
             nodes: 0,
             schemas,
             publishes: Vec::new(),
+            subscribes: Vec::new(),
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            connect: Vec::new(),
+            inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -1914,7 +2686,9 @@ mod tests {
                 lan_access: LanAccess::Open,
                 mdns: false,
             }),
+            remote: None,
             recorder: Some(recorder),
+            graph_exit: None,
         }
     }
 
@@ -1941,7 +2715,7 @@ mod tests {
         let _serial = gateway_test_lock();
         let manager = local_manager("lease_order");
         let mut run = Run::empty(Arc::clone(&manager));
-        run.ownership = Some(GatewayOwnership::acquire(&manager).expect("lease"));
+        run.ownership = Some(GatewayOwnership::acquire(&manager, Vec::new()).expect("lease"));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         run.recorder = Some(RecorderWorker {
@@ -1986,7 +2760,7 @@ mod tests {
         });
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
 
-        let failure = match build(&mut plan, Arc::clone(&manager), &status) {
+        let failure = match build(&mut plan, Arc::clone(&manager), &status, "robot") {
             Ok(_) => panic!("a ready marker that cannot be cleared fails the build"),
             Err(failure) => failure,
         };
@@ -2024,7 +2798,7 @@ mod tests {
         });
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
 
-        let failure = match build(&mut plan, Arc::clone(&manager), &status) {
+        let failure = match build(&mut plan, Arc::clone(&manager), &status, "robot") {
             Ok(_) => panic!("a recorder that exits before ready fails the build"),
             Err(failure) => failure,
         };
@@ -2251,6 +3025,254 @@ mod tests {
     }
 
     #[test]
+    fn status_json_lists_no_node_failures_before_a_graph_runs() {
+        let status = Status::new("robot".to_string());
+        assert!(status.node_failures.list().is_empty());
+        let json = serde_json::to_value(&status).expect("status JSON");
+        assert_eq!(json["node_failures"], serde_json::json!([]));
+    }
+
+    /// A graph whose one node `wheel` is the panic fixture: it panics on its
+    /// third 50 ms tick.
+    fn panic_fixture_graph() -> GraphRuntime {
+        let config = parse_graph(
+            "prefix: status_unit
+nodes:
+  - id: wheel
+    type: test_node_macro_period_panic_cdylib
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+",
+        )
+        .expect("parse the panic graph");
+        let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> =
+            indexmap::IndexMap::new();
+        factories.insert(
+            "wheel".to_string(),
+            Box::new(test_node_macro_period_panic_cdylib::PeriodNodeEntry::new()),
+        );
+        let clock = Arc::new(cerulion_core::clock::VirtualClock::new());
+        GraphRuntime::build_for_test(config, factories, clock, 4096).expect("build the panic graph")
+    }
+
+    #[test]
+    fn node_failures_read_live_and_a_clone_keeps_what_it_read() {
+        let mut graph = panic_fixture_graph();
+        let live = NodeFailures::live(graph.node_tick_panic_records());
+        let before = live.clone();
+        // Ticks 1 and 2 publish; tick 3 panics.
+        for _ in 0..3 {
+            graph.step(Duration::from_millis(50));
+        }
+        let expected = vec![NodeFailure {
+            node_id: "wheel".to_string(),
+            message: "injected candidate crash at tick 3 (exit-3 twin)".to_string(),
+        }];
+        assert_eq!(live.list(), expected);
+        assert!(before.list().is_empty(), "a clone is a snapshot");
+        assert_ne!(live, before);
+        assert_eq!(live.clone(), live);
+        assert_eq!(
+            format!("{live:?}"),
+            "[NodeFailure { node_id: \"wheel\", message: \"injected candidate crash at tick 3 (exit-3 twin)\" }]"
+        );
+    }
+
+    /// A graph whose nodes `a` and `b` read `/app/cmd` on input `cmd` with
+    /// the given depths, and whose node `c` reads `/app/other` on input `cmd`
+    /// with no input metadata.
+    fn depth_graph(depth_a: usize, depth_b: usize) -> GraphInputs {
+        let config = parse_graph(
+            "prefix: depths
+nodes:
+  - id: a
+    type: relay
+    inputs:
+      - name: cmd
+        source: /app/cmd
+  - id: b
+    type: relay
+    inputs:
+      - name: cmd
+        source: /app/cmd
+  - id: c
+    type: relay
+    inputs:
+      - name: cmd
+        source: /app/other
+",
+        )
+        .expect("parse the depth graph");
+        let input = |depth| cerulion_core::graph::node::InputMeta {
+            name: "cmd".to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth,
+            backpressure: Default::default(),
+            expect_within_ms: None,
+            consume: Default::default(),
+            accumulate: false,
+        };
+        let infos = [("a", Some(depth_a)), ("b", Some(depth_b)), ("c", None)]
+            .into_iter()
+            .map(|(id, depth)| {
+                let inputs = depth.map(input).into_iter().collect();
+                (
+                    id.to_string(),
+                    cerulion_core::graph::NodeInfo::with_meta(inputs, Vec::new()),
+                )
+            })
+            .collect();
+        GraphInputs {
+            config,
+            factories: indexmap::IndexMap::new(),
+            infos,
+        }
+    }
+
+    #[test]
+    fn an_app_topic_takes_the_deepest_input_that_reads_it() {
+        let depths = input_depths_by_topic(&depth_graph(32, 64)).expect("depths");
+        // An input with no metadata gets the default depth, 10.
+        let expected =
+            BTreeMap::from([("/app/cmd".to_string(), 64), ("/app/other".to_string(), 10)]);
+        assert_eq!(depths, expected);
+        // The deepest input wins whichever node declares it.
+        let swapped = input_depths_by_topic(&depth_graph(64, 32)).expect("depths");
+        assert_eq!(swapped, expected);
+    }
+
+    #[test]
+    fn an_input_deeper_than_64_is_refused_with_the_limit_named() {
+        let error =
+            input_depths_by_topic(&depth_graph(32, 65)).expect_err("a depth above 64 is refused");
+        let EmbedError::Graph(message) = &error else {
+            panic!("expected a graph error, got: {error}");
+        };
+        assert!(
+            message.contains(
+                "input 'b.cmd' on topic '/app/cmd' declares depth = 65; the maximum queue \
+                 depth is 64"
+            ),
+            "{message}"
+        );
+        // 64 itself is the limit, not past it.
+        assert!(input_depths_by_topic(&depth_graph(64, 64)).is_ok());
+    }
+
+    /// The one node of a graph whose entry lists `outputs` (YAML text).
+    fn node_listing(outputs: &str) -> NodeDef {
+        let config = parse_graph(&format!(
+            "prefix: outputs
+nodes:
+  - id: logic
+    type: relay
+{outputs}"
+        ))
+        .expect("parse the outputs graph");
+        config.nodes.into_iter().next().expect("one node")
+    }
+
+    fn declaring(outputs: &[&str]) -> NodeInfo {
+        NodeInfo::from_names(
+            Vec::new(),
+            outputs.iter().map(|name| name.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn a_node_whose_declared_outputs_are_all_listed_starts() {
+        let both = node_listing(
+            "    outputs:
+      - name: echo
+        schema: geometry_msgs/Vector3
+      - name: state
+        schema: geometry_msgs/Vector3
+        topic: /app/state
+",
+        );
+        // Listed in another order, and with a topic of its own: the name is
+        // what binds an output.
+        assert!(check_declared_outputs_listed(&both, &declaring(&["state", "echo"])).is_ok());
+        // A node that declares no output needs no `outputs:`.
+        assert!(check_declared_outputs_listed(&node_listing(""), &declaring(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_declared_output_the_graph_does_not_list_is_refused_by_node_and_output() {
+        let error = check_declared_outputs_listed(&node_listing(""), &declaring(&["echo"]))
+            .expect_err("an unlisted output is refused");
+        let EmbedError::Graph(message) = &error else {
+            panic!("expected a graph error, got: {error}");
+        };
+        assert_eq!(
+            message,
+            "node 'logic' output 'echo': the node declares this output and the graph does not \
+             list it, so the node has no publisher for it; add `- name: echo` with its \
+             `schema:` under the node's `outputs:`"
+        );
+    }
+
+    #[test]
+    fn the_first_unlisted_output_in_declaration_order_is_named() {
+        let listed = node_listing(
+            "    outputs:
+      - name: b
+        schema: geometry_msgs/Vector3
+",
+        );
+        // Two runs on the same input name the same output in the same words.
+        for _ in 0..2 {
+            let error = check_declared_outputs_listed(&listed, &declaring(&["c", "b", "a"]))
+                .expect_err("two unlisted outputs are refused");
+            assert_eq!(
+                error.to_string(),
+                "node 'logic' output 'c': the node declares this output and the graph does \
+                 not list it, so the node has no publisher for it; add `- name: c` with its \
+                 `schema:` under the node's `outputs:`"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_listed_name_that_matches_exactly_lists_an_output() {
+        // A different case, a longer name and a shorter name each leave
+        // `echo` unlisted.
+        for listed in ["Echo", "echo_raw", "ech"] {
+            let node = node_listing(&format!(
+                "    outputs:
+      - name: {listed}
+        schema: geometry_msgs/Vector3
+"
+            ));
+            let error = check_declared_outputs_listed(&node, &declaring(&["echo"]))
+                .expect_err("names match exactly");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("node 'logic' output 'echo': "),
+                "listed {listed}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_output_the_node_does_not_declare_is_not_refused_here() {
+        // An extra listed output only creates a publisher the node never
+        // writes, so it is accepted.
+        let extra = node_listing(
+            "    outputs:
+      - name: echo
+        schema: geometry_msgs/Vector3
+      - name: spare
+        schema: geometry_msgs/Vector3
+",
+        );
+        assert!(check_declared_outputs_listed(&extra, &declaring(&["echo"])).is_ok());
+    }
+
+    #[test]
     fn recorded_publisher_config_raises_default_base_to_tap_depths() {
         let transport = cerulion_core::testing::TestTransport::default();
         let base = transport.default_topic_config();
@@ -2288,6 +3310,8 @@ mod tests {
             (codes::NETWORK, codes::NETWORK),
             (codes::RECORDER, codes::RECORDER),
             (codes::SPAWN, codes::SPAWN),
+            (codes::REMOTE_NOT_PROVISIONED, codes::REMOTE_NOT_PROVISIONED),
+            (codes::REMOTE, codes::REMOTE),
             (codes::PANIC, codes::PANIC),
         ] {
             let mut status = Status::new("t".to_string());
@@ -2318,7 +3342,7 @@ mod tests {
         let _serial = gateway_test_lock();
         let manager = network_manager("halfbuilt");
         let mut run = Run::empty(Arc::clone(&manager));
-        run.ownership = Some(GatewayOwnership::acquire(&manager).expect("lease"));
+        run.ownership = Some(GatewayOwnership::acquire(&manager, Vec::new()).expect("lease"));
         let network = manager.network().expect("network");
         network.set_lan_access(LanAccess::Open);
         let flag = manager
@@ -2335,6 +3359,97 @@ mod tests {
             "a failed gateway construction must not leave its bridge enabled"
         );
         assert_baseline(&manager);
+    }
+
+    /// Hand oracle over every input: only a start with ingress topics, a
+    /// gateway and the `open` posture takes LAN frames.
+    #[test]
+    fn ingress_takes_lan_frames_only_with_a_gateway_that_is_open() {
+        for (has_ingress, networked, lan_access, expected) in [
+            (false, false, LanAccess::Paired, None),
+            (false, false, LanAccess::Open, None),
+            (false, true, LanAccess::Paired, None),
+            (false, true, LanAccess::Open, None),
+            (
+                true,
+                false,
+                LanAccess::Paired,
+                Some(InertIngress::NoGateway),
+            ),
+            (true, false, LanAccess::Open, Some(InertIngress::NoGateway)),
+            (true, true, LanAccess::Paired, Some(InertIngress::Paired)),
+            (true, true, LanAccess::Open, None),
+        ] {
+            assert_eq!(
+                inert_ingress(has_ingress, networked, lan_access),
+                expected,
+                "ingress={has_ingress} networked={networked} {lan_access:?}"
+            );
+        }
+    }
+
+    /// A gateway that failed after it registered an ingress bridge and its
+    /// demand GET leaves both on the manager. The teardown releases each
+    /// topic of the run's ingress list, and skips one the gateway never
+    /// registered.
+    #[test]
+    fn a_half_built_gateway_teardown_releases_its_ingress_bridges() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("halfingress");
+        let registered = "/half_built/ingress";
+        let never_registered = "/half_built/unregistered";
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership = Some(
+            GatewayOwnership::acquire(
+                &manager,
+                vec![registered.to_string(), never_registered.to_string()],
+            )
+            .expect("lease"),
+        );
+        let network = manager.network().expect("network");
+        manager
+            .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("register an ingress bridge");
+        network
+            .ensure_ingress_demand_keepalive(registered)
+            .expect("demand the ingress topic");
+        assert!(network.is_ingress_registered(registered));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+
+        let (_, error) = run.shutdown();
+
+        assert!(error.is_none(), "{error:?}");
+        assert!(!network.is_ingress_registered(registered));
+        assert!(!network.is_ingress_registered(never_registered));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 0);
+        assert_baseline(&manager);
+        // A topic another user bridged before the lease keeps its bridge
+        // and its demand GET through this run's teardown.
+        let foreign = "/half_built/foreign";
+        manager
+            .register_run_ingress_topic(foreign, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("another user's ingress bridge");
+        network
+            .ensure_ingress_demand_keepalive(foreign)
+            .expect("another user's demand GET");
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership =
+            Some(GatewayOwnership::acquire(&manager, vec![foreign.to_string()]).expect("lease"));
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+        assert!(network.is_ingress_registered(foreign));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+        network.remove_ingress_demand_keepalive(foreign);
+        manager
+            .unregister_ingress_topic(foreign)
+            .expect("release the other user's bridge");
+        // The released topic registers again, as the next start does.
+        manager
+            .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("register the released topic again");
+        manager
+            .unregister_ingress_topic(registered)
+            .expect("release it");
     }
 
     /// The commit holds the run's commit gate, not the status lock, from its
@@ -2383,9 +3498,14 @@ mod tests {
             nodes: 0,
             schemas,
             publishes: Vec::new(),
+            subscribes: Vec::new(),
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            connect: Vec::new(),
+            inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -2396,7 +3516,9 @@ mod tests {
                 lan_access: LanAccess::Open,
                 mdns: false,
             }),
+            remote: None,
             recorder: None,
+            graph_exit: None,
         };
 
         let result = commit(&mut run, &plan, &status, "t");
@@ -2436,9 +3558,14 @@ mod tests {
             nodes: 0,
             schemas,
             publishes: Vec::new(),
+            subscribes: Vec::new(),
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            connect: Vec::new(),
+            inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -2449,13 +3576,91 @@ mod tests {
                 lan_access: LanAccess::Open,
                 mdns: false,
             }),
+            remote: None,
             recorder: None,
+            graph_exit: None,
         };
         let mut run = Run::empty(Arc::clone(&manager));
 
         let result = commit(&mut run, &plan, &status, "t");
 
         assert!(matches!(result, Err(EmbedError::Graph(_))), "{result:?}");
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    /// A remote plane that refuses to serve fails the commit while LAN access
+    /// is still paired: the plane serves before the posture opens.
+    #[test]
+    fn a_remote_plane_that_cannot_serve_fails_the_commit_before_lan_access_opens() {
+        struct Refusing {
+            manager: Arc<TransportManager>,
+            seen: Arc<Mutex<Option<LanAccess>>>,
+        }
+        impl crate::remote::BoundRemote for Refusing {
+            fn endpoint_id(&self) -> String {
+                "refusing".to_string()
+            }
+            fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+                Vec::new()
+            }
+            fn serve(&mut self, _exit: crate::remote::RemoteExit) -> Result<(), String> {
+                *self.seen.lock().unwrap() = self.manager.network().map(|n| n.lan_access());
+                Err("the plane refused to serve".to_string())
+            }
+            fn stop(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let _serial = gateway_test_lock();
+        let manager = network_manager("commitremote");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
+        let plan = StartPlan {
+            graph: None,
+            graph_name: None,
+            nodes: 0,
+            schemas,
+            publishes: Vec::new(),
+            subscribes: Vec::new(),
+            recorded_topics: None,
+            recorded_graph_topics: None,
+            listen: Vec::new(),
+            connect: Vec::new(),
+            inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
+            gateway: Some(GatewayStartPlan {
+                plan: GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: Vec::new(),
+                    ingress: Vec::new(),
+                },
+                serving: SchemaServing::default(),
+                lan_access: LanAccess::Open,
+                mdns: false,
+            }),
+            remote: None,
+            recorder: None,
+            graph_exit: None,
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.remote = Some(
+            crate::remote::hosted_for_test(Box::new(Refusing {
+                manager: Arc::clone(&manager),
+                seen: Arc::clone(&seen),
+            }))
+            .expect("the remote plane lease"),
+        );
+
+        let result = commit(&mut run, &plan, &status, "t");
+
+        assert!(matches!(result, Err(EmbedError::Remote(_))), "{result:?}");
+        assert_eq!(*seen.lock().unwrap(), Some(LanAccess::Paired));
         assert_eq!(network.lan_access(), LanAccess::Paired);
         let (_, error) = run.shutdown();
         assert!(error.is_none(), "{error:?}");
@@ -2542,5 +3747,45 @@ mod tests {
         let status = lock_status(&status);
         assert_eq!(status.state, RuntimeState::Failed);
         assert_eq!(status.last_error, Some(failure));
+    }
+
+    #[test]
+    fn a_frame_without_a_caller_stamp_takes_the_clock_time() {
+        assert_eq!(frame_stamp(42, None).unwrap(), 42);
+    }
+
+    #[test]
+    fn a_caller_stamp_up_to_one_second_ahead_is_taken_as_is() {
+        assert_eq!(frame_stamp(5_000_000_000, Some(0)).unwrap(), 0);
+        assert_eq!(
+            frame_stamp(5_000_000_000, Some(4_999_999_999)).unwrap(),
+            4_999_999_999
+        );
+        assert_eq!(
+            frame_stamp(5_000_000_000, Some(6_000_000_000)).unwrap(),
+            6_000_000_000
+        );
+    }
+
+    #[test]
+    fn a_caller_stamp_more_than_one_second_ahead_is_refused() {
+        let error = frame_stamp(5_000_000_000, Some(6_000_000_001)).unwrap_err();
+        assert!(matches!(error, EmbedError::InvalidArgument(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "publish stamp 6000000001 ns is more than 1000000000 ns ahead of the runtime clock (5000000000 ns)"
+        );
+        assert!(frame_stamp(0, Some(1_000_000_001)).is_err());
+        assert!(frame_stamp(0, Some(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn the_lead_bound_saturates_at_the_end_of_the_clock() {
+        // Near u64::MAX the bound would overflow; it saturates, so every
+        // stamp is within it.
+        assert_eq!(
+            frame_stamp(u64::MAX - 10, Some(u64::MAX)).unwrap(),
+            u64::MAX
+        );
     }
 }

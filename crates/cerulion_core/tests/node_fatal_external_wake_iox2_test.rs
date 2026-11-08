@@ -130,7 +130,7 @@ fn graph(fd: RawFd, fires: Arc<AtomicU64>) -> GraphRuntime {
         prefix: "fatalextwake".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "cam".to_string(),
@@ -139,7 +139,7 @@ fn graph(fd: RawFd, fires: Arc<AtomicU64>) -> GraphRuntime {
                 outputs: vec![output("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "viewer".to_string(),

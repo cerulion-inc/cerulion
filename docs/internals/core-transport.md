@@ -87,6 +87,26 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original
   recipe.
+- A data service created with a history floor (`TopicServiceConfig::create_history_floor`,
+  set by every `rmw_cerulion` endpoint) also carries the attribute `cerulion.history_floor`.
+  Its history then holds what every publisher sent, VOLATILE ones included, so a subscriber
+  port that asks for no particular history (a graph input, a Python subscriber, `topic echo`
+  and `hz`) takes none from it; on any other service it takes the service history, capped at
+  its buffer. An rmw subscription asks for its own: 0 when VOLATILE, its depth when
+  TRANSIENT_LOCAL. The attribute marks the whole service, so on a topic an rmw endpoint
+  created, a native publisher's declared history does not reach native subscribers either.
+  Data-only taps (`bag record`, the viz daemon) do not read the attribute and take the
+  service history either way.
+- A data publisher whose own history request is above 0 is created with the iceoryx2 port
+  name `cerulion.retains` (`transport::RETAINING_PUBLISHER_NAME`, set in `finish_publisher`,
+  the one place every data publisher is built); a publisher that asks for none keeps the
+  default empty name. The name lives in the service's dynamic config, so
+  `TransportManager::topic_publisher_retain_marks` reads one flag per live publisher from
+  any process, and the publisher's drop (or iceoryx2's dead-node cleanup, for a crashed
+  process) removes it. It exists because the service history cannot say which publisher
+  retains: every publisher's ring is sized from the service. `rmw_cerulion` resolves a
+  BEST_AVAILABLE subscription from these flags. A publisher from a build without the
+  name reads as one that retains nothing.
 - Writer cursor contract (for anyone writing an independent frame reader): the
   variable-payload write cursor starts at `wire_fixed_size + 8·N` and only advances
   forward; a re-written variable field is appended at the tail, leaving interior dead
@@ -477,6 +497,21 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
   misses it; consumers read it with the long-lived `RunWatcher`, never a one-shot
   gather.
+- Hosted runs (`transport/hosted_runs.rs`): an embedded host has no registry record and
+  no run directory, so it serves its run from memory.
+  `NetworkManager::hosted_runs().host(run_id, run)` lists a `HostedRun` (its entry and
+  its `live` flag) and returns a `#[must_use]` `HostedRunGuard`; dropping the guard
+  withdraws it. Hosting the same `run_id` again replaces the run, and the old guard then
+  withdraws nothing. The served state comes from `live` at serve time: `Live` while set,
+  `Ending` once the host clears it, until the guard drops. The entry is checked again through `RunEntry::new`
+  and is always served under `run_id`; one that fails the checks is named in
+  `undescribable` with its reason, which demotes a `settled` verdict. The `runs` verb
+  keeps its order (access gate, registry gather, run directories) and folds the hosted
+  entries into the same reply through the one `run_id` dedup (the later start survives;
+  on a tie, the gathered entry). A refused GET never reads the slot; a failed gather
+  still serves the hosted runs, with `not_established`. Only a declared query surface
+  serves them (`NetworkManager::has_query_surface`): a deny-all, ingress-only gateway
+  declares none, so a run hosted there gets no reply.
 - Cross-machine data-plane diagnosis: `crates/cerulion_core/tests/cross_machine_data_plane_harness.rs` is the
   standing two-machine A/B harness (env-driven robot/desk roles; ignored, never run in
   CI; run per its module docs on a live machine pair). It models the shipping asymmetric

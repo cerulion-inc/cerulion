@@ -70,6 +70,7 @@ fn meta_input(name: &str, trigger: bool) -> InputMeta {
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
         accumulate: false,
+        consume: Default::default(),
     }
 }
 
@@ -93,7 +94,7 @@ fn graph_config(node_id: &str) -> GraphConfig {
         identity: format!("warn_{node_id}"),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: node_id.to_string(),

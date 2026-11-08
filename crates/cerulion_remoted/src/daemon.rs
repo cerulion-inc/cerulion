@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The daemon: load the device key + trust store + side-map, build the ONE iroh
-//! endpoint, and run the accept loop dispatching on the negotiated ALPN.
+//! The daemon: honor the kill switch, serve the [`crate::RemotePlane`] entry over
+//! the configured files, and run the accept loop dispatching on the negotiated ALPN.
 //!
 //! Every connection is first classified by the [`PairingAuthorizer`] (deny-by-
 //! default), then dispatched by plane:
@@ -8,19 +8,20 @@
 //!   ([`crate::ops`]) — deploy/inventory/pair/claim/e-stop;
 //! - `cerulion/wire/2` (WireAdmit) → the demand-driven SHM tap plane
 //!   ([`crate::wire`]);
+//! - `cerulion/rcp/1` (RcpAdmit) → the MCP proxy to the local `cerulion-rcpd`
+//!   ([`crate::rcp`]);
 //! - everything else (Refuse / unknown ALPN, or a plane not wired) → a
 //!   deadline-bounded skeleton control-frame report that surfaces the
 //!   [`AcceptDecision`] so the classification stays observable end-to-end.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use cerud::lease::ControlLease;
 use cerulion_core::TransportManager;
 use cerulion_link::{
-    accept_frame_stream, accept_one, build_endpoint, read_frame, write_frame, Accepted, Connection,
-    Endpoint, EndpointConfig, LinkError,
+    accept_frame_stream, accept_one, read_frame, write_frame, Accepted, Connection, Endpoint,
+    LinkError,
 };
 use cerulion_pairing::format::PublicKey;
 use cerulion_pairing::verify::TrustStore;
@@ -31,8 +32,10 @@ use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
 use crate::epoch_pull::EpochPull;
 use crate::error::RemotedError;
+use crate::host::{OpsHost, PlaneFiles, DAEMON_SERVER_NAME};
 use crate::ops::OpsServing;
 use crate::pairing_verbs::SharedCodePairSessions;
+use crate::rcp::{RcpLink, RcpPlane};
 use crate::trust::SharedTrust;
 use crate::wire::WirePlane;
 
@@ -53,22 +56,14 @@ const MAX_HELLO_LEN: usize = 4096;
 /// defensible additional guard and is not implemented.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// The loaded robot state the daemon serves from.
-struct RemotedState {
-    device_key: [u8; 32],
-    trust_store: TrustStore,
-    device_index: DeviceAccountIndex,
-    /// The firmware secure-storage MAC key that authenticates the trust store AND
-    /// the side-map — retained so the pairing verbs can PERSIST a mutation
-    /// (claim/pair/code-pair write both artifacts back to disk).
-    mac_key: Vec<u8>,
-}
-
 /// Build the daemon from config and serve until `shutdown` resolves (or the
 /// endpoint closes).
 ///
 /// Honors the `--network off` / `CERULION_NETWORK=off` kill-switch: if
 /// engaged, it logs loudly and exits cleanly WITHOUT binding an endpoint.
+/// Otherwise it serves the same library entry a host embeds
+/// ([`RemotedConfig::daemon_plane`] with the [`RemotedConfig::key_files`]
+/// provider), which keeps `restart`, `engage-estop` and the rcp plane.
 pub async fn run(
     config: RemotedConfig,
     shutdown: impl std::future::Future<Output = ()>,
@@ -82,71 +77,29 @@ pub async fn run(
         return Ok(());
     }
 
-    let state = load_state(&config)?;
-    let endpoint =
-        build_endpoint(EndpointConfig::new(state.device_key).with_relay(config.relay.clone()))
-            .await?;
-
-    // Bind the trust store to THIS device: the endpoint id (== the device key's
-    // public half, the identity peers TLS-authenticate against) MUST equal the
-    // store's recorded `robot_transport_key`. A transplanted / restored / fleet-
-    // misprovisioned store would otherwise boot cleanly and serve THIS robot
-    // under a DIFFERENT robot's owner + access list. LOUD refusal, never a silent
-    // wrong-robot boot.
-    if let Err(e) = check_store_device_binding(
-        endpoint.id().as_bytes(),
-        &state.trust_store.robot_transport_key(),
-    ) {
-        tracing::error!(error = %e, "cerulion_remoted: refusing to serve — trust store is not bound to this device");
-        endpoint.close().await;
-        return Err(e);
-    }
-
-    // Publish the PUBLIC beacon facts (eid / iroh_port / claimable) for the
-    // gateway's mDNS TXT enrichment. Best-effort + additive — a write
-    // failure warns, never fails the daemon. Read ownership BEFORE the store moves
-    // into the shared trust state; the claim / pair handlers refresh it after a
-    // successful claim.
-    crate::beacon_facts::write_at_startup(
-        &config.beacon_facts_file,
-        &endpoint,
-        state.trust_store.ownership(),
-    );
-
-    // Build the live trust state + the ops/wire planes and serve until shutdown. The
-    // access-check clock is the robot's own WALL clock and the wire plane uses its default
-    // revocation-sweep cadence; the `serve_endpoint` seam parameterizes both so a
-    // daemon-level test can drive a mid-session revoke deterministically through the SAME
-    // wiring.
-    let result = serve_endpoint(
-        &config,
-        state.trust_store,
-        state.device_index,
-        state.mac_key,
-        &endpoint,
-        RemotedClock::wall(),
-        None,
-        None,
-        shutdown,
-    )
-    .await;
-    endpoint.close().await;
-    result
+    // The store↔device binding check, the beacon facts and the endpoint close
+    // live in the entry: `bind` refuses a store bound to another device, `serve`
+    // closes the endpoint however serving ends.
+    config
+        .daemon_plane()
+        .bind(&config.key_files())
+        .await?
+        .serve(shutdown)
+        .await
 }
 
-/// The serving core `run` delegates to (its endpoint already built + device-bound): build
-/// the LIVE shared trust state (accept gate reads it, pairing verbs mutate it — a
-/// claim/pair takes effect at the next accept with no restart), the ops plane, and the
-/// authorizer-wired wire plane, then serve until `shutdown`.
+/// The daemon's serving core over an endpoint a test built and device-bound itself:
+/// [`serve_core`] with every ops verb and the daemon's wire plane.
 ///
 /// `access_clock` is the trusted clock every access check reads (production: the robot
 /// wall clock); `sweep_interval` overrides the wire plane's mid-session revocation-sweep
 /// cadence (`None` = the production default); `manager` overrides the wire plane's SHM
-/// transport (`None` = the production lazy singleton, `Some` = a per-test root). All three
-/// are parameters ONLY so a daemon-level test can inject a fixed, advanceable clock + a
-/// short sweep + an isolated SHM root and observe a mid-session revoke EVICT through the
-/// SAME `.with_demand_authorizer(classify)` wiring `run` uses — `#[doc(hidden)]`, not a
-/// public API.
+/// transport (`None` = the production lazy singleton reading metadata through the default
+/// control socket, `Some` = a per-test root with no metadata source). All three are
+/// parameters ONLY so a daemon-level test can inject a fixed, advanceable clock + a short
+/// sweep + an isolated SHM root and observe a mid-session revoke EVICT through the SAME
+/// `.with_demand_authorizer(classify)` wiring `run` uses. `#[doc(hidden)]`, not a public
+/// API. A host embeds [`crate::RemotePlane`] instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_endpoint(
@@ -158,6 +111,55 @@ pub async fn serve_endpoint(
     access_clock: RemotedClock,
     sweep_interval: Option<Duration>,
     manager: Option<Arc<TransportManager>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
+    // Robot identity resolves through `robot_identity_from_env`, the SAME
+    // override-aware resolver the LAN gateway uses (`CERULION_ROBOT_IDENTITY` override →
+    // else the hostname; by design the hostname is the default robot identity). The
+    // transport manager is LAZY: a `remoted` that never serves a wire peer never
+    // touches iceoryx2.
+    let robot = cerulion_core::graph::robot_identity_from_env();
+    let base = match manager {
+        Some(m) => WirePlane::with_manager(robot, m),
+        None => WirePlane::lazy(robot)
+            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
+    };
+    serve_core(
+        &PlaneFiles::of(config),
+        OpsHost::daemon(),
+        DAEMON_SERVER_NAME,
+        trust_store,
+        device_index,
+        mac_key,
+        endpoint,
+        access_clock,
+        sweep_interval,
+        base,
+        Some(config.rcp.clone()),
+        shutdown,
+    )
+    .await
+}
+
+/// The serving core every entry shares (its endpoint already built + device-bound):
+/// build the LIVE shared trust state (accept gate reads it, pairing verbs mutate it, so a
+/// claim/pair takes effect at the next accept with no restart), the ops plane with the
+/// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
+/// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
+/// `shutdown`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_core(
+    files: &PlaneFiles,
+    ops_host: OpsHost,
+    server_name: &str,
+    trust_store: TrustStore,
+    device_index: DeviceAccountIndex,
+    mac_key: Vec<u8>,
+    endpoint: &Endpoint,
+    access_clock: RemotedClock,
+    sweep_interval: Option<Duration>,
+    base: WirePlane,
+    rcp: Option<RcpLink>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     let shared =
@@ -173,24 +175,26 @@ pub async fn serve_endpoint(
     // The ops plane over `cerulion/ops/1`: cerud's mechanical verbs + the pairing
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
-    let lease = Arc::new(Mutex::new(ControlLease::with_default_window()));
     let sessions = SharedCodePairSessions::new();
-    let ops = Arc::new(OpsServing::new(
+    // The daemon's e-stop lease, for the rcp plane below: the same instance the
+    // `engage-estop` and act verbs use, so its latch and its engage count are
+    // shared. A library host has none, and serves no rcp plane.
+    let estop_lease = ops_host.estop_lease();
+    // On the daemon, `engage-estop` also sends an `estop` to the rcpd the rcp
+    // plane forwards to, over the same link, until rcpd answers; the delivery
+    // in flight ends when the planes stop.
+    let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
+    let rcpd_estop = ops_host.rcpd_estop();
+    let ops = Arc::new(OpsServing::for_host(
+        ops_host,
         shared,
-        lease,
         sessions,
         access_clock.clone(),
-        &config.receipt_file,
-        config.log_root.clone(),
-        "cerulion-remoted",
+        &files.receipt_file,
+        files.log_root.clone(),
+        server_name,
     )?);
 
-    // The production wire plane. Robot identity resolves through
-    // `robot_identity_from_env` — the SAME override-aware resolver the LAN gateway uses
-    // (`CERULION_ROBOT_IDENTITY` override → else the hostname; by design the hostname is the
-    // default robot identity). The transport manager is LAZY — a `remoted` that never
-    // serves a wire peer never touches iceoryx2.
-    //
     // Install the SAME `PairingAuthorizer` as the wire plane's per-demand
     // authorization gate (this line is the wiring a daemon-level test pins). The serving
     // plane then (a) authorizes each `demand` per topic and (b) sweeps established taps
@@ -198,12 +202,6 @@ pub async fn serve_endpoint(
     // admission EVICTS the already-streaming demander — both read the LIVE `SharedTrust`
     // the accept gate reads (no re-plumbing). `classify` is an `Arc<PairingAuthorizer>`; it
     // unsize-coerces to `Arc<dyn DemandAuthorizer>` here.
-    let robot = cerulion_core::graph::robot_identity_from_env();
-    let base = match manager {
-        Some(m) => WirePlane::with_manager(robot, m),
-        None => WirePlane::lazy(robot)
-            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
-    };
     //
     // Install the epoch-sync sink on the SAME plane (this line is the wiring
     // a daemon-level test pins). A desk that carries a newer revocation epoch delivers
@@ -217,10 +215,23 @@ pub async fn serve_endpoint(
         wire_plane = wire_plane.with_revocation_sweep_interval(interval);
     }
     let wire = Arc::new(wire_plane);
+    // The rcp plane authorizes each MCP message against the SAME live handle,
+    // under the SAME e-stop lease as the ops verbs.
+    let rcpd = rcp.as_ref().map(|link| link.addr);
+    let rcp = match (rcp, estop_lease) {
+        (Some(link), Some(lease)) => Some(Arc::new(RcpPlane::new(
+            link,
+            classify.shared().clone(),
+            lease,
+        ))),
+        _ => None,
+    };
     tracing::info!(
         endpoint_id = %endpoint.id(),
         robot = %wire.robot(),
-        "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops; always-on)"
+        rcpd = ?rcpd,
+        "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops, plus rcp on the daemon; \
+         always-on)"
     );
 
     // The robot's own revocation fetch: the supervisor's sync worker leaves
@@ -228,15 +239,26 @@ pub async fn serve_endpoint(
     // only after every fallible plane is built, and owned by a guard that
     // aborts it however this future ends (an error, a cancelled future, a
     // normal return).
-    let pull = config.store_file.parent().map(|dir| {
+    let pull = files.store_file.parent().map(|dir| {
         let recheck = crate::epoch_pull::key_recheck_from_env();
         Arc::new(
             EpochPull::new(dir, shared_for_pull.clone(), pull_clock.clone()).with_recheck(recheck),
         )
     });
     let poller = AbortOnDrop(pull.clone().map(|pull| tokio::spawn(pull.run())));
-    let served =
-        serve_with_epoch_pull(endpoint, classify, Some(ops), Some(wire), pull, shutdown).await;
+    let served = serve_planes(
+        endpoint,
+        classify,
+        Some(ops),
+        Some(wire),
+        pull,
+        rcp,
+        shutdown,
+    )
+    .await;
+    if let Some(rcpd_estop) = rcpd_estop {
+        rcpd_estop.shut_down().await;
+    }
     poller.stop().await;
     served
 }
@@ -245,8 +267,11 @@ pub async fn serve_endpoint(
 struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDrop {
-    /// Abort the task and wait for it to end. A blocking step it already
-    /// started (one file apply) runs to completion first.
+    /// Abort the task and wait for the aborted future to end. An apply already
+    /// handed to the blocking pool is not awaited: it runs to completion on its
+    /// own. That apply replaces the trust store by a rename in the same
+    /// directory, so the store file holds the old store or the new one, never
+    /// a torn one.
     async fn stop(mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
@@ -267,7 +292,7 @@ impl Drop for AbortOnDrop {
 /// device key's public half) must equal the store's `robot_transport_key`.
 /// A mismatch is a LOUD [`RemotedError::ProvisioningMismatch`] (a transplanted
 /// store governing the wrong robot). Pure so it is oracle-testable.
-fn check_store_device_binding(
+pub(crate) fn check_store_device_binding(
     endpoint_key: &[u8; 32],
     store_key: &PublicKey,
 ) -> Result<(), RemotedError> {
@@ -331,6 +356,21 @@ pub async fn serve_with_epoch_pull(
     pull: Option<Arc<EpochPull>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
+    serve_planes(endpoint, classify, ops, wire, pull, None, shutdown).await
+}
+
+/// [`serve_with_epoch_pull`], plus the rcp plane: when `rcp` is `Some`, an
+/// admitted `cerulion/rcp/1` connection is served by
+/// [`crate::rcp::serve_rcp_connection`].
+pub async fn serve_planes(
+    endpoint: &Endpoint,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    pull: Option<Arc<EpochPull>>,
+    rcp: Option<Arc<RcpPlane>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -353,8 +393,9 @@ pub async fn serve_with_epoch_pull(
                         let classify = classify.clone();
                         let ops = ops.clone();
                         let wire = wire.clone();
+                        let rcp = rcp.clone();
                         tokio::spawn(async move {
-                            handle_accepted_with_wire(a, classify, ops, wire).await;
+                            handle_accepted_planes(a, classify, ops, wire, rcp).await;
                         });
                     }
                     // A SINGLE inbound connection failed its handshake (a scanner
@@ -415,6 +456,19 @@ pub async fn handle_accepted_with_wire(
     ops: Option<Arc<OpsServing>>,
     wire: Option<Arc<WirePlane>>,
 ) {
+    handle_accepted_planes(accepted, classify, ops, wire, None).await
+}
+
+/// [`handle_accepted_with_wire`], plus the rcp arm: an `RcpAdmit` connection
+/// is handed to [`crate::rcp::serve_rcp_connection`] as a long-lived session
+/// when `rcp` is `Some`; with `None` it falls through to the skeleton report.
+pub async fn handle_accepted_planes(
+    accepted: Accepted,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    rcp: Option<Arc<RcpPlane>>,
+) {
     let (decision, unpaired) = classify
         .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
     tracing::info!(
@@ -447,6 +501,42 @@ pub async fn handle_accepted_with_wire(
         }
         // WireAdmit but no wire plane wired (ops-only builds + the
         // accept-classification tests): fall through to the skeleton report.
+    }
+
+    // ── The rcp-ALPN dispatch arm ───────────────────────────
+    if matches!(decision, AcceptDecision::RcpAdmit) {
+        if let Some(plane) = rcp {
+            let key = *accepted.remote_id.as_bytes();
+            crate::rcp::serve_rcp_connection(accepted.connection, key, plane).await;
+            return;
+        }
+    }
+
+    // A refused key on the ops ALPN (a cloud row while the allow-from-cloud
+    // switch is OFF): answer in cerud's own framing so an ops client reads the
+    // reason as a handshake `Reject`.
+    if accepted.alpn == cerulion_link::alpn::OPS {
+        if let AcceptDecision::Refuse { reason } = &decision {
+            match tokio::time::timeout(
+                HANDSHAKE_DEADLINE,
+                report_ops_refusal(&accepted.connection, reason),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "cerulion_remoted: ops refusal ended early");
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        remote_id = %accepted.remote_id,
+                        deadline_secs = HANDSHAKE_DEADLINE.as_secs(),
+                        "cerulion_remoted: ops refusal exceeded its deadline; dropping the connection"
+                    );
+                }
+            }
+            return;
+        }
     }
 
     // Everything else (Refuse / UnknownAlpn, and the no-plane fallbacks): the
@@ -498,6 +588,47 @@ async fn report_decision(
     Ok(())
 }
 
+/// The ops-plane refusal: cerud's framing (a `u32` big-endian length, then
+/// JSON). Reads the client's opening frame (bounded by [`MAX_HELLO_LEN`]),
+/// writes one `HandshakeReply::Reject` carrying `reason`, then holds the
+/// connection until the peer closes its stream so the reply is delivered. The
+/// caller bounds the whole exchange with the handshake deadline.
+async fn report_ops_refusal(connection: &Connection, reason: &str) -> Result<(), LinkError> {
+    let stream = |e| LinkError::Stream(Box::new(e));
+    let (mut send, mut recv) = accept_frame_stream(connection).await?;
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| LinkError::Stream(Box::new(e)))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_HELLO_LEN {
+        return Err(LinkError::FrameExceedsMaxLen {
+            len,
+            max: MAX_HELLO_LEN,
+        });
+    }
+    let mut hello = vec![0u8; len];
+    recv.read_exact(&mut hello)
+        .await
+        .map_err(|e| LinkError::Stream(Box::new(e)))?;
+    let reply = cerud::protocol::HandshakeReply::Reject {
+        server_min: cerud::protocol::MIN_PROTOCOL_VERSION,
+        server_max: cerud::protocol::PROTOCOL_VERSION,
+        message: reason.to_string(),
+    };
+    let payload =
+        serde_json::to_vec(&reply).expect("a handshake reply contains only JSON-compatible fields");
+    let payload_len = u32::try_from(payload.len()).expect("a refusal reply is far below 4 GiB");
+    send.write_all(&payload_len.to_be_bytes())
+        .await
+        .map_err(stream)?;
+    send.write_all(&payload).await.map_err(stream)?;
+    let _ = send.finish();
+    let mut sink = [0u8; 256];
+    while let Ok(Some(_)) = recv.read(&mut sink).await {}
+    Ok(())
+}
+
 fn admission_payload(decision: &AcceptDecision, unpaired: bool) -> Vec<u8> {
     #[derive(serde::Serialize)]
     struct Reply<'a> {
@@ -542,45 +673,12 @@ mod admission_reply_tests {
     }
 }
 
-/// Load the device key, trust store, and device→account side-map from disk.
-fn load_state(config: &RemotedConfig) -> Result<RemotedState, RemotedError> {
-    let device_key = load_device_key(&config.key_file)?;
-    // The trust-store MAC key authenticates BOTH the trust store AND the
-    // device→account side-map. It is REQUIRED whenever either MAC'd artifact is
-    // already on disk: a present store/index whose verification key is gone or
-    // unreadable is a PROVISIONING-class / potential-tamper failure (the secret
-    // that authenticates this robot's trust state is missing), NOT a config slip.
-    // On a genuinely-fresh robot (neither artifact present) the key is required by
-    // nothing — its absence is benign, and the absent trust store surfaces its OWN
-    // provisioning-gap error (`RemotedError::Store`) downstream (never fabricated
-    // into an empty store — see the `RemotedError::Store` docs).
-    let mac_required = config.store_file.exists() || config.index_file.exists();
-    let mac_key = load_mac_key(&config.store_mac_key_file, mac_required)?;
-    let trust_store =
-        TrustStore::load(&config.store_file, &mac_key).map_err(RemotedError::Store)?;
-    // The device→account side-map is MAC-authenticated with the SAME secure-
-    // storage key as the trust store: it is the sole device_key→
-    // account binding the accept gate trusts.
-    let device_index = DeviceAccountIndex::load(&config.index_file, &mac_key)?;
-    tracing::info!(
-        claimed = trust_store.is_claimed(),
-        bound_devices = device_index.len(),
-        "cerulion_remoted: state loaded"
-    );
-    Ok(RemotedState {
-        device_key,
-        trust_store,
-        device_index,
-        mac_key,
-    })
-}
-
 /// Load the 32-byte ed25519 device secret (raw bytes). An absent / wrong-size
 /// key is a provisioning gap, never fabricated. On Unix, when `path` itself is a
 /// regular file with a single link, its group and other permission bits are
 /// cleared before it is read; a symbolic link at `path` is read through
 /// unchanged.
-fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
+pub(crate) fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
     let bytes = crate::private_file::read_private(path, "device key").map_err(|e| {
         RemotedError::DeviceKey(format!(
             "{}: {e} (provision the robot's 32-byte device key)",
@@ -615,11 +713,23 @@ fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
 ///   [`RemotedError::MacKey`]: a broken secure-storage secret is never silently
 ///   swallowed, even when no artifact currently requires it.
 ///
+/// A present but EMPTY file loads as an empty key when not `expected` (a fresh
+/// install's placeholder). When `expected` it is refused here with
+/// [`RemotedError::MacKey`] naming the file: an empty key verifies nothing and
+/// cannot persist a mutation. [`crate::RemotePlane::bind`] repeats the refusal
+/// for a [`crate::KeyProvider`] that has no file to name.
+///
 /// On Unix, when `path` itself is a regular file with a single link, its group
 /// and other permission bits are cleared before it is read; a symbolic link at
 /// `path` is read through unchanged.
-fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
+pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
     match crate::private_file::read_private(path, "trust-store MAC key") {
+        Ok(bytes) if bytes.is_empty() && expected => Err(RemotedError::MacKey(format!(
+            "empty trust-store MAC key file {}: a trust store or device index exists and \
+             must be verified with it. An empty key file is only a fresh install's \
+             placeholder; restore this device's own MAC key into it (mode 0600)",
+            path.display()
+        ))),
         Ok(bytes) => Ok(bytes),
         // Genuinely-fresh robot: nothing on disk needs this key and it is simply
         // absent. Defer to the absent store's own `Store` provisioning gap.
@@ -721,6 +831,22 @@ mod tests {
         let key = load_mac_key(&missing, /*expected=*/ false)
             .expect("an unrequired absent MAC key is benign, not an error");
         assert!(key.is_empty(), "the placeholder must be empty, got {key:?}");
+    }
+
+    #[test]
+    fn empty_mac_key_file_is_refused_by_name_only_when_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust_store.mac_key");
+        std::fs::write(&path, b"").unwrap();
+        let err = load_mac_key(&path, /*expected=*/ true).unwrap_err();
+        assert!(matches!(err, RemotedError::MacKey(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "the error names the key file: {err}"
+        );
+        // A fresh install's empty placeholder stays benign.
+        let key = load_mac_key(&path, /*expected=*/ false).unwrap();
+        assert!(key.is_empty());
     }
 
     #[test]

@@ -293,6 +293,7 @@ const EXCLUDED_FROM_DEFAULT_MEMBERS: &[(&str, &str)] = &[
         "iroh (it links cerulion_link unconditionally)",
     ),
     ("cerulion_remoted", "iroh"),
+    ("cerulion_android_remote", "iroh (through cerulion_remoted)"),
     ("cerulion_connectd", "iroh"),
     ("cerulion_accountd", "iroh and the web stack"),
     ("cerulion_viz", "the Rerun SDK"),

@@ -6,7 +6,8 @@
 //! Nothing is sent unless [`Client::from_env_or_key`] returns a client, which
 //! needs a key (`POSTHOG_API_KEY`, else the `CERULION_POSTHOG_KEY` a release
 //! build was compiled with) and consent. The run that prints the notice
-//! sends nothing. The notice prints only on a terminal: a run without one
+//! sends nothing, and so does a run under the network kill switch. The
+//! notice prints only on a terminal: a run without one
 //! sends as usual and leaves the notice for the first run on a terminal.
 
 use std::io::{IsTerminal, Write};
@@ -54,6 +55,11 @@ static SENDING: AtomicBool = AtomicBool::new(false);
 /// instead: a first login inside this run leaves its anonymous id pending.
 static NOTICE_RUN: AtomicBool = AtomicBool::new(false);
 
+/// Set when [`CommandRun::start`] could have sent but the network kill switch
+/// is engaged: a first login inside this run leaves its anonymous id pending,
+/// as the notice run does.
+static SWITCH_RUN: AtomicBool = AtomicBool::new(false);
+
 /// Set when [`login_anon_id`] found an unmerged anonymous id it could not
 /// carry because this run sends nothing.
 static UNCARRIED: AtomicBool = AtomicBool::new(false);
@@ -77,8 +83,18 @@ fn ci_run() -> bool {
 /// not been merged with yet. Holds no data; its presence is the flag. The
 /// merge joins to the account the events sent under the same consent file's
 /// id before the login: by CLI runs without a terminal, and by another
-/// surface on the machine such as the vizd daemon. CI runs send under their
-/// own per-process id ([`consent::event_anon_id`]), so this never joins them.
+/// surface on the machine such as the vizd daemon. Those events are
+/// personless (`$process_person_profile: false`); PostHog ingests them under a
+/// person id derived from the distinct id, and the `$create_alias` that names
+/// the id links them to the account's person through a person override.
+/// PostHog's handbook describes that override for `$identify`
+/// (<https://posthog.com/handbook/engineering/person-processing>), the
+/// ingestion pipeline handles `$create_alias` almost the same way
+/// (<https://posthog.com/docs/how-posthog-works/ingestion-pipeline>), and an
+/// alias merges past and future events into one person
+/// (<https://posthog.com/docs/product-analytics/identify>). CI runs send under
+/// their own per-process id ([`consent::event_anon_id`]), so this never joins
+/// them.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
@@ -96,10 +112,12 @@ const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 /// Printed to stderr once per machine, on the first run that could send and
 /// whose stderr is a terminal. One line, so it stays out of the way.
 pub const NOTICE: &str = "Cerulion sends usage telemetry; turn it off with \
-`cerulion telemetry off` (details: `cerulion telemetry status`).";
+`cerulion telemetry off` (details: https://cerulion.com/telemetry).";
 
-/// What is sent, in full; printed by `cerulion telemetry status`.
-const DETAILS_URL: &str = "https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
+/// The page that lists what is sent, in full: a short address that redirects
+/// to `docs/telemetry.md`. `cerulion telemetry status` prints it and
+/// [`NOTICE`] carries it.
+const DETAILS_URL: &str = "https://cerulion.com/telemetry";
 
 /// Verbs that record no `cli_command_run`: the consent verb itself (an
 /// opt-out must not be counted), the completion hook a shell runs on every
@@ -179,11 +197,27 @@ pub struct CommandRun {
 
 impl CommandRun {
     /// Begin recording, or `None` when nothing may be sent: no key or no
-    /// consent, an unrecorded verb, or this run printed the first-run notice.
-    pub fn start(matches: &clap::ArgMatches) -> Option<CommandRun> {
+    /// consent, the network kill switch engaged for this invocation
+    /// ([`crate::network_switch::engaged`]), an unrecorded verb, or this run
+    /// printed the first-run notice. A run under the switch prints no notice
+    /// either: it leaves the notice to the first run that can send, and the
+    /// merge of a first login inside it to the next run that sends.
+    pub fn start(
+        matches: &clap::ArgMatches,
+        switch: &crate::network_switch::SwitchEnv,
+    ) -> Option<CommandRun> {
         let (verb, sub) = matches.subcommand()?;
         let subverb = sub.subcommand_name();
         if !is_recorded(verb, subverb) {
+            return None;
+        }
+        if crate::network_switch::engaged(matches, switch) {
+            // No client is built: nothing is sent, and no id leaves in a
+            // login. The merge waits for the next run that sends.
+            #[cfg(feature = "telemetry")]
+            if key_present() && consent::status().enabled {
+                SWITCH_RUN.store(true, Ordering::Relaxed);
+            }
             return None;
         }
         let client = Client::from_env_or_key(BAKED_KEY, common())?;
@@ -421,8 +455,9 @@ fn settle_anon_account() -> bool {
     true
 }
 
-/// Merge an anonymous id left pending by a first login that ran while the
-/// notice was printed, now that this run may send. The marker is removed
+/// Merge an anonymous id left pending by a first login in a run that sent
+/// nothing (the notice run, or a run under the network kill switch), now that
+/// this run may send. The marker is removed
 /// once read, unless the anonymous id cannot be read: without a hosted
 /// account there is nothing to merge.
 fn merge_pending_alias(client: &Client) {
@@ -518,9 +553,9 @@ pub fn login_anon_id() -> Option<String> {
         }
         return Some(anon_id);
     }
-    // Only the notice run defers a merge; any other non-sending run mints no
-    // id and writes no consent file.
-    if NOTICE_RUN.load(Ordering::Relaxed)
+    // The notice run and a run under the switch defer a merge; any other
+    // non-sending run mints no id and writes no consent file.
+    if (NOTICE_RUN.load(Ordering::Relaxed) || SWITCH_RUN.load(Ordering::Relaxed))
         && consent::status().enabled
         && consent::anon_id().ok().flatten().is_some()
     {
@@ -570,7 +605,7 @@ pub fn login_completed(outcome: &LoginOutcome) {
 }
 
 /// The on-disk part of [`login_completed`]: rotate the id when it is owed,
-/// record the account, or mark the merge the notice run deferred. Returns
+/// record the account, or mark the merge a non-sending run deferred. Returns
 /// the carried id that is still to be merged into the account from here:
 /// `None` when none was carried, or when another login bound the id to its
 /// account while this one was in flight. That login rotated the id for its
@@ -585,9 +620,10 @@ fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
     if !consent::status().enabled {
         return None;
     }
-    // The notice run defers the merge of an uncarried id, but only a hosted
-    // account is ever merged: for any other account there is nothing owed,
-    // and the id stays the first hosted login's to carry.
+    // The notice run and a run under the switch defer the merge of an
+    // uncarried id, but only a hosted account is ever merged: for any other
+    // account there is nothing owed, and the id stays the first hosted
+    // login's to carry.
     let deferred =
         UNCARRIED.load(Ordering::Relaxed) && hosted_sub(&outcome.state.account_id).is_some();
     if consent::file_path().is_ok_and(|p| p.exists()) {
@@ -628,8 +664,9 @@ fn settle_login(outcome: &LoginOutcome) -> Option<&str> {
             SENDING.store(false, Ordering::Relaxed);
         }
     }
-    // The run that printed the notice sends nothing, so the merge waits
-    // for the next run that may send (see `merge_pending_alias`).
+    // The run that printed the notice, or ran under the switch, sends
+    // nothing, so the merge waits for the next run that may send (see
+    // `merge_pending_alias`).
     if deferred && !outcome.switched_account {
         if let Some(path) = pending_alias_path() {
             if let Err(e) = std::fs::write(path, b"") {

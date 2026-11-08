@@ -54,6 +54,14 @@ device (`verify_chain`'s delegation path) is refused; a stolen laptop whose devi
 is revoked cannot keep minting grants that verify. The account stays valid (its other
 devices still sign); only that device's authority dies.
 
+### Cloud devices
+
+A cloud device's access row expires with its certificate (`not_after`, or an earlier
+owner-row or grant expiry), so a robot drops it even if it never sees the epoch that
+revokes it, and an account service may prune a lapsed cloud device from later epochs.
+Each certificate presented replaces the row's expiry: a renewal extends it, a shorter
+reissue tightens it, and only the key's holder can present.
+
 ## Owner self-lockout guard
 
 `POST /v1/robots/{id}/revoke` **REFUSES** (400) revoking the robot's OWN owner

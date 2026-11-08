@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 
 use super::demand_authorizer::LanAccess;
 use super::egress_send::{EgressLanes, EgressStats, EnqueueOutcome, LossReport};
-use super::liveness::{DrainObservation, TopicLiveness, TopicLivenessObserver};
+use super::liveness::{DrainObservation, LivenessTable, TopicLiveness, TopicLivenessObserver};
 use super::network::{
     canonical_topic, CatalogSource, DemandGetState, GetDemandState, PermissiveShmProbe, RunSource,
     SchemaSource,
@@ -331,10 +331,11 @@ pub struct SchemaServing {
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
 /// topic→name bindings, the hash→name reverse map, and the served docs the
-/// query-surface callback reads. Cloned off the [`GatewayRuntime`] BEFORE it
-/// moves onto its drive thread ([`GatewayRuntime::schema_serving_handles`]), so
-/// a LATER `register_egress` can [`merge`](Self::merge) its own
-/// [`SchemaServing`] into the live plane.
+/// query-surface callback reads, plus the catalog's activity tables beside
+/// them (runtime hashes, boot topics, data-flow liveness). Cloned off the
+/// [`GatewayRuntime`] BEFORE it moves onto its drive thread
+/// ([`GatewayRuntime::schema_serving_handles`]), so a LATER `register_egress`
+/// can [`merge`](Self::merge) its own [`SchemaServing`] into the live plane.
 ///
 /// This exists because a FROZEN boot serving would be wrong: `cerulion-netd`'s
 /// standing gateway boots at daemon start with the built-in corpus only, a
@@ -343,7 +344,7 @@ pub struct SchemaServing {
 /// The merge is the backfill seam that makes the standing boot and per-graph
 /// registrations compose in BOTH directions.
 ///
-/// Cheap to clone (three `Arc`s); `Send + Sync` (the maps are `Mutex`-guarded —
+/// Cheap to clone (`Arc`s only); `Send + Sync` (the maps are `Mutex`-guarded,
 /// the same discipline as the reg-channel hash table beside them).
 #[derive(Clone)]
 pub struct SchemaServingHandles {
@@ -366,6 +367,11 @@ pub struct SchemaServingHandles {
     /// `replace` sets it to the next run's `served_topics`, so a restarted
     /// run's announced topics are not labelled `Runtime`.
     boot_topics: Arc<Mutex<HashSet<String>>>,
+    /// The data-flow liveness table the catalog reads for each entry's
+    /// `liveness`. A restarted gateway's observer records into this same
+    /// table (see [`GatewayRuntime::new_with_schema_serving`]), and `replace`
+    /// clears it so a prior run's frames never show for the next run's topics.
+    liveness: LivenessTable,
 }
 
 impl SchemaServingHandles {
@@ -382,6 +388,7 @@ impl SchemaServingHandles {
         snapshot_lock: Arc<Mutex<()>>,
         runtime_hashes: Arc<Mutex<HashMap<String, u64>>>,
         boot_topics: Arc<Mutex<HashSet<String>>>,
+        liveness: LivenessTable,
     ) -> Self {
         Self {
             topic_schemas,
@@ -390,6 +397,7 @@ impl SchemaServingHandles {
             snapshot_lock,
             runtime_hashes,
             boot_topics,
+            liveness,
         }
     }
 
@@ -404,8 +412,15 @@ impl SchemaServingHandles {
             .copied()
     }
 
+    /// TEST SEAM: the data-flow liveness the catalog these handles serve
+    /// reports for `topic` (canonical-keyed) as of `now_ns`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn liveness_for_test(&self, topic: &str, now_ns: u64) -> Option<TopicLiveness> {
+        super::liveness::read_liveness(&self.liveness, canonical_topic(topic).as_ref(), now_ns)
+    }
+
     /// TEST SEAM: whether these handles serve nothing - no topic binding,
-    /// hash binding, doc, boot topic or runtime hash.
+    /// hash binding, doc, boot topic, runtime hash or liveness record.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn is_serving_nothing_for_test(&self) -> bool {
         fn empty<T>(map: &Mutex<T>, is_empty: impl Fn(&T) -> bool) -> bool {
@@ -419,6 +434,7 @@ impl SchemaServingHandles {
             && empty(&self.docs, std::collections::BTreeMap::is_empty)
             && empty(&self.boot_topics, HashSet::is_empty)
             && empty(&self.runtime_hashes, HashMap::is_empty)
+            && empty(&self.liveness, HashMap::is_empty)
     }
 
     /// TEST SEAM: the canonical boot topics and topic-bound names these
@@ -463,7 +479,7 @@ impl SchemaServingHandles {
     }
 
     /// Fresh maps seeded from a first construction's `serving` and its
-    /// canonical `boot_topics`, with an empty runtime-hash table.
+    /// canonical `boot_topics`, with empty runtime-hash and liveness tables.
     fn seeded(serving: &SchemaServing, boot_topics: &HashSet<String>) -> Self {
         // hot-path-alloc-ok: gateway construction, never per frame.
         let handles = SchemaServingHandles {
@@ -473,6 +489,7 @@ impl SchemaServingHandles {
             docs: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             runtime_hashes: Arc::new(Mutex::new(HashMap::new())),
             boot_topics: Arc::new(Mutex::new(boot_topics.clone())),
+            liveness: Arc::new(Mutex::new(HashMap::new())),
         };
         handles.merge_maps(serving);
         handles
@@ -538,9 +555,10 @@ impl SchemaServingHandles {
     /// data. All locks are held in catalog-reader order while maps are replaced,
     /// preventing a reader from observing a mixed snapshot. Canonical duplicate
     /// topics and duplicate keys within `serving` are first-wins. The runtime
-    /// hash map is cleared: the next run's gateway records its own hashes.
-    /// The boot-topic set becomes the canonical `serving.served_topics`, so
-    /// the catalog labels the next run's announced topics `Boot`.
+    /// hash map and the liveness table are cleared: the next run's gateway
+    /// records its own hashes and observed frames. The boot-topic set becomes
+    /// the canonical `serving.served_topics`, so the catalog labels the next
+    /// run's announced topics `Boot`.
     pub fn replace(&self, serving: &SchemaServing) {
         let _snapshot = self
             .snapshot_lock
@@ -568,6 +586,10 @@ impl SchemaServingHandles {
             .boot_topics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut liveness = self
+            .liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         *boot = serving
             .served_topics
@@ -575,6 +597,7 @@ impl SchemaServingHandles {
             .map(|topic| canonical_topic(topic).into_owned())
             .collect();
         rh.clear();
+        liveness.clear();
         ts.clear();
         hn.clear();
         docs.clear();
@@ -592,8 +615,9 @@ impl SchemaServingHandles {
         }
     }
 
-    /// Serve nothing: empty schema-serving maps and boot set, so the catalog
-    /// names no schema and the schema serve answers no lookup. A host calls
+    /// Serve nothing: empty schema-serving maps, boot set, runtime hashes
+    /// and liveness table, so the catalog names no schema, hash or observed
+    /// frame and the schema serve answers no lookup. A host calls
     /// this when it stops or fails to start its gateway, since the latched
     /// query surface outlives it.
     pub fn serve_nothing(&self) {
@@ -870,8 +894,10 @@ pub struct GatewayRuntime {
     /// a pure-ingress gateway (no queryable declared).
     get_demand_state: Arc<GetDemandState>,
     /// Queryable inversion: DEMANDER-side demand-GET tracking, present
-    /// iff this gateway has ingress topics (the demand-GET loop is running). Its
-    /// counters surface via [`Self::demand_get_pass_count`] etc.
+    /// iff this gateway has ingress topics (the demand-GET loop is running):
+    /// the manager's shared demand set, so its counters cover every pass the
+    /// manager's one loop ran. They surface via [`Self::demand_get_pass_count`]
+    /// etc.
     demand_get_state: Option<Arc<DemandGetState>>,
     /// The belt's LIVE iteration set for the
     /// synchronous [`Self::reconcile_demand_once`] seam (the background thread owns
@@ -888,7 +914,7 @@ pub struct GatewayRuntime {
     /// A CLONE of the [`CatalogSource`] handed to the query surface,
     /// retained so the sync seam [`Self::catalog_serve_for_test`] runs the EXACT
     /// catalog-serve decision (authorizer gate + build) the real `catalog` callback
-    /// runs. Cheap (three `Arc`s). Test-only.
+    /// runs. Cheap (reference-counted handles only). Test-only.
     #[cfg(any(test, feature = "test-helpers"))]
     catalog_source: CatalogSource,
     /// A CLONE of the [`SchemaSource`] handed to the query surface, for
@@ -1065,13 +1091,49 @@ impl GatewayRuntime {
         }
         let egress_flags: Arc<[(String, Arc<AtomicBool>)]> = registered.into();
 
-        // 2c. The DATA-FLOW liveness observer. Created BEFORE the query
-        //     surface (step 3b) so no catalog GET can observe a missing table,
-        //     and seeded with the boot announce set so observation of those
-        //     topics starts at the first drive pass rather than at the first
-        //     runtime registration. Runtime-registered topics join it in
-        //     `reconcile_egress_topics`, exactly as they join the drive view.
-        let mut liveness = TopicLivenessObserver::new(Arc::clone(&manager));
+        // 2c. The serving maps the `catalog` and `schema` verbs read: the
+        //     shared runtime-hash and liveness tables, the boot-topic
+        //     provenance, the topic->schema and hash->name maps, the schema
+        //     docs and the snapshot lock that keeps a reply from mixing two
+        //     updates. While this gateway runs, its drive thread is the only
+        //     writer of the runtime-hash and liveness tables. The maps exist
+        //     BEFORE the query surface starts (step 3b), so every `Arc`
+        //     threads into both the sources the zenoh callbacks read and this
+        //     gateway. The live TOPIC set for a catalog still comes from the
+        //     bridge manager's registered set, so runtime registrations
+        //     catalog correctly even before the drive thread records their
+        //     hash.
+        //
+        //     When an earlier construction already latched the process-wide
+        //     query surface, that surface keeps reading ITS maps (this
+        //     construction's `start_query_surface` no-ops), so this
+        //     construction adopts ALL of them and merges its serving and boot
+        //     topics in, first-wins. Fresh maps here would never reach the
+        //     catalog or schema verbs after a restart. A host that rebuilds its
+        //     gateway calls [`SchemaServingHandles::replace`] first when the
+        //     previous run's serving and activity must not survive.
+        let serving_handles = match manager
+            .network()
+            .and_then(|network| network.query_surface_serving_handles())
+        {
+            Some(latched) => {
+                latched.adopt_construction(&serving, &boot_topics);
+                latched
+            }
+            None => SchemaServingHandles::seeded(&serving, &boot_topics),
+        };
+
+        // 2d. The DATA-FLOW liveness observer, recording into the table the
+        //     catalog reads. Created BEFORE the query surface (step 3b) so no
+        //     catalog GET can observe a missing table, and seeded with the boot
+        //     announce set so observation of those topics starts at the first
+        //     drive pass rather than at the first runtime registration.
+        //     Runtime-registered topics join it in `reconcile_egress_topics`,
+        //     exactly as they join the drive view.
+        let mut liveness = TopicLivenessObserver::recording_into(
+            Arc::clone(&manager),
+            Arc::clone(&serving_handles.liveness),
+        );
         liveness.track_all(egress_flags.iter().map(|(t, _)| t.as_str()));
 
         // 3b. Start the demand path (BOTH halves of the queryable
@@ -1121,35 +1183,6 @@ impl GatewayRuntime {
         let reconcile_pass_count = Arc::new(AtomicU64::new(0));
         let reconciler_enabled_count = Arc::new(AtomicU64::new(0));
         let get_demand_state = Arc::new(GetDemandState::default());
-        // The serving maps the `catalog` and `schema` verbs read: the shared
-        // runtime-hash table (this gateway's drive thread is its sole
-        // writer), the boot-topic provenance, the topic->schema and
-        // hash->name maps, the schema docs and the snapshot lock that keeps a
-        // reply from mixing two updates. They exist BEFORE the query surface
-        // starts (step 3b), so every `Arc` threads into both the sources the
-        // zenoh callbacks read and this gateway. The live TOPIC set for a
-        // catalog still comes from the bridge manager's registered set, so
-        // runtime registrations catalog correctly even before the drive
-        // thread records their hash.
-        //
-        // When an earlier construction already latched the process-wide query
-        // surface, that surface keeps reading ITS maps (this construction's
-        // `start_query_surface` no-ops), so this construction adopts ALL of
-        // them and merges its serving and boot topics in, first-wins. Fresh
-        // maps here would never reach the catalog or schema verbs after a
-        // restart. A host that rebuilds its gateway calls
-        // [`SchemaServingHandles::replace`] first when the previous run's
-        // serving must not survive.
-        let serving_handles = match manager
-            .network()
-            .and_then(|network| network.query_surface_serving_handles())
-        {
-            Some(latched) => {
-                latched.adopt_construction(&serving, &boot_topics);
-                latched
-            }
-            None => SchemaServingHandles::seeded(&serving, &boot_topics),
-        };
         let reg_hashes = Arc::clone(&serving_handles.runtime_hashes);
         let catalog_boot_topics = Arc::clone(&serving_handles.boot_topics);
         let catalog_topic_schemas = Arc::clone(&serving_handles.topic_schemas);
@@ -1176,8 +1209,8 @@ impl GatewayRuntime {
             // affordance). Weak breaks the manager → NetworkManager → query-surface →
             // CatalogSource → manager cycle (the PermissiveShmProbe precedent).
             producer_probe: Some(Arc::downgrade(&manager)),
-            // The DATA-FLOW liveness table the observer below feeds. The
-            // observer is created here (before the query surface starts) so no
+            // The DATA-FLOW liveness table the observer above feeds. The
+            // observer is created before the query surface starts, so no
             // catalog GET can ever race ahead of the table existing.
             liveness: Some(liveness.table()),
             liveness_clock: Some(manager.clock_arc()),
@@ -1193,6 +1226,12 @@ impl GatewayRuntime {
         let run_source = RunSource {
             iox_config: Arc::new(manager.iox_config()),
             gather_window: RUN_GATHER_WINDOW,
+            // The manager's own slot, so a run hosted on this process's network
+            // manager is served by whichever construction latched the surface.
+            hosted: manager
+                .network()
+                .expect("network present (checked above)")
+                .hosted_runs(),
         };
         // Keep test-only clones BEFORE the sources move into the query
         // surface (the seams reconstruct the exact serve decision the callback runs).
@@ -1240,21 +1279,20 @@ impl GatewayRuntime {
         //     — every ~2 s it GETs each ingress topic's egress ON at the producer
         //     (a dialer QUERY that reaches a listening accepter — the direction
         //     that survives a strict connect-only link where the ingress DEMAND
-        //     token declaration above never forwards).
+        //     token declaration above never forwards). A manager runs ONE loop
+        //     for its lifetime, so the topics go into the manager's shared
+        //     demand set the loop reads: a later gateway on the same manager
+        //     (an embedder that starts its run again) is demanded too. Whoever
+        //     stops this gateway removes its topics again
+        //     (`NetworkManager::remove_ingress_demand_keepalive`).
         let demand_get_state = if plan.ingress.is_empty() {
             None
         } else {
-            let ingress_topics: Vec<String> = plan
-                .ingress
-                .iter()
-                .map(|e| canonical_topic(&e.topic).into_owned())
-                .collect();
-            let state = Arc::new(DemandGetState::from_topics(ingress_topics));
-            manager
-                .network()
-                .expect("network present (checked above)")
-                .start_demand_get_loop(Arc::clone(&state))?;
-            Some(state)
+            let network = manager.network().expect("network present (checked above)");
+            for entry in &plan.ingress {
+                network.ensure_ingress_demand_keepalive(&entry.topic)?;
+            }
+            Some(network.ingress_demand_state())
         };
 
         // Open the READER on the runtime-registration control service.
@@ -1384,7 +1422,7 @@ impl GatewayRuntime {
     /// keeps AFTER moving this gateway onto its drive thread, so a later
     /// registration's [`SchemaServing`] (custom hash→name bindings + served docs)
     /// reaches the running query surface instead of being frozen out by the boot
-    /// snapshot. Cheap (three `Arc`s).
+    /// snapshot. Cheap (`Arc`s only).
     pub fn schema_serving_handles(&self) -> SchemaServingHandles {
         self.serving_handles.clone()
     }
@@ -2924,6 +2962,7 @@ impl fmt::Debug for GatewayRuntime {
 mod schema_serving_handles_tests {
     use super::{SchemaHashName, SchemaServing, SchemaServingHandles, TopicSchema};
     use crate::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use crate::transport::liveness::LivenessRecord;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
@@ -2950,6 +2989,10 @@ mod schema_serving_handles_tests {
             Arc::new(Mutex::new(std::collections::HashSet::from([
                 "/retired".to_string()
             ]))),
+            Arc::new(Mutex::new(HashMap::from([(
+                "/chatter".to_string(),
+                LivenessRecord::default(),
+            )]))),
         );
         let new_doc = SchemaDoc {
             qualified: "new_msgs/New".to_string(),
@@ -3028,8 +3071,10 @@ mod schema_serving_handles_tests {
             );
             assert!(!docs.contains_key("old_msgs/Old"));
         }
-        // The prior run's runtime hashes are cleared: the next run records its own.
+        // The prior run's runtime hashes and observed frames are cleared:
+        // the next run records its own.
         assert_eq!(handles.runtime_hashes.lock().unwrap().len(), 0);
+        assert_eq!(handles.liveness.lock().unwrap().len(), 0);
 
         // Serving nothing empties every map and the boot set: a stopped
         // host's catalog names no topic and its schema serve answers nothing.
@@ -3088,3 +3133,192 @@ mod schema_serving_handles_tests {
 // Pure GatewayPlan tests (validate + serde round-trip) live in
 // `tests/gateway_iox2_test.rs` alongside the transport e2e. The compact
 // schema-serving replacement contract test stays local to access the private maps.
+
+#[cfg(test)]
+mod hosted_runs_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{GatewayEgressPolicy, GatewayPlan, GatewayRuntime};
+    use crate::transport::cerulion_q::{
+        RunEntry, RunEntryState, RunsCompleteness, RunsGatherOutcome, RunsReply,
+    };
+    use crate::transport::demand_authorizer::LanAccess;
+    use crate::transport::discovery::query_robot_runs;
+    use crate::transport::hosted_runs::HostedRun;
+    use crate::transport::network::{NetworkConfig, NetworkManager};
+    use crate::transport::run_registry::RunState;
+    use crate::transport::{TransportConfig, TransportManager};
+
+    const ROBOT: &str = "hostgw";
+    const WIRE_CEILING: Duration = Duration::from_secs(20);
+
+    fn allow_all_plan() -> GatewayPlan {
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowAll,
+            announce: Vec::new(),
+            ingress: Vec::new(),
+        }
+    }
+
+    /// A gateway listening on a probed loopback port, with the manager it runs
+    /// on. Retried, because another process can take the probed port first.
+    fn listening_gateway() -> (Arc<TransportManager>, GatewayRuntime, u16) {
+        for attempt in 0..3 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("an ephemeral loopback port")
+                .port();
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("hostgw_wire_{}_{attempt}", std::process::id()),
+                    network: Some(NetworkConfig {
+                        listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                        robot_identity: Some(ROBOT.to_string()),
+                        ..NetworkConfig::default()
+                    }),
+                    ..Default::default()
+                },
+                crate::testing::iceoryx_test_config(),
+            )
+            .expect("init gateway manager");
+            match GatewayRuntime::new(Arc::clone(&manager), allow_all_plan()) {
+                Ok(gateway) => return (manager, gateway, port),
+                Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
+            }
+        }
+        panic!("could not boot a listening gateway in 3 attempts");
+    }
+
+    /// GET `runs` over the wire until a decoded reply satisfies `done`.
+    fn runs_until(session: &zenoh::Session, done: impl Fn(&RunsReply) -> bool) -> RunsReply {
+        let deadline = Instant::now() + WIRE_CEILING;
+        let mut last = String::from("no GET issued");
+        while Instant::now() < deadline {
+            match query_robot_runs(session, ROBOT, Duration::from_millis(500)) {
+                RunsGatherOutcome::Decoded(reply) if done(&reply) => return reply,
+                other => last = format!("{other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no matching runs reply over the wire within {WIRE_CEILING:?}; last {last}");
+    }
+
+    #[test]
+    fn a_gateway_serves_the_runs_hosted_on_its_managers_network() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("hostgw_{}", std::process::id()),
+                network: Some(NetworkConfig {
+                    robot_identity: Some(ROBOT.to_string()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("init gateway manager");
+        let hosted = manager
+            .network()
+            .expect("a configured network")
+            .hosted_runs();
+        let gateway = GatewayRuntime::new(manager, allow_all_plan()).expect("gateway boot");
+        let entry = RunEntry::new(
+            0x7e41,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+
+        let guard = hosted.host(
+            0x7e41,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let served = gateway.runs_serve_for_test(ROBOT);
+        assert_eq!(
+            served
+                .runs
+                .iter()
+                .map(|e| (e.run_id.as_str(), e.graph_name.as_str(), e.state))
+                .collect::<Vec<_>>(),
+            vec![(
+                "0x00000000000000000000000000007e41",
+                "temi",
+                RunEntryState::Live
+            )]
+        );
+
+        drop(guard);
+        assert!(gateway.runs_serve_for_test(ROBOT).runs.is_empty());
+    }
+
+    #[test]
+    fn a_desk_get_over_loopback_reads_the_run_hosted_on_the_gateways_network() {
+        let (manager, _gateway, port) = listening_gateway();
+        let network = manager.network().expect("a configured network");
+        network.set_lan_access(LanAccess::Open);
+        let entry = RunEntry::new(
+            0x7e42,
+            "temi",
+            42,
+            RunState::Live,
+            "name: temi\n",
+            "{\"version\":1}\n",
+        )
+        .expect("a well-formed entry");
+        let guard = network.hosted_runs().host(
+            0x7e42,
+            HostedRun {
+                entry,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let desk = NetworkManager::new(NetworkConfig {
+            connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+            ..NetworkConfig::default()
+        });
+        let session = desk.session().expect("desk session connects");
+
+        let reply = runs_until(session, |reply| !reply.runs.is_empty());
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: vec![RunEntry {
+                    run_id: "0x00000000000000000000000000007e42".to_string(),
+                    graph_name: "temi".to_string(),
+                    run_started_at_ns: 42,
+                    state: RunEntryState::Live,
+                    graph_yaml: "name: temi\n".to_string(),
+                    run_json: "{\"version\":1}\n".to_string(),
+                }],
+                completeness: RunsCompleteness::Settled,
+                undescribable: Vec::new(),
+                error: None,
+            }
+        );
+
+        drop(guard);
+        let reply = runs_until(session, |reply| reply.runs.is_empty());
+        assert_eq!(
+            reply,
+            RunsReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                runs: Vec::new(),
+                completeness: RunsCompleteness::Settled,
+                undescribable: Vec::new(),
+                error: None,
+            },
+            "a withdrawn run leaves the settled empty answer of an idle machine"
+        );
+    }
+}

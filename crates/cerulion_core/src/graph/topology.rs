@@ -2414,12 +2414,13 @@ mod tests {
             backpressure: policy,
             expect_within_ms: None,
             accumulate: false,
+            consume: Default::default(),
         }
     }
 
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: id.to_string(),

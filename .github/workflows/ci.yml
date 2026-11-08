@@ -359,8 +359,26 @@ jobs:
         id: version
         run: echo "version=$(tools/scripts/workspace_version.sh)" >> "$GITHUB_OUTPUT"
 
+      # Built inside ubuntu:20.04 (glibc 2.31), the release build's own
+      # script with the debug profile, so the package the smoke installs on
+      # 20.04, 22.04 and 24.04 below carries programs linked the way the
+      # released ones are. Writes target/x86_64-unknown-linux-gnu/debug/.
       - name: Build the four release binaries
-        run: cargo build --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted
+        run: |
+          docker run --rm \
+            -e TARGET=x86_64-unknown-linux-gnu \
+            -e CARGO_TERM_COLOR \
+            -e CERULION_BUILD_PROFILE=debug \
+            -e CERULION_RELEASE_TOOLCHAIN=1.95.0 \
+            -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE":/work \
+            ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214 \
+            bash /work/tools/scripts/build_release_linux_container.sh
+          python3 -B tools/scripts/check_release_glibc.py \
+            target/x86_64-unknown-linux-gnu/debug/cerulion \
+            target/x86_64-unknown-linux-gnu/debug/cerulion-netd \
+            target/x86_64-unknown-linux-gnu/debug/cerulion-connectd \
+            target/x86_64-unknown-linux-gnu/debug/cerulion-remoted
 
       # build_deb.sh requires every license notice the archive ships, so this
       # smoke has to produce the generated one like the release does. Doing it
@@ -391,10 +409,10 @@ jobs:
           stage="$RUNNER_TEMP/$stem"
           archive="$RUNNER_TEMP/$stem.tar.gz"
           mkdir -p "$stage" "$RUNNER_TEMP/debs"
-          cp target/debug/cerulion "$stage/cerulion"
-          cp target/debug/cerulion-netd "$stage/cerulion-netd"
-          cp target/debug/cerulion-connectd "$stage/cerulion-connectd"
-          cp target/debug/cerulion-remoted "$stage/cerulion-remoted"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion "$stage/cerulion"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion-netd "$stage/cerulion-netd"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion-connectd "$stage/cerulion-connectd"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion-remoted "$stage/cerulion-remoted"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
@@ -529,7 +547,7 @@ jobs:
             exit 1
           fi
           echo "APT bootstrap exact-keyring check passed"
-          for image in ubuntu:22.04 ubuntu:24.04; do
+          for image in ubuntu:20.04 ubuntu:22.04 ubuntu:24.04; do
             echo "=== $image ==="
             docker run --rm --pull=missing --network host \
               -v "$RUNNER_TEMP/apt-repo:/repo:ro" \
@@ -727,6 +745,18 @@ jobs:
       - name: Published crates verification self-test
         run: ./tools/scripts/test_verify_published.sh
 
+      # The release attaches the Android Java facade as an archive this script
+      # builds; the release workflow runs it only outside pull requests, so
+      # its oracle table runs here on every pull request.
+      - name: Android Java facade asset self-test
+        run: python3 -I tools/scripts/test_package_android_java.py
+
+      # Two pieces of release text a reader acts on: the Android app copy step
+      # in docs/android.md must compose with its own Cargo.toml example, and
+      # the CHANGELOG states the empty MAC key fix once, with no key length.
+      - name: Android release docs self-test
+        run: python3 -I tools/scripts/test_android_release_docs.py
+
       # NO ADDED LINE CARRIES A TYPOGRAPHIC DASH. Diff-scoped, not tree-wide:
       # the cut tree carries an em or en dash in over a thousand files, almost
       # all of it in comments, so a tree scan would red `main` and say nothing
@@ -845,6 +875,7 @@ jobs:
       # front is what keeps this job off ENOSPC; the `df` lines make a
       # regression diagnosable from the log.
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -1223,8 +1254,7 @@ jobs:
             cargo-cross-aarch64-
 
       # ring (through the QUIC link's rustls) compiles C in its build script,
-      # so the check needs the aarch64 C compiler that release-artifacts.yml
-      # installs for the same target.
+      # so the check needs an aarch64 C compiler.
       # The hosted image ships a packages.microsoft.com apt source; apt-get
       # update exits 100 when that source refuses or fails its signature check,
       # even though both packages come from the Ubuntu archives. Deleting its
@@ -1604,6 +1634,30 @@ jobs:
       - name: local-transport linked node tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_linked_nodes_test -- --test-threads=1
+      - name: local-transport app topic to linked node tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_app_topic_feeds_linked_node_test -- --test-threads=1
+      - name: local-transport node tick panic status tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_node_tick_panic_status_test -- --test-threads=1
+      - name: local-transport subscribe and poll tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_subscribe_poll_test -- --test-threads=1
+      - name: local-transport trace cap tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_trace_cap_test -- --test-threads=1
+      - name: local-transport publish stamp tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_publish_stamp_test -- --test-threads=1
+      - name: local-transport nested publish tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_nested_publish_test -- --test-threads=1
+      - name: local-transport LAN ingress tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test lan_ingress_test -- --test-threads=1
+      - name: local-transport remote plane host tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_remote_plane_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -1763,6 +1817,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -2073,6 +2128,7 @@ jobs:
       # in every step's env block in the run logs), so there is no incremental
       # directory to reclaim.
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android \
@@ -2702,6 +2758,9 @@ jobs:
       - name: cerulion_android schema restart integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+      - name: cerulion_android catalog restart integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_catalog_restart_test -- --test-threads=1
       - name: cerulion_android gateway exclusivity integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
@@ -2711,6 +2770,15 @@ jobs:
       - name: cerulion_android LAN access integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_access_test -- --test-threads=1
+      - name: cerulion_android LAN egress list integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_egress_test -- --test-threads=1
+      - name: cerulion_android LAN connect integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_connect_test -- --test-threads=1
+      - name: cerulion_android LAN ingress integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_ingress_test -- --test-threads=1
       - name: cerulion_android LAN ownership tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
@@ -2726,6 +2794,35 @@ jobs:
       - name: cerulion_android linked node integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
+      - name: cerulion_android app topic to linked node integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_app_topic_feeds_linked_node_test -- --test-threads=1
+      - name: cerulion_android node tick panic status integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_node_tick_panic_status_test -- --test-threads=1
+      - name: cerulion_android logcat sink integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_logcat_sink_test -- --test-threads=1
+      - name: cerulion_android logcat egress warning tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_logcat_egress_test -- --test-threads=1
+      - name: cerulion_android logcat app subscriber integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_logcat_app_subscriber_test -- --test-threads=1
+      - name: cerulion_android trace cap integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_trace_cap_test -- --test-threads=1
+      - name: cerulion_android publish stamp integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_publish_stamp_test -- --test-threads=1
+      - name: cerulion_android nested publish integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
+      # The `local-transport` job runs this file on the in-process transport.
+      # This step runs it on the default cross-process transport.
+      - name: cerulion_android subscribe and poll integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_subscribe_poll_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test sample_graph_asset_test
@@ -2766,6 +2863,22 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
+
+      # `cerulion_msgio`: messages as text on local shared memory (publish,
+      # service call, snapshot, decode), used by `cerulion_cli_engine` and by
+      # `cerulion-remoted`, which serves the same operations as ops verbs. The
+      # schema store moved here from `cerulion_cli_engine`. Named here for the
+      # same reason as `cerulion_discovery` above: these jobs run only the
+      # packages they name.
+      - name: cerulion_msgio tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
+        run: cargo test -p cerulion_msgio
+      - name: selection marker, cerulion_msgio
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_msgio (selected: $SELECTED)"
 
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
@@ -3047,6 +3160,7 @@ jobs:
       # An unparseable figure simply skips the reclaim (verified on real BSD `df`:
       # empty and non-numeric both fall through the guard, exit 0).
       - name: Report free disk (reclaim only if tight)
+        if: runner.environment == 'github-hosted'
         run: |
           df -h / || true
           avail=$(df -g / | awk 'NR==2 {print $4}') || true
@@ -3615,6 +3729,22 @@ jobs:
         run: |
           echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
+      # `cerulion_msgio`: messages as text on local shared memory (publish,
+      # service call, snapshot, decode), used by `cerulion_cli_engine` and by
+      # `cerulion-remoted`, which serves the same operations as ops verbs. The
+      # schema store moved here from `cerulion_cli_engine`. Named here for the
+      # same reason as `cerulion_discovery` above: these jobs run only the
+      # packages they name.
+      - name: cerulion_msgio tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
+        run: cargo test -p cerulion_msgio
+      - name: selection marker, cerulion_msgio
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_msgio (selected: $SELECTED)"
+
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
       # cerulion_wireclient — a workspace member excluded from default-members because
@@ -3849,13 +3979,19 @@ jobs:
   # ceiling era (see the notes on their `timeout-minutes`); adding four
   # crypto/iroh/web dependency trees to them buys a cancellation, not coverage.
   #
-  # PARALLEL (no `--test-threads=1`) for every package, and that is a READ of
-  # the tests rather than an assumption: nothing here calls
-  # `TransportManager::get_or_init()`. `cerulion_remoted` is the only package
-  # that builds real iceoryx2 transports at all, and its five transport files
-  # mint ISOLATED per-test SHM roots via `TransportManager::init_for_test`
-  # (their own headers say "parallel-safe without `#[serial]`"), which is the
-  # same property that lets the `cerulion_connectd` step above run parallel.
+  # PARALLEL (no `--test-threads=1`) for every package except
+  # `cerulion_android_remote`. That package runs on the in-process transport,
+  # and its hosted plane test starts the process runtime, so its step uses one
+  # thread. For the other packages that is a READ of the tests rather than an
+  # assumption. `cerulion_remoted` is the only one of them that builds real
+  # iceoryx2 transports at all. One of its files, `tests/act_verbs_test.rs`,
+  # calls `TransportManager::get_or_init()`, the process-global manager on the
+  # default namespace; every test in it carries `#[serial]`, which takes one
+  # lock shared by the whole test binary, so no two of them run at once. Its
+  # other transport files mint ISOLATED per-test SHM roots via
+  # `TransportManager::init_for_test` (their own headers say "parallel-safe
+  # without `#[serial]`"), which is the same property that lets the
+  # `cerulion_connectd` step above run parallel.
   # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
   # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
@@ -3988,7 +4124,7 @@ jobs:
       # headroom on the stock runner (the ENOSPC/SIGBUS class documented at
       # length in that job).
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (runner.os == 'Linux')
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android \
@@ -4035,6 +4171,15 @@ jobs:
       - name: cerulion_pairing tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
         run: cargo test -p cerulion_pairing
+      # Lints and tests cerulion_pairing with the `dev-issuer` feature on, and
+      # checks the release package set (check_no_dev_issuer.sh) for it.
+      - name: cerulion_pairing tests, development issuer
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
+        run: |
+          cargo clippy -p cerulion_pairing --all-targets --features dev-issuer -- -D warnings
+          cargo test -p cerulion_pairing --features dev-issuer
+      - name: release binaries build without the development issuer
+        run: tools/scripts/check_no_dev_issuer.sh
       - name: selection marker, cerulion_pairing
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing') }}
         env:
@@ -4077,6 +4222,17 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
+      # The app's transport is the in-process one, and the hosted plane test
+      # starts the process runtime, so one thread.
+      - name: cerulion_android_remote tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android_remote')
+        run: cargo test -p cerulion_android_remote --features local-transport -- --test-threads=1
+      - name: selection marker, cerulion_android_remote
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android_remote') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android_remote (selected: $SELECTED)"
       - name: cerulion_accountd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd')
         run: cargo test -p cerulion_accountd
@@ -4181,6 +4337,28 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_telemetry (selected: $SELECTED)"
+      # The umbrella crate's test is not a unit test: it writes scratch cargo
+      # projects OUTSIDE this workspace (node crates whose only dependency is
+      # the umbrella, a package naming neither crate, two packages whose type
+      # errors sit on fields) and asks cargo to check them. That is the
+      # only way to exercise the claim `cargo add cerulion` makes, because
+      # every package inside this workspace also names the runtime crate
+      # directly. It runs here rather than in a test shard because it drives
+      # cargo itself, and this job's cache namespace is the one that carries
+      # its dependency closure. The doctests in the same package run with it.
+      # Named for the crate rather than starting with it: a step name whose
+      # first word is `cerulion` followed by a lowercase word parses as an
+      # invocation of the binary to the login-gate walk in `cerulion_hygiene`,
+      # which every other step here dodges only because its package name
+      # carries an underscore.
+      - name: Umbrella crate tests (cerulion)
+        env:
+          # The scratch project's artifacts live outside `target/`, which this
+          # job caches. They are about 1.6 GB and belong to a package set
+          # nothing else here builds, so caching them would cost every run an
+          # upload and a restore to save one cold check.
+          CERULION_SCRATCH_TARGET_DIR: ${{ runner.temp }}/cerulion-one-dependency-scratch
+        run: cargo test -p cerulion
 
   # Release-mode latency threshold (Linux-only)
   #
@@ -4584,7 +4762,7 @@ jobs:
       # preinstalled toolchains (~25 GB) on Linux before building. macOS
       # runners have more disk, so skip it there.
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (runner.os == 'Linux')
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /
@@ -4897,6 +5075,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -4993,6 +5172,7 @@ jobs:
       # Reclaim preinstalled SDK bloat (crib test-linux) so the iroh tree has disk
       # headroom on the stock runner.
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android \
                       /usr/share/dotnet \
@@ -5342,7 +5522,7 @@ jobs:
       # the smaller list alongside the larger profile would inherit the
       # mitigation's name without its substance.
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && (runner.os == 'Linux')
         run: |
           sudo rm -rf /usr/local/lib/android \
                       /usr/share/dotnet \

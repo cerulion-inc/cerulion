@@ -42,6 +42,7 @@ pub mod failure_regime_latch;
 pub mod fill_from;
 pub mod frame_drop_latch;
 pub mod gateway;
+pub mod hosted_runs;
 pub mod ingress_build;
 pub mod input_view;
 pub mod kind;
@@ -91,6 +92,10 @@ pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
 #[cfg(feature = "local-transport")]
 pub(crate) use iceoryx2::service::local_threadsafe::Service as CerService;
 
+/// A topic's data-service factory on [`CerService`].
+pub(crate) type DataServiceFactory =
+    iceoryx2::service::port_factory::publish_subscribe::PortFactory<CerService, [u8], ()>;
+
 /// The `event_id_max_value` EVERY Cerulion event service is created with.
 ///
 /// The highest `EventId` the transport mints is
@@ -117,7 +122,7 @@ use publisher::{CerulionPublisher, CerulionPublisherConfig};
 use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 
 /// Maximum topic name length (255 - "/event" suffix = 249).
-const MAX_TOPIC_LEN: usize = 249;
+pub(crate) const MAX_TOPIC_LEN: usize = 249;
 
 /// Refuse node/transport startup when this process's iceoryx2 build lacks
 /// Android shared-memory support (stock iceoryx2 has no `shm_open` on
@@ -205,10 +210,15 @@ pub(crate) const ICEORYX2_DEFAULT_BORROWED_SAMPLES: usize = 2;
 /// latest(1) + receive-transient(1) = 3 — one above the iceoryx2 default
 /// of 2. Defined as `default + 1` so the "held + latest + transient =
 /// default + 1" rationale is self-documenting (and tracks the default if it
-/// ever changes — guarded by the drift-guard test). Set ONLY on
-/// snapshot-source topics (see
-/// [`TopicServiceConfig::subscriber_max_borrowed_samples`]).
-pub(crate) const SUBSCRIBER_MAX_BORROWED_HELD: usize = ICEORYX2_DEFAULT_BORROWED_SAMPLES + 1;
+/// ever changes, guarded by the drift-guard test). Armed as an open
+/// requirement ONLY on snapshot-source topics and on the source topics of
+/// `consume = latest` trigger inputs, whose unread frozen frame is held the
+/// same way (see [`TopicServiceConfig::subscriber_max_borrowed_samples`]); a
+/// topic the graph owns is CREATED at it as a floor. Public so a runtime that
+/// creates a topic before the graph that reads it (the Android embedded
+/// runtime's app publishers) can create it at the same floor through
+/// [`TopicServiceConfig::create_borrow_floor`].
+pub const SUBSCRIBER_MAX_BORROWED_HELD: usize = ICEORYX2_DEFAULT_BORROWED_SAMPLES + 1;
 
 /// Drift-guard hook (test-only): iceoryx2's LIVE create-default
 /// `max_subscribers` for a publish-subscribe service — the subscriber cap a
@@ -924,6 +934,33 @@ impl Default for TransportConfig {
     }
 }
 
+/// What a publisher's send does at a connected subscriber whose queue is
+/// full, on a topic whose data service was created with safe overflow
+/// disabled. On a service created with safe overflow enabled the send
+/// replaces the oldest queued sample under either value.
+///
+/// [`TransportManager::create_ingress_publisher_with`],
+/// [`TransportManager::create_ingress_injector_with`] and
+/// [`TransportManager::create_service_client_with`] take it; every other
+/// publisher constructor builds its port as [`FullQueueSend::ConfigDefault`]
+/// does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FullQueueSend {
+    /// The publisher port is built with no backpressure setting, so it takes
+    /// the strategy of the iceoryx2 config the node was built from
+    /// (`RetryUntilDelivered` in iceoryx2's defaults). Under
+    /// `RetryUntilDelivered` the send waits, with no deadline, until that
+    /// subscriber takes a sample, disconnects or closes its channel.
+    #[default]
+    ConfigDefault,
+    /// The publisher port is built with
+    /// `BackpressureStrategy::DiscardData` and no backpressure handler, so
+    /// iceoryx2 delivers to each subscriber with its non-waiting `try_send`:
+    /// the send skips a subscriber whose queue is full, and the recipient
+    /// count it returns leaves that subscriber out.
+    Discard,
+}
+
 /// Per-topic iceoryx2 SERVICE configuration,
 /// computed by the graph runtime from the topology.
 ///
@@ -955,13 +992,16 @@ pub struct TopicServiceConfig {
     /// global value) always succeed on graph-created services.
     pub subscriber_max_buffer_size: usize,
     /// The iceoryx2 `subscriber_max_borrowed_samples` for this topic.
-    /// `None` = use the iceoryx2 default (2). `Some(3)` is set ONLY on
-    /// topics that feed a non-trigger latest-value input of a macro node
-    /// (a snapshot consumer): such a consumer HOLDS the last-delivered
+    /// `None` = use the iceoryx2 default (2). `Some(3)` is set on topics
+    /// that feed a non-trigger latest-value input of a macro node (a
+    /// snapshot consumer): such a consumer HOLDS the last-delivered
     /// sample across steps, so the drain peak is held(1) +
     /// latest(1) + receive-transient(1) = 3 borrowed per connection. A
     /// burst (≥2 queued) would exceed the default 2 → `ExceedsMaxBorrows`.
-    /// Trigger-only / non-snapshot topics keep the default 2 (no waste).
+    /// The source topic of a `consume = latest` trigger input gets `Some(3)`
+    /// too: its subscriber holds a frame no tick has read through the next
+    /// drain. A topic none of whose consumers holds a frame keeps the
+    /// default 2, and a recorded topic takes the recorder's own raise.
     pub subscriber_max_borrowed_samples: Option<usize>,
     /// A CREATE-leg-only borrow floor — the `subscriber_max_borrowed_samples`
     /// a service THIS opener creates is raised to, WITHOUT arming any open-time
@@ -975,11 +1015,15 @@ pub struct TopicServiceConfig {
     /// (`rmw_take_loaned_message`) HOLDS an [`OwnedInboundSample`](subscriber::OwnedInboundSample)
     /// across the C ABI until rclcpp returns it, so the per-connection borrow
     /// peak is the held-loan count — above the iceoryx2 default of
-    /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` (2). It differs from the
+    /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` (2). That rmw floor differs from the
     /// owned-topic floor (which is keyed on [`PublisherProvisioning`] and pinned
-    /// at `SUBSCRIBER_MAX_BORROWED_HELD` = 3 — both pub(crate) consts, unlinked
-    /// for the same rustdoc reason) in both trigger and value, so it is
-    /// its own knob rather than a special case folded into that rule.
+    /// at [`SUBSCRIBER_MAX_BORROWED_HELD`] = 3) in both trigger and value, so
+    /// this is its own knob, and each caller picks its value.
+    ///
+    /// Also set by the Android embedded runtime on every app publisher, at
+    /// [`SUBSCRIBER_MAX_BORROWED_HELD`]: the app creates its topics before the
+    /// graph builds, so a graph node that holds an app topic as a latest-value
+    /// input needs the topic created at the owned-topic floor.
     ///
     /// A floor at or below the iceoryx2 default is a no-op (`None`-equivalent);
     /// `None` (the default everywhere) changes nothing.
@@ -1016,6 +1060,18 @@ pub struct TopicServiceConfig {
     /// to every publisher's pool on the topic; those slots are demand-paged,
     /// so the cost is virtual address space, not resident memory.
     pub create_subscriber_floor: Option<usize>,
+    /// A CREATE-leg-only native history floor: a service THIS opener creates
+    /// gets `history_size = max(history_size, floor)` and a subscriber buffer
+    /// ceiling of at least `(floor * 4).div_ceil(3)`, the smallest ceiling
+    /// whose three quarters holds `floor`. Neither value arms an open-time
+    /// requirement: the open leg keeps [`Self::history_size`] and
+    /// [`Self::subscriber_max_buffer_size`]. Set by `rmw_cerulion`'s publisher
+    /// and subscription create paths, so every rmw endpoint creates a ROS
+    /// topic with the same history and buffer and a later opener is never
+    /// refused for asking more than the first opener did. A pre-existing
+    /// service below the floor still attaches and is warned about once.
+    /// `None` (the default everywhere) changes nothing.
+    pub create_history_floor: Option<usize>,
     /// Service-level `max_subscribers`. `Some(n)`
     /// provisions the topic for at most `n` subscribers AND requires ≥ `n`
     /// when opening an existing service; `None` leaves the setter uncalled
@@ -1208,6 +1264,8 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DataLeg {
     borrowed_samples: Option<usize>,
+    history_size: usize,
+    subscriber_max_buffer_size: usize,
     max_publishers: Option<usize>,
     max_subscribers: Option<usize>,
     max_nodes: Option<usize>,
@@ -1297,6 +1355,39 @@ pub const INTROSPECTION_SUBSCRIBER_HEADROOM: usize = 5;
 /// graph (fan-out is node-count bounded).
 pub const MAX_REASONABLE_PORTS: usize = 4096;
 
+/// The iceoryx2 port name of every data publisher that asks for history of
+/// its own (`history_size > 0`): an `rmw_cerulion` TRANSIENT_LOCAL or
+/// BEST_AVAILABLE publisher, or a native publisher that declares history. A
+/// publisher that asks for none carries the default empty name.
+///
+/// The name lives in the service's dynamic config, which every process that
+/// opens the service reads, and leaves it with the publisher (its drop
+/// deregisters the port; iceoryx2's dead-node cleanup removes a crashed
+/// process's ports). [`TransportManager::topic_publisher_retain_marks`] reads
+/// it back, and an `rmw_cerulion` subscription that asks for BEST_AVAILABLE
+/// durability takes the retained messages only when every live publisher on
+/// the topic carries it. A publisher created by a build without this mark
+/// reads as one that retains nothing.
+pub const RETAINING_PUBLISHER_NAME: &str = "cerulion.retains";
+
+/// Whether an iceoryx2 publisher port name is [`RETAINING_PUBLISHER_NAME`].
+pub(crate) fn publisher_name_retains(name: &str) -> bool {
+    name == RETAINING_PUBLISHER_NAME
+}
+
+/// One publisher on a topic, as [`TransportManager::topic_publisher_nodes`]
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicPublisherNode {
+    /// The publisher's id: the
+    /// [`ReceivedMessage::origin`](subscriber::ReceivedMessage::origin) of
+    /// every frame it commits. Run random, so compared only within one run.
+    pub publisher: u128,
+    /// The name of the iceoryx2 node the publisher was created under, `None`
+    /// when that node's details cannot be read.
+    pub node_name: Option<String>,
+}
+
 /// How a topic's publisher side is provisioned, derived
 /// from the graph topology. The `Multi` variant is the opt-in —
 /// call sites extend a `match`, not a second signature churn.
@@ -1325,6 +1416,21 @@ pub enum PublisherProvisioning {
     /// requires on open, and every Cerulion graph requiring the same N
     /// passes iceoryx2's at-least verification by equality.
     Multi,
+}
+
+impl PublisherProvisioning {
+    /// The `max_publishers` a service provisioned this way is created with:
+    /// `None` for [`Self::External`] (the setter stays uncalled, so
+    /// iceoryx2's create default applies), `Some(1)` for
+    /// [`Self::SingleWriter`] and `Some(`[`MULTI_PUBLISHER_LOOSE_MAX`]`)` for
+    /// [`Self::Multi`].
+    pub(crate) const fn max_publishers(self) -> Option<usize> {
+        match self {
+            Self::External => None,
+            Self::SingleWriter => Some(1),
+            Self::Multi => Some(MULTI_PUBLISHER_LOOSE_MAX),
+        }
+    }
 }
 
 /// The `max_publishers` cap provisioned for every
@@ -1424,12 +1530,11 @@ impl TopicServiceConfig {
         // for the Some arm: `None` imposes no open requirement, so a
         // graph value below iceoryx2's create-default can never fail a
         // default opener's OPEN-time check.)
-        let (max_subscribers, max_publishers) = match publisher_provisioning {
-            PublisherProvisioning::External => (None, None),
-            PublisherProvisioning::SingleWriter => (
-                Some(in_graph_subscribers.saturating_add(INTROSPECTION_SUBSCRIBER_HEADROOM)),
-                Some(1),
-            ),
+        let max_subscribers = match publisher_provisioning {
+            PublisherProvisioning::External => None,
+            PublisherProvisioning::SingleWriter => {
+                Some(in_graph_subscribers.saturating_add(INTROSPECTION_SUBSCRIBER_HEADROOM))
+            }
             // A multi-publisher topic is CROSS-GRAPH by
             // definition, so BOTH port caps must be graph-independent
             // shared constants — `Some(n)` provisions AND requires
@@ -1439,11 +1544,9 @@ impl TopicServiceConfig {
             // Cerulion graph requires the same two constants, so opens
             // pass by equality; the runtime fail-fasts at build when one
             // graph ALONE exceeds the subscriber cap.
-            PublisherProvisioning::Multi => (
-                Some(MULTI_SUBSCRIBER_LOOSE_MAX),
-                Some(MULTI_PUBLISHER_LOOSE_MAX),
-            ),
+            PublisherProvisioning::Multi => Some(MULTI_SUBSCRIBER_LOOSE_MAX),
         };
+        let max_publishers = publisher_provisioning.max_publishers();
         // The buffer ceiling is the third graph-dependent knob
         // that must be a shared constant on cross-graph (Multi) topics —
         // see MULTI_TOPIC_BUFFER_CEILING. The runtime fail-fasts at build
@@ -1476,6 +1579,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers,
             max_publishers,
             publisher_provisioning,
@@ -1569,6 +1673,26 @@ impl TopicServiceConfig {
             .filter(|&floor| floor > ICEORYX2_DEFAULT_BORROWED_SAMPLES)
     }
 
+    /// The `history_size` for the CREATE leg of a data-service acquisition:
+    /// the open requirement [`Self::history_size`] raised to
+    /// [`Self::create_history_floor`].
+    pub(crate) fn create_history_size(&self) -> usize {
+        self.history_size
+            .max(self.create_history_floor.unwrap_or(0))
+    }
+
+    /// The `subscriber_max_buffer_size` for the CREATE leg: the open
+    /// requirement raised to `(floor * 4).div_ceil(3)` when a
+    /// [`Self::create_history_floor`] is set.
+    pub(crate) fn create_subscriber_max_buffer_size(&self) -> usize {
+        match self.create_history_floor {
+            Some(floor) if floor > 0 => {
+                self.subscriber_max_buffer_size.max((floor * 4).div_ceil(3))
+            }
+            _ => self.subscriber_max_buffer_size,
+        }
+    }
+
     /// The `(max_publishers, max_subscribers)` for the CREATE leg of a
     /// service acquisition. Each axis is the open requirement
     /// (`self.max_publishers` / `self.max_subscribers`) unless that axis's
@@ -1654,6 +1778,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             max_publishers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             publisher_provisioning: PublisherProvisioning::Multi,
@@ -1683,6 +1808,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: Some(1),
             publisher_provisioning: PublisherProvisioning::SingleWriter,
@@ -1734,7 +1860,7 @@ pub struct TopicRequirements {
     /// from `Option` to the concrete count (the iceoryx2 default
     /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` when unset). `>=` the held-snapshot
     /// budget `SUBSCRIBER_MAX_BORROWED_HELD` iff SOME consumer of this topic holds
-    /// a snapshot across steps. This is the headline term: a
+    /// a snapshot across steps or reads it as a `consume = latest` trigger. This is the headline term: a
     /// cross-group snapshot consumer is the reported bug. (This carries
     /// GENUINE requirements only — the owned-topic create-side borrow FLOOR
     /// deliberately does NOT enter the harvest, because a stamped union arms this
@@ -3176,6 +3302,25 @@ impl TransportManager {
         history_size: usize,
         topic_config: TopicServiceConfig,
     ) -> TransportResult<CerulionPublisher> {
+        self.create_publisher_sending(
+            topic,
+            max_slice_len,
+            history_size,
+            topic_config,
+            FullQueueSend::ConfigDefault,
+        )
+    }
+
+    /// [`Self::create_publisher_with_topic_config`] with the publisher port's
+    /// full-queue send set by `full_queue`.
+    fn create_publisher_sending(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        history_size: usize,
+        topic_config: TopicServiceConfig,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<CerulionPublisher> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::PublisherCreation {
             topic: topic_owned.clone(),
@@ -3190,6 +3335,7 @@ impl TransportManager {
             max_slice_len,
             history_size,
             topic_config,
+            full_queue,
             &map_err,
         )
     }
@@ -3223,6 +3369,7 @@ impl TransportManager {
         max_slice_len: MaxSliceLen,
         history_size: usize,
         topic_config: TopicServiceConfig,
+        full_queue: FullQueueSend,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionPublisher> {
         // Cross-graph same-topic guard: iceoryx2's port cap
@@ -3298,6 +3445,15 @@ impl TransportManager {
         let mut publisher_builder = data_service
             .publisher_builder()
             .initial_max_slice_len(max_slice_len.get() as usize);
+        // A publisher that asks for history of its own states it in its port
+        // name, which other processes read from the service's dynamic config
+        // (`topic_publisher_retain_marks`). The service history alone cannot
+        // say it: every publisher's retained ring is sized from the service.
+        if history_size > 0 {
+            let name = PortName::new(RETAINING_PUBLISHER_NAME)
+                .map_err(|e| map_err(format!("retaining publisher port name: {e:?}")))?;
+            publisher_builder = publisher_builder.name(&name);
+        }
         if let Some(max_loaned) = topic_config.publisher_max_loaned_samples {
             // Raise the simultaneous-loan budget above the iceoryx2
             // default (2) — the rmw borrow window holds ~4 outstanding loans per
@@ -3306,6 +3462,15 @@ impl TransportManager {
             // slice-ceiling slot per unit in this publisher's demand-paged
             // pool (see the field doc).
             publisher_builder = publisher_builder.max_loaned_samples(max_loaned);
+        }
+        match full_queue {
+            FullQueueSend::ConfigDefault => {}
+            // No backpressure handler is set, so iceoryx2 delivers through
+            // `try_send`, which returns at a full queue.
+            FullQueueSend::Discard => {
+                publisher_builder =
+                    publisher_builder.backpressure_strategy(BackpressureStrategy::DiscardData);
+            }
         }
         let publisher = publisher_builder.create().map_err(|e| {
             use iceoryx2::port::publisher::PublisherCreateError;
@@ -3537,6 +3702,7 @@ impl TransportManager {
             max_slice_len,
             history_size,
             topic_config,
+            FullQueueSend::ConfigDefault,
             &map_err,
         )
     }
@@ -3590,6 +3756,37 @@ impl TransportManager {
         topic: &str,
         max_slice_len: MaxSliceLen,
     ) -> TransportResult<CerulionPublisher> {
+        self.ingress_publisher_and_service(topic, max_slice_len, FullQueueSend::ConfigDefault)
+            .map(|(publisher, _data_service)| publisher)
+    }
+
+    /// [`Self::create_ingress_publisher`] with the publisher port's
+    /// full-queue send set by `full_queue`. With [`FullQueueSend::Discard`]
+    /// its `publish_raw` returns without waiting on a subscriber whose queue
+    /// is full, and the count it returns leaves that subscriber out.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_ingress_publisher`].
+    #[must_use = "publisher creation result must be checked"]
+    pub fn create_ingress_publisher_with(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<CerulionPublisher> {
+        self.ingress_publisher_and_service(topic, max_slice_len, full_queue)
+            .map(|(publisher, _data_service)| publisher)
+    }
+
+    /// The ingress publisher of [`Self::create_ingress_publisher`] and the
+    /// data service it was attached to.
+    fn ingress_publisher_and_service(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<(CerulionPublisher, DataServiceFactory)> {
         // Loop refusal: this gateway must not both ANNOUNCE (egress-tap) and
         // INGRESS the same topic (re-inject → tap → egress → a remote
         // re-injects → …).
@@ -3678,6 +3875,7 @@ impl TransportManager {
             max_slice_len,
             0, // history_size — ingress retains no late-joiner history
             topic_config,
+            full_queue,
             &map_err,
         )?;
         // A raw-INGRESS publisher wakes its FOREIGN consumers from
@@ -3694,7 +3892,7 @@ impl TransportManager {
         // route is not progress — and best-effort: a recording aid must never
         // be able to fail an ingress route (see `note_ingress_route_created`).
         self.note_ingress_route_created();
-        Ok(publisher)
+        Ok((publisher, data_service))
     }
 
     /// Report that ONE more runtime ingress route was created by this
@@ -3882,6 +4080,31 @@ impl TransportManager {
             expected_schema_hash,
             publisher,
         ))
+    }
+
+    /// [`Self::create_ingress_injector`] with the injection publisher built
+    /// by [`Self::create_ingress_publisher_with`] for `full_queue`. The
+    /// injector also holds the topic's data service, so
+    /// [`IngressInjector::subscriber_count`] reads how many subscribers the
+    /// topic has attached.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_ingress_injector`].
+    #[must_use = "ingress injector creation result must be checked"]
+    pub fn create_ingress_injector_with(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        max_slice_len: MaxSliceLen,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<IngressInjector> {
+        let (publisher, data_service) =
+            self.ingress_publisher_and_service(topic, max_slice_len, full_queue)?;
+        Ok(
+            IngressInjector::new(topic.to_string(), expected_schema_hash, publisher)
+                .with_data_service(data_service),
+        )
     }
 
     /// Create a network-sourced injector with required SHM mirror identity.
@@ -4100,8 +4323,8 @@ impl TransportManager {
     /// within one pass once the transport is back. Call it once per demanded topic,
     /// right after `register_ingress_topic`. Idempotent + start-once.
     ///
-    /// A gateway (which boots its OWN demand-GET loop from its fixed ingress list)
-    /// never calls this — the manager's single loop slot is used by exactly one role.
+    /// A gateway adds its ingress topics to the same set at boot, so the
+    /// manager's one loop demands both.
     ///
     /// # Errors
     ///
@@ -4880,7 +5103,30 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
-        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true)
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true, None)
+    }
+
+    /// [`Self::create_subscriber_with_buffers`] with an explicit late-joiner
+    /// history request: the port receives at most `history_request` retained
+    /// frames when it connects (0 = none), clamped to the service's
+    /// `history_size` and this port's `buffer_size`. A plain
+    /// [`Self::create_subscriber_with_buffers`] receives the service history
+    /// capped at its buffer.
+    #[must_use = "subscriber creation result must be checked"]
+    pub fn create_subscriber_with_history_request(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+        history_request: usize,
+    ) -> TransportResult<CerulionSubscriber> {
+        self.create_subscriber_with_buffers_inner(
+            topic,
+            topic_config,
+            buffer_size,
+            true,
+            Some(history_request),
+        )
     }
 
     /// A subscriber built the way a latest-value input is built: with no event
@@ -4911,7 +5157,7 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
-        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false)
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false, None)
     }
 
     fn create_subscriber_with_buffers_inner(
@@ -4920,6 +5166,7 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
         with_listener: bool,
+        history_request: Option<usize>,
     ) -> TransportResult<CerulionSubscriber> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::SubscriberCreation {
@@ -4937,6 +5184,7 @@ impl TransportManager {
             Some(buffer_size),
             with_listener,
             topic_config.create_subscriber_floor,
+            history_request,
             &map_err,
         )
     }
@@ -4990,6 +5238,7 @@ impl TransportManager {
             &event_service,
             None,
             true,
+            None,
             None,
             &map_err,
         )
@@ -5469,6 +5718,7 @@ impl TransportManager {
             Some(buffer_size),
             with_listener,
             None,
+            None,
             &map_err,
         )
     }
@@ -5711,6 +5961,10 @@ impl TransportManager {
         // The opener's `create_subscriber_floor`, named in a slot-exhaustion
         // error when the service holds fewer slots than it.
         create_subscriber_floor: Option<usize>,
+        // How many retained frames this port asks for when it connects.
+        // `None` takes iceoryx2's default (the service history, capped at the
+        // port buffer); `Some(n)` is clamped to that same bound.
+        history_request: Option<usize>,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionSubscriber> {
         // Slot exhaustion at port creation is the
@@ -5724,6 +5978,19 @@ impl TransportManager {
         let mut subscriber_builder = data_service.subscriber_builder();
         if let Some(buffer_size) = buffer_size {
             subscriber_builder = subscriber_builder.buffer_size(buffer_size);
+        }
+        // A caller that asks for no particular history takes iceoryx2's default
+        // (the service history, capped at the port buffer), except on a service
+        // whose history is a create-leg floor: every publisher there retains
+        // frames, VOLATILE ones included, so such a caller takes none.
+        let history_request = history_request.or_else(|| {
+            wire_header_attribute::history_is_floor(data_service.attributes()).then_some(0)
+        });
+        if let Some(requested) = history_request {
+            let static_config = data_service.static_config();
+            let port_buffer = buffer_size.unwrap_or(static_config.subscriber_max_buffer_size());
+            subscriber_builder = subscriber_builder
+                .history_request(requested.min(static_config.history_size()).min(port_buffer));
         }
         let subscriber = subscriber_builder.create().map_err(|e| {
             use iceoryx2::port::subscriber::SubscriberCreateError;
@@ -5944,6 +6211,35 @@ impl TransportManager {
         self.topic_port_count(topic, false)
     }
 
+    /// [`Self::topic_subscriber_count`] that tells a failed probe apart from
+    /// no subscriber: `Some(n)` when the topic's data service opened (`n`
+    /// subscribers, in every process), `Some(0)` when the service does not
+    /// exist, and `None` when the name is invalid, the service states another
+    /// wire header version, or the open fails for another reason (for
+    /// example the process is out of file descriptors).
+    pub fn topic_subscriber_count_checked(&self, topic: &str) -> Option<usize> {
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let name: ServiceName = format!("{}/data", topic).as_str().try_into().ok()?;
+        match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                None
+            }
+            Ok(service) => Some(service.dynamic_config().number_of_subscribers()),
+            Err(PublishSubscribeOpenError::DoesNotExist) => Some(0),
+            Err(e) => {
+                tracing::debug!(topic = %topic, error = %e, "subscriber count probe failed");
+                None
+            }
+        }
+    }
+
     /// Live PUBLISHER count on a topic's data service, queried from
     /// iceoryx2's dynamic config — covers ALL processes, unlike any
     /// process-local registry (`rcl_action_server_is_
@@ -6038,6 +6334,127 @@ impl TransportManager {
         classify_producer_probe(probe)
     }
 
+    /// One entry per publisher attached to `topic`'s data service right now,
+    /// in every process: `true` when that publisher carries
+    /// [`RETAINING_PUBLISHER_NAME`] (it asked for history of its own).
+    ///
+    /// An empty list when the service does not exist, and when it exists with
+    /// no publisher.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::TopicPublishers`], naming the cause, when the topic
+    /// is not a valid service name, the service cannot be opened for a reason
+    /// other than not existing, or it states another wire header version.
+    pub fn topic_publisher_retain_marks(&self, topic: &str) -> TransportResult<Vec<bool>> {
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let map_err = |reason: String| TransportError::TopicPublishers {
+            topic: topic.to_string(),
+            reason,
+        };
+        let name: ServiceName = format!("{}/data", topic)
+            .as_str()
+            .try_into()
+            .map_err(|e| map_err(format!("{e}")))?;
+        match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service) => {
+                wire_header_attribute::check_opened(topic, service.attributes())
+                    .map_err(map_err)?;
+                let mut marks = Vec::new();
+                service.dynamic_config().list_publishers(|details| {
+                    marks.push(publisher_name_retains(details.publisher_name.as_str()));
+                    CallbackProgression::Continue
+                });
+                Ok(marks)
+            }
+            Err(PublishSubscribeOpenError::DoesNotExist) => Ok(Vec::new()),
+            Err(e) => Err(map_err(format!("{e}"))),
+        }
+    }
+
+    /// One entry per publisher attached to `topic`'s data service right now,
+    /// in every process: its id, which is the
+    /// [`ReceivedMessage::origin`](subscriber::ReceivedMessage::origin) of
+    /// every frame it commits, and the name of the iceoryx2 node it was
+    /// created under ([`TransportConfig::node_name`] for a Cerulion
+    /// transport). The name is `None` when that node's details cannot be
+    /// read: another user's node, or one in an undefined state.
+    ///
+    /// The ports come from the service's dynamic config and the names from
+    /// iceoryx2's node list under this transport's config, so each call reads
+    /// one node record per node on that config.
+    ///
+    /// An empty list when the service does not exist, and when it exists with
+    /// no publisher.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::TopicPublishers`], naming the cause, when the topic
+    /// is not a valid service name, the service cannot be opened for a reason
+    /// other than not existing, it states another wire header version, or the
+    /// node list cannot be read.
+    pub fn topic_publisher_nodes(&self, topic: &str) -> TransportResult<Vec<TopicPublisherNode>> {
+        use iceoryx2::node::NodeView;
+        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
+        let map_err = |reason: String| TransportError::TopicPublishers {
+            topic: topic.to_string(),
+            reason,
+        };
+        let name: ServiceName = format!("{}/data", topic)
+            .as_str()
+            .try_into()
+            .map_err(|e| map_err(format!("{e}")))?;
+        let service = match self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+        {
+            Ok(service) => service,
+            Err(PublishSubscribeOpenError::DoesNotExist) => return Ok(Vec::new()),
+            Err(e) => return Err(map_err(format!("{e}"))),
+        };
+        wire_header_attribute::check_opened(topic, service.attributes()).map_err(map_err)?;
+        let mut ports = Vec::new();
+        service.dynamic_config().list_publishers(|details| {
+            ports.push((details.publisher_id.value(), details.node_id));
+            CallbackProgression::Continue
+        });
+        if ports.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        Node::<CerService>::list(self.node.config(), |state| {
+            let details = match &state {
+                NodeState::Alive(view) => view.details().as_ref(),
+                NodeState::Dead(view) => view.details().as_ref(),
+                NodeState::Inaccessible(_) | NodeState::Undefined(_) => None,
+            };
+            if let Some(details) = details {
+                if ports.iter().any(|(_, node)| node == state.node_id()) {
+                    names.push((*state.node_id(), details.name().as_str().to_string()));
+                }
+            }
+            CallbackProgression::Continue
+        })
+        .map_err(|e| map_err(format!("the node list could not be read: {e:?}")))?;
+        Ok(ports
+            .into_iter()
+            .map(|(publisher, node)| TopicPublisherNode {
+                publisher,
+                node_name: names
+                    .iter()
+                    .find(|(id, _)| *id == node)
+                    .map(|(_, name)| name.clone()),
+            })
+            .collect())
+    }
+
     /// Owned handle to the transport clock (the service layer
     /// stamps frames with it so replay runs under `VirtualClock` produce
     /// bit-identical timestamps).
@@ -6103,6 +6520,7 @@ impl TransportManager {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             // A default opener owns nothing — External is the declared
@@ -6416,6 +6834,8 @@ impl TransportManager {
         let make_data_builder = |legs: DataLeg| {
             let DataLeg {
                 borrowed_samples,
+                history_size,
+                subscriber_max_buffer_size,
                 max_publishers,
                 max_subscribers,
                 max_nodes,
@@ -6424,7 +6844,7 @@ impl TransportManager {
                 .node
                 .service_builder(&data_service_name)
                 .publish_subscribe::<[u8]>()
-                .subscriber_max_buffer_size(topic_config.subscriber_max_buffer_size);
+                .subscriber_max_buffer_size(subscriber_max_buffer_size);
             if let Some(borrowed) = borrowed_samples {
                 // Raise the per-connection borrowed-sample ceiling above
                 // the iceoryx2 default (2) on snapshot-source topics — a macro
@@ -6450,7 +6870,7 @@ impl TransportManager {
                 // requirement.
                 data_builder = data_builder.max_nodes(max_nodes);
             }
-            if topic_config.history_size > 0 {
+            if history_size > 0 {
                 // Arm iceoryx2 NATIVE publisher history at the
                 // CREATOR/precreate site. The publisher port iceoryx2 hands back
                 // on this service automatically gets a history queue of this size
@@ -6467,7 +6887,7 @@ impl TransportManager {
                 // publisher_max_loaned). `enable_safe_overflow` stays at its
                 // default (true), so `history_size > subscriber buffer` is a soft
                 // per-consumer truncation, not a hard open failure.
-                data_builder = data_builder.history_size(topic_config.history_size);
+                data_builder = data_builder.history_size(history_size);
             }
             data_builder
         };
@@ -6508,18 +6928,29 @@ impl TransportManager {
         // its frames carry; an opened one is checked after the open (see
         // `wire_header_attribute`), so the open leg requires nothing and the
         // create leg defines the attribute.
-        let wire_header_specifier = wire_header_attribute::data_service_specifier()?;
+        // A service created with a history floor also states the floor, so a
+        // native subscriber that asks for no particular history can tell that
+        // the history is a floor and ask for none (see `finish_subscriber`).
+        let mut wire_header_specifier = wire_header_attribute::data_service_specifier()?;
+        if let Some(floor) = topic_config.create_history_floor.filter(|&floor| floor > 0) {
+            wire_header_specifier =
+                wire_header_attribute::with_history_floor(wire_header_specifier, floor)?;
+        }
         let node_defaults = &self.node.config().defaults.publish_subscribe;
         let default_caps = (node_defaults.max_publishers, node_defaults.max_subscribers);
         let (create_publishers, create_subscribers) = topic_config.create_port_caps(default_caps);
         let open_leg = DataLeg {
             borrowed_samples: topic_config.subscriber_max_borrowed_samples,
+            history_size: topic_config.history_size,
+            subscriber_max_buffer_size: topic_config.subscriber_max_buffer_size,
             max_publishers: topic_config.max_publishers,
             max_subscribers: topic_config.max_subscribers,
             max_nodes: None,
         };
         let create_leg = DataLeg {
             borrowed_samples: topic_config.create_borrowed_samples(),
+            history_size: topic_config.create_history_size(),
+            subscriber_max_buffer_size: topic_config.create_subscriber_max_buffer_size(),
             max_publishers: create_publishers,
             max_subscribers: create_subscribers,
             max_nodes: topic_config.create_node_cap(default_caps, node_defaults.max_nodes),
@@ -6615,9 +7046,10 @@ impl TransportManager {
                     PublishSubscribeOpenError::DoesNotSupportRequestedMinSubscriberBorrowedSamples,
                 ) => {
                     "; the service already exists with fewer borrowed samples \
-                     than this opener requires — a snapshot-consumer graph \
-                     needs subscriber_max_borrowed_samples >= 3 (the \
-                     latest-value hold) — stop the owning graph or earlier \
+                     than this opener requires: a snapshot-consumer or \
+                     `consume = latest` graph needs \
+                     subscriber_max_borrowed_samples >= 3 (the held frame); \
+                     stop the owning graph or earlier \
                      default opener, or start this graph first"
                 }
                 _ => "",
@@ -6816,6 +7248,29 @@ impl TransportManager {
                      smaller pre-existing value (a subscriber holding that many \
                      loaned takes is refused its next receive); stop the earlier \
                      creator and restart this opener to reclaim the floor"
+                );
+            }
+        }
+        // The history floor twin: a service WE created carries
+        // `create_history_size()`, which is never below the floor, so
+        // `live < floor` means the service pre-existed shallower and the open
+        // leg attached anyway; late joiners then receive at most `live` frames.
+        // Only an opener that retains frames itself (`history_size > 0`) is
+        // degraded by that, so only it warns.
+        if let Some(floor) = topic_config.create_history_floor {
+            let live = data_service.static_config().history_size();
+            if topic_config.history_size > 0
+                && live < floor
+                && self.mark_degraded_once(topic, "history_floor")
+            {
+                tracing::warn!(
+                    topic = %topic,
+                    floor,
+                    live,
+                    "history floor degraded, the service pre-existed with a \
+                     smaller history_size than this opener's create floor, so a \
+                     late joiner receives at most the pre-existing value; stop \
+                     the earlier creator and restart this opener to reclaim the floor"
                 );
             }
         }
@@ -7105,7 +7560,7 @@ pub(crate) fn classify_node_name_refusal(raw: &str) -> NodeNameRefusal {
 }
 
 /// Validate that the topic name is within iceoryx2's service name limit.
-fn validate_topic_name(topic: &str) -> Result<(), String> {
+pub(crate) fn validate_topic_name(topic: &str) -> Result<(), String> {
     if topic.is_empty() {
         return Err("topic name cannot be empty".to_string());
     }
@@ -7527,6 +7982,26 @@ mod node_name_refusal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the exact reserved name marks a retaining publisher, and it is a
+    /// valid iceoryx2 port name.
+    #[test]
+    fn only_the_reserved_port_name_marks_a_retaining_publisher() {
+        assert_eq!(RETAINING_PUBLISHER_NAME, "cerulion.retains");
+        assert!(publisher_name_retains("cerulion.retains"));
+        for other in [
+            "",
+            "cerulion.retain",
+            "cerulion.retains ",
+            " cerulion.retains",
+            "CERULION.RETAINS",
+            "cerulion.retains.x",
+            "retains",
+        ] {
+            assert!(!publisher_name_retains(other), "{other:?}");
+        }
+        assert!(PortName::new(RETAINING_PUBLISHER_NAME).is_ok());
+    }
 
     /// The startup sweep's FAILED-removal arm is the only surface of a fault
     /// with an operator remedy, so it is a `warn!` naming `cerulion clean`;
@@ -8493,6 +8968,7 @@ mod tests {
             create_borrow_floor: Some(66),
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(99),
             max_publishers: Some(99),
             // Deliberately WRONG intent in the seed: for_topology must
@@ -8645,6 +9121,59 @@ mod tests {
         assert_eq!(
             ext.create_borrowed_samples(),
             Some(SUBSCRIBER_MAX_BORROWED_HELD)
+        );
+    }
+
+    /// `create_history_floor` raises the CREATE leg's history and buffer
+    /// ceiling only; the open requirement (the pub fields) is untouched, so a
+    /// later opener with a deeper ask finds a service it can open and a
+    /// pre-existing shallower service is still attached. Hand oracle per arm.
+    #[test]
+    fn create_history_floor_raises_the_create_leg_only() {
+        let mut cfg = default_seed_cfg();
+        assert_eq!(cfg.create_history_size(), 0, "no floor: history as asked");
+        assert_eq!(
+            cfg.create_subscriber_max_buffer_size(),
+            DEFAULT_SUBSCRIBER_BUFFER_SIZE,
+            "no floor: buffer as asked"
+        );
+
+        // The rmw shape for small types: floor 16, a VOLATILE opener (0).
+        cfg.create_history_floor = Some(16);
+        assert_eq!(cfg.history_size, 0, "the floor arms no open requirement");
+        assert_eq!(cfg.create_history_size(), 16);
+        // (16 * 4).div_ceil(3) = 22, the smallest c with 16 <= c * 3 / 4.
+        assert_eq!(cfg.create_subscriber_max_buffer_size(), 22);
+
+        // A TRANSIENT_LOCAL depth-5 opener under the same floor creates the
+        // same service as the VOLATILE one: open order cannot change it.
+        cfg.history_size = 5;
+        cfg.subscriber_max_buffer_size = DEFAULT_SUBSCRIBER_BUFFER_SIZE;
+        assert_eq!(cfg.create_history_size(), 16);
+        assert_eq!(cfg.create_subscriber_max_buffer_size(), 22);
+
+        // The large-slice floor 12 fits the default buffer: no raise.
+        cfg.create_history_floor = Some(12);
+        assert_eq!(cfg.create_history_size(), 12);
+        assert_eq!(
+            cfg.create_subscriber_max_buffer_size(),
+            DEFAULT_SUBSCRIBER_BUFFER_SIZE
+        );
+
+        // A larger genuine requirement wins on both axes.
+        cfg.history_size = 20;
+        cfg.subscriber_max_buffer_size = 40;
+        assert_eq!(cfg.create_history_size(), 20);
+        assert_eq!(cfg.create_subscriber_max_buffer_size(), 40);
+
+        // A zero floor changes nothing.
+        cfg.history_size = 0;
+        cfg.subscriber_max_buffer_size = DEFAULT_SUBSCRIBER_BUFFER_SIZE;
+        cfg.create_history_floor = Some(0);
+        assert_eq!(cfg.create_history_size(), 0);
+        assert_eq!(
+            cfg.create_subscriber_max_buffer_size(),
+            DEFAULT_SUBSCRIBER_BUFFER_SIZE
         );
     }
 
@@ -8803,6 +9332,7 @@ mod tests {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             publisher_provisioning: PublisherProvisioning::SingleWriter,

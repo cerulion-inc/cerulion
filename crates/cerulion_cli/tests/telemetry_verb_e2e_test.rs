@@ -4,7 +4,9 @@
 //! `CERULION_HOME` in its own tempdir and clears every variable that could
 //! decide consent, so the machine's own settings never leak in. The key, where
 //! one is set, points at a reserved dead port or at the test's own loopback
-//! sink: nothing can be delivered anywhere else. [`cerulion`] runs the binary
+//! sink: nothing can be delivered anywhere else. `CERULION_NETWORK` is cleared
+//! too, since nothing is sent while it engages the network kill switch.
+//! [`cerulion`] runs the binary
 //! with stderr on a pseudo-terminal, as a person at a shell does, because the
 //! first-run notice is shown only on a terminal; [`cerulion_piped`] runs it
 //! with a plain pipe. The CI variables are cleared too, so a CI runner's own
@@ -33,7 +35,8 @@ fn command(home: &Path, env: &[(&str, &str)], args: &[&str], cwd: &Path) -> Comm
         .env_remove("DO_NOT_TRACK")
         .env_remove("CERULION_TELEMETRY")
         .env_remove("POSTHOG_API_KEY")
-        .env_remove("POSTHOG_HOST");
+        .env_remove("POSTHOG_HOST")
+        .env_remove("CERULION_NETWORK");
     for name in cerulion_telemetry::ci::CI_ENV_VARS {
         cmd.env_remove(name);
     }
@@ -181,7 +184,16 @@ fn status_needs_no_login_and_writes_nothing() {
     );
     assert!(!keyed.stdout.contains(NO_KEY), "{}", keyed.stdout);
     assert!(!home.path().join("telemetry.json").exists());
+    assert!(
+        out.stdout.contains(&format!("what is sent: {DETAILS}")),
+        "status links the page that describes what is sent: {}",
+        out.stdout
+    );
 }
+
+/// The short address of the page that describes what is sent; the notice
+/// and `cerulion telemetry status` both print it.
+const DETAILS: &str = "https://cerulion.com/telemetry";
 
 #[test]
 fn off_then_on_persist_in_the_consent_file() {
@@ -300,6 +312,11 @@ fn the_notice_is_one_short_line() {
     assert_eq!(lines.len(), 1, "{}", first.stderr);
     assert!(lines[0].chars().count() <= 120, "{:?}", lines[0]);
     assert!(
+        lines[0].contains("`cerulion telemetry off`") && lines[0].contains(DETAILS),
+        "the notice names the off switch and links what is sent: {:?}",
+        lines[0]
+    );
+    assert!(
         !first.stderr.contains("\n\n"),
         "no blank line follows the notice: {:?}",
         first.stderr
@@ -377,6 +394,50 @@ fn a_ci_run_sends_without_a_notice_under_the_random_id_and_leaves_the_notice_owe
         tty.stderr
     );
     assert_nothing_sent(&sink, "the notice run sends nothing");
+}
+
+/// The join a first login makes: events sent before it under the random id
+/// are personless (`$process_person_profile: false`), and the login's
+/// `$create_alias` names that same id under the account and is itself not
+/// personless, so the analytics backend links the earlier events to the
+/// account's person.
+#[test]
+fn events_sent_before_a_first_login_are_named_by_its_alias() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let issuer = issuer(sub);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", issuer.url.as_str()),
+    ];
+    cerulion_piped(home.path(), &env, &["graph", "list"]);
+    let before = events_sent(&sink);
+    let run = the_one(&before, "cli_command_run");
+    let anon = run["distinct_id"]
+        .as_str()
+        .expect("a distinct id")
+        .to_owned();
+    assert!(anon.starts_with("anon:"), "{before:?}");
+    assert_eq!(
+        run["properties"]["$process_person_profile"], false,
+        "{before:?}"
+    );
+
+    let out = cerulion_piped(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    let events = events_sent(&sink);
+    let alias = the_one(&events, "$create_alias");
+    assert_eq!(alias["distinct_id"], sub, "{events:?}");
+    assert_eq!(
+        alias["properties"]["alias"], anon,
+        "the alias names the id the earlier events were sent under: {events:?}"
+    );
+    assert!(
+        alias["properties"].get("$process_person_profile").is_none(),
+        "a personless alias would merge nothing: {alias}"
+    );
 }
 
 #[test]
@@ -1065,6 +1126,133 @@ fn a_refused_pair_delivers_pair_completed_as_a_failure() {
     assert_eq!(run["properties"]["verb"], "pair", "{events:?}");
     assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
     assert_eq!(events.len(), 2, "{events:?}");
+}
+
+/// Nothing leaves while the network kill switch is engaged: `CERULION_NETWORK`
+/// in each spelling that engages it (an unrecognized value fails closed), or a
+/// verb's own `--network off`. A run on a terminal shows no notice either and
+/// leaves it to the first run that can send; the same home and verb without
+/// the switch then sends.
+#[test]
+fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
+    let sink = sink();
+    let home = primed_home(&sink);
+    let [key, host] = sending(&sink);
+    let cases: [(Option<&str>, &[&str]); 7] = [
+        (Some("off"), &["graph", "list"]),
+        (Some(" OFF "), &["graph", "list"]),
+        (Some("typo"), &["graph", "list"]),
+        (Some("off"), &["pair", "robot", "--eid", "ab"]),
+        (None, &["graph", "run", "demo", "--network", "off"]),
+        (None, &["graph", "run", "demo", "--local"]),
+        (None, &["connect", "bench-arm", "--network", "on"]),
+    ];
+    for (network, args) in cases {
+        let mut env = vec![key, host];
+        if let Some(value) = network {
+            env.push(("CERULION_NETWORK", value));
+        }
+        let out = cerulion_piped(home.path(), &env, args);
+        assert!(
+            !out.stderr.contains("cerulion telemetry off"),
+            "{}",
+            out.stderr
+        );
+        assert_nothing_sent(
+            &sink,
+            &format!("{args:?} ran under CERULION_NETWORK={network:?}"),
+        );
+    }
+    let fresh = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(fresh.path(), "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc").unwrap();
+    let tty = cerulion(
+        fresh.path(),
+        &[key, host, ("CERULION_NETWORK", "off")],
+        &["graph", "list"],
+    );
+    assert!(
+        !tty.stderr.contains("cerulion telemetry off"),
+        "no notice under the switch: {}",
+        tty.stderr
+    );
+    assert_nothing_sent(&sink, "the terminal run ran under the switch");
+    let tty = cerulion(fresh.path(), &sending(&sink), &["graph", "list"]);
+    assert!(
+        tty.stderr.contains("cerulion telemetry off"),
+        "the notice waited for a run that can send: {}",
+        tty.stderr
+    );
+    cerulion_piped(home.path(), &sending(&sink), &["graph", "list"]);
+    let events = events_sent(&sink);
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "graph", "{events:?}");
+    // `--local` on any verb but a run keeps that verb off a robot only.
+    cerulion_piped(home.path(), &sending(&sink), &["doctor", "--local"]);
+    let events = events_sent(&sink);
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "doctor", "{events:?}");
+}
+
+/// A first login under the network kill switch sends nothing and carries
+/// nothing in its device-start request, but leaves the merge of the earlier
+/// anonymous events to the next run that sends, as the notice run does.
+/// Without a key it leaves nothing: no account recorded, no merge pending.
+#[test]
+fn a_first_login_under_the_switch_leaves_its_merge_to_the_next_send() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let first = issuer(sub);
+    let [key, host] = sending(&sink);
+    let account = ("CERULION_ACCOUNT_SERVICE", first.url.as_str());
+    cerulion_piped(home.path(), &[key, host, account], &["graph", "list"]);
+    let before = events_sent(&sink);
+    let anon = the_one(&before, "cli_command_run")["distinct_id"]
+        .as_str()
+        .expect("a distinct id")
+        .to_owned();
+    assert!(anon.starts_with("anon:"), "{before:?}");
+
+    let off = ("CERULION_NETWORK", "off");
+    let out = cerulion_piped(home.path(), &[key, host, account, off], &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    let start = first
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    assert_eq!(start, "{}", "nothing is carried under the switch");
+    assert_nothing_sent(&sink, "the login ran under the switch");
+    let marker = home.path().join("telemetry_alias_pending");
+    assert!(marker.exists(), "the merge waits for a run that sends");
+    assert_eq!(bound_account_in(home.path()), sub);
+    assert_eq!(anon_id_in(home.path()), anon, "a first login keeps the id");
+
+    cerulion_piped(home.path(), &[key, host], &["graph", "list"]);
+    let events = events_sent(&sink);
+    let alias = the_one(&events, "$create_alias");
+    assert_eq!(alias["distinct_id"], sub, "{events:?}");
+    assert_eq!(alias["properties"]["alias"], anon, "{events:?}");
+    assert!(!marker.exists(), "the merge is made once");
+
+    let keyless = tempfile::tempdir().unwrap();
+    let on = cerulion(keyless.path(), &[], &["telemetry", "on"]);
+    assert_eq!(on.code, Some(0), "stderr={}", on.stderr);
+    let second = issuer(sub);
+    let account = ("CERULION_ACCOUNT_SERVICE", second.url.as_str());
+    let out = cerulion_piped(keyless.path(), &[account, off], &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    second
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    assert!(
+        !keyless.path().join("telemetry_alias_pending").exists(),
+        "a run without a key leaves no merge pending"
+    );
+    assert!(
+        !keyless.path().join("telemetry_anon_account").exists(),
+        "a run without a key records no account for the id"
+    );
 }
 
 /// `graph run` and `node run` requested inside a workspace deliver the

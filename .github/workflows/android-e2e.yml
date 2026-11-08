@@ -11,6 +11,7 @@ on:
     paths:
       - '.cargo/config.toml'
       - 'crates/cerulion_android/**'
+      - 'crates/cerulion_android_remote/**'
       - 'crates/cerulion_bag/**'
       - 'crates/cerulion_bagd/**'
       - 'crates/cerulion_cli/**'
@@ -45,6 +46,7 @@ on:
     paths:
       - '.cargo/config.toml'
       - 'crates/cerulion_android/**'
+      - 'crates/cerulion_android_remote/**'
       - 'crates/cerulion_bag/**'
       - 'crates/cerulion_bagd/**'
       - 'crates/cerulion_cli/**'
@@ -121,6 +123,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /

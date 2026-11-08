@@ -684,6 +684,90 @@ fn ri_flush(id: &str, input: &str, reads: &mut Vec<[u64; 3]>) {
     reads.clear();
 }
 
+/// How many of the relay's first ticks [`ri_flush_times`] reports.
+#[allow(dead_code)]
+const RI_TIMED_TICKS: u32 = 4;
+
+/// Fields of one timed tick: index, entry and exit on the node's real clock,
+/// then [`ri_thread_snapshot`] at entry and at exit.
+#[allow(dead_code)]
+const RI_TIME_FIELDS: usize = 15;
+
+/// This thread's cumulative `[on-CPU ns, runqueue-wait ns, timeslices, CPU it
+/// last ran on, voluntary switches, involuntary switches]`, from
+/// `/proc/thread-self/{schedstat,stat,status}`. A field whose file is absent
+/// reads `u64::MAX`.
+#[allow(dead_code)]
+fn ri_thread_snapshot() -> [u64; 6] {
+    let mut out = [u64::MAX; 6];
+    let sched = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+    for (slot, word) in out[..3].iter_mut().zip(sched.split_whitespace()) {
+        *slot = word.parse().unwrap_or(u64::MAX);
+    }
+    // Field 39 of `stat` is the CPU; the fields after the parenthesised
+    // command name start at field 3.
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
+    if let Some(cpu) = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(39 - 3))
+        .and_then(|w| w.parse().ok())
+    {
+        out[3] = cpu;
+    }
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
+    for line in status.lines() {
+        let slot = if line.starts_with("voluntary_ctxt_switches:") {
+            4
+        } else if line.starts_with("nonvoluntary_ctxt_switches:") {
+            5
+        } else {
+            continue;
+        };
+        if let Some(v) = line.split_whitespace().nth(1).and_then(|w| w.parse().ok()) {
+            out[slot] = v;
+        }
+    }
+    out
+}
+
+/// The relay's timed ticks, held outside the node's state so they never
+/// reach a captured or compared node state.
+#[allow(dead_code)]
+static RI_TIMES: std::sync::Mutex<Vec<[u64; RI_TIME_FIELDS]>> = std::sync::Mutex::new(Vec::new());
+
+#[allow(dead_code)]
+fn ri_push_time(t: [u64; RI_TIME_FIELDS]) {
+    RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+}
+
+/// Write the relay's timed ticks as `<id>_<pid>_<k>.times`, one line per tick:
+/// `tick` then the [`RI_TIME_FIELDS`] raw values, space separated.
+#[allow(dead_code)]
+fn ri_flush_times(id: &str) {
+    use std::io::Write as _;
+    let Some(dir) = std::env::var_os("CER_RI_READS_DIR") else {
+        return;
+    };
+    let times = std::mem::take(&mut *RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()));
+    if times.is_empty() {
+        return;
+    }
+    let mut out = String::new();
+    for t in times {
+        out.push_str("tick");
+        for v in t {
+            out.push_str(&format!(" {v}"));
+        }
+        out.push('\n');
+    }
+    static K: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = K.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::path::Path::new(&dir).join(format!("{id}_{}_{k}.times", std::process::id()));
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        let _ = f.write_all(out.as_bytes());
+    }
+}
+
 fn ri_sleep(us: u64) {
     if us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(us));
@@ -741,6 +825,10 @@ struct RiRelayNode {
     ri_id: String,
     #[param(default = 100, description = "this writer's identity")]
     ri_writer: u64,
+    #[param(default = 0, description = "microseconds a sleeping fire sleeps")]
+    ri_sleep_us: u64,
+    #[param(default = 1, description = "every this many fires, one sleeps")]
+    ri_sleep_every: u64,
     tick_count: u32,
     ri_reads: Vec<[u64; 3]>,
 }
@@ -748,6 +836,12 @@ struct RiRelayNode {
 #[cerulion_node_impl]
 impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
+        let timed = ri_on() && self.tick_count < RI_TIMED_TICKS;
+        let entry_ns = if timed { self.real_ns() } else { 0 };
+        let entry = if timed { ri_thread_snapshot() } else { [0; 6] };
+        if self.ri_sleep_every > 0 && u64::from(self.tick_count) % self.ri_sleep_every == 0 {
+            ri_sleep(self.ri_sleep_us);
+        }
         self.tick_count += 1;
         let r = [self.inp.x, self.inp.y, self.inp.z];
         if ri_on() {
@@ -756,11 +850,23 @@ impl RiRelayNode {
         self.out.x = self.ri_writer as f64;
         self.out.y = f64::from(self.tick_count);
         self.out.z = ri_fold(r);
+        if timed {
+            let exit_ns = self.real_ns();
+            let exit = ri_thread_snapshot();
+            let mut t = [0u64; RI_TIME_FIELDS];
+            t[0] = u64::from(self.tick_count - 1);
+            t[1] = entry_ns;
+            t[2] = exit_ns;
+            t[3..9].copy_from_slice(&entry);
+            t[9..15].copy_from_slice(&exit);
+            ri_push_time(t);
+        }
         Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), NodeError> {
         ri_flush(&self.ri_id, "inp", &mut self.ri_reads);
+        ri_flush_times(&self.ri_id);
         Ok(())
     }
 }
@@ -974,6 +1080,57 @@ impl RiFastNode {
 }
 "#,
     },
+    // The fast node as the HEAD side of a chain: records the same samples as
+    // `ri_fast` and republishes the frame, so a slow node can follow it.
+    NodeType {
+        name: "ri_fast_relay",
+        policy: MacroPolicy::DataTrigger {
+            input_name: String::new(),
+        },
+        trigger: Some("inp"),
+        inputs: &["inp"],
+        outputs: &["out"],
+        body: r#"#[cerulion_node]
+struct RiFastRelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    samples: Vec<(u64, u64)>,
+}
+
+#[cerulion_node_impl]
+impl RiFastRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let stamp = self.inp.x;
+        let now = self.real_ns();
+        self.samples.push((now, now.saturating_sub(stamp as u64)));
+        self.out.x = self.inp.x;
+        self.out.y = self.inp.y;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), NodeError> {
+        use std::io::Write as _;
+        if self.samples.is_empty() {
+            return Ok(());
+        }
+        let Some(dir) = std::env::var_os("CER_RI_SAMPLES_DIR") else {
+            return Ok(());
+        };
+        let mut out = String::with_capacity(self.samples.len() * 24);
+        for (t, lat) in &self.samples {
+            out.push_str(&format!("{t} {lat}\n"));
+        }
+        let path = std::path::Path::new(&dir).join(format!("fast_{}.samples", std::process::id()));
+        if let Ok(mut f) = std::fs::File::create(path) {
+            let _ = f.write_all(out.as_bytes());
+        }
+        Ok(())
+    }
+}
+"#,
+    },
     // The slow consumer behind a declared `block` edge: its producer is
     // deferred while two frames are unserved.
     NodeType {
@@ -1117,7 +1274,16 @@ pub enum Fixture {
     Ranks2,
     /// The same chain split `[src]` / `[relay]` / `[sink]`.
     Ranks3,
+    /// `Ranks3` with a relay that sleeps [`LATE_RELAY_SLEEP_US`] on every
+    /// [`LATE_RELAY_EVERY`]th fire, so its fires bunch (one step drains two or
+    /// three frames) without its queue overflowing.
+    Ranks3LateRelay,
 }
+
+/// How long a sleeping fire of [`Fixture::Ranks3LateRelay`]'s relay sleeps.
+pub const LATE_RELAY_SLEEP_US: u64 = 2_000;
+/// Every this many fires of [`Fixture::Ranks3LateRelay`]'s relay, one sleeps.
+pub const LATE_RELAY_EVERY: u64 = 20;
 
 /// A fixture's nodes, its process groups in rank order, and its
 /// multi-publisher topics.
@@ -1134,6 +1300,10 @@ pub enum Placement {
     Declared,
     /// Every node in one process (`graph run --single-process`).
     SingleProcess,
+    /// Every node in one declared process group, each declaring
+    /// `isolate: true`: one worker process of a multi-process run that runs
+    /// every node in an executor unit of its own.
+    OneGroup,
 }
 
 impl Placement {
@@ -1141,6 +1311,7 @@ impl Placement {
         match self {
             Placement::Declared => "declared",
             Placement::SingleProcess => "single_process",
+            Placement::OneGroup => "one_group",
         }
     }
 }
@@ -1164,6 +1335,7 @@ impl Fixture {
             Fixture::MultiWriter => "multi_writer",
             Fixture::Ranks2 => "ranks2",
             Fixture::Ranks3 => "ranks3",
+            Fixture::Ranks3LateRelay => "ranks3_late_relay",
         }
     }
 
@@ -1173,7 +1345,9 @@ impl Fixture {
             Fixture::SlowEvict => &[("slow", "inp")],
             Fixture::FanOut => &[("sink_a", "inp"), ("sink_b", "inp")],
             Fixture::MultiWriter => &[("tfbuf", "tf")],
-            Fixture::Ranks2 | Fixture::Ranks3 => &[("relay", "inp"), ("sink", "inp")],
+            Fixture::Ranks2 | Fixture::Ranks3 | Fixture::Ranks3LateRelay => {
+                &[("relay", "inp"), ("sink", "inp")]
+            }
         }
     }
 
@@ -1196,7 +1370,7 @@ impl Fixture {
                     inputs: Vec<InputDef>,
                     outputs: Vec<OutputDef>,
                     params: &[(&str, ParamValue)]| NodeDef {
-            fuse: None,
+            isolate: None,
             ros2: None,
             params: params
                 .iter()
@@ -1294,7 +1468,12 @@ impl Fixture {
                     vec![tf],
                 )
             }
-            Fixture::Ranks2 | Fixture::Ranks3 => {
+            Fixture::Ranks2 | Fixture::Ranks3 | Fixture::Ranks3LateRelay => {
+                let relay_sleep = if self == Fixture::Ranks3LateRelay {
+                    LATE_RELAY_SLEEP_US
+                } else {
+                    0
+                };
                 let nodes = vec![
                     src(),
                     node(
@@ -1302,7 +1481,12 @@ impl Fixture {
                         "ri_relay",
                         vec![input("inp", "src/out".into())],
                         vec![out("out", None)],
-                        &[id("relay"), writer(100)],
+                        &[
+                            id("relay"),
+                            writer(100),
+                            ("ri_sleep_us", ParamValue::UInt(relay_sleep)),
+                            ("ri_sleep_every", ParamValue::UInt(LATE_RELAY_EVERY)),
+                        ],
                     ),
                     node(
                         "sink",
@@ -1338,7 +1522,7 @@ pub fn node_def(
     params: &[(&str, ParamValue)],
 ) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         ros2: None,
         params: params
             .iter()
@@ -1405,7 +1589,10 @@ pub fn graph_config(
 pub struct RecordedRun {
     pub fixture: Fixture,
     pub placement: Placement,
-    pub dir: tempfile::TempDir,
+    /// Kept when the test fails with `CERULION_KEEP_TEST_WS=1`
+    /// ([`ScaffoldDir`]): the bag, the read logs, and each replay's stderr,
+    /// `--report` JSON and re-recording.
+    pub dir: ScaffoldDir,
     pub bag: PathBuf,
     pub live: ReadLog,
     /// Where the live run's nodes wrote their records.
@@ -1532,6 +1719,9 @@ pub fn run_live(
     };
     let mut guard = ChildGuard::spawn_group_leader(&mut cmd)
         .unwrap_or_else(|e| panic!("RI_HARNESS: spawn graph run {graph}: {e}"));
+    let sampler = SAMPLE_UNIT_THREADS
+        .load(Ordering::Relaxed)
+        .then(|| UnitThreadSampler::start(guard.id(), dir.join(UNIT_THREAD_SAMPLES)));
     let start = std::time::Instant::now();
     while !ready() {
         if let Some(status) = guard.try_wait_noting().expect("RI_HARNESS: poll") {
@@ -1557,6 +1747,7 @@ pub fn run_live(
             logs()
         );
     }
+    drop(sampler);
     mp_support::send_signal(guard.id(), libc::SIGINT);
     let status = guard
         .wait_bounded(Duration::from_secs(90))
@@ -1577,6 +1768,132 @@ pub fn run_live(
         ready_ns,
         stop_ns,
     }
+}
+
+/// While set, [`run_live`] samples the executor-unit threads of the run's
+/// processes into [`UNIT_THREAD_SAMPLES`] in the run directory.
+pub static SAMPLE_UNIT_THREADS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The file [`run_live`] writes unit-thread samples to, one line per change of
+/// a thread's state: `<real ns> <pid> <tid> <comm> <state> <wchan> <syscall>`,
+/// with `<syscall>` the first word of `/proc/<pid>/task/<tid>/syscall` and
+/// `-` for an unreadable file.
+pub const UNIT_THREAD_SAMPLES: &str = "unit_threads.samples";
+
+/// How often [`UnitThreadSampler`] reads each unit thread's state.
+const SAMPLE_PERIOD: Duration = Duration::from_micros(100);
+/// How often it looks for new processes under the run.
+const RESCAN_PERIOD: Duration = Duration::from_millis(20);
+/// How long it samples after the spawn.
+const SAMPLE_SPAN: Duration = Duration::from_secs(4);
+
+/// A thread sampling, on Linux, every `cerulion-unit-*` thread of every
+/// process under `root`: whenever a thread's (state, wchan, syscall) changes,
+/// one line goes to the samples file. It stops [`SAMPLE_SPAN`] after it starts
+/// or when dropped, and writes the file then.
+struct UnitThreadSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UnitThreadSampler {
+    fn start(root: u32, out: PathBuf) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || sample_unit_threads(root, &out, &flag));
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for UnitThreadSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Every process under `root`, `root` included, through
+/// `/proc/<pid>/task/<pid>/children`.
+fn descendants(root: u32) -> Vec<u32> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let pid = out[i];
+        let path = format!("/proc/{pid}/task/{pid}/children");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            out.extend(
+                text.split_whitespace()
+                    .filter_map(|w| w.parse::<u32>().ok()),
+            );
+        }
+        i += 1;
+    }
+    out
+}
+
+fn sample_unit_threads(root: u32, out: &Path, stop: &std::sync::atomic::AtomicBool) {
+    use std::fmt::Write as _;
+    let read = |p: String| std::fs::read_to_string(p).unwrap_or_default();
+    let begin = std::time::Instant::now();
+    let mut last_scan: Option<std::time::Instant> = None;
+    let mut threads: Vec<(u32, u32, String)> = Vec::new();
+    let mut last: BTreeMap<u32, String> = BTreeMap::new();
+    let mut lines = String::new();
+    while !stop.load(Ordering::Relaxed) && begin.elapsed() < SAMPLE_SPAN {
+        if last_scan.is_none_or(|t| t.elapsed() >= RESCAN_PERIOD) {
+            last_scan = Some(std::time::Instant::now());
+            threads.clear();
+            for pid in descendants(root) {
+                let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+                    continue;
+                };
+                for task in tasks.flatten() {
+                    let Some(tid) = task.file_name().to_str().and_then(|t| t.parse().ok()) else {
+                        continue;
+                    };
+                    let comm = read(format!("/proc/{pid}/task/{tid}/comm"))
+                        .trim()
+                        .to_string();
+                    if comm.starts_with("cerulion-unit") {
+                        threads.push((pid, tid, comm));
+                    }
+                }
+            }
+        }
+        for (pid, tid, comm) in &threads {
+            let stat = read(format!("/proc/{pid}/task/{tid}/stat"));
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .unwrap_or("-")
+                .to_string();
+            let wchan = read(format!("/proc/{pid}/task/{tid}/wchan"));
+            let wchan = if wchan.is_empty() {
+                "-".to_string()
+            } else {
+                wchan
+            };
+            let syscall = read(format!("/proc/{pid}/task/{tid}/syscall"));
+            let syscall = syscall.split_whitespace().next().unwrap_or("-").to_string();
+            let key = format!("{state} {wchan} {syscall}");
+            if last.get(tid) != Some(&key) {
+                let _ = writeln!(
+                    lines,
+                    "{} {pid} {tid} {comm} {key}",
+                    cerulion_core::real_ns()
+                );
+                last.insert(*tid, key);
+            }
+        }
+        std::thread::sleep(SAMPLE_PERIOD);
+    }
+    let _ = std::fs::write(out, lines);
 }
 
 /// Why a recording is not fit to judge: frames the recorder lost
@@ -1624,9 +1941,20 @@ fn recording_defect(bag: &Path) -> Option<String> {
 pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> RecordedRun {
     let mut last = String::new();
     for attempt in 0..RECORD_ATTEMPTS {
-        let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+        let dir = ScaffoldDir::new("ri_run");
         let (graph, prefix) = unique_names(fixture.name());
-        write_graph(ws, &fixture.graph_config(&graph, &prefix));
+        let mut config = fixture.graph_config(&graph, &prefix);
+        if placement == Placement::OneGroup {
+            let all: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
+            config.process_groups = [("g_all".to_string(), all)].into_iter().collect();
+            config.process_group_order = Vec::new();
+            // Without a profile the group would be one unit; each node opts
+            // into a unit of its own.
+            for node in &mut config.nodes {
+                node.isolate = Some(true);
+            }
+        }
+        write_graph(ws, &config);
         let reads = dir.path().join("live_reads");
         let recordings = dir.path().join("recordings");
         std::fs::create_dir_all(&reads).expect("RI_HARNESS: reads dir");
@@ -1729,10 +2057,25 @@ const USAGE_ERROR_MARKERS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub enum Replayed {
     /// The replay ran: its exit code and every read its nodes made.
-    Reads { exit: i32, log: ReadLog },
+    Reads {
+        exit: i32,
+        log: ReadLog,
+        artifacts: ReplayArtifacts,
+    },
     /// The replay refused the recording (exit 2), with its stderr: a refusal
     /// by name, which is a verdict about the recording, not a harness failure.
     Refused { stderr: String },
+}
+
+/// The files one replay leaves in its run's directory.
+#[derive(Clone, Debug)]
+pub struct ReplayArtifacts {
+    /// The replay's stderr.
+    pub stderr: PathBuf,
+    /// The `--report` JSON (verify legs).
+    pub report: Option<PathBuf>,
+    /// The `--record-out` re-recording (verify legs).
+    pub record_out: Option<PathBuf>,
 }
 
 /// A judgement of one replay.
@@ -1781,7 +2124,7 @@ pub fn judge_replayed(
         Replayed::Refused { stderr } => Ok(Outcome::Refused {
             stderr: stderr.clone(),
         }),
-        Replayed::Reads { exit, log } => Ok(Outcome::Judged {
+        Replayed::Reads { exit, log, .. } => Ok(Outcome::Judged {
             exit: *exit,
             verdict: judge(fixture, live, log, floors)?,
         }),
@@ -1804,11 +2147,23 @@ pub fn resim(
     let reads = run.dir.path().join(format!("{}_reads_{n}", mode.label()));
     std::fs::create_dir_all(&reads).expect("RI_HARNESS: replay reads dir");
     let home = run.dir.path().join("cerhome");
+    let (report, record_out) = if mode == ReplayMode::ResimVerify {
+        (
+            Some(reads.with_extension("report.json")),
+            Some(reads.with_extension("mcap")),
+        )
+    } else {
+        (None, None)
+    };
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
-    cmd.args(["bag", "play"])
-        .arg(&run.bag)
-        .args(mode.args())
-        .current_dir(&ws.root)
+    cmd.args(["bag", "play"]).arg(&run.bag).args(mode.args());
+    if let Some(path) = &report {
+        cmd.arg("--report").arg(path);
+    }
+    if let Some(path) = &record_out {
+        cmd.arg("--record-out").arg(path);
+    }
+    cmd.current_dir(&ws.root)
         // The replayed nodes load their cdylibs from this target directory.
         .env("CARGO_TARGET_DIR", &ws.target_dir)
         .env("CERULION_NETWORK", "off")
@@ -1855,11 +2210,318 @@ pub fn resim(
         Some(c) if mode.judged_exits().contains(&c) => Replayed::Reads {
             exit: c,
             log: ReadLog::collect(&reads).unwrap_or_else(|e| panic!("RI_HARNESS: {e}")),
+            artifacts: ReplayArtifacts {
+                stderr: stderr_path.clone(),
+                report,
+                record_out,
+            },
         },
         _ => panic!(
             "RI_HARNESS: `bag play` ({}) of {} exited {code:?}, outside its contract\nstderr:\n{stderr}",
             mode.label(),
             run.bag.display()
         ),
+    }
+}
+
+// ===========================================================================
+// Divergence evidence.
+// ===========================================================================
+
+/// How many reads either side of a stream's first difference the evidence
+/// prints.
+pub const EVIDENCE_SPAN: usize = 6;
+
+/// One kind-6 record of a bag's read log, decoded.
+struct EvidenceRecord {
+    step: u64,
+    kind: u16,
+    served: u64,
+    popped: u32,
+    run: u32,
+    role: cerulion_core::read_outcome::ReadSiteRole,
+}
+
+/// A bag's per-rank node tables: `rank -> node ids` from its trace manifests.
+fn bag_node_tables(reader: &cerulion_bag::BagReader) -> BTreeMap<u32, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for rank in 0..64u32 {
+        let Ok(Some(att)) =
+            reader.attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
+        else {
+            continue;
+        };
+        let ids = serde_json::from_slice::<serde_json::Value>(&att.data)
+            .ok()
+            .and_then(|v| {
+                v.get("node_ids").and_then(|ids| {
+                    ids.as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                })
+            })
+            .unwrap_or_default();
+        out.insert(rank, ids);
+    }
+    out
+}
+
+/// The input index of `input` on `node`, from the bag's trace manifests.
+fn bag_input_index(reader: &cerulion_bag::BagReader, node: &str, input: &str) -> Option<u16> {
+    for rank in 0..64u32 {
+        let Ok(Some(att)) =
+            reader.attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
+        else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&att.data) else {
+            continue;
+        };
+        if let Some(list) = v
+            .get("inputs")
+            .and_then(|i| i.get(node))
+            .and_then(|l| l.as_array())
+        {
+            return list
+                .iter()
+                .position(|n| n.as_str() == Some(input))
+                .and_then(|p| u16::try_from(p).ok());
+        }
+    }
+    None
+}
+
+/// The rank a trace record was written by: its `reserved` word without the
+/// discard bit.
+fn record_rank(r: &cerulion_core::trace_ring::TraceRingRecord) -> u32 {
+    r.reserved & !cerulion_core::trace_ring::TRACE_DISCARD_BIT
+}
+
+/// What [`bag_evidence`] found in one bag.
+struct BagEvidence {
+    records: Vec<EvidenceRecord>,
+    fires: BTreeMap<u64, usize>,
+    /// Trace records scanned, and the ranks and node tables seen, so a lookup
+    /// that matched nothing says so instead of printing zeros.
+    scanned: usize,
+    ranks: std::collections::BTreeSet<u32>,
+    tables: BTreeMap<u32, Vec<String>>,
+}
+
+/// `node`'s read-log records on `input` and its fires per step, in file order.
+///
+/// A record's node is its rank's table entry at its `node_idx`; a record whose
+/// rank has no table is matched against every table that holds `node` at that
+/// index (a re-recording may write one table for every rank).
+fn bag_evidence(bag: &Path, node: &str, input: &str) -> Result<BagEvidence, String> {
+    use cerulion_core::trace_ring::{
+        read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
+        unpack_read_outcome_run, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME,
+    };
+    let reader = cerulion_bag::BagReader::open(bag).map_err(|e| format!("open {bag:?}: {e}"))?;
+    let tables = bag_node_tables(&reader);
+    let input_idx = bag_input_index(&reader, node, input);
+    let is_node = |r: &cerulion_core::trace_ring::TraceRingRecord| match tables.get(&record_rank(r))
+    {
+        Some(t) => t.get(r.node_idx as usize).map(String::as_str) == Some(node),
+        None => tables
+            .values()
+            .any(|t| t.get(r.node_idx as usize).map(String::as_str) == Some(node)),
+    };
+    let mut records = Vec::new();
+    let mut fires: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut scanned = 0usize;
+    let mut ranks = std::collections::BTreeSet::new();
+    let iter = reader
+        .trace_records()
+        .map_err(|e| format!("trace of {bag:?}: {e}"))?;
+    for item in iter {
+        let r = item.map_err(|e| format!("trace record of {bag:?}: {e}"))?;
+        scanned += 1;
+        ranks.insert(record_rank(&r));
+        if !is_node(&r) {
+            continue;
+        }
+        if r.record_type == RECORD_TYPE_FIRE {
+            *fires.entry(r.step).or_default() += 1;
+        } else if r.record_type == RECORD_TYPE_READ_OUTCOME {
+            let (idx, kind) = unpack_read_outcome_meta(r.global_level);
+            if input_idx.is_some_and(|i| i != idx) {
+                continue;
+            }
+            let annotation = kind == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+            records.push(EvidenceRecord {
+                step: r.step,
+                kind,
+                served: r.fire_time_ns,
+                popped: if annotation {
+                    0
+                } else {
+                    unpack_read_outcome_popped(r.duration_ns)
+                },
+                run: if annotation {
+                    1
+                } else {
+                    unpack_read_outcome_run(r.duration_ns).max(1)
+                },
+                role: read_site_role(r.global_level),
+            });
+        }
+    }
+    Ok(BagEvidence {
+        records,
+        fires,
+        scanned,
+        ranks,
+        tables,
+    })
+}
+
+/// Print, for every stream of `verdict` that is not equal, what a box log needs
+/// to explain it: the replay's violations and trace divergence (from its
+/// `--report` and stderr), the recorded read-log records around the first
+/// difference, and the live and replayed fire counts per step over the same
+/// window. Every line starts `RI_EVIDENCE`.
+pub fn print_divergence_evidence(run: &RecordedRun, replayed: &Replayed, verdict: &Verdict) {
+    let Replayed::Reads {
+        exit, artifacts, ..
+    } = replayed
+    else {
+        return;
+    };
+    let divergent = verdict.divergent();
+    if divergent.is_empty() && *exit != 6 {
+        return;
+    }
+    eprintln!("RI_EVIDENCE exit={exit}");
+    let stderr = mp_support::read_file(&artifacts.stderr);
+    for line in stderr
+        .lines()
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("violation")
+                || l.contains("diverg")
+                || l.contains("feed")
+                || l.contains("shortfall")
+                || l.contains("never_arrived")
+                || l.contains("error")
+        })
+        .take(60)
+    {
+        eprintln!("RI_EVIDENCE stderr: {line}");
+    }
+    if let Some(report) = &artifacts.report {
+        match std::fs::read(report)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        {
+            Some(serde_json::Value::Object(map)) => {
+                for (key, value) in &map {
+                    let k = key.to_ascii_lowercase();
+                    if k.contains("violation")
+                        || k.contains("diverg")
+                        || k.contains("read_identity")
+                        || k.contains("read_log")
+                        || k == "passed"
+                    {
+                        let text = value.to_string();
+                        let cut: String = text.chars().take(4000).collect();
+                        eprintln!("RI_EVIDENCE report {key}: {cut}");
+                    }
+                }
+            }
+            _ => eprintln!("RI_EVIDENCE report: absent or unreadable at {report:?}"),
+        }
+    }
+    for row in divergent {
+        let first = match &row.verdict {
+            RowVerdict::Diverged { index, .. } => *index,
+            _ => row.compared,
+        };
+        let (records, live_fires) = match bag_evidence(&run.bag, &row.node, &row.input) {
+            Ok(v) => (v.records, v.fires),
+            Err(e) => {
+                eprintln!("RI_EVIDENCE recorded read log unreadable: {e}");
+                continue;
+            }
+        };
+        // Serving occurrences (a folded record counts its run) index the
+        // live reads; the window holds every record between the serving reads
+        // first - SPAN and first + SPAN, annotations and markers included.
+        let lo = first.saturating_sub(EVIDENCE_SPAN);
+        let hi = first + EVIDENCE_SPAN;
+        let mut serving = 0usize;
+        let mut window_steps: Vec<u64> = Vec::new();
+        eprintln!(
+            "RI_EVIDENCE node={} input={} first_diff={first} recorded records (serving index, step, kind, served, popped, role, run):",
+            row.node, row.input
+        );
+        for r in &records {
+            let serves = r.kind != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+                && r.kind != cerulion_core::trace_ring::READ_OUTCOME_TRUNCATED
+                && r.served != cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME
+                && r.popped > 0;
+            let start = serving;
+            if serves {
+                serving += r.run as usize;
+            }
+            if serving >= lo && start <= hi {
+                window_steps.push(r.step);
+                eprintln!(
+                    "RI_EVIDENCE   [{start}] step={} kind={} served={} popped={} role={:?} run={}",
+                    r.step,
+                    r.kind,
+                    if r.served == cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME {
+                        "none".to_string()
+                    } else {
+                        r.served.to_string()
+                    },
+                    r.popped,
+                    r.role,
+                    r.run
+                );
+            }
+            if start > hi {
+                break;
+            }
+        }
+        let (Some(first_step), Some(last_step)) = (
+            window_steps.iter().min().copied(),
+            window_steps.iter().max().copied(),
+        ) else {
+            continue;
+        };
+        let replayed = artifacts
+            .record_out
+            .as_ref()
+            .map(|p| (p, bag_evidence(p, &row.node, &row.input)));
+        let replayed_fires = match &replayed {
+            Some((_, Ok(v))) => {
+                let total: usize = v.fires.values().sum();
+                eprintln!(
+                    "RI_EVIDENCE re-recording: {} trace record(s) scanned, ranks {:?}, node tables {:?}, \
+                     {total} fire(s) of {} matched",
+                    v.scanned, v.ranks, v.tables, row.node
+                );
+                Some(v.fires.clone())
+            }
+            Some((p, Err(e))) => {
+                eprintln!("RI_EVIDENCE re-recording {p:?} unreadable: {e}");
+                None
+            }
+            None => None,
+        };
+        for step in first_step..=last_step {
+            eprintln!(
+                "RI_EVIDENCE   fires step={step} live={} replayed={}",
+                live_fires.get(&step).copied().unwrap_or(0),
+                replayed_fires.as_ref().map_or_else(
+                    || "unrecorded".to_string(),
+                    |f| f.get(&step).copied().unwrap_or(0).to_string()
+                )
+            );
+        }
     }
 }

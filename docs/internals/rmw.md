@@ -529,15 +529,17 @@ inside one slice. Busy waiting of any kind, the park and a long spin alike, also
 flat penalty against a kernel-sleeping waiter at message periods from 5 ms to 40 ms and
 none at 2 ms: a scheduler and CPU-topology effect around the peer's wake, not a frequency
 one (a full-P-state spin reads the same). `park_policy()` is therefore a platform table:
-aarch64 `WFE` → `ThroughRung` (park every block, yielding per slice); x86 (`UMWAIT` or
-none) and off-Linux → `NoPark` (the `ppoll` tier), because the bounded park does not pay
-for itself on x86 at either period while it does on aarch64. The shared
+aarch64 `WFE` → `FirstRungOnce` (park the first block of a call, then
+the fd block); x86 (`UMWAIT` or none) and off-Linux → `NoPark` (the `ppoll` tier). The
+aarch64 park-on rows were measured under `ThroughRung` (park every block), which held one
+core per idle subscriber. The shared
 `CERULION_MONITOR_WAIT` flag resolves over that default (`resolve_park`): unset = default,
 `0` = off, `1` = force on (on a no-park Linux target the bounded one-rung `FirstRungOnce`
 shape). The Linux park pins run under that forced shape. The native
 `monitor_wait_block` slices on the same shared `PARK_RECHECK` bound and yields after every
-completed slice (counted in `park_yields`); its park horizon follows the live loop's own
-deadline rather than this table.
+hardware slice (counted in `park_core_yields`; a slice that slept ends with no yield, and
+completed slices of every tier are counted in `park_slices`); its park horizon follows the
+live loop's own deadline rather than this table.
 
 **Fired-only drain/probe.** A stock rclcpp executor's set is 1 subscription + 6
 parameter services + 2 guards; a loop that drains every listener and probes every
@@ -1090,6 +1092,34 @@ with rmw-specific additions:
   not a clamp and stays quiet). `rmw_{publisher,subscription}_get_actual_qos` returns a
   constant profile and does NOT inspect the endpoint, so it does not reflect the
   provisioned depth. Late-joiner delivery itself rides the `rmw_wait` event pump.
+- **Durability.** A publisher's own history request follows its durability:
+  TRANSIENT_LOCAL asks for its depth clamped to `[1, limit]` (KEEP_ALL asks for the
+  limit itself, whatever its depth), where the limit is the type's
+  `ros_topic_history_depth` (16, or 12 above the 16 MiB slice tier), and VOLATILE asks
+  for none (its retained ring is still sized from the service). A subscription asks for
+  retained messages by its durability when it opens (the core clamps the request to the
+  service history and its port buffer): VOLATILE 0, TRANSIENT_LOCAL its depth clamped to
+  `[1, limit]`, or the limit when it is KEEP_ALL (`transient_local_history`).
+  BEST_AVAILABLE is resolved once, at create, by the pure `resolve_publisher_durability`
+  and `resolve_subscription_durability` in `src/api/pubsub.rs`: a publisher takes
+  TRANSIENT_LOCAL; a subscription takes TRANSIENT_LOCAL when at least one publisher is
+  live on the topic and every one carries the retaining mark, and VOLATILE otherwise,
+  including when there is none. This matches `rmw_dds_common` on Jazzy and later; Iron
+  resolves the zero-publisher case to TRANSIENT_LOCAL. The flags come from
+  `TransportManager::topic_publisher_retain_marks`, one per publisher in the service's
+  iceoryx2 dynamic config, so publishers in other processes count; `cerulion_core` names
+  every data publisher whose own history request is above 0 `cerulion.retains`
+  (`RETAINING_PUBLISHER_NAME`), so a native publisher that declares history counts as
+  retaining, and a publisher that asks for none does not: a DDS bridge or network
+  ingress publisher, or a destroyed VOLATILE publisher whose destroy leaked a borrowed
+  slot (its port stays registered until its process exits). A probe that cannot read the
+  service resolves VOLATILE and warns with the reason. A publisher that opens after the
+  subscription does not change its resolution. A publisher from a build without the mark
+  counts as one that retains nothing. Endpoint info reports the REQUESTED durability,
+  BEST_AVAILABLE included. The Foxy, Galactic and Humble headers declare no
+  BEST_AVAILABLE; the constant sits behind
+  `cfg(cerulion_has_durability_best_available)`, and the resolvers return every value
+  unchanged there.
 - **Endpoint info by topic.** `rmw_get_{publishers,subscriptions}_info_by_topic` serves
   the process-LOCAL registry (the rviz2 / `ros2 topic info -v` surface); cross-process
   endpoint discovery is not implemented. Out-arrays are filled through the
@@ -1260,7 +1290,7 @@ table stays at 112 (`rmw_absent_export_table_test`).
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
 | `tests/rmw_e2e_test.rs` | Full rmw C ABI over iceoryx2: pub/sub + wait, loaned zero-copy BOTH directions (publish-side borrow + the loaned take: hold-across-publish, exact borrow-budget 4/5 boundary, destroy-with-outstanding-loan, variable-type UNSUPPORTED control), services, guard conditions, variable messages, TRANSIENT_LOCAL late-joiner pump (+ VOLATILE negative control) | yes; `#[serial]` + `--test-threads=1` (SHM singleton, global guard registry) | none |
-| `tests/rmw_wait_event_test.rs` | The event-driven `rmw_wait`: blocked-wait publish wake + take oracle with cumulative `fd_wakes` (a sleep-poll variant scores 0), exact multi-subscription ready set, THE guard-doorbell re-fire pin (second wait: full timeout + `fd_wakes` delta exactly 0; skip any drain and the residual ring byte fires the block instantly), zero-timeout never blocks (`fd_blocks == 0` × 100), services/clients wake via their own listeners (per-side cumulative `fd_wakes`), TRANSIENT_LOCAL delivery while the only waiter is PARKED (the ≤20 ms block-cap pin), the `CERULION_RMW_EVENT_WAIT=off` kill-switch (`fd_blocks == 0` AND `spin_probes == 0`), no-entity bounded sleep, the spin front catching an imminent publish (cumulative `spin_wakes`/`spin_probes`), and the DEGRADED arm: a sticky listener-drain fault (`fault_inject_drain_events_err_for_test`) with a readable-but-not-ready fd must time out by sleep pacing with `fd_blocks == 0` / `fd_wakes == 0` / `degraded_waits` counted, then heal on the next call, plus the park-tier counter oracle (`assert_park_tier_engaged`: a call's FIRST block parks while a bell is mapped, and only `ThroughRung` keeps the allowance for the rest of the call, so the bound sits on `park_blocks`, not on `fd_blocks`) and the bell-page rendezvous (a topic with NO publisher is still mapped on the wait set's first call, because the consumer's `open_unowned` creates the page) | yes; `#[serial]` + `--test-threads=1` (SHM singleton; env knobs) | none |
+| `tests/rmw_wait_event_test.rs` | The event-driven `rmw_wait`: blocked-wait publish wake + take oracle with cumulative `fd_wakes` (a sleep-poll variant scores 0), exact multi-subscription ready set, THE guard-doorbell re-fire pin (second wait: full timeout + `fd_wakes` delta exactly 0; skip any drain and the residual ring byte fires the block instantly), zero-timeout never blocks (`fd_blocks == 0` × 100), services/clients wake via their own listeners (per-side cumulative `fd_wakes`), TRANSIENT_LOCAL delivery while the only waiter is PARKED (the ≤20 ms block-cap pin), the `CERULION_RMW_EVENT_WAIT=off` kill-switch (`fd_blocks == 0` AND `spin_probes == 0`), no-entity bounded sleep, the spin front catching an imminent publish (cumulative `spin_wakes`/`spin_probes`), and the DEGRADED arm: a sticky listener-drain fault (`fault_inject_drain_events_err_for_test`) with a readable-but-not-ready fd must time out by sleep pacing with `fd_blocks == 0` / `fd_wakes == 0` / `degraded_waits` counted, then heal on the next call, plus the park-tier counter oracle (`assert_park_tier_engaged`: a call's FIRST block parks while a bell is mapped, and every later block of the call takes the fd tier, so the bound sits on `park_blocks`, not on `fd_blocks`) and the bell-page rendezvous (a topic with NO publisher is still mapped on the wait set's first call, because the consumer's `open_unowned` creates the page) | yes; `#[serial]` + `--test-threads=1` (SHM singleton; env knobs) | none |
 | `tests/bridge_test.rs` | C introspection codec: hand-built rosidl fixtures, native-reader interop, padding determinism, hostile-count rejection, complex roundtrips | no | none |
 | `tests/cpp_bridge_test.rs` | C++ codec + shim: real `std::string`, bit-packed `vector<bool>`, resize spy, over-bound UB guard, padding poison, corrupt-size caps, cpp↔native byte identity; the registration census for a `bool[]` this build cannot write, at the top level, inside a nested message, through a nested message array and at the bottom of a chain whose depth comes from a constant, with both boundary twins (the `assign` accessor present, and a fixed `bool[N]`, which needs none) recording nothing and decoding | no (its `#[serial]` arms self-serialize) | none |
 | `tests/rosidl_buffer_downgrade_test.rs` | Lyrical and Rolling `rosidl::Buffer<uint8_t>`, built by the shim (a CPU Buffer and one on a fixture non-CPU backend, read through the accessors rosidl generates, which throw off the CPU): a non-CPU Buffer publishes the bytes a CPU Buffer or a plain sequence would, copied to host memory by the write pass only (the size pass measures a nested Buffer with zeros, never a copy), on both bridges and inside nested C and C++ messages; a backend whose `size()` disagrees with its host copy refuses the frame; `rmw_serialize` downgrades and counts under `<rmw_serialize>`; a take into a non-CPU C++ Buffer leaves a CPU Buffer holding the frame; on C, an owned Buffer is filled in place and a borrowed one is detached and left untouched; a backend that throws on the host copy, or a null Buffer, refuses the frame and counts nothing; through the C ABI, `acceptable_buffer_backends` accepts `NULL`, `""`, `cpu`, `any` and a backend the rmw lacks (a `cuda` subscription receives a device frame as CPU bytes), refuses only a malformed list with the reason on rcl's error channel, a refused create leaves the topic free for a CPU subscription, and three published device Buffers arrive with matching bytes (the first taken into an owned device Buffer, which ends on the CPU backend) and a per-topic count of 3 | yes; `#[serial]` + `--test-threads=1` (process-wide counter, SHM singleton) | none; compiled only where the bindings carry `is_rosidl_buffer` |
@@ -1268,6 +1298,7 @@ table stays at 112 (`rmw_absent_export_table_test`).
 | `tests/canonical_element_body_test.rs` | Variable-element bodies match the canonical framing: rmw encodes, independent `FrameWalker` decodes, vs hand-built byte oracles | no | none |
 | `tests/rmw_endpoint_info_test.rs` | Endpoint info by topic: field round-trips, gid cross-check, QoS (three axes echoed, depth reported as PROVISIONED), null-arg guards, OOM rollback (countdown allocator + pointer ledger), remove-by-gid exactness | yes | none |
 | `tests/rmw_transient_local_ceiling_test.rs` | Ceiling raise + provisioned-depth reporting (clamp, VOLATILE-0, deeper-service read-back) + create-time clamp warn + pump delivery + positive warn control | yes; own binary (`#[traced_test]`) | none |
+| `tests/rmw_topic_open_order_test.rs` | Open order among rmw endpoints: a subscription, a depth-1 publisher or a VOLATILE publisher opens a topic first and a depth-16 TRANSIENT_LOCAL publisher still opens it. Late joiners by durability against hand-written message lists: VOLATILE takes none, TRANSIENT_LOCAL up to its depth and the limit, a large variable type (history limit 12) opened by a subscription reports depth 12 and delivers exactly the newest 12. KEEP_ALL, beside KEEP_LAST controls: a TRANSIENT_LOCAL KEEP_ALL depth-0 subscription takes the newest 16 of 20, and a KEEP_ALL depth-0 publisher reports the limit of 16. BEST_AVAILABLE (Iron and later headers): every publisher retaining gives the backlog, a VOLATILE publisher on the topic gives none beside a TRANSIENT_LOCAL control that takes both rings, a BEST_AVAILABLE publisher retains and reports its depth, a second run takes the same messages, and two arms put the publisher in a self-re-executed child process (`subprocess_child_publishes_then_waits`, driven over stdin and stdout), read its retain mark from this process while it lives and none after it exits, and open a TRANSIENT_LOCAL control subscription that takes the child's ring beside the VOLATILE zero. Native subscribers take no backlog from a VOLATILE rmw publisher, and a natively created topic keeps its declared history | yes; `#[serial]` + `--test-threads=1` (SHM singleton; the child shares the default iceoryx2 root) | none |
 | `tests/rmw_schema_mismatch_test.rs` | Take-side hash-mismatch flood latch at `rmw_take`; latch separateness; decode-latch decade re-announcement; a `bool[]` member this build's C++ typesupport cannot write refuses the frame before any write, with the WHOLE `reason=` value (the member and why) as the oracle, the caller's message byte-identical to its poison, and the refusal latched to one loud line; the same for a `bool[]` inside a NESTED message, named by its path, on the copying take, on the loaned take (whose shadow goes back to the pool unused, so no loan refusal follows), on a service request take driven by a real client on the C typesupport, and in `rmw_deserialize` | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_publish_reject_test.rs` | `rmw_publish_serialized_message` e2e: both reject latches, sequence re-stamp read off the WIRE header through a raw subscriber (the `rmw_message_info_t` field exists only from Humble, so an info-only assertion passes vacuously before it), unfilled-message reject, field-key pins | yes; own binary (every test `#[traced_test]`) | none |
 | `tests/forged_take_bridge_test.rs` | Forged loaned take, bridge half: the eligibility oracle (string + unbounded sequence IS take-loanable; string-only, bounded, `bool`, defaulted and no-`init`/`fini` types are not), the forge aiming into a hand-built frame with `capacity == size`, un-forge to `{NULL, 0, 0}` / the null triplet, `fini` exactly once, misaligned / ragged targets refused all-or-nothing, the data-floor placement (an entry AT the floor forged; one BELOW it (in the fixed section, in the table) copied, counted, outside the mask, freed by `fini`, on both bridges), determinism | no (the counter-reading arms are `#[serial]` within the binary) | none |

@@ -207,9 +207,10 @@ zenoh = { version = "1.10.1", default-features = false, features = [
     "transport_tls",
     "unstable",
 ] }
-# Reads a `quic/` listener's certificate at session open to refuse a CA:TRUE
-# certificate, which webpki rejects as an end entity at handshake time
-# (`apply_tls` in transport/network.rs). The version zenoh-link-commons already uses.
+# Reads a `quic/` or `tls/` listener's certificate at session open and at
+# `cerulion-netd` start-up to refuse a CA:TRUE certificate, which webpki
+# rejects as an end entity at handshake time (`check_tls_files` in
+# transport/carrier.rs). The version zenoh-link-commons already uses.
 x509-parser = "0.18"
 # Team certificate profile and names (`transport/team_auth.rs`): a team session
 # checks its leaf and issuing CA certificates with the same code that issues them.
@@ -276,14 +277,16 @@ debug-logging = ["tracing/max_level_trace"]
 # Enabled automatically for integration tests via the dev-dependencies self
 # reference below (Part B).
 test-helpers = ["dep:ed25519-dalek", "dep:sha2"]
-# Oracle mutants: each `crate::oracle_mutant::active(name)` site breaks one
-# rule while `CERULION_ORACLE_MUTANT=<name>` is set. Off by default and in every
-# release build; mutant runs build with it to prove their oracle catches the
-# break.
-oracle-mutants = []
 # Uses process-local transport for single-process apps. Do not enable in the CLI
 # or daemons, which may need cross-process shared memory.
 local-transport = []
+# Oracle MUTANT seams, compiled only with this feature and never in a release
+# build; the engine's `oracle-mutants` feature turns it on. The read-identity
+# mutant (`replay_feed::mutants`) is a runtime that stages writer runs on
+# multi-writer edges, `CERULION_UNIT_BUDGET_MUTANT` makes executor-unit
+# derivation ignore the tick budget, and each `crate::oracle_mutant::active(name)`
+# site breaks one rule while `CERULION_ORACLE_MUTANT=<name>` is set.
+oracle-mutants = []
 
 [dev-dependencies]
 # The internal dev-deps below are INTENTIONALLY path-only (no

@@ -6,7 +6,8 @@
 # demand probe prints and decides whether it matches what a posture must do.
 # Every report below is written by hand in the probe's line shape. The first
 # case has the counts CI's emulator run printed for the paired app; the open
-# and schema mismatch lines use the counts a manual open run gave. Every ack in
+# and schema mismatch lines use the counts a manual open run gave, and the
+# connect line takes the open counts with the app as the dialer. Every ack in
 # them names the app's robot identity, `android-app`. Each case states
 # the exit status and the exact stdout, or a fragment of it, that the verdict
 # must give. One case per behaviour; the first failing assertion prints one
@@ -16,7 +17,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=42
+CASES_EXPECTED=51
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 verdict="$script_dir/android_e2e_probe_verdict.sh"
@@ -64,7 +65,7 @@ app=android-app
 report() {
     local passes=5 enabled=0 refused=5 wire_header=0 mismatch=0 decode=0 reinject=0
     local lan_refused=0 wire=0 frames=0
-    local schema=std_msgs/String peers=$app overflow=0 overlong=0
+    local schema=std_msgs/String peers=$app overflow=0 overlong=0 dialer=probe
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -82,11 +83,12 @@ report() {
             wire_frames=*) wire=${arg#*=} ;;
             frames=*) frames=${arg#*=} ;;
             schema=*) schema=${arg#*=} ;;
+            dialer=*) dialer=${arg#*=} ;;
             *) printf 'report: unknown field %s\n' "$arg" >&2; exit 1 ;;
         esac
     done
-    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s ack_peer_overflow=%s ack_peer_overlong=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
-        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$overflow" "$overlong" \
+    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 dialer=%s passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s ack_peer_overflow=%s ack_peer_overlong=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+        "$schema" "$dialer" "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$overflow" "$overlong" \
         "$mismatch" "$decode" \
         "$reinject" "$lan_refused" "$wire" "$frames"
 }
@@ -96,6 +98,7 @@ log_line='2026-10-20T10:00:00.000000Z  WARN cerulion_core::transport::network: d
 
 paired_ok=$(report)
 open_ok=$(report enabled_acks=4 refused_acks=0 wire_frames=20 frames=20)
+connect_ok=$(report dialer=app enabled_acks=4 refused_acks=0 wire_frames=20 frames=20)
 mismatch_ok=$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 \
     schema_mismatch_drops=20 wire_frames=20 frames=0)
 
@@ -103,7 +106,7 @@ mismatch_ok=$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 \
 run_case paired_every_demand_refused paired "$app" "$log_line
 $paired_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0'
+expect_exact 'dialer=probe passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0'
 
 run_case paired_one_grant paired "$app" "$(report enabled_acks=1 refused_acks=4)"
 expect_status 1
@@ -154,7 +157,7 @@ expect_output 'ack(s) came from android-app,host-box, not only from the app andr
 # --- open --------------------------------------------------------------------
 run_case open_granted_and_delivered open "$app" "$open_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=20'
+expect_exact 'dialer=probe passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=20'
 
 # The refused ack is the same bytes for every refusal reason, so an open app
 # that refuses even one demand makes a paired refusal prove nothing.
@@ -189,7 +192,7 @@ expect_output 'frames=3 is more than wire_frames=2'
 # --- schema mismatch -----------------------------------------------------------
 run_case mismatch_every_frame_dropped schema-mismatch "$app" "$mismatch_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=20 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=0'
+expect_exact 'dialer=probe passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=20 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=0'
 
 run_case mismatch_frame_delivered schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20 frames=3)"
 expect_status 1
@@ -215,6 +218,47 @@ expect_output 'the ingress dropped 2 frame(s) on local re-injection'
 run_case mismatch_no_drop schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0)"
 expect_status 1
 expect_output 'no frame was dropped on the schema'
+
+# --- connect -------------------------------------------------------------------
+# The app dialed the probe, which listened and dialed nothing: an open app
+# serves the demand over the link it opened.
+run_case connect_granted_and_delivered connect "$app" "$connect_ok"
+expect_status 0
+expect_exact 'dialer=app passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=20'
+
+# A probe that dialed the app proves nothing about the app dialing.
+run_case connect_probe_dialed connect "$app" "$open_ok"
+expect_status 1
+expect_output 'dialer=probe, but the connect case needs the app to dial the probe'
+
+# The paired, open and schema mismatch cases read the app the probe dialed.
+run_case open_app_dialed open "$app" "$connect_ok"
+expect_status 1
+expect_output 'dialer=app, but the open case needs the probe to dial the app'
+
+run_case connect_one_refusal connect "$app" "$(report dialer=app enabled_acks=4 refused_acks=1 wire_frames=20 frames=20)"
+expect_status 1
+expect_output 'an open app refused 1 demand(s)'
+
+run_case connect_granted_no_frame connect "$app" "$(report dialer=app enabled_acks=4 refused_acks=0)"
+expect_status 1
+expect_output 'an open app delivered no frame'
+
+run_case connect_never_granted connect "$app" "$(report dialer=app refused_acks=0 ack_peers=)"
+expect_status 1
+expect_output 'an open app granted no demand'
+
+run_case connect_schema_drops connect "$app" "$(report dialer=app enabled_acks=4 refused_acks=0 schema_mismatch_drops=1 wire_frames=21 frames=20)"
+expect_status 1
+expect_output 'dropped 1 frame(s) on the schema'
+
+run_case dialer_missing paired "$app" "${paired_ok/ dialer=probe/}"
+expect_status 1
+expect_output "field 'dialer' is missing"
+
+run_case dialer_unknown paired "$app" "${paired_ok/dialer=probe/dialer=desk}"
+expect_status 1
+expect_output "field 'dialer' is not probe or app: desk"
 
 # --- the report itself -------------------------------------------------------
 run_case no_report paired "$app" "$log_line"
@@ -272,7 +316,7 @@ expect_output 'the demander ran no pass'
 # --- usage -------------------------------------------------------------------
 run_case unknown_expectation granted "$app" "$paired_ok"
 expect_status 2
-expect_output 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch <app-identity> <probe-output>'
+expect_output 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch|connect <app-identity> <probe-output>'
 
 run_case missing_output paired "$app"
 expect_status 2
