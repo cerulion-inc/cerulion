@@ -896,11 +896,18 @@ mod unix_client {
     /// spawned daemon folds them into its network config at boot. They apply ONLY
     /// to a daemon this call starts — a daemon already running is never respawned,
     /// so its locators are unchanged (the verb says so).
+    ///
+    /// `network_off` is `CERULION_NETWORK` in this process, under the CLI's
+    /// parse: when set, the daemon starts with `CERULION_NETWORK=off`, so its
+    /// telemetry sends nothing under the switch whatever the caller's
+    /// environment spelled. Like the locators, it reaches only a daemon this
+    /// call starts.
     pub fn spawn_vizd_detached(
         binary: &Path,
         log_path: &Path,
         connect: &[String],
         listen: &[String],
+        network_off: bool,
     ) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
         // The log's directory goes through the one socket-directory rule (a
@@ -945,6 +952,9 @@ mod unix_client {
         }
         if !listen.is_empty() {
             cmd.env(VIZD_LISTEN_ENV, listen.join(","));
+        }
+        if network_off {
+            cmd.env(crate::graph_cmd::NETWORK_ENV, "off");
         }
         // SAFETY: `setsid(2)` is async-signal-safe (the only `pre_exec` requirement
         // between fork and exec); the forked child is never a process-group leader,
@@ -1557,7 +1567,7 @@ mod tests {
         let socket = dir.join("vizd.sock");
         let log = vizd_log_path(&socket);
         assert_eq!(log, dir.join("vizd.log"), "log colocated with the socket");
-        spawn_vizd_detached(&script, &log, &[], &[]).expect("spawn the fake daemon");
+        spawn_vizd_detached(&script, &log, &[], &[], false).expect("spawn the fake daemon");
 
         // The marker appears in the log within a bound (the child writes + exits).
         // A regression to stderr→/dev/null leaves the file empty → this fails.
@@ -1610,7 +1620,7 @@ mod tests {
             std::fs::create_dir(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(before)).unwrap();
             let log = vizd_log_path(&dir.join("vizd.sock"));
-            spawn_vizd_detached(&script, &log, &[], &[]).expect("spawn");
+            spawn_vizd_detached(&script, &log, &[], &[], false).expect("spawn");
             (mode(&dir), mode(&log))
         };
         assert_eq!(run("a", 0o775), (0o755, 0o600));
@@ -1626,7 +1636,7 @@ mod tests {
         let victim = base.join("victim");
         std::fs::write(&victim, "keep").unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("vizd.log")).unwrap();
-        spawn_vizd_detached(&script, &dir.join("vizd.log"), &[], &[]).expect("still spawns");
+        spawn_vizd_detached(&script, &dir.join("vizd.log"), &[], &[], false).expect("still spawns");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
 
         // Error arm: a symlinked directory is refused and its target left alone.
@@ -1635,7 +1645,8 @@ mod tests {
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        spawn_vizd_detached(&script, &link.join("vizd.log"), &[], &[]).expect("still spawns");
+        spawn_vizd_detached(&script, &link.join("vizd.log"), &[], &[], false)
+            .expect("still spawns");
         assert_eq!(mode(&real), 0o777, "not re-moded through the link");
         assert!(
             !real.join("vizd.log").exists(),
@@ -1644,6 +1655,54 @@ mod tests {
 
         // Make every directory removable again before cleanup.
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_vizd_detached_passes_the_switch_on_to_the_daemon() {
+        // Under the switch the daemon starts with `CERULION_NETWORK=off`, so its
+        // telemetry sends nothing; without it the variable is inherited as is.
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("cer_vizc_switch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inherited = std::env::var("CERULION_NETWORK").unwrap_or_default();
+        for (network_off, expected) in [(true, "off".to_string()), (false, inherited)] {
+            let out = dir.join(format!("network-{network_off}.out"));
+            let script = dir.join(format!("fake-vizd-switch-{network_off}.sh"));
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'network=[%s]\\n' \"$CERULION_NETWORK\" > {}\n",
+                out.display()
+            )
+            .unwrap();
+            drop(f);
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            spawn_vizd_detached(&script, &dir.join("vizd.log"), &[], &[], network_off)
+                .expect("spawn the fake daemon");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let contents = loop {
+                if let Ok(c) = std::fs::read_to_string(&out) {
+                    if c.ends_with("]\n") {
+                        break c;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "network_off={network_off}: the fake daemon never wrote its env dump"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            assert_eq!(
+                contents,
+                format!("network=[{expected}]\n"),
+                "network_off={network_off}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1682,6 +1741,7 @@ mod tests {
                 "tcp/10.0.0.9:7447".to_string(),
             ],
             &["tcp/0.0.0.0:7447".to_string()],
+            false,
         )
         .expect("spawn the fake env-dumping daemon");
 
@@ -1719,7 +1779,7 @@ mod tests {
         .unwrap();
         drop(f2);
         std::fs::set_permissions(&script2, std::fs::Permissions::from_mode(0o755)).unwrap();
-        spawn_vizd_detached(&script2, &log, &[], &[]).expect("spawn (no locators)");
+        spawn_vizd_detached(&script2, &log, &[], &[], false).expect("spawn (no locators)");
         let deadline = Instant::now() + Duration::from_secs(5);
         let contents2 = loop {
             if let Ok(c) = std::fs::read_to_string(&out2) {

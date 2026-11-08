@@ -404,7 +404,9 @@ pub enum Commands {
         /// Disable all relays (LAN / direct-dial only).
         #[arg(long)]
         relay_disabled: bool,
-        /// Kill-switch: pass `off` to refuse to connect.
+        /// Network kill switch: `off` refuses to connect. The switch keeps
+        /// Cerulion service traffic off (robots, relays, hosted Cerulion
+        /// services and telemetry); signing in to your account still works.
         #[arg(long)]
         network: Option<String>,
     },
@@ -1349,12 +1351,16 @@ pub enum NodeAction {
         no_monitor_wait: bool,
         /// Keep this run on this machine: no network gateway, session,
         /// egress or ingress. Equivalent to `--network off`; the environment
-        /// kill-switch remains honored with or without this flag.
+        /// kill-switch remains honored with or without this flag. The switch
+        /// keeps Cerulion service traffic off (robots, relays, hosted Cerulion
+        /// services and telemetry); signing in to your account still works.
         #[arg(long)]
         local: bool,
         /// Network kill-switch, the same as `graph run --network off`. The only
         /// accepted value is `off`: run LOCAL-ONLY, with no network gateway
-        /// and no topic visible on the network. Without a CLI or environment
+        /// and no topic visible on the network. The switch keeps Cerulion
+        /// service traffic off (robots, relays, hosted Cerulion services and
+        /// telemetry); signing in to your account still works. Without a CLI or environment
         /// kill-switch, a real-clock `node run` starts the network gateway and every produced
         /// topic is announced on the LAN, viewable by any peer without pairing.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
@@ -1558,12 +1564,17 @@ pub enum GraphAction {
         single_process: bool,
         /// Keep this run on this machine: no network gateway, session,
         /// egress or ingress. Equivalent to `--network off`; the environment
-        /// kill-switch remains honored with or without this flag.
+        /// kill-switch remains honored with or without this flag. The switch
+        /// keeps Cerulion service traffic off (robots, relays, hosted Cerulion
+        /// services and telemetry); signing in to your account still works.
         #[arg(long)]
         local: bool,
         /// Network kill-switch. The only accepted value is `off`: run
         /// LOCAL-ONLY. No network gateway is started, no network session opens
         /// and nothing crosses the machine boundary (a loud notice says so).
+        /// The switch keeps Cerulion service traffic off (robots, relays,
+        /// hosted Cerulion services and telemetry); signing in to your account
+        /// still works.
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process

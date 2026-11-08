@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use clap::Command;
 
-use super::cases::{By, Case, Expect, CASES};
+use super::cases::{By, Case, Expect, Home, CASES};
 use super::*;
 use crate::families;
 
@@ -96,6 +96,13 @@ fn every_row_states_its_outcome() {
             Expect::NotSpawned(why) => {
                 assert!(!why.is_empty(), "{:?}: no reason", case.argv);
             }
+            Expect::SignIn { request, .. } => {
+                assert!(
+                    request.starts_with("GET /v1/") || request.starts_with("POST /v1/"),
+                    "{:?}: {request}",
+                    case.argv
+                );
+            }
             Expect::Gated => {}
         }
     }
@@ -181,7 +188,7 @@ fn the_decision_agrees_with_every_row_under_every_spelling() {
                     }
                 }
             }
-            Expect::Gated | Expect::Runs { .. } | Expect::NotSpawned(_) => {
+            Expect::Gated | Expect::Runs { .. } | Expect::NotSpawned(_) | Expect::SignIn { .. } => {
                 for (value, _) in spellings(By::Network) {
                     assert_eq!(
                         families::network_refusal(&matches, &SwitchEnv::network(value)),
@@ -401,5 +408,113 @@ fn every_local_flag_is_the_switch_on_a_run_or_named_as_not_the_switch() {
         local_verbs,
         LOCAL_IS_NOT_THE_SWITCH.len() + 2,
         "every named verb, and the two runs, take --local"
+    );
+}
+
+#[test]
+fn account_sign_in_is_listed_as_allowed_under_the_switch() {
+    // The switch covers Cerulion service traffic, not signing in: each verb
+    // that signs in, and the login gate's own sign-in before a local verb,
+    // has a row that keeps it allowed, so refusing one fails here and in the
+    // sweep.
+    let signs_in = |verb: &[&str]| {
+        CASES
+            .iter()
+            .any(|c| c.verb == verb && matches!(c.expect, Expect::SignIn { .. }))
+    };
+    for verb in [
+        &["login"][..],
+        &["logout"][..],
+        &["account", "devices", "list"][..],
+        &["account", "devices", "revoke"][..],
+    ] {
+        assert!(signs_in(verb), "{verb:?} has no sign-in row");
+    }
+    let gate = CASES
+        .iter()
+        .find(|c| {
+            matches!(
+                c.expect,
+                Expect::SignIn {
+                    home: Home::Fresh,
+                    terminal: true,
+                    ..
+                }
+            )
+        })
+        .expect("a local verb at a terminal on a machine that never signed in");
+    assert!(
+        families::needs_identity(&parse(gate)),
+        "{:?}: the login gate runs for it",
+        gate.argv
+    );
+    for case in CASES {
+        if let Expect::SignIn { .. } = case.expect {
+            let matches = parse(case);
+            for (value, _) in spellings(By::Network) {
+                assert_eq!(
+                    families::network_refusal(&matches, &SwitchEnv::network(value)),
+                    None,
+                    "{:?} signs in, which the switch does not refuse (CERULION_NETWORK={value:?})",
+                    case.argv
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn telemetry_and_the_cli_read_the_switch_the_same_way() {
+    for value in [
+        None,
+        Some(""),
+        Some("   "),
+        Some("off"),
+        Some(" OFF "),
+        Some("Off"),
+        Some("on"),
+        Some("typo"),
+        Some("0"),
+    ] {
+        assert_eq!(
+            cerulion_telemetry::kill_switch::engaged(value),
+            cerulion_cli_engine::graph_cmd::network_env_kill_from(value.map(str::to_string))
+                .is_off(),
+            "CERULION_NETWORK={value:?}"
+        );
+    }
+}
+
+#[test]
+fn every_switch_flag_says_what_the_switch_covers() {
+    // `--network` on every verb that takes it, and `--local` on the two runs,
+    // where it is the same switch.
+    let cmd = families::cli_command();
+    let mut tree = BTreeSet::new();
+    leaves(&cmd, &mut Vec::new(), &mut tree);
+    let mut flags = 0;
+    for path in tree {
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        let run = matches!(path.as_slice(), ["graph", "run"] | ["node", "run"]);
+        for arg in find(&cmd, &path).get_arguments() {
+            let id = arg.get_id().as_str();
+            if id != "network" && !(run && id == "local") {
+                continue;
+            }
+            flags += 1;
+            let help = arg.get_help().map(ToString::to_string).unwrap_or_default();
+            let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                help.contains(
+                    "keeps Cerulion service traffic off (robots, relays, hosted Cerulion \
+                     services and telemetry); signing in to your account still works"
+                ),
+                "{path:?} --{id}: {help}"
+            );
+        }
+    }
+    assert_eq!(
+        flags, 6,
+        "connect, rcp and the two runs' --network and --local"
     );
 }

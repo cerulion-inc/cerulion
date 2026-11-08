@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Every `cerulion` verb as one invocation (two for a verb with `--robot`),
-//! with what the network kill switch does to it.
+//! Every `cerulion` verb as one invocation, with what the network kill switch
+//! does to it: a second row for a verb with `--robot`, and one for each form
+//! that signs in, which the switch allows.
 //!
 //! Read by two tests: `network_switch::tests` holds the table against the
 //! command tree (a verb or a `--robot` flag with no row fails) and checks the
@@ -41,6 +42,26 @@ pub(crate) enum Expect {
     /// The switch does not refuse it (or it never meets the switch's check),
     /// and the sweep does not spawn it, for the reason given.
     NotSpawned(&'static str),
+    /// Account sign-in, which the switch does not cover: the switch covers
+    /// Cerulion service traffic (robots, relays, hosted Cerulion services and
+    /// telemetry), and signing in is the user's own request. Under the switch
+    /// the invocation still reaches the account service: run on `home`, on a
+    /// pseudo-terminal when `terminal`, its first request line opens with
+    /// `request`.
+    SignIn {
+        home: Home,
+        terminal: bool,
+        request: &'static str,
+    },
+}
+
+/// The home a [`Expect::SignIn`] row runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Home {
+    /// A machine that never signed in.
+    Fresh,
+    /// A machine with a stored session.
+    SignedIn,
 }
 
 /// Which setting engages the refusal.
@@ -262,6 +283,52 @@ pub(crate) static CASES: &[Case] = &[
     gated(&["schema", "delete"], &["schema", "delete", "Demo"]),
     gated(&["schema", "info"], &["schema", "info", "std_msgs/String"]),
     gated(&["schema", "list"], &["schema", "list"]),
+    // ---- account sign-in: not covered by the switch, so allowed under it ----
+    Case {
+        verb: &["graph", "list"],
+        argv: &["graph", "list"],
+        expect: Expect::SignIn {
+            home: Home::Fresh,
+            terminal: true,
+            request: "POST /v1/auth/device/start",
+        },
+    },
+    Case {
+        verb: &["login"],
+        argv: &["login"],
+        expect: Expect::SignIn {
+            home: Home::Fresh,
+            terminal: false,
+            request: "POST /v1/auth/device/start",
+        },
+    },
+    Case {
+        verb: &["logout"],
+        argv: &["logout"],
+        expect: Expect::SignIn {
+            home: Home::SignedIn,
+            terminal: false,
+            request: "POST /v1/auth/revoke",
+        },
+    },
+    Case {
+        verb: &["account", "devices", "list"],
+        argv: &["account", "devices", "list"],
+        expect: Expect::SignIn {
+            home: Home::SignedIn,
+            terminal: false,
+            request: "GET /v1/devices",
+        },
+    },
+    Case {
+        verb: &["account", "devices", "revoke"],
+        argv: &["account", "devices", "revoke", "device-1"],
+        expect: Expect::SignIn {
+            home: Home::SignedIn,
+            terminal: false,
+            request: "POST /v1/devices/device-1/revoke",
+        },
+    },
     // ---- not refused under the switch, and no login gate ----
     Case {
         verb: &["logout"],
@@ -328,13 +395,6 @@ pub(crate) static CASES: &[Case] = &[
         },
     },
     // ---- not spawned by the sweep ----
-    Case {
-        verb: &["login"],
-        argv: &["login"],
-        expect: Expect::NotSpawned(
-            "the sign-in itself: it reaches the account service, which the switch does not cover",
-        ),
-    },
     Case {
         verb: &["ros2", "run"],
         argv: &["ros2", "run", "demo_nodes_cpp", "talker"],
