@@ -24124,6 +24124,179 @@ nodes:
         }
     }
 
+    /// A workspace whose graph `lb` holds one process group `p0`: `src`, a
+    /// 10 ms source, feeds `sink` across a chain link, and `beacon`, a 10 ms
+    /// period node that declares `isolate: true`, sits at level 1 between
+    /// them under `level_assignments:` (`src` 0, `beacon` 1, `sink` 2). The
+    /// profile holds 1 us a tick for each and 100 Hz on the link, so the tick
+    /// budget holds every merge. `sink_isolate` is the `isolate:` line of
+    /// `sink`, empty for none.
+    fn level_band_workspace(sink_isolate: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "lb_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "follower",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct FollowerNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = format!(
+            "\
+name: lb
+prefix: lb
+level_assignments:
+  src: 0
+  beacon: 1
+  sink: 2
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: follower
+{sink_isolate}    inputs:
+      - name: inp
+        source: src/out
+  - id: beacon
+    type: ticker
+    isolate: true
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+process_groups:
+  p0: [src, sink, beacon]
+"
+        );
+        std::fs::write(ws.root.join("graphs").join("lb.yaml"), yaml).unwrap();
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "lb".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000u64),
+                ("sink".to_string(), 1_000u64),
+                ("beacon".to_string(), 1_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![ProfileEdge {
+                producer: "src".to_string(),
+                consumer: "sink".to_string(),
+                rate_mhz: 100_000,
+            }],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "lb"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let root = ws.root.clone();
+        (tmp, root)
+    }
+
+    /// With a profile, a chain link whose merged unit would skip the level of
+    /// a node that declares `isolate: true` stays split, and `graph plan`
+    /// names why; the isolated node keeps its unit and the validator accepts
+    /// every unit, so the process is not kept whole.
+    #[test]
+    fn graph_plan_keeps_a_profiled_link_split_across_an_isolated_nodes_level() {
+        let (_tmp, root) = level_band_workspace("");
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        for line in [
+            "graph lb: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "  unit p0.sink: sink",
+            "    starts at sink: joining src's unit would leave level 1 out of the unit while it \
+             runs levels below and above it (a unit runs a contiguous band of levels)",
+            "  unit p0.beacon: beacon",
+            "    starts at beacon: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// A split the partition validator refuses keeps the process as one unit,
+    /// and says so at WARN, naming the process and the refusal. The case: the
+    /// graph above with `sink` declaring `isolate: false`, which joins it to
+    /// `src` whatever the link rules say, so their unit skips level 1.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_unit_split_keeps_the_process_whole_and_warns() {
+        let (_tmp, root) = level_band_workspace("    isolate: false\n");
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        assert!(
+            plan.contains("process p0: 1 unit(s)"),
+            "the refused split keeps p0 whole; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains(
+                "  one unit: its split is refused: Graph validation error: process group \
+                 'p0.src': owns non-adjacent global DAG levels [0, 2]"
+            ),
+            "graph plan names the refusal; plan was:\n{plan}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let hits = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "executor units: the partition validator refuses this process's split",
+            );
+            let named = lines.iter().any(|l| {
+                l.contains("executor units: the partition validator refuses this process's split")
+                    && l.contains("process=p0")
+                    && l.contains("owns non-adjacent")
+            });
+            if hits == 1 && named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly 1 WARN-level refusal line naming p0 and the refusal, got \
+                     {hits} (named: {named})"
+                ))
+            }
+        });
+    }
+
     /// Every sentence of the user-facing pages that calls a `--single-process`
     /// run the monolith, or says it mints no ring, stamps `lockstep` or has no
     /// ranks, names the executor-unit condition it holds under. On the real

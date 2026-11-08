@@ -56,6 +56,16 @@
 //! tightest `tick_within_ms` of its members. A link whose nodes the profile
 //! holds no tick for does not merge.
 //!
+//! A merge also keeps the band of levels the partition validator asks of
+//! every unit: the merged unit owns a contiguous band of the graph's levels,
+//! and, on levels derived from the trigger edges, each of its nodes above the
+//! band's first level is fed from inside the unit at the level just below.
+//! The links are walked once without that check. When a unit that walk forms
+//! breaks its band, they are walked again from the same start, and each merge
+//! whose merged unit would break its band is refused
+//! ([`Boundary::LevelBand`]); a host whose first walk forms only units that
+//! keep their band gets the units of that walk.
+//!
 //! A unit is fed at each member's own period, else through each trigger edge
 //! into the member: at the edge's profiled rate, or, when the profile does not
 //! rate it, from another node of the process at the period that node's group
@@ -71,7 +81,8 @@
 //! edge that is no link (latest-value, fan-out, join, a period or sync
 //! consumer...), `isolate: true`, an isolated producer, an unprofiled merge, a
 //! merge into a unit fed at a rate the profile does not hold, a merge over
-//! budget, or a cycle of links that no chain head reaches. A node in one unit
+//! budget, a merge that would break the unit's band of levels, or a cycle of
+//! links that no chain head reaches. A node in one unit
 //! with a node that triggers it starts no unit and carries no reason.
 //!
 //! # Overrides
@@ -162,6 +173,14 @@ pub enum Boundary {
     },
     /// A link whose merge would put the unit over its tick budget.
     OverBudget(BudgetVerdict),
+    /// A link whose merge would leave the unit without the band of levels
+    /// the partition validator asks of every unit.
+    LevelBand {
+        /// The producer across the link.
+        producer: String,
+        /// How the merged unit would break its band.
+        rule: BandRule,
+    },
     /// A node on a cycle made only of links, which no chain head reaches.
     LinkCycle {
         /// The producer across the node's link.
@@ -213,6 +232,19 @@ impl Boundary {
                  period is unknown (run `cerulion graph profile` while {node} is fed)"
             ),
             Self::OverBudget(v) => v.describe(),
+            Self::LevelBand { producer, rule } => match rule {
+                BandRule::Gap { level } => format!(
+                    "joining {producer}'s unit would leave level {level} out of the unit while \
+                     it runs levels below and above it (a unit runs a contiguous band of levels)"
+                ),
+                BandRule::Unfed { node, level } => format!(
+                    "joining {producer}'s unit would put {node}, at level {level}, in it with \
+                     no node of the unit feeding it at level {} (a unit runs a contiguous band \
+                     of levels, and each of its nodes above the band's first level is fed from \
+                     inside the unit at the level below)",
+                    level.saturating_sub(1)
+                ),
+            },
             Self::LinkCycle { producer } => {
                 format!(
                     "on a cycle of chain links (fed by {producer}), which no chain head reaches"
@@ -283,6 +315,26 @@ pub enum BudgetAgainst {
     },
 }
 
+/// How a unit would break the band of levels the partition validator asks of
+/// every unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BandRule {
+    /// The unit would run levels below and above `level` and no node at it.
+    Gap {
+        /// The lowest level the unit would skip.
+        level: usize,
+    },
+    /// On levels derived from the trigger edges, `node`, above the unit's
+    /// first level, would have no node of the unit feeding it at the level
+    /// just below.
+    Unfed {
+        /// That node.
+        node: String,
+        /// Its level.
+        level: usize,
+    },
+}
+
 /// One executor: the nodes that run on one thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorUnit {
@@ -320,6 +372,12 @@ pub struct UnitGraph {
     /// checks every unit's band against). Empty when the graph's levels cannot
     /// be resolved (a trigger cycle, which the graph's build refuses).
     pub level: IndexMap<String, usize>,
+    /// Whether [`Self::level`] holds the graph's `level_assignments:` rather
+    /// than levels derived from its trigger edges. On derived levels the
+    /// partition validator also asks that each node of a unit above the
+    /// unit's first level be fed from inside the unit at the level just
+    /// below.
+    pub levels_assigned: bool,
 }
 
 impl UnitGraph {
@@ -332,6 +390,7 @@ impl UnitGraph {
     ) -> Self {
         let mut out = Self {
             links: linear_links(entry_infos, topology, trigger_edges),
+            levels_assigned: config.level_assignments.is_some(),
             ..Self::default()
         };
         for flow in topology.topics() {
@@ -524,6 +583,84 @@ struct Growing<'a> {
     feed: Option<Feed<'a>>,
     /// The tightest `tick_within_ms` among its members.
     deadline: Option<Deadline<'a>>,
+}
+
+/// The levels of one host's members, and the band of them the partition
+/// validator asks of a unit.
+struct Bands {
+    /// Each member's level, by member index.
+    level: Vec<usize>,
+    /// Each member's trigger producers in the host, by member index.
+    feeders: Vec<Vec<usize>>,
+    /// Whether the levels are derived from the trigger edges, where a node
+    /// above its unit's first level must be fed from inside the unit at the
+    /// level just below.
+    derived: bool,
+}
+
+impl Bands {
+    /// The bands of `members`; none when a member's level is unknown.
+    fn of(members: &[String], graph: &UnitGraph) -> Option<Self> {
+        let level: Vec<usize> = members
+            .iter()
+            .map(|m| graph.level.get(m).copied())
+            .collect::<Option<_>>()?;
+        let index: IndexSet<&str> = members.iter().map(String::as_str).collect();
+        let mut feeders: Vec<Vec<usize>> = vec![Vec::new(); members.len()];
+        for (producer, consumer) in &graph.trigger_edges {
+            if let (Some(p), Some(c)) = (
+                index.get_index_of(producer.as_str()),
+                index.get_index_of(consumer.as_str()),
+            ) {
+                feeders[c].push(p);
+            }
+        }
+        Some(Self {
+            level,
+            feeders,
+            derived: !graph.levels_assigned,
+        })
+    }
+
+    /// How the unit of the members `unit` (member indices, ascending) breaks
+    /// its band: the lowest level it skips, else, on derived levels, its first
+    /// member above its first level that no member feeds at the level below.
+    fn broken(&self, unit: &[usize], members: &[String]) -> Option<BandRule> {
+        let mut owned: Vec<usize> = unit.iter().map(|&i| self.level[i]).collect();
+        owned.sort_unstable();
+        owned.dedup();
+        if let Some(pair) = owned.windows(2).find(|pair| pair[1] != pair[0] + 1) {
+            return Some(BandRule::Gap { level: pair[0] + 1 });
+        }
+        let first = *owned.first()?;
+        if !self.derived {
+            return None;
+        }
+        unit.iter()
+            .copied()
+            .find(|&i| {
+                let l = self.level[i];
+                l > first
+                    && !self.feeders[i]
+                        .iter()
+                        .any(|p| unit.contains(p) && self.level[*p] + 1 == l)
+            })
+            .map(|i| BandRule::Unfed {
+                node: members[i].clone(),
+                level: self.level[i],
+            })
+    }
+
+    /// Whether a unit of `parent` breaks its band.
+    fn breaks_any(&self, members: &[String], parent: &mut [usize]) -> bool {
+        let mut units: IndexMap<usize, Vec<usize>> = IndexMap::new();
+        for i in 0..members.len() {
+            units.entry(root(parent, i)).or_default().push(i);
+        }
+        units
+            .values()
+            .any(|unit| self.broken(unit, members).is_some())
+    }
 }
 
 /// Decide whether `node` may join the unit `unit` across the link from
@@ -1043,80 +1180,110 @@ fn units_from_profile(
             break;
         }
     }
+    // The band of levels each unit keeps, when every member's level is known.
+    let bands = Bands::of(members, graph);
+    let start = (parent.clone(), starts.clone(), fed.clone());
     let mut walked: IndexSet<&str> = IndexSet::new();
     // Walk each chain of candidate links from the node that heads it, growing
-    // one unit at a time.
-    for node in members {
-        let head = node.as_str();
-        if !heads(head) {
-            continue;
-        }
-        let head_root = index(head).map(|i| root(&mut parent, i));
-        let totals = head_root.map(|r| unit_totals(r, &mut parent));
-        let mut unit = Growing {
-            sum_ns: totals.as_ref().and_then(|t| t.sum_ns),
-            feed: head_root.and_then(|r| fed.get(&r).copied()),
-            deadline: totals.as_ref().and_then(|t| t.deadline),
-        };
-        let mut at = head;
-        while let Some(&next) = link_out.get(at) {
-            if !candidates.contains(next) || !walked.insert(next) {
-                break;
+    // one unit at a time: first without the band check, then, when a unit
+    // that walk formed breaks its band, again from the same start with it.
+    let mut checked: Option<&Bands> = None;
+    loop {
+        for node in members {
+            let head = node.as_str();
+            if !heads(head) {
+                continue;
             }
-            // `unit` holds the ticks of every member of `at`'s group. A `next`
-            // in that group (an `isolate: false` join or a coupling put both
-            // there) adds nothing, so the walk moves on without a verdict.
-            if let (Some(a), Some(b)) = (index(next), index(at)) {
-                if root(&mut parent, a) == root(&mut parent, b) {
-                    at = next;
-                    continue;
+            let head_root = index(head).map(|i| root(&mut parent, i));
+            let totals = head_root.map(|r| unit_totals(r, &mut parent));
+            let mut unit = Growing {
+                sum_ns: totals.as_ref().and_then(|t| t.sum_ns),
+                feed: head_root.and_then(|r| fed.get(&r).copied()),
+                deadline: totals.as_ref().and_then(|t| t.deadline),
+            };
+            let mut at = head;
+            while let Some(&next) = link_out.get(at) {
+                if !candidates.contains(next) || !walked.insert(next) {
+                    break;
                 }
-            }
-            let next_root = index(next).map(|i| root(&mut parent, i));
-            let next_feed = next_root.and_then(|r| fed.get(&r).copied());
-            let add = match next_root {
-                Some(r) => unit_totals(r, &mut parent),
-                None => Growing {
-                    sum_ns: None,
-                    feed: None,
-                    deadline: None,
-                },
-            };
-            // Merged, the unit is fed by every feed of both groups (the link
-            // between them among `next`'s), so the verdict reads the shorter
-            // period.
-            let judged = Growing {
-                feed: joined(unit.feed, next_feed),
-                ..unit
-            };
-            match merge_verdict(next, at, &judged, &add, profile) {
-                Ok(sum) => {
-                    if let (Some(a), Some(b)) = (index(next), index(at)) {
-                        let old = [root(&mut parent, a), root(&mut parent, b)];
-                        union(&mut parent, a, b);
-                        for r in old {
-                            fed.shift_remove(&r);
-                        }
-                        if let Some(f) = judged.feed {
-                            let r = root(&mut parent, a);
-                            fed.insert(r, f);
-                        }
+                // `unit` holds the ticks of every member of `at`'s group. A `next`
+                // in that group (an `isolate: false` join or a coupling put both
+                // there) adds nothing, so the walk moves on without a verdict.
+                if let (Some(a), Some(b)) = (index(next), index(at)) {
+                    if root(&mut parent, a) == root(&mut parent, b) {
+                        at = next;
+                        continue;
                     }
-                    unit = Growing {
-                        sum_ns: sum,
-                        feed: judged.feed,
-                        deadline: tighter(unit.deadline, add.deadline),
-                    };
                 }
-                Err(boundary) => {
-                    starts.insert(next, boundary);
-                    unit = Growing {
-                        feed: next_feed,
-                        ..add
-                    };
+                let next_root = index(next).map(|i| root(&mut parent, i));
+                let next_feed = next_root.and_then(|r| fed.get(&r).copied());
+                let add = match next_root {
+                    Some(r) => unit_totals(r, &mut parent),
+                    None => Growing {
+                        sum_ns: None,
+                        feed: None,
+                        deadline: None,
+                    },
+                };
+                // Merged, the unit is fed by every feed of both groups (the link
+                // between them among `next`'s), so the verdict reads the shorter
+                // period.
+                let judged = Growing {
+                    feed: joined(unit.feed, next_feed),
+                    ..unit
+                };
+                let mut verdict = merge_verdict(next, at, &judged, &add, profile);
+                if let (Ok(_), Some(bands), Some(a), Some(b)) =
+                    (&verdict, checked, index(next), index(at))
+                {
+                    let roots = [root(&mut parent, a), root(&mut parent, b)];
+                    let merged: Vec<usize> = (0..members.len())
+                        .filter(|&i| roots.contains(&root(&mut parent, i)))
+                        .collect();
+                    if let Some(rule) = bands.broken(&merged, members) {
+                        verdict = Err(Boundary::LevelBand {
+                            producer: at.to_string(),
+                            rule,
+                        });
+                    }
                 }
+                match verdict {
+                    Ok(sum) => {
+                        if let (Some(a), Some(b)) = (index(next), index(at)) {
+                            let old = [root(&mut parent, a), root(&mut parent, b)];
+                            union(&mut parent, a, b);
+                            for r in old {
+                                fed.shift_remove(&r);
+                            }
+                            if let Some(f) = judged.feed {
+                                let r = root(&mut parent, a);
+                                fed.insert(r, f);
+                            }
+                        }
+                        unit = Growing {
+                            sum_ns: sum,
+                            feed: judged.feed,
+                            deadline: tighter(unit.deadline, add.deadline),
+                        };
+                    }
+                    Err(boundary) => {
+                        starts.insert(next, boundary);
+                        unit = Growing {
+                            feed: next_feed,
+                            ..add
+                        };
+                    }
+                }
+                at = next;
             }
-            at = next;
+        }
+        match bands.as_ref() {
+            Some(b) if checked.is_none() && b.breaks_any(members, &mut parent) => {
+                checked = Some(b);
+                (parent, starts, fed) = start.clone();
+                walked.clear();
+            }
+            _ => break,
         }
     }
 
@@ -2013,9 +2180,13 @@ mod tests {
             [("b".to_string(), over_period("b", 2_600_000, 10_000_000))]
         );
 
-        // One hop later: `s -> b -> c -> y` with `x` joining `b` and `y`.
-        // `b` (with `x` and `y`) joins `s` at 1.6 ms; `c` brings 1 ms and
-        // starts a unit; `y` would put `c` back into the 10 ms unit.
+        // One hop later: `s -> b -> c -> y` with `x` joining `b` and `y`, so
+        // `b`, `x` and `y` own levels 1, 3 and 4 before the walk. A first
+        // walk joins them to `s` at 1.6 ms and refuses `c` over budget, which
+        // leaves `c`'s level 2 out of that unit. Walked again with the band
+        // check, `b` does not join `s` (the merged unit would skip level 2),
+        // and `c` joins `b`'s unit at 2.1 ms, under a quarter of 10 ms, which
+        // fills the band.
         let mut g = graph(
             &[("s", "b"), ("b", "c"), ("c", "y")],
             &[("b", "x", join.clone()), ("y", "x", join)],
@@ -2035,17 +2206,18 @@ mod tests {
         let units = derive_units("g", &s(&["s", "b", "c", "x", "y"]), &g, profile(&c));
         assert_eq!(
             nodes(&units),
-            [s(&["s", "b", "x", "y"]), s(&["c"])],
+            [s(&["s"]), s(&["b", "c", "x", "y"])],
             "{units:?}"
         );
         assert_eq!(
-            start_of(&units, "c"),
-            Some(&over_period("c", 2_600_000, 10_000_000))
+            start_of(&units, "b"),
+            Some(&Boundary::LevelBand {
+                producer: "s".into(),
+                rule: BandRule::Gap { level: 2 },
+            })
         );
-        assert_eq!(
-            start_of(&units, "y"),
-            Some(&over_period("y", 2_600_000, 10_000_000))
-        );
+        assert_eq!(start_of(&units, "c"), None, "{units:?}");
+        assert_eq!(start_of(&units, "y"), None, "{units:?}");
     }
 
     #[test]
@@ -2118,7 +2290,10 @@ mod tests {
         // `x` share one unit (0.9 ms) fed every 10 ms through `z`. With `hA`
         // it would tick 2.9 ms, over a quarter of 10 ms; with `hB` 1.9 ms,
         // under it. `hB` joins and `hA` does not, whichever head's walk runs
-        // first and whether or not the profile rates the links.
+        // first and whether or not the profile rates the links. The levels
+        // are assigned, where a unit's band needs only to be contiguous; on
+        // derived levels (the last arm) `y` would have no node of `hB`'s
+        // unit feeding it at level 0, so `hB` does not join either.
         let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
         let mut g = graph(
             &[("hA", "y"), ("hB", "z")],
@@ -2126,6 +2301,7 @@ mod tests {
             &[("hA", 100), ("hB", 10)],
         );
         g.isolate.insert("x".into(), false);
+        g.levels_assigned = true;
         let p50 = [
             ("hA", 2_000_000),
             ("hB", 1_000_000),
@@ -2154,17 +2330,39 @@ mod tests {
                 assert!(judged_at_period(&units, "y", 10_000_000), "{units:?}");
             }
         }
+        g.levels_assigned = false;
+        for order in [["hA", "hB", "y", "z", "x"], ["hB", "hA", "y", "z", "x"]] {
+            let units = derive_units("g", &s(&order), &g, profile(&rated));
+            assert_eq!(
+                unit_sets(&units),
+                [s(&["hA"]), s(&["hB"]), s(&["x", "y", "z"])],
+                "{order:?}: {units:?}"
+            );
+            assert_eq!(
+                start_of(&units, "z"),
+                Some(&Boundary::LevelBand {
+                    producer: "hB".into(),
+                    rule: BandRule::Unfed {
+                        node: "y".into(),
+                        level: 1,
+                    },
+                }),
+                "{order:?}: {units:?}"
+            );
+            assert!(judged_at_period(&units, "y", 10_000_000), "{units:?}");
+        }
 
         // The same shape with the heads' members interleaved: `h1` (100 Hz)
         // links to `y`, `h2` (50 Hz) to `w`, and `x` joins `w` and `y`. With
         // `h1` the unit ticks 2.4 ms, under a quarter of 10 ms; with `h2`
-        // 2.9 ms, over it.
+        // 2.9 ms, over it. Levels assigned, as above.
         let mut g = graph(
             &[("h2", "w"), ("h1", "y")],
             &[("w", "x", join.clone()), ("y", "x", join)],
             &[("h1", 10), ("h2", 20)],
         );
         g.isolate.insert("x".into(), false);
+        g.levels_assigned = true;
         let c = costs(
             &[
                 ("h2", 2_000_000),
@@ -2436,7 +2634,10 @@ mod tests {
         // 1 kHz, declares isolate: false, so `a`, `b` and `j` share one unit
         // fed every 1 ms. `h1` (10 Hz) links to `a` and joins at 0.11 ms; the
         // merged unit keeps `h1`'s place and is fed every 1 ms. `h2` (10 Hz)
-        // links to `b`: 0.31 ms reaches a quarter of 1 ms.
+        // links to `b`: 0.31 ms reaches a quarter of 1 ms. The levels are
+        // assigned, where a unit's band needs only to be contiguous; on
+        // derived levels `b` would have no node of `h1`'s unit feeding it at
+        // level 0, so `h1` does not join either (the last arm).
         let join = ChainBar::ConsumerJoin { trigger_edges: 3 };
         let mut g = graph(
             &[("h1", "a"), ("h2", "b")],
@@ -2458,7 +2659,9 @@ mod tests {
             ],
             &[("o", "j", 1_000_000)],
         );
-        let units = derive_units("g", &s(&["h1", "h2", "a", "b", "j"]), &g, profile(&c));
+        g.levels_assigned = true;
+        let members = s(&["h1", "h2", "a", "b", "j"]);
+        let units = derive_units("g", &members, &g, profile(&c));
         assert_eq!(
             nodes(&units),
             [s(&["h1", "a", "b", "j"]), s(&["h2"])],
@@ -2470,6 +2673,28 @@ mod tests {
                 ("h1".to_string(), Boundary::Source),
                 ("b".to_string(), over_period("b", 310_000, 1_000_000)),
             ]
+        );
+
+        g.levels_assigned = false;
+        let units = derive_units("g", &members, &g, profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["h1"]), s(&["h2"]), s(&["a", "b", "j"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&Boundary::LevelBand {
+                producer: "h1".into(),
+                rule: BandRule::Unfed {
+                    node: "b".into(),
+                    level: 1,
+                },
+            })
+        );
+        assert_eq!(
+            start_of(&units, "b"),
+            Some(&over_period("b", 260_000, 1_000_000))
         );
     }
 
@@ -2689,6 +2914,204 @@ mod tests {
         assert_eq!(nodes(&units), [s(&["a", "b"])]);
         assert_eq!(start_of(&units, "b"), None, "b does not start a unit");
         assert_eq!(units[0].block_topics, s(&["t"]));
+    }
+
+    // ---- With a profile, a merge keeps the unit's band of levels.
+
+    /// A 10 ms period node with no input.
+    fn period_info() -> NodeInfo {
+        NodeInfo::with_meta(Vec::new(), Vec::new())
+            .with_policy(MacroPolicy::Period { period_ms: 10 })
+    }
+
+    /// A node woken by its one input, `inp`.
+    fn data_info() -> NodeInfo {
+        let inp = crate::graph::node::InputMeta {
+            name: "inp".to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: 10,
+            backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+        };
+        NodeInfo::with_meta(vec![inp], Vec::new()).with_policy(MacroPolicy::DataTrigger {
+            input_name: "inp".to_string(),
+        })
+    }
+
+    /// `a` (10 ms) feeds `b`, a chain link, and `c`, a 10 ms period node that
+    /// declares `isolate: true`, reads nothing; one process group `g` holds
+    /// all three, at the levels `level_assignments:` gives them.
+    fn isolated_between(a: usize, b: usize, c: usize) -> String {
+        format!(
+            "prefix: t
+level_assignments:
+  a: {a}
+  b: {b}
+  c: {c}
+nodes:
+  - id: a
+    type: a
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: b
+    type: b
+    inputs:
+      - name: inp
+        source: a/out
+  - id: c
+    type: c
+    isolate: true
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+process_groups:
+  g: [a, b, c]
+"
+        )
+    }
+
+    /// The units of `yaml`'s groups under `c`, and the partition validator's
+    /// verdict on them.
+    fn validated_plan(
+        yaml: &str,
+        infos: &[(&str, NodeInfo)],
+        c: &PartitionCosts,
+    ) -> (UnitPlan, crate::error::TransportResult<()>) {
+        let config = crate::graph::parse_graph(yaml).expect("the graph parses");
+        let infos: IndexMap<String, NodeInfo> = infos
+            .iter()
+            .map(|(n, i)| (n.to_string(), i.clone()))
+            .collect();
+        let trigger_edges = crate::graph::build_trigger_edges(&config, &infos);
+        let topology = GraphTopology::build(&config, &infos).expect("the graph builds");
+        let graph = UnitGraph::from_graph(&config, &infos, &topology, &trigger_edges);
+        let plan = expand_process_groups(&config, &graph, profile(c), &IndexSet::new());
+        let verdict = crate::graph::partition::validate_partition(
+            &plan.groups,
+            &config,
+            &infos,
+            &trigger_edges,
+        );
+        (plan, verdict)
+    }
+
+    #[test]
+    fn a_profiled_link_across_an_isolated_nodes_level_stays_split() {
+        // `a` 0, `c` 1, `b` 2: merged, `a` and `b` would own levels 0 and 2 and
+        // not 1, which the partition validator refuses, so the link stays
+        // split, `c` keeps its unit and every unit passes the validator.
+        let infos = [
+            ("a", period_info()),
+            ("b", data_info()),
+            ("c", period_info()),
+        ];
+        let c = costs(
+            &[("a", 1_000), ("b", 1_000), ("c", 1_000)],
+            &[("a", "b", 100_000)],
+        );
+        let (plan, verdict) = validated_plan(&isolated_between(0, 2, 1), &infos, &c);
+        let units = &plan.units["g"];
+        assert!(
+            verdict.is_ok(),
+            "the validator accepts {units:?}: {verdict:?}"
+        );
+        assert_eq!(nodes(units), [s(&["a"]), s(&["b"]), s(&["c"])]);
+        assert_eq!(
+            start_of(units, "b"),
+            Some(&Boundary::LevelBand {
+                producer: "a".into(),
+                rule: BandRule::Gap { level: 1 },
+            })
+        );
+        assert_eq!(start_of(units, "c"), Some(&Boundary::Isolated));
+
+        // `b` at level 1, beside `c`: the merged unit owns levels 0 and 1, so
+        // the link merges.
+        let (plan, verdict) = validated_plan(&isolated_between(0, 1, 1), &infos, &c);
+        let units = &plan.units["g"];
+        assert!(
+            verdict.is_ok(),
+            "the validator accepts {units:?}: {verdict:?}"
+        );
+        assert_eq!(nodes(units), [s(&["a", "b"]), s(&["c"])]);
+        assert_eq!(start_of(units, "b"), None, "b shares a's unit");
+    }
+
+    /// `x` (10 ms) links to `y`, and a `block` coupling keeps `y` with `z`,
+    /// which `w` (10 ms) triggers across an edge that is no link (`w` also
+    /// feeds `v`). Derived levels: `x` and `w` 0, `y`, `z` and `v` 1.
+    fn coupled_beside_a_link() -> UnitGraph {
+        let fan = ChainBar::FanOut { consumers: 2 };
+        let mut g = graph(
+            &[("x", "y")],
+            &[("w", "z", fan.clone()), ("w", "v", fan)],
+            &[("x", 10), ("w", 10)],
+        );
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["y", "z"]),
+        });
+        g
+    }
+
+    #[test]
+    fn a_merge_that_leaves_a_coupled_node_unfed_at_its_level_stays_split() {
+        // Merged, `x`, `y` and `z` would own levels 0 and 1 with `z` at level
+        // 1 fed by no node of the unit at level 0: the validator re-levelizes
+        // `z` to the unit's first level. The link stays split.
+        let c = costs(
+            &[
+                ("x", 1_000),
+                ("y", 1_000),
+                ("z", 1_000),
+                ("w", 1_000),
+                ("v", 1_000),
+            ],
+            &[
+                ("x", "y", 100_000),
+                ("w", "z", 100_000),
+                ("w", "v", 100_000),
+            ],
+        );
+        let members = s(&["x", "y", "z", "w", "v"]);
+        let units = derive_units("g", &members, &coupled_beside_a_link(), profile(&c));
+        assert_eq!(
+            nodes(&units),
+            [s(&["x"]), s(&["y", "z"]), s(&["w"]), s(&["v"])],
+            "{units:?}"
+        );
+        assert_eq!(
+            start_of(&units, "y"),
+            Some(&Boundary::LevelBand {
+                producer: "x".into(),
+                rule: BandRule::Unfed {
+                    node: "z".into(),
+                    level: 1,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_walk_whose_units_all_keep_their_band_merges_through_a_passing_break() {
+        // `w` links to `z` and `x` to `y`, and a `block` coupling keeps `y`
+        // with `z`. Joining `w` alone leaves `y` unfed at level 1, and joining
+        // `x` then feeds it: the walk forms one unit that keeps its band, so
+        // no merge is refused for the band.
+        let mut g = graph(&[("w", "z"), ("x", "y")], &[], &[("w", 10), ("x", 10)]);
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["y", "z"]),
+        });
+        let c = costs(
+            &[("w", 1_000), ("x", 1_000), ("y", 1_000), ("z", 1_000)],
+            &[("w", "z", 100_000), ("x", "y", 100_000)],
+        );
+        let members = s(&["w", "x", "y", "z"]);
+        let units = derive_units("g", &members, &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["w", "x", "y", "z"])], "{units:?}");
     }
 
     // ---- Structure: the shared chain predicate's bars.

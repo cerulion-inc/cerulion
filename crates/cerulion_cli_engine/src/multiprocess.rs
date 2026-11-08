@@ -2762,7 +2762,8 @@ fn units_collapsed_by_mutant() -> bool {
 /// Under [`ExecutionMode::Lockstep`] every group stays one unit: the barrier
 /// rendezvous is per process and per level, which is the level loop itself.
 /// A group whose split the partition validator refuses stays one unit, with
-/// the refusal recorded in [`DeploymentUnits::kept_whole`].
+/// the refusal recorded in [`DeploymentUnits::kept_whole`] and logged at warn,
+/// naming the process and the refusal.
 pub fn plan_executor_units(
     config: &GraphConfig,
     entry_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
@@ -2809,12 +2810,28 @@ pub fn plan_executor_units(
             only.extend(keep.iter().cloned());
             let trial = expand(&graph, &only);
             if let Err(e) = validate_partition(&trial.groups, config, entry_infos, &trigger_edges) {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    process = %host,
+                    error = %e,
+                    "executor units: the partition validator refuses this process's split, so \
+                     the process runs as one unit on one level loop, a node in it that declares \
+                     `isolate: true` included"
+                );
                 keep.insert(host.clone());
                 kept_whole.push((host.clone(), format!("its split is refused: {e}")));
             }
         }
         plan = expand(&graph, &keep);
         if validate_partition(&plan.groups, config, entry_infos, &trigger_edges).is_err() {
+            tracing::warn!(
+                graph = %config.identity(),
+                processes = ?config.process_groups.keys().collect::<Vec<_>>(),
+                error = %first,
+                "executor units: the partition validator refuses the deployment's split, so \
+                 every process runs as one unit on one level loop, a node that declares \
+                 `isolate: true` included"
+            );
             keep = config.process_groups.keys().cloned().collect();
             kept_whole = config
                 .process_groups
