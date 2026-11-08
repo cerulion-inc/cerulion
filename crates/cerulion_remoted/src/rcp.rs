@@ -3479,12 +3479,18 @@ mod tests {
     }
 
     /// The kinds of one attempt rcpd answers in full.
-    const ATTEMPT: [&str; 4] = [
-        "initialize",
-        "notifications/initialized",
-        "tools/call",
-        "DELETE",
-    ];
+    ///
+    /// A function, not a `const`: the walk in `ci_doc_pin_walk_test` counts a
+    /// `tools/`-rooted literal in a `const` the source reads as a read of the
+    /// `tools` tree, and `tools/call` is a method name.
+    fn attempt() -> [&'static str; 4] {
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+            "DELETE",
+        ]
+    }
 
     /// A sender to `rcpd` whose token file is under `dir`.
     fn sender_to(dir: &Path, rcpd: SocketAddr) -> RcpdEstop {
@@ -3528,7 +3534,7 @@ mod tests {
         until_delivered(&rcpd).await;
         let mut kinds = vec!["initialize".to_string()];
         kinds.extend(stand_in.kinds_so_far());
-        assert_eq!(kinds, [&["initialize"][..], &ATTEMPT[..]].concat());
+        assert_eq!(kinds, [&["initialize"][..], &attempt()[..]].concat());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3541,10 +3547,7 @@ mod tests {
         assert!(rcpd.send(&[1; 32]));
         until_delivered(&rcpd).await;
         // Each attempt is a session of its own, deleted at its end.
-        assert_eq!(
-            stand_in.kinds_so_far(),
-            [&ATTEMPT[..], &ATTEMPT[..], &ATTEMPT[..]].concat()
-        );
+        assert_eq!(stand_in.kinds_so_far(), attempt().repeat(3));
         assert!(rcpd.send(&[2; 32]), "the delivery did not free its place");
     }
 
@@ -3560,8 +3563,8 @@ mod tests {
         assert!(rcpd.send(&[1; 32]));
         until_delivered(&rcpd).await;
         let kinds = stand_in.kinds_so_far();
-        assert_eq!(kinds.len(), 16 + ATTEMPT.len(), "{kinds:?}");
-        assert_eq!(kinds[16..], ATTEMPT, "{kinds:?}");
+        assert_eq!(kinds.len(), 16 + attempt().len(), "{kinds:?}");
+        assert_eq!(kinds[16..], attempt(), "{kinds:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
