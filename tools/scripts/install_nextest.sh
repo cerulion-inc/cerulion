@@ -24,10 +24,13 @@
 # Moving the pin means editing NEXTEST_PINNED_VERSION and regenerating all
 # three hashes, which is the reviewable act:
 #
-#   for p in linux linux-arm mac; do
-#       curl -sSL --fail "https://get.nexte.st/<version>/$p" -o "$p.tar.gz"
-#       printf '%s %s\n' "$p" "$(shasum -a 256 "$p.tar.gz" | cut -d' ' -f1)"
-#   done
+#   tools/scripts/install_nextest.sh --print-pins <version>
+#
+# downloads each platform's tarball from BOTH routes, get.nexte.st and the
+# GitHub release asset, and fails naming the platform when either route fails
+# or the two routes serve different bytes. Only when every platform agrees does
+# it print the version line and the three checksum lines, ready to paste over
+# the pin block below. It installs nothing.
 #
 # Idempotent: an already-present binary of the right version is left alone, so
 # a self-hosted runner does not re-download on every job.
@@ -50,6 +53,136 @@ die() {
     printf 'install_nextest: %s\n' "$1" >&2
     exit 1
 }
+
+usage="usage: install_nextest.sh [--print-pins VERSION]"
+
+# annotate LEVEL MESSAGE prints a GitHub Actions workflow command, which the
+# runner turns into an annotation of that level (`warning` or `error`) on the
+# run; outside Actions it is one more log line. `%`, CR and LF are escaped the
+# way the workflow command syntax requires. An annotation does not change the
+# exit status.
+annotate() {
+    local level=$1 message=$2
+    message=${message//'%'/%25}
+    message=${message//$'\r'/%0D}
+    message=${message//$'\n'/%0A}
+    printf '::%s::install_nextest: %s\n' "$level" "$message" >&2
+}
+
+# VERIFY BEFORE EXTRACTING. Everything after the checksum runs code that came
+# off the network, so the checksum is the last moment it is still just bytes.
+# require_sha256 runs before the first download of either mode.
+require_sha256() {
+    command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 \
+        || die "neither shasum nor sha256sum is available, so the download cannot be verified; refusing to run it"
+}
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        sha256sum "$1" | cut -d' ' -f1
+    fi
+}
+
+# Two routes to the SAME bytes, tried in order: get.nexte.st, then the asset
+# on nextest's GitHub release that get.nexte.st redirects to. A platform's
+# GitHub asset is named by its Rust target triple; get.nexte.st names it by
+# the short platform name the checksum variables above use.
+target_of() {
+    case "$1" in
+        linux)     printf '%s' x86_64-unknown-linux-gnu ;;
+        linux-arm) printf '%s' aarch64-unknown-linux-gnu ;;
+        mac)       printf '%s' universal-apple-darwin ;;
+        *)         die "no release target is known for platform '$1'" ;;
+    esac
+}
+
+# primary_url_of VERSION PLATFORM, fallback_url_of VERSION PLATFORM
+primary_url_of() {
+    printf 'https://get.nexte.st/%s/%s' "$1" "$2"
+}
+fallback_url_of() {
+    printf 'https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-%s/cargo-nextest-%s-%s.tar.gz' \
+        "$1" "$1" "$(target_of "$2")"
+}
+
+# download URL FILE: fetch URL into FILE. Returns 0 when curl delivered the
+# whole transfer; otherwise removes FILE and returns 1. The bytes are not
+# checked here; every caller hashes them.
+#
+# `--fail` makes an HTTP error a failed download, not a tarball made of an
+# error page. `--location` follows get.nexte.st's redirect to the release
+# asset, and `--proto-redir '=https'` keeps every hop of it on HTTPS.
+#
+# `--retry-all-errors` widens `--retry` from curl's transient class (a timeout,
+# and HTTP 408, 429, 500, 502, 503 and 504) to every failure, including a
+# connection reset (`curl: (35) Recv failure: Connection reset by peer`), which
+# `--retry` alone gives up on. That is five retries at least five seconds
+# apart, longer when the server sends a Retry-After; curl discards a partial
+# file before each retry. `--connect-timeout` and `--max-time` bound one
+# attempt, and `--retry-max-time` starts no new attempt after 120 s, so a host
+# that stalls hands over to the next route.
+download() {
+    local src=$1 out=$2
+    printf 'install_nextest: fetching %s\n' "$src" >&2
+    rm -f "$out"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --fail --silent --show-error --location \
+        --retry 5 --retry-delay 5 --retry-all-errors --retry-max-time 120 \
+        --connect-timeout 30 --max-time 180 --url "$src" -o "$out" && return 0
+    printf 'install_nextest: download failed for %s\n' "$src" >&2
+    rm -f "$out"
+    return 1
+}
+
+# print_pins VERSION is the pin-bump recipe. Every platform's tarball is
+# fetched from both routes and the two hashes compared; the paste-ready lines
+# go to stdout only after all three platforms agree, so a failure prints no
+# partial pin block.
+print_pins() {
+    local version=$1 platform primary fallback primary_sha fallback_sha pins
+    case "$version" in
+        ''|[!0-9]*|*[!0-9A-Za-z.-]*)
+            die "--print-pins takes a release version such as $NEXTEST_PINNED_VERSION, not '$version'" ;;
+    esac
+    require_sha256
+    pins_tmp=$(mktemp -d)
+    trap 'rm -rf "$pins_tmp"' EXIT
+    pins="NEXTEST_PINNED_VERSION=$version"
+    for platform in linux linux-arm mac; do
+        primary=$(primary_url_of "$version" "$platform")
+        fallback=$(fallback_url_of "$version" "$platform")
+        download "$primary" "$pins_tmp/$platform.primary" \
+            || die "$platform: get.nexte.st did not serve $primary"
+        download "$fallback" "$pins_tmp/$platform.fallback" \
+            || die "$platform: the GitHub release did not serve $fallback.
+If the release renamed its assets, fallback_url_of in this script must follow
+the new names before the pin moves; the install fallback would fail the same way."
+        primary_sha=$(sha256_of "$pins_tmp/$platform.primary")
+        fallback_sha=$(sha256_of "$pins_tmp/$platform.fallback")
+        if [ "$primary_sha" != "$fallback_sha" ]; then
+            die "$platform: the two routes serve different bytes, so no one checksum can pin both:
+  $primary
+    sha256 $primary_sha
+  $fallback
+    sha256 $fallback_sha"
+        fi
+        pins="$pins
+NEXTEST_SHA256_${platform//-/_}=$primary_sha"
+    done
+    printf '%s\n' "$pins"
+}
+
+case "${1-}" in
+    --print-pins)
+        [ "$#" -eq 2 ] || die "$usage"
+        print_pins "$2"
+        exit 0
+        ;;
+    *)
+        [ "$#" -eq 0 ] || die "$usage"
+        ;;
+esac
 
 # NEXTEST_VERSION selects the download; the checksums above do not follow it.
 # Left alone, that combination reads as a usable knob and behaves as a trap: the
@@ -100,14 +233,12 @@ fi
 case "$(uname -s)" in
     Linux)
         case "$(uname -m)" in
-            x86_64|amd64)
-                platform=linux;     target=x86_64-unknown-linux-gnu;  expected=$NEXTEST_SHA256_linux ;;
-            aarch64|arm64)
-                platform=linux-arm; target=aarch64-unknown-linux-gnu; expected=$NEXTEST_SHA256_linux_arm ;;
+            x86_64|amd64)   platform=linux;     expected=$NEXTEST_SHA256_linux ;;
+            aarch64|arm64)  platform=linux-arm; expected=$NEXTEST_SHA256_linux_arm ;;
             *) die "unsupported Linux arch '$(uname -m)' — add it here or install cargo-nextest by hand" ;;
         esac
         ;;
-    Darwin) platform=mac; target=universal-apple-darwin; expected=$NEXTEST_SHA256_mac ;;
+    Darwin) platform=mac; expected=$NEXTEST_SHA256_mac ;;
     *)      die "unsupported OS '$(uname -s)' — add it here or install cargo-nextest by hand" ;;
 esac
 
@@ -116,82 +247,63 @@ esac
 # PATH surgery and no `GITHUB_PATH` write.
 dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
+require_sha256
 
-# VERIFY BEFORE EXTRACTING. Everything after the checksum runs code that came
-# off the network, so the checksum is the last moment it is still just bytes.
-if command -v shasum >/dev/null 2>&1; then
-    sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
-elif command -v sha256sum >/dev/null 2>&1; then
-    sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
-else
-    die "neither shasum nor sha256sum is available, so the download cannot be verified; refusing to run it"
-fi
-
-# Two routes to the SAME bytes, tried in order: get.nexte.st, then the asset
-# on nextest's GitHub release that get.nexte.st redirects to. The checksum is
-# the pinned one above for both; it is never read from either host.
+# The checksum is the pinned one above for both routes; it is never read from
+# either host.
 #
 # NEXTEST_PRIMARY_URL replaces the first route. It changes where the bytes come
 # from, not what runs, because whatever it serves must still match the pinned
 # checksum. Pointing it at a closed port exercises the second route.
-primary_url="${NEXTEST_PRIMARY_URL:-https://get.nexte.st/${NEXTEST_VERSION}/${platform}}"
-fallback_url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${target}.tar.gz"
+primary_url="${NEXTEST_PRIMARY_URL:-$(primary_url_of "$NEXTEST_VERSION" "$platform")}"
+fallback_url=$(fallback_url_of "$NEXTEST_VERSION" "$platform")
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tarball="$tmp/nextest.tar.gz"
 
 # fetch_verified URL: download URL to $tarball and compare it with the pinned
-# checksum. Returns 0 only when $tarball holds the pinned release; otherwise
-# deletes it, prints the reason on stderr and returns 1.
-#
-# `--fail` makes an HTTP error a failed download, not a tarball made of an
-# error page. `--location` follows get.nexte.st's redirect to the release
-# asset, and `--proto-redir '=https'` keeps every hop of it on HTTPS.
-#
-# `--retry-all-errors` widens `--retry` from curl's transient class (a timeout,
-# and HTTP 408, 429, 500, 502, 503 and 504) to every failure, including a
-# connection reset (`curl: (35) Recv failure: Connection reset by peer`), which
-# `--retry` alone gives up on. That is five retries at least five seconds
-# apart, longer when the server sends a Retry-After; curl discards a partial
-# file before each retry. `--connect-timeout` and `--max-time` bound one
-# attempt, and `--retry-max-time` starts no new attempt after 120 s, so a host
-# that stalls hands over to the next route.
-#
-# A checksum mismatch also counts as a failed route: an error page served with
-# a 200, or a stale cache object, is a failed delivery, and the next route's
-# bytes face the same pinned checksum.
+# checksum. Returns 0 only when $tarball holds the pinned release. Otherwise it
+# deletes the file, prints the reason on stderr and returns 1 when the download
+# failed, 2 when the bytes arrived and do not match the pinned checksum.
 fetch_verified() {
     local src=$1 actual
-    printf 'install_nextest: fetching %s\n' "$src"
-    rm -f "$tarball"
-    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --fail --silent --show-error --location \
-        --retry 5 --retry-delay 5 --retry-all-errors --retry-max-time 120 \
-        --connect-timeout 30 --max-time 180 --url "$src" -o "$tarball"; then
-        printf 'install_nextest: download failed for %s\n' "$src" >&2
-        rm -f "$tarball"
-        return 1
-    fi
+    download "$src" "$tarball" || return 1
     actual=$(sha256_of "$tarball")
     if [ "$actual" != "$expected" ]; then
         printf 'install_nextest: checksum mismatch for %s\n  expected %s\n  actual   %s\n' \
             "$src" "$expected" "$actual" >&2
         rm -f "$tarball"
-        return 1
+        return 2
     fi
     printf 'install_nextest: sha256 %s verified\n' "$actual"
 }
 
-if ! fetch_verified "$primary_url"; then
-    printf '::warning::install_nextest: %s did not deliver the pinned release; falling back to the GitHub release asset\n' \
-        "$primary_url" >&2
-    fetch_verified "$fallback_url" \
-        || die "no route delivered the pinned cargo-nextest $NEXTEST_VERSION (errors above).
+# Both kinds of failure hand over to the next route, whose bytes face the same
+# pinned checksum, and they are reported at different levels: a failed download
+# (an outage, a 404) as a `warning`, bytes that arrived and do not match the
+# pinned checksum as an `error`. The error annotation stays on the run's
+# summary when the fallback then succeeds and the job passes.
+primary_status=0
+fetch_verified "$primary_url" || primary_status=$?
+if [ "$primary_status" -ne 0 ]; then
+    if [ "$primary_status" -eq 2 ]; then
+        annotate error "$primary_url served bytes that do not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform); falling back to the GitHub release asset"
+    else
+        annotate warning "$primary_url did not deliver the pinned release; falling back to the GitHub release asset"
+    fi
+    fallback_status=0
+    fetch_verified "$fallback_url" || fallback_status=$?
+    if [ "$fallback_status" -eq 2 ]; then
+        annotate error "$fallback_url served bytes that do not match the pinned sha256 of cargo-nextest $NEXTEST_VERSION ($platform)"
+    fi
+    if [ "$fallback_status" -ne 0 ]; then
+        die "no route delivered the pinned cargo-nextest $NEXTEST_VERSION (errors above).
 If NEXTEST_PINNED_VERSION was just bumped, the pinned checksums in this script
 must be bumped with it (the header shows how to regenerate them). A checksum
 mismatch on a route means the bytes it offered are not the release this repo
 pinned: do not run them."
+    fi
 fi
 
 tar -xzf "$tarball" -C "$tmp" || die "the download was not a gzip tarball"

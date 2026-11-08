@@ -700,6 +700,25 @@ jobs:
       - name: Rust and Cargo bootstrap self-test
         run: ./tools/scripts/test_install_rust.sh
 
+      # Offline: `curl` is a PATH shim serving fixture tarballs, so the route
+      # fallback, its annotations and the pin recipe run here on every pull
+      # request without touching either download host.
+      - name: Nextest installer self-test
+        run: ./tools/scripts/test_install_nextest.sh
+
+      - name: actionlint installer self-test
+        run: ./tools/scripts/test_install_actionlint.sh
+
+      # Every download in the workflows and in the tool and toolchain fetchers
+      # (`tools/scripts/install_*.sh`, `tools/scripts/build_*_container.sh`)
+      # is retried, has each attempt bounded and writes to a file. The
+      # checker's self-test runs first, so a reader that finds nothing cannot
+      # pass, and the check itself exits 2 when it finds no download at all.
+      - name: Tool downloads are retried and bounded
+        run: |
+          python3 -B tools/scripts/check_tool_downloads.py --self-test
+          python3 -B tools/scripts/check_tool_downloads.py
+
       # The rendered formula is Ruby, and parsing it is the headline assertion
       # of the self-test, which refuses to skip that check under CI. No other
       # step in any workflow reads Ruby, so this step installs an interpreter if
@@ -5872,7 +5891,11 @@ jobs:
         run: |
           set -eu
           url=https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o cargo-deny.tgz "$url"
+          # --connect-timeout and --max-time bound one attempt, so a stalled
+          # connection times out and is retried; --retry-max-time starts no new
+          # attempt after 120 s.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 30 --max-time 180 -o cargo-deny.tgz "$url"
           echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tgz" | sha256sum -c -
           tar -xzf cargo-deny.tgz
           install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"

@@ -410,7 +410,10 @@ that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/
 the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
 the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
 crates.io script self-tests (the index wait, the publish retry, and the post-publish
-archive reader `release.yml` runs after an upload); the naming gate (pull requests only);
+archive reader `release.yml` runs after an upload); the nextest and actionlint installer
+self-tests and the tool download check (`tools/scripts/check_tool_downloads.py`: every
+download in a workflow or a tool fetcher is retried, bounded and written to a file); the
+naming gate (pull requests only);
 `shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.

@@ -75,7 +75,11 @@ apt-get install -y --no-install-recommends \
     curl ca-certificates git
 rm -rf /var/lib/apt/lists/*
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+# Plain --retry: ubuntu 20.04's curl 7.68 predates --retry-all-errors, which it
+# would reject as an unknown option. --connect-timeout and --max-time bound one
+# attempt, so a stalled connection times out and is retried.
+curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 5 \
+    --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o /tmp/rustup-init.sh
 sh /tmp/rustup-init.sh -y --profile minimal --no-modify-path \
     --default-toolchain "$toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
