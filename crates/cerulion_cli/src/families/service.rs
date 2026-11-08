@@ -15,6 +15,7 @@ use cerulion_cli_engine::service_cmd;
 use super::nested::topic_message::{seconds, verb_exit_code};
 use super::VerbFamily;
 use crate::cli::VerbLogClass;
+use crate::network_switch::{self, NetworkRefusal, SwitchEnv};
 
 // The family's top-level verb, declared as a one-variant `Subcommand` so the
 // derive generates the `service` command.
@@ -81,6 +82,18 @@ impl VerbFamily for Service {
     /// `service call` runs and exits, so it defaults quiet.
     fn log_class(&self, _matches: &ArgMatches) -> VerbLogClass {
         VerbLogClass::OneShot
+    }
+
+    /// `service call --robot` reaches the robot, so the switch refuses it;
+    /// without `--robot` the call is local and runs.
+    fn network_refusal(&self, matches: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal> {
+        match ServiceAction::from_arg_matches(matches).ok()? {
+            ServiceAction::Call { robot, .. } => network_switch::robot_refusal(
+                robot.as_deref(),
+                cerulion_cli_engine::robot_act::SERVICE_CALL_VERB,
+                env,
+            ),
+        }
     }
 
     /// The same rule as every `topic` verb.

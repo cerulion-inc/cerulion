@@ -4,8 +4,9 @@
 //!
 //! A family owns everything about its verb in ONE module: the clap definition
 //! (its args carry their own completers, so completion comes with it), the log
-//! class, whether the login gate runs first, and the dispatch. It joins the
-//! binary through ONE line in [`FAMILIES`]. Nothing else changes: not the
+//! class, its network kill-switch refusal, whether the login gate runs first,
+//! and the dispatch. It joins the binary through ONE line in [`FAMILIES`].
+//! Nothing else changes: not the
 //! `Commands` enum, not `main`'s dispatch, not the log-class match in `cli.rs`,
 //! not the completion inventory code. [`cli_command`] is the one command
 //! factory `main` parses with and the completion engine completes from, so a
@@ -30,6 +31,7 @@ use clap::{ArgMatches, Command, CommandFactory};
 use cerulion_cli_engine::error::{render_user_error, CliError, CliResult};
 
 use crate::cli::{Cli, VerbLogClass};
+use crate::network_switch::{self, NetworkRefusal, SwitchEnv};
 
 mod doctor;
 mod nested;
@@ -57,11 +59,19 @@ pub(crate) trait VerbFamily: Sync {
     /// The default tracing filter class of the parsed invocation.
     fn log_class(&self, matches: &ArgMatches) -> VerbLogClass;
 
+    /// The refusal of the parsed invocation while the network kill switch in
+    /// `env` is engaged, or `None` when the switch does not refuse it. A verb
+    /// that reaches a robot or a daemon over the network refuses; the registry
+    /// consults this before the login gate, so a refused invocation never
+    /// asks for a sign-in ([`crate::network_switch`]).
+    fn network_refusal(&self, matches: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal>;
+
     /// Whether the login gate runs before [`VerbFamily::run`].
     fn needs_identity(&self, matches: &ArgMatches) -> bool;
 
     /// Run the parsed invocation and return the process exit code. Logging is
-    /// initialised and the login gate has passed by the time this is called.
+    /// initialised, the kill switch has not refused it and the login gate has
+    /// passed by the time this is called.
     fn run(&self, matches: &ArgMatches) -> ExitCode;
 }
 
@@ -292,18 +302,51 @@ pub(crate) fn find<'a>(
 
 /// Run the registered family or nested verb `matches` selected, the way
 /// `main` does: `setup` with its log class (logging and the iceoryx2 bridge),
-/// then `gate` when it needs an identity, then its own handler.
+/// then its kill-switch refusal under `switch`, then `gate` when it needs an
+/// identity, then its own handler ([`network_switch::refuse_or_gate`]).
 ///
 /// `None` when the verb is a built-in `Commands` verb, with neither `setup` nor
-/// `gate` called. A gate that refuses returns its exit code and the verb does
-/// not run.
+/// `gate` called. A refusal, or a gate that refuses, returns its exit code and
+/// the verb does not run; a refused verb never reaches the gate.
 pub(crate) fn route(
     families: &[&dyn VerbFamily],
     matches: &ArgMatches,
+    switch: &SwitchEnv,
     setup: impl FnOnce(VerbLogClass),
     gate: impl FnOnce() -> Option<ExitCode>,
 ) -> Option<ExitCode> {
-    route_with(families, nested::NESTED, matches, setup, gate)
+    route_with(families, nested::NESTED, matches, switch, setup, gate)
+}
+
+/// The kill-switch refusal `main` gives the invocation `matches` under
+/// `switch`: the nested verb's, else the family's, else the `Commands`
+/// verb's, looked up in the order [`route`] and `dispatch` use.
+#[cfg(test)]
+pub(crate) fn network_refusal(matches: &ArgMatches, switch: &SwitchEnv) -> Option<NetworkRefusal> {
+    if let Some((verbs, sub)) = nested::find(nested::NESTED, matches) {
+        return verbs.network_refusal(sub, switch);
+    }
+    if let Some((family, sub)) = find(FAMILIES, matches) {
+        return family.network_refusal(sub, switch);
+    }
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(matches)
+        .expect("a built-in verb converts to `Commands`");
+    crate::command_network_refusal(&cli.command, switch)
+}
+
+/// Whether `main` runs the login gate for the invocation `matches` when the
+/// kill switch does not refuse it, looked up as [`network_refusal`] is.
+#[cfg(test)]
+pub(crate) fn needs_identity(matches: &ArgMatches) -> bool {
+    if let Some((verbs, sub)) = nested::find(nested::NESTED, matches) {
+        return verbs.needs_identity(sub);
+    }
+    if let Some((family, sub)) = find(FAMILIES, matches) {
+        return family.needs_identity(sub);
+    }
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(matches)
+        .expect("a built-in verb converts to `Commands`");
+    crate::command_needs_identity(&cli.command)
 }
 
 /// [`route`] over an explicit nested-verb registry.
@@ -314,13 +357,16 @@ fn route_with(
     families: &[&dyn VerbFamily],
     nested: &[&dyn nested::NestedVerbs],
     matches: &ArgMatches,
+    switch: &SwitchEnv,
     setup: impl FnOnce(VerbLogClass),
     gate: impl FnOnce() -> Option<ExitCode>,
 ) -> Option<ExitCode> {
-    let (class, needs_identity, run): (VerbLogClass, bool, Box<dyn FnOnce() -> ExitCode + '_>) =
+    type Run<'a> = Box<dyn FnOnce() -> ExitCode + 'a>;
+    let (class, refusal, needs_identity, run): (VerbLogClass, _, bool, Run<'_>) =
         if let Some((verbs, sub)) = nested::find(nested, matches) {
             (
                 verbs.log_class(sub),
+                verbs.network_refusal(sub, switch),
                 verbs.needs_identity(sub),
                 Box::new(move || verbs.run(sub)),
             )
@@ -328,15 +374,14 @@ fn route_with(
             let (family, sub) = find(families, matches)?;
             (
                 family.log_class(sub),
+                family.network_refusal(sub, switch),
                 family.needs_identity(sub),
                 Box::new(move || family.run(sub)),
             )
         };
     setup(class);
-    if needs_identity {
-        if let Some(refused) = gate() {
-            return Some(refused);
-        }
+    if let Some(refused) = network_switch::refuse_or_gate(refusal, needs_identity, gate) {
+        return Some(refused);
     }
     Some(run())
 }
@@ -381,6 +426,8 @@ mod tests {
         name: &'static str,
         after: Option<&'static str>,
         gated: bool,
+        /// Refused with exit 9 while `CERULION_NETWORK` engages the switch.
+        refused: bool,
         aliases: &'static [&'static str],
     }
 
@@ -388,6 +435,7 @@ mod tests {
         name: "dummy",
         after: None,
         gated: false,
+        refused: false,
         aliases: &[],
     };
 
@@ -397,6 +445,7 @@ mod tests {
             name,
             after: None,
             gated: false,
+            refused: false,
             aliases: &[],
         }
     }
@@ -418,6 +467,10 @@ mod tests {
                 Some("wait") => VerbLogClass::LongRunning,
                 _ => VerbLogClass::OneShot,
             }
+        }
+        fn network_refusal(&self, _: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal> {
+            (self.refused && env.network_engaged())
+                .then(|| NetworkRefusal::error("the dummy reaches the network", 9))
         }
         fn needs_identity(&self, _matches: &ArgMatches) -> bool {
             self.gated
@@ -455,6 +508,9 @@ mod tests {
         }
         fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
             VerbLogClass::OneShot
+        }
+        fn network_refusal(&self, _: &ArgMatches, _: &SwitchEnv) -> Option<NetworkRefusal> {
+            None
         }
         fn needs_identity(&self, _: &ArgMatches) -> bool {
             true
@@ -566,12 +622,23 @@ mod tests {
         argv: &[&str],
         refuse: Option<u8>,
     ) -> (Option<VerbLogClass>, usize, Option<i64>) {
+        routed_under(families, argv, refuse, &SwitchEnv::default())
+    }
+
+    /// [`routed`] under the kill-switch variables `switch`.
+    fn routed_under(
+        families: &[&dyn VerbFamily],
+        argv: &[&str],
+        refuse: Option<u8>,
+        switch: &SwitchEnv,
+    ) -> (Option<VerbLogClass>, usize, Option<i64>) {
         let matches = with(families).try_get_matches_from(argv).expect("parse");
         let mut class = None;
         let mut gate_runs = 0;
         let code = route(
             families,
             &matches,
+            switch,
             |c| class = Some(c),
             || {
                 gate_runs += 1;
@@ -616,6 +683,10 @@ mod tests {
         fn log_class(&self, _: &ArgMatches) -> VerbLogClass {
             VerbLogClass::LongRunning
         }
+        fn network_refusal(&self, _: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal> {
+            env.network_engaged()
+                .then(|| NetworkRefusal::error("the probe reaches the network", 8))
+        }
         fn needs_identity(&self, _: &ArgMatches) -> bool {
             true
         }
@@ -632,7 +703,7 @@ mod tests {
         let families: [&dyn VerbFamily; 1] = [&DUMMY];
         let sets: [&dyn nested::NestedVerbs; 1] = [&UnderDummy];
         let cmd = nested::attach(with(&families), &sets).expect("nested verbs attach");
-        let route = |argv: &[&str]| {
+        let route = |argv: &[&str], switch: &SwitchEnv| {
             let matches = cmd.clone().try_get_matches_from(argv).expect("parse");
             let mut class = None;
             let mut gate_runs = 0;
@@ -640,6 +711,7 @@ mod tests {
                 &families,
                 &sets,
                 &matches,
+                switch,
                 |c| class = Some(c),
                 || {
                     gate_runs += 1;
@@ -652,15 +724,68 @@ mod tests {
                 code.map(crate::telemetry::exit_code_number),
             )
         };
+        let unset = SwitchEnv::default();
         assert_eq!(
-            route(&["cerulion", "dummy", "probe"]),
+            route(&["cerulion", "dummy", "probe"], &unset),
             (Some(VerbLogClass::LongRunning), 1, Some(44))
         );
         // The family's own verbs still reach the family.
         assert_eq!(
-            route(&["cerulion", "dummy", "wait"]),
+            route(&["cerulion", "dummy", "wait"], &unset),
             (Some(VerbLogClass::LongRunning), 0, Some(43))
         );
+        // Under the switch the nested verb's refusal is the exit code, and
+        // neither the gate nor its handler runs.
+        assert_eq!(
+            route(
+                &["cerulion", "dummy", "probe"],
+                &SwitchEnv::network(Some("off"))
+            ),
+            (Some(VerbLogClass::LongRunning), 0, Some(8))
+        );
+    }
+
+    #[test]
+    fn a_family_the_switch_refuses_exits_before_the_gate_and_its_handler() {
+        let refused = Dummy {
+            gated: true,
+            refused: true,
+            ..dummy("dummy")
+        };
+        // Engaged by `off` in any case and, failing closed, by any other
+        // non-empty value: the refusal's code, no gate, no handler. The gate
+        // here would refuse with 7, so a run that reached it reads 7.
+        for value in ["off", " OFF ", "on"] {
+            let (class, gate_runs, code) = routed_under(
+                &[&refused],
+                &["cerulion", "dummy", "echo", "switched-off"],
+                Some(7),
+                &SwitchEnv::network(Some(value)),
+            );
+            assert_eq!(
+                (class, gate_runs, code),
+                (Some(VerbLogClass::OneShot), 0, Some(9)),
+                "CERULION_NETWORK={value:?}"
+            );
+        }
+        assert!(!DUMMY_RUNS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&"switched-off".to_string()));
+        // Unset or blank, the same family meets the gate as before.
+        for value in [None, Some(""), Some("  ")] {
+            let (_, gate_runs, code) = routed_under(
+                &[&refused],
+                &["cerulion", "dummy", "wait"],
+                None,
+                &SwitchEnv::network(value),
+            );
+            assert_eq!(
+                (gate_runs, code),
+                (1, Some(43)),
+                "CERULION_NETWORK={value:?}"
+            );
+        }
     }
 
     #[test]

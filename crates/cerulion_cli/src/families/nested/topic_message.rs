@@ -17,6 +17,7 @@ use cerulion_cli_engine::topic_cmd::{publish, snapshot, TopicScope};
 use super::NestedVerbs;
 use crate::cli::VerbLogClass;
 use crate::completion;
+use crate::network_switch::{self, NetworkRefusal, SwitchEnv};
 
 /// The verb these verbs are added under (read by the docs gate too).
 const PARENT: &str = "topic";
@@ -115,6 +116,17 @@ impl NestedVerbs for TopicMessage {
     /// Quiet like every `topic` verb: the output is the data.
     fn log_class(&self, _matches: &ArgMatches) -> VerbLogClass {
         VerbLogClass::OneShot
+    }
+
+    /// `--robot` reaches the robot, so the switch refuses it; without
+    /// `--robot` the verb is local and runs.
+    fn network_refusal(&self, matches: &ArgMatches, env: &SwitchEnv) -> Option<NetworkRefusal> {
+        use cerulion_cli_engine::robot_act::{TOPIC_PUBLISH_VERB, TOPIC_SNAPSHOT_VERB};
+        let (robot, verb) = match TopicMessageAction::from_arg_matches(matches).ok()? {
+            TopicMessageAction::Pub { robot, .. } => (robot, TOPIC_PUBLISH_VERB),
+            TopicMessageAction::Snapshot { robot, .. } => (robot, TOPIC_SNAPSHOT_VERB),
+        };
+        network_switch::robot_refusal(robot.as_deref(), verb, env)
     }
 
     /// The same rule as every `topic` verb.
