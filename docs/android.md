@@ -1041,20 +1041,22 @@ the app and a desk can see why remote access is down:
 "remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close"}
 ```
 
-This also applies when the plane does not stop at a restart. The restart does
-not fail because of it. A later start in that process, with or without
-`remote.enabled`, starts its graph, and local work runs. A start with
-`remote.enabled` starts with remote off for that run: it does not bind a
-plane, and `status.remote` names the stuck plane and adds `off_reason`, which
-says that remote is off because an earlier plane did not stop:
+This also applies when the plane does not stop at a restart, or in the
+teardown after a panic. The restart does not fail because of it. Every later
+start in that process, with or without `remote.enabled`, and also of a new
+runtime, starts its graph, local work runs, and `status.remote` names the
+stuck plane. A start with `remote.enabled` starts with remote off for that
+run: it does not bind a plane, and `status.remote` adds `off_reason`, which
+says that remote is off because an earlier plane did not stop. This is also
+true when the plane of another runtime fails to stop while that start binds:
 
 ```json
 "remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close", "off_reason": "remote is off for this run: an earlier remote plane in this process did not stop and may still answer under this device key; restart the app process to host the plane again"}
 ```
 
-`off_reason` stays until that run stops. `stop_error` and `off_reason` are
-not in the JSON while a plane serves. Remote comes back after the app process
-restarts.
+Every other bind failure keeps its code. `off_reason` stays until that run
+stops. `stop_error` and `off_reason` are not in the JSON while a plane serves.
+Remote comes back after the app process restarts.
 
 While it binds, the plane's iroh endpoint lists the network interfaces
 through netlink and through `/sys/class/net`. Android refuses both to apps,

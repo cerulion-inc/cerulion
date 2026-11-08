@@ -497,4 +497,21 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
     }
     runtime.stop().expect("this run hosts no plane");
     assert_eq!(status(&runtime).remote, stuck);
+
+    // A replacement runtime reads the same process record: a start with
+    // remote off names the stuck plane too, without `off_reason`, since
+    // that start did not ask for remote.
+    drop(runtime);
+    let replaced_files = tempdir().unwrap();
+    let mut replaced =
+        EmbeddedRuntime::new(replaced_files.path().to_path_buf(), ROBOT.into()).unwrap();
+    replaced
+        .start(&config(&topics, json!({"enabled": false})))
+        .expect("a replacement runtime starts while the old plane is stuck");
+    assert_eq!(log(&fake), Vec::<String>::new());
+    let replacement = status(&replaced);
+    assert_eq!(replacement.state, RuntimeState::Running);
+    assert_eq!(replacement.remote, stuck, "the stuck plane stays named");
+    replaced.stop().expect("this run hosts no plane");
+    assert_eq!(status(&replaced).remote, stuck);
 }
