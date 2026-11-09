@@ -8,18 +8,44 @@
   </a>
 </p>
 
-**Run robots. Understand failures. Test every change.**
+**Give Claude, Codex, or Cursor your robot recordings. Investigate failures, replay native code, and check changes in CI.**
+
+For robotics engineers who run a ROS 2 stack or write native Rust nodes.
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![crates.io: cerulion_cli 1.0.0](https://img.shields.io/badge/crates.io-cerulion__cli%201.0.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-docs.cerulion.com-blue.svg)](https://docs.cerulion.com)
 
+![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
+
+Install, sign in, then check your current code against a recording:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+cerulion login
+cerulion bag play "recordings/obstacle_avoidance_<timestamp>.mcap" --resim all --verify
+```
+
+The [quickstart](#quickstart-run-record-and-verify) builds the example graph and makes that recording with `cerulion graph run --record`.
+
+Connect your agent to Hindsight, which investigates MCAP recordings and cites topics and timestamps. Hindsight is in early access: [request access](https://docs.cerulion.com/cerulion/hindsight).
+
+```bash
+claude mcp add --transport stdio hindsight -- hindsight mcp
+```
+
+**[Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides) · [Benchmarks](https://cerulion.com/benchmarks) · [Talk to the team](https://cerulion.com/demo)**
+
+If Cerulion saves you a debugging session, a star helps other robotics engineers find it.
+
+## What Cerulion is
+
 Cerulion connects the software running on a robot to the tools that inspect it and the tests that keep it working. Run your nodes, see their data in Studio, capture a failure, and re-execute that recording against a code or model change before deploying it.
 
 Built for **Physical AI**, Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-copy shared memory, a scheduler that follows your node graph, ROS 2 interoperability and secure access to remote robots. The runtime records the data and execution context needed to turn real robot behavior into CI tests.
 
-**[Install](#install) · [Architecture](#how-it-fits-together) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack) · [Docs](https://docs.cerulion.com)**
+**[Install](#install) · [Architecture](#how-it-fits-together) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack)**
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/development-loop-dark.svg">
@@ -202,9 +228,7 @@ cerulion node build safety_controller --release
 cerulion bag play "$BAG" --resim all --verify
 ```
 
-This time verification reports a divergence and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot.
-
-![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
+This time verification reports a divergence and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation at the top of this page shows this whole run.
 
 <details>
 <summary>What replay verification checks</summary>
