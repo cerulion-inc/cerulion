@@ -1997,6 +1997,14 @@ async fn the_daemon_engages_the_ops_latch_from_an_rcp_estop_with_rcpd_down() {
         before.starts_with("verb error: usage: unknown message type"),
         "clear: {before}"
     );
+    // `restart` with no `graph`: while the latch is clear its gate lets it
+    // read the args, so it answers the args error and runs nothing.
+    let restart_before =
+        remote_message(ops_call(&desk, robot_addr.clone(), "restart", json!({})).await);
+    assert_eq!(
+        restart_before,
+        "verb error: invalid restart args: missing field `graph`"
+    );
 
     let conn = bounded("dial rcp", dial(&desk, robot_addr.clone(), alpn::RCP))
         .await
@@ -2024,10 +2032,15 @@ async fn the_daemon_engages_the_ops_latch_from_an_rcp_estop_with_rcpd_down() {
         "{r}"
     );
 
-    let after = remote_message(ops_call(&desk, robot_addr, "topic-publish", args).await);
+    let after = remote_message(ops_call(&desk, robot_addr.clone(), "topic-publish", args).await);
     assert_eq!(
         after,
         "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+    );
+    let restart_after = remote_message(ops_call(&desk, robot_addr, "restart", json!({})).await);
+    assert_eq!(
+        restart_after,
+        "verb error: unavailable: the robot's e-stop is engaged, so restart is refused"
     );
     let _ = stop.send(());
     let served = bounded("daemon stops", daemon).await.expect("daemon task");
