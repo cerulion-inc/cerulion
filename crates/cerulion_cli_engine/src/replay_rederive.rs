@@ -558,9 +558,16 @@ pub enum LatestDrain {
     /// recording staged no trigger-drain (`Drain`) read stage for the input.
     Unified,
     /// Two subscribers: the boundary drain pops the trigger subscriber's copy
-    /// of each frame, the tick reads the body subscriber's copy, and the step
-    /// fires the node only while the body subscriber holds a frame no read has
-    /// taken. The recording staged a trigger-drain read stage for the input,
+    /// of each frame and the tick reads the body subscriber's copy. On an
+    /// entry that answers the body probe (`NodeEntry::probes_trigger_input`)
+    /// the step fires the node only while the body subscriber holds a frame no
+    /// read has taken. On one that does not, the drain signals one arrival per
+    /// counted frame and the scheduler's `consume = latest` arm spends them
+    /// all in one fire, so the node fires once at every step whose drain
+    /// counted a frame unless a pre-fire check holds it. The bag records
+    /// neither which kind the entry was nor
+    /// the probe's answers, so the input is judged by the rules that hold for
+    /// both. The recording staged a trigger-drain read stage for the input,
     /// or, on a bag that states no per-input stage set, the input declares
     /// `block` or `sample(N)`, which never read through one subscriber.
     Separate,
@@ -830,8 +837,9 @@ pub struct ScheduleFinding {
 /// writer. Before the node's first fire in the pass, a read the read log does
 /// not hold can have taken one queue of them more ([`Self::unlogged`]). Any
 /// frame past those sat unread in the body subscriber when this step counted
-/// its arrivals and asked the body whether a read finds a frame, so the step
-/// owed the node a fire and the recording holds none.
+/// its arrivals, so the step owed the node a fire and the recording holds
+/// none: an entry that answers the body probe finds that frame, and one that
+/// does not fires on any counted frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadFrames {
     /// The trigger input.
@@ -3286,9 +3294,12 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// to the bound on every step and to the unread-frame rule instead of the
 /// per-pop fire. Its drain records are the trigger subscriber's pops, which
 /// include frames an earlier body read already drained, and the live step
-/// mints a fire only when its probe finds a frame in the body subscriber (or,
-/// where the entry cannot answer, on every counted arrival, which only adds
-/// fires). The log records neither the probe's answer nor the body queue, so a pop owes no
+/// mints a fire only when its probe finds a frame in the body subscriber, or,
+/// on an entry that does not answer the probe, one signal per counted frame,
+/// which the scheduler's `consume = latest` arm spends in one fire. That only
+/// adds fires, never a second one in a step, so the bound holds for both. The
+/// log records neither which kind the entry was, nor the probe's answer, nor
+/// the body queue, so a pop owes no
 /// fire of its own; what it does owe is that a frame the trigger drain counted
 /// was taken by a read or followed by a fire ([`LatestUnread::step`]). A step
 /// whose counted frames outrun what the last fire's reads took plus two
@@ -3576,7 +3587,11 @@ enum LatestUnreadVerdict {
 /// frame that sits unread in the body queue. A writer hands over one frame at
 /// a time, so the middle two are at most one each per writer. The fourth
 /// makes the live step's body probe answer that a read finds a frame, and the
-/// step that counted it then fires the node.
+/// step that counted it then fires the node. An entry that does not answer
+/// the probe fires at every step whose drain counted any frame (a pre-fire
+/// check aside, which [`verify_latest`] judges apart), so the rule
+/// holds for it too, and judges it more leniently than one fire per counting
+/// step, which the bag cannot tell it owed.
 ///
 /// Before the node's first fire in the pass a fifth kind is possible: a frame
 /// a read the read log does not hold took (the node's `init`, which runs
@@ -6127,6 +6142,52 @@ mod tests {
         ]
     }
 
+    /// The trigger drain's count of `popped` frames, the newest `seq`.
+    fn counted_burst(seq: u32, popped: u32) -> RecordedRead {
+        latest_read(
+            ReadOutcomeKind::DrainedBatch,
+            seq,
+            popped,
+            ReadSiteRole::Drain,
+        )
+    }
+
+    /// The tick's read finding the queue it reads empty.
+    fn empty_body_read() -> RecordedRead {
+        RecordedRead {
+            served_seq: None,
+            ..read_with_role(
+                "sink",
+                "inp",
+                ReadOutcomeKind::NoFrame,
+                0,
+                None,
+                ReadSiteRole::Body,
+            )
+        }
+    }
+
+    /// A healthy recording of an input read through two subscribers by an
+    /// entry that answers no body probe. The boundary drain signals one
+    /// arrival per counted frame, and the scheduler's `consume = latest` arm
+    /// fires the node once however many arrivals are pending, so the node
+    /// fires once at every step whose trigger drain counted a frame. Step 1 counts three
+    /// frames and its read takes them and frame 4, which landed after that
+    /// count; step 2 counts frame 4 and fires on it, and its read finds
+    /// nothing; step 3 counts nothing and fires nothing; step 4 counts two
+    /// frames; step 6's tick does not read the input.
+    fn unprobed_two_subscriber_recording() -> Vec<RecordedStep> {
+        vec![
+            latest_step(0, true, vec![counted(0), body_read(0, 1)]),
+            latest_step(1, true, vec![counted_burst(3, 3), body_read(4, 4)]),
+            latest_step(2, true, vec![counted(4), empty_body_read()]),
+            latest_step(3, false, vec![]),
+            latest_step(4, true, vec![counted_burst(6, 2), body_read(6, 2)]),
+            latest_step(5, true, vec![counted(7), body_read(7, 1)]),
+            latest_step(6, true, vec![counted(8)]),
+        ]
+    }
+
     /// A latest node's drain pops a whole burst and fires ONCE; a step that
     /// popped nothing fires at most once (a held frame re-offered).
     #[test]
@@ -6340,6 +6401,131 @@ mod tests {
         let unified = verify_unrestored(&latest_node(), &healthy, &[], BELIEVED);
         assert_eq!(unified.findings[0].step, 0, "{:?}", unified.findings);
         assert_eq!(unified.findings[0].unread, None);
+    }
+
+    /// An entry that answers no body probe signals on every counted arrival
+    /// and fires once at every step that counted one, and the bag does not
+    /// record whether an entry answered it. Its
+    /// recording, one fire at every step whose drain counted a frame, a
+    /// three-frame count and a count of a frame the last read took included,
+    /// re-derives clean with nothing stood down: on either reading of the
+    /// roles, with or without a writer cap, and on a drain the bag does not
+    /// record. Its per-frame signals still give one fire a step, so a second
+    /// fire at the three-frame step is a finding on the one-fire bound, with
+    /// nothing stood down.
+    #[test]
+    fn an_unprobed_separate_drain_latest_recording_re_derives_clean() {
+        let unprobed = unprobed_two_subscriber_recording();
+        for writers in [Some(1), None] {
+            let separate = latest_node_on(LatestDrain::Separate, writers);
+            for trust in [BELIEVED, RoleTrust::Declined] {
+                let report = verify_unrestored(&separate, &unprobed, &[], trust);
+                assert!(
+                    report.is_clean(),
+                    "{writers:?} {trust:?}: {:?}",
+                    report.findings
+                );
+                assert!(
+                    report.stand_downs.is_empty(),
+                    "{writers:?} {trust:?}: {:?}",
+                    report.stand_downs
+                );
+            }
+        }
+        let unrecorded = verify_unrestored(
+            &latest_node_on(LatestDrain::Unrecorded, Some(1)),
+            &unprobed,
+            &[],
+            BELIEVED,
+        );
+        assert!(
+            unrecorded.is_clean() && unrecorded.stand_downs.is_empty(),
+            "{unrecorded:?}"
+        );
+
+        let mut twice = unprobed.clone();
+        twice[1].fires.push(fire("sink", EPOCH + 1));
+        let bound = verify_unrestored(
+            &latest_node_on(LatestDrain::Separate, Some(1)),
+            &twice,
+            &[],
+            BELIEVED,
+        );
+        assert!(bound.stand_downs.is_empty(), "{:?}", bound.stand_downs);
+        assert_eq!(bound.findings.len(), 1, "{:?}", bound.findings);
+        assert_eq!(bound.findings[0].step, 1);
+        assert_eq!(bound.findings[0].recorded, StepFires::count(2));
+        assert_eq!(bound.findings[0].unread, None);
+    }
+
+    /// The same entry, stalled: it fires on every count through step 2,
+    /// whose read finds nothing, then fires nothing while its trigger drain
+    /// counts two frames a step. A step that popped and fired nothing is
+    /// owed no fire of its own, since the bag cannot say the entry answered
+    /// no probe; the count passes the reads and the two frames one writer
+    /// can be delivering at step 4, which is the finding. An archived bag
+    /// credits step 2's unsited pop as a possible read and convicts at the
+    /// same step. A drain the bag does not record names that once, at step
+    /// 3, and step 4 is the same finding.
+    #[test]
+    fn an_unprobed_separate_drain_latest_node_that_stops_firing_is_still_caught() {
+        let mut stalled = unprobed_two_subscriber_recording()[..3].to_vec();
+        stalled.push(latest_step(3, false, vec![counted_burst(6, 2)]));
+        stalled.push(latest_step(4, false, vec![counted_burst(8, 2)]));
+        stalled.push(latest_step(5, false, vec![counted_burst(10, 2)]));
+        let separate = latest_node_on(LatestDrain::Separate, Some(1));
+        let report = verify_unrestored(&separate, &stalled, &[], BELIEVED);
+        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        assert_eq!(
+            report.findings,
+            vec![ScheduleFinding {
+                node_id: "sink".to_string(),
+                step: 4,
+                decider: Decider::LatestFire,
+                expected: StepFires::count(1),
+                recorded: StepFires::count(0),
+                unread: Some(UnreadFrames {
+                    input: "inp".to_string(),
+                    newest_seq: Some(8),
+                    last_fire: Some(2),
+                    counted: 4,
+                    read: 0,
+                    in_delivery: 2,
+                    unlogged: 0,
+                }),
+            }]
+        );
+        let archived = verify_unrestored(&separate, &stalled, &[], RoleTrust::Declined);
+        assert!(
+            archived.stand_downs.is_empty(),
+            "{:?}",
+            archived.stand_downs
+        );
+        assert_eq!(archived.findings.len(), 1, "{:?}", archived.findings);
+        assert_eq!(archived.findings[0].step, 4);
+        assert_eq!(
+            archived.findings[0]
+                .unread
+                .as_ref()
+                .map(|f| (f.counted, f.read)),
+            Some((4, 1))
+        );
+
+        let unrecorded = verify_unrestored(
+            &latest_node_on(LatestDrain::Unrecorded, Some(1)),
+            &stalled,
+            &[],
+            BELIEVED,
+        );
+        assert_eq!(
+            unrecorded.stand_downs,
+            vec![StandDown {
+                node_id: "sink".to_string(),
+                decider: Decider::LatestFire,
+                reason: StandDownReason::LatestDrainUnrecorded,
+            }]
+        );
+        assert_eq!(unrecorded.findings, report.findings);
     }
 
     /// Where the bag lacks what the comparison needs, the rule stands down
