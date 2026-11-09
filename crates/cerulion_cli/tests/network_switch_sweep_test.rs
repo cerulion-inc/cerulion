@@ -712,6 +712,42 @@ fn viz_robot_under_a_daemon_switch_refuses_before_the_login_gate() {
     }
 }
 
+#[test]
+fn graph_live_and_fires_under_the_netd_switch_refuse_before_the_login_gate() {
+    // They ask robots through `cerulion-netd`, so its own switch refuses them
+    // as `CERULION_NETWORK` does, before the gate.
+    for argv in [&["graph", "live"][..], &["graph", "fires"][..]] {
+        let what = format!("{argv:?} under CERULION_NETD_NETWORK=off");
+        let home = tempfile::tempdir().expect("a home");
+        let run = spawn_with(
+            home.path(),
+            None,
+            &[("CERULION_NETD_NETWORK", "off")],
+            argv,
+            true,
+        );
+        assert_eq!(run.code, Some(1), "{what}: stderr={}", run.stderr);
+        assert!(
+            run.stderr.contains(&format!(
+                "Error: cerulion {}: asking robots is disabled by CERULION_NETD_NETWORK=off",
+                argv.join(" ")
+            )),
+            "{what}: stderr={}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("unset CERULION_NETD_NETWORK to ask robots"),
+            "{what}: stderr={}",
+            run.stderr
+        );
+        assert_no_sign_in(&what, &run);
+        assert_no_contact(&what, &run);
+        assert!(run.stdout.is_empty(), "{what}: stdout={}", run.stdout);
+        assert_no_identity_written(&what, home.path());
+    }
+}
+
 /// A signed-in home.
 fn seeded_home() -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("a home");

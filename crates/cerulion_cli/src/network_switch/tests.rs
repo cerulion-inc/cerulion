@@ -108,10 +108,15 @@ fn every_row_states_its_outcome() {
     }
 }
 
+/// The verbs whose `--robot` only narrows which robots they ask: without it
+/// they ask every robot, so the switch refuses them in every form.
+const ALWAYS_ASK_ROBOTS: &[&[&str]] = &[&["graph", "live"], &["graph", "fires"]];
+
 #[test]
 fn every_robot_flag_has_a_refused_row_and_a_local_row() {
     // A verb that gains `--robot` reaches a robot: the table must say what the
-    // switch does to that form, and to the form without it.
+    // switch does to that form, and to the form without it, which runs on
+    // this machine unless the verb always asks robots.
     let cmd = families::cli_command();
     let mut tree = BTreeSet::new();
     leaves(&cmd, &mut Vec::new(), &mut tree);
@@ -131,6 +136,20 @@ fn every_robot_flag_has_a_refused_row_and_a_local_row() {
                 .any(|c| c.argv.contains(&"--robot") && matches!(c.expect, Expect::Refused { .. })),
             "{path:?} takes --robot: it needs a refused row with --robot"
         );
+        if ALWAYS_ASK_ROBOTS.contains(&path.as_slice()) {
+            assert!(
+                rows.iter()
+                    .any(|c| !c.argv.contains(&"--robot")
+                        && matches!(c.expect, Expect::Refused { .. })),
+                "{path:?} always asks robots: it needs a refused row without --robot"
+            );
+            assert!(
+                rows.iter()
+                    .all(|c| matches!(c.expect, Expect::Refused { .. })),
+                "{path:?} always asks robots: the switch refuses every row"
+            );
+            continue;
+        }
         assert!(
             rows.iter().any(
                 |c| !c.argv.contains(&"--robot") && !matches!(c.expect, Expect::Refused { .. })
@@ -262,6 +281,49 @@ fn viz_robot_also_refuses_under_the_daemon_switches() {
         ..SwitchEnv::default()
     };
     assert_eq!(families::network_refusal(&matches, &not_off), None);
+}
+
+#[test]
+fn graph_live_and_fires_also_refuse_under_the_netd_switch() {
+    // They ask robots through `cerulion-netd`, so its own switch refuses them
+    // as `CERULION_NETWORK` does, with the daemon's parse (only `off`).
+    let netd = |value: &str| SwitchEnv {
+        netd: Some(value.into()),
+        ..SwitchEnv::default()
+    };
+    let mut rows = 0;
+    for case in CASES.iter().filter(|c| ALWAYS_ASK_ROBOTS.contains(&c.verb)) {
+        rows += 1;
+        let matches = parse(case);
+        let got = families::network_refusal(&matches, &netd("off"))
+            .unwrap_or_else(|| panic!("{:?}: not refused", case.argv));
+        assert_eq!(got.code(), 1, "{}", got.line());
+        assert!(
+            got.line()
+                .contains("disabled by CERULION_NETD_NETWORK=off, so this command")
+                && got
+                    .line()
+                    .contains("unset CERULION_NETD_NETWORK to ask robots"),
+            "{:?}: {}",
+            case.argv,
+            got.line()
+        );
+        for value in ["OFF", " off", "on"] {
+            assert_eq!(
+                families::network_refusal(&matches, &netd(value)),
+                None,
+                "{:?} under CERULION_NETD_NETWORK={value:?}",
+                case.argv
+            );
+        }
+        // `CERULION_VIZD_NETWORK` is the viewer daemon's switch only.
+        let vizd = SwitchEnv {
+            vizd: Some("off".into()),
+            ..SwitchEnv::default()
+        };
+        assert_eq!(families::network_refusal(&matches, &vizd), None);
+    }
+    assert_eq!(rows, 6, "a bare, a --robot and a --connect row per verb");
 }
 
 #[test]

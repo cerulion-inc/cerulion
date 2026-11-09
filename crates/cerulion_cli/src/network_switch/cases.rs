@@ -110,6 +110,32 @@ const RCP_FLAG: &[&str] = &[
     "Error: cerulion rcp reaches the robot over the network, which --network off disables; \
      drop --network to reach the robot's rcpd",
 ];
+const GRAPH_LIVE: &[&str] = &[
+    "Error: cerulion graph live: asking robots is disabled by ",
+    ", so this command stays local-only and contacts no robot; unset CERULION_NETWORK to ask \
+     robots through cerulion-netd or --connect",
+];
+const GRAPH_FIRES: &[&str] = &[
+    "Error: cerulion graph fires: asking robots is disabled by ",
+    ", so this command stays local-only and contacts no robot; unset CERULION_NETWORK to ask \
+     robots through cerulion-netd or --connect",
+];
+
+const fn refused_query(
+    verb: &'static [&'static str],
+    argv: &'static [&'static str],
+    says: &'static [&'static str],
+) -> Case {
+    Case {
+        verb,
+        argv,
+        expect: Expect::Refused {
+            code: 1,
+            says,
+            by: By::Network,
+        },
+    }
+}
 
 const fn gated(verb: &'static [&'static str], argv: &'static [&'static str]) -> Case {
     Case {
@@ -218,6 +244,30 @@ pub(crate) static CASES: &[Case] = &[
             by: By::Flag,
         },
     },
+    // ---- refused in every form: they always ask robots, through
+    // cerulion-netd or a session of their own (--connect) ----
+    refused_query(&["graph", "live"], &["graph", "live"], GRAPH_LIVE),
+    refused_query(
+        &["graph", "live"],
+        &["graph", "live", "--robot", "bench-arm"],
+        GRAPH_LIVE,
+    ),
+    refused_query(
+        &["graph", "live"],
+        &["graph", "live", "--connect", "tcp/127.0.0.1:7683"],
+        GRAPH_LIVE,
+    ),
+    refused_query(&["graph", "fires"], &["graph", "fires"], GRAPH_FIRES),
+    refused_query(
+        &["graph", "fires"],
+        &["graph", "fires", "--robot", "bench-arm"],
+        GRAPH_FIRES,
+    ),
+    refused_query(
+        &["graph", "fires"],
+        &["graph", "fires", "--connect", "tcp/127.0.0.1:7683"],
+        GRAPH_FIRES,
+    ),
     // ---- the same verbs without --robot are not refused ----
     gated(
         &["topic", "pub"],

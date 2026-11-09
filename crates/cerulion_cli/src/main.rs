@@ -3908,9 +3908,10 @@ fn command_needs_identity(command: &Commands) -> bool {
 /// The network kill-switch refusal of a `Commands` verb under `switch`, which
 /// `dispatch` gives before the login gate. Each verb's refusal is the one its
 /// own path gives further down, with the same text and exit code:
-/// `viz --robot` (exit 1) and `pair` (exit 1) under the run and query parse of
-/// `CERULION_NETWORK`, and `viz --robot` under `CERULION_NETD_NETWORK` or
-/// `CERULION_VIZD_NETWORK` at `off` too; `connect` (a warning, exit 0) when
+/// `viz --robot`, `pair`, `graph live` and `graph fires` (exit 1) under the run
+/// and query parse of `CERULION_NETWORK`, `viz --robot`, `graph live` and
+/// `graph fires` under `CERULION_NETD_NETWORK` at `off` too, and `viz --robot`
+/// under `CERULION_VIZD_NETWORK` at `off`; `connect` (a warning, exit 0) when
 /// `--network` or `CERULION_NETWORK` is exactly `off`, the value its helper
 /// reads. Every other verb is not refused here: it runs as without the
 /// switch, or does not run through `dispatch`. The match names every
@@ -3937,6 +3938,21 @@ fn command_network_refusal(
             connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
                 .map(|refusal| NetworkRefusal::warning(refusal, 0))
         }
+        // `graph live` and `graph fires` ask robots with or without `--robot`
+        // and `--connect`, so the query-side switches refuse every form.
+        Commands::Graph { action } => {
+            let verb = match action {
+                GraphAction::Live { .. } => "graph live",
+                GraphAction::Fires { .. } => "graph fires",
+                _ => return None,
+            };
+            let kill = cerulion_cli_engine::graph_cmd::query_network_kill_from(
+                switch.network.clone(),
+                switch.netd.as_deref(),
+            );
+            cerulion_cli_engine::graph_live::network_refusal(verb, &kill)
+                .map(|refusal| NetworkRefusal::error(refusal, 1))
+        }
         // Dispatched before this check (`main`'s internal workers, `bagd`),
         // or not refused under the switch: the runs and queries go
         // local-only, and the account verbs reach the account service, which
@@ -3945,7 +3961,6 @@ fn command_network_refusal(
         Commands::BootstrapRobot { .. } | Commands::RobotSyncEpoch { .. } => None,
         Commands::Workspace { .. }
         | Commands::Node { .. }
-        | Commands::Graph { .. }
         | Commands::Topic { .. }
         | Commands::Ros { .. }
         | Commands::Ros2 { .. }
