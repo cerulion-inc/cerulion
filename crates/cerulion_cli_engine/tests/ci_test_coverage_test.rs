@@ -4439,7 +4439,7 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
 const REQUIRED_CONTEXTS_FILE: &str = "tools/ci/required_contexts.txt";
 
 /// How many names that export carries.
-const REQUIRED_CONTEXT_COUNT: usize = 20;
+const REQUIRED_CONTEXT_COUNT: usize = 22;
 
 /// The events a workflow that produces a required check name may trigger on.
 ///

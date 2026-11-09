@@ -10844,6 +10844,7 @@ fn node_trigger_decl(
     info: &cerulion_core::graph::NodeInfo,
     node_inputs: &[cerulion_core::graph::config::InputDef],
     arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
+    recorded_separate: &dyn Fn(&str) -> Option<bool>,
 ) -> replay_rederive::TriggerDecl {
     use cerulion_core::graph::node::MacroPolicy;
     // Trigger-marked ∩ WIRED, from the ONE shared rule the
@@ -10875,8 +10876,13 @@ fn node_trigger_decl(
         },
         Some(MacroPolicy::DataTrigger { input_name }) => {
             if consumes_latest(info, &input_name) {
+                // The recording's own stage set, where the bag states one;
+                // the declared backpressure otherwise.
+                let separate_drain = recorded_separate(&input_name)
+                    .unwrap_or_else(|| reads_through_two_subscribers(info, &input_name));
                 replay_rederive::TriggerDecl::DataLatest {
                     trigger_inputs: vec![input_name],
+                    separate_drain,
                 }
             } else {
                 replay_rederive::TriggerDecl::Data {
@@ -11025,6 +11031,51 @@ fn consumes_latest(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
     info.input_meta()
         .iter()
         .any(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
+}
+
+/// Does this data-trigger input's declared backpressure keep it on two
+/// subscribers (`block` or `sample(N)`, the inputs `NodeInfo::unifies_data_trigger`
+/// refuses on policy)? The judge's latest rule reads it as
+/// `TriggerDecl::DataLatest::separate_drain` on a bag that states no per-input
+/// stage set ([`recorded_separate_drain`]).
+fn reads_through_two_subscribers(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+    use cerulion_core::graph::node::BackpressurePolicy;
+    info.input_meta().iter().any(|m| {
+        m.name == input
+            && matches!(
+                m.backpressure,
+                BackpressurePolicy::Block | BackpressurePolicy::Sample(_)
+            )
+    })
+}
+
+/// How the recording read `node`'s `input`, from the per-input stage set its
+/// manifest states: `Some(true)` when it staged a trigger-drain
+/// ([`ReadStageRole::Drain`](cerulion_core::read_outcome::ReadStageRole::Drain))
+/// read for the input, which only the separate drain discipline wires for a
+/// data-trigger input; `Some(false)` when it staged reads for the node and no
+/// drain stage for the input; `None` when the bag states no per-input stage set,
+/// names no such input, or staged nothing for the node.
+fn recorded_separate_drain(
+    rims: &RecordedStagingRims,
+    recorded_inputs: &BTreeMap<String, Vec<String>>,
+    node: &str,
+    input: &str,
+) -> Option<bool> {
+    let rows = rims.per_edge.as_ref()?;
+    let input_idx = recorded_inputs
+        .get(node)?
+        .iter()
+        .position(|name| name == input)
+        .and_then(|idx| u16::try_from(idx).ok())?;
+    if !rows.keys().any(|key| key.node == node) {
+        return None;
+    }
+    Some(rows.contains_key(&cerulion_core::read_outcome::StageKey {
+        node: node.to_string(),
+        input_idx,
+        role: cerulion_core::read_outcome::ReadStageRole::Drain,
+    }))
 }
 
 /// Narrow a kind-6 record's `served_seq` slot to the `u32` the wire carries.
@@ -12820,9 +12871,12 @@ fn prepare_pass_verification(
                 .iter()
                 .find(|n| &n.id == id)
                 .map_or(&[], |n| n.inputs.as_slice());
+            let trigger = node_trigger_decl(info, wired, catchup_onset, &|input| {
+                recorded_separate_drain(&recorded_rims, &recorded_inputs, id, input)
+            });
             Some(replay_rederive::NodeDecl {
                 node_id: id.clone(),
-                trigger: node_trigger_decl(info, wired, catchup_onset),
+                trigger,
                 throttle_ns: info.throttle_ms().map(|ms| ms.saturating_mul(1_000_000)),
                 has_non_trigger_inputs: node_has_non_trigger_inputs(info, wired),
                 trigger_input_capacities: trigger_input_capacities(
@@ -18009,14 +18063,14 @@ mod node_trigger_decl_tests {
     fn a_capture_time_sync_node_is_declared_apart_from_a_publish_time_one() {
         let both = vec!["cam".to_string(), "lidar".to_string()];
         assert_eq!(
-            node_trigger_decl(&info(false), &wired(), None),
+            node_trigger_decl(&info(false), &wired(), None, &|_| None),
             TriggerDecl::Sync {
                 window_ns: Some(10_000_000),
                 trigger_inputs: both.clone(),
             }
         );
         assert_eq!(
-            node_trigger_decl(&info(true), &wired(), None),
+            node_trigger_decl(&info(true), &wired(), None, &|_| None),
             TriggerDecl::SyncOnCaptureTime {
                 trigger_inputs: both
             }
@@ -18030,14 +18084,14 @@ mod node_trigger_decl_tests {
     fn a_latest_data_trigger_is_declared_and_injected_as_latest() {
         use super::{input_consume_mode, replay_inject::ConsumeMode};
         use cerulion_core::graph::node::InputConsume;
-        let data = |consume| {
+        let data_with = |consume, backpressure| {
             NodeInfo::with_meta(
                 vec![InputMeta {
                     name: "cam".to_string(),
                     schema_hash: 0,
                     trigger: true,
                     depth: 4,
-                    backpressure: BackpressurePolicy::DropOldest,
+                    backpressure,
                     expect_within_ms: None,
                     consume,
                     accumulate: false,
@@ -18048,6 +18102,7 @@ mod node_trigger_decl_tests {
                 input_name: "cam".to_string(),
             })
         };
+        let data = |consume| data_with(consume, BackpressurePolicy::DropOldest);
         let wired = vec![InputDef {
             name: "cam".to_string(),
             source: "/cam".to_string(),
@@ -18057,19 +18112,114 @@ mod node_trigger_decl_tests {
         let latest = data(InputConsume::Latest);
         let fifo = data(InputConsume::Fifo);
         assert_eq!(
-            node_trigger_decl(&latest, &wired, None),
+            node_trigger_decl(&latest, &wired, None, &|_| None),
             TriggerDecl::DataLatest {
-                trigger_inputs: cam.clone()
+                trigger_inputs: cam.clone(),
+                separate_drain: false,
+            }
+        );
+        // `block` and `sample(N)` keep the input on two subscribers.
+        for backpressure in [BackpressurePolicy::Block, BackpressurePolicy::Sample(5)] {
+            assert_eq!(
+                node_trigger_decl(
+                    &data_with(InputConsume::Latest, backpressure),
+                    &wired,
+                    None,
+                    &|_| None
+                ),
+                TriggerDecl::DataLatest {
+                    trigger_inputs: cam.clone(),
+                    separate_drain: true,
+                },
+                "{backpressure:?}"
+            );
+        }
+        // The recording's stage set, where the bag states one, decides over
+        // the declaration in both directions.
+        assert_eq!(
+            node_trigger_decl(&latest, &wired, None, &|input| {
+                assert_eq!(input, "cam");
+                Some(true)
+            }),
+            TriggerDecl::DataLatest {
+                trigger_inputs: cam.clone(),
+                separate_drain: true,
             }
         );
         assert_eq!(
-            node_trigger_decl(&fifo, &wired, None),
+            node_trigger_decl(
+                &data_with(InputConsume::Latest, BackpressurePolicy::Block),
+                &wired,
+                None,
+                &|_| Some(false)
+            ),
+            TriggerDecl::DataLatest {
+                trigger_inputs: cam.clone(),
+                separate_drain: false,
+            }
+        );
+        assert_eq!(
+            node_trigger_decl(&fifo, &wired, None, &|_| None),
             TriggerDecl::Data {
                 trigger_inputs: cam
             }
         );
         assert_eq!(input_consume_mode(&latest, "cam"), ConsumeMode::Latest);
         assert_eq!(input_consume_mode(&fifo, "cam"), ConsumeMode::EachFifo);
+    }
+
+    /// The recording's stage set names a latest input's drain discipline: a
+    /// `Drain` stage on the input is the separate one, `Body` stages alone are
+    /// the unified one, and a bag with no per-input stage set, or none for the
+    /// node, states nothing.
+    #[test]
+    fn the_recorded_stage_set_names_a_latest_inputs_drain_discipline() {
+        use super::{recorded_separate_drain, RecordedStagingRims};
+        use cerulion_core::read_outcome::{AdoptedRim, ReadStageRole, StageKey};
+        use std::collections::{BTreeMap, HashMap};
+        let key = |node: &str, input_idx, role| StageKey {
+            node: node.to_string(),
+            input_idx,
+            role,
+        };
+        let rim = AdoptedRim::from_recorded(64).expect("rim in range");
+        let rims = RecordedStagingRims {
+            per_edge: Some(HashMap::from([
+                (key("sep", 1, ReadStageRole::Body), rim),
+                (key("sep", 1, ReadStageRole::Drain), rim),
+                (key("uni", 0, ReadStageRole::Body), rim),
+            ])),
+            legacy_global: None,
+        };
+        let inputs = BTreeMap::from([
+            (
+                "sep".to_string(),
+                vec!["ctx".to_string(), "cam".to_string()],
+            ),
+            ("uni".to_string(), vec!["cam".to_string()]),
+            ("none".to_string(), vec!["cam".to_string()]),
+        ]);
+        assert_eq!(
+            recorded_separate_drain(&rims, &inputs, "sep", "cam"),
+            Some(true)
+        );
+        assert_eq!(
+            recorded_separate_drain(&rims, &inputs, "sep", "ctx"),
+            Some(false)
+        );
+        assert_eq!(
+            recorded_separate_drain(&rims, &inputs, "uni", "cam"),
+            Some(false)
+        );
+        assert_eq!(recorded_separate_drain(&rims, &inputs, "none", "cam"), None);
+        let no_rows = RecordedStagingRims {
+            per_edge: None,
+            legacy_global: Some(64),
+        };
+        assert_eq!(
+            recorded_separate_drain(&no_rows, &inputs, "sep", "cam"),
+            None
+        );
     }
 }
 

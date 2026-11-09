@@ -25,6 +25,11 @@
 //! | `block` | each fire's read empties the queue, so the producer is paced only when `depth` frames queue between two reads, as while a deferred fire spans `depth` publishes; superseded frames are not served |
 //! | `sample(N)` | the gate admits the drain's newest frame at most once per N ms; a decimated one is counted |
 //!
+//! On the separate drain discipline the step counts arrivals off a second
+//! (trigger) subscriber and the tick's read drains the body subscriber, so
+//! the gap arms put a frame between the two and hold every fire to reading a
+//! frame (fires equal reads).
+//!
 //! `#[serial]`: the forced-Separate arms mutate the process-global
 //! `CERULION_DRAIN_DISCIPLINE` env.
 //!
@@ -42,7 +47,8 @@ use std::time::Duration;
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::{
-    BackpressurePolicy, ClosureNodeEntry, InputConsume, InputMeta, NodeEntry, NodeInfo,
+    BackpressurePolicy, ClosureNodeEntry, InputConsume, InputMeta, NodeContext, NodeEntry,
+    NodeInfo, TriggerProbe,
 };
 use cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH;
 use cerulion_core::graph::GraphRuntime;
@@ -696,4 +702,368 @@ fn the_latest_drain_holds_an_unread_frame_and_never_refills_past_it() {
         (0, None),
         "a read frame is not re-offered"
     );
+}
+
+// The separate drain discipline (`block` and `sample(N)` inputs, forced
+// Separate, and entries without the unified drain) reads the input through
+// TWO subscribers on one topic: the trigger subscriber, popped at the level
+// boundary to count arrivals, and the body subscriber, drained to its newest
+// frame by the tick's read. A frame that lands between those two pops is read
+// by the tick and still queued on the trigger subscriber. The arms below put
+// a frame in exactly that window and hold every fire to reading a frame.
+
+/// The latest-value source the gap injector reads. Never published: it only
+/// gives the injector a latest-value input.
+const GAP_CTX: &str = "/latest/gap_ctx";
+
+/// The source [`EXT`]'s one publisher, shared by the test body and the gap
+/// injector's tick.
+type SharedPublisher = Arc<Mutex<Option<cerulion_core::transport::publisher::CerulionPublisher>>>;
+
+/// A `period_ms = 1` node that publishes `gap` (0 = nothing) onto [`EXT`]
+/// from its own tick, then clears it.
+///
+/// It sits in the consumer's level (neither has an in-graph producer), and
+/// its latest-value input puts it on the level's serial pass, which ticks
+/// before the rest of the level (`tick_decided_parallel` pass 1). Its frame
+/// therefore lands after the level's trigger drain and before the consumer's
+/// read: the window between the two pops of the separate discipline.
+fn gap_injector(ext: SharedPublisher, gap: Arc<AtomicU64>) -> ClosureNodeEntry {
+    let info = NodeInfo::from_names(vec!["ctx".to_string()], vec![])
+        .with_policy(MacroPolicy::Period { period_ms: 1 });
+    ClosureNodeEntry::new(info, move |_ctx| {
+        let v = gap.swap(0, Ordering::Relaxed);
+        if v != 0 {
+            if let Some(p) = ext.lock().unwrap().as_mut() {
+                publish_all(p, [v]);
+            }
+        }
+        Ok(())
+    })
+    .with_label("latest_gap_injector")
+}
+
+fn gap_injector_node() -> NodeDef {
+    NodeDef {
+        isolate: None,
+        params: Default::default(),
+        ros2: None,
+        id: "inj".to_string(),
+        node_type: "latest_gap_injector".to_string(),
+        inputs: vec![InputDef {
+            name: "ctx".to_string(),
+            source: GAP_CTX.to_string(),
+        }],
+        outputs: vec![],
+    }
+}
+
+/// A runtime holding the gap injector and `sink` (reading [`EXT`]), plus the
+/// shared [`EXT`] publisher and the injector's `gap` cell.
+fn gap_runtime(
+    prefix: &str,
+    sink: Box<dyn NodeEntry>,
+    sink_def: NodeDef,
+) -> (GraphRuntime, SharedPublisher, Arc<AtomicU64>) {
+    let ext: SharedPublisher = Arc::new(Mutex::new(None));
+    let gap = Arc::new(AtomicU64::new(0));
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "inj".to_string(),
+        Box::new(gap_injector(Arc::clone(&ext), Arc::clone(&gap))),
+    );
+    factories.insert(sink_def.id.clone(), sink);
+    let clock = Arc::new(VirtualClock::new());
+    let runtime = GraphRuntime::build_for_test(
+        graph(prefix, vec![gap_injector_node(), sink_def]),
+        factories,
+        clock,
+        16,
+    )
+    .expect("build gap graph");
+    let mgr = runtime.test_transport().expect("test transport parked");
+    *ext.lock().unwrap() = Some(
+        mgr.create_publisher(EXT, MaxSliceLen::const_new(64), 0)
+            .expect("external publisher attaches"),
+    );
+    (runtime, ext, gap)
+}
+
+/// The gap schedule, `idle` = the empty steps between the two halves:
+///
+/// 1. frame 1 queued, frame 2 armed on the injector, one step: the trigger
+///    drain counts frame 1, the injector publishes frame 2, and the
+///    consumer's read drains both and serves frame 2;
+/// 2. one step: the trigger subscriber still holds frame 2, which the read
+///    above already took, so nothing is owed;
+/// 3. `idle` empty steps, then frame 3 and two steps: one fire reading 3.
+///
+/// Oracle, from the rule that a frame a read drained is not counted again:
+/// reads `[2, 3]` in exactly 2 fires. Without the body probe, step 2 fires
+/// once more on an empty queue: 3 fires.
+fn drive_gap(
+    runtime: &mut GraphRuntime,
+    ext: &SharedPublisher,
+    gap: &AtomicU64,
+    sink: &str,
+    idle: u32,
+) -> u64 {
+    gap.store(2, Ordering::Relaxed);
+    publish_all(ext.lock().unwrap().as_mut().expect("publisher"), [1]);
+    runtime.step(Duration::from_millis(1));
+    assert_eq!(gap.load(Ordering::Relaxed), 0, "the injector ticked");
+    runtime.step(Duration::from_millis(1));
+    for _ in 0..idle {
+        runtime.step(Duration::from_millis(1));
+    }
+    publish_all(ext.lock().unwrap().as_mut().expect("publisher"), [3]);
+    runtime.step(Duration::from_millis(1));
+    runtime.step(Duration::from_millis(1));
+    runtime.node_handle(sink).unwrap().fire_count()
+}
+
+/// The gap schedule on a closure consumer reading through `try_view`.
+fn run_gap_closure(prefix: &str, c: Consumer, opt_out_of_unified: bool) -> (Vec<u64>, u64) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut entry = consumer_entry(c, Arc::clone(&seen));
+    if opt_out_of_unified {
+        entry = entry.with_unified_drain(false);
+    }
+    let (mut runtime, ext, gap) = gap_runtime(prefix, Box::new(entry), sink_node(EXT));
+    let fired = drive_gap(&mut runtime, &ext, &gap, "sink", 4);
+    let observed = seen.lock().unwrap().clone();
+    (observed, fired)
+}
+
+/// Forced Separate, `drop_oldest`: a frame landing between the trigger drain
+/// and the read is served by that read and fires nothing more. The closure
+/// answers the probe, so the build names nothing.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_frame_landing_between_the_drains_is_read_once_and_fires_nothing_more() {
+    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+    let (observed, fired) = run_gap_closure("latgapsep", Consumer::latest(), false);
+    assert!(!logs_contain(
+        "cannot tell whether its read will find a frame"
+    ));
+    assert_eq!(observed, vec![2, 3]);
+    assert_eq!(
+        fired,
+        observed.len() as u64,
+        "every fire reads a frame: {fired} fires for reads {observed:?}"
+    );
+}
+
+/// `sample(N)` keeps the separate discipline under the default build. The
+/// first read is always admitted and frame 3 comes more than N ms after
+/// frame 2, so no read here is decimated and every fire reads a frame.
+#[test]
+#[serial]
+fn a_sampled_latest_input_reads_a_gap_frame_once() {
+    let c = Consumer {
+        backpressure: BackpressurePolicy::Sample(5),
+        ..Consumer::latest()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, ext, gap) = gap_runtime(
+        "latgapsamp",
+        Box::new(consumer_entry(c, Arc::clone(&seen))),
+        sink_node(EXT),
+    );
+    let fired = drive_gap(&mut runtime, &ext, &gap, "sink", 6);
+    let observed = seen.lock().unwrap().clone();
+    assert_eq!(observed, vec![2, 3]);
+    assert_eq!(fired, 2, "every fire reads a frame: reads {observed:?}");
+    assert_eq!(
+        runtime
+            .node_handle("sink")
+            .unwrap()
+            .backpressure_sampled_count("inp"),
+        0,
+        "no read was decimated"
+    );
+}
+
+/// A closure opted out of the unified drain keeps two subscribers under the
+/// default build, and its body still answers the probe.
+#[test]
+#[serial]
+fn an_entry_without_the_unified_drain_reads_a_gap_frame_once() {
+    let (observed, fired) = run_gap_closure("latgapopt", Consumer::latest(), true);
+    assert_eq!(observed, vec![2, 3]);
+    assert_eq!(fired, 2, "every fire reads a frame: reads {observed:?}");
+}
+
+/// Through a dlopen'd `#[cerulion_node]` cdylib under forced Separate: the
+/// body subscriber lives in the cdylib's own copy of the core, and the probe
+/// reaches it across the FFI. The node forwards each read frame to `cmd`, so
+/// the `cmd` stream is the read record.
+#[test]
+#[serial]
+fn a_cdylib_reads_a_gap_frame_once_on_the_separate_drain() {
+    use cerulion_core::graph::node::DylibNodeEntry;
+
+    let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+    let entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
+        "test_node_macro_consume_latest_cdylib",
+    ))
+    .expect("load consume-latest fixture cdylib");
+    let node = NodeDef {
+        isolate: None,
+        params: Default::default(),
+        ros2: None,
+        id: "node".to_string(),
+        node_type: "consume_latest_node".to_string(),
+        inputs: vec![InputDef {
+            name: "trigger_in".to_string(),
+            source: EXT.to_string(),
+        }],
+        outputs: vec![OutputDef {
+            name: "cmd".to_string(),
+            schema: "Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: None,
+        }],
+    };
+    let (mut runtime, ext, gap) = gap_runtime("latgapdyl", Box::new(entry), node);
+    let cmd_sub = runtime
+        .test_transport()
+        .expect("test transport parked")
+        .create_subscriber_open_only("/latgapdyl/node/cmd")
+        .expect("open the cdylib's cmd topic");
+    let fired = drive_gap(&mut runtime, &ext, &gap, "node", 4);
+    let mut forwarded: Vec<u64> = Vec::new();
+    cmd_sub
+        .try_receive(|msg| {
+            let x = f64::from_le_bytes(msg.payload()[0..8].try_into().unwrap());
+            forwarded.push(x as u64);
+        })
+        .expect("drain cmd stream");
+    assert_eq!(forwarded, vec![2, 3]);
+    assert_eq!(
+        fired, 2,
+        "every fire reads a frame: forwarded {forwarded:?}"
+    );
+}
+
+/// A consumer whose body probe answers from `script` first and from its own
+/// subscriber after. A scripted `Empty` while the body queue holds the frame
+/// is what a frame the trigger subscriber received before the body queue did
+/// looks like from the step: iceoryx2 delivers to one subscriber queue at a
+/// time. The entry declares no unified drain, so its input is read through
+/// two subscribers.
+struct ScriptedProbe {
+    inner: ClosureNodeEntry,
+    script: std::collections::VecDeque<TriggerProbe>,
+}
+
+impl NodeEntry for ScriptedProbe {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        self.inner.info()
+    }
+    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        self.inner.init(context)
+    }
+    fn tick(&mut self) -> TransportResult<()> {
+        self.inner.tick()
+    }
+    fn probes_trigger_input(&self) -> bool {
+        true
+    }
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        match self.script.pop_front() {
+            Some(answer) => answer,
+            None => self.inner.probe_trigger_input(input_name),
+        }
+    }
+}
+
+/// One frame, probe answers `script` then the truth: returns (reads, fires)
+/// after each of 4 steps.
+fn run_scripted(prefix: &str, script: &[TriggerProbe]) -> Vec<(Vec<u64>, u64)> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let entry = ScriptedProbe {
+        inner: consumer_entry(Consumer::latest(), Arc::clone(&seen)),
+        script: script.iter().copied().collect(),
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("sink".to_string(), Box::new(entry));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime =
+        GraphRuntime::build_for_test(graph(prefix, vec![sink_node(EXT)]), factories, clock, 16)
+            .expect("build scripted graph");
+    let mgr = runtime.test_transport().expect("test transport parked");
+    let mut ext = mgr
+        .create_publisher(EXT, MaxSliceLen::const_new(64), 0)
+        .expect("external publisher attaches");
+    publish_all(&mut ext, [1]);
+    let mut after = Vec::new();
+    for _ in 0..4 {
+        runtime.step(Duration::from_millis(1));
+        after.push((seen.lock().unwrap().clone(), fires(&runtime)));
+    }
+    after
+}
+
+/// The trigger subscriber counts frame 1 while the body shows nothing, so the
+/// step fires nothing. The arrival is carried: the next step pops nothing,
+/// probes again, finds the frame and fires once on it.
+#[test]
+#[serial]
+fn a_frame_the_body_has_not_received_yet_fires_on_a_later_step() {
+    let after = run_scripted("latcarry", &[TriggerProbe::Empty]);
+    assert_eq!(after[0], (vec![], 0), "step 1: the body showed no frame");
+    assert_eq!(after[1], (vec![1], 1), "step 2: the carried arrival fires");
+    assert_eq!(after[3], (vec![1], 1), "nothing more");
+}
+
+/// A probe that cannot answer fires the node as the arrival count says.
+#[test]
+#[serial]
+fn a_probe_that_cannot_answer_fires_on_the_arrival() {
+    let after = run_scripted("latunknown", &[TriggerProbe::Unknown]);
+    assert_eq!(after[0], (vec![1], 1));
+    assert_eq!(after[3], (vec![1], 1));
+}
+
+/// An entry that answers no probe keeps firing on every counted arrival, and
+/// the build names it once.
+struct NoProbe(ClosureNodeEntry);
+
+impl NodeEntry for NoProbe {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        self.0.info()
+    }
+    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        self.0.init(context)
+    }
+    fn tick(&mut self) -> TransportResult<()> {
+        self.0.tick()
+    }
+}
+
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn the_build_names_a_latest_input_whose_body_answers_no_probe() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "sink".to_string(),
+        Box::new(NoProbe(consumer_entry(Consumer::latest(), seen))),
+    );
+    let clock = Arc::new(VirtualClock::new());
+    let _runtime = GraphRuntime::build_for_test(
+        graph("latnoprobe", vec![sink_node(EXT)]),
+        factories,
+        clock,
+        16,
+    )
+    .expect("build no-probe graph");
+    assert!(logs_contain("sink.inp"), "the warn names node and input");
+    assert!(logs_contain(
+        "cannot tell whether its read will find a frame"
+    ));
 }

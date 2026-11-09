@@ -51,7 +51,7 @@ use serial_test::serial;
 #[path = "../src/network_switch/cases.rs"]
 mod cases;
 
-use cases::{By, Case, Expect, CASES};
+use cases::{By, Case, Expect, Home, CASES};
 
 /// The refusal the gate prints on a machine that never signed in, without a
 /// terminal: its first line, hand-written from the text a user reads.
@@ -820,6 +820,53 @@ fn a_signed_in_machine_gets_the_same_refusal_under_the_switch() {
         true
     });
     assert!(refused >= 7, "the table lost its refused rows: {refused}");
+}
+
+/// Signing in is not covered by the switch: under `CERULION_NETWORK=off`
+/// each sign-in row still reaches the account service, its first request
+/// line the one the table names, and it is not refused. No usage event is
+/// sent. On a machine that never signed in, a local verb at a terminal starts
+/// the login gate's sign-in.
+#[test]
+fn account_sign_in_is_allowed_under_the_switch_and_reaches_the_account_service() {
+    let signs_in = each("sign-in rows under the switch", |case| {
+        let Expect::SignIn {
+            home,
+            terminal,
+            request,
+        } = case.expect
+        else {
+            return false;
+        };
+        let what = format!("{:?} under CERULION_NETWORK=off", case.argv);
+        let home = match home {
+            Home::Fresh => tempfile::tempdir().expect("a home"),
+            Home::SignedIn => seeded_home(),
+        };
+        let run = spawn(home.path(), Some("off"), case.argv, terminal);
+        assert!(
+            run.contacts
+                .first()
+                .is_some_and(|line| line.starts_with(request)),
+            "{what}: the first request is not {request:?}: {:?}; stderr={}",
+            run.contacts,
+            run.stderr
+        );
+        assert!(
+            !run.contacts
+                .iter()
+                .any(|line| line.starts_with("POST /batch")),
+            "{what}: a usage event was sent: {:?}",
+            run.contacts
+        );
+        assert!(
+            !run.stderr.contains(" disables;") && !run.stderr.contains("kill-switch engaged"),
+            "{what}: refused: {}",
+            run.stderr
+        );
+        true
+    });
+    assert!(signs_in >= 5, "the table lost its sign-in rows: {signs_in}");
 }
 
 /// A recorder closes its listener and ends its thread when it is dropped,

@@ -3087,6 +3087,39 @@ pub fn cdylib_platform_check() -> Result<(), String> {
     })
 }
 
+/// What a node body's trigger input holds right now, as answered by
+/// [`NodeEntry::probe_trigger_input`].
+///
+/// The graph asks it for a `consume = latest` trigger input that it reads
+/// through two subscribers (the separate drain discipline): the step counts an
+/// arrival off the trigger subscriber, and this answer says whether the BODY
+/// subscriber, the one the tick reads, still holds a frame for that arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerProbe {
+    /// The body subscriber holds a frame no read has taken yet. A read still
+    /// applies the input's own policy to it: `sample(N)` may decimate it and a
+    /// malformed frame is refused, so such a read can serve nothing.
+    Unread,
+    /// The body subscriber holds no frame: every frame delivered to it so far
+    /// was taken by an earlier read.
+    Empty,
+    /// The entry could not answer (no probe, a failed probe, a poisoned
+    /// lock). The step treats the arrival as it would without a probe.
+    Unknown,
+}
+
+/// A [`SyncHeadOp::ProbeNext`] answer read as a [`TriggerProbe`]: `Present` is
+/// a frame no read has taken, `Nothing` is an empty queue, and every other
+/// answer (`Failed`, or a kind the probe never returns) is
+/// [`TriggerProbe::Unknown`].
+fn trigger_probe_from(answer: SyncOpAnswer) -> TriggerProbe {
+    match answer {
+        SyncOpAnswer::Present => TriggerProbe::Unread,
+        SyncOpAnswer::Nothing => TriggerProbe::Empty,
+        _ => TriggerProbe::Unknown,
+    }
+}
+
 /// Interface between the graph runtime and node logic.
 ///
 /// Implementations must be `Send` for use with `Arc<Mutex<Box<dyn NodeEntry>>>`.
@@ -3456,6 +3489,44 @@ pub trait NodeEntry: Send {
         false
     }
 
+    /// Without consuming anything, does a read of `input_name` right now find
+    /// a frame no read has taken yet?
+    ///
+    /// The graph asks this for a `consume = latest` trigger input read through
+    /// two subscribers, at the level boundary, after the trigger subscriber
+    /// counted an arrival and before the node fires: the step fires the node
+    /// only if the body still holds a frame. An arrival the tick's read
+    /// already drained (it landed after the boundary drain and before that
+    /// read) therefore fires nothing more.
+    ///
+    /// The default asks [`SyncHeadOp::ProbeNext`] when the entry
+    /// [`Self::supports_sync_head_ops`]: the probe reports a staged next frame
+    /// or a non-empty subscriber queue. A `consume = latest` input read through
+    /// two subscribers stages nothing and has no frozen slot (its tick reads
+    /// the queue live), so the answer is whether its queue holds a frame. On a cdylib that probe crosses
+    /// `cerulion_node_sync_head_op` as op code [`SYNC_HEAD_OP_PROBE_NEXT`],
+    /// which every `#[cerulion_node]` cdylib exports. Without head ops the
+    /// default answers [`TriggerProbe::Unknown`].
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        if !self.supports_sync_head_ops() {
+            return TriggerProbe::Unknown;
+        }
+        trigger_probe_from(self.sync_head_op(input_name, SyncHeadOp::ProbeNext))
+    }
+
+    /// Does [`Self::probe_trigger_input`] really ask the body (vs answering
+    /// [`TriggerProbe::Unknown`] every time)?
+    ///
+    /// Read once per node at graph build, beside
+    /// [`Self::supports_sync_head_ops`], under the same static-answer contract:
+    /// the capability map is captured before [`Self::init`] injects the
+    /// context. A `false` on a node with a `consume = latest` input read
+    /// through two subscribers is named once at build: such an input fires on
+    /// every counted arrival, including one an earlier read already drained.
+    fn probes_trigger_input(&self) -> bool {
+        self.supports_sync_head_ops()
+    }
+
     /// Decode the capture stamp of the frame a per-set Sync slot holds, for a
     /// node that matches its Sync trigger on `header.stamp`. See
     /// [`NodeContext::sync_capture_stamp`].
@@ -3796,6 +3867,20 @@ impl NodeEntry for ClosureNodeEntry {
     // than a second flag restating it.
     fn supports_sync_head_ops(&self) -> bool {
         self.unified_drain
+    }
+
+    // The probe reads the body subscriber's queue and touches no frozen slot,
+    // so it answers on BOTH settings of `unified_drain`, including an opted-out
+    // closure, whose trigger input is read through two subscribers.
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        match self.context.as_mut() {
+            Some(ctx) => trigger_probe_from(ctx.sync_head_op(input_name, SyncHeadOp::ProbeNext)),
+            None => TriggerProbe::Unknown,
+        }
+    }
+
+    fn probes_trigger_input(&self) -> bool {
+        true
     }
 
     fn sync_capture_stamp(

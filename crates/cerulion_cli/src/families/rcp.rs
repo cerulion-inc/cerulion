@@ -66,7 +66,9 @@ struct RcpCliArgs {
     /// Disable all relays (LAN / direct-dial only).
     #[arg(long)]
     relay_disabled: bool,
-    /// Kill-switch: pass `off` to refuse to connect.
+    /// Network kill switch: `off` refuses to dial the robot. The switch keeps
+    /// Cerulion service traffic off (robots, relays, hosted Cerulion services
+    /// and telemetry); signing in to your account still works.
     #[arg(long)]
     network: Option<String>,
 }
