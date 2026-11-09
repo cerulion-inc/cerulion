@@ -311,8 +311,13 @@ snapshot (`topic-snapshot`).
   AND role ≥ VIEWER (non-vacuous: `Role` is an open `u16`, so a role less
   privileged than VIEWER holding `CAP_OBSERVE` is representable, and denied);
   lifecycle mutation needs role ≥ OPERATOR; `teleop` needs `CAP_TELEOP` AND
-  role ≥ OPERATOR; an UNCLASSIFIED verb is DENIED, never fail-open. Lower
-  `Role` value = higher privilege.
+  role ≥ OPERATOR; `clear-estop` needs the OPERATOR role or higher and is
+  refused to a row whose principal is cloud whether the allow-from-cloud switch
+  is on or off (class `NonCloud`: the authorizer refuses it before dispatch, so
+  the refusal is receipted `Denied`); `estop-status` needs `CAP_OBSERVE` AND the
+  VIEWER role or higher; no host registers either e-stop verb yet, so a caller
+  the authorizer admits gets `unknown_verb`; an UNCLASSIFIED verb is DENIED,
+  never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read
   from client args (`pairing_verbs.rs` module docs; `ops_loopback_test.rs`).
   Validity, anti-rollback and the CPace TTL are evaluated against the robot's

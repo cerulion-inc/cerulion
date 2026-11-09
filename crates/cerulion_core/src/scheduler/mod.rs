@@ -389,6 +389,13 @@ pub enum SyncHeadOp {
     /// consume it — re-offering it would fire the node again on one frame.
     FillRefill,
     /// The NON-CONSUMING "has another frame arrived behind the head?" probe.
+    ///
+    /// `NodeEntry::probe_trigger_input` asks it too, for a Data
+    /// `consume = latest` input read through two subscribers, where no head is
+    /// held: there `Present` means the body subscriber's queue holds a frame
+    /// and `Nothing` means it holds none, and the step fires the node only on
+    /// `Present` (or `Failed`). An entry answering `Nothing` while its queue
+    /// holds a frame leaves that input unfired.
     ProbeNext,
     /// Pop the next frame into the staged slot and report its stamp.
     ///
