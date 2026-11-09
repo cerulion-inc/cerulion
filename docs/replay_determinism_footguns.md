@@ -281,12 +281,14 @@ A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
 node's last fire than that fire's read took, plus two per writer still
 delivering one, owed the node a fire, so a node that stops firing on frames its
-queue still holds is a finding. That rule stands down by name where a count
+queue still holds is a finding. Before the node's first fire in the pass, one
+queue of the input more (its declared depth per writer) is excused, once and by
+name, because a node's init can read its inputs before the recording starts its
+read log and a resumed pass starts after reads its bag does not keep; a count
+past that queue is still a finding. That rule stands down by name where a count
 needs an excuse the bag cannot check: a topic no graph node produces leaves the
-frames in delivery unbounded; a resumed pass's reads before the recording's
-first retained step are not in the bag, so its steps before the node's first
-fire are not judged; and a node that produces a topic a `block` input in its
-own rank reads can have a fire held by that edge's pre-fire check with no
+frames in delivery unbounded; and a node that produces a topic a `block` input
+in its own rank reads can have a fire held by that edge's pre-fire check with no
 record, which stands down the fire a pop owes on one subscriber too. On a bag
 that does not record whether a `drop_oldest` input was read through one
 subscriber or two, a step that popped and fired nothing stands down rather

@@ -526,6 +526,13 @@ pub enum TriggerDecl {
         /// graph node produces, whose publisher count nothing caps. Read only
         /// where the input is read through two subscribers.
         writers: Option<u32>,
+        /// The trigger input's declared queue depth (`#[input(depth = N)]`),
+        /// from the same `InputMeta` entry that declares it `consume = latest`.
+        /// The runtime sizes the trigger-drain subscriber's queue to at most
+        /// it on each publisher connection, so that queue holds at most
+        /// `depth` frames per writer. Read only where the input is read through two
+        /// subscribers.
+        depth: u32,
     },
     /// A `sync_window_ms` node that aligns its trigger inputs on each
     /// message's `header.stamp` (capture time) instead of its wire stamp. The
@@ -820,9 +827,11 @@ pub struct ScheduleFinding {
 /// [`Self::read`]; a writer can have been handing at most one to the trigger
 /// queue when an earlier read already took it, and at most one more to the
 /// body queue when this step asked, so [`Self::in_delivery`] is two per
-/// writer. Any frame past those sat unread in the body subscriber when this
-/// step counted its arrivals and asked the body whether a read finds a frame,
-/// so the step owed the node a fire and the recording holds none.
+/// writer. Before the node's first fire in the pass, a read the read log does
+/// not hold can have taken one queue of them more ([`Self::unlogged`]). Any
+/// frame past those sat unread in the body subscriber when this step counted
+/// its arrivals and asked the body whether a read finds a frame, so the step
+/// owed the node a fire and the recording holds none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadFrames {
     /// The trigger input.
@@ -839,6 +848,10 @@ pub struct UnreadFrames {
     /// Frames the input's writers can still have been delivering: two per
     /// writer.
     pub in_delivery: u64,
+    /// Frames a read the read log does not hold can have taken: one queue of
+    /// the input (its declared depth per writer) before the node's first fire
+    /// in the pass ([`StandDownReason::LatestBeforeFirstFire`]), none after.
+    pub unlogged: u64,
 }
 
 impl fmt::Display for UnreadFrames {
@@ -856,14 +869,22 @@ impl fmt::Display for UnreadFrames {
             Some(seq) => write!(f, ", the newest seq {seq} at this step")?,
             None => f.write_str(", the newest at this step")?,
         }
+        write!(f, "; reads took {}", self.read)?;
+        if self.unlogged > 0 {
+            write!(
+                f,
+                ", a read the read log does not hold can have taken {} more,",
+                self.unlogged
+            )?;
+        }
         write!(
             f,
-            "; reads took {} and its writers can still have been delivering {}, so \
-             at least {} sat unread in the queue the node reads and the step fired nothing",
-            self.read,
+            " and its writers can still have been delivering {}, so at least {} sat \
+             unread in the queue the node reads and the step fired nothing",
             self.in_delivery,
             self.counted
                 .saturating_sub(self.read)
+                .saturating_sub(self.unlogged)
                 .saturating_sub(self.in_delivery)
         )
     }
@@ -1151,20 +1172,25 @@ pub enum StandDownReason {
     /// the unified drain owes.
     LatestDrainUnrecorded,
     /// A `consume = latest` input read through two subscribers counted more
-    /// frames after the node's last fire than that fire's reads took, and its
-    /// topic has no graph producer, so nothing caps how many of those frames
-    /// its publishers can still have been delivering to the node's two queues
-    /// (`TriggerDecl::DataLatest::writers` is `None`). The unread-frame rule
-    /// stops for the node; the one-fire bound still holds.
+    /// frames than the reads in the pass took, and its topic has no graph
+    /// producer, so nothing caps how many of those frames its publishers can
+    /// still have been delivering to the node's two queues, nor, before the
+    /// node's first fire, how many a read the read log does not hold can have
+    /// taken (`TriggerDecl::DataLatest::writers` is `None`). The unread-frame
+    /// rule stops for the node; the one-fire bound still holds.
     LatestWritersUncapped,
-    /// A RESUMED pass's `consume = latest` input read through two subscribers
-    /// counted, before the node's first fire in the pass, more frames than
-    /// the pass's reads took plus the frames its writers can still have been
-    /// delivering. A read made before the recording's first retained step can
-    /// have taken them, and its pops are not in the bag. The unread-frame rule
-    /// does not judge those steps, and the node's first fire in the pass
-    /// starts it again; the one-fire bound holds throughout.
-    LatestResumeUnanchored,
+    /// A `consume = latest` input read through two subscribers counted,
+    /// before the node's first fire in the pass, more frames than the pass's
+    /// reads took plus the frames its writers can still have been delivering.
+    /// A read the read log does not hold can have taken them: a node's `init`
+    /// can read its inputs, and it runs before a recording arms the read log,
+    /// and a resumed pass starts after reads its bag does not keep. Such a
+    /// read took frames from the queue the node reads while their copies sat
+    /// in the trigger-drain queue, so it took at most what that queue holds:
+    /// the input's declared depth per writer. The unread-frame rule still
+    /// judges those steps with that one queue excused, so a count past it is a
+    /// finding, and the node's first fire in the pass ends the excuse.
+    LatestBeforeFirstFire,
     /// A `consume = latest` node produces a topic a `block` input in its own
     /// rank reads ([`NodeDecl::feeds_local_block_edge`]), and a step owed it a
     /// fire it did not record: a step whose drain popped a frame on one
@@ -1216,10 +1242,11 @@ impl StandDownReason {
                 "the consume = latest input's topic has no graph producer, so how many counted \
                  frames its publishers were still delivering is not bounded"
             }
-            Self::LatestResumeUnanchored => {
-                "the pass resumed before the node's first fire, so a read made before the \
-                 recording's first retained step can have taken the frames its trigger drain \
-                 counted until that fire"
+            Self::LatestBeforeFirstFire => {
+                "before the node's first fire in the pass, a read the read log does not hold \
+                 (in the node's init, or before a resumed pass's first retained step) can have \
+                 taken one queue of the frames its trigger drain counted, so one queue was \
+                 excused until that fire"
             }
             Self::LatestBlockHeld => {
                 "the node produces a topic a block input in its own rank reads, and that edge's \
@@ -1255,7 +1282,7 @@ impl StandDownReason {
             Self::CaptureTimeSync => "capture_time_sync",
             Self::LatestDrainUnrecorded => "latest_drain_unrecorded",
             Self::LatestWritersUncapped => "latest_writers_uncapped",
-            Self::LatestResumeUnanchored => "latest_resume_unanchored",
+            Self::LatestBeforeFirstFire => "latest_before_first_fire",
             Self::LatestBlockHeld => "latest_block_held",
         }
     }
@@ -1794,7 +1821,6 @@ pub(crate) fn verify(
                         trigger_inputs,
                         block_gated,
                         trust,
-                        restore.resumed,
                         stops.stop_point(&node.node_id),
                         &mut report,
                     );
@@ -3266,7 +3292,9 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// was taken by a read or followed by a fire ([`LatestUnread::step`]). A step
 /// whose counted frames outrun what the last fire's reads took plus two
 /// frames per writer still being delivered owes a fire, and one that records
-/// none is a finding naming those frames ([`UnreadFrames`]).
+/// none is a finding naming those frames ([`UnreadFrames`]). Before the node's
+/// first fire in the pass, from the start or resumed, one queue of the input
+/// more is excused ([`StandDownReason::LatestBeforeFirstFire`]).
 ///
 /// On [`LatestDrain::Unrecorded`] both of those rules run, since they hold on
 /// either drain, and a step that popped and did not fire, which only the
@@ -3279,14 +3307,12 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// would owe it a fire it did not record, on either drain, stands the owing
 /// rule down by name ([`StandDownReason::LatestBlockHeld`]); until then both
 /// rules judge it, and the one-fire bound runs throughout.
-#[allow(clippy::too_many_arguments)]
 fn verify_latest(
     node: &NodeDecl,
     steps: &[RecordedStep],
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
-    resumed: bool,
     stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
@@ -3298,22 +3324,23 @@ fn verify_latest(
         });
         return;
     }
-    let (drain, writers) = match node.trigger {
-        TriggerDecl::DataLatest { drain, writers, .. } => (drain, writers),
-        _ => (LatestDrain::Unified, None),
+    let (drain, writers, depth) = match node.trigger {
+        TriggerDecl::DataLatest {
+            drain,
+            writers,
+            depth,
+            ..
+        } => (drain, writers, depth),
+        _ => (LatestDrain::Unified, None, 0),
     };
     // One carry per trigger input. A throttled node may defer the fire a
     // counted frame owes, so it is held to the bound alone on either drain.
-    let mut unread: Option<Vec<LatestUnread>> =
-        (drain != LatestDrain::Unified && node.throttle_ns.is_none()).then(|| {
-            trigger_inputs
-                .iter()
-                .map(|_| LatestUnread::new(!resumed))
-                .collect()
-        });
+    let mut unread: Option<Vec<LatestUnread>> = (drain != LatestDrain::Unified
+        && node.throttle_ns.is_none())
+    .then(|| trigger_inputs.iter().map(|_| LatestUnread::new()).collect());
     let mut unrecorded_noted = false;
     let mut block_noted = false;
-    let mut resume_noted = false;
+    let mut excuse_noted = false;
     let mut pops = vec![LatestStepPops::default(); trigger_inputs.len()];
     for step in steps {
         if stop.is_some_and(|s| step.step > s.step) {
@@ -3424,20 +3451,21 @@ fn verify_latest(
                     step_pops,
                     recorded.count > 0,
                     writers,
+                    depth,
                     node.feeds_local_block_edge,
                 ) {
                     LatestUnreadVerdict::Explained => {}
-                    // The carry is kept, so the node's first fire in the pass
-                    // starts the rule again; the note says which steps it
-                    // could not judge.
+                    // The carry is kept and later steps are judged against the
+                    // same excused queue; the note, once per node, says the
+                    // excuse was used.
                     LatestUnreadVerdict::Excused(reason) => {
-                        if !resume_noted {
+                        if !excuse_noted {
                             report.stand_downs.push(StandDown {
                                 node_id: node.node_id.clone(),
                                 decider: Decider::LatestFire,
                                 reason,
                             });
-                            resume_noted = true;
+                            excuse_noted = true;
                         }
                     }
                     LatestUnreadVerdict::Owed(frames) => {
@@ -3524,9 +3552,10 @@ enum LatestUnreadVerdict {
     Explained,
     /// The step owed the node a fire and fired nothing.
     Owed(UnreadFrames),
-    /// Counted frames that only a read made before the recording's first
-    /// retained step can explain: the step is not judged, and the carry
-    /// stays, so the node's next fire starts the rule again.
+    /// Counted frames, before the node's first fire in the pass, that only a
+    /// read the read log does not hold can explain, and no more than one
+    /// queue of the input past the reads and the frames in delivery: the carry
+    /// stays, so a later count past that queue is still owed.
     Excused(StandDownReason),
     /// Counted frames that something the bag does not record can explain
     /// on every later step too: the rule stops for the node.
@@ -3547,6 +3576,14 @@ enum LatestUnreadVerdict {
 /// a time, so the middle two are at most one each per writer. The fourth
 /// makes the live step's body probe answer that a read finds a frame, and the
 /// step that counted it then fires the node.
+///
+/// Before the node's first fire in the pass a fifth kind is possible: a frame
+/// a read the read log does not hold took (the node's `init`, which runs
+/// before a recording arms the read log, or a read before a resumed pass's
+/// first retained step). Such a read drained the queue the node reads while
+/// the copies of what it took still sat in the trigger-drain queue, so there
+/// are at most as many as that queue holds: the input's declared depth per
+/// writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LatestUnread {
     /// The node's last fire in the pass.
@@ -3555,34 +3592,34 @@ struct LatestUnread {
     counted: u64,
     /// Frames its reads took, and any read on a later step.
     read: u64,
-    /// The pass holds every read that can have taken a counted frame: a
-    /// from-start pass, or a resumed one once the node has fired. Until then
-    /// a count past the reads and the frames in delivery is excused, and the
-    /// node's first fire sets it.
+    /// The node has fired in the pass, so the pass holds every read that can
+    /// have taken a frame counted after that fire. Until then one queue of the
+    /// input past the reads and the frames in delivery is excused.
     anchored: bool,
 }
 
 impl LatestUnread {
-    fn new(anchored: bool) -> Self {
+    fn new() -> Self {
         Self {
             last_fire: None,
             counted: 0,
             read: 0,
-            anchored,
+            anchored: false,
         }
     }
 
     /// Fold one step in. `fired` is whether the recording holds a fire of
-    /// the node at this step; `writers` is
-    /// `TriggerDecl::DataLatest::writers`; `block_held` is
+    /// the node at this step; `writers` and `depth` are
+    /// `TriggerDecl::DataLatest`'s; `block_held` is
     /// [`NodeDecl::feeds_local_block_edge`].
     ///
-    /// A count is checked against what the bag can bound before it is
-    /// excused: the reads, then the frames in delivery where the writers are
-    /// known. Only a count past both asks for an excuse: a read before the
-    /// recording's first retained step (until the node's first fire in a
-    /// resumed pass), an uncapped publisher count, or an in-rank `block`
-    /// hold, in that order.
+    /// A count is checked against the reads first. Past them it needs the
+    /// writer count: with none the frames in delivery have no bound, and the
+    /// rule stops for the node. Past the frames in delivery, and before the
+    /// node's first fire, one queue of the input is excused. A count past all
+    /// of that is owed a fire, unless an in-rank `block` hold can have held
+    /// it.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         step: u64,
@@ -3590,6 +3627,7 @@ impl LatestUnread {
         pops: &LatestStepPops,
         fired: bool,
         writers: Option<u32>,
+        depth: u32,
         block_held: bool,
     ) -> LatestUnreadVerdict {
         if fired {
@@ -3612,16 +3650,22 @@ impl LatestUnread {
         if self.counted <= self.read {
             return LatestUnreadVerdict::Explained;
         }
-        let in_delivery = writers.map(|w| u64::from(w).saturating_mul(2));
-        if in_delivery.is_some_and(|d| self.counted <= self.read.saturating_add(d)) {
-            return LatestUnreadVerdict::Explained;
-        }
-        if !self.anchored {
-            return LatestUnreadVerdict::Excused(StandDownReason::LatestResumeUnanchored);
-        }
-        let Some(in_delivery) = in_delivery else {
+        let Some(writers) = writers else {
             return LatestUnreadVerdict::Unbounded(StandDownReason::LatestWritersUncapped);
         };
+        let in_delivery = u64::from(writers).saturating_mul(2);
+        let delivered = self.read.saturating_add(in_delivery);
+        if self.counted <= delivered {
+            return LatestUnreadVerdict::Explained;
+        }
+        let unlogged = if self.anchored {
+            0
+        } else {
+            u64::from(depth).saturating_mul(u64::from(writers))
+        };
+        if self.counted <= delivered.saturating_add(unlogged) {
+            return LatestUnreadVerdict::Excused(StandDownReason::LatestBeforeFirstFire);
+        }
         if block_held {
             return LatestUnreadVerdict::Unbounded(StandDownReason::LatestBlockHeld);
         }
@@ -3632,6 +3676,7 @@ impl LatestUnread {
             counted: self.counted,
             read: self.read,
             in_delivery,
+            unlogged,
         })
     }
 }
@@ -5980,17 +6025,37 @@ mod tests {
         latest_node_on(LatestDrain::Unified, Some(1))
     }
 
+    /// The declared depth of `sink`'s input in [`latest_node_on`].
+    const LATEST_DEPTH: u32 = 2;
+
     /// A `consume = latest` node `sink` on `inp`, read through `drain`, its
-    /// topic written by at most `writers` publishers.
+    /// topic written by at most `writers` publishers, at
+    /// [`LATEST_DEPTH`].
     fn latest_node_on(drain: LatestDrain, writers: Option<u32>) -> Vec<NodeDecl> {
+        latest_node_with(drain, writers, LATEST_DEPTH)
+    }
+
+    /// [`latest_node_on`] at a declared input `depth`.
+    fn latest_node_with(drain: LatestDrain, writers: Option<u32>, depth: u32) -> Vec<NodeDecl> {
         vec![node(
             "sink",
             TriggerDecl::DataLatest {
                 trigger_inputs: inputs(&["inp"]),
                 drain,
                 writers,
+                depth,
             },
         )]
+    }
+
+    /// The one note a node gets when its counts before its first fire use
+    /// the excused queue.
+    fn excused_before_first_fire() -> Vec<StandDown> {
+        vec![StandDown {
+            node_id: "sink".to_string(),
+            decider: Decider::LatestFire,
+            reason: StandDownReason::LatestBeforeFirstFire,
+        }]
     }
 
     /// A record on `(sink, inp)` at a real read-site role and wire sequence.
@@ -6169,7 +6234,10 @@ mod tests {
     /// every step and which never fires (a body probe that always answers
     /// that the queue is empty) is a finding naming the node, the input, the
     /// step that owed the fire and the frames it counted. One writer can be
-    /// delivering at most two of them, so the third count owes the fire.
+    /// delivering at most two of them, and before the node's first fire a
+    /// read the read log does not hold can have taken one queue more (two
+    /// frames at [`LATEST_DEPTH`], named once), so the fifth count owes the
+    /// fire.
     ///
     /// The comparison needs no read-site role: the node body reads only
     /// inside a tick, so every pop at a step the node did not fire is the
@@ -6180,31 +6248,34 @@ mod tests {
         let separate = latest_node_on(LatestDrain::Separate, Some(1));
         let regressed = never_fired_on_its_counted_frames();
         let report = verify_unrestored(&separate, &regressed, &[], BELIEVED);
-        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        assert_eq!(report.stand_downs, excused_before_first_fire());
         assert_eq!(
             report.findings,
             vec![ScheduleFinding {
                 node_id: "sink".to_string(),
-                step: 2,
+                step: 4,
                 decider: Decider::LatestFire,
                 expected: StepFires::count(1),
                 recorded: StepFires::count(0),
                 unread: Some(UnreadFrames {
                     input: "inp".to_string(),
-                    newest_seq: Some(2),
+                    newest_seq: Some(4),
                     last_fire: None,
-                    counted: 3,
+                    counted: 5,
                     read: 0,
                     in_delivery: 2,
+                    unlogged: 2,
                 }),
             }]
         );
         let rendered = report.findings[0].to_string();
         for part in [
-            "node 'sink' step 2",
+            "node 'sink' step 4",
             "input 'inp'",
-            "counted 3 frame(s)",
-            "seq 2",
+            "counted 5 frame(s)",
+            "seq 4",
+            "before the node's first fire",
+            "does not hold can have taken 2 more",
         ] {
             assert!(rendered.contains(part), "{part:?} missing from: {rendered}");
         }
@@ -6215,6 +6286,7 @@ mod tests {
         }
         let archived = verify_unrestored(&separate, &unstamped, &[], RoleTrust::Declined);
         assert_eq!(archived.findings, report.findings);
+        assert_eq!(archived.stand_downs, report.stand_downs);
 
         // After a fire whose read took three frames, the first three counts
         // are those frames, the next two can be in delivery, and the sixth
@@ -6272,10 +6344,11 @@ mod tests {
     /// Where the bag lacks what the comparison needs, the rule stands down
     /// LOUDLY instead of passing: an input whose topic no graph node produces
     /// has no cap on the frames its publishers can still have been
-    /// delivering, and a resumed pass cannot see the read before its first
-    /// retained step. Each stands down only once a counted frame needs that
+    /// delivering. It stands down only once a counted frame needs that
     /// excuse: a recording whose every count a read explains is judged in
-    /// full, and a resumed pass is judged from the node's first fire on.
+    /// full. A resumed pass, whose reads before its first retained step are
+    /// not in the bag, is judged as a from-start one: one queue is excused
+    /// before the node's first fire, and a count past it is a finding.
     #[test]
     fn a_separate_drain_latest_input_the_bag_cannot_bound_stands_down_loudly() {
         let uncapped = latest_node_on(LatestDrain::Separate, None);
@@ -6312,11 +6385,18 @@ mod tests {
             &resumed,
             &PassStops::none(),
         );
-        assert!(unanchored.is_clean(), "{:?}", unanchored.findings);
+        assert_eq!(unanchored.stand_downs, excused_before_first_fire());
         assert_eq!(
-            unanchored.stand_downs,
-            stood_down(StandDownReason::LatestResumeUnanchored)
+            unanchored.findings,
+            verify_unrestored(
+                &separate,
+                &never_fired_on_its_counted_frames(),
+                &[],
+                BELIEVED
+            )
+            .findings
         );
+        assert_eq!(unanchored.findings[0].step, 4);
         let mut anchored_late = vec![latest_step(0, true, vec![body_read(0, 1)])];
         anchored_late
             .extend((1..=4u32).map(|s| latest_step(u64::from(s), false, vec![counted(s)])));
@@ -6364,9 +6444,11 @@ mod tests {
             &[],
             BELIEVED,
         );
-        assert_eq!(regressed.stand_downs, not_recorded);
+        let mut noted = not_recorded.clone();
+        noted.extend(excused_before_first_fire());
+        assert_eq!(regressed.stand_downs, noted);
         assert_eq!(regressed.findings.len(), 1, "{:?}", regressed.findings);
-        assert_eq!(regressed.findings[0].step, 2);
+        assert_eq!(regressed.findings[0].step, 4);
 
         let every_pop_fires: Vec<RecordedStep> = (0..4u32)
             .map(|s| latest_step(u64::from(s), true, vec![counted(s)]))
@@ -6518,12 +6600,12 @@ mod tests {
     }
 
     /// A resumed pass checks a count against the frames in delivery before it
-    /// asks for the resume excuse, and keeps its carry when it does excuse
-    /// one. A first retained step that counts one frame still in delivery is
-    /// judged with nothing stood down, so the node that later stops firing is
-    /// caught; and a pass whose counts before the node's first fire do need a
-    /// read before the recording names that once and still catches the node
-    /// that stops firing after its first fire.
+    /// asks for the excuse before the node's first fire, and keeps its carry
+    /// when it does excuse one. A first retained step that counts one frame
+    /// still in delivery is judged with nothing stood down, so the node that
+    /// later stops firing is caught; and a pass whose counts before the
+    /// node's first fire do need a read before the recording names that once
+    /// and still catches the node that stops firing after its first fire.
     #[test]
     fn a_resumed_latest_pass_is_judged_from_the_frames_in_delivery_and_its_first_fire() {
         let resumed = PassRestore::from_sync_heads(BTreeMap::new());
@@ -6574,7 +6656,7 @@ mod tests {
             vec![StandDown {
                 node_id: "sink".to_string(),
                 decider: Decider::LatestFire,
-                reason: StandDownReason::LatestResumeUnanchored,
+                reason: StandDownReason::LatestBeforeFirstFire,
             }]
         );
         assert_eq!(reanchored.findings.len(), 1, "{:?}", reanchored.findings);
@@ -6582,6 +6664,139 @@ mod tests {
         assert_eq!(
             reanchored.findings[0].unread.as_ref().map(|f| f.last_fire),
             Some(Some(4))
+        );
+    }
+
+    /// A node can read its inputs in its `init`, which runs before a
+    /// recording arms the read log. Four frames a producer published before
+    /// that read are taken there while their copies stay in the trigger
+    /// queue, so the first step counts four frames no recorded read took and
+    /// the body probe finds nothing to fire on. Before the node's first fire
+    /// one queue of the input (its depth per writer) is excused, named once,
+    /// and the fire at step 1 ends the excuse. A count past that queue before
+    /// the first fire is a finding, and so is one past the reads and the
+    /// frames in delivery after it.
+    #[test]
+    fn frames_a_node_read_in_its_init_are_excused_up_to_one_queue_before_its_first_fire() {
+        let deep = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        let read_in_init = latest_step(
+            0,
+            false,
+            vec![latest_read(
+                ReadOutcomeKind::DrainedBatch,
+                3,
+                4,
+                ReadSiteRole::Drain,
+            )],
+        );
+        let healthy = vec![
+            read_in_init.clone(),
+            latest_step(1, true, vec![counted(4), body_read(4, 1)]),
+        ];
+        let report = verify_unrestored(&deep, &healthy, &[], BELIEVED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(report.stand_downs, excused_before_first_fire());
+
+        let mut past_one_queue = vec![read_in_init];
+        past_one_queue
+            .extend((1..=3u32).map(|s| latest_step(u64::from(s), false, vec![counted(s + 3)])));
+        let unfired = verify_unrestored(&deep, &past_one_queue, &[], BELIEVED);
+        assert_eq!(unfired.findings.len(), 1, "{:?}", unfired.findings);
+        assert_eq!(unfired.findings[0].step, 3);
+        let frames = unfired.findings[0]
+            .unread
+            .as_ref()
+            .expect("the counted frames");
+        assert_eq!(
+            (
+                frames.last_fire,
+                frames.counted,
+                frames.read,
+                frames.in_delivery,
+                frames.unlogged
+            ),
+            (None, 7, 0, 2, 4)
+        );
+
+        let mut stops_after_it = healthy;
+        stops_after_it
+            .extend((2..=5u32).map(|s| latest_step(u64::from(s), false, vec![counted(s + 3)])));
+        let anchored = verify_unrestored(&deep, &stops_after_it, &[], BELIEVED);
+        assert_eq!(anchored.stand_downs, excused_before_first_fire());
+        assert_eq!(anchored.findings.len(), 1, "{:?}", anchored.findings);
+        assert_eq!(anchored.findings[0].step, 5);
+        let frames = anchored.findings[0]
+            .unread
+            .as_ref()
+            .expect("the counted frames");
+        assert_eq!(
+            (
+                frames.last_fire,
+                frames.counted,
+                frames.read,
+                frames.in_delivery,
+                frames.unlogged
+            ),
+            (Some(1), 4, 1, 2, 0)
+        );
+    }
+
+    /// The excuse before a node's first fire is one queue, not the rest of
+    /// the pass. A resumed pass whose node never fires while its trigger
+    /// drain counts a thousand frames is a finding at the step whose count
+    /// passes the reads, two frames per writer in delivery and one queue
+    /// (depth 4 and one writer: the seventh count), and a from-start pass is
+    /// judged the same way. Two writers double both allowances. A topic no
+    /// graph node produces bounds neither, so the rule stands down by name.
+    #[test]
+    fn a_node_that_never_fires_is_a_finding_once_its_count_passes_one_queue() {
+        let never: Vec<RecordedStep> = (0..1000u32)
+            .map(|s| latest_step(u64::from(s), false, vec![counted(s)]))
+            .collect();
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new());
+        let judge = |writers, restore: &PassRestore| {
+            verify(
+                &latest_node_with(LatestDrain::Separate, writers, 4),
+                &never,
+                &[],
+                BELIEVED,
+                restore,
+                &PassStops::none(),
+            )
+        };
+        for restore in [resumed.clone(), PassRestore::none()] {
+            let report = judge(Some(1), &restore);
+            assert_eq!(report.stand_downs, excused_before_first_fire());
+            assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+            assert_eq!(report.findings[0].step, 6);
+            let frames = report.findings[0]
+                .unread
+                .as_ref()
+                .expect("the counted frames");
+            assert_eq!(
+                (
+                    frames.last_fire,
+                    frames.counted,
+                    frames.read,
+                    frames.in_delivery,
+                    frames.unlogged
+                ),
+                (None, 7, 0, 2, 4)
+            );
+        }
+        let two_writers = judge(Some(2), &resumed);
+        assert_eq!(two_writers.findings.len(), 1, "{:?}", two_writers.findings);
+        assert_eq!(two_writers.findings[0].step, 12);
+
+        let uncapped = judge(None, &resumed);
+        assert!(uncapped.is_clean(), "{:?}", uncapped.findings);
+        assert_eq!(
+            uncapped.stand_downs,
+            vec![StandDown {
+                node_id: "sink".to_string(),
+                decider: Decider::LatestFire,
+                reason: StandDownReason::LatestWritersUncapped,
+            }]
         );
     }
 
@@ -7393,7 +7608,7 @@ mod tests {
             StandDownReason::CaptureTimeSync,
             StandDownReason::LatestDrainUnrecorded,
             StandDownReason::LatestWritersUncapped,
-            StandDownReason::LatestResumeUnanchored,
+            StandDownReason::LatestBeforeFirstFire,
             StandDownReason::LatestBlockHeld,
         ];
         let codes: std::collections::BTreeSet<&str> = all.iter().map(|r| r.code()).collect();

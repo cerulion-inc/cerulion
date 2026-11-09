@@ -10876,7 +10876,7 @@ fn node_trigger_decl(
             trigger_inputs,
         },
         Some(MacroPolicy::DataTrigger { input_name }) => {
-            if consumes_latest(info, &input_name) {
+            if let Some(depth) = latest_input_depth(info, &input_name) {
                 // The recording's own stage set, where the bag states one;
                 // what the declaration settles otherwise.
                 let drain = match recorded_separate(&input_name) {
@@ -10889,6 +10889,7 @@ fn node_trigger_decl(
                     trigger_inputs: vec![input_name],
                     drain,
                     writers,
+                    depth,
                 }
             } else {
                 replay_rederive::TriggerDecl::Data {
@@ -11067,9 +11068,18 @@ fn input_consume_mode(
 /// Does `input` declare `consume = latest`? Read from the node's own
 /// `InputMeta`, the declaration the graph runtime wires from.
 fn consumes_latest(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+    latest_input_depth(info, input).is_some()
+}
+
+/// The declared queue depth of `input` when it declares `consume = latest`,
+/// read from the same `InputMeta` entry: the depth the graph runtime sizes the
+/// input's subscriber queues to on each publisher connection. `None` for an
+/// input that does not declare `consume = latest`.
+fn latest_input_depth(info: &cerulion_core::graph::NodeInfo, input: &str) -> Option<u32> {
     info.input_meta()
         .iter()
-        .any(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
+        .find(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
+        .map(|m| u32::try_from(m.depth).unwrap_or(u32::MAX))
 }
 
 /// The drain a `consume = latest` data-trigger input's DECLARATION settles, for
@@ -18189,10 +18199,12 @@ mod node_trigger_decl_tests {
         let cam = vec!["cam".to_string()];
         let latest = data(InputConsume::Latest);
         let fifo = data(InputConsume::Fifo);
+        // The depth is the trigger input's declared one, 4.
         let latest_on = |drain, writers| TriggerDecl::DataLatest {
             trigger_inputs: cam.clone(),
             drain,
             writers,
+            depth: 4,
         };
         // A `drop_oldest` input on a bag that states no stage set: the bag
         // records none of what decides its drain. The writer cap is the
@@ -18365,7 +18377,10 @@ mod node_trigger_decl_tests {
         ));
         assert_eq!(judge(&unified, &took_it_already).findings[0].step, 1);
 
-        let never_fired: Vec<RecordedStep> = (0..4u32)
+        // One frame counted a step and no fire: past the reads, the two
+        // frames one writer can be delivering and, before the first fire, one
+        // queue of the declared depth 4, the seventh count owes the fire.
+        let never_fired: Vec<RecordedStep> = (0..8u32)
             .map(|s| {
                 at(
                     u64::from(s),
@@ -18376,7 +18391,7 @@ mod node_trigger_decl_tests {
             .collect();
         let regressed = judge(&declared, &never_fired);
         assert_eq!(regressed.findings.len(), 1, "{:?}", regressed.findings);
-        assert_eq!(regressed.findings[0].step, 2);
+        assert_eq!(regressed.findings[0].step, 6);
         assert!(regressed.findings[0].unread.is_some());
     }
 
