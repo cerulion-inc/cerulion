@@ -260,7 +260,7 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// | `sync_window_ms = N` | once per complete aligned set: every `#[input(trigger)]` field has a message, and the set's timestamps lie within `N` ms of each other |
 /// | `unbounded_sync` | once per complete set: as soon as every `#[input(trigger)]` field has an unconsumed message, with no timing bound. Not recommended for control loops: the worst-case fire latency is the slowest publisher's interval, and unbounded if that publisher stops |
 /// | `external` | when its own `external_source()` signals (a device fd or a blocking SDK call). See [`macro@cerulion_node_impl`] |
-/// | none of these | each time a message arrives on the ONE field marked `#[input(trigger)]` |
+/// | none of these | each time a message arrives on the ONE field marked `#[input(trigger)]`; with `consume = latest` on that field, at most once per scheduler step, on the newest queued message |
 ///
 /// Under both sync policies each trigger message is consumed by at most one
 /// set, so a burst holding several complete sets gives one fire per set, in
@@ -299,6 +299,9 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// - A zero value for `period_ms`, `sync_window_ms`, `tick_within_ms`,
 ///   `throttle_ms`, `expect_within_ms` or `promise_within_ms`.
 /// - `depth` outside `1..=64`.
+/// - `consume` on an input that is not `#[input(trigger)]`, a `consume` mode
+///   other than `fifo` or `latest`, and `consume = latest` on any input of a
+///   `sync_window_ms` or `unbounded_sync` node.
 /// - A duplicate port name, a struct with no `#[input]` / `#[output]` field,
 ///   and the macro on anything that is not a struct.
 /// - `type_name`, `inputs(...)` and `outputs(...)` as macro arguments. The
@@ -328,6 +331,8 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// | `backpressure = sample(N)` | Admit at most one message per `N` ms, by the message's own timestamp |
 /// | `backpressure = block` | Lossless: the producer's tick is deferred while this consumer's queue is full. Installed only when EVERY consumer of the topic declares `block`; on a mixed topic this input is degraded to `drop_oldest`, with a `warn` at graph build |
 /// | `expect_within_ms = N` | Arrival watchdog. If `N` ms pass with no new message, `expect_within_missed_count` increments and a `warn` is logged. Independent of `trigger` |
+/// | `consume = fifo` | Default, `trigger` only. One fire per queued message, in arrival order |
+/// | `consume = latest` | `trigger` only, not on a sync node. At most one fire per scheduler step; that fire's read drains the queue and serves the newest message, and the older ones it drained are not served. A message no fire has read yet (the fire was deferred by `throttle_ms` or a `block` gate) is kept until a newer one arrives |
 ///
 /// An input that is not a trigger is a latest-value read: `tick` sees the most
 /// recent message, held across steps, and until the first message arrives the

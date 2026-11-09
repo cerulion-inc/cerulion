@@ -62,7 +62,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
         identity: "ingress_preflight".to_string(),
         prefix: "ingress_preflight".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -204,6 +204,7 @@ fn preflight_passes_when_the_ingress_consumer_declares_a_schema() {
                 depth: 1,
                 backpressure: Default::default(),
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         ),

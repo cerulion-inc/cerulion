@@ -134,6 +134,7 @@ fn recording_consumer(seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
             depth: CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -609,7 +610,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
         prefix: "fbwsCdylib".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fwd".to_string(),
@@ -627,7 +628,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -1077,7 +1078,7 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
         nodes: vec![
             ping_node(),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1196,6 +1197,7 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -1219,7 +1221,7 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
 /// The `period_ms = 1` trigger producer every chain in this file shares.
 fn ping_node() -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "ping".to_string(),
@@ -1238,7 +1240,7 @@ fn ping_node() -> NodeDef {
 /// The pair recorder wired to `consumer/out`.
 fn record_node() -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "record".to_string(),
@@ -1262,7 +1264,7 @@ fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRunt
         nodes: vec![
             ping_node(),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1317,7 +1319,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
         nodes: vec![
             ping_node(),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ctxsrc".to_string(),
@@ -1335,7 +1337,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1435,6 +1437,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -1458,7 +1461,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ping".to_string(),
@@ -1473,7 +1476,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "collapsed".to_string(),
@@ -1497,7 +1500,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "record".to_string(),
@@ -1532,7 +1535,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ping".to_string(),
@@ -1547,7 +1550,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -1582,7 +1585,7 @@ fn external_source_graph(
         identity: "fifo_burst_within_step_live".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),

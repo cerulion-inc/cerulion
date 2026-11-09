@@ -222,7 +222,7 @@ fn fires_per_step(trace: &[TraceEntry], id: &str, steps: u64) -> Vec<usize> {
 fn node(id: &str, node_type: &str, source: Option<String>, output: bool) -> NodeDef {
     NodeDef {
         params: Default::default(),
-        fuse: None,
+        isolate: None,
         ros2: None,
         id: id.to_string(),
         node_type: node_type.to_string(),

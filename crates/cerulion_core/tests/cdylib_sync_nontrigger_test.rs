@@ -156,7 +156,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
@@ -184,7 +184,7 @@ fn build_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -518,6 +518,7 @@ fn build_seq_graph(
         depth: 16,
         backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        consume: Default::default(),
     };
     let sink = ClosureNodeEntry::new(
         NodeInfo::with_meta(vec![sink_meta], vec![]).with_policy(MacroPolicy::DataTrigger {
@@ -547,7 +548,7 @@ fn build_seq_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
@@ -575,7 +576,7 @@ fn build_seq_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

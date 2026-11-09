@@ -34,9 +34,14 @@ workspace = true
 # tests, which is what the dev-dependency self-reference below is for.
 test-seams = []
 # Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
-# show its oracle catches it. Off by default and in every release build; only an
-# explicit `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
-oracle-mutants = []
+# show its oracle catches it, among them the private replay feed's
+# (`replay_feed::mutants`) and the core's (`cerulion_core/oracle-mutants`). Off by
+# default and in every release build; only an explicit
+# `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
+# This crate's seams include `CERULION_UNIT_COLLAPSE_MUTANT`, which keeps every
+# process group one executor unit; the core's feature carries the unit planner's
+# seams.
+oracle-mutants = ["cerulion_core/oracle-mutants"]
 
 [dependencies]
 cerulion_core = { workspace = true }
@@ -75,6 +80,8 @@ serde_yaml = "0.9"
 # with a real JSON parser. `cerulion_core` already pulls
 # `serde_json` transitively; listing it explicitly here.
 serde_json = "1"
+# `topic pub`, `service call`, `topic snapshot` and the `.msg`/`.srv` store.
+cerulion_msgio = { workspace = true }
 # `cerulion bag migrate` stamps the SOURCE bag's SHA-256 into the
 # `__cerulion/migration.json` provenance attachment, so a migrated bag can be
 # checked back against the recording it descends from. `sha2 = "0.10"` is
