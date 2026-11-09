@@ -40,6 +40,13 @@
 //! a queued one that carries every frame, with every node firing at the steps
 //! and times the queued run of the whole graph fires it.
 //!
+//! A third graph gives a chain member a `consume = latest` trigger input.
+//! Called, it fires once per step on the newest frame, as its queued twin
+//! does. On the separate drain discipline, where the step asks the member's
+//! body subscriber whether a read finds a frame before it fires the member,
+//! the member's binding is no unified one, so the chain call is cut there and
+//! the member runs at its own level.
+//!
 //! ```bash
 //! cargo test -p cerulion_core --test chain_call_identity_test -- --test-threads=1
 //! ```
@@ -455,8 +462,12 @@ struct Run {
 }
 
 fn run(fused: bool) -> Run {
+    step_through(build(fused))
+}
+
+/// Step `runtime` through the clock deltas and collect what it produced.
+fn step_through(mut runtime: GraphRuntime) -> Run {
     FRAMES.lock().expect("not poisoned").clear();
-    let mut runtime = build(fused);
     runtime.set_trace_limit(usize::MAX);
     runtime.enable_read_outcome_memory_sink();
     let mut reads = Vec::new();
@@ -687,6 +698,167 @@ fn an_unset_seam_makes_no_chain_call() {
     let n = runtime.trace().len();
     assert!(n >= 50 * 10, "the graph must run; {n} fires in 50 steps");
     assert_eq!(runtime.chain_calls_made(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A chain member whose trigger input is `consume = latest`.
+//
+// `pace -> pick -> last`: `pace` fires every 1 ms, so a step of d ms puts d
+// frames on `pick`'s input. `pick` fires once per step on the newest of them,
+// and `last` reads every frame `pick` publishes. The census chains all three,
+// and on the unified drain `pick` and `last` are called; on the separate
+// drain, where the step asks `pick`'s body subscriber whether a read finds a
+// frame before it fires `pick`, the chain call is cut at `pick` and both run
+// at their own levels.
+// ---------------------------------------------------------------------------
+
+/// Forwards the newest frame its `consume = latest` input holds.
+#[cerulion_node]
+#[derive(Default)]
+struct Picker {
+    #[input(trigger, consume = latest)]
+    inp: Int32,
+    #[output]
+    out: Int32,
+}
+
+#[cerulion_node_impl]
+impl Picker {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let v = self.inp.data;
+        note("pick", v);
+        self.out.data = v;
+        Ok(())
+    }
+}
+
+sink!(LastSink, "last");
+
+const LATEST_GRAPH: &str = r#"
+prefix: test/chain_call_latest
+nodes:
+  - id: pace
+    type: count
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: pick
+    type: picker
+    inputs:
+      - name: inp
+        source: pace/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: last
+    type: sink
+    inputs:
+      - name: inp
+        source: pick/out
+"#;
+
+/// Removes the drain-discipline seam's variable on drop, panic included.
+struct DrainEnv;
+
+impl Drop for DrainEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("CERULION_DRAIN_DISCIPLINE");
+    }
+}
+
+fn latest_run(fused: bool, separate: bool) -> Run {
+    let _drain = separate.then(|| {
+        std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
+        DrainEnv
+    });
+    let runtime = {
+        let _env = FuseEnv::set(if fused { "1" } else { "0" });
+        let config = parse_graph(LATEST_GRAPH).expect("the latest graph must parse");
+        validate_graph(&config).expect("the latest graph must validate");
+        let mut f: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        f.insert("pace".into(), Box::new(CountEntry::new()));
+        f.insert("pick".into(), Box::new(PickerEntry::new()));
+        f.insert("last".into(), Box::new(LastSinkEntry::new()));
+        GraphRuntime::build_for_test(config, f, Arc::new(VirtualClock::new()), 8)
+            .expect("the latest graph must build")
+    };
+    step_through(runtime)
+}
+
+/// `pick` read the newest frame of every step: `pace` publishes its fire
+/// count, so the frame `pick` reads at step `s` is the number of `pace` fires
+/// at or before `s`. `last` reads every frame `pick` publishes, in order.
+fn assert_latest_oracle(run: &Run, label: &str) {
+    let pace: Vec<u64> = run
+        .trace
+        .iter()
+        .filter(|r| r.0 == "pace")
+        .map(|r| r.1)
+        .collect();
+    let pick_steps: Vec<u64> = run
+        .trace
+        .iter()
+        .filter(|r| r.0 == "pick")
+        .map(|r| r.1)
+        .collect();
+    let picked = stream(&run.frames, "pick");
+    assert_eq!(
+        pick_steps.len(),
+        STEPS,
+        "{label}: pick fires once in every step"
+    );
+    assert!(
+        pace.len() >= STEPS + STEPS / 2,
+        "{label}: pace fired {} times in {STEPS} steps; the multi-fire steps must reach pick",
+        pace.len()
+    );
+    assert_eq!(
+        picked.len(),
+        pick_steps.len(),
+        "{label}: one frame per fire"
+    );
+    for (s, v) in pick_steps.iter().zip(&picked) {
+        let newest = pace.iter().filter(|p| *p <= s).count();
+        assert_eq!(
+            usize::try_from(*v).expect("a fire count"),
+            newest,
+            "{label}: pick read {v} at step {s}, the newest frame then is {newest}"
+        );
+    }
+    assert_eq!(
+        stream(&run.frames, "last"),
+        picked,
+        "{label}: last reads every frame pick publishes"
+    );
+    assert!(
+        run.reads.iter().any(|r| r.node_id == "pick"),
+        "{label}: pick logs its reads"
+    );
+}
+
+#[test]
+#[serial]
+fn a_chain_member_with_a_latest_trigger_input_is_called_as_it_fires_queued() {
+    for separate in [false, true] {
+        let label = if separate { "separate" } else { "unified" };
+        let queued = latest_run(false, separate);
+        let fused = latest_run(true, separate);
+        assert_eq!(
+            queued.calls, 0,
+            "{label}: the queued run makes no chain call"
+        );
+        let want = if separate { 0 } else { (STEPS * 2) as u64 };
+        assert_eq!(
+            fused.calls, want,
+            "{label}: pick and last are called every step on the unified drain, and \
+             neither on the separate one"
+        );
+        assert_latest_oracle(&queued, &format!("{label}, queued"));
+        assert_latest_oracle(&fused, &format!("{label}, fused"));
+        if let Err(e) = compare(&queued, &fused) {
+            panic!("{label}: {e}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
