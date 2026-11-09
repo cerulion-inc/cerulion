@@ -88,10 +88,11 @@
 //! second copy of that enum here is exactly the drift the rider forbids, so the
 //! gate rides along. If the vocabulary ever un-gates, so can this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+use cerulion_core::replay_feed::EdgeIdentity;
 use cerulion_core::scheduler::catchup_clamp::{derive_catchup_cap_override, effective_max_catchup};
 
 use crate::replay_engine::DivergenceClass;
@@ -519,12 +520,17 @@ pub enum TriggerDecl {
         trigger_inputs: Vec<String>,
         /// How the live graph read the trigger input.
         drain: LatestDrain,
-        /// The most publishers the trigger input's topic can have had while
-        /// the recording ran: the graph's producer count for a topic a graph
-        /// node produces, the shared multi-publisher port cap for one the
-        /// graph lists in `multi_publisher_topics`, and `None` for a topic no
-        /// graph node produces, whose publisher count nothing caps. Read only
-        /// where the input is read through two subscribers.
+        /// The publishers the graph provisions the trigger input's topic
+        /// with: the graph's producer count for a topic a graph node
+        /// produces, the shared multi-publisher port cap for one the graph
+        /// lists in `multi_publisher_topics`, and `None` for a topic no graph
+        /// node produces, whose publisher count nothing caps. The transport
+        /// enforces the cap only on a service the graph created: one that
+        /// already existed with more publisher slots is opened with a warning
+        /// and accepts publishers from outside the graph, so the unread-frame
+        /// rule also counts every writer the read log names on the input
+        /// ([`RecordedRead::writer`]). Read only where the input is read
+        /// through two subscribers.
         writers: Option<u32>,
         /// The trigger input's declared queue depth (`#[input(depth = N)]`),
         /// from the same `InputMeta` entry that declares it `consume = latest`.
@@ -533,6 +539,15 @@ pub enum TriggerDecl {
         /// `depth` frames per writer. Read only where the input is read through two
         /// subscribers.
         depth: u32,
+        /// The producer annotation rule the recording staged its read log
+        /// under: [`EdgeIdentity::EveryEdge`] from `trace_format` 8 on,
+        /// [`EdgeIdentity::MultiWriterEdges`] below it. Under the first a
+        /// writer change on any edge stages an annotation, so a counted frame
+        /// recorded before its read site's first annotation in the pass is a
+        /// frame of the writer run the pass began inside, and the unread-frame
+        /// rule counts that run's writer. Read only where the input is read
+        /// through two subscribers.
+        identity: EdgeIdentity,
     },
     /// A `sync_window_ms` node that aligns its trigger inputs on each
     /// message's `header.stamp` (capture time) instead of its wire stamp. The
@@ -702,6 +717,12 @@ pub struct RecordedRead {
     /// today and would silently start believing whatever a future writer put
     /// there.
     pub role: ReadSiteRole,
+    /// The writer a [`ReadOutcomeKind::Producer`] annotation names: its
+    /// 64-bit producer token, the whole aux word of the record. It names the
+    /// writer of every later record of its read site
+    /// ([`cerulion_core::read_outcome::writer_run_site`]) on its stage, up to
+    /// that site's next annotation. `None` on every other kind.
+    pub writer: Option<u64>,
 }
 
 /// One recorded scheduler step on ONE rank.
@@ -834,12 +855,13 @@ pub struct ScheduleFinding {
 /// [`Self::read`]; a writer can have been handing at most one to the trigger
 /// queue when an earlier read already took it, and at most one more to the
 /// body queue when this step asked, so [`Self::in_delivery`] is two per
-/// writer. Before the node's first fire in the pass, a read the read log does
-/// not hold can have taken one queue of them more ([`Self::unlogged`]). Any
-/// frame past those sat unread in the body subscriber when this step counted
-/// its arrivals, so the step owed the node a fire and the recording holds
-/// none: an entry that answers the body probe finds that frame, and one that
-/// does not fires on any counted frame.
+/// writer: the graph's publisher cap, or the writers the read log names on
+/// the input when it names more. Before the node's first fire in the pass, a
+/// read the read log does not hold can have taken one queue of them more
+/// ([`Self::unlogged`]). Any frame past those sat unread in the body
+/// subscriber when this step counted its arrivals, so the step owed the node a
+/// fire and the recording holds none: an entry that answers the body probe
+/// finds that frame, and one that does not fires on any counted frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadFrames {
     /// The trigger input.
@@ -854,7 +876,8 @@ pub struct UnreadFrames {
     /// Frames that fire's reads took.
     pub read: u64,
     /// Frames the input's writers can still have been delivering: two per
-    /// writer.
+    /// writer, the larger of the graph's publisher cap and the writers the
+    /// read log names on the input.
     pub in_delivery: u64,
     /// Frames a read the read log does not hold can have taken: one queue of
     /// the input (its declared depth per writer) before the node's first fire
@@ -1187,6 +1210,26 @@ pub enum StandDownReason {
     /// taken (`TriggerDecl::DataLatest::writers` is `None`). The unread-frame
     /// rule stops for the node; the one-fire bound still holds.
     LatestWritersUncapped,
+    /// A `consume = latest` input read through two subscribers counted more
+    /// frames since the node's last fire than the reads took and its writers
+    /// can explain, and the read log does not name the writer of every one
+    /// of those frames. The writers counted are the larger of the graph's
+    /// publisher cap and the writers the read log names, and the cap holds
+    /// only on a service the graph created: a topic opened on a service that
+    /// already existed with more publisher slots accepts publishers from
+    /// outside the graph. The read log names a counted frame's writer
+    /// through its producer annotations, which a recorder stages on every
+    /// edge from trace format 8 on and on a multi-writer edge before that,
+    /// and names every frame of a count of more than one from trace format 9,
+    /// when the count fits its read stage. From trace format 8 on, a frame
+    /// recorded before its read site's first annotation in the pass, as on a
+    /// bag that begins mid-run, is named as the writer of the run the pass
+    /// began inside, one writer more; below it a single-writer edge names no
+    /// writer. A frame the log does not name can be a writer's the count
+    /// leaves out, so the step is not convicted. The carry stays until the
+    /// node's next fire; after it, a count whose every frame since that fire
+    /// is named is judged again and can be a finding.
+    LatestWritersUnnamed,
     /// A `consume = latest` input read through two subscribers counted,
     /// before the node's first fire in the pass, more frames than the pass's
     /// reads took plus the frames its writers can still have been delivering.
@@ -1251,6 +1294,11 @@ impl StandDownReason {
                 "the consume = latest input's topic has no graph producer, so how many counted \
                  frames its publishers were still delivering is not bounded"
             }
+            Self::LatestWritersUnnamed => {
+                "the consume = latest input's counted frames outran what the reads and its \
+                 writers explain, and the read log does not name the writer of every frame it \
+                 counted, so a publisher beyond the graph's cap cannot be ruled out"
+            }
             Self::LatestBeforeFirstFire => {
                 "before the node's first fire in the pass, a read the read log does not hold \
                  (in the node's init, or before a resumed pass's first retained step) can have \
@@ -1291,6 +1339,7 @@ impl StandDownReason {
             Self::CaptureTimeSync => "capture_time_sync",
             Self::LatestDrainUnrecorded => "latest_drain_unrecorded",
             Self::LatestWritersUncapped => "latest_writers_uncapped",
+            Self::LatestWritersUnnamed => "latest_writers_unnamed",
             Self::LatestBeforeFirstFire => "latest_before_first_fire",
             Self::LatestBlockHeld => "latest_block_held",
         }
@@ -3306,7 +3355,12 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// frames per writer still being delivered owes a fire, and one that records
 /// none is a finding naming those frames ([`UnreadFrames`]). Before the node's
 /// first fire in the pass, from the start or resumed, one queue of the input
-/// more is excused ([`StandDownReason::LatestBeforeFirstFire`]).
+/// more is excused ([`StandDownReason::LatestBeforeFirstFire`]). The writers
+/// are the larger of the graph's publisher cap and the writers the read log
+/// names on the input ([`LatestWriters`]), and a count past what they explain
+/// is convicted only when the read log names the writer of every frame
+/// counted since the last fire; otherwise the step stands down
+/// ([`StandDownReason::LatestWritersUnnamed`]).
 ///
 /// On [`LatestDrain::Unrecorded`] both of those rules run, since they hold on
 /// either drain, and a step that popped and did not fire, which only the
@@ -3336,14 +3390,20 @@ fn verify_latest(
         });
         return;
     }
-    let (drain, writers, depth) = match node.trigger {
+    let (drain, writers, depth, identity) = match node.trigger {
         TriggerDecl::DataLatest {
             drain,
             writers,
             depth,
+            identity,
             ..
-        } => (drain, writers, depth),
-        _ => (LatestDrain::Unified, None, 0),
+        } => (drain, writers, depth, identity),
+        _ => (
+            LatestDrain::Unified,
+            None,
+            0,
+            EdgeIdentity::MultiWriterEdges,
+        ),
     };
     // One carry per trigger input. A throttled node may defer the fire a
     // counted frame owes, so it is held to the bound alone on either drain.
@@ -3352,8 +3412,9 @@ fn verify_latest(
     .then(|| trigger_inputs.iter().map(|_| LatestUnread::new()).collect());
     let mut unrecorded_noted = false;
     let mut block_noted = false;
-    let mut excuse_noted = false;
+    let mut excuses_noted: Vec<StandDownReason> = Vec::new();
     let mut pops = vec![LatestStepPops::default(); trigger_inputs.len()];
+    let mut writers_named = vec![LatestWriters::new(identity); trigger_inputs.len()];
     for step in steps {
         if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::LatestFire, false, report) {
@@ -3397,7 +3458,7 @@ fn verify_latest(
                 }
                 _ => {}
             }
-            pops[idx].add(read, trust);
+            pops[idx].add(read, trust, &mut writers_named[idx]);
         }
         let recorded = recorded_fires(step, &node.node_id, false);
         let at_stop = stop.is_some_and(|s| s.step == step.step);
@@ -3456,28 +3517,36 @@ fn verify_latest(
         }
         let mut unbounded = None;
         if let Some(carries) = unread.as_mut() {
-            for ((carry, input), step_pops) in carries.iter_mut().zip(trigger_inputs).zip(&pops) {
+            for (((carry, input), step_pops), named) in carries
+                .iter_mut()
+                .zip(trigger_inputs)
+                .zip(&pops)
+                .zip(&writers_named)
+            {
                 match carry.step(
                     step.step,
                     input,
                     step_pops,
                     recorded.count > 0,
-                    writers,
+                    LatestWriterCount {
+                        cap: writers,
+                        named: named.count(),
+                    },
                     depth,
                     node.feeds_local_block_edge,
                 ) {
                     LatestUnreadVerdict::Explained => {}
-                    // The carry is kept and later steps are judged against the
-                    // same excused queue; the note, once per node, says the
-                    // excuse was used.
+                    // The carry is kept and later steps are judged against
+                    // it; the note, once per node and reason, says the excuse
+                    // was used.
                     LatestUnreadVerdict::Excused(reason) => {
-                        if !excuse_noted {
+                        if !excuses_noted.contains(&reason) {
+                            excuses_noted.push(reason.clone());
                             report.stand_downs.push(StandDown {
                                 node_id: node.node_id.clone(),
                                 decider: Decider::LatestFire,
                                 reason,
                             });
-                            excuse_noted = true;
                         }
                     }
                     LatestUnreadVerdict::Owed(frames) => {
@@ -3526,12 +3595,17 @@ struct LatestStepPops {
     read: u32,
     /// The newest frame a drain-site `DrainedBatch` named, by wire sequence.
     newest_seq: Option<u32>,
+    /// The part of [`Self::drained`] whose writer the read log does not name
+    /// ([`LatestWriters::fold`]).
+    unnamed: u32,
 }
 
 impl LatestStepPops {
-    /// Fold one record in. Annotations (`Producer`, `BatchFrame`) pop
-    /// nothing; `Truncated` and `Decimated` stand the rule down before this.
-    fn add(&mut self, read: &RecordedRead, trust: RoleTrust) {
+    /// Fold one record in, in record order, through `writers`, the input's
+    /// named writers. Annotations (`Producer`, `BatchFrame`) pop nothing;
+    /// `Truncated` and `Decimated` stand the rule down before this.
+    fn add(&mut self, read: &RecordedRead, trust: RoleTrust, writers: &mut LatestWriters) {
+        self.unnamed = self.unnamed.saturating_add(writers.fold(read, trust));
         match read.kind {
             ReadOutcomeKind::DrainedBatch if is_drain_site_read(read, trust) => {
                 self.drained = self.drained.saturating_add(read.popped);
@@ -3556,6 +3630,136 @@ impl LatestStepPops {
     }
 }
 
+/// The writers the read log names on one `consume = latest` trigger input,
+/// and the state that says whether it names the writer of each frame the
+/// trigger drain counts.
+///
+/// A recorder stages a [`ReadOutcomeKind::Producer`] annotation before a
+/// record whose writer is not the writer of its read site's open run, and the
+/// annotation names the writer of every later record of that site on its
+/// stage, up to the next one; a multi-writer edge annotates every record. A
+/// `DrainedBatch` names the newest frame it counted, and from trace format 9
+/// the `BatchFrame` records before it name each other frame, when they and
+/// the read fit the read stage. A writer that published nothing the drain
+/// counted contributes no counted frame, so the writers named bound the
+/// writers of every counted frame the log names.
+///
+/// Under [`EdgeIdentity::EveryEdge`] (trace format 8 on) every edge carries
+/// the annotation and a stage's runs open at its arm, so a site's records
+/// before its first annotation in the pass belong to the run the pass began
+/// inside: a bag that begins mid-run (a resumed pass, a ring capture) does
+/// not hold the annotation that opened it. A pair the stage cannot admit
+/// leaves the site's run on its old writer and leaves a `Truncated` marker,
+/// which stands the rule down. The frames those records name, a
+/// `DrainedBatch`'s newest and each `BatchFrame` before it, are that one
+/// writer's, counted as one writer more than the annotations name
+/// ([`Self::count`]); a writer the pass annotates later can be that writer
+/// again, and counting it twice only widens the allowance. Under
+/// [`EdgeIdentity::MultiWriterEdges`] a single-writer edge carries no
+/// annotation, so such a record names no writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LatestWriters {
+    /// Whether a site's records before its first annotation belong to the
+    /// run the pass began inside ([`EdgeIdentity::EveryEdge`]).
+    inherits_runs: bool,
+    /// Every writer an annotation on the input named so far in the pass.
+    named: BTreeSet<u64>,
+    /// Per read site, the writer of its open run: the last annotation of the
+    /// site, `None` before one.
+    run: [Option<u64>; 2],
+    /// Per read site, the `BatchFrame` records since the site's last read
+    /// whose writer its open run, or the run the pass began inside, names.
+    batch_named: [u32; 2],
+    /// Per read site, whether one of those `BatchFrame` records came before
+    /// the site's first annotation.
+    batch_inherited: [bool; 2],
+    /// Whether a frame the trigger drain counted belongs to the run its site
+    /// was inside when the pass began.
+    inherited: bool,
+}
+
+impl LatestWriters {
+    /// No writer named yet, on a read log staged under `identity`.
+    fn new(identity: EdgeIdentity) -> Self {
+        Self {
+            inherits_runs: identity == EdgeIdentity::EveryEdge,
+            named: BTreeSet::new(),
+            run: [None; 2],
+            batch_named: [0; 2],
+            batch_inherited: [false; 2],
+            inherited: false,
+        }
+    }
+
+    /// How many distinct writers the read log has named on the input: the
+    /// writers its annotations name, and one more once a counted frame
+    /// belongs to the run the pass began inside.
+    fn count(&self) -> u32 {
+        u32::try_from(self.named.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(self.inherited))
+    }
+
+    /// Fold one record of the input in, in record order, and answer how many
+    /// of the frames it counted the read log names no writer for: on a
+    /// drain-site `DrainedBatch` ([`is_drain_site_read`]), the frames it
+    /// popped past the `BatchFrame` records before it and the newest frame it
+    /// names itself, each counted only where its site has an open run or the
+    /// site's records belong to the run the pass began inside; zero on every
+    /// other record.
+    fn fold(&mut self, read: &RecordedRead, trust: RoleTrust) -> u32 {
+        let site = cerulion_core::read_outcome::writer_run_site(read.role);
+        match read.kind {
+            ReadOutcomeKind::Producer => {
+                if let Some(writer) = read.writer {
+                    self.named.insert(writer);
+                }
+                self.run[site] = read.writer;
+                0
+            }
+            ReadOutcomeKind::BatchFrame => {
+                if self.run[site].is_some() {
+                    self.batch_named[site] = self.batch_named[site].saturating_add(1);
+                } else if self.inherits_runs {
+                    self.batch_named[site] = self.batch_named[site].saturating_add(1);
+                    self.batch_inherited[site] = true;
+                }
+                0
+            }
+            ReadOutcomeKind::Served
+            | ReadOutcomeKind::Held
+            | ReadOutcomeKind::NoFrame
+            | ReadOutcomeKind::DrainedBatch
+            | ReadOutcomeKind::Decimated
+            | ReadOutcomeKind::Truncated => {
+                let batch = std::mem::take(&mut self.batch_named[site]);
+                let batch_inherited = std::mem::take(&mut self.batch_inherited[site]);
+                if !is_drain_site_read(read, trust) {
+                    return 0;
+                }
+                let inherited = self.run[site].is_none() && self.inherits_runs;
+                let own = read.served_seq.is_some() && (self.run[site].is_some() || inherited);
+                if read.popped > 0 && (batch_inherited || (own && inherited)) {
+                    self.inherited = true;
+                }
+                read.popped
+                    .saturating_sub(batch.saturating_add(u32::from(own)))
+            }
+        }
+    }
+}
+
+/// The writers [`LatestUnread::step`] judges a count against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatestWriterCount {
+    /// `TriggerDecl::DataLatest::writers`: the publishers the graph
+    /// provisions the topic with, `None` when nothing caps them.
+    cap: Option<u32>,
+    /// The distinct writers the read log has named on the input so far in
+    /// the pass ([`LatestWriters::count`]).
+    named: u32,
+}
+
 /// What one step of [`LatestUnread::step`] concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LatestUnreadVerdict {
@@ -3564,10 +3768,14 @@ enum LatestUnreadVerdict {
     Explained,
     /// The step owed the node a fire and fired nothing.
     Owed(UnreadFrames),
-    /// Counted frames, before the node's first fire in the pass, that only a
-    /// read the read log does not hold can explain, and no more than one
-    /// queue of the input past the reads and the frames in delivery: the carry
-    /// stays, so a later count past that queue is still owed.
+    /// Counted frames that only something the read log does not hold can
+    /// explain: before the node's first fire in the pass, a read it does not
+    /// hold, up to one queue of the input past the reads and the frames in
+    /// delivery ([`StandDownReason::LatestBeforeFirstFire`]); or a writer it
+    /// does not name ([`StandDownReason::LatestWritersUnnamed`]). The step is
+    /// not convicted and the carry stays, so a later count is still judged:
+    /// one past every excuse is a finding once the read log names the writer
+    /// of every frame counted since the node's last fire.
     Excused(StandDownReason),
     /// Counted frames that something the bag does not record can explain
     /// on every later step too: the rule stops for the node.
@@ -3608,6 +3816,8 @@ struct LatestUnread {
     counted: u64,
     /// Frames its reads took, and any read on a later step.
     read: u64,
+    /// The part of [`Self::counted`] whose writer the read log does not name.
+    unnamed: u64,
     /// The node has fired in the pass, so the pass holds every read that can
     /// have taken a frame counted after that fire. Until then one queue of the
     /// input past the reads and the frames in delivery is excused.
@@ -3620,21 +3830,25 @@ impl LatestUnread {
             last_fire: None,
             counted: 0,
             read: 0,
+            unnamed: 0,
             anchored: false,
         }
     }
 
     /// Fold one step in. `fired` is whether the recording holds a fire of
-    /// the node at this step; `writers` and `depth` are
+    /// the node at this step; `writers` holds `TriggerDecl::DataLatest`'s
+    /// cap and the writers the read log names, and `depth` is
     /// `TriggerDecl::DataLatest`'s; `block_held` is
     /// [`NodeDecl::feeds_local_block_edge`].
     ///
     /// A count is checked against the reads first. Past them it needs the
-    /// writer count: with none the frames in delivery have no bound, and the
-    /// rule stops for the node. Past the frames in delivery, and before the
+    /// writer count: with no cap the frames in delivery have no bound, and the
+    /// rule stops for the node; with one, the writers are the larger of the
+    /// cap and the writers named. Past the frames in delivery, and before the
     /// node's first fire, one queue of the input is excused. A count past all
     /// of that is owed a fire, unless an in-rank `block` hold can have held
-    /// it.
+    /// it, or a counted frame since the last fire has no named writer and can
+    /// be a writer's the count leaves out.
     #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
@@ -3642,7 +3856,7 @@ impl LatestUnread {
         input: &str,
         pops: &LatestStepPops,
         fired: bool,
-        writers: Option<u32>,
+        writers: LatestWriterCount,
         depth: u32,
         block_held: bool,
     ) -> LatestUnreadVerdict {
@@ -3654,6 +3868,7 @@ impl LatestUnread {
                 last_fire: Some(step),
                 counted: 0,
                 read: u64::from(pops.read).saturating_add(u64::from(pops.unsited)),
+                unnamed: 0,
                 anchored: true,
             };
             return LatestUnreadVerdict::Explained;
@@ -3663,12 +3878,14 @@ impl LatestUnread {
             return LatestUnreadVerdict::Explained;
         }
         self.counted = self.counted.saturating_add(u64::from(pops.drained));
+        self.unnamed = self.unnamed.saturating_add(u64::from(pops.unnamed));
         if self.counted <= self.read {
             return LatestUnreadVerdict::Explained;
         }
-        let Some(writers) = writers else {
+        let Some(cap) = writers.cap else {
             return LatestUnreadVerdict::Unbounded(StandDownReason::LatestWritersUncapped);
         };
+        let writers = cap.max(writers.named);
         let in_delivery = u64::from(writers).saturating_mul(2);
         let delivered = self.read.saturating_add(in_delivery);
         if self.counted <= delivered {
@@ -3684,6 +3901,9 @@ impl LatestUnread {
         }
         if block_held {
             return LatestUnreadVerdict::Unbounded(StandDownReason::LatestBlockHeld);
+        }
+        if self.unnamed > 0 {
+            return LatestUnreadVerdict::Excused(StandDownReason::LatestWritersUnnamed);
         }
         LatestUnreadVerdict::Owed(UnreadFrames {
             input: input.to_string(),
@@ -4119,6 +4339,7 @@ mod tests {
             // so these vectors keep meaning exactly what they meant. The
             // ROLE-STAMPED arms build their reads through `read_with_role`.
             role: ReadSiteRole::Unstamped,
+            writer: None,
         }
     }
 
@@ -6051,8 +6272,20 @@ mod tests {
         latest_node_with(drain, writers, LATEST_DEPTH)
     }
 
-    /// [`latest_node_on`] at a declared input `depth`.
+    /// [`latest_node_on`] at a declared input `depth`, on a bag recorded at
+    /// trace format 8 or later.
     fn latest_node_with(drain: LatestDrain, writers: Option<u32>, depth: u32) -> Vec<NodeDecl> {
+        latest_node_recorded(drain, writers, depth, EdgeIdentity::EveryEdge)
+    }
+
+    /// [`latest_node_with`] on a bag whose read log was staged under
+    /// `identity`: [`EdgeIdentity::MultiWriterEdges`] below trace format 8.
+    fn latest_node_recorded(
+        drain: LatestDrain,
+        writers: Option<u32>,
+        depth: u32,
+        identity: EdgeIdentity,
+    ) -> Vec<NodeDecl> {
         vec![node(
             "sink",
             TriggerDecl::DataLatest {
@@ -6060,6 +6293,7 @@ mod tests {
                 drain,
                 writers,
                 depth,
+                identity,
             },
         )]
     }
@@ -6304,11 +6538,11 @@ mod tests {
     /// The comparison needs no read-site role: the node body reads only
     /// inside a tick, so every pop at a step the node did not fire is the
     /// trigger drain's, and an archived bag's reading of the same records
-    /// convicts at the same step.
+    /// convicts at the same step. The recording names its writer ([`named`]).
     #[test]
     fn a_separate_drain_latest_node_that_never_fires_on_counted_frames_is_caught() {
         let separate = latest_node_on(LatestDrain::Separate, Some(1));
-        let regressed = never_fired_on_its_counted_frames();
+        let regressed = named(never_fired_on_its_counted_frames());
         let report = verify_unrestored(&separate, &regressed, &[], BELIEVED);
         assert_eq!(report.stand_downs, excused_before_first_fire());
         assert_eq!(
@@ -6355,7 +6589,7 @@ mod tests {
         // owes the fire.
         let mut after_a_read = vec![latest_step(0, true, vec![body_read(0, 3)])];
         after_a_read.extend((1..=6u32).map(|s| latest_step(u64::from(s), false, vec![counted(s)])));
-        let late = verify_unrestored(&separate, &after_a_read, &[], BELIEVED);
+        let late = verify_unrestored(&separate, &named(after_a_read), &[], BELIEVED);
         assert_eq!(late.findings.len(), 1, "{:?}", late.findings);
         assert_eq!(late.findings[0].step, 6);
         let frames = late.findings[0]
@@ -6473,6 +6707,7 @@ mod tests {
         stalled.push(latest_step(3, false, vec![counted_burst(6, 2)]));
         stalled.push(latest_step(4, false, vec![counted_burst(8, 2)]));
         stalled.push(latest_step(5, false, vec![counted_burst(10, 2)]));
+        let stalled = named(stalled);
         let separate = latest_node_on(LatestDrain::Separate, Some(1));
         let report = verify_unrestored(&separate, &stalled, &[], BELIEVED);
         assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
@@ -6534,8 +6769,9 @@ mod tests {
     /// delivering. It stands down only once a counted frame needs that
     /// excuse: a recording whose every count a read explains is judged in
     /// full. A resumed pass, whose reads before its first retained step are
-    /// not in the bag, is judged as a from-start one: one queue is excused
-    /// before the node's first fire, and a count past it is a finding.
+    /// not in the bag, nor the annotation that opened its writer's run, is
+    /// judged as a from-start one: one queue is excused before the node's
+    /// first fire, and a count past it is a finding.
     #[test]
     fn a_separate_drain_latest_input_the_bag_cannot_bound_stands_down_loudly() {
         let uncapped = latest_node_on(LatestDrain::Separate, None);
@@ -6577,7 +6813,7 @@ mod tests {
             unanchored.findings,
             verify_unrestored(
                 &separate,
-                &never_fired_on_its_counted_frames(),
+                &named(never_fired_on_its_counted_frames()),
                 &[],
                 BELIEVED
             )
@@ -6627,7 +6863,7 @@ mod tests {
 
         let regressed = verify_unrestored(
             &unrecorded,
-            &never_fired_on_its_counted_frames(),
+            &named(never_fired_on_its_counted_frames()),
             &[],
             BELIEVED,
         );
@@ -6687,7 +6923,7 @@ mod tests {
     /// bound still convicts.
     #[test]
     fn a_separate_drain_latest_node_a_block_edge_in_its_rank_holds_back_is_not_convicted() {
-        let held = held_back_by_a_block_edge_in_its_rank();
+        let held = named(held_back_by_a_block_edge_in_its_rank());
         let block_held = vec![StandDown {
             node_id: "sink".to_string(),
             decider: Decider::LatestFire,
@@ -6793,6 +7029,8 @@ mod tests {
     /// later stops firing is caught; and a pass whose counts before the
     /// node's first fire do need a read before the recording names that once
     /// and still catches the node that stops firing after its first fire.
+    /// Neither holds the annotation that opened its writer's run: its counts
+    /// are that one writer's.
     #[test]
     fn a_resumed_latest_pass_is_judged_from_the_frames_in_delivery_and_its_first_fire() {
         let resumed = PassRestore::from_sync_heads(BTreeMap::new());
@@ -6887,7 +7125,7 @@ mod tests {
         let mut past_one_queue = vec![read_in_init];
         past_one_queue
             .extend((1..=3u32).map(|s| latest_step(u64::from(s), false, vec![counted(s + 3)])));
-        let unfired = verify_unrestored(&deep, &past_one_queue, &[], BELIEVED);
+        let unfired = verify_unrestored(&deep, &named(past_one_queue), &[], BELIEVED);
         assert_eq!(unfired.findings.len(), 1, "{:?}", unfired.findings);
         assert_eq!(unfired.findings[0].step, 3);
         let frames = unfired.findings[0]
@@ -6908,7 +7146,7 @@ mod tests {
         let mut stops_after_it = healthy;
         stops_after_it
             .extend((2..=5u32).map(|s| latest_step(u64::from(s), false, vec![counted(s + 3)])));
-        let anchored = verify_unrestored(&deep, &stops_after_it, &[], BELIEVED);
+        let anchored = verify_unrestored(&deep, &named(stops_after_it), &[], BELIEVED);
         assert_eq!(anchored.stand_downs, excused_before_first_fire());
         assert_eq!(anchored.findings.len(), 1, "{:?}", anchored.findings);
         assert_eq!(anchored.findings[0].step, 5);
@@ -6933,18 +7171,26 @@ mod tests {
     /// drain counts a thousand frames is a finding at the step whose count
     /// passes the reads, two frames per writer in delivery and one queue
     /// (depth 4 and one writer: the seventh count), and a from-start pass is
-    /// judged the same way. Two writers double both allowances. A topic no
-    /// graph node produces bounds neither, so the rule stands down by name.
+    /// judged the same way. The resumed bag begins inside its writer's run
+    /// and the from-start one holds the annotation that opens it. Two writers
+    /// double both allowances. A topic no graph node produces bounds neither,
+    /// so the rule stands down by name.
     #[test]
     fn a_node_that_never_fires_is_a_finding_once_its_count_passes_one_queue() {
-        let never: Vec<RecordedStep> = (0..1000u32)
+        let mid_run: Vec<RecordedStep> = (0..1000u32)
             .map(|s| latest_step(u64::from(s), false, vec![counted(s)]))
             .collect();
+        let from_start = named(mid_run.clone());
         let resumed = PassRestore::from_sync_heads(BTreeMap::new());
         let judge = |writers, restore: &PassRestore| {
+            let never = if restore.resumed {
+                &mid_run
+            } else {
+                &from_start
+            };
             verify(
                 &latest_node_with(LatestDrain::Separate, writers, 4),
-                &never,
+                never,
                 &[],
                 BELIEVED,
                 restore,
@@ -6984,6 +7230,485 @@ mod tests {
                 decider: Decider::LatestFire,
                 reason: StandDownReason::LatestWritersUncapped,
             }]
+        );
+    }
+
+    /// One of the two writers of `sink`'s topic in the writer tests below.
+    const WRITER_A: u64 = 0xA11C_E000_0000_0001;
+    /// The other.
+    const WRITER_B: u64 = 0xB0B0_0000_0000_0002;
+
+    /// A producer annotation on `sink`'s trigger drain naming `writer`: the
+    /// writer of every drain-site record after it, up to the next annotation.
+    fn annotation(writer: u64, seq: u32) -> RecordedRead {
+        RecordedRead {
+            writer: Some(writer),
+            ..latest_read(ReadOutcomeKind::Producer, seq, 0, ReadSiteRole::Drain)
+        }
+    }
+
+    /// The trigger drain's count of `frames`, each a writer and its wire
+    /// sequence in pop order, as a current recorder stages it: a `BatchFrame`
+    /// for every frame but the newest, which the `DrainedBatch` names, and an
+    /// annotation before each record whose writer is not the one before it,
+    /// the first record's included.
+    fn named_count(frames: &[(u64, u32)]) -> Vec<RecordedRead> {
+        let popped = u32::try_from(frames.len()).expect("a test burst");
+        let mut out = Vec::new();
+        let mut run = None;
+        for (pos, &(writer, seq)) in frames.iter().enumerate() {
+            if run != Some(writer) {
+                out.push(annotation(writer, seq));
+                run = Some(writer);
+            }
+            out.push(if pos + 1 == frames.len() {
+                counted_burst(seq, popped)
+            } else {
+                latest_read(ReadOutcomeKind::BatchFrame, seq, 0, ReadSiteRole::Drain)
+            });
+        }
+        out
+    }
+
+    /// `steps` as a current recorder stages them from the start of a
+    /// recording for one writer of `sink`'s topic, [`WRITER_A`]: the
+    /// annotation that opens the writer's run on the trigger drain before its
+    /// first count, and a `BatchFrame` before a count of more than one for
+    /// each of its frames but the newest, each at the count's own role. A bag
+    /// that begins mid-run does not hold that annotation.
+    fn named(steps: Vec<RecordedStep>) -> Vec<RecordedStep> {
+        let mut opened = false;
+        steps
+            .into_iter()
+            .map(|mut step| {
+                let mut reads = Vec::with_capacity(step.reads.len());
+                for read in std::mem::take(&mut step.reads) {
+                    if read.kind == ReadOutcomeKind::DrainedBatch && read.role != ReadSiteRole::Body
+                    {
+                        let newest = read.served_seq.unwrap_or(0);
+                        if !opened {
+                            reads.push(RecordedRead {
+                                role: read.role,
+                                ..annotation(WRITER_A, newest)
+                            });
+                            opened = true;
+                        }
+                        for back in (1..read.popped).rev() {
+                            reads.push(latest_read(
+                                ReadOutcomeKind::BatchFrame,
+                                newest.wrapping_sub(back),
+                                0,
+                                read.role,
+                            ));
+                        }
+                    }
+                    reads.push(read);
+                }
+                step.reads = reads;
+                step
+            })
+            .collect()
+    }
+
+    /// A graph-owned topic opened on a service that already existed with more
+    /// publisher slots than the graph provisions accepts a publisher from
+    /// outside the graph, so the graph's cap of one writer bounds nothing.
+    /// Two writers at depth 4 fill the trigger queue with eight frames; the
+    /// node's init read their eight copies from the queue it reads, so the
+    /// first step counts all eight and the body probe finds nothing to fire
+    /// on. The read log names both writers, and their two queues are
+    /// excused before the node's first fire, named once. Two queues and no
+    /// more: the thirteenth count before the first fire is a finding with the
+    /// two writers' allowances in it. A bag that does not name the writer of
+    /// every frame stands the count down by name instead of convicting it on
+    /// the cap, whether it carries no annotation or batch frame or, as a
+    /// recorder without batch frames does, names only the newest frame of
+    /// the count.
+    #[test]
+    fn a_second_writer_the_read_log_names_widens_the_queue_before_the_first_fire() {
+        let deep = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        let init_copies: Vec<(u64, u32)> = (0..4)
+            .map(|s| (WRITER_A, s))
+            .chain((0..4).map(|s| (WRITER_B, 100 + s)))
+            .collect();
+        let mut first_fire = named_count(&[(WRITER_A, 4)]);
+        first_fire.push(body_read(4, 1));
+        let healthy = vec![
+            latest_step(0, false, named_count(&init_copies)),
+            latest_step(1, true, first_fire),
+        ];
+        let report = verify_unrestored(&deep, &healthy, &[], BELIEVED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(report.stand_downs, excused_before_first_fire());
+
+        let mut stalled = vec![healthy[0].clone()];
+        stalled.extend((1..=5u32).map(|s| {
+            let writer = if s % 2 == 0 { WRITER_A } else { WRITER_B };
+            latest_step(u64::from(s), false, named_count(&[(writer, 200 + s)]))
+        }));
+        let past = verify_unrestored(&deep, &stalled, &[], BELIEVED);
+        assert_eq!(past.stand_downs, excused_before_first_fire());
+        assert_eq!(past.findings.len(), 1, "{:?}", past.findings);
+        assert_eq!(past.findings[0].step, 5);
+        let frames = past.findings[0]
+            .unread
+            .as_ref()
+            .expect("the counted frames");
+        assert_eq!(
+            (
+                frames.counted,
+                frames.read,
+                frames.in_delivery,
+                frames.unlogged
+            ),
+            (13, 0, 4, 8)
+        );
+
+        let unnamed_writers = vec![StandDown {
+            node_id: "sink".to_string(),
+            decider: Decider::LatestFire,
+            reason: StandDownReason::LatestWritersUnnamed,
+        }];
+        let unannotated: Vec<RecordedStep> = healthy
+            .iter()
+            .map(|step| RecordedStep {
+                reads: step
+                    .reads
+                    .iter()
+                    .filter(|r| {
+                        !matches!(
+                            r.kind,
+                            ReadOutcomeKind::Producer | ReadOutcomeKind::BatchFrame
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+                ..step.clone()
+            })
+            .collect();
+        let named_none = verify_unrestored(&deep, &unannotated, &[], BELIEVED);
+        assert!(named_none.is_clean(), "{:?}", named_none.findings);
+        assert_eq!(named_none.stand_downs, unnamed_writers);
+
+        let mut newest_only = healthy.clone();
+        newest_only[0].reads = vec![annotation(WRITER_B, 103), counted_burst(103, 8)];
+        let one_named = verify_unrestored(&deep, &newest_only, &[], BELIEVED);
+        assert!(one_named.is_clean(), "{:?}", one_named.findings);
+        assert_eq!(one_named.stand_downs, unnamed_writers);
+    }
+
+    /// After a fire whose read took three frames, two writers the read log
+    /// names can each be delivering two of the frames the trigger drain
+    /// counts, so the first three counts are those frames, the next four can
+    /// be in delivery, and the eighth owes the fire. The same counts with no
+    /// annotation are, on a bag from trace format 8 on, the one writer the
+    /// pass began inside, and the sixth owes the fire. On a bag below it they
+    /// name no writer and stand down by name at the sixth, the first the
+    /// graph's cap of one writer cannot explain, and the carry stays until
+    /// the next fire: after it, a count whose every frame since that fire is
+    /// named is judged again, and one writer named after that fire is held to
+    /// two frames in delivery.
+    #[test]
+    fn a_second_writer_the_read_log_names_doubles_the_frames_in_delivery() {
+        let separate = latest_node_on(LatestDrain::Separate, Some(1));
+        let older = latest_node_recorded(
+            LatestDrain::Separate,
+            Some(1),
+            LATEST_DEPTH,
+            EdgeIdentity::MultiWriterEdges,
+        );
+        let mut steps = vec![latest_step(0, true, vec![body_read(0, 3)])];
+        steps.extend((1..=8u32).map(|s| {
+            let writer = if s % 2 == 0 { WRITER_A } else { WRITER_B };
+            latest_step(u64::from(s), false, named_count(&[(writer, s)]))
+        }));
+        let report = verify_unrestored(&separate, &steps, &[], BELIEVED);
+        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 8);
+        let frames = report.findings[0]
+            .unread
+            .as_ref()
+            .expect("the counted frames");
+        assert_eq!(
+            (
+                frames.last_fire,
+                frames.counted,
+                frames.read,
+                frames.in_delivery
+            ),
+            (Some(0), 8, 3, 4)
+        );
+
+        let mut unnamed: Vec<RecordedStep> = (0..=8u32)
+            .map(|s| {
+                if s == 0 {
+                    latest_step(0, true, vec![body_read(0, 3)])
+                } else {
+                    latest_step(u64::from(s), false, vec![counted(s)])
+                }
+            })
+            .collect();
+        let inherited = verify_unrestored(&separate, &unnamed, &[], BELIEVED);
+        assert!(
+            inherited.stand_downs.is_empty(),
+            "{:?}",
+            inherited.stand_downs
+        );
+        assert_eq!(inherited.findings.len(), 1, "{:?}", inherited.findings);
+        assert_eq!(inherited.findings[0].step, 6);
+        assert_eq!(
+            inherited.findings[0].unread.as_ref().map(|f| (
+                f.last_fire,
+                f.counted,
+                f.read,
+                f.in_delivery
+            )),
+            Some((Some(0), 6, 3, 2))
+        );
+        let stood_down = verify_unrestored(&older, &unnamed, &[], BELIEVED);
+        assert!(stood_down.is_clean(), "{:?}", stood_down.findings);
+        assert_eq!(
+            stood_down.stand_downs,
+            vec![StandDown {
+                node_id: "sink".to_string(),
+                decider: Decider::LatestFire,
+                reason: StandDownReason::LatestWritersUnnamed,
+            }]
+        );
+        unnamed.push(latest_step(9, true, vec![body_read(9, 1)]));
+        unnamed.extend(
+            (10..=13u32).map(|s| latest_step(u64::from(s), false, named_count(&[(WRITER_A, s)]))),
+        );
+        let judged_again = verify_unrestored(&older, &unnamed, &[], BELIEVED);
+        assert_eq!(judged_again.stand_downs, stood_down.stand_downs);
+        assert_eq!(
+            judged_again.findings.len(),
+            1,
+            "{:?}",
+            judged_again.findings
+        );
+        assert_eq!(judged_again.findings[0].step, 13);
+        assert_eq!(
+            judged_again.findings[0].unread.as_ref().map(|f| (
+                f.last_fire,
+                f.counted,
+                f.read,
+                f.in_delivery
+            )),
+            Some((Some(9), 4, 1, 2))
+        );
+    }
+
+    /// A counted frame's writer is named only through its own read site's
+    /// open run: an annotation on the node body's reads names nothing the
+    /// trigger drain counts, and a count names its newest frame and each
+    /// `BatchFrame` before it whose site has a run. The run carries to the
+    /// site's later counts. Before the drain site's first annotation, a bag
+    /// from trace format 8 on names the count's newest frame as the writer
+    /// of the run the pass began inside, one writer more, and a bag below it
+    /// names nothing. An archived bag's unstamped roles share one site.
+    #[test]
+    fn the_read_log_names_a_counted_frame_only_through_its_own_sites_run() {
+        for (identity, before_the_run, writers) in [
+            (EdgeIdentity::MultiWriterEdges, 2, 2),
+            (EdgeIdentity::EveryEdge, 1, 3),
+        ] {
+            let mut named = LatestWriters::new(identity);
+            let body_annotation = RecordedRead {
+                role: ReadSiteRole::Body,
+                ..annotation(WRITER_A, 0)
+            };
+            assert_eq!(named.fold(&body_annotation, BELIEVED), 0);
+            assert_eq!(named.fold(&body_read(0, 1), BELIEVED), 0);
+            assert_eq!(
+                named.fold(&counted_burst(2, 2), BELIEVED),
+                before_the_run,
+                "{identity:?}"
+            );
+            assert_eq!(named.fold(&annotation(WRITER_B, 4), BELIEVED), 0);
+            let batch = latest_read(ReadOutcomeKind::BatchFrame, 3, 0, ReadSiteRole::Drain);
+            assert_eq!(named.fold(&batch, BELIEVED), 0);
+            assert_eq!(named.fold(&counted_burst(4, 3), BELIEVED), 1);
+            assert_eq!(named.fold(&counted(5), BELIEVED), 0);
+            assert_eq!(named.count(), writers, "{identity:?}");
+        }
+
+        let mut archived = LatestWriters::new(EdgeIdentity::MultiWriterEdges);
+        let unstamped = |read: RecordedRead| RecordedRead {
+            role: ReadSiteRole::Unstamped,
+            ..read
+        };
+        let declined = RoleTrust::Declined;
+        assert_eq!(
+            archived.fold(&unstamped(annotation(WRITER_A, 0)), declined),
+            0
+        );
+        assert_eq!(archived.fold(&unstamped(counted(0)), declined), 0);
+        assert_eq!(archived.fold(&unstamped(counted_burst(2, 2)), declined), 1);
+        assert_eq!(archived.count(), 1);
+    }
+
+    /// A `BatchFrame` names a frame only of the read it precedes, and only
+    /// through its site's run. Before the drain site's first annotation, a
+    /// bag from trace format 8 on names batch frames as the writer of the
+    /// run the pass began inside, one writer more, even when an annotation
+    /// opens a new run before the read; a bag below it names none of them.
+    /// The credit ends at its read: the next count of more than one with no
+    /// batch frames names only its newest frame. A count that names no
+    /// served frame and carries no batch frames names no writer on either.
+    #[test]
+    fn a_batch_frame_names_a_counted_frame_only_for_the_read_it_precedes() {
+        let drain_batch =
+            |seq| latest_read(ReadOutcomeKind::BatchFrame, seq, 0, ReadSiteRole::Drain);
+        for (identity, unnamed_before_the_run, inherited) in [
+            (EdgeIdentity::MultiWriterEdges, 3, 0),
+            (EdgeIdentity::EveryEdge, 0, 1),
+        ] {
+            let mut before_any = LatestWriters::new(identity);
+            assert_eq!(before_any.fold(&drain_batch(1), BELIEVED), 0);
+            assert_eq!(before_any.fold(&drain_batch(2), BELIEVED), 0);
+            assert_eq!(
+                before_any.fold(&counted_burst(3, 3), BELIEVED),
+                unnamed_before_the_run,
+                "{identity:?}"
+            );
+            assert_eq!(before_any.count(), inherited, "{identity:?}");
+
+            let mut new_run = LatestWriters::new(identity);
+            assert_eq!(new_run.fold(&drain_batch(1), BELIEVED), 0);
+            assert_eq!(new_run.fold(&annotation(WRITER_B, 2), BELIEVED), 0);
+            assert_eq!(
+                new_run.fold(&counted_burst(2, 2), BELIEVED),
+                1 - inherited,
+                "{identity:?}"
+            );
+            assert_eq!(new_run.count(), 1 + inherited, "{identity:?}");
+
+            let mut credit = LatestWriters::new(identity);
+            assert_eq!(credit.fold(&annotation(WRITER_A, 0), BELIEVED), 0);
+            assert_eq!(credit.fold(&drain_batch(0), BELIEVED), 0);
+            assert_eq!(credit.fold(&counted_burst(1, 2), BELIEVED), 0);
+            assert_eq!(
+                credit.fold(&counted_burst(4, 3), BELIEVED),
+                2,
+                "{identity:?}"
+            );
+            assert_eq!(credit.count(), 1, "{identity:?}");
+
+            let mut seqless = LatestWriters::new(identity);
+            let no_served_frame = |popped| RecordedRead {
+                served_seq: None,
+                ..counted_burst(0, popped)
+            };
+            assert_eq!(
+                seqless.fold(&no_served_frame(1), BELIEVED),
+                1,
+                "{identity:?}"
+            );
+            assert_eq!(
+                seqless.fold(&no_served_frame(2), BELIEVED),
+                2,
+                "{identity:?}"
+            );
+            assert_eq!(seqless.count(), 0, "{identity:?}");
+        }
+    }
+
+    /// A bag that begins mid-run (a resumed pass, a ring capture) does not
+    /// hold the annotation that opened its writer's run on the trigger drain:
+    /// a recorder stages one when a site's run opens, so every count in the
+    /// bag is bare. From trace format 8 on a writer change on any edge
+    /// stages an annotation, so those counts are the one writer the bag began
+    /// inside, and a node that stops firing is a finding at the seventh count
+    /// (depth 4, one writer), as on a bag that holds the annotation.
+    #[test]
+    fn a_pass_that_begins_inside_a_writer_run_still_convicts_a_node_that_stops_firing() {
+        let deep = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new());
+        let bare: Vec<RecordedStep> = (0..20u32)
+            .map(|s| latest_step(u64::from(s), false, vec![counted(s)]))
+            .collect();
+        let report = verify(&deep, &bare, &[], BELIEVED, &resumed, &PassStops::none());
+        assert_eq!(report.stand_downs, excused_before_first_fire());
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 6);
+        let frames = report.findings[0]
+            .unread
+            .as_ref()
+            .expect("the counted frames");
+        assert_eq!(
+            (
+                frames.last_fire,
+                frames.counted,
+                frames.read,
+                frames.in_delivery,
+                frames.unlogged
+            ),
+            (None, 7, 0, 2, 4)
+        );
+
+        // Below trace format 8 a single-writer edge carries no annotation, so
+        // the same counts name no writer and stand down by name.
+        let older = latest_node_recorded(
+            LatestDrain::Separate,
+            Some(1),
+            4,
+            EdgeIdentity::MultiWriterEdges,
+        );
+        let unnamed = vec![
+            excused_before_first_fire()[0].clone(),
+            StandDown {
+                node_id: "sink".to_string(),
+                decider: Decider::LatestFire,
+                reason: StandDownReason::LatestWritersUnnamed,
+            },
+        ];
+        let report = verify(&older, &bare, &[], BELIEVED, &resumed, &PassStops::none());
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(report.stand_downs, unnamed);
+
+        // A count that names no served frame names no writer either.
+        let mut seqless = bare;
+        seqless[3].reads[0].served_seq = None;
+        let report = verify(&deep, &seqless, &[], BELIEVED, &resumed, &PassStops::none());
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(report.stand_downs, unnamed);
+    }
+
+    /// A writer that starts publishing inside such a bag opens its run with
+    /// an annotation, and the writer the bag began inside still counts: two
+    /// writers at depth 4 excuse twelve counts before the node's first fire,
+    /// and the thirteenth is a finding with both writers' allowances in it.
+    #[test]
+    fn a_writer_change_inside_the_pass_counts_beside_the_writer_it_began_inside() {
+        let deep = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new());
+        let mut steps: Vec<RecordedStep> = (0..6u32)
+            .map(|s| latest_step(u64::from(s), false, vec![counted(s)]))
+            .collect();
+        steps.push(latest_step(
+            6,
+            false,
+            vec![annotation(WRITER_B, 106), counted(106)],
+        ));
+        steps.extend((7..20u32).map(|s| latest_step(u64::from(s), false, vec![counted(100 + s)])));
+        let report = verify(&deep, &steps, &[], BELIEVED, &resumed, &PassStops::none());
+        assert_eq!(report.stand_downs, excused_before_first_fire());
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 12);
+        let frames = report.findings[0]
+            .unread
+            .as_ref()
+            .expect("the counted frames");
+        assert_eq!(
+            (
+                frames.counted,
+                frames.read,
+                frames.in_delivery,
+                frames.unlogged
+            ),
+            (13, 0, 4, 8)
         );
     }
 
@@ -7795,6 +8520,7 @@ mod tests {
             StandDownReason::CaptureTimeSync,
             StandDownReason::LatestDrainUnrecorded,
             StandDownReason::LatestWritersUncapped,
+            StandDownReason::LatestWritersUnnamed,
             StandDownReason::LatestBeforeFirstFire,
             StandDownReason::LatestBlockHeld,
         ];
