@@ -145,17 +145,18 @@ const ALLOWED: &[Owner] = &[
                  pre-wait drain in `wait_for_message`",
     },
     Owner {
-        name: "try_receive_one",
+        name: "try_receive_one_with",
         sites: 3,
         spellings: &[POLICY],
-        reason: "a read entry that takes the policy at each of its three exits, reporting the \
-                 removals it popped whether it delivered a frame or not",
+        reason: "the single-frame read body, which takes the policy at each of its three exits, \
+                 reporting the removals it popped whether it delivered a frame or not, so \
+                 `try_receive_one` over it owns no site of its own",
     },
     Owner {
-        name: "try_receive_one_owned",
+        name: "try_receive_one_owned_with",
         sites: 3,
         spellings: &[POLICY],
-        reason: "the same, for the loaned take",
+        reason: "the same, for the loaned take under `try_receive_one_owned`",
     },
     Owner {
         name: "drain_samples",

@@ -1495,8 +1495,9 @@ impl CerulionPublisher {
     }
 
     /// Best-effort `SentSample` notification — exposed for `OutputProxy::Drop`,
-    /// the service layer, and the rmw bridge (which publish via
-    /// `publish_raw` / `send_raw_loan` and must wake event-driven subscribers).
+    /// the service layer, and raw-ingress `publish_raw`: the doorbell ring, then
+    /// the listener notify. The rmw bridge's publish paths call the two halves
+    /// ([`Self::ring_doorbell`], [`Self::notify_after_ring`]) themselves.
     ///
     /// Returns the underlying iceoryx2 result so the caller can log the
     /// specific error code; the data is already in shared memory by the
@@ -1504,17 +1505,32 @@ impl CerulionPublisher {
     pub fn notify_sent_sample(
         &self,
     ) -> Result<usize, iceoryx2::port::notifier::NotifierNotifyError> {
-        // Ring this topic's SHM doorbell AFTER the data is already in
-        // the iceoryx2 SHM queue (this post-send hook is called by
-        // `OutputProxy::Drop`, `send_overflow_frame`, the service layer,
-        // and the rmw bridge). `None` unless `enable_doorbell` ran at build,
-        // so production pays nothing. A consumer parked in a shallow
-        // CPU monitor-wait on the same line wakes the instant of this store.
-        // FIREWALL: a wake signal only — never the data path (the sample is
-        // already enqueued; the consumer still reads it from SHM in `step()`).
+        self.ring_doorbell();
+        self.notify_after_ring()
+    }
+
+    /// Ring this topic's SHM doorbell, the first half of
+    /// [`Self::notify_sent_sample`], for a caller that rings right after its
+    /// send and notifies later with [`Self::notify_after_ring`].
+    ///
+    /// Called only AFTER the data is in the iceoryx2 SHM queue. `None` unless
+    /// `enable_doorbell` ran at build, so a publisher without one pays one
+    /// branch. A consumer parked in a shallow CPU monitor-wait on the same line
+    /// wakes the instant of this store.
+    /// FIREWALL: a wake signal only — never the data path (the sample is
+    /// already enqueued; the consumer still reads it from SHM).
+    pub fn ring_doorbell(&self) {
         if let Some(db) = &self.doorbell {
             db.ring();
         }
+    }
+
+    /// The listener half of [`Self::notify_sent_sample`]: the `SentSample`
+    /// notify, behind the elision gate, without the doorbell ring. For a caller
+    /// that already rang with [`Self::ring_doorbell`] after the same send.
+    pub fn notify_after_ring(
+        &self,
+    ) -> Result<usize, iceoryx2::port::notifier::NotifierNotifyError> {
         // Self-healing NOTIFY ELISION. For a graph-owned topic
         // whose consumers are all SAME-process + level-gated, the scheduler
         // already drains every consumer at its DAG level within the SAME step
@@ -1531,8 +1547,8 @@ impl CerulionPublisher {
         // never WHAT it reads/fires (the sample is already committed to the SHM
         // queue by the send() above), and the ≤250ms live heartbeat is the
         // always-present wake backstop — no wedge is possible. The DOORBELL
-        // (rung above) still carries the monitor-wait park's data wake, so the
-        // park path is unaffected by elision.
+        // (rung before this notify, by `ring_doorbell`) still carries the
+        // monitor-wait park's data wake, so the park path is unaffected by elision.
         // The LIVE listener count, read AT MOST ONCE per call and ONLY
         // when a branch actually needs it. Two branches can:
         //

@@ -398,6 +398,19 @@ const BACKWARD_GAP_THRESHOLD: u32 = u32::MAX / 2;
 /// periodic re-warn exists to break.
 const ANOMALY_REWARN_EVERY: u64 = 64;
 
+/// Who empties a subscriber's event listener after a single-frame read
+/// ([`CerulionSubscriber::try_receive_one_with`],
+/// [`CerulionSubscriber::try_receive_one_owned_with`]) removed frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerDrain {
+    /// The read drains the listener after it removed frames.
+    AfterRemovals,
+    /// The read leaves the listener as it is. For a caller whose next wait checks every
+    /// listener fd it watches and drains each readable one before its readiness probe: the
+    /// notification of the frame this read removed is cleared there.
+    ByNextWait,
+}
+
 /// Listener drains this process has run, test visible only.
 ///
 /// A drain that runs where it is not needed costs time and changes no answer, so
@@ -2838,8 +2851,11 @@ impl CerulionSubscriber {
     /// binding's standalone listener and a per-set binding's. A separate or sync
     /// binding's drain READ contributes to that only when it removed frames, which
     /// is this policy.
-    fn drain_listener_after_removals(&self, removals: u64) {
-        if removals == 0 {
+    ///
+    /// A single-frame read made with [`ListenerDrain::ByNextWait`] drains nothing: its
+    /// caller's next wait drains every readable listener it watches before it probes.
+    fn drain_listener_after_removals(&self, removals: u64, drain: ListenerDrain) {
+        if removals == 0 || drain == ListenerDrain::ByNextWait {
             return;
         }
         self.drain_stale_events();
@@ -3062,7 +3078,20 @@ impl CerulionSubscriber {
     /// callback. Malformed frames are skipped with a warning and
     /// reception continues to the next sample (a corrupt frame must not
     /// wedge the queue).
-    pub fn try_receive_one<F>(&self, mut callback: F) -> TransportResult<bool>
+    pub fn try_receive_one<F>(&self, callback: F) -> TransportResult<bool>
+    where
+        F: FnMut(ReceivedMessage<'_>),
+    {
+        self.try_receive_one_with(ListenerDrain::AfterRemovals, callback)
+    }
+
+    /// [`Self::try_receive_one`], with `drain` choosing whether this read drains the
+    /// listener after the frames it removed.
+    pub fn try_receive_one_with<F>(
+        &self,
+        drain: ListenerDrain,
+        mut callback: F,
+    ) -> TransportResult<bool>
     where
         F: FnMut(ReceivedMessage<'_>),
     {
@@ -3083,7 +3112,7 @@ impl CerulionSubscriber {
             let received = match self.subscriber.receive() {
                 Ok(received) => received,
                 Err(e) => {
-                    self.drain_listener_after_removals(removals);
+                    self.drain_listener_after_removals(removals, drain);
                     return Err(TransportError::Receive {
                         topic: self.topic.clone(),
                         reason: format!("{}", e),
@@ -3091,7 +3120,7 @@ impl CerulionSubscriber {
                 }
             };
             let Some(sample) = received else {
-                self.drain_listener_after_removals(removals);
+                self.drain_listener_after_removals(removals, drain);
                 return Ok(false);
             };
             removals += 1;
@@ -3134,7 +3163,7 @@ impl CerulionSubscriber {
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
             self.record_service_cursor_from(&header);
-            self.drain_listener_after_removals(removals);
+            self.drain_listener_after_removals(removals, drain);
             return Ok(true);
         }
     }
@@ -3175,6 +3204,16 @@ impl CerulionSubscriber {
     /// read-outcome log (rmw takes are not recorded in graph bags today).
     #[must_use = "receive result must be checked"]
     pub fn try_receive_one_owned(&self) -> TransportResult<Option<OwnedInboundSample>> {
+        self.try_receive_one_owned_with(ListenerDrain::AfterRemovals)
+    }
+
+    /// [`Self::try_receive_one_owned`], with `drain` choosing whether this read drains
+    /// the listener after the frames it removed.
+    #[must_use = "receive result must be checked"]
+    pub fn try_receive_one_owned_with(
+        &self,
+        drain: ListenerDrain,
+    ) -> TransportResult<Option<OwnedInboundSample>> {
         // Same misuse warn as `try_receive_one`:
         // shared latch, one warn per input across the queue-draining read
         // paths.
@@ -3190,7 +3229,7 @@ impl CerulionSubscriber {
             let received = match self.subscriber.receive() {
                 Ok(received) => received,
                 Err(e) => {
-                    self.drain_listener_after_removals(removals);
+                    self.drain_listener_after_removals(removals, drain);
                     return Err(TransportError::Receive {
                         topic: self.topic.clone(),
                         reason: format!("{}", e),
@@ -3198,7 +3237,7 @@ impl CerulionSubscriber {
                 }
             };
             let Some(sample) = received else {
-                self.drain_listener_after_removals(removals);
+                self.drain_listener_after_removals(removals, drain);
                 return Ok(None);
             };
             removals += 1;
@@ -3232,7 +3271,7 @@ impl CerulionSubscriber {
             // Same serve point as the callback twin — one frame,
             // really delivered (ownership does not change what "served" means).
             self.record_service_cursor_from(&header);
-            self.drain_listener_after_removals(removals);
+            self.drain_listener_after_removals(removals, drain);
             return Ok(Some(OwnedInboundSample::with_header(sample, &header)));
         }
     }
@@ -3462,7 +3501,7 @@ impl CerulionSubscriber {
         // The listener policy runs on EVERY exit, the errored partial batch
         // included: those samples are already popped and already recorded, so an
         // exit through `?` would leave what they rode unclaimed by any later read.
-        self.drain_listener_after_removals(removals.get());
+        self.drain_listener_after_removals(removals.get(), ListenerDrain::AfterRemovals);
         drain_result?;
         Ok(count)
     }
