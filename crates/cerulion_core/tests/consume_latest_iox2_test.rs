@@ -753,6 +753,7 @@ fn gap_injector_node() -> NodeDef {
         inputs: vec![InputDef {
             name: "ctx".to_string(),
             source: GAP_CTX.to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }
@@ -918,6 +919,7 @@ fn a_cdylib_reads_a_gap_frame_once_on_the_separate_drain() {
         inputs: vec![InputDef {
             name: "trigger_in".to_string(),
             source: EXT.to_string(),
+            ..Default::default()
         }],
         outputs: vec![OutputDef {
             name: "cmd".to_string(),
