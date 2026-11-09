@@ -223,9 +223,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use cerulion_core::error::TransportError;
-use cerulion_core::transport::failure_regime_latch::{
-    lock_regime_latch, FailureRegimeLatch, RegimeDecision,
-};
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use cerulion_core::wake::{FdWake, FdWakeSet};
 
 use crate::ffi::{self, rmw_ret_t, RMW_RET_INVALID_ARGUMENT, RMW_RET_OK, RMW_RET_TIMEOUT};
@@ -718,7 +716,7 @@ pub struct WaitSetData {
     spin_disarmed: AtomicBool,
     /// Flood-suppression for the drain-failure log: loud once per regime,
     /// counted repeats, a recovery line — never one line per iteration.
-    drain_failures: Mutex<FailureRegimeLatch>,
+    drain_failures: crate::gated_latch::GatedLatch<FailureRegimeLatch>,
     /// Diagnostics (Principle #3 — observable independent of logs):
     /// kernel blocks entered on the event path. Monotonic, never reset;
     /// tests read them back by casting the opaque data pointer.
@@ -972,7 +970,7 @@ impl WaitSetData {
     /// Unconditional running total of listener-drain failures on this wait
     /// set (never reset by recovery — Principle #3).
     pub fn drain_failure_count(&self) -> u64 {
-        lock_regime_latch(&self.drain_failures).total_failures()
+        self.drain_failures.read().total_failures()
     }
 
     /// Diagnostics (Principle #3): how many fds the last call's snapshot
@@ -2147,15 +2145,16 @@ unsafe fn consume_from_mask(ws: &WaitSetData, ents: Entities) {
 fn note_drain_outcome(ws: &WaitSetData, res: Result<(), TransportError>) {
     match res {
         Ok(()) => {
-            let mut latch = lock_regime_latch(&ws.drain_failures);
-            if let Some(suppressed) = latch.on_success() {
-                tracing::info!(
-                    suppressed_count = suppressed,
-                    total_failures = latch.total_failures(),
-                    "rmw_wait listener drain recovered — fd wakes resume on the \
-                     next call"
-                );
-            }
+            ws.drain_failures.on_success(|latch| {
+                if let Some(suppressed) = latch.on_success() {
+                    tracing::info!(
+                        suppressed_count = suppressed,
+                        total_failures = latch.total_failures(),
+                        "rmw_wait listener drain recovered: fd wakes resume on the \
+                         next call"
+                    );
+                }
+            });
         }
         Err(e) => {
             // A listener that cannot be drained may stay readable: blocking on
@@ -2165,7 +2164,7 @@ fn note_drain_outcome(ws: &WaitSetData, res: Result<(), TransportError>) {
             if !ws.degraded.swap(true, Ordering::Relaxed) {
                 ws.degraded_waits.fetch_add(1, Ordering::Relaxed);
             }
-            let mut latch = lock_regime_latch(&ws.drain_failures);
+            let mut latch = ws.drain_failures.lock_failure();
             match latch.on_failure() {
                 RegimeDecision::Loud => tracing::warn!(
                     error = %e,
