@@ -1186,8 +1186,9 @@ pub enum StandDownReason {
     /// can read its inputs, and it runs before a recording arms the read log,
     /// and a resumed pass starts after reads its bag does not keep. Such a
     /// read took frames from the queue the node reads while their copies sat
-    /// in the trigger-drain queue, so it took at most what that queue holds:
-    /// the input's declared depth per writer. The unread-frame rule still
+    /// in the trigger-drain queue, and that queue holds at most the input's
+    /// declared depth per writer, so at most that many counted frames are
+    /// copies of frames such a read took. The unread-frame rule still
     /// judges those steps with that one queue excused, so a count past it is a
     /// finding, and the node's first fire in the pass ends the excuse.
     LatestBeforeFirstFire,
