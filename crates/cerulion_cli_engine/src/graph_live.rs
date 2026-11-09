@@ -1288,6 +1288,7 @@ pub fn follow_fires(
             break FiresEnd::Window;
         }
         let mut read_on = false;
+        let asked_at = pacer.elapsed();
         let poll = match source.fires(&run.robot, &run.run_id, stream.cursor()) {
             Ok(poll) => poll,
             Err(e) => break FiresEnd::Failed(e.to_string()),
@@ -1348,7 +1349,10 @@ pub fn follow_fires(
             }
         }
         if !read_on {
-            pacer.sleep(FIRES_POLL_INTERVAL);
+            // The ask's own gather window counts toward the interval, so asks
+            // start every FIRES_POLL_INTERVAL rather than that long apart.
+            let asking = pacer.elapsed().saturating_sub(asked_at);
+            pacer.sleep(FIRES_POLL_INTERVAL.saturating_sub(asking));
         }
     };
     write_fires_summary(out, run, &stream, &end, reading_for(pacer), json)?;
