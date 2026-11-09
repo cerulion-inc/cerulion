@@ -394,8 +394,12 @@ pub enum SyncHeadOp {
     /// `consume = latest` input read through two subscribers, where no head is
     /// held: there `Present` means the body subscriber's queue holds a frame
     /// and `Nothing` means it holds none, and the step fires the node only on
-    /// `Present` (or `Failed`). An entry answering `Nothing` while its queue
-    /// holds a frame leaves that input unfired.
+    /// `Present` (or `Failed`). The graph asks this of a Data input only on
+    /// an entry whose `NodeEntry::probes_trigger_input` is `true` (on a
+    /// cdylib, one whose `cerulion_node_probes_trigger_input` returns a
+    /// positive value beside `cerulion_node_sync_head_op`), since an entry
+    /// answering `Nothing` while that queue holds a frame leaves the input
+    /// unfired.
     ProbeNext,
     /// Pop the next frame into the staged slot and report its stamp.
     ///
