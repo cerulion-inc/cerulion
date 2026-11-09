@@ -495,6 +495,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "a release measurement of a consumer receive, the library receive and a publish; prints a table, gates nothing",
     ),
     (
+        "consume_latest_iox2_test.rs",
+        "measure_the_carried_probe_cost",
+        "unix-by-hand",
+        "prints the carried probe's per-step cost on a closure and on a cdylib under the separate drain; a measurement, gates nothing",
+    ),
+    (
         "cross_machine_data_plane_harness.rs",
         "cross_machine_data_plane",
         "two-machine",
