@@ -995,6 +995,16 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         fn supports_sync_head_ops(&self) -> bool {
             true
         }
+
+        // Declare the `consume = latest` body probe. The trait default
+        // `probe_trigger_input` asks `sync_head_op(ProbeNext)`, which the
+        // forward above hands to `NodeContext::sync_head_op`; for a Data input
+        // that reports whether the subscriber the generated tick reads holds a
+        // frame. The cdylib form declares the same through
+        // `cerulion_node_probes_trigger_input`.
+        fn probes_trigger_input(&self) -> bool {
+            true
+        }
     };
 
     // The IN-PROCESS half of the keystone. The fold-in placed an
@@ -3138,6 +3148,19 @@ fn gen_cdylib(
                         -4
                     }
                 }
+            }
+
+            // `cerulion_node_probes_trigger_input`: 1 declares that op code 0
+            // of `cerulion_node_sync_head_op` above answers a Data trigger
+            // input from the subscriber the generated tick reads, because the
+            // export hands that op to `NodeContext::sync_head_op`. Handle-less
+            // and constant: the host reads it ONCE at load, before `init`, as
+            // `NodeEntry::probes_trigger_input`. OPTIONAL and ADDITIVE, no ABI
+            // bump: a library without it keeps its `consume = latest` inputs
+            // unprobed, and the graph build names them.
+            #[no_mangle]
+            pub extern "C" fn cerulion_node_probes_trigger_input() -> i32 {
+                1
             }
 
             // ================================================================
