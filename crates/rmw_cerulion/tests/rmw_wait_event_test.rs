@@ -29,6 +29,10 @@
 //! * `CERULION_RMW_EVENT_WAIT=off` restores the sleep-poll
 //!   (`fd_blocks == 0` while the functional round trip still works);
 //! * a wait with no entities spends its timeout (bounded sleep, no spin);
+//! * a wake's listener notification, left by the ready return and by the
+//!   take, is drained by the next wait's entry pass: every round wakes on its
+//!   publish, no notification fires a later block, and an idle wait after the
+//!   last round times out with no fd wake;
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
 //!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
 //!   block parks while a bell is mapped, and every later block of the call
@@ -2256,8 +2260,8 @@ fn an_empty_wait_never_spins_under_a_nonzero_budget() {
 }
 
 /// The park tier: a publish wakes a PARKED wait through the topic
-/// DOORBELL — the SHM line the rmw publisher armed at create and rings on
-/// every send (`notify_sent_sample`). Default env
+/// DOORBELL — the SHM line the rmw publisher armed at create and rings right
+/// after every send (`ring_doorbell`). Default env
 /// (`CERULION_MONITOR_WAIT` unset = auto ON): on Linux the wait must map
 /// exactly the one subscription topic's bell, park the FIRST block of every
 /// call (see `assert_park_tier_engaged` for why the bound sits on
@@ -3237,6 +3241,353 @@ fn a_no_readiness_notify_storm_does_not_rearm_the_idle_spin() {
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
         assert_eq!(rmw_destroy_guard_condition(gc), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// Is `fd` readable within `within`? (`poll(2)` on one fd, POLLIN.)
+fn fd_readable_within(fd: std::os::raw::c_int, within: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid pollfd for the duration of the call.
+    let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+    n == 1 && pfd.revents & libc::POLLIN != 0
+}
+
+/// The listener fd behind a subscription handle.
+unsafe fn listener_fd_of(subscription: *mut ffi::rmw_subscription_t) -> std::os::raw::c_int {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    rmw_cerulion::runtime::lock_unpoisoned(&data.inner)
+        .expect("a live subscription")
+        .subscriber
+        .event_listener_fd()
+}
+
+/// The wait's ready return and the take leave the wake's listener notification
+/// in place, and the NEXT wait's entry pass drains it, so no wake is lost and none
+/// re-fires. Each round blocks a waiter, publishes one message into its block and
+/// takes it. Per round: the wait returns that round's message, the block woke on
+/// the publish (one fd or doorbell wake), the take ran no listener drain, and the
+/// listener is still readable after the take. Across the rounds fd wakes stay at
+/// one per round at most: a notification left readable into a later block would
+/// fire it before the publish. The last wait, with nothing published, times out
+/// with no fd wake and leaves the listener drained. Run on the fd tier
+/// (`CERULION_MONITOR_WAIT=0`) and on the platform default, which parks on the
+/// topic doorbell on Linux aarch64.
+#[test]
+#[serial]
+fn a_wake_left_undrained_by_the_wait_and_the_take_is_drained_by_the_next_entry() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    for tier in ["fd", "default"] {
+        let _park = (tier == "fd").then(|| EnvVarGuard::set("CERULION_MONITOR_WAIT", "0"));
+        let _unset = (tier == "default").then(MonitorWaitUnset::new);
+        unsafe { deferred_drain_rounds(tier) };
+    }
+}
+
+unsafe fn deferred_drain_rounds(tier: &str) {
+    use cerulion_core::transport::subscriber::listener_drain_count;
+    let suffix = unique_suffix();
+    let ts = point_ts(&format!("WevDd{suffix}"));
+    let (context, node, _opts) = setup_node(&format!("wev_dd_{suffix}"));
+    let topic = CString::new(format!("/rmw_wev/dd/{suffix}")).expect("topic");
+    let qos = default_qos();
+    let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+    let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+    let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+    assert!(!subscription.is_null());
+    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+    assert!(!publisher.is_null());
+    let ws = rmw_create_wait_set(context, 8);
+    let data = &*((*ws).data as *const WaitSetData);
+    let listener = listener_fd_of(subscription);
+
+    const ROUNDS: u64 = 12;
+    let fd_wakes0 = data.fd_wakes.load(Ordering::Relaxed);
+    for round in 0..ROUNDS {
+        let woke0 = data.fd_wakes.load(Ordering::Relaxed)
+            + data.park_wakes_doorbell.load(Ordering::Relaxed);
+        let seen = blocks_entered(ws);
+        let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
+        await_fresh_block(ws, seen);
+        let msg = CPoint {
+            x: round as f64,
+            y: -1.0,
+            z: 4.0,
+        };
+        assert_eq!(
+            rmw_publish(
+                publisher,
+                &msg as *const _ as *const c_void,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        let (ret, ready) = handle.join().expect("wait thread");
+        assert_eq!(ret, RMW_RET_OK, "{tier} round {round}: the wait returns");
+        assert!(ready, "{tier} round {round}: the subscription is ready");
+        let woke = data.fd_wakes.load(Ordering::Relaxed)
+            + data.park_wakes_doorbell.load(Ordering::Relaxed)
+            - woke0;
+        assert!(
+            woke >= 1,
+            "{tier} round {round}: the block must wake on the publish, not on the pump \
+             cadence (fd + doorbell wakes {woke})"
+        );
+        let drains_before_take = listener_drain_count();
+        let mut out = CPoint::default();
+        let mut taken = false;
+        assert_eq!(
+            rmw_take(
+                subscription,
+                &mut out as *mut _ as *mut c_void,
+                &mut taken,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        assert!(taken, "{tier} round {round}: the take delivers");
+        assert_eq!(out, msg, "{tier} round {round}: this round's message");
+        assert_eq!(
+            listener_drain_count(),
+            drains_before_take,
+            "{tier} round {round}: the take leaves the listener to the next wait"
+        );
+        assert!(
+            fd_readable_within(listener, Duration::from_secs(1)),
+            "{tier} round {round}: the wake's notification is still on the listener"
+        );
+    }
+    let fd_wakes = data.fd_wakes.load(Ordering::Relaxed) - fd_wakes0;
+    eprintln!(
+        "deferred-drain {tier}: rounds={ROUNDS} fd_wakes={fd_wakes} park_wakes_doorbell={} \
+         drain_calls={}",
+        data.park_wakes_doorbell.load(Ordering::Relaxed),
+        data.drain_calls.load(Ordering::Relaxed)
+    );
+    assert!(
+        fd_wakes <= ROUNDS,
+        "{tier}: at most one fd wake per round; {fd_wakes} over {ROUNDS} rounds means a \
+         notification left by a ready return fired a later block"
+    );
+
+    let fd_wakes_idle = data.fd_wakes.load(Ordering::Relaxed);
+    let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_millis(200));
+    let (ret, ready) = handle.join().expect("idle wait thread");
+    assert_eq!(
+        ret,
+        ffi::RMW_RET_TIMEOUT,
+        "{tier}: nothing published, so a timeout"
+    );
+    assert!(!ready);
+    assert_eq!(
+        data.fd_wakes.load(Ordering::Relaxed),
+        fd_wakes_idle,
+        "{tier}: the entry pass drained the last notification, so no block fired"
+    );
+    assert!(
+        !fd_readable_within(listener, Duration::ZERO),
+        "{tier}: the idle wait's entry pass drained the listener"
+    );
+
+    assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+    assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+    assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+}
+
+/// System-call probe for one wait-then-take per message, for an external
+/// `strace -c -f` (or `perf stat -e raw_syscalls:sys_enter --per-thread`). Not a
+/// pass/fail test: it runs only with `--ignored`.
+///
+/// A publisher thread sends `CERULION_SYSCALL_PROBE_MESSAGES` messages (default
+/// 1000) at a fixed period of `CERULION_SYSCALL_PROBE_PERIOD_US` (default 1000), so a
+/// period-park build learns the topic and predicts it. The waiter loops `rmw_wait`
+/// then `rmw_take` until it has taken the last message, or every message was sent
+/// and a wait finds nothing. It prints both thread ids (`gettid` on Linux), the
+/// messages taken and dropped (a queue that overflowed while the waiter was
+/// descheduled), and the wait set's counters per taken message, read at the last
+/// take. Two runs with different message counts that both report `dropped=0`,
+/// subtracted, give the system calls per message with the setup cost cancelled.
+#[test]
+#[ignore = "probe for strace or perf; run with --ignored --exact"]
+#[serial]
+fn syscall_probe_wait_then_take_per_message() {
+    let messages: u64 = std::env::var("CERULION_SYSCALL_PROBE_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let period_us: u64 = std::env::var("CERULION_SYSCALL_PROBE_PERIOD_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevSp{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_sp_{suffix}"));
+        let topic = CString::new(format!("/rmw_wev/sp/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!publisher.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+        let data = &*((*ws).data as *const WaitSetData);
+        let counters = |d: &WaitSetData| {
+            [
+                d.fd_blocks.load(Ordering::Relaxed),
+                d.fd_wakes.load(Ordering::Relaxed),
+                d.timeout_wakes.load(Ordering::Relaxed),
+                d.park_blocks.load(Ordering::Relaxed),
+                d.park_wakes_doorbell.load(Ordering::Relaxed),
+                d.drain_calls.load(Ordering::Relaxed),
+                d.probes_entry.load(Ordering::Relaxed),
+                d.probes_wake.load(Ordering::Relaxed),
+            ]
+        };
+        let before = counters(data);
+        let listener_drains0 = cerulion_core::transport::subscriber::listener_drain_count();
+        let pub_addr = publisher as usize;
+        let sent_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_flag = std::sync::Arc::clone(&sent_all);
+        let sender = std::thread::spawn(move || {
+            #[cfg(target_os = "linux")]
+            eprintln!("syscall-probe publisher tid={}", libc::gettid());
+            let start = Instant::now();
+            for k in 0..messages {
+                let due = start + Duration::from_micros(period_us * (k + 1));
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                let msg = CPoint {
+                    x: k as f64,
+                    y: 0.0,
+                    z: 0.0,
+                };
+                assert_eq!(
+                    rmw_publish(
+                        pub_addr as *const ffi::rmw_publisher_t,
+                        &msg as *const _ as *const c_void,
+                        std::ptr::null_mut()
+                    ),
+                    RMW_RET_OK
+                );
+            }
+            sent_flag.store(true, Ordering::Release);
+        });
+        #[cfg(target_os = "linux")]
+        eprintln!("syscall-probe waiter tid={}", libc::gettid());
+        let mut sub_ptrs = [(*subscription).data];
+        let t = ffi::rmw_time_t {
+            sec: 0,
+            nsec: 200_000_000,
+        };
+        // Taken messages, and the ones the queue dropped (a gap in the sequence)
+        // when the waiter fell behind.
+        let mut taken_count = 0u64;
+        let mut dropped = 0u64;
+        let mut next = 0u64;
+        let start = Instant::now();
+        let mut last_take = None;
+        while next < messages {
+            // Read before the wait: a message sent after a wait's last probe is
+            // still in the queue, so only a wait that began after the last send
+            // and found nothing ends the run.
+            let all_sent_before = sent_all.load(Ordering::Acquire);
+            sub_ptrs[0] = (*subscription).data;
+            let mut subs = ffi::rmw_subscriptions_t {
+                subscriber_count: 1,
+                subscribers: sub_ptrs.as_mut_ptr(),
+            };
+            let ret = rmw_wait(
+                &mut subs,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                ws,
+                &t,
+            );
+            assert!(
+                ret == RMW_RET_OK || ret == ffi::RMW_RET_TIMEOUT,
+                "rmw_wait failed: {ret}"
+            );
+            if ret != RMW_RET_OK || sub_ptrs[0].is_null() {
+                if all_sent_before {
+                    // Every message was sent and none is left: the rest were dropped.
+                    dropped += messages - next;
+                    break;
+                }
+                continue;
+            }
+            let mut out = CPoint::default();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    subscription,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            if taken {
+                let k = out.x as u64;
+                assert!(k >= next, "messages arrive in order ({k} after {next})");
+                dropped += k - next;
+                next = k + 1;
+                taken_count += 1;
+                // The counters and the time at the last take: a run that dropped
+                // messages ends with one more, empty, wait that is not counted.
+                last_take = Some((counters(data), start.elapsed()));
+            }
+        }
+        sender.join().expect("publisher thread");
+        let (after, elapsed) = last_take.unwrap_or_else(|| (counters(data), start.elapsed()));
+        let names = [
+            "fd_blocks",
+            "fd_wakes",
+            "timeout_wakes",
+            "park_blocks",
+            "park_wakes_doorbell",
+            "drain_calls",
+            "probes_entry",
+            "probes_wake",
+        ];
+        let per = taken_count.max(1) as f64;
+        let per_msg: Vec<String> = names
+            .iter()
+            .zip(before.iter().zip(after.iter()))
+            .map(|(n, (b, a))| format!("{n}={:.3}", (a - b) as f64 / per))
+            .collect();
+        eprintln!(
+            "syscall-probe messages={messages} taken={taken_count} dropped={dropped} \
+             period_us={period_us} elapsed_ms={} listener_drains_per_msg={:.3} per_msg: {}",
+            elapsed.as_millis(),
+            (cerulion_core::transport::subscriber::listener_drain_count() - listener_drains0)
+                as f64
+                / per,
+            per_msg.join(" ")
+        );
+        #[cfg(feature = "period-park")]
+        eprintln!(
+            "syscall-probe predicted_parks={} predicted_bell_wakes={} \
+             predicted_rings_before_park={}",
+            data.predicted_parks.load(Ordering::Relaxed),
+            data.predicted_bell_wakes.load(Ordering::Relaxed),
+            data.predicted_rings_before_park.load(Ordering::Relaxed)
+        );
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }

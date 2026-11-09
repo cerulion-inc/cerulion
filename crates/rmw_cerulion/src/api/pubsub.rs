@@ -832,8 +832,8 @@ pub unsafe extern "C" fn rmw_create_publisher(
         let type_name = ros_graph_type_name(bridge.qualified_name());
         let can_loan = bridge.can_loan();
         // Parity with the native graph build: arm the producer-side SHM
-        // doorbell (rings inside `notify_sent_sample`, which every rmw
-        // publish path already calls), so a consumer parked on this topic's
+        // doorbell (every rmw publish path rings it right after its send, in
+        // `wake_after_send`), so a consumer parked on this topic's
         // line — the event-driven `rmw_wait`'s park tier, or a native
         // monitor-wait loop in the same namespace — wakes the instant the
         // frame is committed. On macOS the ring costs a second atomic bump in
@@ -1400,10 +1400,7 @@ unsafe fn publish_impl(
                     // Wake event-driven subscribers + drain SubscriberConnected
                     // so a late joiner gets the retained history via
                     // `update_connections` (publish_raw itself doesn't notify).
-                    inner.publisher.check_subscriber_events();
-                    if let Err(e) = inner.publisher.notify_sent_sample() {
-                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                    }
+                    wake_after_send(&mut inner.publisher, &data.topic);
                     RMW_RET_OK
                 }
                 Err(e) => {
@@ -1502,10 +1499,7 @@ unsafe fn publish_impl(
             capture_frame_output(loan.bytes_mut());
             match inner.publisher.send_raw_loan(loan) {
                 Ok(_recipients) => {
-                    inner.publisher.check_subscriber_events();
-                    if let Err(e) = inner.publisher.notify_sent_sample() {
-                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                    }
+                    wake_after_send(&mut inner.publisher, &data.topic);
                     RMW_RET_OK
                 }
                 Err(e) => {
@@ -1990,10 +1984,7 @@ unsafe fn publish_windowed_loan(
                     } else {
                         data.borrow_copied_frames.fetch_add(1, Ordering::Relaxed);
                     }
-                    inner.publisher.check_subscriber_events();
-                    if let Err(e) = inner.publisher.notify_sent_sample() {
-                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                    }
+                    wake_after_send(&mut inner.publisher, &data.topic);
                     RMW_RET_OK
                 }
                 Err(e) => {
@@ -2105,10 +2096,7 @@ unsafe fn publish_copy_of_slot_struct(
     capture_frame_output(copy_loan.bytes_mut());
     match inner.publisher.send_raw_loan(copy_loan) {
         Ok(_recipients) => {
-            inner.publisher.check_subscriber_events();
-            if let Err(e) = inner.publisher.notify_sent_sample() {
-                tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-            }
+            wake_after_send(&mut inner.publisher, &data.topic);
             RMW_RET_OK
         }
         Err(e) => {
@@ -2231,10 +2219,7 @@ unsafe fn publish_loaned_impl(
         // push/finish/rollback machinery is needed.
         match inner.publisher.send_raw_loan(loan) {
             Ok(_recipients) => {
-                inner.publisher.check_subscriber_events();
-                if let Err(e) = inner.publisher.notify_sent_sample() {
-                    tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                }
+                wake_after_send(&mut inner.publisher, &data.topic);
                 RMW_RET_OK
             }
             Err(e) => {
@@ -2951,6 +2936,27 @@ unsafe fn serve_recorded_message(
     rec.ret
 }
 
+/// Wake a topic's consumers after a send that returned `Ok`: the doorbell ring
+/// first, right after the send (a consumer parked on the line wakes then), then
+/// `check_subscriber_events` (a `SubscriberConnected` drives history delivery),
+/// then the listener notify. A failed notify loses only the wake: the frame is
+/// already in the queue, and the failure is logged at debug.
+pub(crate) fn wake_after_send(
+    publisher: &mut cerulion_core::transport::publisher::CerulionPublisher,
+    topic: &str,
+) {
+    publisher.ring_doorbell();
+    publisher.check_subscriber_events();
+    if let Err(e) = publisher.notify_after_ring() {
+        tracing::debug!(topic = %topic, error = ?e, "notify failed");
+    }
+}
+
+/// How a subscription take leaves its listener: to the next `rmw_wait`, whose
+/// entry pass drains every readable listener fd before its full probe.
+pub(crate) const TAKE_LISTENER_DRAIN: cerulion_core::transport::subscriber::ListenerDrain =
+    cerulion_core::transport::subscriber::ListenerDrain::ByNextWait;
+
 /// The live take.
 unsafe fn take_impl_live(
     subscription: *const ffi::rmw_subscription_t,
@@ -3010,8 +3016,10 @@ unsafe fn take_impl_live(
     let mut info_out: Option<(u64, u64, u128)> = None;
     // ONE message per call (the rmw take contract): try_receive_one,
     // never the drain-everything path — extra drained frames would be
-    // silently lost (Principle #6).
-    let receive = inner.subscriber.try_receive_one(|msg| {
+    // silently lost (Principle #6). The listener is left for the next
+    // `rmw_wait` ([`TAKE_LISTENER_DRAIN`]).
+    let sub = &inner.subscriber;
+    let receive = sub.try_receive_one_with(TAKE_LISTENER_DRAIN, |msg| {
         let origin = msg.origin();
         let header = msg.header();
         // The DECISION lives in `take_gate` — one pure
@@ -3343,7 +3351,10 @@ unsafe fn take_adopted(
     let expected_hash = data.bridge.schema_hash();
     let api = *adopt.grant.api();
 
-    let owned = match inner.subscriber.try_receive_one_owned() {
+    let owned = match inner
+        .subscriber
+        .try_receive_one_owned_with(TAKE_LISTENER_DRAIN)
+    {
         Ok(o) => {
             // The receive SUCCEEDED, so close any open
             // receive-failure regime. A latch with no success side is worse
@@ -4169,7 +4180,10 @@ unsafe fn take_loaned_impl(
             }
         }
     }
-    let owned = match inner.subscriber.try_receive_one_owned() {
+    let owned = match inner
+        .subscriber
+        .try_receive_one_owned_with(TAKE_LISTENER_DRAIN)
+    {
         Ok(o) => o,
         Err(e) => {
             // The transport-side budget arm lands here: with
