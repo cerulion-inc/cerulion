@@ -1061,7 +1061,7 @@ fn block_gap_runtime(
     };
     let nodes = vec![
         NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "pace".to_string(),
@@ -1070,7 +1070,7 @@ fn block_gap_runtime(
             outputs: vec![output("out", Some(BLK)), output("tick", None)],
         },
         NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "inj".to_string(),
