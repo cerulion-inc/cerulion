@@ -533,6 +533,100 @@ fn epoch_revoked_device_is_denied_everywhere_but_the_accounts_other_devices_surv
     );
 }
 
+#[test]
+fn act_verbs_follow_the_teleop_and_observe_rows() {
+    use cerulion_remoted::act_verbs::{
+        SERVICE_CALL, TOPIC_ECHO_ONCE, TOPIC_PUBLISH, TOPIC_SNAPSHOT,
+    };
+    let (authz, f) = claimed_authorizer();
+    let owner = caller_for(&f.owner_device_key);
+    let viewer = caller_for(&f.viewer_device_key);
+    let operator = caller_for(&f.operator_device_key);
+    assert_allow(
+        authz.authorize_verb(&owner, TOPIC_PUBLISH),
+        "owner topic-publish",
+    );
+    assert_allow(
+        authz.authorize_verb(&owner, SERVICE_CALL),
+        "owner service-call",
+    );
+    assert_deny(
+        authz.authorize_verb(&viewer, TOPIC_PUBLISH),
+        "lacks the requirement",
+        "viewer topic-publish",
+    );
+    assert_deny(
+        authz.authorize_verb(&viewer, SERVICE_CALL),
+        "lacks the requirement",
+        "viewer service-call",
+    );
+    for verb in [TOPIC_PUBLISH, SERVICE_CALL] {
+        assert_deny(
+            authz.authorize_verb(&operator, verb),
+            "lacks the requirement",
+            "operator-no-caps (role passes, CAP_TELEOP missing)",
+        );
+    }
+    assert_allow(
+        authz.authorize_verb(&viewer, TOPIC_SNAPSHOT),
+        "viewer topic-snapshot",
+    );
+    assert_allow(
+        authz.authorize_verb(&viewer, TOPIC_ECHO_ONCE),
+        "viewer topic-echo-once",
+    );
+    assert_deny(
+        authz.authorize_verb(&operator, TOPIC_SNAPSHOT),
+        "lacks the requirement",
+        "operator-no-caps topic-snapshot (CAP_OBSERVE missing)",
+    );
+
+    // Role isolated from the capability: an OPERATOR holding CAP_TELEOP may
+    // publish and call; a VIEWER holding CAP_TELEOP may not (the role gate).
+    let (mut store, mut index, _) = build_claimed();
+    let teleop_operator = establish_via_chain(
+        &mut store,
+        &sk(1),
+        &sk(2),
+        RobotId([5; 32]),
+        AccountId([41; 32]),
+        &sk(41),
+        Scope {
+            role: Role::OPERATOR,
+            caps: Scope::CAP_TELEOP,
+        },
+        "operator-teleop",
+    );
+    let teleop_viewer = establish_via_chain(
+        &mut store,
+        &sk(1),
+        &sk(2),
+        RobotId([5; 32]),
+        AccountId([42; 32]),
+        &sk(42),
+        Scope {
+            role: Role::VIEWER,
+            caps: Scope::CAP_TELEOP | Scope::CAP_OBSERVE,
+        },
+        "viewer-teleop",
+    );
+    index.bind(teleop_operator, AccountId([41; 32]));
+    index.bind(teleop_viewer, AccountId([42; 32]));
+    let authz = PairingAuthorizer::new(store, index);
+    let teleop_operator = caller_for(&teleop_operator);
+    let teleop_viewer = caller_for(&teleop_viewer);
+    for verb in [TOPIC_PUBLISH, SERVICE_CALL] {
+        assert_allow(authz.authorize_verb(&teleop_operator, verb), verb);
+        assert_deny(authz.authorize_verb(&teleop_viewer, verb), "role", verb);
+    }
+    // An OPERATOR without CAP_OBSERVE may not read (the observe cap is required).
+    assert_deny(
+        authz.authorize_verb(&teleop_operator, TOPIC_ECHO_ONCE),
+        "lacks the requirement",
+        "operator-teleop topic-echo-once (CAP_OBSERVE missing)",
+    );
+}
+
 // ── Capability conjunct isolated from the role gate ──────────────────────────
 
 #[test]

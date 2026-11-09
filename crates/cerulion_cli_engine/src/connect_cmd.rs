@@ -201,7 +201,7 @@ pub fn desk_key_path() -> Option<PathBuf> {
 ///
 /// A machine key that cannot be read, is the wrong size, or disagrees with the
 /// legacy `desk.key`.
-fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
+pub(crate) fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
     let Some(layout) = crate::auth::identity_layout() else {
         return Ok(None);
     };
@@ -221,7 +221,7 @@ fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
 
 /// Load the `~/.cerulion/robots.toml` name→eid map (empty if the file is absent
 /// or unreadable — a missing file is normal).
-fn load_robots() -> BTreeMap<String, String> {
+pub(crate) fn load_robots() -> BTreeMap<String, String> {
     let Some(path) = robots_toml_path() else {
         return BTreeMap::new();
     };
@@ -580,6 +580,20 @@ pub fn resolve_connectd_bin() -> CliResult<PathBuf> {
     resolve_connectd_bin_from_dirs(env_override, exe_dir, resolved_dir, &|p| p.exists())
 }
 
+/// The notice `cerulion connect` prints when the kill switch keeps it off the
+/// network: `--network` (`flag`) or `CERULION_NETWORK` (`env`) at exactly
+/// `off`, the value `cerulion-connectd connect` engages the switch on (`None`
+/// = not given). `cerulion connect` then exits 0, as the helper does for the
+/// same refusal, without resolving the robot or spawning the helper. `None`
+/// when neither is `off`. PURE.
+pub fn network_refusal(flag: Option<&str>, env: Option<&str>) -> Option<&'static str> {
+    (flag == Some("off") || env == Some("off")).then_some(NETWORK_REFUSAL)
+}
+
+/// The text of [`network_refusal`].
+pub const NETWORK_REFUSAL: &str = "cerulion connect: network kill-switch engaged (--network off / \
+                                   CERULION_NETWORK=off), refusing to connect; exiting cleanly";
+
 /// Resolve the full spawn plan: the robot eid + the argv + the binary path.
 ///
 /// When the user passed no `--key-file`, this machine's paired key
@@ -756,6 +770,35 @@ fn forward_shutdown_to_child(child: &mut Child) -> Option<ExitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `connect` refuses on exactly `off` in the flag or the variable, the
+    /// value `cerulion-connectd connect` reads; every other value connects.
+    #[test]
+    fn connect_refuses_on_exactly_off_in_the_flag_or_the_variable() {
+        let refusal = "cerulion connect: network kill-switch engaged (--network off / \
+                       CERULION_NETWORK=off), refusing to connect; exiting cleanly";
+        for (flag, env) in [
+            (Some("off"), None),
+            (None, Some("off")),
+            (Some("off"), Some("off")),
+            (Some("on"), Some("off")),
+        ] {
+            assert_eq!(
+                network_refusal(flag, env),
+                Some(refusal),
+                "{flag:?} {env:?}"
+            );
+        }
+        for (flag, env) in [
+            (None, None),
+            (Some("OFF"), None),
+            (None, Some(" off")),
+            (None, Some("")),
+            (Some("of"), Some("on")),
+        ] {
+            assert_eq!(network_refusal(flag, env), None, "{flag:?} {env:?}");
+        }
+    }
 
     fn robots(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

@@ -141,6 +141,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
             depth: DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -182,7 +183,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
         identity: "go2_tf_drain_e2e".to_string(),
         prefix: "drain".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "tf_viz".to_string(),
