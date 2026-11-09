@@ -9,6 +9,9 @@ members = [
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",
+    # Messages as text on local shared memory (publish, service call, snapshot,
+    # decode), shared by the CLI engine and cerulion-remoted.
+    "crates/cerulion_msgio",
     "crates/cerulion_android",
     # Local Studio workspace engine daemon. It links cli_engine, so it inherits
     # the workspace AGPL license rather than being a proprietary client library.
@@ -59,6 +62,8 @@ members = [
     "crates/test_fixtures/test_node_macro_external_cdylib",
     # Macro-emitted DataTrigger round-trip fixture.
     "crates/test_fixtures/test_node_macro_data_trigger_cdylib",
+    # `#[input(trigger, consume = latest)]` across the cdylib info JSON.
+    "crates/test_fixtures/test_node_macro_consume_latest_cdylib",
     # The tick that NEVER RETURNS (env-switched), the one condition
     # the wedge alarm exists to report and the only fixture that can produce it.
     "crates/test_fixtures/test_node_hang_cdylib",
@@ -88,6 +93,9 @@ members = [
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
+    # A period cdylib whose tick is held open while a file exists; two
+    # instances of it must tick concurrently (per-instance lock pin).
+    "crates/test_fixtures/test_node_macro_gate_cdylib",
     # Raw-FFI cdylib whose info JSON declares a param but which exports no
     # cerulion_node_init_with_params symbol; the host must refuse it at info time.
     "crates/test_fixtures/test_node_params_no_symbol_cdylib",
@@ -361,6 +369,7 @@ default-members = [
     "crates/cerulion_hygiene",
     # Pulls mdns-sd only (already in this tree via cerulion_cli_engine).
     "crates/cerulion_mdns",
+    "crates/cerulion_msgio",
     "crates/cerulion_cli_engine",
     "crates/cerulion_wsd",
     "crates/cerulion_cli",
@@ -533,6 +542,7 @@ cerulion_discovery = { path = "crates/cerulion_discovery", version = "=2.0.0" }
 cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=2.0.0" }
 cerulion_link = { path = "crates/cerulion_link", version = "=2.0.0" }
 cerulion_mdns = { path = "crates/cerulion_mdns", version = "=2.0.0" }
+cerulion_msgio = { path = "crates/cerulion_msgio", version = "=2.0.0" }
 cerulion_netd = { path = "crates/cerulion_netd", version = "=2.0.0", default-features = false }
 cerulion_pairing = { path = "crates/cerulion_pairing", version = "=2.0.0" }
 cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=2.0.0" }

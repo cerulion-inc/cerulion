@@ -3,8 +3,9 @@
 //! after each publish and the consumer WAITS on, so the live loop wakes the instant
 //! a producer rings and not only on the timer. Where the CPU carries a monitor-wait
 //! primitive ([`crate::monitor_wait`]) the consumer arms it on the ring counter's
-//! line; on macOS the page carries a kernel wake word beside that counter and the
-//! consumer blocks on it instead.
+//! line; elsewhere the page carries a kernel wake word beside that counter (a
+//! shared futex on Linux and Android, the os_sync word on macOS) and the consumer
+//! blocks on it instead.
 //!
 //! # Why
 //!
@@ -15,16 +16,17 @@
 //! data-trigger topic gets one cache-line-aligned page that producer and consumer
 //! both map: the producer `ring()`s on each publish, and the consumer waits on that
 //! exact line, with `UMONITOR`/`WFE` where the CPU has them and with a kernel block
-//! on the page's wake word on macOS, so a ring wakes the park with no timer
-//! round-trip.
+//! on the page's wake word where it does not, so a ring wakes the park with no
+//! timer round-trip.
 //!
 //! # Mechanism (Linux and Android)
 //!
-//! `shm_open(O_CREAT|O_RDWR, <name>)` + `ftruncate(64)` + `mmap(MAP_SHARED)` → a
-//! pointer to one `AtomicU64`. Two processes opening the SAME name map the SAME
-//! physical page (POSIX named SHM), so a store in the publisher is observed in
-//! the consumer. 64 bytes = one cache line, so the doorbell never false-shares
-//! with an adjacent topic. The seq is a RELATIVE counter: the consumer snapshots
+//! `shm_open(O_CREAT|O_RDWR, <name>)` + `ftruncate(64)` + `mmap(MAP_SHARED)` → the
+//! page head: the `AtomicU64` ring counter at offset 0, the 4-byte futex wake word
+//! at offset 8 and the 4-byte `parked` claim count at offset 12, the macOS layout.
+//! Two processes opening the SAME name map the SAME physical page (POSIX named
+//! SHM), so a store in the publisher is observed in the consumer. 64 bytes = one
+//! cache line, so the doorbell never false-shares with an adjacent topic. The seq is a RELATIVE counter: the consumer snapshots
 //! it on attach and reads deltas, so a stale absolute value from a reused object
 //! is harmless.
 //!
@@ -98,11 +100,15 @@
 //! # Targets
 //!
 //! - Linux: real POSIX named SHM (`shm_open`/`mmap`/`shm_unlink` via `libc`),
-//!   rung by one `Release` atomic increment, heard by the CPU monitor-wait
-//!   primitive (`UMONITOR`/`WFE`) armed on the same line where the CPU carries
-//!   one, and otherwise by the park's loop-top poll within one recheck.
-//! - Android: named shared-memory objects are files under `CERULION_SHM_DIR`;
-//!   a ring is observed by the consumer's next poll.
+//!   rung by one `SeqCst` increment of the ring counter and one load of the
+//!   page's `parked` count, heard by the CPU monitor-wait primitive
+//!   (`UMONITOR`/`WFE`) armed on the same line where the CPU carries one. A
+//!   consumer without one claims `parked` and blocks with `FUTEX_WAIT` on the
+//!   page's wake word, bounded by its park slice; only while such a claim is
+//!   held does a ring bump the word and issue one shared `FUTEX_WAKE`.
+//! - Android: named shared-memory objects are files under `CERULION_SHM_DIR`,
+//!   with the Linux page, ring and futex wake word. The park has no CPU
+//!   monitor-wait primitive there, so a consumer always blocks on the word.
 //! - `macos`: real POSIX named SHM too, plus a KERNEL WAKE WORD. There is no CPU
 //!   monitor-wait primitive on this target, so a plain store is heard by nobody
 //!   and a parked consumer would only re-poll at its pacing chunk. The page
@@ -130,19 +136,22 @@
 //! # Who a ring serves
 //!
 //! A kernel wake reaches a consumer only while that consumer is blocked, and a
-//! consumer can be blocked while a publish happens only when the two are in
-//! different processes: inside one process the publish runs in a step the parking
-//! thread itself drives. The two sides are gated separately, and only one of them
-//! asks who the peer is. A PRODUCER arms a doorbell for EVERY topic it publishes
+//! consumer can be blocked while a publish happens only when the two run on
+//! different live loops: two processes, or two executor units of one process.
+//! Inside one live loop the publish runs in a step the parking thread itself
+//! drives. The two sides are gated separately, and only one of them asks who the
+//! peer is. A PRODUCER arms a doorbell for EVERY topic it publishes
 //! while the policy permits one, because the consumers a ring can reach are not
 //! knowable from the publishing graph: a graph running beside another one, an
 //! `rmw_cerulion` wait set and a tool that subscribes are all blocked readers
 //! this build never hears about. A CONSUMER opens a page only when one of its
-//! declared trigger or sync-input topics admits a writer outside its process
-//! ([`crate::graph`]'s `rung_topics`), which it reads off its own declarations.
+//! declared trigger or sync-input topics admits a writer outside the graph its
+//! live loop runs (its process's graph, or its executor unit's cut of it;
+//! [`crate::graph`]'s `rung_topics`), which it reads off its own declarations.
 //!
 //! What a producer pays for a page nobody blocks on is one atomic on the ring
-//! counter and one cached backend read per publish. The kernel wake stays behind
+//! counter per publish, plus one load of the page's `parked` count on Linux and
+//! Android and one cached backend read on macOS. The kernel wake stays behind
 //! the page's `parked` claim, so a topic with no blocked consumer reaches no
 //! syscall at all; `wake_syscall_counts` is where an operator reads how many
 //! wakes were issued and how many found nobody.
@@ -159,9 +168,9 @@
 
 use std::io;
 use std::sync::atomic::AtomicU64;
-// The park slice the guard's kernel block is bounded by. macOS only, because
-// only there does this module own a wait.
-#[cfg(target_os = "macos")]
+// The park slice the guard's kernel block is bounded by, on the targets where
+// this module owns a wait.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 use std::time::Duration;
 
 /// Derive the POSIX SHM object name for `(ns, topic)`.
@@ -338,33 +347,86 @@ mod imp {
     use std::ffi::CString;
     use std::io;
     use std::os::raw::c_void;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::time::Duration;
 
-    /// 64 bytes — one cache line — so a topic's doorbell never false-shares with
-    /// an adjacent topic's. Only the leading `AtomicU64` is used.
+    /// 64 bytes, one cache line, so a topic's doorbell never false-shares with
+    /// an adjacent topic's. The leading [`DoorbellShared`] uses the first 16.
     const DOORBELL_BYTES: usize = 64;
 
-    /// A process-shared SHM doorbell — one cache-line-aligned `AtomicU64`.
+    /// The mapped doorbell page's head, laid out exactly as the macOS page.
+    ///
+    /// `seq` is the ring counter the CPU monitor-wait park arms on (offset 0, the
+    /// address [`Doorbell::addr`] hands out). `wake_seq` is the kernel wait/wake
+    /// word a consumer with no CPU monitor-wait primitive blocks on with
+    /// `FUTEX_WAIT`, and `parked` counts the consumers holding a claim on that
+    /// word right now. The ringer reads `parked` after every ring counter bump and
+    /// bumps `wake_seq` and issues `FUTEX_WAKE` only when it is non-zero. A
+    /// consumer that parks in hardware never takes a claim, so on a host whose CPU
+    /// carries a monitor-wait primitive a ring is one increment and one load.
+    ///
+    /// A page rung by a build that never bumps `wake_seq` leaves a blocked
+    /// consumer to its bounded cap, which is the recheck it would have run anyway.
+    ///
+    /// A consumer SIGKILLed inside its block never runs its guard's `Drop` and
+    /// leaks its claim. The cost is latency only: every later ring on the page
+    /// pays the word bump and one `FUTEX_WAKE` that finds nobody, which
+    /// [`super::wake_syscall_counts`] reports as wakes with no waiter. The claim
+    /// clears only when a producer creates a FRESH page; an orphan reused after a
+    /// crash is attached with its stale claim intact, and on a consumer-only
+    /// topic, which no owner ever unlinks, the claims of successive crashed
+    /// consumers add up until the machine reboots.
+    #[repr(C)]
+    struct DoorbellShared {
+        seq: AtomicU64,
+        wake_seq: AtomicU32,
+        parked: AtomicU32,
+    }
+
+    const _: () = assert!(
+        core::mem::size_of::<DoorbellShared>() <= DOORBELL_BYTES,
+        "DoorbellShared must fit the cache line the page maps"
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(DoorbellShared, seq) == 0,
+        "seq must sit at offset 0, the address the CPU monitor-wait park arms on"
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(DoorbellShared, wake_seq) == 8,
+        "wake_seq must sit at offset 8 (4-byte aligned) as the futex word"
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(DoorbellShared, parked) == 12,
+        "parked must sit at offset 12, in the same cache line as the word it gates"
+    );
+
+    /// A process-shared SHM doorbell: one cache-line page holding the ring
+    /// counter and its futex wake word (`DoorbellShared`).
     ///
     /// Construct via [`Doorbell::open_owned`] (producer — owns + `shm_unlink`s
     /// the name on drop) or [`Doorbell::open_unowned`] (consumer — maps only).
     #[must_use = "the doorbell is unmapped (and, if owned, shm_unlink'd) on drop — bind it to a named local for the desired scope"]
     pub struct Doorbell {
-        /// Pointer to the mapped `AtomicU64` (offset 0 of the `MAP_SHARED` page).
-        ptr: *mut AtomicU64,
+        /// Base of the `MAP_SHARED` page, read as a [`DoorbellShared`].
+        ptr: *mut DoorbellShared,
         /// The POSIX SHM object name — retained so an OWNED doorbell can
         /// `shm_unlink` it on drop.
         name: CString,
+        /// The topic this doorbell belongs to, the key every failure event on
+        /// this page carries: the object name hashes the topic, so it names
+        /// nothing an operator can look up.
+        topic: String,
         /// `true` for a producer-created doorbell that owns the name and must
         /// `shm_unlink` it on drop; `false` for a consumer mapping (munmap only).
         owns_name: bool,
     }
 
-    // SAFETY: the doorbell is a single `AtomicU64` in a shared page. All access
-    // goes through atomic load/fetch_add, so it is sound to send/share the
-    // handle across threads (the OS guarantees the page is coherent across the
-    // mapping; atomics give the intra-process ordering). `name`/`owns_name` are
-    // plain Send+Sync data.
+    // SAFETY: the doorbell is a `DoorbellShared` in a shared page. Every access
+    // to the page goes through its atomics or through a futex syscall on its
+    // 4-byte wake word, so it is sound to send/share the handle across threads
+    // (the OS keeps the page coherent across mappings; the atomics give the
+    // intra-process ordering). `name`/`topic`/`owns_name` are plain Send+Sync
+    // data.
     unsafe impl Send for Doorbell {}
     unsafe impl Sync for Doorbell {}
 
@@ -428,32 +490,266 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self {
-                ptr: addr as *mut AtomicU64,
+                ptr: addr as *mut DoorbellShared,
                 name,
+                topic: topic.to_string(),
                 owns_name,
             })
         }
 
-        /// Ring the doorbell — a `Release` store (`fetch_add(1)`) that wakes a
-        /// consumer parked with `UMONITOR`/`WFE` on this line.
+        fn shared(&self) -> &DoorbellShared {
+            // SAFETY: `ptr` is a live, page-aligned mapping of DOORBELL_BYTES, and
+            // DoorbellShared fits it (asserted above); every field is an atomic.
+            unsafe { &*self.ptr }
+        }
+
+        /// Ring the doorbell: bump `seq`, which wakes a consumer parked with
+        /// `UMONITOR`/`WFE` on this line, then read `parked`. Only while a
+        /// consumer holds a claim on the futex word does the ring bump the word
+        /// and issue one shared `FUTEX_WAKE`.
+        ///
+        /// # Cost on the publish path
+        ///
+        /// With no claim on the page: one locked increment and one load from the
+        /// cache line that increment holds (`lock xadd` and a plain `mov` on
+        /// x86_64, `ldaddal` and `ldar` on aarch64). That is the whole cost on a
+        /// host whose consumers park in hardware, because they never claim the
+        /// word. With a claim: a second increment into the same line and one
+        /// `FUTEX_WAKE`.
+        ///
+        /// # Ordering
+        ///
+        /// The `seq` increment and the `parked` load are both `SeqCst`, and they
+        /// pair with the parker's claim, its `SeqCst` fence and its re-read of
+        /// `seq` (`park_enter`, then the caller's ring delta re-derive): in the
+        /// single total order either this load sees the claim or the parker's
+        /// re-read sees this increment, so a parker never blocks on a ring this
+        /// ringer passed by. The word bump comes after the increment with
+        /// `Release`, so a parker whose word snapshot already reads it also reads
+        /// the increment at its re-derive and does not block.
         pub fn ring(&self) {
-            // SAFETY: `ptr` is a valid, 8-byte-aligned mapping of an `AtomicU64`.
-            let a = unsafe { &*self.ptr };
-            a.fetch_add(1, Ordering::Release);
+            let s = self.shared();
+            s.seq.fetch_add(1, Ordering::SeqCst);
+            if s.parked.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            s.wake_seq.fetch_add(1, Ordering::Release);
+            self.futex_wake();
+        }
+
+        /// One shared `FUTEX_WAKE` on the wake word, waking every consumer
+        /// blocked on it (each re-derives its own ring delta).
+        ///
+        /// The rc is classified rather than discarded: a positive count closes an
+        /// open failure regime, zero is a wake that found nobody (the leaked claim
+        /// reading `wake_syscall_counts` reports), and `-1` goes through the wake
+        /// side's flood latch, because a host whose wake fails leaves every
+        /// blocked consumer to its cap and the producer is the only process that
+        /// sees the errno.
+        #[inline]
+        fn futex_wake(&self) {
+            // SAFETY: `wake_seq` is a live, 4-byte-aligned u32 in this MAP_SHARED
+            // mapping. FUTEX_WAKE without FUTEX_PRIVATE_FLAG keys on the shared
+            // page, so a waiter in another process or on another mapping of it
+            // is woken; it reads no memory beyond the word.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &self.shared().wake_seq as *const AtomicU32,
+                    libc::FUTEX_WAKE,
+                    i32::MAX,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    0u32,
+                )
+            };
+            super::note_wake_syscall();
+            if rc >= 0 {
+                if rc == 0 {
+                    super::note_wake_found_nobody();
+                }
+                // Gated on a relaxed load, never on the lock: this is the arm every
+                // publish to a claimed page takes.
+                if super::wake_regime_is_open() {
+                    super::note_wake_recovered();
+                }
+                return;
+            }
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            use crate::transport::failure_regime_latch::RegimeDecision;
+            match super::note_wake_errno() {
+                RegimeDecision::Loud => tracing::warn!(
+                    topic = %self.topic,
+                    errno,
+                    "doorbell wake word FUTEX_WAKE failed; a consumer blocked on this topic \
+                     waits out its park slice instead of being woken by this publish"
+                ),
+                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                    topic = %self.topic,
+                    errno,
+                    suppressed,
+                    "doorbell wake word FUTEX_WAKE failed; a consumer blocked on this topic \
+                     waits out its park slice instead of being woken by this publish"
+                ),
+                RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                    topic = %self.topic,
+                    errno,
+                    total_failures = total,
+                    suppressed,
+                    "doorbell wake word FUTEX_WAKE failed; a consumer blocked on this topic \
+                     waits out its park slice instead of being woken by this publish"
+                ),
+            }
         }
 
         /// Current ring count (`Acquire` load). The consumer snapshots this
-        /// before parking and re-checks it after, to detect a ring. RELATIVE —
+        /// before parking and re-checks it after, to detect a ring. RELATIVE:
         /// compare against a snapshot, never an absolute baseline.
         pub fn seq(&self) -> u64 {
-            // SAFETY: as `ring`.
-            let a = unsafe { &*self.ptr };
-            a.load(Ordering::Acquire)
+            self.shared().seq.load(Ordering::Acquire)
         }
 
-        /// The watched address for `UMONITOR`/`WFE` (the `AtomicU64`'s location).
+        /// The watched address for `UMONITOR`/`WFE` (the ring counter's location).
         pub fn addr(&self) -> *const AtomicU64 {
-            self.ptr as *const AtomicU64
+            &self.shared().seq as *const AtomicU64
+        }
+
+        #[cfg(test)]
+        pub fn parked_for_test(&self) -> u32 {
+            self.shared().parked.load(Ordering::Acquire)
+        }
+
+        pub(super) fn wake_seq_snapshot(&self) -> u32 {
+            self.shared().wake_seq.load(Ordering::Acquire)
+        }
+
+        /// Claim a blocked consumer on this page. The `SeqCst` fence after the
+        /// claim is the parker's half of the pairing [`Self::ring`] describes: it
+        /// orders the claim before the caller's word snapshot and its re-read of
+        /// `seq`.
+        pub(super) fn park_enter(&self) {
+            self.shared().parked.fetch_add(1, Ordering::AcqRel);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+
+        /// Release the claim [`Self::park_enter`] took, never below zero.
+        pub(super) fn park_exit(&self) {
+            let parked = &self.shared().parked;
+            let mut cur = parked.load(Ordering::Acquire);
+            loop {
+                debug_assert!(cur != 0, "park_exit without a matching park_enter");
+                let Some(next) = super::parked_decrement(cur) else {
+                    // Unreachable through the guard, so reaching it means the
+                    // shared count was written by something else; the note is the
+                    // only evidence a release build leaves.
+                    super::note_parked_gate_underflow();
+                    return;
+                };
+                match parked.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return,
+                    Err(seen) => cur = seen,
+                }
+            }
+        }
+
+        /// Block on the futex word until a ring moves it from `snapshot` or `cap`
+        /// elapses. `RingPending` when the word already moved (no block), `Parked`
+        /// after a completed wait (woken, timed out or interrupted), and
+        /// `Unavailable` for a zero cap or a failed wait, so the caller paces with
+        /// its own nap. A failed wait goes through the wait side's flood latch
+        /// with its errno and the topic: the first of a regime is a warn, repeats
+        /// are downgraded and re-announced at each decade, and the next wait that
+        /// runs closes the regime. Record-only: it changes only WHEN the park
+        /// returns, never what the step reads.
+        pub(super) fn park_wait_ring(
+            &self,
+            snapshot: u32,
+            cap: Duration,
+        ) -> crate::monitor_wait::AddrParkOutcome {
+            use crate::monitor_wait::AddrParkOutcome;
+            if cap.is_zero() {
+                return AddrParkOutcome::Unavailable;
+            }
+            let word = &self.shared().wake_seq;
+            if word.load(Ordering::Acquire) != snapshot {
+                return AddrParkOutcome::RingPending;
+            }
+            let timeout = libc::timespec {
+                tv_sec: cap.as_secs() as libc::time_t,
+                tv_nsec: libc::c_long::from(cap.subsec_nanos()),
+            };
+            // SAFETY: `word` is a live, 4-byte-aligned u32 in this MAP_SHARED
+            // mapping; `timeout` is a valid relative timespec on this frame. A
+            // shared FUTEX_WAIT returns at once with EAGAIN when the word no longer
+            // equals `snapshot`.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    word as *const AtomicU32,
+                    libc::FUTEX_WAIT,
+                    snapshot,
+                    &timeout as *const libc::timespec,
+                    std::ptr::null::<u32>(),
+                    0u32,
+                )
+            };
+            let errno = if rc == 0 {
+                0
+            } else {
+                io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            };
+            if let Some(outcome) = futex_wait_outcome(rc, errno) {
+                super::note_wait_recovered();
+                return outcome;
+            }
+            use crate::transport::failure_regime_latch::RegimeDecision;
+            match super::note_wait_errno() {
+                RegimeDecision::Loud => tracing::warn!(
+                    topic = %self.topic,
+                    errno,
+                    "doorbell wake word FUTEX_WAIT failed; this park takes its bounded \
+                     recheck nap instead of the kernel block for as long as the errno \
+                     persists"
+                ),
+                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                    topic = %self.topic,
+                    errno,
+                    suppressed,
+                    "doorbell wake word FUTEX_WAIT failed; this park takes its bounded \
+                     recheck nap instead of the kernel block for as long as the errno \
+                     persists"
+                ),
+                RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                    topic = %self.topic,
+                    errno,
+                    total_failures = total,
+                    suppressed,
+                    "doorbell wake word FUTEX_WAIT failed; this park takes its bounded \
+                     recheck nap instead of the kernel block for as long as the errno \
+                     persists"
+                ),
+            }
+            AddrParkOutcome::Unavailable
+        }
+    }
+
+    /// What one shared `FUTEX_WAIT` on the wake word ended as, from its rc and
+    /// errno: a return of `0` (a wake), `ETIMEDOUT` (the cap) and `EINTR` (a
+    /// signal) are a wait that ran, `EAGAIN` is the word having moved before the
+    /// kernel compared it, and every other errno is `None`, a failed wait the
+    /// caller reports.
+    pub(super) fn futex_wait_outcome(
+        rc: libc::c_long,
+        errno: i32,
+    ) -> Option<crate::monitor_wait::AddrParkOutcome> {
+        use crate::monitor_wait::AddrParkOutcome;
+        if rc == 0 {
+            return Some(AddrParkOutcome::Parked);
+        }
+        match errno {
+            libc::EAGAIN => Some(AddrParkOutcome::RingPending),
+            libc::ETIMEDOUT | libc::EINTR => Some(AddrParkOutcome::Parked),
+            _ => None,
         }
     }
 
@@ -1261,16 +1557,22 @@ fn wake_word_active_from(backend_usable: bool, killed: bool) -> bool {
 
 /// Can a consumer KERNEL-BLOCK on a doorbell's wake word on this host?
 ///
-/// `true` only on macOS with the os_sync family resolved, unlatched and not
-/// killed by [`DOORBELL_OS_SYNC_ENV`]. Linux uses the CPU monitor-wait primitive
-/// (`UMONITOR`/`WFE`) where available, and Android observes the ring at its next
-/// poll; neither uses this kernel-wake park rung. Other targets have no primitive.
+/// `true` on Linux and Android, where the page's wake word is a shared futex,
+/// and on macOS with the os_sync family resolved, unlatched and not killed by
+/// [`DOORBELL_OS_SYNC_ENV`]. A park whose slice the CPU monitor-wait primitive
+/// performs (`UMONITOR`/`WFE` on the ring counter) never reaches this rung; a
+/// park without one blocks on the wake word instead of pacing its recheck nap.
+/// Other targets have no wake word.
 pub fn wake_word_block_primitive_available() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        true
+    }
     #[cfg(target_os = "macos")]
     {
         doorbell_os_sync_tier_active()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         false
     }
@@ -1280,7 +1582,7 @@ pub fn wake_word_block_primitive_available() -> bool {
 /// module's own rule: a failing wait and a failing wake have different remedies,
 /// and a shared regime would report whichever failed second at `debug` while the
 /// operator's only loud line named the other.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn wake_latch(
 ) -> &'static std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> {
     use crate::transport::failure_regime_latch::FailureRegimeLatch;
@@ -1294,7 +1596,7 @@ fn wake_latch(
 ///
 /// Called only when [`wake_regime_is_open`] says there is a regime to close, so
 /// the lock stays off the healthy publish path.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_wake_recovered() {
     use crate::transport::failure_regime_latch::lock_regime_latch;
     let suppressed = lock_regime_latch(wake_latch()).on_success();
@@ -1302,14 +1604,14 @@ fn note_wake_recovered() {
     if let Some(suppressed) = suppressed {
         tracing::warn!(
             suppressed,
-            "doorbell wake word os_sync_wake_by_address is succeeding again"
+            "doorbell wake word kernel wake is succeeding again"
         );
     }
 }
 
 /// The wait side's own regime; see [`wake_latch`] for why the two are not
 /// shared.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn wait_latch(
 ) -> &'static std::sync::Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch> {
     use crate::transport::failure_regime_latch::FailureRegimeLatch;
@@ -1320,7 +1622,7 @@ fn wait_latch(
 
 /// Whether the wait regime is open. Read on the park path, which can afford the
 /// lock, but kept symmetric with the wake side so both regimes close the same way.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 static WAIT_REGIME_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record one failing wake-word WAIT and say how the caller should log it: a
@@ -1331,7 +1633,7 @@ static WAIT_REGIME_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// site cannot drift from the discipline every other flood site in the crate
 /// keeps. The DECISION comes back rather than a formatted line, because the
 /// message is the caller's.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_wait_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
     use crate::transport::failure_regime_latch::lock_regime_latch;
     WAIT_REGIME_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1343,7 +1645,7 @@ fn note_wait_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
 /// Without it the first unexpected errno is loud and every LATER regime resolves to
 /// a downgraded repeat, so a park that degrades a second time says nothing at the
 /// level an operator reads.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_wait_recovered() {
     use crate::transport::failure_regime_latch::lock_regime_latch;
     if !WAIT_REGIME_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1354,7 +1656,7 @@ fn note_wait_recovered() {
     if let Some(suppressed) = suppressed {
         tracing::warn!(
             suppressed,
-            "doorbell wake word os_sync_wait_on_address is succeeding again"
+            "doorbell wake word kernel wait is succeeding again"
         );
     }
 }
@@ -1413,26 +1715,46 @@ fn retry_lost_name_race<T>(
 /// Pure and split out because the arm it decides is unreachable through the guard,
 /// so the `debug_assert` beside it can never fire in a test build, and the warn it
 /// guards is the only evidence a release build would leave.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", test))]
 fn parked_decrement(cur: u32) -> Option<u32> {
     cur.checked_sub(1)
 }
 
-/// Say ONCE that a doorbell page's `parked` count was decremented below zero.
+/// Report that a doorbell page's `parked` count was already zero at park exit,
+/// through its own flood latch: the first is a warn, repeats are downgraded and
+/// re-announced at each decade of the running total.
 ///
 /// Unreachable through [`ParkedDoorbellGuard`], so reaching it means the count in
 /// a page every peer maps was written by something else. The consequence lands on
 /// a PEER (its ringer's gate reads the wrong value and a real waiter is never
-/// woken), so the process that sees it is the only one that can report it.
-#[cfg(target_os = "macos")]
+/// woken), so the process that sees it is the only one that can report it. No
+/// success closes this regime: a count that went wrong once stays suspect.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_parked_gate_underflow() {
-    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
+    use crate::transport::failure_regime_latch::{
+        lock_regime_latch, FailureRegimeLatch, RegimeDecision,
+    };
+    static LATCH: std::sync::Mutex<FailureRegimeLatch> =
+        std::sync::Mutex::new(FailureRegimeLatch::new());
+    match lock_regime_latch(&LATCH).on_failure() {
+        RegimeDecision::Loud => tracing::warn!(
             "a doorbell page's parked count was already zero at park exit: the count is shared \
              with every peer that maps the topic, so a ringer may now read it wrong and leave a \
              blocked consumer unwoken for its whole park slice"
-        );
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            suppressed,
+            "a doorbell page's parked count was already zero at park exit: the count is shared \
+             with every peer that maps the topic, so a ringer may now read it wrong and leave a \
+             blocked consumer unwoken for its whole park slice"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            total_failures = total,
+            suppressed,
+            "a doorbell page's parked count was already zero at park exit: the count is shared \
+             with every peer that maps the topic, so a ringer may now read it wrong and leave a \
+             blocked consumer unwoken for its whole park slice"
+        ),
     }
 }
 
@@ -1442,17 +1764,17 @@ fn note_parked_gate_underflow() {
 /// parked topic reaches it on EVERY publish, so the lock cannot be the thing that
 /// decides there is nothing to recover from. A stale read costs at most one late
 /// recovery line.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 static WAKE_REGIME_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Is a wake regime open? Read on the publish path, so it is one relaxed load.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn wake_regime_is_open() -> bool {
     WAKE_REGIME_OPEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Record one failing wake-word WAKE, in the wake side's own regime.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_wake_errno() -> crate::transport::failure_regime_latch::RegimeDecision {
     use crate::transport::failure_regime_latch::lock_regime_latch;
     WAKE_REGIME_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1475,13 +1797,13 @@ fn doorbell_page_bytes_for_test() -> usize {
 /// crashed consumers add up, so every later publish pays a syscall that returns at
 /// once. That is accepted and bounded, but it is a permanent publish-path cost with
 /// no log line by design, so the numbers are the only way an operator can answer
-/// "my macOS publish path got slower after a worker died" without a rebuild. A
+/// "my publish path got slower after a worker died" without a rebuild. A
 /// relaxed counter on an arm that already paid for a syscall.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 static WAKE_SYSCALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Wake syscalls that found no waiter. See [`WAKE_SYSCALLS`].
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 static WAKES_WITH_NO_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // The same pair as `WAKE_SYSCALLS` and `WAKES_WITH_NO_WAITER`, counted for THIS
@@ -1495,7 +1817,10 @@ static WAKES_WITH_NO_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 // behaviour. A thread-local count is written by the thread that issued the
 // syscall and read by that same thread, so the gate under test is the only thing
 // that can move it, and the assertion can be an equality.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "android")
+))]
 thread_local! {
     static THREAD_WAKE_SYSCALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static THREAD_WAKES_WITH_NO_WAITER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1504,7 +1829,10 @@ thread_local! {
 /// This thread's issued count and how many of its wakes found no waiter, the
 /// thread-local mirror of [`wake_syscall_counts`]. The comment above the two
 /// cells says why they are per thread.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "android")
+))]
 fn thread_wake_counts() -> (u64, u64) {
     (
         THREAD_WAKE_SYSCALLS.with(std::cell::Cell::get),
@@ -1513,7 +1841,7 @@ fn thread_wake_counts() -> (u64, u64) {
 }
 
 /// Record one issued wake syscall.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_wake_syscall() {
     WAKE_SYSCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -1521,7 +1849,7 @@ fn note_wake_syscall() {
 }
 
 /// Record one wake syscall that found no waiter.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn note_wake_found_nobody() {
     WAKES_WITH_NO_WAITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -1535,7 +1863,7 @@ fn note_wake_found_nobody() {
 /// topic issue a wake the kernel answers with no waiter, so the two counts climb
 /// together. A second number far below the first is the healthy one, where the
 /// wakes are reaching consumers that were really blocked.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub fn wake_syscall_counts() -> (u64, u64) {
     (
         WAKE_SYSCALLS.load(std::sync::atomic::Ordering::Relaxed),
@@ -1587,7 +1915,7 @@ pub(crate) fn note_tier_inactive() {
 /// syscall is issued) and would wait out its whole cap in silence. Inside this
 /// module the order is a convention the guard makes obvious, not one the compiler
 /// checks.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 #[must_use = "the parked claim is released on drop - bind the guard for the block's lifetime"]
 pub struct ParkedDoorbellGuard<'a> {
     bell: &'a Doorbell,
@@ -1599,7 +1927,7 @@ pub struct ParkedDoorbellGuard<'a> {
     snapshot: u32,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 impl<'a> ParkedDoorbellGuard<'a> {
     /// Claim the gate for the duration of one kernel block, and read the compare
     /// value the block will use.
@@ -1623,7 +1951,7 @@ impl<'a> ParkedDoorbellGuard<'a> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 impl Drop for ParkedDoorbellGuard<'_> {
     fn drop(&mut self) {
         self.bell.park_exit();
@@ -1706,10 +2034,19 @@ impl DoorbellRegistry {
         self.doorbells.iter().map(Doorbell::seq).collect()
     }
 
+    /// [`snapshot_all`](Self::snapshot_all) into a caller's buffer: `out` is
+    /// cleared and refilled in topic order, and once its capacity covers the
+    /// registry the refill allocates nothing. The live loop's park entry takes
+    /// its baseline through this.
+    pub fn snapshot_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(self.doorbells.iter().map(Doorbell::seq));
+    }
+
     /// `true` iff ANY doorbell's ring count differs from the parallel `baseline`
     /// snapshot (a prior [`snapshot_all`](Self::snapshot_all)). The
     /// non-allocating poll-all the runtime's park loop uses to detect a ring on
-    /// a NON-primary topic, and the re-derive the macOS wake-word block runs
+    /// a NON-primary topic, and the re-derive the wake-word block runs
     /// between its claim and its kernel wait. Where the CPU carries a monitor-wait
     /// primitive the primary line is additionally hardware-armed; every other
     /// topic is caught only by this ≤100µs-recheck delta scan.
@@ -1765,7 +2102,7 @@ impl DoorbellRegistry {
 
     /// The doorbell handle for `topic`, or `None` if not registered.
     ///
-    /// The macOS wake-word park takes its handle here rather than positionally,
+    /// The wake-word park takes its handle here rather than positionally,
     /// so the handle it blocks on and the address the hardware plane arms come
     /// from the same topic.
     pub fn bell(&self, topic: &str) -> Option<&Doorbell> {
@@ -2152,6 +2489,36 @@ mod tests {
 
     // ---- lifecycle (real SHM): create → ring → observe → drop-unlinks ----
 
+    /// The park entry's baseline read: `snapshot_into` refills the caller's
+    /// buffer with exactly what `snapshot_all` returns, stale content cleared,
+    /// and a buffer already sized to the registry keeps its allocation.
+    #[test]
+    fn snapshot_into_refills_a_sized_buffer_in_place() {
+        let ns = test_ns("snap_into");
+        let topics = vec!["/a".to_string(), "/b".to_string()];
+        let reg = DoorbellRegistry::open(&ns, &topics).expect("registry open");
+        let ringer = Doorbell::open_unowned(&ns, "/b").expect("ringer open");
+        ringer.ring();
+        let mut out = Vec::with_capacity(reg.len());
+        out.push(u64::MAX);
+        let buffer = out.as_ptr();
+        reg.snapshot_into(&mut out);
+        assert_eq!(
+            out,
+            reg.snapshot_all(),
+            "the same counters in the same order"
+        );
+        assert_eq!(
+            out.as_ptr(),
+            buffer,
+            "a buffer sized to the registry is refilled in place, so the park entry \
+             allocates nothing"
+        );
+        drop(ringer);
+        drop(reg);
+        cleanup(&ns, &["/a", "/b"]);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn owner_rings_consumer_observes_and_owner_drop_unlinks() {
@@ -2356,15 +2723,252 @@ mod tests {
         );
     }
 
-    /// Off macOS there is no kernel wake word at all, so the availability gate
-    /// is a compile-time `false` and the park rung is compiled out.
-    #[cfg(not(target_os = "macos"))]
+    /// On Linux and Android the wake word is a shared futex, which every host
+    /// carries, so the availability gate answers `true` with no probe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn the_wake_word_is_unavailable_off_macos() {
-        assert!(!wake_word_block_primitive_available());
+    fn the_wake_word_is_available_on_linux_and_android() {
+        assert!(wake_word_block_primitive_available());
     }
 
-    // ---- the macOS kernel wake word (real SHM, real syscalls) ----
+    /// A ring on the producer's mapping wakes a consumer blocked on the futex
+    /// word through ITS OWN mapping of the same page, well inside the block's
+    /// cap: two mappings in one process and two processes key the same shared
+    /// futex. The claim is released once the block returns.
+    ///
+    /// The ringer waits until the consumer's claim shows through the
+    /// PRODUCER's mapping, so the ring takes the wake arm, then sleeps a further
+    /// 20 ms, which usually puts the consumer inside `FUTEX_WAIT` first. The
+    /// ring's wakes are counted on the ringing thread, read before and after
+    /// the ring, so no other arm of the binary moves them.
+    ///
+    /// An attempt whose ring did not land inside a kernel block is RETRIED
+    /// rather than judged. A ring that reaches the word before the block returns
+    /// `RingPending` and needs no wake at all; a wake the kernel answers with no
+    /// waiter reached a consumer that was not blocked; and a block that returned
+    /// before the ring was not ended by it. A consumer preempted between its
+    /// claim and its wait for longer than the sleep opens the first two. Every
+    /// other attempt is judged: the block must be a completed wait (`Parked`),
+    /// it must return within 1 s against its 5 s cap, and the ring must have
+    /// issued exactly one `FUTEX_WAKE` that the kernel did not answer with no
+    /// waiter. A wake that is missing or fails with an errno leaves the block to
+    /// run to its cap, so it fails the 1 s bound. The arm fails when none of its
+    /// 16 attempts lands a ring inside a block.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_ring_on_one_mapping_wakes_a_futex_park_on_another() {
+        use crate::monitor_wait::AddrParkOutcome;
+        use std::time::Instant;
+        // The timeout the block is handed.
+        const CAP: Duration = Duration::from_secs(5);
+        // How far inside CAP a judged block must return.
+        const WOKEN_WITHIN: Duration = Duration::from_secs(1);
+        // Bounded so a claim that never shows fails the test rather than
+        // hanging it.
+        const GATE_WAIT: Duration = Duration::from_secs(5);
+        // The ringer's sleep after the gate. It raises the share of attempts
+        // whose ring lands inside the block; a miss is retried.
+        const SETTLE: Duration = Duration::from_millis(20);
+        const ATTEMPTS: u32 = 16;
+
+        let ns = format!("dbfutex_{}", std::process::id());
+        let producer = Doorbell::open_owned(&ns, "/futex/wake").expect("producer page");
+        let consumer = Doorbell::open_unowned(&ns, "/futex/wake").expect("consumer page");
+
+        let mut missed = 0u32;
+        let mut judged = false;
+        for _ in 0..ATTEMPTS {
+            let (outcome, waited, returned_at, rang_at, issued, found_nobody) =
+                std::thread::scope(|scope| {
+                    let waiter = scope.spawn(|| {
+                        let guard = ParkedDoorbellGuard::enter(&consumer);
+                        let started = Instant::now();
+                        let outcome = guard.wait(CAP);
+                        let returned_at = Instant::now();
+                        (outcome, returned_at - started, returned_at)
+                    });
+                    let spun_up = Instant::now();
+                    while producer.parked_for_test() == 0 {
+                        assert!(
+                            spun_up.elapsed() < GATE_WAIT,
+                            "the consumer's claim never reached the producer's mapping"
+                        );
+                        std::thread::yield_now();
+                    }
+                    std::thread::sleep(SETTLE);
+                    let (issued_before, nobody_before) = thread_wake_counts();
+                    let rang_at = Instant::now();
+                    producer.ring();
+                    let (issued_after, nobody_after) = thread_wake_counts();
+                    let (outcome, waited, returned_at) =
+                        waiter.join().expect("waiter thread panicked");
+                    (
+                        outcome,
+                        waited,
+                        returned_at,
+                        rang_at,
+                        issued_after - issued_before,
+                        nobody_after - nobody_before,
+                    )
+                });
+            assert_eq!(
+                consumer.parked_for_test(),
+                0,
+                "the guard releases its claim when the block returns"
+            );
+
+            if outcome == AddrParkOutcome::RingPending || found_nobody != 0 || returned_at < rang_at
+            {
+                missed += 1;
+                continue;
+            }
+
+            assert_eq!(
+                outcome,
+                AddrParkOutcome::Parked,
+                "a block the ring landed inside must report a completed wait"
+            );
+            let since_ring = returned_at.saturating_duration_since(rang_at);
+            assert!(
+                waited < WOKEN_WITHIN,
+                "the ring must end the block, not its {CAP:?} cap: it waited {waited:?}, \
+                 {since_ring:?} of it after the ring"
+            );
+            assert_eq!(
+                issued, 1,
+                "the ring must issue exactly one FUTEX_WAKE while the consumer's claim is \
+                 held, and the kernel found a waiter for it"
+            );
+            println!(
+                "doorbell futex wake: {since_ring:?} from the ring to the block's return, \
+                 inside a {CAP:?} cap ({missed} of {ATTEMPTS} attempts missed the block)"
+            );
+            judged = true;
+            break;
+        }
+
+        assert!(
+            judged,
+            "{ATTEMPTS} attempts all missed the block, so the wake under test never ran: a \
+             ring that reaches the word before the block, a wake that finds nobody and a \
+             block that returns before the ring judge neither way"
+        );
+    }
+
+    /// On Linux and Android a ring with no claim on the page moves the ring
+    /// counter and nothing else. The futex word and the kernel sit behind the
+    /// page's `parked` count, and a consumer that parks in hardware never claims
+    /// it, so on a host whose CPU carries a monitor-wait primitive a publish costs
+    /// one increment and one load. Read through the OTHER mapping of the page, so
+    /// the word asserted on is the shared one. The positive control holds a claim
+    /// across one ring and sees the word move by exactly one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_ring_with_nobody_parked_moves_only_the_ring_counter() {
+        let ns = test_ns("hw_ring");
+        let topic = "scan";
+        let owner = Doorbell::open_owned(&ns, topic).expect("owner open_owned");
+        let consumer = Doorbell::open_unowned(&ns, topic).expect("consumer open_unowned");
+
+        let seq0 = consumer.seq();
+        let word0 = consumer.wake_seq_snapshot();
+        for _ in 0..3 {
+            owner.ring();
+        }
+        assert_eq!(
+            consumer.seq(),
+            seq0 + 3,
+            "every ring advances the ring counter by exactly one"
+        );
+        assert_eq!(
+            consumer.wake_seq_snapshot(),
+            word0,
+            "with no claim on the page a ring must leave the futex word alone: a \
+             consumer parked in hardware hears the ring counter, and nobody blocks on \
+             the word"
+        );
+
+        let guard = ParkedDoorbellGuard::enter(&consumer);
+        owner.ring();
+        drop(guard);
+        assert_eq!(
+            consumer.seq(),
+            seq0 + 4,
+            "a ring with a claim held still advances the ring counter by exactly one"
+        );
+        assert_eq!(
+            consumer.wake_seq_snapshot(),
+            word0.wrapping_add(1),
+            "with a claim held a ring must move the futex word by exactly one, or a \
+             blocked consumer's kernel compare would still match and it would sleep \
+             through the ring"
+        );
+
+        drop(consumer);
+        drop(owner);
+        cleanup(&ns, &[topic]);
+    }
+
+    /// Does a ring with a claim held reach a kernel wake on this host? Always on
+    /// Linux and Android, where the wake is a futex; on macOS only with the
+    /// os_sync backend resolved.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn wake_backend_resolved() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            crate::os_sync::os_sync_backend().is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
+
+    /// The futex wait's verdicts: a wake, the cap and a signal are a wait that
+    /// ran, `EAGAIN` is a ring in hand, and any other errno is a failure the
+    /// caller reports through the wait latch rather than a quiet fallback.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_futex_wait_reports_every_errno_it_does_not_expect_as_a_failure() {
+        use crate::monitor_wait::AddrParkOutcome;
+        use imp::futex_wait_outcome;
+        assert_eq!(futex_wait_outcome(0, 0), Some(AddrParkOutcome::Parked));
+        assert_eq!(
+            futex_wait_outcome(-1, libc::ETIMEDOUT),
+            Some(AddrParkOutcome::Parked)
+        );
+        assert_eq!(
+            futex_wait_outcome(-1, libc::EINTR),
+            Some(AddrParkOutcome::Parked)
+        );
+        assert_eq!(
+            futex_wait_outcome(-1, libc::EAGAIN),
+            Some(AddrParkOutcome::RingPending)
+        );
+        for errno in [libc::EINVAL, libc::EFAULT, libc::ENOSYS, libc::EPERM, 0] {
+            assert_eq!(
+                futex_wait_outcome(-1, errno),
+                None,
+                "errno {errno} is not a wait that ran, so it must reach the latch"
+            );
+        }
+    }
+
+    /// A parked count already at zero at park exit is reported, at warn the first
+    /// time, on every target that maps a page with a wake word.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    #[tracing_test::traced_test]
+    fn a_parked_count_underflow_is_reported() {
+        note_parked_gate_underflow();
+        assert!(
+            logs_contain("parked count was already zero at park exit"),
+            "the underflow must leave a line, the only evidence a release build has"
+        );
+    }
+
+    // ---- the kernel wake word (real SHM, real syscalls) ----
 
     /// The availability rule's truth table, over an INJECTED pair rather than
     /// this host's answer: the tier is active only when the shared backend is
@@ -2532,7 +3136,7 @@ mod tests {
     /// that holds a parked claim and rings from its own thread can move it
     /// between two reads, which is a red with no behaviour behind it. A
     /// thread-local count is exact and needs no arm of this binary to run alone.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_ring_with_nobody_parked_issues_no_wake_syscall() {
         let ns = test_ns("wake_gate");
@@ -2554,7 +3158,7 @@ mod tests {
         // there is no syscall to count, which is judged rather than skipped.
         let guard = ParkedDoorbellGuard::enter(&consumer);
         owner.ring();
-        if crate::os_sync::os_sync_backend().is_some() {
+        if wake_backend_resolved() {
             assert_eq!(
                 thread_wake_counts().0,
                 before + 1,
@@ -2586,7 +3190,7 @@ mod tests {
     /// kernel and is answered with no waiter. Counted on this thread for the
     /// equality; the process-wide pair is also read, with a bound rather than an
     /// equality, because a sibling arm can only add to it.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_wake_that_finds_nobody_is_counted_as_finding_nobody() {
         let ns = test_ns("found_nobody");
@@ -2601,7 +3205,7 @@ mod tests {
         drop(guard);
 
         let (issued_after, nobody_after) = thread_wake_counts();
-        if crate::os_sync::os_sync_backend().is_some() {
+        if wake_backend_resolved() {
             assert_eq!(
                 issued_after,
                 issued_before + 1,
@@ -2638,7 +3242,7 @@ mod tests {
     /// The lost-wake protocol: a ring landing AFTER the parker's snapshot and
     /// BEFORE its block must fail the kernel compare, so the block returns at
     /// once instead of sleeping through a wake nobody will repeat (Principle 6).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_ring_after_the_snapshot_fails_the_compare_and_returns_at_once() {
         const CAP: Duration = Duration::from_secs(5);
@@ -2696,7 +3300,7 @@ mod tests {
     /// also passes on a host with no tier, where the call returns the same
     /// verdict for a different reason, and deleting the `cap.is_zero()` guard
     /// would be invisible there.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_zero_cap_runs_no_block() {
         use crate::monitor_wait::AddrParkOutcome;
@@ -2728,7 +3332,7 @@ mod tests {
     /// block's lifetime and released on every exit path, the RAII contract.
     /// Read through the page the OTHER handle maps, which also proves the gate
     /// is cross-mapping shared state rather than a process-local flag.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn the_parked_gate_is_claimed_for_the_block_and_released_on_drop() {
         let ns = test_ns("parked_gate");
@@ -2778,10 +3382,13 @@ mod tests {
         cleanup(&ns, &[topic]);
     }
 
-    /// A ring bumps BOTH words in the page: the relative ring counter the
-    /// poll-all reads, and the wake epoch the kernel compares. Dropping either
-    /// bump breaks a different half of the design, so both are pinned.
-    #[cfg(target_os = "macos")]
+    /// A ring with a consumer's claim on the page bumps BOTH words in it: the
+    /// relative ring counter the poll-all reads, and the wake epoch the kernel
+    /// compares. Dropping either bump breaks a different half of the design, so
+    /// both are pinned. The claim is held across the ring because the Linux and
+    /// Android ring leaves the epoch alone when nobody holds one, which
+    /// `a_ring_with_nobody_parked_moves_only_the_ring_counter` pins.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_ring_bumps_both_the_ring_counter_and_the_wake_epoch() {
         let ns = test_ns("two_words");
@@ -2792,8 +3399,8 @@ mod tests {
         let seq0 = consumer.seq();
         let guard = ParkedDoorbellGuard::enter(&consumer);
         let epoch0 = guard.snapshot();
-        drop(guard);
         owner.ring();
+        drop(guard);
         // EXACTLY one, not merely different: a double bump would pass an
         // inequality and would make the consumer's ring delta count publishes
         // that never happened.
@@ -2991,7 +3598,7 @@ mod tests {
     /// line about the WAIT and act on the wrong remedy. Driven directly, because
     /// both are module-private functions over pure latch state: no syscall, no env,
     /// no thread.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
     #[tracing_test::traced_test]
@@ -3015,7 +3622,7 @@ mod tests {
             "a recovery closes it, so the next publish takes one relaxed load"
         );
         assert!(
-            logs_contain("os_sync_wake_by_address is succeeding again"),
+            logs_contain("doorbell wake word kernel wake is succeeding again"),
             "the recovery reports what it suppressed"
         );
         // The WAIT regime is untouched by the wake side's recovery: its next repeat

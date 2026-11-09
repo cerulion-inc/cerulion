@@ -668,17 +668,18 @@ fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType,
         }),
         // Assume anything else is a message type from the same package.
         //
-        // `package: None` means "same package as the parent schema". Note:
-        // NOTHING EVER FILLS IT IN. `resolve_fixed_nested`'s rewrite phase
-        // mutates only the `fixed` flag; `resolve.rs::lookup` resolves a bare
-        // name to a schema INDEX for fixedness/layout purposes but never
-        // writes the package back onto the `FieldType`. So `None` survives
-        // into `canonical_str()` (which renders the BARE name) and therefore
-        // into `MessageSchema::schema_hash`.
+        // `package: None` means "same package as the parent schema". The
+        // parser leaves it `None`. The first step of `resolve_fixed_nested`
+        // (`resolve.rs::qualify_bare_references`) writes the package in when
+        // the own-package or `Header` step of the binding ladder binds the
+        // reference in the set being resolved; a reference no such step
+        // binds keeps `None`, which `canonical_str()` renders as the BARE
+        // name in `MessageSchema::schema_hash`.
         //
-        // Consequence, stated because it is a live wire-skew mechanism: a
-        // bare `Vector3` and a qualified `geometry_msgs/Vector3` hash
-        // DIFFERENTLY even after full resolution. `rmw_cerulion` always
+        // Consequence, stated because it is a wire-compatibility mechanism:
+        // a bare `Vector3` and a qualified `geometry_msgs/Vector3` hash
+        // DIFFERENTLY until resolution qualifies the bare one, so a parsed
+        // schema hashed without resolution keeps the bare hash. `rmw_cerulion` always
         // produces `Some(pkg)` (it reads the rosidl introspection
         // namespace), so the qualified form is the one that interoperates,
         // while upstream ROS `.msg` text writes intra-package references
@@ -704,10 +705,12 @@ fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType,
         // `upstream_drift_test.rs::normalize_type`) — which is precisely
         // why the zero-tolerance gate is a SEPARATE test.
         //
-        // Note this is a property of the VENDORED corpus only. A `.msg`
-        // acquired at runtime (its wire rung, a workspace `.msg`
-        // store) can still carry bare refs, and for those the skew above is
-        // live: nothing normalizes them before `schema_hash`.
+        // Note this is a property of the VENDORED corpus only. A workspace
+        // `.msg` store file, a served closure or a bag's recorded text can
+        // carry bare refs; resolution qualifies them over the set it
+        // resolves, so every pipeline that hashes after `resolve_fixed_nested`
+        // (codegen, `LayoutResolver`, `FrameWalker`, `SchemaSet`) hashes them
+        // as `rmw_cerulion` does.
         other => Ok(FieldType::Nested {
             schema_name: other.to_string(),
             package: None,
