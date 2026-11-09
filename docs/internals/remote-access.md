@@ -134,7 +134,7 @@ the same entry instead of running the daemon.
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
 | `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, and the protocol-only `OpsClient`; depends on serde, serde_json and thiserror only |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
-| `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust |
+| `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
 | `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the `cerulion connect`/`pair` worker binary (session driver + CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
@@ -398,7 +398,10 @@ snapshot (`topic-snapshot`).
   incident capture request onto the machine-local flashback channel
   (`remoted/src/flashback.rs`), best-effort by design: a failed ask never
   fails the e-stop, and the verb type cannot be built without a real ask in a
-  production build (`estop_flashback_test.rs`).
+  production build (`estop_flashback_test.rs`). On the daemon it also counts
+  the engage with `rcp::RcpdEstop::send`, whose delivery sends an `estop` into
+  the robot's `cerulion-rcpd` until rcpd answers (see the rcp plane, section
+  6); the verb's answer never waits for it.
 - **Lease over reconnects**: the holder/engager token is the stable
   TLS-authenticated device key, not the QUIC connection id; e-stop is robot
   state persisting across reconnects until cleared, and a different paired key
@@ -603,35 +606,64 @@ never across an `.await` and never with a connection, session, trust or
 receipt lock. The latch is read when a desk's message arrives and again on
 the open connection to rcpd just before the plane sends it. A call already
 sent to rcpd is stopped by rcpd's own latch, which an rcp `estop` closes in
-its stream and an ops `engage-estop` closes through `RcpdEstop::send`: after
-`EstopLease::engage` and its warning, the verb decodes the caller's device
-key and calls `send`, which returns at once. `send` takes the in-flight flag
-(one `AtomicBool`, compare-and-swap); when a delivery holds it, the engage
-starts none and logs that at info. Otherwise it spawns, on the runtime handle
-`serve_core` captured, a task that owns the flag's guard and runs
-`Delivery::run`, a loop of `estop_rcpd` attempts until one returns `Ok`.
-Each attempt reads the token through `load_token`, then sends `initialize`,
+its stream and an ops `engage-estop` closes through `RcpdEstop::send`:
+right after `EstopLease::engage`, and before its `e-stop ENGAGED` warning,
+the verb decodes the caller's device key and calls `send`, which returns
+at once, so a blocked write of that warning holds back no first attempt
+(the delivery writes its failure line before a retry and its closed-latch
+line before an `Again` resend, on its own task); a caller id that is not
+a device key sends nothing and logs that at warn. `RcpdEstop` shares an
+`Owing` with its delivery: a `period` mutex over the period's first engager
+and the last delivery id, an `engages` count and the `running` delivery
+id (0 for none). Under `period`, `send` names the first engager of the
+period, adds one to `engages`, and, when `running` is 0, sets it to a new
+id and spawns `Delivery::run` on the runtime handle `serve_core` captured,
+in the engage's span; otherwise it releases `period` and logs at info that
+the running delivery covers the engage. `period` is held only for those
+steps and never across an `.await`. Each attempt reads `engages` as it
+begins, reads the token through `load_token`, then sends `initialize`,
 `notifications/initialized` and `tools/call` `estop` with `reason`
-`rcp::OPS_ESTOP_REASON`, each POST on a fresh loopback connection with the
-headers `Upstream::request` builds (`x-cerulion-caller` is
-`caller_identity(key, account_for_key(key))`), its response head within
-`RcpLimits::head_timeout` and its answer within the target's answer timeout
-(`OPS_ESTOP_ANSWER`, 10 s) after it, then a `DELETE` of the session it
-opened. It returns `Ok` only when the call's result says `"estopped": true`
-(`estop_outcome`). After a failed attempt the loop sleeps `retry_in`
-(`OPS_ESTOP_RETRY_FIRST`, 100 ms, doubled after each failure up to
-`OPS_ESTOP_RETRY_CAP`, 2 s), logs the first failure at error with `reason`
-and then at most one line per `OPS_ESTOP_LOG_EVERY` (30 s) with `attempts`
-(rcpd's text through `sanitize_peer_text`), and logs the closed latch at
-warn. Both the attempt and the sleep race the stop flag, a `watch` that
-`RcpdEstop::shut_down` sets once `serve_planes` returns; `shut_down` then
-waits for the task within `CONNECT_TIMEOUT`, and a delivery cut short logs
-at warn. Nothing the delivery does reaches the verb's answer or the
-lease. rcpd refuses each mutating call it holds that it
-has not yet published once its latch closes; the one it is running was
-already published. `ControlLease::clear_estop` has no caller, so the latch
-clears only when `cerulion-remoted` restarts; then rcpd's own latch clears
-through its `estop_clear` (`limits.estop_clear: agent`) or by deleting
+`rcp::OPS_ESTOP_REASON` (`estop_session`), each POST on a fresh loopback
+connection with the headers `Upstream::request` builds (`x-cerulion-caller`
+is `caller_identity(key, account_for_key(key))` of the period's first
+engager), its response head within `estop_policy::estop_head_bound` of
+`RcpLimits::head_timeout` (at least `OPS_ESTOP_HEAD_FLOOR`, 1 s) and its
+answer within `OPS_ESTOP_ANSWER` (10 s) after it, then a `DELETE` of the
+session rcpd issued it, within `OPS_ESTOP_DELETE` (2 s), also after a
+stop by Ctrl-C or SIGTERM. It succeeds only when the call's result says
+`"estopped": true` (`estop_outcome`); the delivery logs that at warn with
+`failed_attempts`, then runs `Owing::finish` on a blocking thread. `finish`,
+under `period`, asks `estop_policy::after_answer` of the count at the
+attempt's start and now: `Done` ends the period and clears `running` while
+it still holds the delivery's id, so the next engage starts a delivery, and
+`Again` (an engage came during the answered attempt) sends at once again.
+After a failed attempt the loop logs through one `FailureRegimeLatch`
+per delivery (the first failure and each decade of failures at warn with
+`reason`, rcpd's text through `sanitize_peer_text`, the others at debug
+with `suppressed`), then sleeps `retry_in` (`OPS_ESTOP_RETRY_FIRST`, 100 ms,
+doubled after each failure up to `OPS_ESTOP_RETRY_CAP`, 2 s). Both the attempt
+and the sleep race the stop flag, a `watch` that `RcpdEstop::shut_down`
+sets once `serve_planes` returns; `shut_down` then waits for the task within
+`CONNECT_TIMEOUT`. A `Running` guard in the delivery clears `running` on
+any other end, by compare-and-swap of its own id, and logs at error unless
+rcpd had answered: a stop by Ctrl-C or SIGTERM (`serve_core`'s teardown
+calls `RcpdEstop::shut_down`), a panic, or a runtime dropped with the task.
+A `cerulion-remoted` that is killed (SIGKILL), crashes, or ends at the
+hard-exit deadline or a second stop signal (`_exit(4)`) runs no destructor,
+so it may end with no line and no `DELETE`. A `send` that reads `running`
+just before an ending delivery's guard clears it logs the engage as covered
+and starts nothing; unless rcpd had answered the attempt, the guard logs
+its error line as well. A delivery that ends without rcpd's answer leaves
+its period open, so the next delivery still names the period's first engager
+and rcpd's journal can name an earlier device for a later engage. Every
+delivery line names the engager as `by` (the device key, hex); the warn
+failure lines and the closed-latch line also carry rcpd's caller identity as
+`caller`. Nothing the delivery does reaches the verb's answer or the lease.
+rcpd refuses each mutating call it holds when the `estop` reaches it and has
+not yet published once its latch closes; the one it is running was already
+published. `ControlLease::clear_estop` has no caller outside tests, so the
+latch clears only when `cerulion-remoted` restarts; then rcpd's own latch
+clears through its `estop_clear` (`limits.estop_clear: agent`) or by deleting
 `<receipts>.estop` and restarting rcpd.
 
 When rcpd answers HTTP 404 to a request that carried its session id (rcpd
