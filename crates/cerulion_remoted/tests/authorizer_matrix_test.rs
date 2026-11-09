@@ -21,7 +21,7 @@ use cerulion_pairing::format::{
     AccessListEpoch, AccountId, DeviceCert, Grant, IntermediateCert, PrincipalKind, PublicKey,
     RobotId, Role, RootSet, Scope, Validity, FORMAT_VERSION,
 };
-use cerulion_pairing::verify::{PairingPresentation, TrustStore};
+use cerulion_pairing::verify::{OwnerCertificatePresentationWire, PairingPresentation, TrustStore};
 use ed25519_dalek::SigningKey;
 
 use cerulion_remoted::{verbs, AcceptDecision, DeviceAccountIndex, PairingAuthorizer};
@@ -68,6 +68,33 @@ fn establish_via_chain(
     scope: Scope,
     name: &str,
 ) -> PublicKey {
+    establish_via_chain_as(
+        store,
+        root,
+        intermediate,
+        robot,
+        account,
+        device,
+        scope,
+        name,
+        PrincipalKind::Human,
+    )
+}
+
+/// [`establish_via_chain`] with the principal the device certificate and the
+/// grant name; the row keeps the device certificate's principal.
+#[allow(clippy::too_many_arguments)]
+fn establish_via_chain_as(
+    store: &mut TrustStore,
+    root: &SigningKey,
+    intermediate: &SigningKey,
+    robot: RobotId,
+    account: AccountId,
+    device: &SigningKey,
+    scope: Scope,
+    name: &str,
+    principal_kind: PrincipalKind,
+) -> PublicKey {
     let device_key = pk(device);
     let int_pk = pk(intermediate);
     let int_cert = IntermediateCert {
@@ -82,7 +109,7 @@ fn establish_via_chain(
         version: FORMAT_VERSION,
         device_key,
         account,
-        principal_kind: PrincipalKind::Human,
+        principal_kind,
         scope,
         validity: wide(),
         issued_at_ns: ISSUED,
@@ -94,7 +121,7 @@ fn establish_via_chain(
         subject: account,
         robot,
         scope,
-        principal_kind: PrincipalKind::Human,
+        principal_kind,
         delegation_depth: 0,
         validity: wide(),
         issued_at_ns: ISSUED,
@@ -240,6 +267,56 @@ fn unclaimed_authorizer() -> PairingAuthorizer {
     )
     .unwrap();
     PairingAuthorizer::new(store, DeviceAccountIndex::new())
+}
+
+/// The claimed robot of [`build_claimed`] plus a second device of the OWNER
+/// account whose device certificate names the cloud principal, admitted by
+/// certificate presentation (`verify_owner_certificate`: the row keeps the
+/// certificate's principal and the owner row's scope), with the robot's
+/// allow-from-cloud switch then set to `allow_cloud`. Returns the cloud
+/// device's key.
+fn claimed_authorizer_with_cloud_owner(
+    allow_cloud: bool,
+) -> (PairingAuthorizer, Fixtures, PublicKey) {
+    let (mut store, mut index, f) = build_claimed();
+    let intermediate = sk(2);
+    let int_cert = IntermediateCert {
+        version: FORMAT_VERSION,
+        intermediate_key: pk(&intermediate),
+        validity: wide(),
+        issued_at_ns: ISSUED,
+        max_scope: Scope::OWNER_FULL,
+    }
+    .sign_by_roots(&[&sk(1)]);
+    let cloud_device_key = pk(&sk(90));
+    let device_cert = DeviceCert {
+        version: FORMAT_VERSION,
+        device_key: cloud_device_key,
+        account: OWNER_ACCOUNT,
+        principal_kind: PrincipalKind::Cloud,
+        scope: Scope::OWNER_FULL,
+        // A cloud row expires at its certificate's `not_after`, and the
+        // authorizer reads the wall clock, so this certificate never expires.
+        validity: Validity {
+            not_before_ns: 0,
+            not_after_ns: u64::MAX,
+        },
+        issued_at_ns: ISSUED,
+        issuer_key: pk(&intermediate),
+    }
+    .sign(&intermediate);
+    store
+        .verify_owner_certificate(
+            &OwnerCertificatePresentationWire::new(int_cert, device_cert),
+            &cloud_device_key,
+            T_NOW,
+        )
+        .expect("the owner's cloud device certificate is admitted while the switch is ON");
+    index.bind(cloud_device_key, OWNER_ACCOUNT);
+    store
+        .set_allow_cloud(&OWNER_ACCOUNT, allow_cloud)
+        .expect("the owner sets the allow-from-cloud switch");
+    (PairingAuthorizer::new(store, index), f, cloud_device_key)
 }
 
 struct Fixtures {
@@ -624,6 +701,182 @@ fn act_verbs_follow_the_teleop_and_observe_rows() {
         authz.authorize_verb(&teleop_operator, TOPIC_ECHO_ONCE),
         "lacks the requirement",
         "operator-teleop topic-echo-once (CAP_OBSERVE missing)",
+    );
+}
+
+// ── The e-stop clear and read rows ──────────────────────────────────────────
+
+#[test]
+fn clear_estop_follows_the_operator_row() {
+    let (authz, f) = claimed_authorizer();
+    assert_allow(
+        authz.authorize_verb(&caller_for(&f.owner_device_key), verbs::CLEAR_ESTOP),
+        "owner clear-estop",
+    );
+    assert_allow(
+        authz.authorize_verb(&caller_for(&f.operator_device_key), verbs::CLEAR_ESTOP),
+        "operator-no-caps clear-estop (no capability is required)",
+    );
+    assert_deny(
+        authz.authorize_verb(&caller_for(&f.viewer_device_key), verbs::CLEAR_ESTOP),
+        "lacks the requirement for verb 'clear-estop'",
+        "viewer clear-estop (role value 3 > 2)",
+    );
+    assert_deny(
+        authz.authorize_verb(&caller_for(&f.unpaired_device_key), verbs::CLEAR_ESTOP),
+        "unpaired",
+        "unpaired clear-estop",
+    );
+    assert_deny(
+        authz.authorize_verb(&CallerIdentity::local_dev(), verbs::CLEAR_ESTOP),
+        "not transport-authenticated",
+        "unauthenticated clear-estop",
+    );
+
+    // A machine principal is not a cloud principal: an operator row whose
+    // certificate chain names `Machine` passes.
+    let (mut store, mut index, _) = build_claimed();
+    let machine_account = AccountId([50; 32]);
+    let machine = establish_via_chain_as(
+        &mut store,
+        &sk(1),
+        &sk(2),
+        RobotId([5; 32]),
+        machine_account,
+        &sk(51),
+        Scope {
+            role: Role::OPERATOR,
+            caps: 0,
+        },
+        "operator-machine",
+        PrincipalKind::Machine,
+    );
+    index.bind(machine, machine_account);
+    let machine_authz = PairingAuthorizer::new(store, index);
+    let (_, _, row) = machine_authz.shared().snapshot_row_for_key(&machine.0);
+    assert_eq!(
+        row.map(|row| row.principal_kind),
+        Some(PrincipalKind::Machine),
+        "the fixture's row names the machine principal"
+    );
+    assert_allow(
+        machine_authz.authorize_verb(&caller_for(&machine), verbs::CLEAR_ESTOP),
+        "machine operator clear-estop",
+    );
+
+    let (revoked, rf) = claimed_authorizer_viewer_revoked();
+    assert_deny(
+        revoked.authorize_verb(&caller_for(&rf.viewer_device_key), verbs::CLEAR_ESTOP),
+        "not on the access list",
+        "owner-revoked clear-estop",
+    );
+    let (cut, cf) = claimed_authorizer_viewer_device_revoked();
+    assert_deny(
+        cut.authorize_verb(&caller_for(&cf.viewer_device_key), verbs::CLEAR_ESTOP),
+        "revoked by the current access-list epoch",
+        "epoch-revoked clear-estop",
+    );
+    assert_deny(
+        unclaimed_authorizer()
+            .authorize_verb(&caller_for(&PublicKey([123; 32])), verbs::CLEAR_ESTOP),
+        "UNCLAIMED",
+        "unclaimed clear-estop",
+    );
+}
+
+#[test]
+fn clear_estop_is_refused_to_a_cloud_principal_with_the_switch_on_or_off() {
+    use cerulion_remoted::act_verbs::TOPIC_PUBLISH;
+
+    // Switch ON: the cloud row is allowed, and only clear-estop refuses it.
+    let (authz, f, cloud) = claimed_authorizer_with_cloud_owner(true);
+    let (_, _, row) = authz.shared().snapshot_row_for_key(&cloud.0);
+    assert_eq!(
+        row.map(|row| row.principal_kind),
+        Some(PrincipalKind::Cloud),
+        "the fixture's row names the cloud principal"
+    );
+    let cloud = caller_for(&cloud);
+    assert_deny(
+        authz.authorize_verb(&cloud, verbs::CLEAR_ESTOP),
+        "verb 'clear-estop' refused: the e-stop is cleared only from a device that is not a \
+         cloud principal",
+        "cloud owner clear-estop, switch ON",
+    );
+    for verb in [verbs::RESTART, TOPIC_PUBLISH, verbs::ESTOP_STATUS] {
+        assert_allow(
+            authz.authorize_verb(&cloud, verb),
+            &format!("cloud owner {verb}, switch ON"),
+        );
+    }
+    assert_allow(
+        authz.authorize_verb(&caller_for(&f.owner_device_key), verbs::CLEAR_ESTOP),
+        "owner's own device clear-estop, switch ON",
+    );
+
+    // Switch OFF: the cloud row is refused for every verb, with the switch's reason.
+    let (authz, f, cloud) = claimed_authorizer_with_cloud_owner(false);
+    assert_deny(
+        authz.authorize_verb(&caller_for(&cloud), verbs::CLEAR_ESTOP),
+        "allow-from-cloud switch is off",
+        "cloud owner clear-estop, switch OFF",
+    );
+    assert_allow(
+        authz.authorize_verb(&caller_for(&f.owner_device_key), verbs::CLEAR_ESTOP),
+        "owner's own device clear-estop, switch OFF",
+    );
+}
+
+#[test]
+fn estop_status_follows_the_observe_row() {
+    let (authz, f) = claimed_authorizer();
+    assert_allow(
+        authz.authorize_verb(&caller_for(&f.owner_device_key), verbs::ESTOP_STATUS),
+        "owner estop-status",
+    );
+    assert_allow(
+        authz.authorize_verb(&caller_for(&f.viewer_device_key), verbs::ESTOP_STATUS),
+        "viewer estop-status",
+    );
+    assert_deny(
+        authz.authorize_verb(&caller_for(&f.operator_device_key), verbs::ESTOP_STATUS),
+        "lacks the requirement for verb 'estop-status'",
+        "operator-no-caps estop-status (CAP_OBSERVE missing)",
+    );
+    assert_deny(
+        authz.authorize_verb(&caller_for(&f.unpaired_device_key), verbs::ESTOP_STATUS),
+        "unpaired",
+        "unpaired estop-status",
+    );
+    let (revoked, rf) = claimed_authorizer_viewer_revoked();
+    assert_deny(
+        revoked.authorize_verb(&caller_for(&rf.viewer_device_key), verbs::ESTOP_STATUS),
+        "not on the access list",
+        "owner-revoked estop-status",
+    );
+    let (cut, cf) = claimed_authorizer_viewer_device_revoked();
+    assert_deny(
+        cut.authorize_verb(&caller_for(&cf.viewer_device_key), verbs::ESTOP_STATUS),
+        "revoked by the current access-list epoch",
+        "epoch-revoked estop-status",
+    );
+    assert_deny(
+        unclaimed_authorizer()
+            .authorize_verb(&caller_for(&PublicKey([123; 32])), verbs::ESTOP_STATUS),
+        "UNCLAIMED",
+        "unclaimed estop-status",
+    );
+
+    let (on, _, cloud) = claimed_authorizer_with_cloud_owner(true);
+    assert_allow(
+        on.authorize_verb(&caller_for(&cloud), verbs::ESTOP_STATUS),
+        "cloud owner estop-status, switch ON",
+    );
+    let (off, _, cloud) = claimed_authorizer_with_cloud_owner(false);
+    assert_deny(
+        off.authorize_verb(&caller_for(&cloud), verbs::ESTOP_STATUS),
+        "allow-from-cloud switch is off",
+        "cloud owner estop-status, switch OFF",
     );
 }
 
