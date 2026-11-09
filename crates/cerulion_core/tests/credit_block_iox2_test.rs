@@ -2193,7 +2193,7 @@ fn without_a_credit_binding_the_split_consumer_graph_is_refused_as_producer_less
         "this scheduler can only defer producers in THIS graph",
         "the partition split the producer away from this consumer and the plan carried no \
          cross-process credit word for the edge — one is minted only for a topic with \
-         exactly ONE in-graph producer and NO non-`block` consumers.",
+         exactly ONE in-graph producer.",
         "never switch to drop_oldest for that, it silently loses data",
     ] {
         assert!(

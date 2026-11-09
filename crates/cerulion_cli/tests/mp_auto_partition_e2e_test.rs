@@ -1988,9 +1988,9 @@ fn a_hand_written_split_of_a_multi_producer_block_edge_is_refused_pre_spawn() {
     // continuation indentation into the literal, and `cargo fmt` never
     // rewrites a string's contents).
     for sentence in [
-        "A SPLIT edge can carry that mirror in shared memory — a cross-process \
-         credit word — but only for a topic with exactly ONE in-graph producer and NO \
-         non-`block` consumers",
+        "A SPLIT edge can carry that mirror in shared memory",
+        "but only for a topic with exactly ONE in-graph \
+         producer, and topic",
         "Rewriting it to `drop_oldest` would silently LOSE data, so this is refused instead.",
         "Deleting the `process_groups:` block entirely also works",
     ] {
