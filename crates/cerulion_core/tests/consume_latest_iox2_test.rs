@@ -1037,6 +1037,7 @@ fn block_gap_runtime(
             backpressure: BackpressurePolicy::Block,
             expect_within_ms: None,
             consume: InputConsume::Latest,
+            accumulate: false,
         }],
         vec![],
     )
@@ -1083,6 +1084,7 @@ fn block_gap_runtime(
             inputs: vec![InputDef {
                 name: "tick".to_string(),
                 source: "pace/tick".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         },
