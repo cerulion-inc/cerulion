@@ -313,7 +313,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
         prefix: "p".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -328,7 +328,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -340,7 +340,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "laggard".to_string(),
@@ -1503,7 +1503,7 @@ fn inp(name: &str, source: &str) -> InputDef {
 
 fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),

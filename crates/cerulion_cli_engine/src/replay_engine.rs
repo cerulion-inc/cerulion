@@ -11528,10 +11528,11 @@ fn rank_step_targets(
 /// A rank with no entry here is one this function had nothing to plan from: its
 /// manifest could not be used, its census was declined, its bag carries no read
 /// record for the rank, or the bag states no staging rows at all (every pre-stamp
-/// bag). Each of those is a path the PASS already owns, with its own decline, its
-/// own warn and its own report field, and reproducing them here would be a second
-/// spelling of each; the pass plans for itself only in the no-rows case, where
-/// there was nothing to plan from before pass 0.
+/// bag, and the bag of a graph whose nodes have no input, which a fed replay
+/// feeds nothing). Each of those is a path the PASS already owns, with its own
+/// decline, its own warn and its own report field, and reproducing them here
+/// would be a second spelling of each; the pass plans for itself only in the
+/// no-rows case, where there was nothing to plan from before pass 0.
 // NINE arguments, every one a BAG or GRAPH fact this planning needs and none of
 // them derivable from another: the plans, the trace and its rank tables, the
 // graph config, the factories the declared node metadata is read from, the topic
@@ -11579,9 +11580,17 @@ fn plan_bag_side_admissions(
         }
         Err(_) => return Ok(BTreeMap::new()),
     };
+    // A graph whose nodes have no input wires no read stage on any rank, and the
+    // recorder writes staging rows only for a rank that wired one, so its bag
+    // states none and holds no read to place: nothing is planned and every pass
+    // feeds nothing. A graph with an input needs the rows.
+    let consumes = plans
+        .iter()
+        .any(|plan| !rank_consumed_edges(plan).is_empty());
     let rows =
         match (rims.per_edge, fed) {
             (Some(rows), _) => rows,
+            (None, Some(_)) if !consumes => return Ok(BTreeMap::new()),
             (None, Some(_)) => return Err(read_identity_refusal(
                 None,
                 "read_identity_unplanned",

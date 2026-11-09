@@ -28,7 +28,7 @@ use std::process::ExitCode;
 
 use clap::{ArgMatches, Command, CommandFactory};
 
-use cerulion_cli_engine::error::{render_user_error, CliResult};
+use cerulion_cli_engine::error::{render_user_error, CliError, CliResult};
 
 use crate::cli::{Cli, VerbLogClass};
 use crate::network_switch::{self, NetworkRefusal, SwitchEnv};
@@ -143,7 +143,10 @@ pub(crate) fn exit_code_of(result: CliResult<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", render_user_error(&e));
+            // The worker process already printed this verdict's `Error:` line.
+            if !matches!(e, CliError::WorkerNodeFatalAnnounced) {
+                eprintln!("Error: {}", render_user_error(&e));
+            }
             ExitCode::from(crate::cli_error_exit_code(&e))
         }
     }

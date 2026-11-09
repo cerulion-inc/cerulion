@@ -156,7 +156,7 @@ fn consumer_only_graph(prefix: &str) -> GraphConfig {
         identity: "ewf".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -182,7 +182,7 @@ fn producer_consumer_graph(prefix: &str, producer_type: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -197,7 +197,7 @@ fn producer_consumer_graph(prefix: &str, producer_type: &str) -> GraphConfig {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -812,7 +812,7 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
         prefix: "ewfe".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -827,7 +827,7 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

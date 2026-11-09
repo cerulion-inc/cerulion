@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use cerulion_cli_engine::graph_cmd::{
     network_env_kill, remote_network_suppressed, resolve_gateway_base_port, resolve_robot_identity,
     resolve_run_network, NetworkEnvKill, RunNetwork, TimeSource, GATEWAY_WELL_KNOWN_PORT,
-    NETWORK_OFF_LOCAL_ONLY_NOTICE, NETWORK_OFF_REDUNDANT_NOTICE,
+    KILL_SWITCH_SCOPE, NETWORK_OFF_LOCAL_ONLY_NOTICE, NETWORK_OFF_REDUNDANT_NOTICE,
 };
 use cerulion_core::graph::config::{GraphConfig, NetworkBlock, NetworkMode, NodeDef};
 use cerulion_core::transport::network::ZenohMode;
@@ -49,7 +49,7 @@ fn graph_with(network: Option<NetworkBlock>) -> GraphConfig {
         identity: "netgate".to_string(),
         prefix: "ng".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "n".to_string(),
@@ -95,6 +95,15 @@ fn egress_only_block() -> NetworkBlock {
 // Kill switch (`--network off` + the `CERULION_NETWORK=off` env knob).
 // ==========================================================================
 
+#[test]
+fn the_switch_says_it_covers_service_traffic_and_not_sign_in() {
+    assert_eq!(
+        KILL_SWITCH_SCOPE,
+        "the network kill switch keeps Cerulion service traffic off (robots, relays, hosted \
+         Cerulion services and telemetry); signing in to your account still works"
+    );
+}
+
 /// `--network off` + enabled block ⇒ `Off` AND the loud kill-switch warn.
 #[test]
 #[traced_test]
@@ -108,6 +117,10 @@ fn network_off_forces_off_and_warns() {
     ));
     assert!(!logs_contain("--network off"));
     assert!(logs_contain("will NOT cross the machine boundary"));
+    assert!(
+        logs_contain(KILL_SWITCH_SCOPE),
+        "the notice says what the switch covers"
+    );
 }
 
 /// `--network off` + no block + REAL clock ⇒
@@ -123,6 +136,7 @@ fn network_off_on_blockless_real_clock_confirms_suppression() {
         logs_contain(NETWORK_OFF_LOCAL_ONLY_NOTICE),
         "the blockless real-clock kill-switch must confirm it SUPPRESSED the permissive default"
     );
+    assert!(NETWORK_OFF_LOCAL_ONLY_NOTICE.ends_with(KILL_SWITCH_SCOPE));
     assert!(
         !logs_contain("redundant"),
         "the real-clock arm must not claim the flag was redundant"
@@ -203,6 +217,14 @@ fn env_knob_unrecognized_value_fails_closed_with_warn() {
         logs_contain("CERULION_NETWORK is set to an unrecognized value")
             && logs_contain("the only accepted value is `off`"),
         "the fail-closed arm must warn loudly, naming the accepted value"
+    );
+    // The fail-closed warn itself ends with the scope, not only the notice
+    // that follows it.
+    assert!(
+        logs_contain(&format!(
+            "restore the default network behavior; {KILL_SWITCH_SCOPE}"
+        )),
+        "the warn says what the switch covers"
     );
 }
 
@@ -412,7 +434,7 @@ fn node_run_temp_graph_shape_is_permissive() {
         identity: "__temp_talker".to_string(),
         prefix: "standalone".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "talker".to_string(),
@@ -447,7 +469,7 @@ fn ros_attach_bridge_graph_shape_is_permissive() {
     let mut config = graph_with(None);
     config.identity = "go2_bridge".to_string();
     config.nodes.push(NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "viz".to_string(),
@@ -706,6 +728,14 @@ fn remote_network_suppressed_honors_the_kill_switch_and_warns_on_garbage() {
     assert!(remote_network_suppressed());
     // The fail-closed warn names the offending value.
     assert!(logs_contain("unrecognized value") && logs_contain("yes-please"));
+    // The fail-closed warn itself ends with the scope, not only the notice
+    // that follows it.
+    assert!(
+        logs_contain(&format!(
+            "restore the default network behavior; {KILL_SWITCH_SCOPE}"
+        )),
+        "the warn says what the switch covers"
+    );
 }
 
 // ─── The robot NETWORK IDENTITY resolver ────────────────────────────────

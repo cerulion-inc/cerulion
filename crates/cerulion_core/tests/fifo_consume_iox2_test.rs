@@ -101,7 +101,7 @@ fn burst_consumer_graph(
         identity: "fifo_consume".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -380,7 +380,7 @@ fn latest_value_context_inputs_keep_drain_to_latest() {
         identity: "fifo_ctx_control".to_string(),
         prefix: "fifoctx".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "reader".to_string(),
@@ -486,7 +486,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
         prefix: "fifoblk".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -501,7 +501,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -587,7 +587,7 @@ fn cdylib_data_trigger_forwards_a_burst_per_message_in_order() {
         identity: "fifo_cdylib_parity".to_string(),
         prefix: "fifodyl".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "node".to_string(),
@@ -697,7 +697,7 @@ fn a_throttled_data_trigger_consumer_loses_no_frames() {
         identity: "fifo_throttle".to_string(),
         prefix: "fifothr".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -795,7 +795,7 @@ fn a_collapsed_tick_does_not_wedge_the_input_and_the_backlog_survives() {
         identity: "fifo_collapse".to_string(),
         prefix: "fifocol".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),

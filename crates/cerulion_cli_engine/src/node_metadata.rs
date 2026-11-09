@@ -37,6 +37,14 @@ pub struct NodeMetadata {
     /// available to it. Dropping the parsed value here would leave the rule
     /// decidable in principle and never decided.
     pub throttle_ms: Option<u64>,
+    /// The node-level `tick_within_ms = N` tick deadline, when the type declares
+    /// one.
+    ///
+    /// Read from SOURCE for the executor-unit planning that runs before any node
+    /// library is loaded (`graph plan`, `--single-process`, a run's recorded
+    /// chain census): a merge whose summed p50 ticks reach a quarter of a
+    /// member's deadline is refused, as it is over the loaded libraries.
+    pub tick_within_ms: Option<u64>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
 }
@@ -100,6 +108,7 @@ impl NodeMetadata {
             node_type: node_type.to_string(),
             policy,
             throttle_ms: None,
+            tick_within_ms: None,
             inputs: vec![],
             outputs: vec![],
         }
@@ -657,6 +666,7 @@ fn try_parse_macro_node(source: &str, node_type: &str) -> CliResult<Option<NodeM
         node_type: node_type.to_string(),
         policy,
         throttle_ms: macro_attr.and_then(macro_attr_throttle_ms),
+        tick_within_ms: macro_attr.and_then(macro_attr_tick_within_ms),
         inputs,
         outputs,
     }))
@@ -799,6 +809,9 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         /// on an info block written before the key existed.
         #[serde(default)]
         throttle_ms: Option<u64>,
+        /// The node-level tick deadline. Absent on a node that declares none.
+        #[serde(default)]
+        tick_within_ms: Option<u64>,
     }
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
@@ -823,9 +836,11 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
     // which consumer read your info block would decide whether a typo is
     // visible at all. Same `unknown_key=` field name, so ONE grep finds both.
     //
-    // The legal set is the DOCUMENT's, not this parser's: `tick_within_ms`
-    // and `throttle_ms` are read by the runtime and merely not this
-    // consumer's business, so warning about them here would be wrong.
+    // The legal set is the DOCUMENT's: `tick_within_ms` and `throttle_ms` are
+    // envelope keys of the info block. The runtime reads both at load, and this
+    // parser reads both into `NodeMetadata` for the analysis that runs before
+    // any library is loaded (chain fusion reads `throttle_ms`, executor-unit
+    // planning reads `tick_within_ms`).
     const LEGAL_ENVELOPE_KEYS: &[&str] = &[
         "inputs",
         "outputs",
@@ -857,6 +872,7 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
     })?;
     let policy = info.policy.and_then(PolicyJson::into_macro_policy);
     let throttle_ms = info.throttle_ms;
+    let tick_within_ms = info.tick_within_ms;
     let (inputs, outputs) = (info.inputs, info.outputs);
     let mut port_schemas = match block.lines().map(str::trim).find_map(|line| {
         if line == PORT_SCHEMAS_MARKER.trim_end() {
@@ -930,6 +946,7 @@ fn try_parse_raw_ffi_node(source: &str, node_type: &str) -> CliResult<Option<Nod
         node_type: node_type.to_string(),
         policy,
         throttle_ms,
+        tick_within_ms,
         inputs,
         outputs,
     }))
@@ -2568,6 +2585,20 @@ fn macro_attr_to_policy(attr: &syn::Attribute) -> Option<MacroPolicy> {
 /// last one. Stopping at the first would let the report name a cap the node
 /// does not have.
 fn macro_attr_throttle_ms(attr: &syn::Attribute) -> Option<u64> {
+    macro_attr_last_u64(attr, "throttle_ms")
+}
+
+/// Read the node-level `tick_within_ms = N` tick deadline off the
+/// `#[cerulion_node(...)]` attribute, or `None` when the node declares none.
+/// A repeated key reads as its last value, as the macro assigns each occurrence
+/// in sequence.
+fn macro_attr_tick_within_ms(attr: &syn::Attribute) -> Option<u64> {
+    macro_attr_last_u64(attr, "tick_within_ms")
+}
+
+/// The integer of the LAST `key = <literal>` in the attribute's argument list,
+/// or `None` when the key is absent.
+fn macro_attr_last_u64(attr: &syn::Attribute, key: &str) -> Option<u64> {
     let syn::Meta::List(meta_list) = &attr.meta else {
         return None;
     };
@@ -2578,7 +2609,7 @@ fn macro_attr_throttle_ms(attr: &syn::Attribute) -> Option<u64> {
         let TokenTree::Ident(ident) = &tokens[i] else {
             continue;
         };
-        if ident != "throttle_ms" || i + 2 >= tokens.len() {
+        if ident != key || i + 2 >= tokens.len() {
             continue;
         }
         if let (TokenTree::Punct(p), TokenTree::Literal(lit)) = (&tokens[i + 1], &tokens[i + 2]) {
@@ -2716,6 +2747,104 @@ struct CappedNode {
         let bare = capped.replace("#[cerulion_node(throttle_ms = 5)]", "#[cerulion_node]");
         let node_dir = write_node(&tmp, "bare", &bare);
         assert_eq!(parse_node_metadata(&node_dir).unwrap().throttle_ms, None);
+    }
+
+    /// A node-level tick deadline is read off the macro attribute, beside the
+    /// trigger policy and the rate cap it sits with.
+    ///
+    /// Executor-unit planning from source refuses a merge whose summed ticks
+    /// reach a quarter of a member's deadline, and it runs before any node
+    /// library is loaded, so a deadline this parser dropped would merge what the
+    /// planner over the loaded libraries splits.
+    #[test]
+    fn a_macro_nodes_tick_deadline_is_read_beside_its_policy() {
+        let tmp = TempDir::new().unwrap();
+        let declared = r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(tick_within_ms = 4)]
+#[derive(Default)]
+struct DeadlineNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#;
+        let node_dir = write_node(&tmp, "deadline", declared);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(metadata.tick_within_ms, Some(4));
+        assert_eq!(
+            metadata.policy,
+            Some(MacroPolicy::DataTrigger {
+                input_name: "inp".to_string()
+            }),
+            "the deadline does not replace the policy the trigger input synthesizes"
+        );
+
+        let spelled = declared.replace(
+            "tick_within_ms = 4",
+            "sync_window_ms = 25, throttle_ms = 7, tick_within_ms = 2_000u64",
+        );
+        let node_dir = write_node(&tmp, "spelled", &spelled);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(
+            (
+                metadata.tick_within_ms,
+                metadata.throttle_ms,
+                metadata.policy
+            ),
+            (
+                Some(2000),
+                Some(7),
+                Some(MacroPolicy::Sync { window_ms: 25 })
+            ),
+            "each node-level key reads as its own value"
+        );
+
+        let repeated = declared.replace(
+            "tick_within_ms = 4",
+            "tick_within_ms = 4, tick_within_ms = 9",
+        );
+        let node_dir = write_node(&tmp, "repeated", &repeated);
+        assert_eq!(
+            parse_node_metadata(&node_dir).unwrap().tick_within_ms,
+            Some(9),
+            "a repeated deadline reads as the value the compiled node carries"
+        );
+
+        let bare = declared.replace("#[cerulion_node(tick_within_ms = 4)]", "#[cerulion_node]");
+        let node_dir = write_node(&tmp, "bare", &bare);
+        assert_eq!(parse_node_metadata(&node_dir).unwrap().tick_within_ms, None);
+    }
+
+    /// A raw-FFI node's info block carries the same top-level `tick_within_ms`
+    /// key the runtime loader reads, and the source parser reads it too.
+    #[test]
+    fn a_raw_ffi_info_blocks_tick_deadline_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let src = r#"
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[{\"name\":\"inp\",\"trigger\":true}],\"outputs\":[\"out\"],\"tick_within_ms\":7,\"throttle_ms\":3}\0";
+
+#[no_mangle]
+pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
+    INFO_BYTES.as_ptr() as *const std::ffi::c_char
+}
+// CERULION:INFO_END
+"#;
+        let node_dir = write_node(&tmp, "rawdeadline", src);
+        let metadata = parse_node_metadata(&node_dir).unwrap();
+        assert_eq!(
+            (metadata.tick_within_ms, metadata.throttle_ms),
+            (Some(7), Some(3))
+        );
+
+        let bare = src.replace(",\\\"tick_within_ms\\\":7", "");
+        assert_ne!(bare, src, "the bare variant drops the key");
+        let node_dir = write_node(&tmp, "rawbare", &bare);
+        assert_eq!(parse_node_metadata(&node_dir).unwrap().tick_within_ms, None);
     }
 
     #[test]

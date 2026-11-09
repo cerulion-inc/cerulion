@@ -116,6 +116,17 @@ network kill switch is engaged: `CERULION_NETWORK` set to `off` or to any
 other value that is not blank (which fails closed), or a command run with
 `--network off` (on `cerulion connect` and `cerulion rcp`, any `--network`
 value that is not blank) or with `--local` on `graph run` and `node run`.
+A vizd daemon started while `CERULION_NETWORK` or its own
+`CERULION_VIZD_NETWORK` is set to a value that is not blank sends no
+`vizd_started` and no heartbeat, and `cerulion viz` starts it with
+`CERULION_NETWORK=off` under the switch. That stops its telemetry only: its
+network plane reads `CERULION_VIZD_NETWORK` alone. A daemon already running
+keeps the setting it started with; `cerulion viz` says so when it reuses one
+under the switch, and `cerulion telemetry off` stops its heartbeats. The
+switch covers Cerulion service traffic (robots, relays, hosted Cerulion
+services and telemetry); signing in to your account is not covered, so a
+first login under it still contacts the account service, and the next run
+that sends makes the join described above.
 
 ## The first-run notice
 

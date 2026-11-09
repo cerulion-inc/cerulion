@@ -13,11 +13,16 @@ zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
 **What ships today.** The lease, deadman and e-stop state machine, and the
 remote `engage-estop` verb. Engaging the e-stop records the engaged state and
-its engager; it does not stop motion by itself, and the state is held in the
-daemon's memory, so a daemon restart clears it, and nothing else does. Nothing
-outside the daemon can read that state yet: an `engage-estop` returns a reply
-to the caller, writes a warning to the log, and asks Flashback to save a
-recording; an `estop` over the rcp plane engages the latch without that ask.
+its engager and sends an `estop` to the robot's `cerulion-rcpd`, again until
+rcpd answers, which closes rcpd's own latch and publishes an e-stop frame to
+the graph; neither stops motion by itself. The engaged state is held in the daemon's memory, so a
+daemon restart clears it, and nothing else does; rcpd's latch, once that
+`estop` closed it, clears only through its `estop_clear` or by deleting its
+latch file and restarting rcpd.
+Nothing outside the daemon can read that state yet: an `engage-estop` returns
+a reply to the caller, writes a warning to the log, sends that `estop` and
+asks Flashback to save a recording; an `estop` over the rcp plane engages the
+latch without that ask.
 It is the one e-stop latch the ops act verbs and the `cerulion/rcp/1` plane
 obey: while it is engaged, the ops act verbs `topic-publish` and
 `service-call` and every tool call over the `cerulion/rcp/1` plane except
@@ -26,10 +31,12 @@ obey: while it is engaged, the ops act verbs `topic-publish` and
 does not read it, and neither does LAN ingress. An `engage-estop`
 refuses each rcp tool call other than `estop` that the plane has not yet sent
 to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
-rcpd just before each send), but does not reach rcpd, so a tool call sent to
-rcpd before it still runs; an `estop` over the rcp plane also closes rcpd's
-own latch, which refuses the calls rcpd has not yet published. A robot still needs its own stop path (a hardwired
-e-stop) to stop motion. Only the `cerulion-remoted` daemon serves
+rcpd just before each send), then sends an `estop` to rcpd without waiting
+for it, and sends it again while rcpd is not reachable or answers with an
+error, logging the failure, until rcpd answers that its latch closed. That
+latch then refuses the mutating calls rcpd holds and has not yet published;
+an `estop` over the rcp plane closes rcpd's own latch too. A robot still needs its own stop path (a hardwired e-stop) to
+stop motion. Only the `cerulion-remoted` daemon serves
 `engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
 `topic-snapshot`, `topic-echo-once`) and the `cerulion/rcp/1` plane: a process
 that hosts the remote plane as a library refuses each of those verbs with an

@@ -22,20 +22,25 @@
 //!    engine-side pins call `prepare_recording_inputs` directly and so cannot
 //!    see the supervisor handing it the wrong config.
 //!
-//!    - *(1b) the control + the monolith half* - `--single-process
-//!      --record` on the same unpartitioned graph (written with NO `prefix:`
-//!      line) embeds a graph with NO `process_groups:`, because that is what it
-//!      ran; and its prefix - absent on disk, resolved at run time - is the one
-//!      every recorded channel is named under. Covers `run_graph_recording`,
-//!      the path arm 1 does not reach.
+//!    - *(1b) the control + the monolith half*: `--single-process
+//!      --record` on the same unpartitioned chain, one executor unit with no
+//!      profile (and with NO `prefix:` line), embeds a graph with NO `process_groups:`,
+//!      because that is what it ran; and its prefix, absent on disk and
+//!      resolved at run time, is the one every recorded channel is named
+//!      under. Covers `run_graph_recording`, the path arm 1 does not reach.
 //! 2. **Persist then respect** — `cerulion graph partition apdemo --yes`
 //!    writes the block (re-parse == the derived groups; `.bak` carries the
 //!    original bytes), and a second `graph run` RESPECTS it: supervisor GO
 //!    breadcrumb present, NO auto-partition notice of any kind (the absence
 //!    pin — a persisted partition must not re-derive or re-notice).
-//! 3. **The opt-out** - `graph run --single-process` on the unpartitioned
-//!    twin runs the MONOLITH: zero `run-worker` children across the window,
-//!    no GO breadcrumb, the skip notice present, file untouched.
+//! 3. **The opt-out**: `graph run --single-process` on the unpartitioned
+//!    twin, one executor unit with no profile, runs the MONOLITH: zero
+//!    `run-worker` children across the window, no GO breadcrumb, the skip
+//!    notice present, file untouched. *(3b)* On the twin whose `relay` and
+//!    `sink` declare `isolate: true`, three units, ONE `run-worker` child
+//!    hosts every unit across the window, nothing is derived, the skip notice
+//!    is present, and the bag embeds one process group holding every node,
+//!    with one rank per unit.
 //!
 //! Harness cribs `mp_record_e2e_test.rs` (tempdir workspace, PREBUILT fixture
 //! cdylibs — no in-test cargo build, redirected child logs, bounded waits,
@@ -344,6 +349,28 @@ fn build_unpartitioned_workspace(root: &Path, prefix: &str) -> String {
 /// NAMES every recorded channel.
 fn build_unpartitioned_workspace_opt_prefix(root: &Path, prefix: Option<&str>) -> String {
     build_workspace_with_sink(root, prefix, "test_node_macro_data_trigger_cdylib")
+}
+
+/// The same unpartitioned chain with `relay` and `sink` declared
+/// `isolate: true`, so each runs in an executor unit of its own and the three
+/// nodes are THREE units. `--single-process` on the real clock hosts them in
+/// one worker process; the chain as written has no profile, so it is one unit,
+/// which `--single-process` runs in the `graph run` process as one level loop.
+fn build_three_unit_workspace(root: &Path, prefix: &str) -> String {
+    let one_unit = build_unpartitioned_workspace(root, prefix);
+    let mut yaml = one_unit.clone();
+    for node in ["relay", "sink"] {
+        let entry = format!("  type: {node}\n");
+        assert_eq!(
+            yaml.matches(&entry).count(),
+            1,
+            "precondition: the chain declares `{node}` once"
+        );
+        yaml = yaml.replace(&entry, &format!("{entry}  isolate: true\n"));
+    }
+    assert_ne!(yaml, one_unit, "the isolate lines landed");
+    std::fs::write(root.join("graphs/apdemo.yaml"), &yaml).unwrap();
+    yaml
 }
 
 /// The same 3-node chain with the `sink` node TYPE staged from a
@@ -675,6 +702,12 @@ fn has_field(log: &str, field: &str) -> bool {
 }
 
 const GO_MARKER: &str = "GO signaled; deployment live";
+/// `--single-process` on a graph that is one executor unit (no profile and no
+/// `isolate: true`): the nodes run in the `graph run` process as one level loop.
+const MONOLITH_NOTICE_MARKER: &str = "running the single-process monolith";
+/// What every `--single-process` run of a graph with no `process_groups:`
+/// says, whichever process its nodes run in.
+const SKIPPED_DEFAULT_MARKER: &str = "the multi-process auto-partition default is skipped";
 
 /// (1) The LITERAL default on a no-TTY run: in-memory mp floor + real
 /// supervisor/workers + the mp recording of the DERIVED split.
@@ -879,8 +912,9 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 }
 
 /// (1b) The CONTROL + the MONOLITH half: a `--single-process --record` run
-/// of the SAME unpartitioned graph must embed a graph with NO `process_groups:`
-/// - because that is what it EXECUTED.
+/// of the same unpartitioned chain, ONE executor unit (no profile and no
+/// `isolate: true`), must embed a graph with NO `process_groups:`, because
+/// that is what it EXECUTED: one level loop in the `graph run` process.
 ///
 /// Two things this arm does that (1) cannot:
 ///
@@ -891,6 +925,9 @@ fn no_tty_default_derives_in_memory_mp_and_records_mp_shaped() {
 ///   `start_supervisor_recording`; this exercises `run_graph_recording`, whose
 ///   config is CLONED before being moved into the runtime build. Nothing in (1)
 ///   would notice that clone going stale or being taken from the wrong value.
+///   The chain is one unit because a `--single-process` graph of several units
+///   records through `start_supervisor_recording` too, from its one worker
+///   process; (3b) pins that embed.
 ///
 /// It also carries the prefix divergence end-to-end: the graph file is written with
 /// NO `prefix:` line, so the embed's prefix can only have come from the run's
@@ -943,6 +980,10 @@ fn a_single_process_record_embeds_the_unpartitioned_graph_it_actually_ran() {
     );
     // It really was the monolith: no supervisor deployment went live.
     let log = merged_log(&stdout_path, &stderr_path);
+    assert!(
+        log.contains(MONOLITH_NOTICE_MARKER),
+        "--single-process on a graph that is one unit announces the monolith; log:\n{log}"
+    );
     assert!(
         !log.contains(GO_MARKER),
         "--single-process must NOT reach the supervisor; log:\n{log}"
@@ -1069,8 +1110,9 @@ fn partition_yes_persists_then_run_respects_without_notice() {
     );
 }
 
-/// (3) `--single-process` on the unpartitioned twin = the plain monolith:
-/// no derivation, no workers, no GO.
+/// (3) `--single-process` on the unpartitioned twin, one executor unit (no
+/// profile and no `isolate: true`) = the plain monolith: no derivation, no
+/// workers, no GO. (3b) runs the twin that is three units.
 #[test]
 #[serial]
 fn single_process_opt_out_runs_monolith_with_no_workers() {
@@ -1083,12 +1125,8 @@ fn single_process_opt_out_runs_monolith_with_no_workers() {
     // `tracing::info!` → STDERR (init_logging writes there so stdout stays clean
     // data) — poll stderr primary, short stdout fallback.
     assert!(
-        wait_for_log(&stderr_path, "running the single-process monolith", Duration::from_secs(60))
-            || wait_for_log(
-                &stdout_path,
-                "running the single-process monolith",
-                Duration::from_secs(1)
-            ),
+        wait_for_log(&stderr_path, MONOLITH_NOTICE_MARKER, Duration::from_secs(60))
+            || wait_for_log(&stdout_path, MONOLITH_NOTICE_MARKER, Duration::from_secs(1)),
         "--single-process must announce the skipped auto-partition default;\nstdout:\n{}\nstderr:\n{}",
         read_file(&stdout_path),
         read_file(&stderr_path)
@@ -1117,6 +1155,10 @@ fn single_process_opt_out_runs_monolith_with_no_workers() {
 
     let log = merged_log(&stdout_path, &stderr_path);
     assert!(
+        log.contains(SKIPPED_DEFAULT_MARKER),
+        "the monolith notice names the skipped auto-partition default; log:\n{log}"
+    );
+    assert!(
         !log.contains(GO_MARKER),
         "the monolith never runs the supervisor GO; log:\n{log}"
     );
@@ -1128,6 +1170,162 @@ fn single_process_opt_out_runs_monolith_with_no_workers() {
         std::fs::read_to_string(tmp.path().join("graphs/apdemo.yaml")).expect("readable"),
         original_yaml,
         "the opt-out run never touches the file"
+    );
+}
+
+/// (3b) `--single-process` on the unpartitioned twin whose `relay` and `sink`
+/// declare `isolate: true`, which is three executor units (each isolated node a
+/// unit of its own, `ticker` the process's remaining one): the
+/// three units run in ONE worker process beside `graph run`, and no other
+/// worker starts. The opt-out still derives nothing and still says the
+/// auto-partition default is skipped, and the recording embeds what ran: one
+/// process group holding every node, with one rank per unit plus the
+/// supervisor's departure ring, stamped `free_run`.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn single_process_opt_out_hosts_every_unit_in_one_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let original_yaml = build_three_unit_workspace(tmp.path(), "apdu");
+    assert!(
+        !original_yaml.contains("process_groups")
+            && original_yaml.matches("isolate: true").count() == 2,
+        "precondition: no declared groups, and `isolate: true` on relay and sink alone"
+    );
+    assert!(
+        !tmp.path().join("graphs/apdemo.costs.yaml").exists(),
+        "precondition: no profile, so the units come from the isolate keys alone"
+    );
+    let (mut guard, stdout_path, stderr_path) =
+        spawn_graph_run(tmp.path(), &["--single-process", "--record=recordings"]);
+    let bagd_guard = BagdGuard::for_recording(guard.0.id(), tmp.path(), &stdout_path, &stderr_path);
+    let sup_pid = guard.0.id();
+
+    let recordings = tmp.path().join("recordings");
+    let bag =
+        wait_for_bag(&recordings, Duration::from_secs(90), &bagd_guard).unwrap_or_else(|| {
+            panic!(
+                "bagd never created the bag (single-process bring-up failed?)\nstdout:\n{}\n\
+             stderr:\n{}",
+                read_file(&stdout_path),
+                read_file(&stderr_path)
+            )
+        });
+    let workers = wait_for_workers(sup_pid, 1, Duration::from_secs(60));
+    assert_eq!(
+        workers.len(),
+        1,
+        "one worker process hosts every unit of a --single-process run, observed {workers:?}\n\
+         stdout:\n{}\nstderr:\n{}",
+        read_file(&stdout_path),
+        read_file(&stderr_path)
+    );
+    wait_for_bag_state(
+        &bag,
+        "all three units' boundary streams and the ticker's frames",
+        RECORDED_WINDOW_TIMEOUT,
+        |snap| {
+            (0..3).all(|rank| snap.boundaries_for_rank(rank) >= RECORDED_WINDOW_BOUNDARIES)
+                && snap.frames_on("/apdu/ticker/cmd") > 0
+        },
+    );
+    // Across a 3s window of the live run: that worker and no other.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let pids = worker_pids(sup_pid);
+        assert_eq!(
+            pids, workers,
+            "--single-process starts no second worker process, observed {pids:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = bagd_guard.pids(); // retain the owned recorder before reaping the parent
+    send_sigint(sup_pid);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(90))
+        .expect("the single-process run did not exit after SIGINT");
+    assert!(
+        status.success(),
+        "the single-process run must exit 0 on Ctrl-C, got {status:?}\nstdout:\n{}\nstderr:\n{}",
+        read_file(&stdout_path),
+        read_file(&stderr_path)
+    );
+
+    let log = merged_log(&stdout_path, &stderr_path);
+    assert!(
+        log.contains(SKIPPED_DEFAULT_MARKER),
+        "--single-process must announce the skipped auto-partition default; log:\n{log}"
+    );
+    assert!(
+        !log.contains(IN_MEMORY_NOTICE_MARKER),
+        "--single-process skips the derivation entirely, so no in-memory notice; log:\n{log}"
+    );
+    assert!(
+        !log.contains(MONOLITH_NOTICE_MARKER),
+        "a graph of three units does not run as one level loop; log:\n{log}"
+    );
+
+    let reader = BagReader::open(&bag).expect("open bag");
+    let (_msgs, completeness) = reader.recover_messages().expect("recover");
+    assert!(
+        completeness.is_finalized(),
+        "the single-process teardown must FINALIZE the bag, got {completeness:?}"
+    );
+    let ranks: Vec<Option<Vec<String>>> = (0..4).map(|r| read_manifest(&reader, r)).collect();
+    assert_eq!(
+        ranks,
+        vec![
+            Some(vec!["ticker".to_string()]),
+            Some(vec!["relay".to_string()]),
+            Some(vec!["sink".to_string()]),
+            None,
+        ],
+        "one rank per executor unit, and no fourth"
+    );
+    assert_eq!(
+        read_manifest(&reader, u32::MAX),
+        Some(Vec::new()),
+        "the supervisor's departure ring is recorded, as on any multi-process run"
+    );
+    let recorder: serde_json::Value = serde_json::from_slice(
+        &reader
+            .attachment("__cerulion/recorder.json")
+            .expect("read attachments")
+            .expect("__cerulion/recorder.json attachment present")
+            .data,
+    )
+    .expect("recorder.json parses as JSON");
+    assert_eq!(
+        recorder["coordination"], "free_run",
+        "the units free-run, so the bag stamps free_run rather than the monolith's lockstep: \
+         {recorder}"
+    );
+    let (embed_text, embedded) = read_embedded_graph(&reader);
+    let groups: Vec<(String, Vec<String>)> = embedded
+        .process_groups
+        .iter()
+        .map(|(g, ns)| (g.clone(), ns.clone()))
+        .collect();
+    assert_eq!(
+        groups,
+        vec![(
+            "apdemo".to_string(),
+            vec![
+                "ticker".to_string(),
+                "relay".to_string(),
+                "sink".to_string()
+            ]
+        )],
+        "the bag's graph is the one process the run executed, not the derived per-node split \
+         and not the file's absence of groups\n{embed_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("graphs/apdemo.yaml")).expect("readable"),
+        original_yaml,
+        "the opt-out run never touches the file"
+    );
+    assert!(
+        !tmp.path().join("graphs/apdemo.yaml.bak").exists(),
+        "no .bak on the opt-out path"
     );
 }
 

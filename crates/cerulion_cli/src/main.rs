@@ -428,7 +428,9 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
-        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        CliError::NodeFatal { .. }
+        | CliError::WorkerNodeFatal { .. }
+        | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
         _ => 1,
     }
 }
@@ -1940,6 +1942,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Plan { name } => {
+                    print!("{}", graph_cmd::graph_plan(&ws.root, &name)?);
+                    Ok(())
+                }
                 GraphAction::Levels { name } => {
                     // Levelization inspection. The engine
                     // returns the fully-rendered report; print it verbatim,
@@ -2139,7 +2145,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     // way `graph run` does. `running` forwards Ctrl+C so the
                     // worker's live loop stops cleanly on SIGINT.
                     let running = setup_ctrlc_handler()?;
-                    graph_cmd::graph_run_worker(&ws.root, &plan, running)
+                    graph_cmd::graph_run_worker_host(&ws.root, &plan, running)
                 }
                 GraphAction::RunGateway { handoff } => {
                     // Hidden verb: the network GATEWAY process of a
@@ -2266,6 +2272,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 &connect,
                 &listen,
                 detach,
+                network_switch::SwitchEnv::from_process().network_engaged(),
             )
         }
         // The explicit login verb. Runs the RFC 8628 device-code
@@ -2761,6 +2768,7 @@ fn run_viz(
     connect: &[String],
     listen: &[String],
     detach: bool,
+    network_off: bool,
 ) -> CliResult<()> {
     if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
         return Err(cerulion_cli_engine::error::CliError::Validation(
@@ -2769,7 +2777,7 @@ fn run_viz(
     }
     #[cfg(not(unix))]
     {
-        let _ = (running, topics, robot, connect, listen, detach);
+        let _ = (running, topics, robot, connect, listen, detach, network_off);
         Err(cerulion_cli_engine::error::CliError::Validation(
             "cerulion viz needs the cerulion-vizd daemon, which speaks over a Unix domain socket \
              and is not supported on this platform (Windows is a future target)"
@@ -2778,7 +2786,7 @@ fn run_viz(
     }
     #[cfg(unix)]
     {
-        run_viz_unix(running, topics, robot, connect, listen, detach)
+        run_viz_unix(running, topics, robot, connect, listen, detach, network_off)
     }
 }
 
@@ -2806,6 +2814,7 @@ fn run_viz_unix(
     connect: &[String],
     listen: &[String],
     detach: bool,
+    network_off: bool,
 ) -> CliResult<()> {
     use cerulion_cli_engine::error::CliError;
     use std::time::Duration;
@@ -2881,6 +2890,7 @@ fn run_viz_unix(
                 &log_for_spawn,
                 &connect_for_spawn,
                 &listen_for_spawn,
+                network_off,
             )?;
             println!("cerulion viz: started the cerulion-vizd daemon");
             Ok(())
@@ -2907,6 +2917,11 @@ fn run_viz_unix(
              keeps its boot-time locators. Restart it \
              (stop the daemon, then re-run) to bake in these locators."
         );
+    }
+    // A reused daemon keeps the telemetry setting it started with: say so
+    // under the switch.
+    if let Some(note) = viz_reused_daemon_switch_note(spawned, network_off) {
+        eprintln!("{note}");
     }
 
     // 2. Resolve the attach list (explicit shape validated above; the zero-arg
@@ -3922,6 +3937,24 @@ const VIZ_ROBOT_NEEDS_A_TOPIC: &str = concat!(
     "`/utlidar/cloud=sensor_msgs/PointCloud2`"
 );
 
+/// What `cerulion viz` prints when it reuses a `cerulion-vizd` it did not
+/// start while the network kill switch is engaged: the daemon reads the
+/// switch once, at start, so its telemetry keeps the setting it started with.
+#[cfg(unix)]
+const VIZ_REUSED_DAEMON_UNDER_SWITCH: &str =
+    "cerulion viz: note: the cerulion-vizd daemon was already running, so this command's \
+     network kill switch does not change it: it keeps the telemetry setting it started with. \
+     If it started without the switch, run `cerulion telemetry off` to stop its heartbeats, \
+     or stop the daemon and re-run to start it under the switch.";
+
+/// The note for a reused daemon under the switch, or `None`: `spawned` is
+/// whether this run started the daemon, `network_off` whether the switch is
+/// engaged. PURE.
+#[cfg(unix)]
+fn viz_reused_daemon_switch_note(spawned: bool, network_off: bool) -> Option<&'static str> {
+    (!spawned && network_off).then_some(VIZ_REUSED_DAEMON_UNDER_SWITCH)
+}
+
 /// The refusals of `cerulion viz` that `dispatch` gives BEFORE the kill switch
 /// and the identity gate: the platform's, when it cannot run the verb, then
 /// `--robot` with no TOPIC ([`VIZ_ROBOT_NEEDS_A_TOPIC`], which `run_viz` also
@@ -4132,7 +4165,7 @@ mod login_gate_exemption_tests {
     fn internal_subprocess_verbs_are_exempt() {
         assert!(!command_needs_identity(&Commands::Graph {
             action: GraphAction::RunWorker {
-                plan: PathBuf::from("plan.json"),
+                plan: vec![PathBuf::from("plan.json")],
             },
         }));
         assert!(!command_needs_identity(&Commands::Graph {
@@ -5324,9 +5357,37 @@ mod cli_error_exit_code_tests {
         };
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod viz_reused_daemon_switch_note_tests {
+    use super::{viz_reused_daemon_switch_note, VIZ_REUSED_DAEMON_UNDER_SWITCH};
+
+    #[test]
+    fn only_a_reused_daemon_under_the_switch_gets_the_note() {
+        assert_eq!(
+            viz_reused_daemon_switch_note(false, true),
+            Some(VIZ_REUSED_DAEMON_UNDER_SWITCH),
+            "a daemon this run reused, under the switch"
+        );
+        assert_eq!(
+            viz_reused_daemon_switch_note(true, true),
+            None,
+            "a daemon this run started"
+        );
+        assert_eq!(
+            viz_reused_daemon_switch_note(false, false),
+            None,
+            "no switch"
+        );
+        assert_eq!(viz_reused_daemon_switch_note(true, false), None);
+        assert!(VIZ_REUSED_DAEMON_UNDER_SWITCH.contains("telemetry"));
+        assert!(VIZ_REUSED_DAEMON_UNDER_SWITCH.contains("`cerulion telemetry off`"));
     }
 }

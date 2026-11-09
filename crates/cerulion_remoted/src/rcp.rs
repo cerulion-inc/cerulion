@@ -62,11 +62,45 @@
 //! ([`ESTOP_ENGAGED_REFUSAL`]), and `estop_clear` with
 //! [`ESTOP_CLEAR_REFUSAL`]; Session, Observe and Estop messages still pass.
 //! The latch is read when a desk's message arrives and again on the open
-//! connection to rcpd just before the plane sends it, so a tool call sent to
-//! rcpd before an ops `engage-estop`, including one rcpd holds behind the call
-//! it is running, still runs at rcpd, whose own latch only an `estop` message
-//! closes. The latch clears only when `cerulion-remoted` restarts. While it is
-//! clear, `estop_clear` reaches rcpd as any tool call does.
+//! connection to rcpd just before the plane sends it. rcpd's own latch closes
+//! on an `estop` tool call, so an ops `engage-estop` on the daemon also sends
+//! one into rcpd once it has engaged the latch, again until rcpd answers (see
+//! [the ops e-stop in rcpd](#the-ops-e-stop-in-rcpd)): rcpd then refuses each
+//! mutating call it holds and has not yet published, and the call it is
+//! running, already published, runs on. The latch clears only when
+//! `cerulion-remoted` restarts. While it is clear, `estop_clear` reaches rcpd
+//! as any tool call does.
+//!
+//! ## The ops e-stop in rcpd
+//!
+//! For each ops `engage-estop`, the daemon's `engage-estop` verb sends rcpd
+//! an [`ESTOP_TOOL`] call over the plane's [`RcpLink`] and sends it again
+//! until rcpd answers that its latch closed. The delivery runs on a task of
+//! its own, started after the latch is engaged; `engage-estop` answers
+//! without waiting for it, and its outcome changes neither the answer nor
+//! the latch.
+//!
+//! Each attempt opens an MCP session of its own: it reads the token file
+//! with its mode check, sends `initialize`, `notifications/initialized` and
+//! the `estop` call with the `reason` [`OPS_ESTOP_REASON`], each response head
+//! within [`RcpLimits::head_timeout`] and each answer within 10 s after it,
+//! and then deletes the session. [`CALLER_HEADER`] names the engager as
+//! [`caller_identity`] does, so rcpd receipts and journals the `estop` under
+//! the same identity as that desk's rcp calls. An attempt succeeds when the
+//! call's result says `"estopped": true`. It fails when rcpd is unreachable,
+//! the token file fails its check, rcpd answers with an error, an HTTP error
+//! status or a 404 for the session, the result does not say `estopped`, or
+//! no head or answer comes in time. After a failure the delivery waits
+//! 100 ms, twice as long after each further failure, at most 2 s, and tries
+//! again. The first failure is logged at error with its reason, then at most
+//! one line per 30 s with the attempt count; the closed latch is logged at
+//! warn. A delivery ends early, logged at warn, when the daemon stops.
+//!
+//! One delivery is in flight at a time: an engage while one is in flight
+//! starts none and logs that, since the delivery in flight sends until rcpd
+//! answers; an engage after it ended starts a new one. An `estop` over this
+//! plane reaches rcpd in its own stream and starts no delivery. A library
+//! host has no rcp link and refuses `engage-estop`.
 //!
 //! A request sent with rcpd's session id that rcpd answers with HTTP `404`
 //! (rcpd restarted and no longer knows the session) is answered with
@@ -106,6 +140,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -2040,6 +2075,455 @@ async fn delete_session(upstream: &Upstream) {
     }
 }
 
+/// The `reason` of the [`ESTOP_TOOL`] call an ops `engage-estop` sends to
+/// rcpd ([the ops e-stop in rcpd](self#the-ops-e-stop-in-rcpd)); rcpd puts it
+/// in the e-stop frame the graph receives.
+pub const OPS_ESTOP_REASON: &str = "the robot's ops e-stop was engaged (engage-estop)";
+
+/// The MCP protocol version an ops e-stop session offers rcpd.
+const OPS_ESTOP_PROTOCOL: &str = "2025-06-18";
+
+/// The JSON-RPC id of an ops e-stop session's `initialize`.
+const OPS_ESTOP_INITIALIZE_ID: i64 = 0;
+
+/// The JSON-RPC id of an ops e-stop session's [`ESTOP_TOOL`] call.
+const OPS_ESTOP_CALL_ID: i64 = 1;
+
+/// How long an ops e-stop session's answer may take once its response head
+/// is in: rcpd answers an `estop` once the graph acknowledges its frame, or
+/// after 2 s without that.
+const OPS_ESTOP_ANSWER: Duration = Duration::from_secs(10);
+
+/// How long an ops e-stop waits after its first failed attempt before the
+/// next; each later wait doubles, up to [`OPS_ESTOP_RETRY_CAP`].
+const OPS_ESTOP_RETRY_FIRST: Duration = Duration::from_millis(100);
+
+/// The longest wait between two attempts of an ops e-stop.
+const OPS_ESTOP_RETRY_CAP: Duration = Duration::from_secs(2);
+
+/// The least time between two error lines about the failed attempts of one
+/// ops e-stop; the first failure is always logged.
+const OPS_ESTOP_LOG_EVERY: Duration = Duration::from_secs(30);
+
+/// Where and within what bounds an ops e-stop reaches rcpd: one attempt's
+/// connection and response heads within `head_timeout`, each answer within
+/// `answer_timeout` after its head.
+#[derive(Debug, Clone)]
+struct EstopTarget {
+    addr: SocketAddr,
+    token_file: PathBuf,
+    head_timeout: Duration,
+    answer_timeout: Duration,
+}
+
+/// Sends the robot's rcpd an [`ESTOP_TOOL`] call for an ops `engage-estop`
+/// and sends it again until rcpd answers that its latch closed
+/// ([the ops e-stop in rcpd](self#the-ops-e-stop-in-rcpd)). One delivery runs
+/// at a time. The daemon builds one from its [`RcpLink`], and only its
+/// `engage-estop` verb holds it.
+pub(crate) struct RcpdEstop {
+    target: EstopTarget,
+    shared: SharedTrust,
+    runtime: tokio::runtime::Handle,
+    /// The wait after a delivery's first failed attempt.
+    retry_first: Duration,
+    /// The longest wait between two attempts.
+    retry_cap: Duration,
+    /// Set while a delivery runs; cleared by its [`InFlight`] guard.
+    in_flight: Arc<AtomicBool>,
+    /// `true` once the daemon stops; a delivery ends when it reads `true` or
+    /// this sender is dropped.
+    stop: watch::Sender<bool>,
+    /// The latest delivery's task, awaited by [`RcpdEstop::shut_down`].
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl RcpdEstop {
+    /// A sender to the rcpd of `link`, its attempts bounded by
+    /// [`RcpLimits::head_timeout`] and [`OPS_ESTOP_ANSWER`], that names each
+    /// engager's account from `shared` and runs each delivery on `runtime`.
+    pub(crate) fn new(
+        link: &RcpLink,
+        shared: SharedTrust,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            target: EstopTarget {
+                addr: link.addr,
+                token_file: link.token_file.clone(),
+                head_timeout: link.limits.head_timeout,
+                answer_timeout: OPS_ESTOP_ANSWER,
+            },
+            shared,
+            runtime,
+            retry_first: OPS_ESTOP_RETRY_FIRST,
+            retry_cap: OPS_ESTOP_RETRY_CAP,
+            in_flight: Arc::new(AtomicBool::new(false)),
+            stop: watch::channel(false).0,
+            task: Mutex::new(None),
+        }
+    }
+
+    /// Start delivering the `estop` for an engage by the device key
+    /// `engager` on a task of its own, and return at once: `true` when a
+    /// delivery started, `false` when one was in flight, which sends again
+    /// until rcpd answers, so this engage starts none. The task looks up the
+    /// engager's account and runs [`Delivery::run`].
+    pub(crate) fn send(&self, engager: &[u8; 32]) -> bool {
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::info!(
+                by = %hex::encode(engager),
+                "cerulion_remoted: an estop to rcpd is already in flight; this engage-estop \
+                 starts none"
+            );
+            return false;
+        }
+        let in_flight = InFlight(self.in_flight.clone());
+        let delivery = Delivery {
+            target: self.target.clone(),
+            shared: self.shared.clone(),
+            engager: *engager,
+            retry_first: self.retry_first,
+            retry_cap: self.retry_cap,
+            stop: self.stop.subscribe(),
+        };
+        let run = async move {
+            let _in_flight = in_flight;
+            delivery.run().await;
+        };
+        let task = self.runtime.spawn(run);
+        *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+        true
+    }
+
+    /// End the delivery in flight, if any: mark the daemon stopping, then wait
+    /// for the delivery's task, within [`CONNECT_TIMEOUT`]. A delivery that
+    /// rcpd had not answered logs that at warn.
+    pub(crate) async fn shut_down(&self) {
+        self.stop.send_replace(true);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, task).await;
+        }
+    }
+}
+
+/// Clears an [`RcpdEstop`]'s in-flight flag when dropped: when its delivery
+/// ends, and when the runtime drops its task.
+struct InFlight(Arc<AtomicBool>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// One ops e-stop on its way to rcpd: attempts of [`estop_rcpd`] until one
+/// returns `Ok`.
+struct Delivery {
+    target: EstopTarget,
+    shared: SharedTrust,
+    engager: [u8; 32],
+    retry_first: Duration,
+    retry_cap: Duration,
+    stop: watch::Receiver<bool>,
+}
+
+impl Delivery {
+    /// Attempt until rcpd answers that its latch closed, then log that at
+    /// warn. After a failed attempt it waits `retry_first`, then twice as
+    /// long after each further failure, up to `retry_cap`, and logs the
+    /// first failure at error and then at most one line per
+    /// [`OPS_ESTOP_LOG_EVERY`]. It ends early, with a warn line, when the
+    /// daemon stops.
+    async fn run(mut self) {
+        let mut attempts: u64 = 0;
+        let mut retry_in = self.retry_first;
+        let mut logged_at: Option<tokio::time::Instant> = None;
+        loop {
+            attempts += 1;
+            let caller = caller_identity(&self.engager, self.shared.account_for_key(&self.engager));
+            let attempt = tokio::select! {
+                outcome = estop_rcpd(&self.target, caller.clone()) => outcome,
+                () = stopping(&mut self.stop) => {
+                    stopped_before_rcpd_answered(&caller, attempts);
+                    return;
+                }
+            };
+            let reason = match attempt {
+                Ok(graph_acknowledged) => {
+                    tracing::warn!(
+                        by = %caller,
+                        attempts,
+                        graph_acknowledged,
+                        "cerulion_remoted: rcpd's e-stop latch closed by an ops engage-estop"
+                    );
+                    return;
+                }
+                Err(reason) => reason,
+            };
+            if logged_at.is_none_or(|at| at.elapsed() >= OPS_ESTOP_LOG_EVERY) {
+                tracing::error!(
+                    by = %caller,
+                    attempts,
+                    %reason,
+                    "cerulion_remoted: the estop an ops engage-estop sent to rcpd failed; the \
+                     ops e-stop stays engaged and the estop is sent again until rcpd answers"
+                );
+                logged_at = Some(tokio::time::Instant::now());
+            }
+            tokio::select! {
+                () = tokio::time::sleep(retry_in) => {}
+                () = stopping(&mut self.stop) => {
+                    stopped_before_rcpd_answered(&caller, attempts);
+                    return;
+                }
+            }
+            retry_in = retry_in.saturating_mul(2).min(self.retry_cap);
+        }
+    }
+}
+
+/// Resolves once `stop` reads `true` or its sender is dropped.
+async fn stopping(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopping| *stopping).await;
+}
+
+fn stopped_before_rcpd_answered(caller: &str, attempts: u64) {
+    tracing::warn!(
+        by = %caller,
+        attempts,
+        "cerulion_remoted: the daemon is stopping before rcpd answered the ops estop; \
+         rcpd's own latch may be open"
+    );
+}
+
+/// One attempt of an ops e-stop at `target`, as `caller`: the token from its
+/// token file ([`load_token`]), then `initialize`,
+/// `notifications/initialized` and the [`ESTOP_TOOL`] call with
+/// [`OPS_ESTOP_REASON`] on an MCP session of its own, each response head
+/// within the target's head timeout and each answer within its answer
+/// timeout after it, then a `DELETE` of the session rcpd issued. Returns
+/// whether the graph acknowledged the e-stop frame.
+///
+/// # Errors
+///
+/// Why the `estop` got no answer from rcpd, or rcpd's error answer, its text
+/// passed through `sanitize_peer_text`.
+async fn estop_rcpd(target: &EstopTarget, caller: String) -> Result<bool, String> {
+    let token = load_token(&target.token_file)?;
+    let upstream = Upstream {
+        addr: target.addr,
+        head_timeout: target.head_timeout,
+        token,
+        caller,
+        session_id: Mutex::new(None),
+        protocol: Mutex::new(None),
+        lost: Notify::new(),
+    };
+    let outcome = estop_session(&upstream, target.answer_timeout).await;
+    if upstream.session_id().is_some() {
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, delete_session(&upstream)).await;
+    }
+    outcome
+}
+
+/// The three messages of [`estop_rcpd`] on `upstream`, each answer within
+/// `answer_timeout` after its head.
+async fn estop_session(upstream: &Upstream, answer_timeout: Duration) -> Result<bool, String> {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": OPS_ESTOP_INITIALIZE_ID,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": OPS_ESTOP_PROTOCOL,
+            "capabilities": {},
+            "clientInfo": { "name": "cerulion-remoted", "version": env!("CARGO_PKG_VERSION") },
+        },
+    });
+    let answer = ops_estop_post(upstream, &initialize, answer_timeout)
+        .await?
+        .ok_or_else(|| "rcpd answered initialize with no body".to_string())?;
+    rpc_result(&answer, "initialize")?;
+    record_protocol(upstream, initialize.get("id"), &answer);
+    let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    ops_estop_post(upstream, &initialized, answer_timeout).await?;
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": OPS_ESTOP_CALL_ID,
+        "method": "tools/call",
+        "params": { "name": ESTOP_TOOL, "arguments": { "reason": OPS_ESTOP_REASON } },
+    });
+    let answer = ops_estop_post(upstream, &call, answer_timeout)
+        .await?
+        .ok_or_else(|| "rcpd answered the estop call with no body".to_string())?;
+    estop_outcome(&rpc_result(&answer, ESTOP_TOOL)?)
+}
+
+/// Whether the graph acknowledged the e-stop, from the result of rcpd's
+/// [`ESTOP_TOOL`] call, whose text block must say `"estopped": true`.
+///
+/// # Errors
+///
+/// A result with `isError: true`, or one whose text block does not say
+/// `"estopped": true`, its text passed through `sanitize_peer_text`.
+fn estop_outcome(result: &Value) -> Result<bool, String> {
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        return Err(format!(
+            "rcpd's estop answered an error: {}",
+            cerulion_wireclient::epoch::sanitize_peer_text(text)
+        ));
+    }
+    let body = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    if body.get("estopped") != Some(&Value::Bool(true)) {
+        return Err(format!(
+            "rcpd's estop answer does not say estopped: {}",
+            cerulion_wireclient::epoch::sanitize_peer_text(text)
+        ));
+    }
+    Ok(body.get("graph_acknowledged") == Some(&Value::Bool(true)))
+}
+
+/// The `result` of the JSON-RPC answer `answer` to `method`.
+///
+/// # Errors
+///
+/// An error answer, its message passed through `sanitize_peer_text`, or an
+/// answer with no `result`.
+fn rpc_result(answer: &[u8], method: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(answer)
+        .map_err(|e| format!("rcpd's answer to {method} is not JSON: {e}"))?;
+    if let Some(error) = value.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+        return Err(format!(
+            "rcpd answered {method} with error {code}: {}",
+            cerulion_wireclient::epoch::sanitize_peer_text(message)
+        ));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("rcpd's answer to {method} has no result"))
+}
+
+/// POST `message` on a fresh connection to rcpd, recording the session id an
+/// `initialize` is answered with. The connection and the response head are
+/// bounded by the session's head timeout ([`RcpLimits::head_timeout`]), the
+/// body by `answer_timeout`. Returns the JSON-RPC message answering a
+/// request, or `None` for a notification rcpd accepted.
+///
+/// # Errors
+///
+/// Why rcpd gave no answer: no connection, an HTTP error status, a lost
+/// session, a body cut off or past the relay bound, or no head or answer in
+/// time.
+async fn ops_estop_post(
+    upstream: &Upstream,
+    message: &Value,
+    answer_timeout: Duration,
+) -> Result<Option<Vec<u8>>, String> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let sent_session = upstream.session_id().is_some();
+    let request = upstream
+        .request(Method::POST, "application/json, text/event-stream")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(message.to_string())))
+        .map_err(|e| format!("cannot build the rcpd request: {e}"))?;
+    let head = async {
+        let mut sender = connect::<Full<Bytes>>(upstream.addr).await?;
+        sender
+            .send_request(request)
+            .await
+            .map_err(|e| format!("rcpd request failed: {e}"))
+    };
+    let response = tokio::time::timeout(upstream.head_timeout, head)
+        .await
+        .map_err(|_| {
+            format!(
+                "rcpd sent no response head to {method} within {:?}",
+                upstream.head_timeout
+            )
+        })??;
+    if method == "initialize" {
+        if let Some(sid) = header_text(&response, "mcp-session-id") {
+            *upstream
+                .session_id
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(sid);
+        }
+    }
+    let status = response.status();
+    if status == StatusCode::ACCEPTED {
+        return Ok(None);
+    }
+    if status == StatusCode::NOT_FOUND && sent_session {
+        return Err("rcpd lost the e-stop session (it restarted)".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("rcpd answered HTTP {status}"));
+    }
+    let Some(id) = message.get("id") else {
+        return Ok(None);
+    };
+    tokio::time::timeout(answer_timeout, answer_of(response, id))
+        .await
+        .map_err(|_| {
+            format!("rcpd did not finish its answer to {method} within {answer_timeout:?}")
+        })?
+        .map(Some)
+}
+
+/// The JSON-RPC message in `response`'s body that answers the request `id`,
+/// from a JSON body or any `data:` event of an SSE body, within
+/// [`MAX_RESPONSE_MESSAGE`].
+async fn answer_of(response: Response<Incoming>, id: &Value) -> Result<Vec<u8>, String> {
+    let sse = header_text(&response, CONTENT_TYPE.as_str())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    let mut body = response.into_body();
+    let mut events = SseBuffer::default();
+    let mut whole: Vec<u8> = Vec::new();
+    while let Some(next) = body.frame().await {
+        let frame = next.map_err(|e| format!("rcpd's answer was cut off: {e}"))?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if sse {
+            let messages = events
+                .push(&chunk)
+                .map_err(|()| "an event of rcpd's answer exceeded the relay bound".to_string())?;
+            if let Some(m) = messages.into_iter().find(|m| answers(Some(id), m)) {
+                return Ok(m);
+            }
+        } else {
+            if whole.len() + chunk.len() > MAX_RESPONSE_MESSAGE {
+                return Err("rcpd's answer exceeded the relay bound".to_string());
+            }
+            whole.extend_from_slice(&chunk);
+        }
+    }
+    if answers(Some(id), &whole) {
+        return Ok(whole);
+    }
+    Err("rcpd ended its answer without a response".to_string())
+}
+
 /// An incremental `text/event-stream` parser yielding each event's `data`.
 #[derive(Debug, Default)]
 pub struct SseBuffer {
@@ -2784,6 +3268,454 @@ mod tests {
             refusal,
             Ok(Some(ESTOP_ENGAGED_REFUSAL)),
             "an Act message was not refused while an e-stop engage was counted"
+        );
+    }
+
+    /// A provisioned robot's trust state with no device bound to an account.
+    fn bare_trust() -> SharedTrust {
+        use cerulion_pairing::format::{PublicKey, RobotId, RootSet};
+        let root = PublicKey(
+            ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let store = cerulion_pairing::verify::TrustStore::provision(
+            RobotId([5; 32]),
+            PublicKey([7; 32]),
+            RootSet::new(vec![root], 1).unwrap(),
+            b"rcp-unit-chassis-secret",
+            0,
+        )
+        .unwrap();
+        SharedTrust::new(store, crate::DeviceAccountIndex::new(), Vec::new())
+    }
+
+    /// A link to `addr` whose token file under `dir` has `mode`. Its head
+    /// timeout outlasts every bounded step, so a send that connected to a
+    /// stand-in that never answers is still in flight when a step ends.
+    fn link_to(dir: &Path, addr: SocketAddr, mode: u32) -> RcpLink {
+        let mut link = RcpLink::under(dir);
+        link.addr = addr;
+        link.limits.head_timeout = Duration::from_secs(3600);
+        std::fs::write(&link.token_file, "CERULION_RCP_TOKEN=unit-token\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&link.token_file, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        link
+    }
+
+    async fn within<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(20), fut)
+            .await
+            .unwrap_or_else(|_| panic!("'{what}' timed out"))
+    }
+
+    /// Wait until the delivery in flight on `rcpd` has ended.
+    async fn until_delivered(rcpd: &RcpdEstop) {
+        within("the delivery ends", async {
+            while rcpd.in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+    }
+
+    /// What the scripted rcpd does on a connection once it has read the
+    /// request on it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Turn {
+        /// Close the connection without a byte.
+        Close,
+        /// Write nothing until the stand-in's release, then close.
+        HoldUntilReleased,
+        /// Keep the connection open and write nothing.
+        Hold,
+        /// Write a `200` event-stream head with session id `s`, no body, and
+        /// keep the connection open.
+        HeadOnly,
+        /// Answer `404`, as rcpd answers a session id it does not know.
+        Lost,
+        /// Answer the request with a JSON-RPC error.
+        Error,
+        /// Answer as rcpd does.
+        Answer,
+    }
+
+    /// A loopback rcpd that plays `script` on its connections in order and
+    /// answers as rcpd does past it. Each request's kind (its JSON-RPC
+    /// method, or `DELETE`) and whole text go on the receiver as it is read.
+    struct ScriptedRcpd {
+        addr: SocketAddr,
+        requests: mpsc::UnboundedReceiver<(String, String)>,
+        release: Arc<Notify>,
+    }
+
+    impl ScriptedRcpd {
+        async fn start(script: Vec<Turn>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, requests) = mpsc::unbounded_channel();
+            let release = Arc::new(Notify::new());
+            let released = release.clone();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                let mut turns = script.into_iter();
+                while let Ok((mut conn, _)) = listener.accept().await {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let request = loop {
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                            let length = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                            if buf.len() >= end + 4 + length {
+                                break String::from_utf8_lossy(&buf).into_owned();
+                            }
+                        }
+                        match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break String::from_utf8_lossy(&buf).into_owned(),
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let body: Value = request
+                        .split("\r\n\r\n")
+                        .nth(1)
+                        .and_then(|b| serde_json::from_str(b).ok())
+                        .unwrap_or(Value::Null);
+                    let kind = if request.starts_with("DELETE ") {
+                        "DELETE".to_string()
+                    } else {
+                        body["method"].as_str().unwrap_or_default().to_string()
+                    };
+                    let _ = tx.send((kind.clone(), request));
+                    let json = |status: &str, extra: &str, answer: Value| {
+                        let text = answer.to_string();
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}\
+                             content-length: {}\r\nconnection: close\r\n\r\n{text}",
+                            text.len()
+                        )
+                    };
+                    let empty = |status: &str| {
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                    };
+                    let id = body["id"].clone();
+                    let reply = match turns.next().unwrap_or(Turn::Answer) {
+                        Turn::Close => None,
+                        Turn::HoldUntilReleased => {
+                            released.notified().await;
+                            None
+                        }
+                        Turn::Hold => {
+                            held.push(conn);
+                            continue;
+                        }
+                        Turn::HeadOnly => {
+                            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                        mcp-session-id: s\r\n\r\n";
+                            let _ = conn.write_all(head.as_bytes()).await;
+                            held.push(conn);
+                            continue;
+                        }
+                        Turn::Lost => Some(empty("404 Not Found")),
+                        Turn::Error => Some(json(
+                            "200 OK",
+                            "",
+                            json!({ "jsonrpc": "2.0", "id": id,
+                                    "error": { "code": -32603, "message": "unit error" } }),
+                        )),
+                        Turn::Answer if kind == "DELETE" => Some(empty("200 OK")),
+                        Turn::Answer if id.is_null() => Some(empty("202 Accepted")),
+                        Turn::Answer if kind == "initialize" => Some(json(
+                            "200 OK",
+                            "mcp-session-id: s\r\n",
+                            json!({ "jsonrpc": "2.0", "id": id,
+                                    "result": { "protocolVersion": "2025-06-18" } }),
+                        )),
+                        Turn::Answer => Some(json(
+                            "200 OK",
+                            "",
+                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{
+                                "type": "text",
+                                "text": r#"{"estopped":true,"graph_acknowledged":true}"#,
+                            }] } }),
+                        )),
+                    };
+                    if let Some(reply) = reply {
+                        let _ = conn.write_all(reply.as_bytes()).await;
+                    }
+                }
+            });
+            ScriptedRcpd {
+                addr,
+                requests,
+                release,
+            }
+        }
+
+        /// The kind and text of the next request rcpd reads.
+        async fn next(&mut self) -> (String, String) {
+            within("rcpd reads a request", self.requests.recv())
+                .await
+                .expect("the scripted rcpd runs")
+        }
+
+        /// The kinds of every request read so far and not taken.
+        fn kinds_so_far(&mut self) -> Vec<String> {
+            std::iter::from_fn(|| self.requests.try_recv().ok())
+                .map(|(kind, _)| kind)
+                .collect()
+        }
+    }
+
+    /// The kinds of one attempt rcpd answers in full.
+    ///
+    /// A function, not a `const`: the walk in `ci_doc_pin_walk_test` counts a
+    /// `tools/`-rooted literal in a `const` the source reads as a read of the
+    /// `tools` tree, and `tools/call` is a method name.
+    fn attempt() -> [&'static str; 4] {
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+            "DELETE",
+        ]
+    }
+
+    /// A sender to `rcpd` whose token file is under `dir`.
+    fn sender_to(dir: &Path, rcpd: SocketAddr) -> RcpdEstop {
+        let link = link_to(dir, rcpd, 0o600);
+        RcpdEstop::new(&link, bare_trust(), tokio::runtime::Handle::current())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ops_estop_that_fails_is_sent_again_with_no_new_engage() {
+        let dir = tempfile::tempdir().unwrap();
+        // rcpd here accepts each connection and never answers on it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rcpd = sender_to(dir.path(), listener.local_addr().unwrap());
+        assert!(rcpd.send(&[1; 32]), "the first engage starts a delivery");
+        let (held, _) = within("the estop connects", listener.accept())
+            .await
+            .unwrap();
+        assert!(
+            !rcpd.send(&[2; 32]),
+            "a second engage started a delivery while one was in flight"
+        );
+        // rcpd closes the connection: that attempt fails, and the delivery
+        // connects again with no new engage.
+        drop(held);
+        let (_again, _) = within("the estop connects again", listener.accept())
+            .await
+            .unwrap();
+        assert!(!rcpd.send(&[3; 32]), "the delivery ended after one failure");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_engage_during_a_failing_attempt_starts_nothing_and_the_estop_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in = ScriptedRcpd::start(vec![Turn::HoldUntilReleased]).await;
+        let rcpd = sender_to(dir.path(), stand_in.addr);
+        assert!(rcpd.send(&[1; 32]));
+        assert_eq!(stand_in.next().await.0, "initialize");
+        assert!(!rcpd.send(&[2; 32]), "the second engage started a delivery");
+        // The held attempt fails; the one delivery tries again and arrives.
+        stand_in.release.notify_one();
+        until_delivered(&rcpd).await;
+        let mut kinds = vec!["initialize".to_string()];
+        kinds.extend(stand_in.kinds_so_far());
+        assert_eq!(kinds, [&["initialize"][..], &attempt()[..]].concat());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ops_estop_answered_404_then_an_error_is_sent_until_rcpd_answers() {
+        use Turn::{Answer, Error, Lost};
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in =
+            ScriptedRcpd::start(vec![Answer, Answer, Lost, Answer, Answer, Answer, Error]).await;
+        let rcpd = sender_to(dir.path(), stand_in.addr);
+        assert!(rcpd.send(&[1; 32]));
+        until_delivered(&rcpd).await;
+        // Each attempt is a session of its own, deleted at its end.
+        assert_eq!(stand_in.kinds_so_far(), attempt().repeat(3));
+        assert!(rcpd.send(&[2; 32]), "the delivery did not free its place");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_wait_between_attempts_stops_growing_at_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sixteen failed attempts: doubling from 1 ms past a 1 ms cap would
+        // wait over 65 s in all.
+        let mut stand_in = ScriptedRcpd::start(vec![Turn::Close; 16]).await;
+        let mut rcpd = sender_to(dir.path(), stand_in.addr);
+        rcpd.retry_first = Duration::from_millis(1);
+        rcpd.retry_cap = Duration::from_millis(1);
+        assert!(rcpd.send(&[1; 32]));
+        until_delivered(&rcpd).await;
+        let kinds = stand_in.kinds_so_far();
+        assert_eq!(kinds.len(), 16 + attempt().len(), "{kinds:?}");
+        assert_eq!(kinds[16..], attempt(), "{kinds:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attempt_that_gets_no_head_ends_at_the_head_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in = ScriptedRcpd::start(vec![Turn::Hold]).await;
+        let mut rcpd = sender_to(dir.path(), stand_in.addr);
+        rcpd.target.head_timeout = Duration::from_millis(100);
+        assert!(rcpd.send(&[1; 32]));
+        assert_eq!(stand_in.next().await.0, "initialize");
+        // The first connection stays open with no head; the next attempt
+        // starts anyway.
+        assert_eq!(stand_in.next().await.0, "initialize");
+        until_delivered(&rcpd).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attempt_whose_answer_never_ends_stops_at_the_answer_bound_and_deletes_its_session()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in = ScriptedRcpd::start(vec![Turn::HeadOnly]).await;
+        let mut rcpd = sender_to(dir.path(), stand_in.addr);
+        rcpd.target.answer_timeout = Duration::from_millis(100);
+        assert!(rcpd.send(&[1; 32]));
+        assert_eq!(stand_in.next().await.0, "initialize");
+        let (kind, delete) = stand_in.next().await;
+        assert_eq!(kind, "DELETE", "{delete}");
+        assert!(delete.contains("mcp-session-id: s\r\n"), "{delete}");
+        assert_eq!(stand_in.next().await.0, "initialize");
+        until_delivered(&rcpd).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_rcpd_never_answers_ends_when_the_daemon_shuts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rcpd = sender_to(dir.path(), listener.local_addr().unwrap());
+        assert!(rcpd.send(&[1; 32]));
+        let (_held, _) = within("the estop connects", listener.accept())
+            .await
+            .unwrap();
+        within("the delivery stops", rcpd.shut_down()).await;
+        assert!(
+            !rcpd.in_flight.load(Ordering::Acquire),
+            "the delivery outlived the shutdown"
+        );
+    }
+
+    struct NoCapture;
+
+    impl crate::flashback::EstopCaptureAsk for NoCapture {
+        fn ask(&self, _by: &str) {}
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_engage_whose_rcpd_token_fails_its_check_engages_and_sends_once_it_passes() {
+        use cerud::transport::CallerIdentity;
+        use cerud::verbs::VerbHandler;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A token file its group can read fails the check.
+        let link = link_to(dir.path(), listener.local_addr().unwrap(), 0o640);
+        let lease = EstopLease::new(Arc::new(Mutex::new(ControlLease::new(1_000_000_000))));
+        let rcpd = Arc::new(RcpdEstop::new(
+            &link,
+            bare_trust(),
+            tokio::runtime::Handle::current(),
+        ));
+        let refused = estop_rcpd(&rcpd.target, "iroh:ab".into())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("has mode 640"), "{refused}");
+        let verb = crate::pairing_verbs::EngageEstopVerb::with_capture_ask(
+            lease.clone(),
+            Arc::new(NoCapture),
+        )
+        .with_rcpd_estop(rcpd.clone());
+        let engager = CallerIdentity::verified(hex::encode([7u8; 32]));
+        let answer = verb
+            .execute_with_caller(&engager, &json!({}))
+            .expect("the engage answers");
+        assert_eq!(answer["engaged"], json!(true), "{answer}");
+        assert_eq!(
+            lease.lock().unwrap().estop(),
+            &EstopState::Engaged {
+                by: hex::encode([7u8; 32])
+            }
+        );
+        // Once the file passes its check, the estop reaches rcpd with no
+        // second engage.
+        std::fs::set_permissions(&link.token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (_conn, _) = within("the estop reaches rcpd", listener.accept())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_the_daemon_given_an_rcp_link_sends_its_estop_to_rcpd() {
+        use crate::host::OpsHost;
+        let link = RcpLink::under(Path::new("unused-state-dir"));
+        let shared = bare_trust();
+        assert!(
+            matches!(
+                OpsHost::Embedded.with_rcpd_estop(Some(&link), &shared),
+                OpsHost::Embedded
+            ),
+            "a library host got an rcpd e-stop sender"
+        );
+        assert!(matches!(
+            OpsHost::daemon().with_rcpd_estop(None, &shared),
+            OpsHost::Daemon { rcpd: None, .. }
+        ));
+        let daemon = OpsHost::daemon().with_rcpd_estop(Some(&link), &shared);
+        assert!(
+            matches!(daemon, OpsHost::Daemon { rcpd: Some(_), .. }),
+            "the daemon with an rcp link sends no estop to rcpd"
+        );
+        assert!(daemon.rcpd_estop().is_some(), "the daemon cannot stop it");
+        assert!(OpsHost::Embedded.rcpd_estop().is_none());
+    }
+
+    #[test]
+    fn rcpds_error_text_is_sanitized_where_it_enters_the_reason() {
+        let answer =
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad\u001b[2Jcaller"}}"#;
+        assert_eq!(
+            rpc_result(answer, "estop"),
+            Err("rcpd answered estop with error -32602: bad\u{fffd}[2Jcaller".to_string())
+        );
+        let answer = br#"{"jsonrpc":"2.0","id":1,"result":{"isError":false}}"#;
+        assert_eq!(rpc_result(answer, "estop"), Ok(json!({ "isError": false })));
+        let refused = json!({ "isError": true,
+                              "content": [{ "type": "text", "text": "no\u{7}pe" }] });
+        assert_eq!(
+            estop_outcome(&refused),
+            Err("rcpd's estop answered an error: no\u{fffd}pe".to_string())
+        );
+        let answered = |body: &str| json!({ "content": [{ "type": "text", "text": body }] });
+        assert_eq!(
+            estop_outcome(&answered(r#"{"estopped":true,"graph_acknowledged":true}"#)),
+            Ok(true)
+        );
+        assert_eq!(
+            estop_outcome(&answered(r#"{"estopped":true,"graph_acknowledged":false}"#)),
+            Ok(false)
+        );
+        assert_eq!(
+            estop_outcome(&answered("not\u{1b}json")),
+            Err("rcpd's estop answer does not say estopped: not\u{fffd}json".to_string())
         );
     }
 }
