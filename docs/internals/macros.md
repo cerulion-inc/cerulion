@@ -214,7 +214,7 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 
 Return-code semantics (part of the ABI; the host and the replay verdicts classify on
 them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
-panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex is poisoned; `4`
+panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex or the instance's own lock is poisoned; `4`
 handle not found. The macros convert a user `NodeError` at the boundary with
 `NodeError::into_transport`, which keeps its kind; the `NodeErrorKind` wire codes are
 part of the same contract (never renumber one).

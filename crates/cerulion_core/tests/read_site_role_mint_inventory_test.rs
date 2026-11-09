@@ -101,14 +101,17 @@ const WALKED: [&str; 3] = [
 /// `a_non_improving_peek_is_marked_a_peek_not_the_head`.
 const DECLARED_LITERAL_MINTS: usize = 35;
 
-/// Calls that FORWARD a `role` parameter rather than naming one, all six in
-/// `subscriber.rs`: the two `stage_read_outcome*` helper bodies, and the four
-/// mints inside `drain_samples` (the two `DrainedBatch` mints, plus the two
-/// `NoFrame` mints the every-consult record added at the gate's withheld
-/// return and at a zero-delivery drain), which pass that function's own `role`
-/// parameter through to them. Every one of those six is reached only from a
-/// site this walk ALSO checks, so the chain bottoms out in a literal.
-const DECLARED_FORWARDING_MINTS: usize = 6;
+/// Calls that FORWARD a `role` parameter rather than naming one, all eight in
+/// `subscriber.rs`: the two `stage_read_outcome*` helper bodies, the two
+/// `BatchFrame` mints inside `stage_batch_frames` (the plain and the
+/// producer-annotated arm, `trace_format` 9), which that function reaches only
+/// from those two helper bodies with their `role`, and the four mints inside
+/// `drain_samples` (the two `DrainedBatch` mints, plus the two `NoFrame` mints
+/// the every-consult record added at the gate's withheld return and at a
+/// zero-delivery drain), which pass that function's own `role` parameter
+/// through to them. Every one of those eight is reached only from a site this
+/// walk ALSO checks, so the chain bottoms out in a literal.
+const DECLARED_FORWARDING_MINTS: usize = 8;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

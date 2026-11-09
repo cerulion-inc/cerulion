@@ -404,7 +404,9 @@ pub enum Commands {
         /// Disable all relays (LAN / direct-dial only).
         #[arg(long)]
         relay_disabled: bool,
-        /// Kill-switch: pass `off` to refuse to connect.
+        /// Network kill switch: `off` refuses to connect. The switch keeps
+        /// Cerulion service traffic off (robots, relays, hosted Cerulion
+        /// services and telemetry); signing in to your account still works.
         #[arg(long)]
         network: Option<String>,
     },
@@ -702,6 +704,7 @@ impl Commands {
                 | GraphAction::Validate { .. }
                 | GraphAction::List
                 | GraphAction::Levels { .. }
+                | GraphAction::Plan { .. }
                 | GraphAction::Partition { .. }
                 | GraphAction::Pause { .. }
                 | GraphAction::Resume { .. } => OneShot,
@@ -1349,12 +1352,16 @@ pub enum NodeAction {
         no_monitor_wait: bool,
         /// Keep this run on this machine: no network gateway, session,
         /// egress or ingress. Equivalent to `--network off`; the environment
-        /// kill-switch remains honored with or without this flag.
+        /// kill-switch remains honored with or without this flag. The switch
+        /// keeps Cerulion service traffic off (robots, relays, hosted Cerulion
+        /// services and telemetry); signing in to your account still works.
         #[arg(long)]
         local: bool,
         /// Network kill-switch, the same as `graph run --network off`. The only
         /// accepted value is `off`: run LOCAL-ONLY, with no network gateway
-        /// and no topic visible on the network. Without a CLI or environment
+        /// and no topic visible on the network. The switch keeps Cerulion
+        /// service traffic off (robots, relays, hosted Cerulion services and
+        /// telemetry); signing in to your account still works. Without a CLI or environment
         /// kill-switch, a real-clock `node run` starts the network gateway and every produced
         /// topic is announced on the LAN, viewable by any peer without pairing.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
@@ -1551,19 +1558,28 @@ pub enum GraphAction {
         #[arg(long = "peer-loss", value_enum)]
         peer_loss: Option<PeerLoss>,
         /// Force a single-process run, even when the graph declares
-        /// `process_groups:`. The graph produces identical results, just
-        /// without process isolation. On a graph WITHOUT `process_groups:`
-        /// this also skips deriving the multi-process default. Conflicts with `--auto-partition`.
+        /// `process_groups:`. Every node shares one process, with no process
+        /// isolation between them. On a graph WITHOUT `process_groups:`
+        /// this also skips deriving the multi-process default. On the real
+        /// clock the one process still runs its nodes in executor units, one
+        /// thread per unit (`cerulion graph plan` shows them), so a slow node
+        /// does not hold the others; a graph that is one unit runs as one level
+        /// loop. Conflicts with `--auto-partition`.
         #[arg(long = "single-process")]
         single_process: bool,
         /// Keep this run on this machine: no network gateway, session,
         /// egress or ingress. Equivalent to `--network off`; the environment
-        /// kill-switch remains honored with or without this flag.
+        /// kill-switch remains honored with or without this flag. The switch
+        /// keeps Cerulion service traffic off (robots, relays, hosted Cerulion
+        /// services and telemetry); signing in to your account still works.
         #[arg(long)]
         local: bool,
         /// Network kill-switch. The only accepted value is `off`: run
         /// LOCAL-ONLY. No network gateway is started, no network session opens
         /// and nothing crosses the machine boundary (a loud notice says so).
+        /// The switch keeps Cerulion service traffic off (robots, relays,
+        /// hosted Cerulion services and telemetry); signing in to your account
+        /// still works.
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
@@ -1670,6 +1686,24 @@ pub enum GraphAction {
     /// census into its run directory. Nothing in the runtime fuses chains
     /// yet: the block reports what the graph would allow.
     Levels {
+        /// Graph name
+        #[arg(add = ArgValueCandidates::new(completion::graph_names))]
+        name: String,
+    },
+    /// Show the processes a free run of a graph starts and the executor units
+    /// inside each (read-only).
+    ///
+    /// Executor units are opt in. Without a profile a process runs its nodes
+    /// as one unit, as before, and a node that declares `isolate: true` runs
+    /// in a unit of its own, on its own thread, so its ticks never hold the
+    /// rest of the process. With the graph's profile
+    /// (`graphs/<NAME>.costs.yaml`) every node starts a unit, and a linear
+    /// chain of trigger edges merges into one unit where the profile shows
+    /// the unit's ticks stay under a quarter of its period and of its nodes'
+    /// `tick_within_ms`; `isolate: true` and `isolate: false` override. A
+    /// `block` edge's producer and consumers always share a unit. Every unit
+    /// is printed with its nodes and the reason it starts.
+    Plan {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
         name: String,
@@ -1812,10 +1846,12 @@ pub enum GraphAction {
     /// worker its own plan file. Users always run `cerulion graph run`.
     #[command(hide = true)]
     RunWorker {
-        /// Path to the serialized `WorkerPlan` JSON the supervisor wrote.
-        #[arg(long)]
+        /// Path to a serialized `WorkerPlan` JSON the supervisor wrote. Given
+        /// more than once, the process runs each plan (one executor unit
+        /// each) on its own thread.
+        #[arg(long, required = true)]
         #[arg(value_hint = clap::ValueHint::FilePath)]
-        plan: PathBuf,
+        plan: Vec<PathBuf>,
     },
     /// HIDDEN: run the network gateway process of a `graph run`.
     ///
@@ -2121,6 +2157,13 @@ pub enum BagAction {
         /// `--report`, the JSON gains a `record_out` field naming the path.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         record_out: Option<PathBuf>,
+        /// With `--resim --verify`: the bytes a fed replay's feed index is
+        /// charged (default 1073741824, 1 GiB): 40 per recorded frame the
+        /// replayed reads consume, up to `--duration` when it is given, and 40
+        /// per producer label of the topics they consume. A replay that needs
+        /// more is refused with exit 2 naming the size it needs.
+        #[arg(long, value_name = "BYTES")]
+        feed_index_budget: Option<u64>,
     },
     /// Show what a bag holds (topics, frame counts, schemas, time span) without
     /// publishing anything.
@@ -3291,11 +3334,43 @@ mod time_source_flag_tests {
                 action: GraphAction::RunWorker { plan },
             } => assert_eq!(
                 plan,
-                std::path::PathBuf::from("/tmp/worker_P0.json"),
+                vec![std::path::PathBuf::from("/tmp/worker_P0.json")],
                 "the --plan path must be captured verbatim"
             ),
             _ => panic!("expected Graph::RunWorker"),
         }
+    }
+
+    /// A worker process hosting several executor units takes one `--plan`
+    /// per unit, in order.
+    #[test]
+    fn graph_run_worker_takes_one_plan_per_hosted_unit() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "graph",
+            "run-worker",
+            "--plan",
+            "/tmp/a.json",
+            "--plan",
+            "/tmp/b.json",
+        ])
+        .expect("repeated --plan must parse");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::RunWorker { plan },
+            } => assert_eq!(
+                plan,
+                vec![
+                    std::path::PathBuf::from("/tmp/a.json"),
+                    std::path::PathBuf::from("/tmp/b.json")
+                ]
+            ),
+            _ => panic!("expected Graph::RunWorker"),
+        }
+        assert!(
+            Cli::try_parse_from(["cerulion", "graph", "run-worker"]).is_err(),
+            "run-worker without a --plan must be refused"
+        );
     }
 
     /// `graph run-worker` WITHOUT `--plan` is rejected by clap (the

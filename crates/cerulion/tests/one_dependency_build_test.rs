@@ -18,10 +18,10 @@
 //!   crate, each with the `[lib]` and `[features]` tables
 //!   `cerulion node create` writes, so `default = ["cdylib"]` compiles the
 //!   `#[cfg(feature = "cdylib")]` FFI module the macros emit. Between them the
-//!   nodes take a data trigger, a sync window and an external source, and
-//!   declare params, a sampled input, an accumulate input, outputs with and
-//!   without a promise, `init` and `shutdown`, event handlers, a port-writing
-//!   helper and every state escape.
+//!   nodes take a data trigger read with `consume = latest`, a sync window
+//!   and an external source, and declare params, a sampled input, an
+//!   accumulate input, outputs with and without a promise, `init` and
+//!   `shutdown`, event handlers, a port-writing helper and every state escape.
 //! - The negative control: a package that depends on the macro crate alone,
 //!   which must fail with the named missing-dependency error from each macro.
 //! - The diagnostic span cases: one package per root, umbrella and runtime,
@@ -70,9 +70,10 @@ cdylib = []
 default = [\"cdylib\"]
 ";
 
-/// A data-triggered node with params, three input kinds, two outputs, the
-/// lifecycle methods, event handlers, a port-writing helper and every state
-/// escape, plus a derived enum it holds as state.
+/// A data-triggered node (its trigger read with `consume = latest`) with
+/// params, three input kinds, two outputs, the lifecycle methods, event
+/// handlers, a port-writing helper and every state escape, plus a derived enum
+/// it holds as state.
 ///
 /// `generated_items_exist` names `SensorNodeEntry`, which exists only because
 /// `#[cerulion_node]` generated it, and `Mode`'s `STATE_SHAPE`, which
@@ -95,7 +96,7 @@ pub enum Mode {
 #[cerulion_node]
 #[derive(Default)]
 pub struct SensorNode {
-    #[input(trigger, expect_within_ms = 20)]
+    #[input(trigger, consume = latest, expect_within_ms = 20)]
     imu: Vector3,
     #[input(backpressure = sample(3))]
     odom: Vector3,

@@ -6,7 +6,8 @@
 //! results topic, and one subscriber per `robot://state/{name}` topic. Every
 //! frame is a `std_msgs/String` holding JSON.
 //!
-//! A call is published as `{"call_id", "tool", "args"}`. The graph answers on
+//! A call is published as `{"call_id", "tool", "args"}`, plus `"caller"` when a
+//! remote caller is in scope ([`crate::caller`]). The graph answers on
 //! the results topic with a JSON object carrying the same `call_id`. The
 //! thread never blocks on an answer: it keeps every published call in a
 //! pending table, reads EVERY frame on the results topic in arrival order, and
@@ -152,9 +153,18 @@ impl Journal {
         }
     }
 
-    /// The serialized frame for one call, as it will be published.
+    /// The serialized frame for one call, as it will be published. Inside a
+    /// [`crate::caller::scope`] the frame also carries `"caller"`.
     pub fn frame(call_id: u64, tool: &str, args: &Value) -> String {
-        serde_json::json!({ "call_id": call_id, "tool": tool, "args": args }).to_string()
+        match crate::caller::remote() {
+            Some(caller) => serde_json::json!({
+                "call_id": call_id, "tool": tool, "args": args, "caller": caller
+            })
+            .to_string(),
+            None => {
+                serde_json::json!({ "call_id": call_id, "tool": tool, "args": args }).to_string()
+            }
+        }
     }
 
     /// Publish one call and wait for the graph's answer to it. A

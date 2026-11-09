@@ -156,7 +156,7 @@ fn build_probe_graph() -> TransportResult<GraphRuntime> {
         identity: "cdylib_level".to_string(),
         prefix: "lvl".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "probe0".to_string(),
@@ -386,7 +386,7 @@ fn subprocess_child_raw_ffi_level_probe() {
         identity: "rawffi_level".to_string(),
         prefix: "lvlr".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "raw0".to_string(),

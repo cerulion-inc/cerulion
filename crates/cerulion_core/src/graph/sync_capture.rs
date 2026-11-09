@@ -374,6 +374,7 @@ mod tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 

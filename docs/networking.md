@@ -97,8 +97,15 @@ default + gateway, the discovery ladder, and pairing.
   write topics, unless `CERULION_LAN_ACCESS=open` is set. While the app is
   `paired`, a desk reads its topics only through the remote plane the app hosts
   with its `remote` runtime key. A robot or app that runs the remote plane lets a paired desk with observe access
-  (`CAP_OBSERVE`) read topics over it, but only from robot to desk: a desk cannot send teleop
-  commands over it today, because the `teleop` verb has no handler yet. An
+  (`CAP_OBSERVE`) read topics over it, from robot to desk on
+  its `cerulion/wire/2` protocol. The `cerulion-remoted` daemon also lets a
+  paired desk with the teleoperate capability (`CAP_TELEOP`) and at least the
+  operator role publish a message on a robot topic or call a
+  robot service on its ops protocol (`cerulion topic pub --robot`,
+  `cerulion service call --robot`; see [remote access](remote_plane.md)),
+  refused while the robot's e-stop is engaged; the plane an app hosts refuses
+  both, so a desk cannot write into the app. The `teleop` verb
+  has no handler yet, so no remote command holds a control lease. An
   Android app selects the same posture with its `lan_access` key (see [Android](android.md)). The gateway keeps the
   posture in front of every installed demand authorizer; changing an inner
   authorizer does not disable it. Choose the posture at startup with
