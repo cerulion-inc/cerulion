@@ -21,6 +21,8 @@ Leak guard (media)
 Leak guard (messages)
 Leak guard (tree and names)
 Lint
+Period park (aarch64 Linux)
+Period park (x86_64 Linux)
 Test (Linux) shard 0
 Test (Linux) shard 1
 Test (Linux) shard 2
