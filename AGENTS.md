@@ -3,7 +3,7 @@
 Cerulion is a zero-copy, deterministic communication framework for real-time robotics:
 iceoryx2 shared memory locally, zenoh across machines, ROS 2 interop via `rmw_cerulion`.
 A Rust workspace (authoritative crate list: root `Cargo.toml`). The user-facing API - the
-`#[cerulion_node]` macro, the `cerulion` CLI, graph/schema YAML (`docs/user-api.md`) - is a contract.
+`#[cerulion_node]` macro, the `cerulion` CLI, graph/schema YAML, env vars (`docs/user-api.md`) - is a contract.
 Users build a WORKSPACE: ONE node type per `nodes/<type>/` crate, wiring ONLY in `graphs/*.yaml`,
 run by `cerulion` verbs. Examples, docs, rustdoc, README and the scaffold must show nothing else:
 multi-node files, `main`, in-code graphs, runtime-API construction (`GraphRuntime`) are for tests ONLY.
@@ -138,7 +138,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 | Core runtime (wire, transport, scheduler, graph, codegen) | `cerulion_core`* |
 | Node-author macros | `cerulion_macros`* |
 | Generated ROS 2 message types | `native_ros2_messages`* |
-| CLI / Android | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry`, `cerulion_android` |
+| CLI / Android | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry`, `_android`, `_android_remote` (remote plane an app hosts; unpublished) |
 | Recording: MCAP writer/reader + daemon | `cerulion_bag`*, `cerulion_bagd`* |
 | ROS 2 RMW layer (via `cerulion ros2 run/launch`) | `rmw_cerulion`* |
 | Network & discovery daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns` |
@@ -183,7 +183,6 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 
 ## Deeper context
 
-- `docs/user-api.md` - the user API reference (CLI, macros, YAML, env vars).
 - `crates/<crate>/AGENTS.md` - scoped invariants, serial tests, gotchas.
 - `docs/internals/*.md` - contributor dossiers (test maps, module contracts); each crate
   names its own; `ci-and-gates.md`: the gates.

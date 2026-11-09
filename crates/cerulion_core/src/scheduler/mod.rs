@@ -497,6 +497,14 @@ struct ScheduledNode {
     // Timing state (managed by scheduler)
     next_fire_ns: Option<u64>,
     pending_data_count: u64,
+    /// The node's `Data` trigger input declares `consume = latest`: a step
+    /// that fires the node with any pending arrival fires it ONCE and clears
+    /// the count, because that one fire's read drains the queue to its newest
+    /// frame. A deferred step (`throttle_ms`, a `block` gate) returns before
+    /// the collapse and keeps the count.
+    /// Set at graph build by [`Scheduler::set_data_consume_latest`]; `false`
+    /// (one fire per arrival) otherwise.
+    data_consume_latest: bool,
     /// Per trigger-input HEAD — the frame this input contributes to
     /// the set currently being formed, keyed by the RESOLVED SOURCE TOPIC.
     ///
@@ -2440,6 +2448,7 @@ impl Scheduler {
             node_id: Arc::clone(&node_id_arc),
             next_fire_ns,
             pending_data_count: 0,
+            data_consume_latest: false,
             sync_heads: IndexMap::new(),
             // Installed later (graph build) for TRANSPORT-backed Sync
             // nodes only; a pure-scheduler embedder keeps the hand-driven
@@ -2879,6 +2888,13 @@ impl Scheduler {
     /// `ScheduledNode::replay_refill_shortfalls`. `None` for an unknown id.
     pub fn replay_refill_shortfalls(&self, node_id: &str) -> Option<u64> {
         self.nodes.get(node_id).map(|n| n.replay_refill_shortfalls)
+    }
+
+    /// Testing-only: does this node carry a between-fires refill hook
+    /// ([`Self::set_trigger_refill`])? `None` for an unknown id.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn has_trigger_refill_for_test(&self, node_id: &str) -> Option<bool> {
+        self.nodes.get(node_id).map(|n| n.trigger_refill.is_some())
     }
 
     /// How many times this node's trace-driven burst asked its refill hook for
@@ -3362,7 +3378,15 @@ impl Scheduler {
         match &node.policy {
             TriggerPolicy::Data => {
                 node.data_backlog_hint = false;
-                let consumed = node.pending_data_count.min(u64::from(planned.fire_count));
+                // A `consume = latest` fire spends EVERY pending arrival, as
+                // `decide_node` does live: on the Separate discipline each
+                // queued frame signalled one, and the one fire's read drained
+                // them all.
+                let consumed = if node.data_consume_latest && planned.fire_count > 0 {
+                    node.pending_data_count
+                } else {
+                    node.pending_data_count.min(u64::from(planned.fire_count))
+                };
                 node.pending_data_count -= consumed;
                 node.pending_data_count_shared
                     .store(node.pending_data_count, Ordering::Release);
@@ -3914,6 +3938,35 @@ impl Scheduler {
                 backlog_latch: FailureRegimeLatch::new(),
             },
         );
+        Ok(())
+    }
+
+    /// Declare that `node_id`'s `Data` trigger input is `consume = latest`.
+    ///
+    /// From then on a step that fires the node with any pending arrival
+    /// fires it once and clears the count, where the `fifo` default fires
+    /// once per arrival; a deferred step keeps the count. The arrivals beyond
+    /// the first are not owed fires: the one fire's read drains the queue to
+    /// the newest frame. Refused for a node whose policy is not `Data`, the
+    /// [`Self::set_trigger_refill`] rule.
+    // hot-path-alloc-ok-fn: cold: graph BUILD, once per `consume = latest` node
+    pub fn set_data_consume_latest(&mut self, node_id: &str) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        if !matches!(node.policy, TriggerPolicy::Data) {
+            return Err(TransportError::SchedulerError {
+                reason: format!(
+                    "set_data_consume_latest() not valid for node '{}' with policy {:?}: \
+                     `consume = latest` applies to a data-trigger node",
+                    node_id, node.policy
+                ),
+            });
+        }
+        node.data_consume_latest = true;
         Ok(())
     }
 
@@ -7266,7 +7319,17 @@ impl Scheduler {
                     // due-NOW through `ns_until_next_fire`, so on the live path
                     // the wake window stays at the loop's 1 ms floor until it
                     // clears — never a busy-spin, and never a per-frame tail.
-                    let fire_count = node.pending_data_count.min(DATA_PENDING_CARRY_CLAMP);
+                    //
+                    // A `consume = latest` node fires ONCE however many
+                    // arrivals are pending, and none carry: its read drains
+                    // the queue to the newest frame, so the older arrivals
+                    // have no frame left to serve.
+                    let fire_count = if node.data_consume_latest {
+                        node.pending_data_count = 1;
+                        1
+                    } else {
+                        node.pending_data_count.min(DATA_PENDING_CARRY_CLAMP)
+                    };
                     node.pending_data_count -= fire_count;
                     node.pending_data_count_shared
                         .store(node.pending_data_count, Ordering::Release);

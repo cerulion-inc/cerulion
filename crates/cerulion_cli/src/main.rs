@@ -5,6 +5,7 @@ mod cli;
 mod completion;
 mod families;
 mod install_marker;
+mod network_switch;
 mod telemetry;
 mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries
@@ -127,19 +128,24 @@ fn main() -> ExitCode {
             }
         };
     }
+    // The network kill-switch variables, read once for the telemetry decision
+    // and the refusal every verb meets before the login gate.
+    let switch = network_switch::SwitchEnv::from_process();
     // One `cli_command_run` per invocation, recorded around the whole
     // dispatch so every intercept below is covered. `None` (nothing is
-    // recorded or sent) without a key, without consent, for the internal
-    // subprocess verbs, and on the run that prints the first-run notice.
-    let command_run = telemetry::CommandRun::start(&matches);
+    // recorded or sent) without a key, without consent, while the network
+    // kill switch is engaged, for the internal subprocess verbs, and on the
+    // run that prints the first-run notice.
+    let command_run = telemetry::CommandRun::start(&matches, &switch);
     // A registered verb family owns its own dispatch, after the same logging
-    // setup, iceoryx2 bridge and login gate a `Commands` verb gets in
-    // [`dispatch`]; every other verb is a `Commands` variant and takes the
-    // generic path.
+    // setup, iceoryx2 bridge, kill-switch refusal and login gate a `Commands`
+    // verb gets in [`dispatch`]; every other verb is a `Commands` variant and
+    // takes the generic path.
     let verbose = matches.get_flag("verbose");
     let family_code = families::route(
         families::FAMILIES,
         &matches,
+        &switch,
         |class| {
             init_logging(verbose, class.is_quiet_default());
             let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
@@ -148,7 +154,10 @@ fn main() -> ExitCode {
     );
     let code = match family_code {
         Some(code) => code,
-        None => dispatch(Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())),
+        None => dispatch(
+            Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit()),
+            &switch,
+        ),
     };
     if let Some(command_run) = command_run {
         command_run.finish(code);
@@ -184,8 +193,9 @@ fn login_gate() -> Option<ExitCode> {
 }
 
 /// Everything `main` does after parsing a `Commands` verb: the intercepts, the
-/// login gate and the generic [`run`] dispatch.
-fn dispatch(cli: Cli) -> ExitCode {
+/// kill-switch refusal under `switch`, the login gate and the generic [`run`]
+/// dispatch.
+fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
     // its own logging default (the old standalone binary's exact behavior; its
@@ -307,15 +317,23 @@ fn dispatch(cli: Cli) -> ExitCode {
     // (FAILURE), the same code `run_viz` gives this refusal as a `Validation`
     // error through the generic dispatch: the command line is well-formed, so
     // it is not a usage error (2), and the hoist must not change the code.
+    // `viz --robot` with no TOPIC is answered here too, with the text and
+    // code `run_viz` gives it on Unix, so it precedes the kill-switch refusal
+    // below.
     if let Some(refusal) = viz_refusal(&cli.command, cfg!(target_os = "android")) {
         eprintln!("Error: {refusal}");
         return ExitCode::FAILURE;
     }
 
-    if command_needs_identity(&cli.command) {
-        if let Some(refused) = login_gate() {
-            return refused;
-        }
+    // The kill-switch refusal (`command_network_refusal`), then the login gate:
+    // below the usage and platform refusals above, so a refused verb never
+    // reaches the gate.
+    if let Some(refused) = network_switch::refuse_or_gate(
+        command_network_refusal(&cli.command, switch),
+        command_needs_identity(&cli.command),
+        login_gate,
+    ) {
+        return refused;
     }
 
     // `cerulion bag play --resim` inherits the stable 0–6
@@ -410,7 +428,9 @@ fn dispatch(cli: Cli) -> ExitCode {
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
-        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        CliError::NodeFatal { .. }
+        | CliError::WorkerNodeFatal { .. }
+        | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
         _ => 1,
     }
 }
@@ -1922,6 +1942,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Plan { name } => {
+                    print!("{}", graph_cmd::graph_plan(&ws.root, &name)?);
+                    Ok(())
+                }
                 GraphAction::Levels { name } => {
                     // Levelization inspection. The engine
                     // returns the fully-rendered report; print it verbatim,
@@ -2121,7 +2145,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     // way `graph run` does. `running` forwards Ctrl+C so the
                     // worker's live loop stops cleanly on SIGINT.
                     let running = setup_ctrlc_handler()?;
-                    graph_cmd::graph_run_worker(&ws.root, &plan, running)
+                    graph_cmd::graph_run_worker_host(&ws.root, &plan, running)
                 }
                 GraphAction::RunGateway { handoff } => {
                     // Hidden verb: the network GATEWAY process of a
@@ -2248,6 +2272,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 &connect,
                 &listen,
                 detach,
+                network_switch::SwitchEnv::from_process().network_engaged(),
             )
         }
         // The explicit login verb. Runs the RFC 8628 device-code
@@ -2743,6 +2768,7 @@ fn run_viz(
     connect: &[String],
     listen: &[String],
     detach: bool,
+    network_off: bool,
 ) -> CliResult<()> {
     if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
         return Err(cerulion_cli_engine::error::CliError::Validation(
@@ -2751,7 +2777,7 @@ fn run_viz(
     }
     #[cfg(not(unix))]
     {
-        let _ = (running, topics, robot, connect, listen, detach);
+        let _ = (running, topics, robot, connect, listen, detach, network_off);
         Err(cerulion_cli_engine::error::CliError::Validation(
             "cerulion viz needs the cerulion-vizd daemon, which speaks over a Unix domain socket \
              and is not supported on this platform (Windows is a future target)"
@@ -2760,7 +2786,7 @@ fn run_viz(
     }
     #[cfg(unix)]
     {
-        run_viz_unix(running, topics, robot, connect, listen, detach)
+        run_viz_unix(running, topics, robot, connect, listen, detach, network_off)
     }
 }
 
@@ -2788,6 +2814,7 @@ fn run_viz_unix(
     connect: &[String],
     listen: &[String],
     detach: bool,
+    network_off: bool,
 ) -> CliResult<()> {
     use cerulion_cli_engine::error::CliError;
     use std::time::Duration;
@@ -2805,12 +2832,7 @@ fn run_viz_unix(
         // type's schema over the network. Topics are still REQUIRED (the daemon's
         // `discover` lists only LOCAL topics, so there is no remote discover-all).
         if topics.is_empty() {
-            return Err(val(
-                "cerulion viz --robot needs at least one TOPIC (a schema pin is optional — the \
-                 daemon resolves the type from the robot's catalog): e.g. `/utlidar/cloud` or \
-                 `/utlidar/cloud=sensor_msgs/PointCloud2`"
-                    .to_string(),
-            ));
+            return Err(val(VIZ_ROBOT_NEEDS_A_TOPIC.to_string()));
         }
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     } else if topics.is_empty() {
@@ -2819,8 +2841,9 @@ fn run_viz_unix(
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
 
-    // A remote attach under a kill switch is refused after the arg-shape checks
-    // and before any daemon is spawned or contacted.
+    // `dispatch` refuses a remote attach under a kill switch first
+    // (`command_network_refusal`); this check covers a call that does not come
+    // through it, before any daemon is spawned or contacted.
     if let Some(refusal) = robot.and_then(cerulion_cli_engine::viz_cmd::remote_viz_refusal) {
         return Err(val(refusal));
     }
@@ -2867,6 +2890,7 @@ fn run_viz_unix(
                 &log_for_spawn,
                 &connect_for_spawn,
                 &listen_for_spawn,
+                network_off,
             )?;
             println!("cerulion viz: started the cerulion-vizd daemon");
             Ok(())
@@ -2893,6 +2917,11 @@ fn run_viz_unix(
              keeps its boot-time locators. Restart it \
              (stop the daemon, then re-run) to bake in these locators."
         );
+    }
+    // A reused daemon keeps the telemetry setting it started with: say so
+    // under the switch.
+    if let Some(note) = viz_reused_daemon_switch_note(spawned, network_off) {
+        eprintln!("{note}");
     }
 
     // 2. Resolve the attach list (explicit shape validated above; the zero-arg
@@ -3837,15 +3866,106 @@ fn command_needs_identity(command: &Commands) -> bool {
     )
 }
 
-/// The platform refusal for `cerulion viz`, when the platform cannot run it,
-/// lifted out of `run_viz` so `dispatch` can refuse BEFORE the identity gate.
-/// `is_android` is an argument (not a cfg read) so the decision is
+/// The network kill-switch refusal of a `Commands` verb under `switch`, which
+/// `dispatch` gives before the login gate. Each verb's refusal is the one its
+/// own path gives further down, with the same text and exit code:
+/// `viz --robot` (exit 1) and `pair` (exit 1) under the run and query parse of
+/// `CERULION_NETWORK`, and `viz --robot` under `CERULION_NETD_NETWORK` or
+/// `CERULION_VIZD_NETWORK` at `off` too; `connect` (a warning, exit 0) when
+/// `--network` or `CERULION_NETWORK` is exactly `off`, the value its helper
+/// reads. Every other verb is not refused here: it runs as without the
+/// switch, or does not run through `dispatch`. The match names every
+/// top-level verb, so a new one is decided here before it compiles; a new
+/// subverb of a verb below needs its row in `network_switch/cases.rs`.
+fn command_network_refusal(
+    command: &Commands,
+    switch: &network_switch::SwitchEnv,
+) -> Option<network_switch::NetworkRefusal> {
+    use network_switch::NetworkRefusal;
+    match command {
+        Commands::Viz { robot, .. } => {
+            let refusal = cerulion_cli_engine::viz_cmd::remote_viz_refusal_from(
+                robot.as_deref()?,
+                switch.network.clone(),
+                switch.netd.as_deref(),
+                switch.vizd.as_deref(),
+            )?;
+            Some(NetworkRefusal::error(refusal, 1))
+        }
+        Commands::Pair { .. } => pair_cmd::network_refusal_from(switch.network.clone())
+            .map(|refusal| NetworkRefusal::error(refusal, 1)),
+        Commands::Connect { network, .. } => {
+            connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
+                .map(|refusal| NetworkRefusal::warning(refusal, 0))
+        }
+        // Dispatched before this check (`main`'s internal workers, `bagd`),
+        // or not refused under the switch: the runs and queries go
+        // local-only, and the account verbs reach the account service, which
+        // the switch does not cover.
+        #[cfg(unix)]
+        Commands::BootstrapRobot { .. } | Commands::RobotSyncEpoch { .. } => None,
+        Commands::Workspace { .. }
+        | Commands::Node { .. }
+        | Commands::Graph { .. }
+        | Commands::Topic { .. }
+        | Commands::Ros { .. }
+        | Commands::Ros2 { .. }
+        | Commands::Login
+        | Commands::Logout
+        | Commands::Account { .. }
+        | Commands::Telemetry { .. }
+        | Commands::Tui
+        | Commands::Trace { .. }
+        | Commands::Bag { .. }
+        | Commands::Completions { .. }
+        | Commands::Clean { .. } => None,
+        #[cfg(unix)]
+        Commands::Flashback { .. } => None,
+        #[cfg(not(unix))]
+        Commands::Flashback => None,
+        #[cfg(unix)]
+        Commands::Bagd(..) => None,
+        #[cfg(not(unix))]
+        Commands::Bagd => None,
+    }
+}
+
+/// The usage refusal of `cerulion viz --robot` with no TOPIC.
+const VIZ_ROBOT_NEEDS_A_TOPIC: &str = concat!(
+    "cerulion viz --robot needs at least one TOPIC (a schema pin is optional — the ", // dash-ok
+    "daemon resolves the type from the robot's catalog): e.g. `/utlidar/cloud` or ",
+    "`/utlidar/cloud=sensor_msgs/PointCloud2`"
+);
+
+/// What `cerulion viz` prints when it reuses a `cerulion-vizd` it did not
+/// start while the network kill switch is engaged: the daemon reads the
+/// switch once, at start, so its telemetry keeps the setting it started with.
+#[cfg(unix)]
+const VIZ_REUSED_DAEMON_UNDER_SWITCH: &str =
+    "cerulion viz: note: the cerulion-vizd daemon was already running, so this command's \
+     network kill switch does not change it: it keeps the telemetry setting it started with. \
+     If it started without the switch, run `cerulion telemetry off` to stop its heartbeats, \
+     or stop the daemon and re-run to start it under the switch.";
+
+/// The note for a reused daemon under the switch, or `None`: `spawned` is
+/// whether this run started the daemon, `network_off` whether the switch is
+/// engaged. PURE.
+#[cfg(unix)]
+fn viz_reused_daemon_switch_note(spawned: bool, network_off: bool) -> Option<&'static str> {
+    (!spawned && network_off).then_some(VIZ_REUSED_DAEMON_UNDER_SWITCH)
+}
+
+/// The refusals of `cerulion viz` that `dispatch` gives BEFORE the kill switch
+/// and the identity gate: the platform's, when it cannot run the verb, then
+/// `--robot` with no TOPIC ([`VIZ_ROBOT_NEEDS_A_TOPIC`], which `run_viz` also
+/// gives on Unix). `is_android` is an argument (not a cfg read) so the decision is
 /// oracle-testable on host. PURE.
 fn viz_refusal(command: &Commands, is_android: bool) -> Option<&'static str> {
-    if !matches!(command, Commands::Viz { .. }) {
+    let Commands::Viz { topics, robot, .. } = command else {
         return None;
-    }
+    };
     cerulion_cli_engine::viz_client::unsupported_viz_message(is_android)
+        .or_else(|| (robot.is_some() && topics.is_empty()).then_some(VIZ_ROBOT_NEEDS_A_TOPIC))
 }
 
 /// Install the process-wide shutdown-signal handler and return the shared
@@ -4045,7 +4165,7 @@ mod login_gate_exemption_tests {
     fn internal_subprocess_verbs_are_exempt() {
         assert!(!command_needs_identity(&Commands::Graph {
             action: GraphAction::RunWorker {
-                plan: PathBuf::from("plan.json"),
+                plan: vec![PathBuf::from("plan.json")],
             },
         }));
         assert!(!command_needs_identity(&Commands::Graph {
@@ -4089,6 +4209,29 @@ mod login_gate_exemption_tests {
         assert!(viz_refusal(&viz, true).is_some());
         assert!(viz_refusal(&viz, false).is_none());
         assert!(viz_refusal(&Commands::Login, true).is_none());
+        // `--robot` with no TOPIC is refused above the gate too, after the
+        // platform refusal; with a TOPIC it is not.
+        let robot_only = Commands::Viz {
+            topics: Vec::new(),
+            robot: Some("go2".to_string()),
+            connect: Vec::new(),
+            listen: Vec::new(),
+            detach: false,
+        };
+        assert!(viz_refusal(&robot_only, false)
+            .is_some_and(|r| r.starts_with("cerulion viz --robot needs at least one TOPIC")));
+        assert_eq!(
+            viz_refusal(&robot_only, true),
+            cerulion_cli_engine::viz_client::unsupported_viz_message(true)
+        );
+        let robot_topic = Commands::Viz {
+            topics: vec!["/t".to_string()],
+            robot: Some("go2".to_string()),
+            connect: Vec::new(),
+            listen: Vec::new(),
+            detach: false,
+        };
+        assert!(viz_refusal(&robot_topic, false).is_none());
     }
 
     #[test]
@@ -5214,9 +5357,37 @@ mod cli_error_exit_code_tests {
         };
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod viz_reused_daemon_switch_note_tests {
+    use super::{viz_reused_daemon_switch_note, VIZ_REUSED_DAEMON_UNDER_SWITCH};
+
+    #[test]
+    fn only_a_reused_daemon_under_the_switch_gets_the_note() {
+        assert_eq!(
+            viz_reused_daemon_switch_note(false, true),
+            Some(VIZ_REUSED_DAEMON_UNDER_SWITCH),
+            "a daemon this run reused, under the switch"
+        );
+        assert_eq!(
+            viz_reused_daemon_switch_note(true, true),
+            None,
+            "a daemon this run started"
+        );
+        assert_eq!(
+            viz_reused_daemon_switch_note(false, false),
+            None,
+            "no switch"
+        );
+        assert_eq!(viz_reused_daemon_switch_note(true, false), None);
+        assert!(VIZ_REUSED_DAEMON_UNDER_SWITCH.contains("telemetry"));
+        assert!(VIZ_REUSED_DAEMON_UNDER_SWITCH.contains("`cerulion telemetry off`"));
     }
 }

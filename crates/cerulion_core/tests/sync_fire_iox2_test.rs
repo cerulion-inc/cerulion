@@ -64,7 +64,7 @@ fn sync_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn N
         identity: "sync_fire_test".to_string(),
         prefix: "syncf".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -400,7 +400,7 @@ fn ctx_graph(entry: Box<dyn NodeEntry>) -> (GraphConfig, IndexMap<String, Box<dy
         identity: "sync_ctx_fire_test".to_string(),
         prefix: "s425f".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),

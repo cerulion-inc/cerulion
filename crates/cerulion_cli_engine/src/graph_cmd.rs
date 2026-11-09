@@ -2116,7 +2116,7 @@ pub fn build_node_def(
         .collect();
 
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id,
@@ -3584,14 +3584,28 @@ fn collect_entry_infos_from_cache(
     Ok(entry_infos)
 }
 
+/// The text of [`KILL_SWITCH_SCOPE`], for `concat!`.
+macro_rules! kill_switch_scope {
+    () => {
+        "the network kill switch keeps Cerulion service traffic off (robots, relays, hosted \
+         Cerulion services and telemetry); signing in to your account still works"
+    };
+}
+
+/// What the network kill switch covers, in every notice it prints: Cerulion
+/// service traffic, not account sign-in. `pub` so tests pin the exact text.
+pub const KILL_SWITCH_SCOPE: &str = kill_switch_scope!();
+
 /// Kill-switch, blockless arm: under the permissive default,
 /// `--network off` on a blockless REAL-clock graph is not inert — it
 /// SUPPRESSES the open-by-default network exposure. This notice confirms the
 /// kill-switch ACTED (warn-level — the docs promise a loud kill-switch
 /// notice). `pub` so tests pin the exact text.
-pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str =
+pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str = concat!(
     "local execution selected: this run is LOCAL-ONLY; the permissive open-by-default network exposure \
-     is suppressed; no gateway is spawned and no zenoh session opens";
+     is suppressed; no gateway is spawned and no zenoh session opens; ",
+    kill_switch_scope!()
+);
 
 /// Kill-switch, replay-class arm: the one arm where `--network off`
 /// is GENUINELY redundant — a virtual/external-clock run is network-inert by
@@ -3610,7 +3624,7 @@ pub const NETWORK_OFF_REDUNDANT_NOTICE: &str =
 /// as `off` (an operator who set the kill-switch env at all intended
 /// local-only; failing open on a typo is the wrong direction for a security
 /// default). Empty/unset ⇒ no effect. Read inside [`resolve_run_network`].
-const NETWORK_ENV: &str = "CERULION_NETWORK";
+pub const NETWORK_ENV: &str = "CERULION_NETWORK";
 
 /// Resolve the robot's network
 /// IDENTITY — the value stamped identically into the announce keys' robot chunk,
@@ -3680,8 +3694,11 @@ impl NetworkEnvKill {
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
 ///
-/// The single source of truth for the kill-switch parse (trimmed, ASCII
-/// case-insensitive `off`; fails CLOSED on any other non-empty value). Pure
+/// The CLI's one kill-switch parse (trimmed, ASCII case-insensitive `off`;
+/// fails CLOSED on any other non-empty value).
+/// `cerulion_telemetry::kill_switch::engaged` is a copy of its blank decision
+/// for `cerulion-vizd`'s telemetry, and a `cerulion_cli` unit test holds the
+/// two equal. Pure
 /// over the environment — it emits NO log; each caller emits its own
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
@@ -3798,7 +3815,8 @@ pub fn remote_network_suppressed() -> bool {
                 value = %v,
                 "CERULION_NETWORK is set to an unrecognized value — the only accepted value is \
                  `off`; failing CLOSED and treating it as `off` (this remote query is \
-                 LOCAL-ONLY). Unset the variable to restore the default network behavior"
+                 LOCAL-ONLY). Unset the variable to restore the default network behavior; \
+                 {KILL_SWITCH_SCOPE}"
             );
             true
         }
@@ -3966,7 +3984,8 @@ pub fn resolve_run_network(
             value = %v,
             "CERULION_NETWORK is set to an unrecognized value — the only accepted \
              value is `off`; failing CLOSED and treating it as `off` (this run is \
-             LOCAL-ONLY). Unset the variable to restore the default network behavior"
+             LOCAL-ONLY). Unset the variable to restore the default network behavior; \
+             {KILL_SWITCH_SCOPE}"
         );
     }
     let env_off = env_kill.is_off();
@@ -3979,7 +3998,7 @@ pub fn resolve_run_network(
                 egress = net.egress.len(),
                 ingress = net.ingress.len(),
                 "local execution selected: the graph's declared egress/ingress \
-                 topics will NOT cross the machine boundary for this run"
+                 topics will NOT cross the machine boundary for this run; {KILL_SWITCH_SCOPE}"
             );
         } else if time_source == TimeSource::Real {
             // (b) blockless + real clock: the kill-switch ACTED — it
@@ -5357,7 +5376,7 @@ mod open_file_limit_verdict_tests {
     /// per chain.
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id,
@@ -5989,6 +6008,17 @@ pub fn graph_run(
     // above. (`graph profile` never routes through this function — see the
     // explicit local-only profile arm in `resolve_run_network`'s docs.)
 
+    // The execution mode is read from the environment exactly once per run,
+    // HERE, and the result threaded to every reader below.
+    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
+    // value to "unset" and skips the garbage warn every other unrecognised
+    // value gets. The lossy form is never a recognised
+    // spelling, so it takes the garbage arm and is printed under `got=`.
+    let raw_execution_mode =
+        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
+    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
+    let keep_linear_chains = run_keeps_linear_chains(time_source, execution_mode_request);
+
     // The auto-partition PRE-FLIGHT — derive the partition
     // and persist only with `--yes`. The run proceeds with the
     // RETURNED config (derived groups installed for the persisted AND
@@ -6008,7 +6038,7 @@ pub fn graph_run(
         // that already carries exactly the derived partition needs no
         // write, so that run proceeds.
         let refuse_save = consent.assume_yes && wiring_overridden;
-        let pre = crate::partition_emit::run_auto_partition_preflight(
+        let pre = crate::partition_emit::run_auto_partition_preflight_with(
             workspace_root,
             graph_name,
             config,
@@ -6020,6 +6050,7 @@ pub fn graph_run(
                 lenient_costs: !consent.auto_partition,
                 assume_yes: consent.assume_yes && !refuse_save,
             },
+            cerulion_core::graph::AutoPartitionOptions { keep_linear_chains },
         )?;
         if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
         {
@@ -6048,6 +6079,18 @@ pub fn graph_run(
     // (b) An INVALID deployment is a pre-run rejection, and a rejected run must
     //     not first create a directory and announce itself LIVE. Resolving
     //     before the descriptor keeps that arm ahead of any side effect.
+    // `--single-process` on the real clock keeps every node in one process,
+    // and that process runs its nodes in executor units: when they split, the
+    // run goes through the supervisor with ONE process group holding every
+    // node, so one worker process hosts all the units.
+    let single_process_in_units = single_process
+        && single_process_hosts_units(
+            workspace_root,
+            &mut config,
+            time_source,
+            execution_mode_request,
+        )?;
+    let single_process = single_process && !single_process_in_units;
     let deployment = resolve_deployment(
         config.has_process_groups(),
         single_process,
@@ -6061,9 +6104,9 @@ pub fn graph_run(
         )));
     }
     let executes_process_groups = matches!(deployment, Ok(Deployment::Supervisor));
-    // The execution mode is RESOLVED here, once, from the same
-    // deployment fact - the environment is read exactly one time per run and
-    // the RESULT is threaded to the run-directory descriptor, the supervisor
+    // The execution mode is RESOLVED here, once, from the deployment fact and
+    // the request read above (the environment's one read per run); the RESULT
+    // is threaded to the run-directory descriptor, the supervisor
     // (which stamps it into every worker plan) and the recording paths, so no
     // two of them can disagree about the contract the run executed under.
     // A supervisor run FREE-RUNS by default;
@@ -6071,13 +6114,6 @@ pub fn graph_run(
     // a run with no ranks is the one-rank lockstep timeline whatever is
     // asked. An explicit `free_run` the route cannot honour warns loudly
     // rather than silently doing nothing.
-    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
-    // value to "unset" and skips the garbage warn every other unrecognised
-    // value gets. The lossy form is never a recognised
-    // spelling, so it takes the garbage arm and is printed under `got=`.
-    let raw_execution_mode =
-        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
-    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
     let execution_mode =
         resolve_run_execution_mode(executes_process_groups, execution_mode_request);
     note_inert_execution_mode_request(executes_process_groups, execution_mode_request);
@@ -6220,6 +6256,20 @@ pub fn graph_run(
     let state_arm = crate::state_arm_attach::state_arm_tag_for_process(Some(run_id));
     #[cfg(not(unix))]
     let state_arm: Option<(String, crate::state_arm_attach::ArmTagSource)> = None;
+    // The executor units this run's processes split into, so the recorded
+    // census judges every edge against the threads it will run on: a fused
+    // chain never leaves a unit.
+    #[cfg(unix)]
+    let unit_groups: Option<indexmap::IndexMap<String, Vec<String>>> = executes_process_groups
+        .then(|| {
+            run_unit_groups(
+                workspace_root,
+                &config,
+                execution_mode,
+                time_source == TimeSource::Real,
+            )
+        })
+        .flatten();
     #[cfg(unix)]
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
@@ -6235,10 +6285,14 @@ pub fn graph_run(
                     chains: run_chain_summary(
                         workspace_root,
                         &config,
-                        if executes_process_groups {
-                            cerulion_core::graph::Colocation::ProcessGroups(&config.process_groups)
-                        } else {
-                            cerulion_core::graph::Colocation::SingleProcess
+                        match (executes_process_groups, unit_groups.as_ref()) {
+                            (true, Some(units)) => {
+                                cerulion_core::graph::Colocation::ProcessGroups(units)
+                            }
+                            (true, None) => cerulion_core::graph::Colocation::ProcessGroups(
+                                &config.process_groups,
+                            ),
+                            (false, _) => cerulion_core::graph::Colocation::SingleProcess,
                         },
                     ),
                     run_id,
@@ -6399,7 +6453,16 @@ pub fn graph_run(
                     )
                 })
                 .flatten();
-            return ros2_children.finish(graph_run_supervisor(
+            // A `--single-process` run in executor units is one worker
+            // process, which prints a fatal node's own `Error:` line; the
+            // verdict then adds no line naming the process.
+            let announce = |result: CliResult<()>| match result {
+                Err(CliError::WorkerNodeFatal { .. }) if single_process_in_units => {
+                    Err(CliError::WorkerNodeFatalAnnounced)
+                }
+                other => other,
+            };
+            return ros2_children.finish(announce(graph_run_supervisor(
                 workspace_root,
                 graphs_dir,
                 config,
@@ -6451,7 +6514,7 @@ pub fn graph_run(
                 #[cfg(not(unix))]
                 None,
                 &embed_config,
-            ));
+            )));
         }
         Ok(Deployment::MonolithFallback { reason }) => {
             tracing::warn!(graph = %config.identity(), "{reason}");
@@ -7080,6 +7143,155 @@ pub fn graph_run(
     ros2_children.finish(crate::error::node_fatal_verdict(fatal_nodes))
 }
 
+/// The transport one worker plan runs on, on the run's shared iceoryx2
+/// config.
+///
+/// A plan that is its own process initializes the process's transport
+/// singleton. A plan hosted with other executor units in one process
+/// ([`WorkerPlan::host`](crate::multiprocess::WorkerPlan::host)) gets a
+/// detached transport of its own: its own iceoryx2 node on the same config,
+/// carrying its own clock, because the singleton carries one clock and each
+/// unit's runtime is refused a transport built with another unit's.
+///
+/// Mp workers are always network-free: the separate gateway process owns the
+/// robot's whole network plane.
+fn worker_transport(
+    plan: &crate::multiprocess::WorkerPlan,
+    clock: Arc<dyn cerulion_core::clock::Clock>,
+    ix_config: iceoryx2::config::Config,
+) -> CliResult<Arc<cerulion_core::TransportManager>> {
+    let config = cerulion_core::TransportConfig {
+        node_name: plan.node_name.clone(),
+        clock,
+        subscriber_buffer_size: 16,
+        network: None,
+    };
+    let transport = if plan.host.is_some() {
+        cerulion_core::TransportManager::detached_with_config(config, ix_config)?
+    } else {
+        cerulion_core::TransportManager::init_with_config(config, ix_config)?
+    };
+    Ok(transport)
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes a process
+/// that hosts several executor units skip sizing its descriptor table.
+#[cfg(feature = "oracle-mutants")]
+pub const DESCRIPTOR_PRESIZE_MUTANT_ENV: &str = "CERULION_DESCRIPTOR_PRESIZE_MUTANT";
+
+fn descriptor_presize_skipped_by_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        if std::env::var_os(DESCRIPTOR_PRESIZE_MUTANT_ENV).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the worker plans of one process: one plan runs on this thread exactly
+/// as [`graph_run_worker`]; several plans (the executor units one process
+/// group was split into) run one per thread.
+///
+/// Each thread builds and runs its own runtime from its own plan: its own
+/// transport node, step counter, gating clock, trace ring and READY sentinel,
+/// so the supervisor sees each unit as it sees a worker process. The units of
+/// one process share its fate: the first one to return, with an error or
+/// without, clears `running`, which stops the others at their next step
+/// boundary, and the process reports the worst outcome: an error, then a
+/// node-fatal verdict, then success.
+pub fn graph_run_worker_host(
+    workspace_root: &Path,
+    plan_paths: &[std::path::PathBuf],
+    running: Arc<AtomicBool>,
+) -> CliResult<()> {
+    match plan_paths {
+        [] => {
+            return Err(CliError::Validation(
+                "graph run-worker: no `--plan` given".to_string(),
+            ))
+        }
+        [one] => return graph_run_worker(workspace_root, one, running),
+        _ => {}
+    }
+    tracing::info!(
+        units = plan_paths.len(),
+        "worker process hosts several executor units, one thread each"
+    );
+    // The unit threads below share this process's descriptor table, and an
+    // open that grows a shared table waits for an RCU grace period. The table
+    // is sized here, before those threads start.
+    #[cfg(unix)]
+    {
+        let _ = cerulion_core::fd_limit::raise_open_file_limit();
+        if !descriptor_presize_skipped_by_mutant() {
+            let _ = cerulion_core::fd_limit::presize_descriptor_table();
+        }
+    }
+    /// Clears `running` when its unit's thread leaves `graph_run_worker`, by
+    /// return or by unwind, so a panicking unit stops its siblings and the
+    /// process exits instead of running on without it.
+    struct StopSiblingsOnExit(Arc<AtomicBool>);
+    impl Drop for StopSiblingsOnExit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let outcomes: Vec<CliResult<()>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan_paths.len());
+        for (i, path) in plan_paths.iter().enumerate() {
+            let unit_running = Arc::clone(&running);
+            let spawned = std::thread::Builder::new()
+                .name(format!("cerulion-unit-{i}"))
+                .spawn_scoped(scope, move || {
+                    let _stop = StopSiblingsOnExit(Arc::clone(&unit_running));
+                    graph_run_worker(workspace_root, path, unit_running)
+                });
+            match spawned {
+                Ok(handle) => handles.push(Ok(handle)),
+                Err(e) => {
+                    running.store(false, Ordering::Relaxed);
+                    handles.push(Err(CliError::Validation(format!(
+                        "graph run-worker: cannot start the thread for plan `{}`: {e}",
+                        path.display()
+                    ))));
+                }
+            }
+        }
+        handles
+            .into_iter()
+            .zip(plan_paths)
+            .map(|(handle, path)| match handle {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(CliError::Validation(format!(
+                        "graph run-worker: the executor thread for plan `{}` panicked",
+                        path.display()
+                    )))
+                }),
+                Err(refused) => Err(refused),
+            })
+            .collect()
+    });
+    let mut node_fatal: Vec<(String, String)> = Vec::new();
+    let mut first_error: Option<CliError> = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(()) => {}
+            Err(CliError::NodeFatal { nodes }) => node_fatal.extend(nodes),
+            Err(e) => {
+                tracing::error!(error = %e, "an executor unit of this worker process failed");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => crate::error::node_fatal_verdict(node_fatal),
+    }
+}
+
 /// Run ONE worker process of a multi-process deployment from
 /// its serialized [`WorkerPlan`](crate::multiprocess::WorkerPlan).
 ///
@@ -7289,22 +7501,10 @@ pub fn graph_run_worker(
         None => Arc::new(cerulion_core::clock::RealClock),
     };
 
-    // (4) init the process transport singleton on the shared, supervisor-minted
-    // iceoryx2 Config so every co-resident worker lands on ONE SHM namespace and
-    // their cross-group pub/sub connect.
-    let transport = cerulion_core::TransportManager::init_with_config(
-        cerulion_core::TransportConfig {
-            node_name: plan.node_name.clone(),
-            clock: Arc::clone(&clock_dyn),
-            subscriber_buffer_size: 16,
-            // Mp workers are ALWAYS network-free - the separate
-            // GATEWAY process (spawned by the supervisor) owns the robot's
-            // whole network plane (one robot = one peer). Networked
-            // multi-process is first-class and never refused.
-            network: None,
-        },
-        ix_config,
-    )?;
+    // (4) the transport on the shared, supervisor-minted iceoryx2 Config, so
+    // every co-resident worker lands on ONE SHM namespace and their
+    // cross-group pub/sub connect.
+    let transport = worker_transport(&plan, Arc::clone(&clock_dyn), ix_config)?;
 
     // (5) OPEN (not create) the shared barrier the supervisor OWNS. Bounded retry:
     // exec startup races the supervisor's `create_owned`, so the segment may be
@@ -7612,12 +7812,11 @@ pub fn graph_run_worker(
 
     // Park the worker's shared-config TransportManager so a
     // tier-2 `Blocking` external-source doorbell mints on THIS manager — the
-    // same explicit wiring as the monolith live arm. Belt-and-suspenders here:
-    // `init_with_config` above primed the process-global singleton with this
-    // SAME manager (`INSTANCE.get_or_init` in `transport/mod.rs`), so the
-    // doorbell fallback chain (`resolve_doorbell_transport`: parked handle →
-    // `TransportManager::get()` singleton) already resolves to it; parking makes
-    // the wiring explicit and immune to a future non-singleton worker transport.
+    // same explicit wiring as the monolith live arm. A plan that is its own
+    // process also primed the process-global singleton with this SAME manager,
+    // so the doorbell fallback chain (`resolve_doorbell_transport`: parked
+    // handle → `TransportManager::get()` singleton) resolves to it either way;
+    // a hosted unit's detached manager is reachable only through this parking.
     runtime.set_live_transport(Arc::clone(&transport));
     // Let `graph pause` hold this rank at a step boundary.
     #[cfg(unix)]
@@ -9327,10 +9526,18 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
                 }
             }
             ChildPoll::Exited(status) => {
-                deaths.push((g.group.clone(), format!("exited {status}")));
+                deaths.extend(
+                    g.units()
+                        .into_iter()
+                        .map(|u| (u, format!("exited {status}"))),
+                );
             }
             ChildPoll::Lost => {
-                deaths.push((g.group.clone(), "unpollable (Lost)".to_string()));
+                deaths.extend(
+                    g.units()
+                        .into_iter()
+                        .map(|u| (u, "unpollable (Lost)".to_string())),
+                );
             }
         }
     }
@@ -9483,9 +9690,29 @@ pub(crate) struct ChildGuard {
     /// and the grace loop, and one loud line plus `debug!` repeats is the
     /// flood discipline every latch in this repo follows.
     peek_warned: bool,
+    /// The executor units this process runs when it runs more than one (a
+    /// worker host); empty for a process that is one unit, named `group`.
+    hosted: Vec<String>,
 }
 
 impl ChildGuard {
+    /// Record the executor units this worker process runs, so its exit is
+    /// reported as the departure of each of them.
+    pub(crate) fn hosting(mut self, units: Vec<String>) -> Self {
+        self.hosted = units;
+        self
+    }
+
+    /// The units this process's exit takes down: its hosted units, or its own
+    /// group.
+    pub(crate) fn units(&self) -> Vec<String> {
+        if self.hosted.is_empty() {
+            vec![self.group.clone()]
+        } else {
+            self.hosted.clone()
+        }
+    }
+
     /// A guard that makes no group promise (the multi-process workers; the
     /// recorders, which are group leaders that never need the group
     /// family). The group-kill methods are not for this guard.
@@ -9496,6 +9723,7 @@ impl ChildGuard {
             group,
             leads_group: false,
             peek_warned: false,
+            hosted: Vec::new(),
         }
     }
 
@@ -9509,6 +9737,7 @@ impl ChildGuard {
             group,
             leads_group: true,
             peek_warned: false,
+            hosted: Vec::new(),
         }
     }
 
@@ -10425,6 +10654,209 @@ fn supervisor_precreate_error(
     ))
 }
 
+/// For `--single-process`: put every native node in one process group when
+/// that process splits into more than one executor unit, and say so, with what
+/// the flag opts out of (the auto-partition default, or the declared
+/// `process_groups:`). Returns whether it did. A non-real time source, the lockstep execution mode, a
+/// non-Unix host or a graph that is one unit keeps the single-process
+/// monolith (one level loop).
+fn single_process_hosts_units(
+    workspace_root: &Path,
+    config: &mut GraphConfig,
+    time_source: TimeSource,
+    execution_mode_request: Option<crate::multiprocess::ExecutionMode>,
+) -> CliResult<bool> {
+    let lockstep = matches!(
+        execution_mode_request,
+        Some(crate::multiprocess::ExecutionMode::Lockstep)
+    );
+    if time_source != TimeSource::Real || lockstep || !cfg!(unix) {
+        return Ok(false);
+    }
+    let mut one = config.clone();
+    let host = config.identity().to_string();
+    one.process_groups = [(
+        host.clone(),
+        one.native_nodes().map(|n| n.id.clone()).collect(),
+    )]
+    .into_iter()
+    .collect();
+    one.process_group_order = Vec::new();
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = source_entry_infos(
+        &workspace_root.join("nodes"),
+        &one,
+        "--single-process splits the process into executor units by each node's declared \
+         trigger policy",
+    )
+    .and_then(|entry_infos| {
+        crate::multiprocess::plan_executor_units(
+            &one,
+            &entry_infos,
+            crate::multiprocess::ExecutionMode::FreeRun,
+            true,
+            profile
+                .as_ref()
+                .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                    costs,
+                    label: label.as_str(),
+                }),
+        )
+        .map_err(CliError::from)
+    });
+    let units = match units {
+        Ok(units) => units,
+        Err(e) => {
+            tracing::warn!(
+                graph = %config.identity(),
+                error = %e,
+                "--single-process: the executor units could not be derived from the nodes' \
+                 source, so the process runs every node on one level loop"
+            );
+            return Ok(false);
+        }
+    };
+    if !units.plan.splits_any() {
+        return Ok(false);
+    }
+    // A graph that splits never reaches the monolith arm of the deployment
+    // match, which announces the opt-out, so this line carries it.
+    let unit_count = units.plan.units.get(&host).map_or(0, Vec::len);
+    if config.has_process_groups() {
+        tracing::info!(
+            graph = %config.identity(),
+            units = unit_count,
+            "--single-process: every node runs in one worker process, on its executor units, \
+             despite `process_groups:` (the declared groups are not executed)"
+        );
+    } else {
+        tracing::info!(
+            graph = %config.identity(),
+            units = unit_count,
+            "--single-process: every node runs in one worker process, on its executor units (no \
+             `process_groups:` in the graph; the multi-process auto-partition default is skipped)"
+        );
+    }
+    *config = one;
+    Ok(true)
+}
+
+/// The executor-unit groups a run of `config` executes, from the nodes' source
+/// declarations and the graph's profile; `None` (with a warn) when the source
+/// cannot be read, which the census reports on its own.
+fn run_unit_groups(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    execution_mode: crate::multiprocess::ExecutionMode,
+    real_clock: bool,
+) -> Option<indexmap::IndexMap<String, Vec<String>>> {
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        config,
+        "a run records the chain census of its executor units",
+    )
+    .ok()?;
+    let profile = load_unit_profile(workspace_root, config.identity());
+    match crate::multiprocess::plan_executor_units(
+        config,
+        &entry_infos,
+        execution_mode,
+        real_clock,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    ) {
+        Ok(units) => Some(units.plan.groups),
+        Err(e) => {
+            tracing::warn!(
+                graph = %config.identity(),
+                error = %e,
+                "this run's executor units could not be derived for its recorded chain census; \
+                 the census is judged against the process groups instead"
+            );
+            None
+        }
+    }
+}
+
+/// The graph's profile for the executor tick budget: the cost snapshot at
+/// [`default_artifact_path`], when one is present and usable.
+pub(crate) fn load_unit_profile(
+    workspace_root: &Path,
+    graph_name: &str,
+) -> Option<(cerulion_core::graph::PartitionCosts, String)> {
+    let path = default_artifact_path(workspace_root, graph_name);
+    let text = std::fs::read_to_string(&path).ok()?;
+    match parse_profile_artifact(&text).and_then(|a| a.to_costs()) {
+        Ok((costs, _isolated)) => Some((costs, path.display().to_string())),
+        Err(e) => {
+            tracing::warn!(
+                graph = %graph_name,
+                profile = %path.display(),
+                error = %e,
+                "the graph's profile is present but unusable; each process runs as one \
+                 executor unit, except a node that declares `isolate: true`"
+            );
+            None
+        }
+    }
+}
+
+/// Derive the deployment's executor units and log them: one line per unit of
+/// a process that hosts more than one, naming its nodes and why it starts.
+fn plan_supervisor_units(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    loaded_entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    execution_mode: crate::multiprocess::ExecutionMode,
+    real_clock: bool,
+) -> CliResult<crate::multiprocess::DeploymentUnits> {
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = crate::multiprocess::plan_executor_units(
+        config,
+        loaded_entry_infos,
+        execution_mode,
+        real_clock,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    for (host, reason) in &units.kept_whole {
+        tracing::info!(
+            graph = %config.identity(),
+            host = %host,
+            reason = %reason,
+            "executor units: this process group runs as one unit (one level loop)"
+        );
+    }
+    for (host, host_units) in units.plan.split_hosts() {
+        for unit in host_units {
+            let starts: Vec<String> = unit
+                .boundaries
+                .iter()
+                .map(|(node, b)| format!("{node}: {}", b.describe()))
+                .collect();
+            tracing::info!(
+                graph = %config.identity(),
+                host = %host,
+                unit = %unit.name,
+                nodes = ?unit.nodes,
+                starts = ?starts,
+                block_topics = ?unit.block_topics,
+                "executor unit: these nodes share one thread; the unit runs on its own executor"
+            );
+        }
+    }
+    Ok(units)
+}
+
 /// The multi-process SUPERVISOR — the path `graph_run` dispatches
 /// to when the graph YAML declares `process_groups:`.
 ///
@@ -10742,8 +11174,20 @@ fn graph_run_supervisor(
 
     // (5) PURE PLAN — one WorkerPlan per group (rank order): participant maps,
     // handed quantum, barrier/ready identifiers, subgraphs.
+    // Executor units: split every process group into units (chains on one
+    // thread each) before planning, so each unit gets its own worker plan and
+    // every edge between units the wiring of an edge between processes.
+    let units = plan_supervisor_units(
+        workspace_root,
+        &config,
+        &loaded_entry_infos,
+        execution_mode,
+        time_source == TimeSource::Real,
+    )?;
+    let config = units.config.clone();
     let mut plan = crate::multiprocess::plan_deployment(&config, &levels, tightest, &nonce)
         .map_err(CliError::from)?;
+    crate::multiprocess::stamp_hosts(&mut plan, &units.plan.hosts);
 
     // Run the FULL partition validator (contiguity + BRIDGE) at PLAN
     // time — PRE-SPAWN — so every surface (`graph partition`, `graph levels`,
@@ -11165,6 +11609,22 @@ fn graph_run_supervisor(
     let mut _capture_plane: Option<std::sync::Arc<cerulion_core::state_arm::MappedStateArm>> = None;
     #[cfg(unix)]
     let armed_tag: Option<String> = {
+        // An anchor forks the rank's process; a fork copies only the forking
+        // thread and every lock another thread holds at that instant, so a
+        // process running several units cannot be anchored by a fork.
+        let state_arm_tag = match (state_arm_tag.as_deref(), units.plan.splits_any()) {
+            (Some(_), true) => {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    hosts = ?units.plan.split_hosts().map(|(h, _)| h).collect::<Vec<_>>(),
+                    "flashback checkpoints are OFF for this run: at least one process hosts \
+                     more than one executor unit, and a checkpoint forks its process, which \
+                     copies one thread, so this run takes none"
+                );
+                None
+            }
+            (tag, _) => tag.map(str::to_string),
+        };
         let armed = state_arm_tag.as_deref().and_then(|tag| {
             // Every worker plan carries the SAME `handed_quantum_ns` by
             // construction (multiprocess.rs: it is the min over the full graph),
@@ -11726,52 +12186,65 @@ fn graph_run_supervisor(
     // — which is what made `deferred_producer_groups` render a constant.
     let rank_groups: std::collections::HashMap<u32, String> =
         group_ranks.iter().map(|(g, r)| (*r, g.clone())).collect();
-    for idx in crate::multiprocess::spawn_order(&plan) {
-        let w = &plan.workers[idx];
-        let plan_path = &plan_paths[idx];
-        let child = std::process::Command::new(&self_exe)
-            .args(["graph", "run-worker", "--plan"])
-            .arg(plan_path)
-            .current_dir(workspace_root)
-            .spawn()
-            .map_err(|e| {
-                CliError::Validation(format!(
-                    "graph run (multi-process): failed to spawn worker process for group '{}': {e}",
-                    w.group
-                ))
-            })?;
+    // One process per host: a plan without a host is its own process, and the
+    // plans of one host run as threads of one `graph run-worker` process.
+    'spawn: for (host, idxs) in crate::multiprocess::host_spawn_order(&plan) {
+        let mut command = std::process::Command::new(&self_exe);
+        command.args(["graph", "run-worker"]);
+        for &idx in &idxs {
+            command.arg("--plan").arg(&plan_paths[idx]);
+        }
+        let child = command.current_dir(workspace_root).spawn().map_err(|e| {
+            CliError::Validation(format!(
+                "graph run (multi-process): failed to spawn worker process for group '{host}': {e}"
+            ))
+        })?;
         let pid = child.id();
         tracing::info!(
-            group = %w.group,
+            group = %host,
             pid,
-            nodes = w.subgraph.nodes.len(),
+            nodes = idxs
+                .iter()
+                .map(|&i| plan.workers[i].subgraph.nodes.len())
+                .sum::<usize>(),
+            units = idxs.len(),
             "spawned worker process"
         );
-        let mut guard = ChildGuard::new(child, w.group.clone());
-        // Block until READY / Ctrl-C, the child dies first, or the deadline
-        // elapses. On an `Err`, `guards` (already-spawned siblings) + `guard`
-        // drop → all children SIGKILLed + reaped.
-        match wait_for_ready_or_exit(
-            &mut guard,
-            Path::new(&w.ready_path),
-            &w.group,
-            &running,
-            READY_DEADLINE,
-        )? {
-            ReadyWait::Ready => guards.push(guard),
-            ReadyWait::CtrlC => {
-                // Stop spawning further workers; drain the ones already up (NOT
-                // a fail-loud - user-initiated). The JOIN loop below flips to
-                // Draining on its first pass (`running` is false) and
-                // SIGINTs every spawned worker, flipping each one's own
-                // `running` so its `wait_for_go` returns early and `run_live`
-                // exits at once (a directed kill to the supervisor pid never
-                // reached them; the process-group SIGINT covers only a real
-                // terminal Ctrl-C).
-                guards.push(guard);
-                break;
+        let mut guard = ChildGuard::new(child, host.clone());
+        if idxs.len() > 1 {
+            guard = guard.hosting(
+                idxs.iter()
+                    .map(|&i| plan.workers[i].group.clone())
+                    .collect(),
+            );
+        }
+        // Block until every plan of this process is READY, Ctrl-C, the child
+        // dies first, or the deadline elapses. On an `Err`, `guards`
+        // (already-spawned siblings) + `guard` drop → all children SIGKILLed +
+        // reaped.
+        for &idx in &idxs {
+            let w = &plan.workers[idx];
+            match wait_for_ready_or_exit(
+                &mut guard,
+                Path::new(&w.ready_path),
+                &w.group,
+                &running,
+                READY_DEADLINE,
+            )? {
+                ReadyWait::Ready => {}
+                ReadyWait::CtrlC => {
+                    // Stop spawning further workers; drain the ones already up
+                    // (NOT a fail-loud: user-initiated). The JOIN loop below
+                    // flips to Draining on its first pass (`running` is false)
+                    // and SIGINTs every spawned worker, flipping each one's own
+                    // `running` so its `wait_for_go` returns early and
+                    // `run_live` exits at once.
+                    guards.push(guard);
+                    break 'spawn;
+                }
             }
         }
+        guards.push(guard);
     }
 
     // (10.35) **DECLARE what this run's trace plane really is** —
@@ -12224,7 +12697,7 @@ fn graph_run_supervisor(
     // `crashed_groups` is the degraded-run ledger — the groups lost under
     // peer-loss=continue (used for the all-crashed→Err edge + the degraded summary).
     let drop_stall_grace = drop_stall_grace_from_env();
-    let total_workers = guards.len();
+    let total_workers: usize = guards.iter().map(|g| g.units().len()).sum();
     let mut crashed_groups: Vec<String> = Vec::new();
     // The groups whose worker exited `EXIT_NODE_FATAL`: a clean exit after a
     // node stopped on `NodeError::Fatal`. Folded into the verdict below (exit 3).
@@ -12273,13 +12746,16 @@ fn graph_run_supervisor(
 
         if let Some((i, poll)) = event {
             let group = guards[i].group.clone();
+            let units = guards[i].units();
             // Wedge alarm: this rank's worker is gone (exited, died, or became
             // unpollable) — stop watching its page. A dead worker's seq pairs
             // freeze by definition, so without this the alarm would fire on every
             // normal shutdown, naming nodes whose process no longer exists as
             // wedged. The departure itself is already reported by the arms below.
             #[cfg(unix)]
-            wedge_observer.retire(&group);
+            for unit in &units {
+                wedge_observer.retire(unit);
+            }
             let normal = state == JoinState::Normal && running.load(Ordering::Relaxed);
             match poll {
                 // Never stored as an event — the poll loop counts Running as alive.
@@ -12345,7 +12821,12 @@ fn graph_run_supervisor(
                                 // publish on a detached thread).
                                 publish_process_faults(
                                     config.identity(),
-                                    &[(group.clone(), format!("worker process died ({status})"))],
+                                    &units
+                                        .iter()
+                                        .map(|u| {
+                                            (u.clone(), format!("worker process died ({status})"))
+                                        })
+                                        .collect::<Vec<_>>(),
                                     worker_iox2_config.as_ref(),
                                 );
                                 // Write the DEPARTURE record FIRST, then
@@ -12356,7 +12837,9 @@ fn graph_run_supervisor(
                                 // bagd outcome is logged inside `finalize`.
                                 #[cfg(unix)]
                                 if let Some(plane) = trace_plane.as_mut() {
-                                    plane.record_departure(&group);
+                                    for unit in &units {
+                                        plane.record_departure(unit);
+                                    }
                                 }
                                 #[cfg(unix)]
                                 if let Some(rec) = recording.take() {
@@ -12375,7 +12858,10 @@ fn graph_run_supervisor(
                                 // (serial per-death graces would exceed the
                                 // survivors' ~5s boundary timeout at k >= 5 deaths
                                 // and cascade a partial loss into all-crashed).
-                                let mut batch = vec![(group.clone(), format!("exited {status}"))];
+                                let mut batch: Vec<(String, String)> = units
+                                    .iter()
+                                    .map(|u| (u.clone(), format!("exited {status}")))
+                                    .collect();
                                 let sweep = sweep_additional_deaths(&mut guards);
                                 batch.extend(sweep.deaths);
                                 // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12397,7 +12883,11 @@ fn graph_run_supervisor(
                                     &rank_groups,
                                     &mut credit_death_watch,
                                 );
-                                let survivors = guards.iter().filter(|g| !g.reaped()).count();
+                                let survivors: usize = guards
+                                    .iter()
+                                    .filter(|g| !g.reaped())
+                                    .map(|g| g.units().len())
+                                    .sum();
                                 match &barrier_owner {
                                     Some(barrier) => drop_dead_peers_batch(
                                         barrier,
@@ -12501,10 +12991,15 @@ fn graph_run_supervisor(
                             // for.
                             publish_process_faults(
                                 config.identity(),
-                                &[(
-                                    group.clone(),
-                                    "worker process became unpollable (Lost)".to_string(),
-                                )],
+                                &units
+                                    .iter()
+                                    .map(|u| {
+                                        (
+                                            u.clone(),
+                                            "worker process became unpollable (Lost)".to_string(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
                                 worker_iox2_config.as_ref(),
                             );
                             // Departure record FIRST, then finalize the
@@ -12513,7 +13008,9 @@ fn graph_run_supervisor(
                             // stays diagnosable; the deployment Err wins).
                             #[cfg(unix)]
                             if let Some(plane) = trace_plane.as_mut() {
-                                plane.record_departure(&group);
+                                for unit in &units {
+                                    plane.record_departure(unit);
+                                }
                             }
                             #[cfg(unix)]
                             if let Some(rec) = recording.take() {
@@ -12528,7 +13025,10 @@ fn graph_run_supervisor(
                         PeerLossPolicy::Continue => {
                             // The same batched sweep as the Exited(nonzero)
                             // arm — see the comment there.
-                            let mut batch = vec![(group.clone(), "unpollable (Lost)".to_string())];
+                            let mut batch: Vec<(String, String)> = units
+                                .iter()
+                                .map(|u| (u.clone(), "unpollable (Lost)".to_string()))
+                                .collect();
                             let sweep = sweep_additional_deaths(&mut guards);
                             batch.extend(sweep.deaths);
                             // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12550,7 +13050,11 @@ fn graph_run_supervisor(
                                 &rank_groups,
                                 &mut credit_death_watch,
                             );
-                            let survivors = guards.iter().filter(|g| !g.reaped()).count();
+                            let survivors: usize = guards
+                                .iter()
+                                .filter(|g| !g.reaped())
+                                .map(|g| g.units().len())
+                                .sum();
                             match &barrier_owner {
                                 Some(barrier) => drop_dead_peers_batch(
                                     barrier,
@@ -12959,6 +13463,138 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
     Ok(report)
 }
 
+/// `cerulion graph plan <name>`: the processes a free run of the graph starts
+/// and the executor units inside each, with the reason every unit starts.
+///
+/// The groups are the graph's `process_groups:`, or, when it declares none,
+/// the partition `graph run` derives in memory (process per node, or the
+/// cost-fused groups when the graph has a profile). Each group is split into
+/// units by the same derivation the run uses: with the graph's profile (its
+/// `graphs/<name>.costs.yaml`) the link rules and the tick budget; without
+/// one, one unit per process and one per node declaring `isolate: true`, and
+/// a node past an isolated node's level joins the earliest unit of the other
+/// nodes that starts at its level or feeds it at the level below, and
+/// otherwise starts a later unit.
+/// `--single-process` and the lockstep execution mode are not modelled: the
+/// view is the default free run.
+pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
+    let graphs_dir = workspace_root.join("graphs");
+    let (mut config, raw) = graph_read_raw(&graphs_dir, graph_name)?;
+    if config.prefix.is_empty() {
+        config.prefix = cerulion_core::graph::default_prefix(config.identity());
+    }
+    validate_graph(&config)?;
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        &config,
+        "graph plan splits the graph by each node's declared trigger policy",
+    )?;
+    let derived = !config.has_process_groups();
+    let config = if derived {
+        crate::partition_emit::run_auto_partition_preflight_with(
+            workspace_root,
+            graph_name,
+            config,
+            &raw,
+            &crate::partition_emit::PreflightOptions {
+                lenient_costs: true,
+                assume_yes: false,
+            },
+            // `graph plan` shows a free run, whose processes run units.
+            cerulion_core::graph::AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )?
+        .config
+    } else {
+        config
+    };
+    let profile = load_unit_profile(workspace_root, graph_name);
+    let units = crate::multiprocess::plan_executor_units(
+        &config,
+        &entry_infos,
+        crate::multiprocess::ExecutionMode::FreeRun,
+        true,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    Ok(render_unit_plan(
+        graph_name,
+        derived,
+        profile.as_ref().map(|(_, label)| label.as_str()),
+        &units,
+    ))
+}
+
+/// The text of [`graph_plan`].
+pub(crate) fn render_unit_plan(
+    graph_name: &str,
+    derived: bool,
+    profile: Option<&str>,
+    units: &crate::multiprocess::DeploymentUnits,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let unit_count: usize = units.plan.units.values().map(Vec::len).sum();
+    let _ = writeln!(
+        out,
+        "graph {graph_name}: {} process(es), {unit_count} executor unit(s)",
+        units.plan.units.len()
+    );
+    let _ = writeln!(
+        out,
+        "  groups: {}",
+        if derived {
+            "derived by graph run (no process_groups: in the graph)"
+        } else {
+            "the graph's process_groups:"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  units: {}",
+        match profile {
+            Some(label) => format!(
+                "from profile {label}: every node starts a unit, and a chain link merges where \
+                 the tick budget holds"
+            ),
+            None => "no profile, so each process runs as one unit; a node that declares \
+                     `isolate: true` runs in a unit of its own, and a node past an isolated \
+                     node's level joins the earliest unit of the other nodes that starts at its \
+                     level or feeds it at the level below, or else starts a later unit (a unit \
+                     runs a contiguous band of levels)"
+                .to_string(),
+        }
+    );
+    let whole: indexmap::IndexMap<&str, &str> = units
+        .kept_whole
+        .iter()
+        .map(|(h, r)| (h.as_str(), r.as_str()))
+        .collect();
+    for (host, host_units) in &units.plan.units {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "process {host}: {} unit(s)", host_units.len());
+        if let Some(reason) = whole.get(host.as_str()) {
+            let _ = writeln!(out, "  one unit: {reason}");
+        }
+        for unit in host_units {
+            let _ = writeln!(out, "  unit {}: {}", unit.name, unit.nodes.join(", "));
+            for (node, boundary) in &unit.boundaries {
+                let _ = writeln!(out, "    starts at {node}: {}", boundary.describe());
+            }
+            for topic in &unit.block_topics {
+                let _ = writeln!(out, "    kept together by the block edge on {topic}");
+            }
+        }
+    }
+    out
+}
+
 /// Derive per-INSTANCE `NodeInfo` from each node TYPE's
 /// source metadata — `parse_node_metadata` walks `nodes/<type>/src/lib.rs`
 /// once per type (memoized; K instances of one type parse once). Source is
@@ -12999,6 +13635,11 @@ pub(crate) fn source_entry_infos(
     // its own fire, and it runs before any node library is loaded, so a
     // discarded value would leave that rule decidable and never decided.
     //
+    // The node-level `tick_within_ms` deadline rides it too: executor-unit
+    // planning from source (`graph plan`, `--single-process`, a run's recorded
+    // census) refuses a merge whose summed p50 ticks reach a quarter of a
+    // member's deadline, as the planner over the loaded libraries does.
+    //
     // The REMAINING `InputMeta` fields are still the topology-safe defaults —
     // the CLI's `PortDef` knows nothing about depth or `expect_within_ms` — and
     // `schema_hash: 0` + `DEFAULT_CONSUMER_DEPTH` + no `expect_within_ms` are
@@ -13008,6 +13649,7 @@ pub(crate) fn source_entry_infos(
     type TypeInput = (String, bool, cerulion_core::graph::node::BackpressurePolicy);
     type TypeMeta = (
         Option<cerulion_core::MacroPolicy>,
+        Option<u64>,
         Option<u64>,
         Vec<TypeInput>,
     );
@@ -13045,10 +13687,15 @@ pub(crate) fn source_entry_infos(
                 .collect();
             type_meta.insert(
                 node_type.clone(),
-                (metadata.policy, metadata.throttle_ms, inputs),
+                (
+                    metadata.policy,
+                    metadata.throttle_ms,
+                    metadata.tick_within_ms,
+                    inputs,
+                ),
             );
         }
-        let (policy, throttle_ms, inputs) = &type_meta[&node_type];
+        let (policy, throttle_ms, tick_within_ms, inputs) = &type_meta[&node_type];
         let input_meta: Vec<cerulion_core::graph::node::InputMeta> = inputs
             .iter()
             .map(
@@ -13059,6 +13706,7 @@ pub(crate) fn source_entry_infos(
                     depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                     backpressure: *backpressure,
                     expect_within_ms: None,
+                    consume: Default::default(),
                 },
             )
             .collect();
@@ -13068,6 +13716,9 @@ pub(crate) fn source_entry_infos(
         }
         if let Some(throttle_ms) = *throttle_ms {
             info = info.with_throttle_ms(throttle_ms);
+        }
+        if let Some(tick_within_ms) = *tick_within_ms {
+            info = info.with_tick_within_ms(tick_within_ms);
         }
         entry_infos.insert(node_def.id.clone(), info);
     }
@@ -16452,6 +17103,187 @@ fn parse_execution_mode_env(
         Some("lockstep") => (Some(crate::multiprocess::ExecutionMode::Lockstep), false),
         Some("free_run") => (Some(crate::multiprocess::ExecutionMode::FreeRun), false),
         Some(_) => (None, true),
+    }
+}
+
+/// Whether the partitioner keeps every linear chain in one group for this run:
+/// a run on the real clock, on unix, outside the lockstep mode, whose
+/// processes execute their nodes in executor units.
+fn run_keeps_linear_chains(
+    time_source: TimeSource,
+    execution_mode_request: Option<crate::multiprocess::ExecutionMode>,
+) -> bool {
+    time_source == TimeSource::Real
+        && cfg!(unix)
+        && !matches!(
+            execution_mode_request,
+            Some(crate::multiprocess::ExecutionMode::Lockstep)
+        )
+}
+
+#[cfg(test)]
+mod chain_keeping_tests {
+    use super::*;
+    use crate::multiprocess::ExecutionMode;
+    use cerulion_core::graph::config::{InputDef, OutputDef};
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta};
+    use cerulion_core::graph::topology::{TriggerEdges, DEFAULT_CONSUMER_DEPTH};
+    use cerulion_core::graph::{
+        auto_partition, auto_partition_with_options, AutoPartition, AutoPartitionOptions, HopCosts,
+        PartitionCosts,
+    };
+    use cerulion_core::NodeInfo;
+    use indexmap::IndexMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `src` fans out to `mid` and `side`, so `mid -> tail` is the one linear
+    /// chain; every node costs 1000 ns and every edge has rate 0, so the cost
+    /// model alone fuses nothing, and chain keeping makes `mid -> tail` one
+    /// group.
+    fn chain_partition(options: AutoPartitionOptions) -> (AutoPartition, AutoPartition) {
+        let node = |id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: id.to_string(),
+            node_type: id.to_string(),
+            inputs,
+            outputs,
+        };
+        let out = |name: &str| OutputDef {
+            name: name.to_string(),
+            schema: "Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: None,
+        };
+        let inp = |name: &str, source: &str| InputDef {
+            name: name.to_string(),
+            source: source.to_string(),
+        };
+        let config = GraphConfig {
+            level_assignments: None,
+            network: None,
+            name: None,
+            identity: "chain".to_string(),
+            prefix: "p".to_string(),
+            nodes: vec![
+                node("src", vec![], vec![out("a"), out("b")]),
+                node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
+                node("tail", vec![inp("inp", "mid/m")], vec![]),
+                node("side", vec![inp("inp", "src/b")], vec![]),
+            ],
+            multi_publisher_topics: Vec::new(),
+            process_groups: IndexMap::new(),
+            process_group_order: Vec::new(),
+        };
+        let meta = InputMeta {
+            name: "inp".to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: DEFAULT_CONSUMER_DEPTH,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+            consume: cerulion_core::graph::node::InputConsume::Fifo,
+        };
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        for id in ["mid", "tail", "side"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![meta.clone()], vec![]),
+            );
+        }
+        let mut edges = TriggerEdges::new();
+        edges.insert("mid", "/p/src/a");
+        edges.insert("tail", "/p/mid/m");
+        edges.insert("side", "/p/src/b");
+        let costs = PartitionCosts {
+            node_p50_ns: ["src", "mid", "tail", "side"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        let isolated = BTreeSet::new();
+        let with = auto_partition_with_options(
+            &config, &infos, &edges, &costs, &isolated, 1_000_000, options,
+        )
+        .expect("derive");
+        let main =
+            auto_partition(&config, &infos, &edges, &costs, &isolated, 1_000_000).expect("derive");
+        (with, main)
+    }
+
+    /// The partition a run in `time_source` and `mode` takes, against
+    /// `auto_partition`'s own.
+    fn run_partition(
+        time_source: TimeSource,
+        mode: Option<ExecutionMode>,
+    ) -> (AutoPartition, AutoPartition) {
+        chain_partition(AutoPartitionOptions {
+            keep_linear_chains: run_keeps_linear_chains(time_source, mode),
+        })
+    }
+
+    /// A lockstep run takes `auto_partition`'s result byte for byte.
+    #[test]
+    fn a_lockstep_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::Real, Some(ExecutionMode::Lockstep));
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// A run on the virtual (simulated) clock takes `auto_partition`'s result
+    /// byte for byte.
+    #[test]
+    fn a_virtual_clock_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::Virtual, None);
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// A run on an external clock takes `auto_partition`'s result byte for
+    /// byte.
+    #[test]
+    fn an_external_clock_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::External, None);
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// The control: a free run on the real clock keeps the chain, so the
+    /// fixture does tell the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_free_run_on_the_real_clock_keeps_the_chain() {
+        let (run, main) = run_partition(TimeSource::Real, None);
+        assert_ne!(run.groups, main.groups);
+        let group_of = |p: &AutoPartition, id: &str| {
+            p.groups
+                .iter()
+                .find(|(_, members)| members.iter().any(|m| m == id))
+                .map(|(g, _)| g.clone())
+                .expect("every node is in a group")
+        };
+        assert_eq!(group_of(&run, "mid"), group_of(&run, "tail"));
+        assert_ne!(group_of(&main, "mid"), group_of(&main, "tail"));
+    }
+
+    /// Chains are kept whole only for a run whose processes run executor
+    /// units: the real clock outside the lockstep mode.
+    #[test]
+    fn only_a_free_run_on_the_real_clock_keeps_linear_chains() {
+        use crate::multiprocess::ExecutionMode;
+        assert_eq!(run_keeps_linear_chains(TimeSource::Real, None), cfg!(unix));
+        assert_eq!(
+            run_keeps_linear_chains(TimeSource::Real, Some(ExecutionMode::FreeRun)),
+            cfg!(unix)
+        );
+        assert!(!run_keeps_linear_chains(
+            TimeSource::Real,
+            Some(ExecutionMode::Lockstep)
+        ));
+        assert!(!run_keeps_linear_chains(TimeSource::Virtual, None));
+        assert!(!run_keeps_linear_chains(TimeSource::External, None));
     }
 }
 
@@ -22732,6 +23564,1102 @@ nodes:
         );
     }
 
+    /// Without a profile and without `isolate: true`, the nodes of a process
+    /// are ONE executor unit, as a process ran its nodes before units existed,
+    /// and `graph plan` says why. The case: one process group holding a 10 ms
+    /// producer, a relay it feeds and a join of both. With `isolate: true` on
+    /// the join, the join alone gets a unit of its own and the plan names the
+    /// key; on the relay, which alone feeds the join at the level below it,
+    /// the join also starts a unit past the relay's level, the first unit says
+    /// it does not hold every node, and the partition validator accepts every
+    /// unit.
+    #[test]
+    fn graph_plan_shows_one_unit_per_process_without_a_profile_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "upj_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: upj
+prefix: upj
+nodes:
+  - id: src
+    type: producer
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: mid
+    type: relay
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: join
+    type: joiner
+    inputs:
+      - name: a
+        source: src/out
+      - name: b
+        source: mid/out
+process_groups:
+  p0: [src, mid, join]
+";
+        let graph_file = ws.root.join("graphs").join("upj.yaml");
+        std::fs::write(&graph_file, yaml).unwrap();
+        assert!(
+            !default_artifact_path(&ws.root, "upj").exists(),
+            "precondition: the graph has no profile"
+        );
+
+        let plan = graph_plan(&ws.root, "upj").unwrap();
+        eprintln!("plan without isolate:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 1 executor unit(s)",
+            "  units: no profile, so each process runs as one unit; a node that declares \
+             `isolate: true` runs in a unit of its own, and a node past an isolated node's level \
+             joins the earliest unit of the other nodes that starts at its level or feeds it at \
+             the level below, or else starts a later unit (a unit runs a contiguous band of \
+             levels)",
+            "process p0: 1 unit(s)",
+            "  unit p0: src, mid, join",
+            "    starts at src: no profile: every node of this process that does not declare \
+             `isolate: true` runs in this unit",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+
+        let no_profile = "    starts at src: no profile: every node of this process that does not \
+                          declare `isolate: true` runs in this unit";
+        let isolating = |node_type: &str| {
+            let entry = format!("    type: {node_type}\n");
+            std::fs::write(
+                &graph_file,
+                yaml.replace(&entry, &format!("{entry}    isolate: true\n")),
+            )
+            .unwrap();
+            graph_plan(&ws.root, "upj").unwrap()
+        };
+
+        // The join, at the last level, isolated: it alone leaves the unit.
+        let plan = isolating("joiner");
+        eprintln!("plan with the join isolated:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 2 executor unit(s)",
+            "process p0: 2 unit(s)",
+            "  unit p0.src: src, mid",
+            no_profile,
+            "  unit p0.join: join",
+            "    starts at join: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+
+        // The relay, between the source and the join, isolated: a unit runs a
+        // contiguous band of levels, so the join starts a unit past it.
+        let plan = isolating("relay");
+        eprintln!("plan with the relay isolated:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "    starts at src: no profile: the nodes of this process that do not declare \
+             `isolate: true` run in this unit, apart from those in a unit that starts past an \
+             isolated node's level (a unit runs a contiguous band of levels)",
+            "  unit p0.mid: mid",
+            "    starts at mid: isolate: true",
+            "  unit p0.join: join",
+            "    starts at join: no profile: past level 1 of mid, which declares isolate: true, \
+             and no node of an earlier unit that does not declare isolate: true feeds it at the \
+             level below (a unit runs a contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("every node of this process that does not declare"),
+            "a cut process does not say every node runs in one unit; plan was:\n{plan}"
+        );
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// Without a profile, `isolate: true` takes out of the process's one unit
+    /// only the isolated node and the nodes a contiguous band of levels cannot
+    /// keep with the rest, and the partition validator accepts the split. Two
+    /// one-process graphs, each with one node isolated: a 10 ms source feeding
+    /// `fast` and `slow` (`slow` isolated) with `fast` feeding `sink`, where
+    /// `sink` is past slow's level but fed by `fast` at the level below; and
+    /// two sources `cam` and `lidar` (`lidar` isolated) feeding a join, which
+    /// `cam` feeds at the level below.
+    #[test]
+    fn graph_plan_keeps_in_the_one_unit_every_node_an_isolated_node_does_not_cut_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "keep_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let relay = |id: &str, source: &str, isolate: bool| {
+            format!(
+                "  - id: {id}\n    type: relay\n{}    inputs:\n      - name: inp\n        \
+                 source: {source}/out\n    outputs:\n      - name: out\n        schema: \
+                 geometry_msgs/Vector3\n",
+                if isolate { "    isolate: true\n" } else { "" }
+            )
+        };
+        let producer = |id: &str, isolate: bool| {
+            format!(
+                "  - id: {id}\n    type: producer\n{}    outputs:\n      - name: out\n        \
+                 schema: geometry_msgs/Vector3\n",
+                if isolate { "    isolate: true\n" } else { "" }
+            )
+        };
+        let fan = format!(
+            "name: fan\nprefix: fan\nnodes:\n{}{}{}{}process_groups:\n  p0: [src, fast, slow, \
+             sink]\n",
+            producer("src", false),
+            relay("fast", "src", false),
+            relay("slow", "src", true),
+            relay("sink", "fast", false),
+        );
+        std::fs::write(ws.root.join("graphs").join("fan.yaml"), fan).unwrap();
+        let fuse = format!(
+            "name: fuse\nprefix: fuse\nnodes:\n{}{}  - id: join\n    type: joiner\n    \
+             inputs:\n      - name: a\n        source: cam/out\n      - name: b\n        \
+             source: lidar/out\nprocess_groups:\n  p0: [cam, lidar, join]\n",
+            producer("cam", false),
+            producer("lidar", true),
+        );
+        std::fs::write(ws.root.join("graphs").join("fuse.yaml"), fuse).unwrap();
+
+        let no_profile = "    starts at src: no profile: every node of this process that does not \
+                          declare `isolate: true` runs in this unit";
+        let plan = graph_plan(&ws.root, "fan").unwrap();
+        eprintln!("fan plan:\n{plan}");
+        for line in [
+            "graph fan: 1 process(es), 2 executor unit(s)",
+            "  unit p0.src: src, fast, sink",
+            no_profile,
+            "  unit p0.slow: slow",
+            "    starts at slow: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+
+        let cam_heads = no_profile.replace("at src:", "at cam:");
+        let plan = graph_plan(&ws.root, "fuse").unwrap();
+        eprintln!("fuse plan:\n{plan}");
+        for line in [
+            "graph fuse: 1 process(es), 2 executor unit(s)",
+            "  unit p0.cam: cam, join",
+            cam_heads.as_str(),
+            "  unit p0.lidar: lidar",
+            "    starts at lidar: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// A `tick_within_ms` declared in node SOURCE reaches every path that
+    /// derives executor units from source: `graph plan`, `--single-process`
+    /// and the run's recorded census, as it reaches the planner that reads the
+    /// loaded libraries.
+    ///
+    /// The case: a 100 ms source feeding a sink, both profiled at 1 ms a tick,
+    /// the sink declaring `tick_within_ms = 4`. Merged, the unit's ticks sum to
+    /// 2 ms. Two ms times the budget divisor (4) stays under the 100 ms period
+    /// and reaches the 4 ms deadline, so the deadline alone keeps the sink in a
+    /// unit of its own.
+    #[test]
+    fn a_tick_deadline_in_node_source_splits_the_units_on_every_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "td_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "deadline_sink",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(tick_within_ms = 4)]
+#[derive(Default)]
+struct DeadlineSinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: td
+prefix: td
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: deadline_sink
+    inputs:
+      - name: inp
+        source: src/out
+process_groups:
+  p0: [src, sink]
+";
+        std::fs::write(ws.root.join("graphs").join("td.yaml"), yaml).unwrap();
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "td".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000_000u64),
+                ("sink".to_string(), 1_000_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![ProfileEdge {
+                producer: "src".to_string(),
+                consumer: "sink".to_string(),
+                rate_mhz: 10_000,
+            }],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "td"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let config = cerulion_core::graph::parse_graph_raw(yaml).unwrap();
+
+        let infos = source_entry_infos(&ws.nodes_dir, &config, "a unit oracle").unwrap();
+        let deadlines = (
+            infos["src"].tick_within_ms(),
+            infos["sink"].tick_within_ms(),
+        );
+        let plan = graph_plan(&ws.root, "td").unwrap();
+        let groups: Vec<String> = run_unit_groups(
+            &ws.root,
+            &config,
+            crate::multiprocess::ExecutionMode::FreeRun,
+            true,
+        )
+        .expect("the run's units derive from source")
+        .into_keys()
+        .collect();
+        let single_process_splits = cfg!(unix).then(|| {
+            let mut single = config.clone();
+            single_process_hosts_units(&ws.root, &mut single, TimeSource::Real, None).unwrap()
+        });
+        eprintln!(
+            "deadlines {deadlines:?}; census units {groups:?}; --single-process splits \
+             {single_process_splits:?}; plan:\n{plan}"
+        );
+
+        assert_eq!(
+            deadlines,
+            (None, Some(4)),
+            "the source metadata carries each node's declared tick deadline"
+        );
+        assert!(
+            plan.contains("graph td: 1 process(es), 2 executor unit(s)"),
+            "graph plan shows two units; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains(
+                "starts at sink: tick budget: the unit's p50 ticks would sum to 2000000 ns >= \
+                 1000000 ns, 1/4 of sink's 4000000 ns tick_within"
+            ),
+            "the sink starts its own unit on its deadline; plan was:\n{plan}"
+        );
+        assert_eq!(
+            groups,
+            vec!["p0.src", "p0.sink"],
+            "the run's census is judged against two units"
+        );
+        if let Some(splits) = single_process_splits {
+            assert!(
+                splits,
+                "--single-process runs the two units rather than one level loop"
+            );
+        }
+    }
+
+    /// `--single-process` on a graph that splits into executor units leaves
+    /// the monolith arm of the deployment match, so the opt-out that arm
+    /// announces (the auto-partition default skipped, or the declared groups
+    /// not executed) is announced where the units are hosted instead.
+    ///
+    /// The case: a 100 ms source feeding a data-triggered sink that declares
+    /// `isolate: true`, so two units. Written with no `process_groups:`, then
+    /// with a declared split the run does not execute, then without the key
+    /// (no profile: one unit, which stays the monolith and says nothing here),
+    /// and with `isolate: false` in its place (still one unit).
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_single_process_run_of_several_units_announces_what_it_opts_out_of() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "spu_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "sink",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct SinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: spu
+prefix: spu
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: sink
+    isolate: true
+    inputs:
+      - name: inp
+        source: src/out
+";
+        let host_all = |config: &GraphConfig| -> Vec<(String, Vec<String>)> {
+            config
+                .process_groups
+                .iter()
+                .map(|(g, ns)| (g.clone(), ns.clone()))
+                .collect()
+        };
+        let one_process = vec![(
+            "spu".to_string(),
+            vec!["src".to_string(), "sink".to_string()],
+        )];
+
+        let mut unpartitioned = cerulion_core::graph::parse_graph_raw(yaml).unwrap();
+        let split =
+            single_process_hosts_units(&ws.root, &mut unpartitioned, TimeSource::Real, None)
+                .unwrap();
+        assert!(split, "two units: the run hosts them in one worker process");
+        assert_eq!(host_all(&unpartitioned), one_process);
+        assert!(
+            logs_contain(
+                "on its executor units (no `process_groups:` in the graph; the multi-process \
+                 auto-partition default is skipped)"
+            ),
+            "an unpartitioned graph's opt-out names the skipped auto-partition default"
+        );
+
+        let mut declared = cerulion_core::graph::parse_graph_raw(&format!(
+            "{yaml}process_groups:\n  a: [src]\n  b: [sink]\n"
+        ))
+        .unwrap();
+        assert!(
+            single_process_hosts_units(&ws.root, &mut declared, TimeSource::Real, None).unwrap()
+        );
+        assert_eq!(host_all(&declared), one_process);
+        assert!(
+            logs_contain(
+                "on its executor units, despite `process_groups:` (the declared groups are not \
+                 executed)"
+            ),
+            "a declared split the run does not execute is named"
+        );
+
+        for (label, isolate) in [("no isolate key", ""), ("isolate: false", "false")] {
+            let line = if isolate.is_empty() {
+                String::new()
+            } else {
+                format!("    isolate: {isolate}\n")
+            };
+            let mut one_unit =
+                cerulion_core::graph::parse_graph_raw(&yaml.replace("    isolate: true\n", &line))
+                    .unwrap();
+            assert!(
+                !single_process_hosts_units(&ws.root, &mut one_unit, TimeSource::Real, None)
+                    .unwrap(),
+                "{label}: one unit, so the monolith arm runs it and announces the opt-out itself"
+            );
+            assert!(
+                one_unit.process_groups.is_empty(),
+                "{label}: the monolith keeps the graph as written"
+            );
+        }
+    }
+
+    /// A workspace whose graph `lb` holds one process group `p0`: `src`, a
+    /// 10 ms source, feeds `sink`, and `beacon`, a 10 ms period node, sits at
+    /// level 1 between them under `level_assignments:` (`src` 0, `beacon` 1,
+    /// `sink` 2). `sink_type` is `follower`, whose input is a chain link, or
+    /// `blocker`, whose input is a `block` edge that keeps `sink` with `src`;
+    /// `beacon` declares `isolate: true` when `beacon_isolated`. The profile
+    /// holds 1 us a tick for each and 100 Hz on the edge, so the tick budget
+    /// holds every merge.
+    fn level_band_workspace(
+        sink_type: &str,
+        beacon_isolated: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "lb_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "follower",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct FollowerNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "blocker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct BlockerNode {
+    #[input(trigger, backpressure = block, depth = 4)]
+    inp: Vector3,
+}
+"#,
+        );
+        let beacon_isolate = if beacon_isolated {
+            "    isolate: true\n"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            "\
+name: lb
+prefix: lb
+level_assignments:
+  src: 0
+  beacon: 1
+  sink: 2
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: {sink_type}
+    inputs:
+      - name: inp
+        source: src/out
+  - id: beacon
+    type: ticker
+{beacon_isolate}    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+process_groups:
+  p0: [src, sink, beacon]
+"
+        );
+        std::fs::write(ws.root.join("graphs").join("lb.yaml"), yaml).unwrap();
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "lb".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000u64),
+                ("sink".to_string(), 1_000u64),
+                ("beacon".to_string(), 1_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![ProfileEdge {
+                producer: "src".to_string(),
+                consumer: "sink".to_string(),
+                rate_mhz: 100_000,
+            }],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "lb"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let root = ws.root.clone();
+        (tmp, root)
+    }
+
+    /// With a profile, a chain link whose merged unit would skip the level of
+    /// a node that declares `isolate: true` stays split, and `graph plan`
+    /// names why; the isolated node keeps its unit and the validator accepts
+    /// every unit, so the process is not kept whole.
+    #[test]
+    fn graph_plan_keeps_a_profiled_link_split_across_an_isolated_nodes_level() {
+        let (_tmp, root) = level_band_workspace("follower", true);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        for line in [
+            "graph lb: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "  unit p0.sink: sink",
+            "    starts at sink: joining src's unit would leave level 1 out of the unit while it \
+             runs levels below and above it (a unit runs a contiguous band of levels)",
+            "  unit p0.beacon: beacon",
+            "    starts at beacon: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// A split the partition validator refuses keeps the process as one unit,
+    /// and says so at WARN, naming the process, the refusal and each node of
+    /// it that declares `isolate: true`. The case: the graph above with a
+    /// `block` edge from `src` to `sink`, which keeps them in one unit
+    /// whatever the other rules say, so their unit skips level 1.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_unit_split_keeps_the_process_whole_and_warns() {
+        let (_tmp, root) = level_band_workspace("blocker", true);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        assert!(
+            plan.contains("process p0: 1 unit(s)"),
+            "the refused split keeps p0 whole; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains(
+                "  one unit: its split is refused: Graph validation error: process group \
+                 'p0.src': owns non-adjacent global DAG levels [0, 2]"
+            ),
+            "graph plan names the refusal; plan was:\n{plan}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let hits = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "executor units: the partition validator refuses this process's split",
+            );
+            let named = lines.iter().any(|l| {
+                l.contains("executor units: the partition validator refuses this process's split")
+                    && l.contains("process=p0")
+                    && l.contains("owns non-adjacent")
+                    && l.contains("its nodes that declare `isolate: true` included")
+                    && l.contains("isolated=[\"beacon\"]")
+            });
+            if hits == 1 && named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly 1 WARN-level refusal line naming p0, the refusal and \
+                     beacon, got {hits} (named: {named})"
+                ))
+            }
+        });
+    }
+
+    /// The refused split of a process in which no node declares
+    /// `isolate: true` warns without claiming one does.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_split_with_no_isolated_node_warns_without_naming_one() {
+        let (_tmp, root) = level_band_workspace("blocker", false);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        assert!(
+            plan.contains("process p0: 1 unit(s)"),
+            "the refused split keeps p0 whole; plan was:\n{plan}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let refusals: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(
+                        "executor units: the partition validator refuses this process's split",
+                    )
+                })
+                .collect();
+            let hits = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "executor units: the partition validator refuses this process's split",
+            );
+            let named = refusals.iter().all(|l| {
+                l.contains("process=p0")
+                    && !l.contains("`isolate: true`")
+                    && !l.contains("isolated=")
+            });
+            if hits == 1 && refusals.len() == 1 && named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly 1 WARN-level refusal line naming p0 and no isolated \
+                     node, got {hits}: {refusals:?}"
+                ))
+            }
+        });
+    }
+
+    /// A workspace whose graph `ij` holds one process group `p0`: `src`, a
+    /// 10 ms source, feeds `mid`, which declares `isolate: true`, and the
+    /// join `join`, which `mid` also feeds and which declares
+    /// `isolate: false`. Derived levels: `src` 0, `mid` 1, `join` 2. The
+    /// profile holds 1 us a tick for each node and 100 Hz on each edge.
+    fn isolated_middle_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "ij_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: ij
+prefix: ij
+nodes:
+  - id: src
+    type: producer
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: mid
+    type: relay
+    isolate: true
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: join
+    type: joiner
+    isolate: false
+    inputs:
+      - name: a
+        source: src/out
+      - name: b
+        source: mid/out
+process_groups:
+  p0: [src, mid, join]
+";
+        std::fs::write(ws.root.join("graphs").join("ij.yaml"), yaml).unwrap();
+        let edge = |producer: &str, consumer: &str| ProfileEdge {
+            producer: producer.to_string(),
+            consumer: consumer.to_string(),
+            rate_mhz: 100_000,
+        };
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "ij".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000u64),
+                ("mid".to_string(), 1_000u64),
+                ("join".to_string(), 1_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![edge("src", "mid"), edge("src", "join"), edge("mid", "join")],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "ij"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let root = ws.root.clone();
+        (tmp, root)
+    }
+
+    /// With a profile, a join that declares `isolate: false` is not joined to
+    /// a producer whose unit would leave the level of a node that declares
+    /// `isolate: true` out of the joined unit: it keeps a unit of its own and
+    /// `graph plan` names why, and the isolated node keeps its unit.
+    #[test]
+    #[tracing_test::traced_test]
+    fn graph_plan_keeps_an_isolate_false_join_apart_from_a_producer_past_an_isolated_level() {
+        let (_tmp, root) = isolated_middle_workspace();
+        let plan = graph_plan(&root, "ij").unwrap();
+        eprintln!("plan:\n{plan}");
+        for line in [
+            "graph ij: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "  unit p0.mid: mid",
+            "    starts at mid: isolate: true",
+            "  unit p0.join: join",
+            "    starts at join: joining src's unit would leave level 1 out of the unit while it \
+             runs levels below and above it (a unit runs a contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+        assert!(
+            !logs_contain("executor units: the partition validator refuses"),
+            "no split is refused"
+        );
+    }
+
+    /// Every sentence of the user-facing pages that calls a `--single-process`
+    /// run the monolith, or says it mints no ring, stamps `lockstep` or has no
+    /// ranks, names the executor-unit condition it holds under. On the real
+    /// clock `single_process_hosts_units` runs a graph whose nodes split into
+    /// several units through the supervisor as one process group, so that run
+    /// mints the trace rings, free-runs and records one rank per unit; a graph
+    /// that is one unit stays the monolith.
+    ///
+    /// Each page is read as prose blocks (a paragraph, a table row or a
+    /// heading, whitespace-normalized, fenced code skipped), and each block is
+    /// split into sentences after a `.`, `!` or `?` followed by a space, so the
+    /// condition has to sit in the sentence that makes the claim.
+    #[test]
+    fn the_docs_tie_every_single_process_monolith_claim_to_the_executor_units() {
+        const PAGES: [&str; 5] = [
+            "multi_process.md",
+            "bag.md",
+            "flashback.md",
+            "replay_determinism_footguns.md",
+            "user-api.md",
+        ];
+        const SUBJECTS: [&str; 2] = ["--single-process", "single-process run"];
+        const CLAIMS: [&str; 10] = [
+            "monolith",
+            "mint no ring",
+            "mints no ring",
+            "mint none",
+            "no trace ring",
+            "no ranks",
+            "frames-only",
+            "cannot be re-run",
+            "one-rank lockstep",
+            "stamps `lockstep`",
+        ];
+        const CONDITIONS: [&str; 2] = ["executor unit", "one unit"];
+
+        fn prose_blocks(text: &str) -> Vec<String> {
+            let mut blocks: Vec<String> = Vec::new();
+            let mut paragraph: Vec<&str> = Vec::new();
+            let mut fenced = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                let breaks = fenced
+                    || trimmed.is_empty()
+                    || trimmed.starts_with("```")
+                    || trimmed.starts_with('|')
+                    || trimmed.starts_with('#');
+                if breaks && !paragraph.is_empty() {
+                    blocks.push(paragraph.join(" "));
+                    paragraph.clear();
+                }
+                if trimmed.starts_with("```") {
+                    fenced = !fenced;
+                } else if !fenced && !trimmed.is_empty() {
+                    if breaks {
+                        blocks.push(trimmed.to_string());
+                    } else {
+                        paragraph.push(trimmed);
+                    }
+                }
+            }
+            if !paragraph.is_empty() {
+                blocks.push(paragraph.join(" "));
+            }
+            blocks
+                .iter()
+                .map(|b| b.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect()
+        }
+
+        fn sentences(block: &str) -> Vec<&str> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            for (i, c) in block.char_indices() {
+                if matches!(c, '.' | '!' | '?') && block.as_bytes().get(i + 1) == Some(&b' ') {
+                    out.push(block[start..=i].trim());
+                    start = i + 1;
+                }
+            }
+            out.push(block[start..].trim());
+            out.retain(|s| !s.is_empty());
+            out
+        }
+
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let mut unqualified = Vec::new();
+        for page in PAGES {
+            let path = docs.join(page);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let mut claims = 0;
+            for block in prose_blocks(&text) {
+                for sentence in sentences(&block) {
+                    let lower = sentence.to_lowercase();
+                    if !SUBJECTS.iter().any(|s| lower.contains(s))
+                        || !CLAIMS.iter().any(|c| lower.contains(c))
+                    {
+                        continue;
+                    }
+                    claims += 1;
+                    if !CONDITIONS.iter().any(|c| lower.contains(c)) {
+                        unqualified.push(format!("docs/{page}: {sentence}"));
+                    }
+                }
+            }
+            assert!(
+                claims > 0,
+                "docs/{page} carries no sentence that says what a --single-process run is \
+                 not, so this test reads nothing there; update PAGES or CLAIMS"
+            );
+        }
+        assert!(
+            unqualified.is_empty(),
+            "these sentences say a --single-process run is the monolith without the condition \
+             that makes it one (a graph that is one executor unit); on the real clock a graph \
+             whose nodes split into several units runs them in one worker process, which mints \
+             the rings and records one rank per unit:\n\n{}",
+            unqualified.join("\n\n")
+        );
+    }
+
     /// What `graph run --record` hands the recorder is what
     /// arms live-topic discovery, and nothing pinned it.
     ///
@@ -25259,7 +27187,7 @@ nodes:
             prefix: "rr".to_string(),
             nodes: vec![
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "cam".to_string(),
@@ -25290,7 +27218,7 @@ nodes:
                     ],
                 },
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "cam2".to_string(),
@@ -25613,7 +27541,7 @@ nodes:
             identity: "rec_cfg_pin".to_string(),
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -25691,7 +27619,7 @@ nodes:
             identity: "rec_cfg_mp_pin".to_string(),
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -25774,7 +27702,7 @@ nodes:
             identity: "rec_cfg_fr_pin".to_string(),
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -28860,7 +30788,7 @@ nodes:
             identity: "vext".to_string(),
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "driver".to_string(),
@@ -28929,7 +30857,7 @@ nodes:
             identity: "vok".to_string(),
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -30872,7 +32800,7 @@ nodes:
             .find("let refuse_save = consent.assume_yes && wiring_overridden;")
             .expect("the save gate must be computed from --yes and the wiring judgement");
         let preflight = body
-            .find("run_auto_partition_preflight(")
+            .find("run_auto_partition_preflight_with(")
             .expect("the pre-flight must still be there");
         assert!(
             gate < preflight,
@@ -33304,7 +35232,7 @@ network:
             prefix: "p".to_string(),
             nodes: (0..n)
                 .map(|i| NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
@@ -37486,7 +39414,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             identity: "period".to_string(),
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -37545,7 +39473,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_multi_test".to_string(),
             nodes: vec![
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "fast".to_string(),
@@ -37560,7 +39488,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                     }],
                 },
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "slow".to_string(),
@@ -40374,6 +42302,7 @@ mod worker_tests {
             run_dir: None,
             wedge_page: None,
             pause_tag: None,
+            host: None,
         }
     }
 
@@ -40607,7 +42536,7 @@ mod worker_tests {
         }
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
@@ -40851,6 +42780,117 @@ mod worker_tests {
             err.to_string().contains("unparseable `ix_config_json`"),
             "expected the unparseable-config rejection, got: {err}"
         );
+    }
+
+    /// Every executor unit of a worker host runs on a transport carrying its
+    /// OWN clock: a unit's runtime refuses a transport built with another
+    /// clock, so two units in one process that shared the process singleton
+    /// could not both build.
+    #[test]
+    #[serial_test::serial]
+    fn each_unit_of_a_worker_host_gets_a_transport_with_its_own_clock() {
+        let ix = crate::multiprocess::planning_ix_config(
+            "unit_transport",
+            &format!("{}", std::process::id()),
+        )
+        .expect("ix config");
+        let mut clocks = Vec::new();
+        let mut transports = Vec::new();
+        for (i, group) in ["g.a", "g.b"].into_iter().enumerate() {
+            let mut plan = minimal_plan("");
+            plan.group = group.to_string();
+            plan.node_name = format!("unit_transport_{i}");
+            plan.host = Some("g".to_string());
+            let clock: Arc<dyn cerulion_core::clock::Clock> =
+                Arc::new(cerulion_core::VirtualClock::new());
+            let transport =
+                worker_transport(&plan, Arc::clone(&clock), ix.clone()).expect("transport");
+            clocks.push(clock);
+            transports.push(transport);
+        }
+        for (i, (t, c)) in transports.iter().zip(&clocks).enumerate() {
+            assert!(
+                Arc::ptr_eq(&t.clock_arc(), c),
+                "unit {i}'s transport carries another unit's clock"
+            );
+        }
+    }
+
+    /// The plans of one host are one spawn entry, in spawn order; a plan
+    /// without a host is its own.
+    #[test]
+    fn host_spawn_order_puts_the_plans_of_one_host_in_one_process() {
+        let mut plan = crate::multiprocess::DeploymentPlan {
+            workers: Vec::new(),
+            barrier_ns: "ns".to_string(),
+            barrier_id: "id".to_string(),
+            expected: 3,
+        };
+        for (rank, (group, host)) in [
+            ("cam", None),
+            ("work.pace", Some("work")),
+            ("work.fast", Some("work")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut w = minimal_plan("{}");
+            w.group = group.to_string();
+            w.rank = rank;
+            w.host = host.map(str::to_string);
+            plan.workers.push(w);
+        }
+        let order = crate::multiprocess::host_spawn_order(&plan);
+        let mut flat: Vec<(String, Vec<String>)> = order
+            .iter()
+            .map(|(host, idxs)| {
+                (
+                    host.clone(),
+                    idxs.iter()
+                        .map(|&i| plan.workers[i].group.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        flat.sort();
+        assert_eq!(
+            flat,
+            vec![
+                ("cam".to_string(), vec!["cam".to_string()]),
+                (
+                    "work".to_string(),
+                    vec!["work.pace".to_string(), "work.fast".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// A host with several plans runs each one, and the first to stop clears
+    /// `running` for the others; an empty plan list is refused.
+    #[test]
+    fn a_worker_host_runs_every_plan_and_stops_them_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let mut w = minimal_plan("");
+            w.group = name.to_string();
+            let path = dir.join(format!("plan_{name}.json"));
+            std::fs::write(&path, serde_json::to_string(&w).expect("json")).expect("write");
+            paths.push(path);
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        let err = graph_run_worker_host(&dir, &paths, Arc::clone(&running))
+            .expect_err("a plan with no iceoryx2 config must fail");
+        assert!(
+            err.to_string().contains("empty `ix_config_json`"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "a unit that stopped must clear `running` for its siblings"
+        );
+        assert!(graph_run_worker_host(&dir, &[], Arc::new(AtomicBool::new(true))).is_err());
     }
 }
 
@@ -41525,6 +43565,7 @@ mod supervisor_tests {
             run_dir: None,
             wedge_page: None,
             pause_tag: None,
+            host: None,
         };
         DeploymentPlan {
             workers: vec![worker("a", 0), worker("b", 1)],
@@ -42338,7 +44379,7 @@ mod supervisor_tests {
         cfg.nodes = ids
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),

@@ -28,9 +28,9 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 
 use cerulion_core::graph::{
-    auto_partition, baseline_process_per_node, block_colocation_seeds, build_trigger_edges,
-    default_prefix, parse_graph_raw, validate_graph, GraphConfig, GraphTopology, LevelGrowth,
-    Levels, NodeInfo, TriggerEdges,
+    auto_partition_with_options, baseline_process_per_node, block_colocation_seeds,
+    build_trigger_edges, default_prefix, parse_graph_raw, validate_graph, AutoPartitionOptions,
+    GraphConfig, GraphTopology, LevelGrowth, Levels, NodeInfo, TriggerEdges,
 };
 
 use crate::error::{CliError, CliResult};
@@ -50,17 +50,17 @@ use crate::yaml_splice::{
 ///
 /// * `Some(artifact)` — thaw the cost snapshot (via
 ///   [`ProfileArtifact::to_costs`], which carries its own loud hand-edit
-///   validation) and run the cost-aware [`auto_partition`]: process-per-node
+///   validation) and run the cost-aware [`auto_partition`](cerulion_core::graph::auto_partition): process-per-node
 ///   baseline + validated greedy fusion under `budget_ns`.
 /// * `None` — no measured costs, so fall back to
 ///   [`baseline_process_per_node`]: every node in its own process (maximal
 ///   fault isolation). Deriving the baseline directly (rather than feeding
-///   [`auto_partition`] a synthesized zero-cost snapshot) keeps the fallback
+///   [`auto_partition`](cerulion_core::graph::auto_partition) a synthesized zero-cost snapshot) keeps the fallback
 ///   measurement-free — no fabricated per-node durations (Principle #13).
 ///
 /// Both arms name groups + order them identically (`grp_<lead>`, pipeline
 /// order) because they share the partitioner's internal assembly. Pure: the
-/// only effect is a `tracing::warn!` from [`auto_partition`] on a stray
+/// only effect is a `tracing::warn!` from [`auto_partition`](cerulion_core::graph::auto_partition) on a stray
 /// cost-snapshot key.
 ///
 /// The returned map drops straight into [`GraphConfig::process_groups`] and
@@ -92,16 +92,37 @@ pub fn derive_emit_groups(
     artifact: Option<&ProfileArtifact>,
     budget_ns: u64,
 ) -> CliResult<IndexMap<String, Vec<String>>> {
+    derive_emit_groups_with(
+        config,
+        entry_infos,
+        trigger_edges,
+        artifact,
+        budget_ns,
+        AutoPartitionOptions::default(),
+    )
+}
+
+/// [`derive_emit_groups`] with the partitioner's
+/// [`AutoPartitionOptions`]; the baseline (no artifact) takes no options.
+pub fn derive_emit_groups_with(
+    config: &GraphConfig,
+    entry_infos: &IndexMap<String, NodeInfo>,
+    trigger_edges: &TriggerEdges,
+    artifact: Option<&ProfileArtifact>,
+    budget_ns: u64,
+    options: AutoPartitionOptions,
+) -> CliResult<IndexMap<String, Vec<String>>> {
     match artifact {
         Some(artifact) => {
             let (costs, isolated) = artifact.to_costs()?;
-            let partition = auto_partition(
+            let partition = auto_partition_with_options(
                 config,
                 entry_infos,
                 trigger_edges,
                 &costs,
                 &isolated,
                 budget_ns,
+                options,
             )?;
             Ok(partition.groups)
         }
@@ -582,6 +603,7 @@ pub fn graph_partition(
             explicit_path: opts.costs_path.as_deref(),
             budget_ns: opts.budget_ns,
             lenient_default: false,
+            partition: AutoPartitionOptions::default(),
         },
         // The verb IS the refinement surface — it emits (or
         // removes) the `level_assignments:` block and bands the partition
@@ -670,6 +692,10 @@ struct CostsRequest<'a> {
     /// asked for cost-aware behavior). `false` (the verb + `--auto-partition`
     /// — the user asked for cost-aware) keeps the hard `Err`.
     lenient_default: bool,
+    /// The partitioner's options: the `graph run` pre-flight keeps linear
+    /// chains whole when the run executes in executor units; the verb never
+    /// does.
+    partition: AutoPartitionOptions,
 }
 
 /// The shared derive-and-render core of the partition flows — everything
@@ -913,12 +939,13 @@ fn derive_partition(
         // allowed; the only `0` arm is a node-less
         // graph, where refinement is vacuous (nothing to grow) and the emit
         // fails loudly at the empty-groups rewrite guard regardless.
-        let kahn_groups = derive_emit_groups(
+        let kahn_groups = derive_emit_groups_with(
             &kahn_view,
             &entry_infos,
             &trigger_edges,
             artifact.as_ref(),
             effective_budget_ns,
+            costs.partition,
         )?;
         let mut growth = if kahn_groups.len() > 1 {
             LevelGrowth::Deny
@@ -957,12 +984,13 @@ fn derive_partition(
                         .collect(),
                 )
             };
-            let groups = derive_emit_groups(
+            let groups = derive_emit_groups_with(
                 &candidate,
                 &entry_infos,
                 &trigger_edges,
                 artifact.as_ref(),
                 effective_budget_ns,
+                costs.partition,
             )?;
             Ok((refined, candidate, groups))
         };
@@ -1007,12 +1035,13 @@ fn derive_partition(
         // refine+band flow above — re-deriving here would risk banding over
         // levels other than the refinement's.
         Some(groups) => groups,
-        None => match derive_emit_groups(
+        None => match derive_emit_groups_with(
             &effective_config,
             &entry_infos,
             &trigger_edges,
             artifact.as_ref(),
             effective_budget_ns,
+            costs.partition,
         ) {
             Ok(groups) => groups,
             // On the zero-flag lenient path,
@@ -1035,12 +1064,13 @@ fn derive_partition(
                 //
                 // A structural retry failure propagates as-is (`?` — rustc
                 // 1.97's clippy::question_mark insists on the sugar here).
-                let groups = derive_emit_groups(
+                let groups = derive_emit_groups_with(
                     &effective_config,
                     &entry_infos,
                     &trigger_edges,
                     None,
                     effective_budget_ns,
+                    costs.partition,
                 )?;
                 let artifact_path = match &mode {
                     PartitionMode::Fused { artifact_path } => artifact_path.clone(),
@@ -1686,6 +1716,28 @@ pub fn run_auto_partition_preflight(
     raw: &str,
     opts: &PreflightOptions,
 ) -> CliResult<RunPartitionPreflight> {
+    run_auto_partition_preflight_with(
+        workspace_root,
+        graph_name,
+        config,
+        raw,
+        opts,
+        AutoPartitionOptions::default(),
+    )
+}
+
+/// [`run_auto_partition_preflight`] with the partitioner's
+/// [`AutoPartitionOptions`]. `graph run` passes
+/// [`AutoPartitionOptions::keep_linear_chains`] for a run that executes its
+/// processes' nodes in executor units (the free run on the real clock).
+pub fn run_auto_partition_preflight_with(
+    workspace_root: &Path,
+    graph_name: &str,
+    config: GraphConfig,
+    raw: &str,
+    opts: &PreflightOptions,
+    partition: AutoPartitionOptions,
+) -> CliResult<RunPartitionPreflight> {
     let &PreflightOptions {
         lenient_costs,
         assume_yes,
@@ -1727,6 +1779,7 @@ pub fn run_auto_partition_preflight(
             explicit_path: None,
             budget_ns: None,
             lenient_default: lenient_costs,
+            partition,
         },
         // The run preflight never refines: an
         // in-memory refined-levels override would band groups over levels

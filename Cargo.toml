@@ -62,6 +62,8 @@ members = [
     "crates/test_fixtures/test_node_macro_external_cdylib",
     # Macro-emitted DataTrigger round-trip fixture.
     "crates/test_fixtures/test_node_macro_data_trigger_cdylib",
+    # `#[input(trigger, consume = latest)]` across the cdylib info JSON.
+    "crates/test_fixtures/test_node_macro_consume_latest_cdylib",
     # The tick that NEVER RETURNS (env-switched), the one condition
     # the wedge alarm exists to report and the only fixture that can produce it.
     "crates/test_fixtures/test_node_hang_cdylib",
@@ -91,6 +93,9 @@ members = [
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
+    # A period cdylib whose tick is held open while a file exists; two
+    # instances of it must tick concurrently (per-instance lock pin).
+    "crates/test_fixtures/test_node_macro_gate_cdylib",
     # Raw-FFI cdylib whose info JSON declares a param but which exports no
     # cerulion_node_init_with_params symbol; the host must refuse it at info time.
     "crates/test_fixtures/test_node_params_no_symbol_cdylib",

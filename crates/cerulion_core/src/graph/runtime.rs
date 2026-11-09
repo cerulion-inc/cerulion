@@ -43,8 +43,8 @@ use crate::wire::MaxSliceLen;
 use super::config::{GraphConfig, DEFAULT_MAX_SLICE_LEN};
 use super::node::{
     flood_log_action, AnyPublisher, AnySubscriber, BackpressurePolicy, ExternalSource,
-    FloodLogAction, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo, OutputMeta,
-    ShutdownSignal,
+    FloodLogAction, InputConsume, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo,
+    OutputMeta, ShutdownSignal,
 };
 use super::tick_failure_latch::{TickFailureLatch, TickFailureLog};
 use super::topology::{GraphTopology, Levels};
@@ -1035,12 +1035,14 @@ fn edge_needs_producer_annotation(
     config.is_multi_publisher(topic) || provisioning == PublisherProvisioning::External
 }
 
-/// Can a publisher this process does not own write `topic`?
+/// Can a publisher outside this runtime's graph write `topic`?
 ///
 /// The same question [`edge_needs_producer_annotation`] asks, under the name the
 /// park's doorbell arming asks it by, so a reader narrowing one call site sees
-/// the other. The two terms are the two ways a writer the graph does not own is
-/// admitted: the `multi_publisher_topics:` opt-in, read off the config whatever
+/// the other. The graph is the one this runtime was built from: a whole process's
+/// graph, or one executor unit's cut of it, so a topic another unit of the same
+/// process produces has no in-graph producer here. The two terms are the two ways
+/// a writer the graph does not own is admitted: the `multi_publisher_topics:` opt-in, read off the config whatever
 /// the provisioning, and `External` provisioning, which is every topic with no
 /// in-graph producer. The opt-in ADMITS such a
 /// writer rather than guaranteeing one, so a `true` here is not proof a peer
@@ -1091,6 +1093,10 @@ struct DataTriggerBinding {
     /// key the consumer opens the matching SHM doorbell on. `Arc<str>` mirrors
     /// `node_id`.
     topic: Arc<str>,
+    /// The input declares `consume = latest`: its drains pop the whole queue
+    /// and serve the newest frame, and the node fires at most once per step.
+    /// `false` for the `fifo` default.
+    consume_latest: bool,
 }
 
 /// Per-input drain binding for a `Sync`/`UnboundedSync` node — the
@@ -2216,9 +2222,11 @@ struct RungTopics {
 /// returned, and every in-graph publish happens inside `step()`/`drain_level`,
 /// including the within-level fires, which run on the fire pool that `step()`
 /// joins before returning. So while that thread is blocked, no node of this
-/// runtime can ring. Hence `armable`: a line is armed only when a publisher this
-/// process does not own can write it, which
-/// [`topic_is_writable_from_outside`] answers over the resolved provisioning.
+/// runtime can ring. Hence `armable`: a line is armed only when a publisher
+/// outside this runtime's graph can write it (another process, or another
+/// executor unit of this process, each of which steps its own runtime on its own
+/// thread), which [`topic_is_writable_from_outside`] answers over the resolved
+/// provisioning.
 ///
 /// Both planes find the armed line by NAME, so the ordering decides nothing the
 /// park reads; it keeps the registry's positional accessors describing the same
@@ -3396,7 +3404,7 @@ pub struct GraphRuntime {
     monitor_wait_policy: crate::monitor_wait::MonitorWaitPolicy,
     /// Consumer-side SHM doorbell registry over the data-trigger + sync
     /// input topics, built only when `policy.doorbell`. Ordered by
-    /// [`rung_topics`]: the topics a publisher this process does not own can
+    /// [`rung_topics`]: the topics a publisher outside this runtime's graph can
     /// write come first in declared order, then the rest.
     /// `monitor_wait_block` arms the hardware monitor on the armed line's address,
     /// taken by topic, and poll-all-scans the registry for non-primary rings.
@@ -5382,7 +5390,7 @@ impl GraphRuntime {
         // same shape `cerulion graph levels` reports and every run records, so
         // one graph reads the same way from all three.
         {
-            let decision = super::chain::resolve_fusion(&config);
+            let decision = super::chain::resolve_fusion();
             let colocation = if config.has_process_groups() {
                 super::chain::Colocation::ProcessGroups(&config.process_groups)
             } else {
@@ -5547,6 +5555,34 @@ impl GraphRuntime {
             };
             for input in &node_def.inputs {
                 if snap_names.contains(&input.name) {
+                    snapshot_source_topics.insert(resolve_source(&config.prefix, &input.source));
+                }
+            }
+        }
+        // A `consume = latest` trigger input has the same borrow peak: its
+        // subscriber keeps a frame no tick has read borrowed through the next
+        // boundary's drain-to-latest (subscriber.rs `drain_for_trigger`), so
+        // with two or more newer frames queued behind it the drain's second
+        // receive is the third borrow, which fails with `ExceedsMaxBorrows`
+        // at the iceoryx2 default of 2. Its source topic takes the same raise,
+        // and with it the same open requirement: a service a foreign opener
+        // already created at the default refuses the build. Read on a
+        // `DataTrigger` node's named input only, the input the data-trigger
+        // wiring below treats as `latest`.
+        for node_def in &config.nodes {
+            let Some(info) = entry_infos.get(&node_def.id) else {
+                continue;
+            };
+            let Some(MacroPolicy::DataTrigger { input_name }) = info.policy.as_ref() else {
+                continue;
+            };
+            for input in &node_def.inputs {
+                if input.name == *input_name
+                    && info
+                        .input_meta
+                        .iter()
+                        .any(|m| m.name == input.name && m.consume == InputConsume::Latest)
+                {
                     snapshot_source_topics.insert(resolve_source(&config.prefix, &input.source));
                 }
             }
@@ -6060,7 +6096,8 @@ impl GraphRuntime {
                 );
             }
         }
-        // Raise borrowed-sample headroom on snapshot-source topics.
+        // Raise borrowed-sample headroom on snapshot-source topics (and on
+        // the sources of `consume = latest` trigger inputs, collected above).
         // A miss is a topology/`resolve_source` desync (topology records every
         // graph topic, and snapshot sources resolve to graph topics) — an
         // internal invariant violation, NOT user input. HARD-FAIL it here via
@@ -6386,6 +6423,9 @@ impl GraphRuntime {
         // Collected from each node's macro `throttle_ms()` in the loop below,
         // then composed into that node's pre-fire (defer if throttle OR block).
         let mut throttle_by_node: HashMap<String, u64> = HashMap::new();
+        // Nodes whose data-trigger input declares `consume = latest`, handed
+        // to the scheduler once every node exists in it.
+        let mut consume_latest_nodes: Vec<String> = Vec::new();
         // QoS watchdog registrations, drained into the
         // scheduler AFTER `add_node` (the node must exist before
         // `set_{expect,promise,tick}_within`). The `Arc<AtomicU64>` window
@@ -7713,7 +7753,25 @@ impl GraphRuntime {
                 // own wiring site below: per-set delivery consumes
                 // each member by exactly one set, so drain-to-latest there
                 // would serve the tick a frame the matcher never chose.
-                if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
+                //
+                // `consume = latest` opts OUT of all of that: the body
+                // subscriber keeps the drain-to-latest read a context input
+                // has, the scheduler collapses the node's pending arrivals to
+                // one fire per step, and no refill runs between fires. Read
+                // from the node's own `InputMeta`, the declaration both the
+                // macro and the cdylib info JSON carry.
+                let consume_latest = entry_info
+                    .input_meta
+                    .iter()
+                    .find(|m| m.name == *input_name)
+                    .is_some_and(|m| m.consume == InputConsume::Latest);
+                if consume_latest {
+                    // No service cursor is minted, so the node states no
+                    // `input_service` table and a mid-run resume keeps this
+                    // input's whole pre-anchor band, the degrade for an input
+                    // the recording states nothing about.
+                    consume_latest_nodes.push(node_def.id.clone());
+                } else if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
                     body_sub.mark_fifo_consume();
                     // Mint this input's SERVICE CURSOR here, at the
                     // ONE site that knows an input is per-message FIFO — so
@@ -7803,6 +7861,7 @@ impl GraphRuntime {
                         warn_suppressed: false,
                         drain: DrainSource::Unified { listener_idx: idx },
                         topic: Arc::<str>::from(trigger_topic.as_str()),
+                        consume_latest,
                     });
                     // Mark the BODY
                     // subscriber this Unified binding drains through, arming
@@ -8045,6 +8104,7 @@ impl GraphRuntime {
                         warn_suppressed: false,
                         drain: DrainSource::Separate { sub_idx: idx },
                         topic: Arc::<str>::from(trigger_topic.as_str()),
+                        consume_latest,
                     });
                 }
             }
@@ -8920,6 +8980,9 @@ impl GraphRuntime {
         for (node, within_ms) in tick_within_registrations {
             scheduler.set_tick_within(&node, within_ms)?;
         }
+        for node in &consume_latest_nodes {
+            scheduler.set_data_consume_latest(node)?;
+        }
         // Install ONE composed pre-fire per node that has block
         // edges and/or a throttle_ms cap. Defer if EITHER predicate fires.
         // The throttle + block actuators share the scheduler's single
@@ -9115,7 +9178,9 @@ impl GraphRuntime {
         // the live loop's poll cadence, never a same-frame re-fire.
         let mut refill_incapable: Vec<String> = Vec::new();
         for binding in &data_trigger_bindings {
-            if !matches!(binding.drain, DrainSource::Unified { .. }) {
+            // A `consume = latest` input fires once per step on the newest
+            // frame, so there is no burst to refill and nothing is installed.
+            if !matches!(binding.drain, DrainSource::Unified { .. }) || binding.consume_latest {
                 continue;
             }
             if refills_trigger_input.get(binding.node_id.as_ref()) != Some(&true) {
@@ -9403,7 +9468,8 @@ impl GraphRuntime {
         // Under an active doorbell policy, build the CONSUMER-side
         // doorbell registry over this graph's data-trigger + sync input topics,
         // ordered by `rung_topics` so the armed slot holds a topic a publisher
-        // this process does not own can write. `monitor_wait_block` arms the
+        // outside this graph (another process, or another executor unit of this
+        // process) can write. `monitor_wait_block` arms the
         // hardware monitor on the armed line's address, taken by topic, and
         // poll-all-scans the registry for non-primary rings. A
         // failed open is non-fatal: the live loop then falls back to the
@@ -9421,7 +9487,7 @@ impl GraphRuntime {
                 .map(|b| b.topic.to_string())
                 .collect();
             topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher this process does not own can write, read
+            // Which of them a publisher outside this graph can write, read
             // off the provisioning this build already RESOLVED per topic rather
             // than re-derived from the node list. `topic_is_writable_from_outside`
             // is true for a topic in the graph's `multi_publisher_topics` opt-in,
@@ -9451,7 +9517,7 @@ impl GraphRuntime {
                 tracing::debug!(
                     graph = %config.identity(),
                     topics = topics.len(),
-                    "no declared topic is writable from outside this process; the \
+                    "no declared topic is writable from outside this graph; the \
                      live loop keeps its bounded recheck and maps no doorbell page"
                 );
                 None
@@ -10912,8 +10978,9 @@ impl GraphRuntime {
                 // input: a data-trigger consumer or a PER-SET Sync
                 // one (whose trigger inputs are FIFO for the same
                 // reason and whose table therefore names EVERY one of them).
-                // Every other node (Period, legacy latest-per-set Sync,
-                // latest-only, no inputs at all) keeps `None`, because a
+                // Every other node (Period, legacy latest-per-set Sync, a
+                // `consume = latest` data trigger, latest-value inputs only, no
+                // inputs at all) keeps `None`, because a
                 // stated table is
                 // WRITTEN (the content-dependent version-2 tail), and stating
                 // an empty one for every node in the repo would grow every
@@ -13741,15 +13808,24 @@ impl GraphRuntime {
     ///
     /// # Which line, and what that costs
     ///
-    /// The registry's PRIMARY: the first declared topic a publisher this process
-    /// does not own can write ([`rung_topics`]) - exactly the line the CPU
-    /// monitor-wait primitive arms on Linux where the CPU carries one. A consumer of several topics is NOT
-    /// kernel-woken by a ring on a non-primary line; it observes that ring at the
-    /// next pacing chunk through the record-only poll-all, which is what it does
-    /// today and what a host whose hardware monitor watches one line does. So
-    /// this is a strict improvement on the primary edge and a change to
-    /// nothing else. A linear chain, the shape a multi-process split produces,
-    /// has one input topic per worker and is entirely primary.
+    /// The registry's PRIMARY: the first declared topic a publisher outside this
+    /// runtime's graph can write ([`rung_topics`]), exactly the line the CPU
+    /// monitor-wait primitive arms on Linux where the CPU carries one. A consumer
+    /// of several such topics is NOT kernel-woken by a ring on a non-primary line;
+    /// it observes that ring at the next pacing chunk through the record-only
+    /// poll-all, as a host whose hardware monitor watches one line does. A linear
+    /// chain has one input topic per runtime and is entirely primary. A join
+    /// with two or more armable inputs is not. Inside one process a join has
+    /// two or more when, for example, the executor-unit planner places it in a
+    /// unit that holds none of its producers: it declares `isolate: true`; from
+    /// a profile, no `isolate: false` or `block` coupling keeps it with its
+    /// producers; without one, it runs past an isolated node's level in a later
+    /// unit that holds none of them, or its producers all declare
+    /// `isolate: true`. Such a join takes the kernel wake on its first
+    /// armable input only and waits up to one pacing chunk for a frame on any
+    /// other, between two units of one process as between two processes.
+    /// `a_join_in_its_own_executor_unit_is_kernel_woken_only_by_its_first_armable_input`
+    /// in `monitor_wait_park_iox2_test` holds this.
     ///
     /// # Why it can never be worse than the nap it replaces
     ///
@@ -17180,6 +17256,14 @@ impl GraphRuntime {
         self.scheduler.replay_refill_shortfalls(node_id)
     }
 
+    /// Testing-only: does this node carry a between-fires refill hook? A
+    /// unified `fifo` data-trigger node does; a `consume = latest` one never
+    /// does. `None` for an unknown id.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn has_trigger_refill_for_test(&self, node_id: &str) -> Option<bool> {
+        self.scheduler.has_trigger_refill_for_test(node_id)
+    }
+
     /// Install the engine's INTRA-STEP injection callback — see
     /// [`crate::scheduler::Scheduler::set_replay_injection_hook`] for the
     /// contract and [`crate::scheduler::ReplayInjectionHook`] for what the hook
@@ -18495,6 +18579,7 @@ impl GraphRuntime {
             // hot-path-alloc-ok: not a heap allocation: cloning an `Arc`/`Option<Arc>` is a
             // refcount bump — the comment above says so, and `input_name` is an `Option<Arc<str>>`
             let input_name = self.data_trigger_bindings[i].input_name.clone();
+            let consume_latest = self.data_trigger_bindings[i].consume_latest;
 
             // Dispatch on the binding's `DrainSource` — the two
             // drain disciplines are mutually exclusive in the type system, so the
@@ -18764,11 +18849,15 @@ impl GraphRuntime {
                     // The SEPARATE discipline is untouched — it drains a
                     // dedicated subscriber that never re-offers, so its
                     // per-frame signals are per-frame truth.
+                    // A `consume = latest` drain pops the whole queue, so its
+                    // count may exceed one; the gate below mints at most one
+                    // signal either way, which is the one fire a latest input
+                    // gets per step.
                     debug_assert!(
-                        popped <= 1,
+                        popped <= 1 || consume_latest,
                         "unified trigger drain popped {popped} frames for node '{node_id}'; \
                          the mint gate below assumes the EachFifo pop-one contract \
-                         (every data-trigger input is marked `mark_fifo_consume`)"
+                         (every fifo data-trigger input is marked `mark_fifo_consume`)"
                     );
                     if popped > 0 && self.scheduler.pending_data_count(&node_id) == 0 {
                         if let Err(e) = self.scheduler.signal_data(&node_id) {
@@ -19866,6 +19955,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
 
         // Mixed: exactly the marked pair survives.
@@ -19910,7 +20000,7 @@ mod tests {
             nodes: nodes
                 .into_iter()
                 .map(|(id, inputs)| NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: id.to_string(),
@@ -19943,6 +20033,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 
@@ -20102,6 +20193,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let wired = |name: &str| InputDef {
             name: name.to_string(),
@@ -20170,6 +20262,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let wired = |name: &str, source: &str| InputDef {
             name: name.to_string(),
@@ -20183,7 +20276,7 @@ mod tests {
             topic: None,
         };
         let node = |inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "me".to_string(),
@@ -20551,7 +20644,7 @@ mod tests {
     /// topics match and the infinite-loop backstop fires.
     fn self_loop_node_def() -> crate::graph::config::NodeDef {
         crate::graph::config::NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "looper".to_string(),
@@ -20609,7 +20702,7 @@ mod tests {
     #[test]
     fn resolve_macro_data_trigger_input_non_self_source_returns_ok() {
         let node_def = crate::graph::config::NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
@@ -20631,7 +20724,7 @@ mod tests {
     #[test]
     fn resolve_macro_data_trigger_input_missing_input_errors() {
         let node_def = crate::graph::config::NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),

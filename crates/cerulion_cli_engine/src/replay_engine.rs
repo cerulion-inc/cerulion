@@ -10873,9 +10873,17 @@ fn node_trigger_decl(
             window_ns: None,
             trigger_inputs,
         },
-        Some(MacroPolicy::DataTrigger { input_name }) => replay_rederive::TriggerDecl::Data {
-            trigger_inputs: vec![input_name],
-        },
+        Some(MacroPolicy::DataTrigger { input_name }) => {
+            if consumes_latest(info, &input_name) {
+                replay_rederive::TriggerDecl::DataLatest {
+                    trigger_inputs: vec![input_name],
+                }
+            } else {
+                replay_rederive::TriggerDecl::Data {
+                    trigger_inputs: vec![input_name],
+                }
+            }
+        }
         // External / host-driven / undeclared: no rule to decline (the judge's
         // `Unmodelled` emits no stand-down, deliberately).
         Some(MacroPolicy::External) | None => replay_rederive::TriggerDecl::Unmodelled,
@@ -10990,24 +10998,33 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 /// How ONE input's drain consumes its queue.
 ///
 /// The rule is the graph runtime's own, at the one site that knows it: a
-/// `MacroPolicy::DataTrigger`'s NAMED input is marked `mark_fifo_consume` and
-/// every other input keeps drain-to-latest. Restated here because the marker is
-/// `pub(crate)` in `cerulion_core`, with the mirror named — a wrong `Latest`
-/// label costs a spurious stand-down (loud, safe), a wrong `EachFifo` one would
-/// let an infeasible schedule through, so the conservative direction is the
-/// default and the FIFO arm is the narrow one.
+/// `MacroPolicy::DataTrigger`'s NAMED input is marked `mark_fifo_consume`
+/// unless it declares `consume = latest`, and every other input keeps
+/// drain-to-latest. Restated here because the marker is `pub(crate)` in
+/// `cerulion_core`, with the mirror named: a wrong `Latest` label costs a
+/// spurious stand-down (loud, safe), a wrong `EachFifo` one would let an
+/// infeasible schedule through, so the conservative direction is the default
+/// and the FIFO arm is the narrow one.
 fn input_consume_mode(
     info: &cerulion_core::graph::NodeInfo,
     input: &str,
 ) -> replay_inject::ConsumeMode {
     match info.policy() {
         Some(cerulion_core::graph::node::MacroPolicy::DataTrigger { input_name })
-            if input_name == input =>
+            if input_name == input && !consumes_latest(info, input) =>
         {
             replay_inject::ConsumeMode::EachFifo
         }
         _ => replay_inject::ConsumeMode::Latest,
     }
+}
+
+/// Does `input` declare `consume = latest`? Read from the node's own
+/// `InputMeta`, the declaration the graph runtime wires from.
+fn consumes_latest(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+    info.input_meta()
+        .iter()
+        .any(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
 }
 
 /// Narrow a kind-6 record's `served_seq` slot to the `u32` the wire carries.
@@ -11460,10 +11477,11 @@ fn rank_step_targets(
 /// A rank with no entry here is one this function had nothing to plan from: its
 /// manifest could not be used, its census was declined, its bag carries no read
 /// record for the rank, or the bag states no staging rows at all (every pre-stamp
-/// bag). Each of those is a path the PASS already owns, with its own decline, its
-/// own warn and its own report field, and reproducing them here would be a second
-/// spelling of each; the pass plans for itself only in the no-rows case, where
-/// there was nothing to plan from before pass 0.
+/// bag, and the bag of a graph whose nodes have no input, which a fed replay
+/// feeds nothing). Each of those is a path the PASS already owns, with its own
+/// decline, its own warn and its own report field, and reproducing them here
+/// would be a second spelling of each; the pass plans for itself only in the
+/// no-rows case, where there was nothing to plan from before pass 0.
 // NINE arguments, every one a BAG or GRAPH fact this planning needs and none of
 // them derivable from another: the plans, the trace and its rank tables, the
 // graph config, the factories the declared node metadata is read from, the topic
@@ -11511,9 +11529,17 @@ fn plan_bag_side_admissions(
         }
         Err(_) => return Ok(BTreeMap::new()),
     };
+    // A graph whose nodes have no input wires no read stage on any rank, and the
+    // recorder writes staging rows only for a rank that wired one, so its bag
+    // states none and holds no read to place: nothing is planned and every pass
+    // feeds nothing. A graph with an input needs the rows.
+    let consumes = plans
+        .iter()
+        .any(|plan| !rank_consumed_edges(plan).is_empty());
     let rows =
         match (rims.per_edge, fed) {
             (Some(rows), _) => rows,
+            (None, Some(_)) if !consumes => return Ok(BTreeMap::new()),
             (None, Some(_)) => return Err(read_identity_refusal(
                 None,
                 "read_identity_unplanned",
@@ -17939,6 +17965,7 @@ mod node_trigger_decl_tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
             .with_policy(MacroPolicy::Sync { window_ms: 10 });
@@ -17982,6 +18009,53 @@ mod node_trigger_decl_tests {
                 trigger_inputs: both
             }
         );
+    }
+
+    /// A data-trigger node is judged by the latest rule exactly when its
+    /// trigger input declares `consume = latest`, and replay injects that
+    /// edge as drain-to-latest; the `fifo` default keeps the FIFO pair.
+    #[test]
+    fn a_latest_data_trigger_is_declared_and_injected_as_latest() {
+        use super::{input_consume_mode, replay_inject::ConsumeMode};
+        use cerulion_core::graph::node::InputConsume;
+        let data = |consume| {
+            NodeInfo::with_meta(
+                vec![InputMeta {
+                    name: "cam".to_string(),
+                    schema_hash: 0,
+                    trigger: true,
+                    depth: 4,
+                    backpressure: BackpressurePolicy::DropOldest,
+                    expect_within_ms: None,
+                    consume,
+                }],
+                vec![],
+            )
+            .with_policy(MacroPolicy::DataTrigger {
+                input_name: "cam".to_string(),
+            })
+        };
+        let wired = vec![InputDef {
+            name: "cam".to_string(),
+            source: "/cam".to_string(),
+        }];
+        let cam = vec!["cam".to_string()];
+        let latest = data(InputConsume::Latest);
+        let fifo = data(InputConsume::Fifo);
+        assert_eq!(
+            node_trigger_decl(&latest, &wired, None),
+            TriggerDecl::DataLatest {
+                trigger_inputs: cam.clone()
+            }
+        );
+        assert_eq!(
+            node_trigger_decl(&fifo, &wired, None),
+            TriggerDecl::Data {
+                trigger_inputs: cam
+            }
+        );
+        assert_eq!(input_consume_mode(&latest, "cam"), ConsumeMode::Latest);
+        assert_eq!(input_consume_mode(&fifo, "cam"), ConsumeMode::EachFifo);
     }
 }
 

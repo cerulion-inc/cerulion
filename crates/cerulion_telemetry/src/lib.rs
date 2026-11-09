@@ -17,6 +17,11 @@
 //!   sends, tagged `ci: true`.
 //! * **No key, no client.** [`Client::from_env`] is `None` unless
 //!   `POSTHOG_API_KEY` is set and consent resolves enabled.
+//! * **The network kill switch is read by each surface** ([`kill_switch`]):
+//!   [`Client::from_env`] does not read it. The CLI builds no client while
+//!   `CERULION_NETWORK` is set to a value that is not blank, and
+//!   `cerulion-vizd` reads it, with its own `CERULION_VIZD_NETWORK`, once at
+//!   start.
 //! * **Every property is guarded** (the `guard` module): keys must be in the
 //!   event's [`Allowlist`], and string values may not look like URLs, emails
 //!   or paths, nor exceed 128 chars. A rejected property is dropped and
@@ -28,6 +33,7 @@ pub mod client;
 pub mod consent;
 mod error;
 pub mod guard;
+pub mod kill_switch;
 #[cfg(feature = "posthog")]
 pub mod payload;
 pub mod rfc3339;

@@ -21,6 +21,15 @@ use crate::message_text::VerbError;
 /// How long the dial and handshake may take on top of the verb's own wait.
 const DIAL_ALLOWANCE: Duration = Duration::from_secs(20);
 
+/// The act verb `topic pub --robot` calls on the robot.
+pub const TOPIC_PUBLISH_VERB: &str = "topic-publish";
+
+/// The act verb `topic snapshot --robot` calls on the robot.
+pub const TOPIC_SNAPSHOT_VERB: &str = "topic-snapshot";
+
+/// The act verb `service call --robot` calls on the robot.
+pub const SERVICE_CALL_VERB: &str = "service-call";
+
 /// Call the act verb `verb` with `args` on the robot `robot`, allowing the
 /// verb `verb_wait` for its own waits, and return its JSON result.
 ///
@@ -187,7 +196,7 @@ pub fn robot_pub(
         "wait_subscribers_s": req.wait_subscribers.as_secs_f64(),
     });
     let wait = req.wait_subscribers.saturating_add(frames_wait);
-    let result = call_robot_verb(robot, "topic-publish", &args, wait)?;
+    let result = call_robot_verb(robot, TOPIC_PUBLISH_VERB, &args, wait)?;
     let count = |key: &str| {
         result
             .get(key)
@@ -230,7 +239,7 @@ pub fn robot_service_call(
         "request": req.request,
         "timeout_s": req.timeout.as_secs_f64(),
     });
-    let result = call_robot_verb(robot, "service-call", &args, req.timeout)?;
+    let result = call_robot_verb(robot, SERVICE_CALL_VERB, &args, req.timeout)?;
     response_line(result_str(&result, "response_text")?).map(str::to_string)
 }
 
@@ -263,7 +272,7 @@ pub fn robot_snapshot(
         "timeout_s": req.timeout.as_secs_f64(),
         "quality": req.quality,
     });
-    let result = call_robot_verb(robot, "topic-snapshot", &args, req.timeout)?;
+    let result = call_robot_verb(robot, TOPIC_SNAPSHOT_VERB, &args, req.timeout)?;
     write_snapshot(&result, req)
 }
 

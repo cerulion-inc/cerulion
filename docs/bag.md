@@ -538,11 +538,14 @@ tell the two apart.) Such a bag records frames and carries no
 `state_coverage.json`, so `bag play --resim` will refuse it: anchors for that
 run live in the standing recorder's captures. Whether it also carries a
 scheduler TRACE is a separate fact the run states under `trace_rings`: a
-multi-process run declares rings and the bag gets one; so does a
-`--single-process --record` run, which creates a rank-0 ring for its own
-recorder and declares it (`trace_rings: declared`, same as the multi-process
-shape). The monolith shapes that mint none (a plain `--single-process` run,
-`ros2 attach`, `node run`, an external time source) write no `trace_rings` key
+multi-process run declares rings and the bag gets one, and so does a
+`--single-process` run of a graph whose nodes split into several executor
+units, which runs them in one worker process; so does a
+`--single-process --record` run of a graph that is one unit, which creates a
+rank-0 ring for its own recorder and declares it (`trace_rings: declared`, same
+as the multi-process shape). The monolith shapes that mint none (a plain
+`--single-process` run of a graph that is one executor unit, `ros2 attach`,
+`node run`, an external time source) write no `trace_rings` key
 at all, so the bag reports the absence as the legacy by-omission cause and gets
 neither ring nor trace. Every UNKNOWN
 state proceeds instead, exactly as a manifest without the key does, and says so.
@@ -556,10 +559,11 @@ memory elsewhere; such a run gets frames and attachments but **no trace**, and
 `__cerulion/run.json`'s `trace` field says exactly that rather than leaving a
 reader to conclude the recorder lost something.
 
-The MONOLITH shapes (`--single-process`, `cerulion ros2 attach`, `node run`)
-mint no ring either, and that is a decision rather than an omission: their gating
-clock is WALL-driven, so a trace taken there would carry boundaries a resim
-cannot re-advance to, i.e. a `resimmable: true` that is confidently false.
+The MONOLITH shapes (`--single-process` on a graph that is one executor unit,
+`cerulion ros2 attach`, `node run`) mint no ring either, and that is a decision
+rather than an omission: their gating clock is WALL-driven, so a trace taken
+there would carry boundaries a resim cannot re-advance to, i.e. a
+`resimmable: true` that is confidently false.
 Routing them onto the recording clock's discipline is not implemented.
 
 No `bag record` flag can add a trace to a run already under way: the rings are
@@ -583,7 +587,7 @@ license a positive claim about WHY a bag carries no trace.
 | `declared` | Rings were created; `rings` names them | `from the attach point`, unless a declared RANK is missing (below) | **yes**: every multi-process `graph run`, recording or not |
 | `declined: <reason>` | The run DECLINED rings at launch, by CHOICE | `none: this run DECLINED …`, carrying the run's reason | **yes**: `graph run --no-rings` |
 | `unavailable: <reason>` | The run wanted rings and was REFUSED, by a resource gate or a run shape whose clock cannot produce a resimmable trace | `none: this run wanted … and could not have them` | **yes**: a `/dev/shm` free-space refusal, or a failed departure ring on a plain run |
-| *absent* | The run said nothing: an earlier binary, a MONOLITH shape (`--single-process` / `ros2 attach` / `node run`), or a declaration that was never written | the legacy `none: the run's manifest declared no trace rings …` | **yes**, on those shapes |
+| *absent* | The run said nothing: an earlier binary, a MONOLITH shape (`--single-process` on a graph that is one executor unit / `ros2 attach` / `node run`), or a declaration that was never written | the legacy `none: the run's manifest declared no trace rings …` | **yes**, on those shapes |
 | *anything else* | A state THIS BUILD does not know: a manifest written by a newer `cerulion` | `unknown: … a scheduler-trace state this build does not know (\`<token>\`) … upgrade this build to read it` | n/a: read, never written |
 
 A present-but-unreadable value and an absent key look identical to a reader
@@ -919,9 +923,11 @@ fact rather than a hedge.
 **A `free_run` bag is what a multi-process `graph run --record` produces by
 default.** The reader re-executes such a bag PER RANK. A `lockstep` stamp means
 one of two things: the run opted out with `CERULION_EXECUTION_MODE=lockstep`,
-or it was a MONOLITH recording (`--single-process --record`; a monolith has no
-ranks); the `lockstep` row above covers both. The variable is an execution-mode
-switch rather than a tuning knob; see
+or it was a MONOLITH recording (`--single-process --record` of a graph that is
+one executor unit; a monolith has no ranks); the `lockstep` row above covers
+both. A `--single-process --record` of a graph whose nodes split into several
+units runs them in one worker process and stamps `free_run`, one rank per unit.
+The variable is an execution-mode switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 

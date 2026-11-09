@@ -70,14 +70,13 @@
 //! `ReceiptLog::open` recovers the torn tail).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cerulion_link::{accept_frame_stream, Accepted, Connection, QuicOpsStream};
 
 use cerud::authz::Authorizer;
 use cerud::error::{CerudError, CerudResult};
-use cerud::lease::ControlLease;
 use cerud::receipt::ReceiptLog;
 use cerud::server::OpsServer;
 use cerud::transport::{CallerIdentity, OpsConnection};
@@ -137,13 +136,18 @@ impl OpsServing {
     /// `lease` is the shared control lease the `engage-estop` floor engages;
     /// the e-stop verb and the act verbs share one [`EstopLease`] over it, so
     /// an engage waiting for its lock is counted where the act verbs read it.
+    /// A bare `Arc<Mutex<ControlLease>>` becomes an `EstopLease` with a count
+    /// of its own; pass a clone of an `EstopLease` to share its count with
+    /// another plane, as the daemon does with the rcp plane. This plane's
+    /// `engage-estop` sends no `estop` to rcpd: the daemon adds that send from
+    /// its rcp link ([`crate::rcp`]).
     /// `sessions` is the CPace fallback session store; `clock` is the robot's
     /// TRUSTED clock the pairing verbs verify against; `log_root` is the
     /// `log-tail` allow-list root; `receipt_path` is the audit log.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared: SharedTrust,
-        lease: Arc<Mutex<ControlLease>>,
+        lease: impl Into<EstopLease>,
         sessions: SharedCodePairSessions,
         clock: RemotedClock,
         receipt_path: &Path,
@@ -151,7 +155,10 @@ impl OpsServing {
         server_name: impl Into<String>,
     ) -> Result<Self, RemotedError> {
         Self::for_host(
-            OpsHost::Daemon { lease },
+            OpsHost::Daemon {
+                lease: lease.into(),
+                rcpd: None,
+            },
             shared,
             sessions,
             clock,
@@ -338,15 +345,16 @@ fn verb_registry(
 ) -> VerbRegistry {
     let (restart, engage_estop, act_lease): (Box<dyn VerbHandler>, Box<dyn VerbHandler>, _) =
         match host {
-            OpsHost::Daemon { lease } => {
+            OpsHost::Daemon { lease, rcpd } => {
                 // One `EstopLease` for the plane: the e-stop verb engages through
-                // it and the act verbs read its count before each send.
-                let lease = EstopLease::new(lease);
-                (
-                    Box::new(RestartVerb::new()),
-                    Box::new(EngageEstopVerb::new(lease.clone())),
-                    Some(lease),
-                )
+                // it and the act verbs read its count before each send. With
+                // `rcpd`, the e-stop verb also sends an `estop` into rcpd.
+                let engage = EngageEstopVerb::new(lease.clone());
+                let engage = match rcpd {
+                    Some(rcpd) => engage.with_rcpd_estop(rcpd),
+                    None => engage,
+                };
+                (Box::new(RestartVerb::new()), Box::new(engage), Some(lease))
             }
             OpsHost::Embedded => (
                 Box::new(DaemonOnlyVerb::RESTART),
@@ -511,9 +519,7 @@ mod verb_set_tests {
     fn an_embedded_host_registers_every_daemon_verb_name() {
         // The authorizer classifies by name before dispatch, so the refusing
         // stand-ins must carry the daemon verbs' exact names.
-        let daemon = names(OpsHost::Daemon {
-            lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
-        });
+        let daemon = names(OpsHost::daemon());
         let expected = [
             "claim",
             "cloud-access",
@@ -532,6 +538,52 @@ mod verb_set_tests {
         ];
         assert_eq!(daemon, expected);
         assert_eq!(names(OpsHost::Embedded), expected);
+    }
+
+    #[test]
+    fn the_act_verbs_read_the_engage_count_the_daemon_lends() {
+        use std::time::{Duration, Instant};
+        let host = OpsHost::daemon();
+        let lent = host.estop_lease().expect("the daemon has an e-stop lease");
+        let registry = registry(host);
+        let publish = registry.get(crate::act_verbs::TOPIC_PUBLISH).unwrap();
+        let args = serde_json::json!({
+            "topic": "/ops_unit/latch",
+            "type": "nope_msgs/msg/Nope",
+            "message": {},
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        // An engage through the lent lease, as the rcp plane makes, waits for
+        // the lock this test holds; `topic-publish` must see it counted and
+        // refuse without taking that lock. Every guard is dropped before an
+        // assertion, so a failure never strands the scoped threads.
+        let held = lent.lock().unwrap();
+        let (counted, refusal) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                lent.engage("iroh:ab");
+            });
+            let until = Instant::now() + Duration::from_secs(10);
+            while !lent.engage_pending() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let counted = lent.engage_pending();
+            let args = &args;
+            scope.spawn(move || {
+                let _ = tx.send(publish.execute(args));
+            });
+            let refusal = rx.recv_timeout(Duration::from_secs(10));
+            drop(held);
+            (counted, refusal)
+        });
+        assert!(counted, "the lent lease did not count the engage");
+        let err = refusal
+            .expect("topic-publish waited for the held lock: it does not read the lent count")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the robot's e-stop is engaged, so topic-publish is refused"),
+            "{err}"
+        );
     }
 
     #[test]
