@@ -12,6 +12,9 @@
 //! - the live loop's wait sizing holds a deferred producer until its slot's
 //!   `block_timeout_ms` deadline, or until the drain that frees it, instead of
 //!   re-evaluating it at the 1 ms floor;
+//! - a held `external` producer whose event its doorbell already delivered
+//!   is released at its `block_timeout_ms` deadline on the live loop, not at
+//!   the 250 ms sweep;
 //! - the graph's `backpressure:` key turns a `drop_oldest` input into `block`;
 //! - a ring of `block` edges, `block` on a `network.ingress` topic, and the
 //!   graph's `backpressure: block` or `depth:` on an `#[input(accumulate)]`
@@ -22,8 +25,8 @@
 //! `block_accumulate_refusal_off` each make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::config::{
@@ -166,6 +169,52 @@ struct Relay {
 impl Relay {
     fn tick(&mut self) -> Result<(), NodeError> {
         self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// An `external` producer fed by a blocking read: each `()` the test sends is
+/// one event, which the runtime's helper thread rings on the node's doorbell.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct BlockingProducer {
+    #[output]
+    out: Vector3,
+    events: Option<mpsc::Receiver<()>>,
+    n: u32,
+}
+
+#[cerulion_node_impl]
+impl BlockingProducer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.n += 1;
+        self.out.x = self.n as f64;
+        Ok(())
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        let events = self
+            .events
+            .take()
+            .expect("the runtime queries the external source once");
+        ExternalSource::Blocking(Box::new(move || {
+            events.recv_timeout(Duration::from_millis(20)).is_ok()
+        }))
+    }
+}
+
+/// `block`, depth 2, on a period far past any test, so it never drains.
+#[cerulion_node(period_ms = 600000)]
+#[derive(Default)]
+struct IdleBlock {
+    #[input(backpressure = block, depth = 2)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl IdleBlock {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
         Ok(())
     }
 }
@@ -556,6 +605,130 @@ fn a_held_producer_with_no_timeout_waits_for_the_drain_that_frees_it() {
     assert!(
         freed <= Duration::from_millis(10),
         "once the slot has room the producer's own period stands: {freed:?}"
+    );
+}
+
+/// One live-loop iteration, waiting what the loop itself would wait.
+fn live_iteration(rt: &mut GraphRuntime) {
+    let wait = rt.live_timeout_for_test();
+    rt.run_live_step_once_for_test(wait);
+}
+
+/// Hand `events` one event and run the live loop until `done` holds.
+fn deliver_and_run_until(
+    rt: &mut GraphRuntime,
+    events: &mpsc::SyncSender<()>,
+    what: &str,
+    mut done: impl FnMut(&GraphRuntime) -> bool,
+) {
+    // A rendezvous channel: `send` returns once the helper thread has taken
+    // the event, just before it rings the doorbell.
+    events.send(()).expect("the helper thread takes the event");
+    let start = Instant::now();
+    while !done(rt) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the live loop never reached {what}"
+        );
+        live_iteration(rt);
+    }
+}
+
+#[test]
+fn a_held_external_producer_is_released_at_its_deadline_not_the_sweep() {
+    const TIMEOUT_MS: u64 = 10;
+    let (events, rx) = mpsc::sync_channel::<()>(0);
+    let cfg = config(
+        "bsr_ext_wait",
+        vec![
+            node("producer", "blocking_producer", vec![], vec![output("out")]),
+            node(
+                "stuck",
+                "idle_block",
+                vec![with_timeout(input("producer/out"), TIMEOUT_MS)],
+                vec![],
+            ),
+        ],
+    );
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "producer".to_string(),
+        Box::new(BlockingProducerEntry::with_state(BlockingProducer {
+            events: Some(rx),
+            ..Default::default()
+        })),
+    );
+    factories.insert("stuck".to_string(), Box::new(IdleBlockEntry::new()));
+    let mut rt = GraphRuntime::build_for_test(cfg, factories, Arc::new(VirtualClock::new()), 64)
+        .expect("build");
+    rt.collect_external_sources_for_test();
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        SWEEP,
+        "an external producer with no event pending adds no deadline"
+    );
+
+    // Two events fill the depth-2 slot, one fire each.
+    for k in 1..=2 {
+        deliver_and_run_until(&mut rt, &events, "the producer's fire", |rt| {
+            fires(rt, "producer") >= k
+        });
+    }
+    assert_eq!(
+        outstanding(&rt, "stuck"),
+        2,
+        "anti-vacuity: the slot is full"
+    );
+    assert_eq!(
+        deferred(&rt, "stuck"),
+        0,
+        "anti-vacuity: no evaluation has seen the slot full, so its stall clock starts at the next"
+    );
+
+    // The third event: the sweep drains the doorbell and marks the node, and
+    // the step that would fire it finds the slot full. Nothing else will ring.
+    deliver_and_run_until(&mut rt, &events, "the deferral", |rt| {
+        deferred(rt, "stuck") > 0
+    });
+    let held_at = Instant::now();
+    assert_eq!(fires(&rt, "producer"), 2, "the third event was deferred");
+    assert_eq!(releases(&rt, "stuck"), 0, "and the slot is still held");
+
+    let first_wait = rt.live_timeout_for_test();
+    let mut iterations = 0u32;
+    while releases(&rt, "stuck") == 0 {
+        assert!(
+            held_at.elapsed() < Duration::from_secs(5),
+            "the held slot was never released"
+        );
+        live_iteration(&mut rt);
+        iterations += 1;
+    }
+    let delay = held_at.elapsed();
+    println!(
+        "held external producer, block_timeout_ms = {TIMEOUT_MS}: first wait {first_wait:?}, \
+         released after {delay:?} in {iterations} live iteration(s); the sweep is {SWEEP:?}"
+    );
+    assert!(
+        first_wait <= Duration::from_millis(TIMEOUT_MS) && first_wait > FLOOR,
+        "the held event bounds the wait at its {TIMEOUT_MS} ms release deadline, not the {SWEEP:?} sweep: {first_wait:?}"
+    );
+    // Waiting out the sweep instead, with nothing else to wake the loop, the
+    // release lands no sooner than 250 ms after the deferral. The bound leaves
+    // a loaded host room for late wakes.
+    assert!(
+        delay < Duration::from_millis(200),
+        "the release lands near its {TIMEOUT_MS} ms deadline, before the {SWEEP:?} sweep: {delay:?}"
+    );
+    assert_eq!(
+        fires(&rt, "producer"),
+        3,
+        "the deferred event fires once, in the step that releases the slot"
+    );
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        SWEEP,
+        "served, the producer adds no deadline again"
     );
 }
 
