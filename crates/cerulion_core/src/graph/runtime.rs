@@ -16015,8 +16015,9 @@ impl GraphRuntime {
         // The members' event queues are emptied once every member of this
         // walk has fired, still inside the step; each fire read the frame its
         // drain froze. A frame a publisher outside the graph puts on a
-        // member's queue after that member's drain loses its wake event here,
-        // and the member's next call, one per step, drains it.
+        // member's queue after that member's drain loses its wake event here:
+        // it stays queued until a wake from another source starts a step, and
+        // that step's call of the member drains it.
         for call in &calls_now[start..end] {
             if let DrainSource::Unified { listener_idx } =
                 self.data_trigger_bindings[call.binding].drain
