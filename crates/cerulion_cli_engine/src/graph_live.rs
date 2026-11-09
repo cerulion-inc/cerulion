@@ -1645,11 +1645,12 @@ fn netd_contact_made(gather: &cerulion_netd::query::RunsGather) -> bool {
 // The commands.
 // ---------------------------------------------------------------------------
 
-/// The refusal `verb` gives while a query-side kill switch
-/// ([`crate::graph_cmd::query_network_kill`]) keeps this machine local-only.
-/// `None` when neither switch is engaged. `--connect` does not override an
-/// engaged switch.
-fn network_refusal(verb: &str, kill: &crate::graph_cmd::QueryNetworkKill) -> Option<String> {
+/// The refusal `verb` (`graph live` or `graph fires`) gives while a
+/// query-side kill switch ([`crate::graph_cmd::query_network_kill`]) keeps this
+/// machine local-only. `None` when neither switch is engaged. Neither
+/// `--robot` nor `--connect` overrides an engaged switch: both verbs always
+/// ask robots. The CLI gives this refusal before its login gate, exit 1.
+pub fn network_refusal(verb: &str, kill: &crate::graph_cmd::QueryNetworkKill) -> Option<String> {
     let mut labels: Vec<String> = kill.network.refusal_label().into_iter().collect();
     if kill.netd_off {
         labels.push(format!("{}=off", crate::graph_cmd::NETD_NETWORK_ENV));
@@ -1667,7 +1668,9 @@ fn network_refusal(verb: &str, kill: &crate::graph_cmd::QueryNetworkKill) -> Opt
 
 /// Refuse `verb` before it opens `cerulion-netd` or a session of its own
 /// while a kill switch is engaged: a runs or fires query is network traffic,
-/// and a fires query arms recording on the robot.
+/// and a fires query arms recording on the robot. The CLI refuses first,
+/// before its login gate ([`network_refusal`]); this check covers a call that
+/// does not come through it.
 fn refuse_under_kill_switch(verb: &str) -> CliResult<()> {
     match network_refusal(verb, &crate::graph_cmd::query_network_kill()) {
         Some(refusal) => Err(CliError::Validation(refusal)),
