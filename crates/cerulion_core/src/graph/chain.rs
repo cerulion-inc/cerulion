@@ -366,7 +366,7 @@ impl std::fmt::Display for ChainBar {
             }
             Self::BlockEdge => write!(
                 f,
-                "the input declares `block`, whose deferral a consumer running inside the producer's own fire could never reach"
+                "the input declares `block`, which defers the producer while the consumer is at threshold"
             ),
             Self::SampleEdge { window_ms } => write!(
                 f,
@@ -383,7 +383,7 @@ impl std::fmt::Display for ChainBar {
             ),
             Self::ConsumerThrottled { throttle_ms } => write!(
                 f,
-                "the consumer declares `throttle_ms = {throttle_ms}`, and a direct call has nowhere to defer to"
+                "the consumer declares `throttle_ms = {throttle_ms}`, which can defer its fire past the step its frame arrives in"
             ),
             Self::BlockInvolved { producer, consumer } => {
                 let who = match (*producer, *consumer) {

@@ -753,7 +753,7 @@ fn a_block_input_keeps_the_queued_path_and_makes_its_ends_serial() {
     );
     assert_eq!(
         sentence(&census, "block"),
-        "the input declares `block`, whose deferral a consumer running inside the producer's own fire could never reach"
+        "the input declares `block`, which defers the producer while the consumer is at threshold"
     );
     assert_eq!(
         sentence(&census, "block-involved"),
@@ -919,7 +919,7 @@ fn a_throttled_consumer_keeps_the_queued_path() {
     );
     assert_eq!(
         sentence(&census, "throttle"),
-        "the consumer declares `throttle_ms = 5`, and a direct call has nowhere to defer to"
+        "the consumer declares `throttle_ms = 5`, which can defer its fire past the step its frame arrives in"
     );
     assert_total(&census);
 }

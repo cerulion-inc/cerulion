@@ -1176,8 +1176,8 @@ run directory)
     n1 -> n2  on /p/n1/out
   queued by reason: throttle 1
   queued  /p/n0/out  n0 -> n1.inp
-    throttle: the consumer declares `throttle_ms = 5`, and a direct call has nowhere to \
-defer to
+    throttle: the consumer declares `throttle_ms = 5`, which can defer its fire past the step \
+its frame arrives in
 ";
     assert_eq!(
         report, expected,
