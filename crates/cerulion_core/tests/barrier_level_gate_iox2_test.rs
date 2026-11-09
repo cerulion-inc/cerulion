@@ -215,7 +215,7 @@ fn in_def(name: &str, source: &str) -> InputDef {
 /// A relay `NodeDef`: one trigger input `inp` from `source`, one output `out`.
 fn relay_node(id: &str, source: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -228,7 +228,7 @@ fn relay_node(id: &str, source: &str) -> NodeDef {
 /// The sink `NodeDef`: one trigger input `inp` from `source`, no output.
 fn sink_node(id: &str, source: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -2054,7 +2054,7 @@ fn period_source_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) 
         identity: "barrier_gate_period_src".to_string(),
         prefix: "blgp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "p0".to_string(),

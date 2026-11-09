@@ -57,7 +57,7 @@ impl Producer {
 fn producer(id: &str) -> NodeDef {
     NodeDef {
         params: Default::default(),
-        fuse: None,
+        isolate: None,
         ros2: None,
         id: id.to_string(),
         node_type: "Producer".to_string(),

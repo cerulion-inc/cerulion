@@ -1,0 +1,9 @@
+{
+  "customContext": {
+    "rules": [
+      {
+        "rule": "Never quote internal issue-tracker identifiers, ticket numbers or tracker links in review comments or the summary. Describe the work in plain words instead."
+      }
+    ]
+  }
+}
