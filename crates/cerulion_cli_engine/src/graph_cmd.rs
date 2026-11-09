@@ -10407,9 +10407,10 @@ fn stamp_credit_edges(
 }
 
 /// Stamp into each worker plan the paced-topic warnings whose producer node is
-/// in that worker's subgraph. A `block` topic's producers all run in the unit
-/// of its `block` consumers (a split multi-producer `block` edge is refused),
-/// so one worker logs each warning. Pure (plan in, plan out).
+/// in that worker's subgraph. A single-producer topic's producer node is in
+/// exactly one plan, and a multi-producer `block` topic's producers share one
+/// plan because its split is refused, so one worker logs each warning. Pure
+/// (plan in, plan out).
 fn stamp_paced_topic_warnings(
     plan: &mut crate::multiprocess::DeploymentPlan,
     warnings: &[cerulion_core::graph::PacedTopicWarning],

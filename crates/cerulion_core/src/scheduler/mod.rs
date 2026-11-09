@@ -2175,7 +2175,9 @@ impl Scheduler {
     }
 
     /// Nanoseconds until the soonest pending fire, or `None` if no enabled
-    /// node has one. A Period node reports its next deadline; a node due NOW
+    /// node has one with a deadline: a node held by a `block` slot that only
+    /// a drain or a release frees contributes none. A Period node reports its
+    /// next deadline; a node due NOW
     /// reports 0: a Data node carrying a FIFO backlog, a Sync node carrying a
     /// Sync backlog (a complete aligned set it has not fired), or an External
     /// node with a pending mark (a fire a pre-fire check deferred). PURE
