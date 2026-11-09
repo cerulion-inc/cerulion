@@ -73,6 +73,9 @@
 //! - [`flashback`]: publishes a capture request when the ops-plane e-stop is engaged.
 //! - [`rcp`]: the `cerulion/rcp/1` plane, an MCP proxy from a paired desk to the
 //!   robot's local `cerulion-rcpd`, checking every message per MCP method.
+//! - [`shutdown`]: the [`ShutdownStage`](shutdown::ShutdownStage) the serving
+//!   loop runs before the daemon tears down, and the binary's hard-exit
+//!   deadline.
 //! - [`clock`]: the robot's TRUSTED clock for pairing verification (never a
 //!   client-supplied time).
 //!
@@ -109,6 +112,7 @@ mod private_file;
 pub mod provision;
 pub mod rcp;
 pub mod robot_settings;
+pub mod shutdown;
 pub mod tap;
 pub mod trust;
 pub mod verbs;

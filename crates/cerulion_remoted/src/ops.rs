@@ -106,6 +106,7 @@ use crate::pairing_verbs::{
     ClaimVerb, CodePairFinishVerb, CodePairStartVerb, EngageEstopVerb, PairVerb, PresentGrantVerb,
     SharedCodePairSessions,
 };
+use crate::shutdown::ShutdownStage;
 use crate::trust::SharedTrust;
 use crate::verbs;
 
@@ -147,6 +148,9 @@ pub struct OpsServing {
     /// tests via [`OpsServing::with_deadline_for_test`] so the stalled-session
     /// unwedge can be pinned without a 2-minute wait.
     deadline: Duration,
+    /// The stage the serving loop runs after its accept loop stops and before
+    /// the daemon tears down ([`crate::shutdown`]).
+    shutdown: ShutdownStage,
 }
 
 impl OpsServing {
@@ -204,6 +208,9 @@ impl OpsServing {
         log_root: PathBuf,
         server_name: impl Into<String>,
     ) -> Result<Self, RemotedError> {
+        let shutdown = ShutdownStage::default();
+        #[cfg(feature = "test-seam")]
+        crate::shutdown::register_probe_for_test(&shutdown, host.rcpd_estop());
         let verbs = verb_registry(host, &shared, sessions, clock, log_root);
         let authorizer: Box<dyn Authorizer> = Box::new(PairingAuthorizer::from_shared(shared));
         let receipts = ReceiptLog::open(receipt_path).map_err(|e| {
@@ -216,7 +223,17 @@ impl OpsServing {
         Ok(OpsServing {
             server: Arc::new(server),
             deadline: OPS_SESSION_DEADLINE,
+            shutdown,
         })
+    }
+
+    /// The stage the serving loop runs after its accept loop stops, while this
+    /// plane's receipt sink is alive (the endpoint too after a stop request;
+    /// see [`crate::shutdown`]); each
+    /// [`ShutdownParticipant`](crate::shutdown::ShutdownParticipant) registered
+    /// on it is driven to settlement there.
+    pub fn shutdown_stage(&self) -> &ShutdownStage {
+        &self.shutdown
     }
 
     /// Override the per-session deadline (tests only) so the deadline-unwedge +

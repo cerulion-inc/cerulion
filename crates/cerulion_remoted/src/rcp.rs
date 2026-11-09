@@ -202,8 +202,9 @@ pub const UPSTREAM_CODE: i64 = -32603;
 
 /// How long a TCP connect to rcpd may take. rcpd is on loopback, where a
 /// connect either completes at once or is refused, so this only bounds a
-/// wedged host; not tunable.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// wedged host; not tunable. [`RcpdEstop::shut_down`] waits this long for a
+/// delivery in flight.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Frames queued for the desk per session; the byte budget
 /// ([`RcpLimits::session_buffer_bytes`]) is the bound that matters, this only
@@ -2186,6 +2187,12 @@ impl RcpdEstop {
         let task = self.runtime.spawn(run);
         *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
         true
+    }
+
+    /// Whether [`RcpdEstop::shut_down`] has marked the daemon stopping.
+    #[cfg(feature = "test-seam")]
+    pub(crate) fn is_stopping(&self) -> bool {
+        *self.stop.borrow()
     }
 
     /// End the delivery in flight, if any: mark the daemon stopping, then wait

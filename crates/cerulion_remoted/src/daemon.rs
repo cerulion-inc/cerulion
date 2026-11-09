@@ -57,7 +57,9 @@ const MAX_HELLO_LEN: usize = 4096;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Build the daemon from config and serve until `shutdown` resolves (or the
-/// endpoint closes).
+/// endpoint closes). `shutdown` is dropped as soon as the accept loop stops,
+/// before anything is logged and before the shutdown stage runs, or before the
+/// kill-switch line when `run` will not serve.
 ///
 /// Honors the `--network off` / `CERULION_NETWORK=off` kill-switch: if
 /// engaged, it logs loudly and exits cleanly WITHOUT binding an endpoint.
@@ -69,6 +71,9 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     if config.network_disabled {
+        // Dropped before the line below, as `serve_planes` drops it before it
+        // logs: a host that watches it learns serving will not start.
+        drop(shutdown);
         tracing::warn!(
             "cerulion_remoted: network kill-switch engaged (--network off / \
              CERULION_NETWORK=off) — refusing to serve the remote plane; exiting \
@@ -146,7 +151,9 @@ pub async fn serve_endpoint(
 /// claim/pair takes effect at the next accept with no restart), the ops plane with the
 /// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
 /// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
-/// `shutdown`.
+/// `shutdown`. When [`serve_planes`] returns, after its shutdown stage, it ends
+/// the rcpd e-stop delivery in flight and stops the epoch poller, then returns
+/// what `serve_planes` returned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_core(
     files: &PlaneFiles,
@@ -233,6 +240,8 @@ pub(crate) async fn serve_core(
         "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops, plus rcp on the daemon; \
          always-on)"
     );
+    #[cfg(feature = "test-seam")]
+    crate::shutdown::close_endpoint_for_test(endpoint);
 
     // The robot's own revocation fetch: the supervisor's sync worker leaves
     // fetched epochs in the state directory, applied here on a poll. Started
@@ -249,17 +258,22 @@ pub(crate) async fn serve_core(
     let served = serve_planes(
         endpoint,
         classify,
-        Some(ops),
+        Some(Arc::clone(&ops)),
         Some(wire),
         pull,
         rcp,
         shutdown,
     )
     .await;
+    // `serve_planes` ran the ops plane's shutdown stage before it returned,
+    // failed or not; the teardown below runs either way.
     if let Some(rcpd_estop) = rcpd_estop {
         rcpd_estop.shut_down().await;
     }
     poller.stop().await;
+    tracing::info!("cerulion_remoted: the rcpd e-stop sender and the epoch poller are stopped");
+    // The ops plane and its receipt sink stay alive until the teardown ends.
+    drop(ops);
     served
 }
 
@@ -362,6 +376,14 @@ pub async fn serve_with_epoch_pull(
 /// [`serve_with_epoch_pull`], plus the rcp plane: when `rcp` is `Some`, an
 /// admitted `cerulion/rcp/1` connection is served by
 /// [`crate::rcp::serve_rcp_connection`].
+///
+/// Once the accept loop stops, it drops `shutdown` before it logs anything,
+/// then runs the
+/// [`ShutdownStage`](crate::shutdown::ShutdownStage) of `ops` while the ops
+/// receipt sink is alive, and returns [`RemotedError::Shutdown`] when a
+/// participant did not complete. The endpoint and its connections are alive
+/// during the stage after a stop request, and already gone when the endpoint
+/// closed on its own.
 pub async fn serve_planes(
     endpoint: &Endpoint,
     classify: Arc<PairingAuthorizer>,
@@ -371,21 +393,15 @@ pub async fn serve_planes(
     rcp: Option<Arc<RcpPlane>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
-    tokio::pin!(shutdown);
-    loop {
+    let mut shutdown = Box::pin(shutdown);
+    let closed_on_its_own = loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("cerulion_remoted: shutdown signalled; stopping accept loop");
-                break;
-            }
+            _ = &mut shutdown => break false,
             accepted = accept_one(endpoint) => {
                 match accepted {
                     // The endpoint's accept stream ended → the daemon is closing.
                     // This is the ONLY per-accept signal that terminates the loop.
-                    Ok(None) => {
-                        tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
-                        break;
-                    }
+                    Ok(None) => break true,
                     Ok(Some(a)) => {
                         if let Some(pull) = &pull {
                             pull.note_accept(a.remote_id.as_bytes());
@@ -417,6 +433,23 @@ pub async fn serve_planes(
                 }
             }
         }
+    };
+    // Dropped before anything is logged or awaited, so a host that watches it
+    // learns the accept loop stopped even when a log write blocks; the binary
+    // arms its hard-exit deadline then.
+    drop(shutdown);
+    if closed_on_its_own {
+        tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
+    } else {
+        tracing::info!("cerulion_remoted: shutdown signalled; stopping accept loop");
+    }
+    // The ops receipt sink is alive here; the endpoint and its connections are
+    // too, unless the endpoint closed on its own.
+    if let Some(ops) = &ops {
+        ops.shutdown_stage()
+            .run()
+            .await
+            .map_err(RemotedError::Shutdown)?;
     }
     Ok(())
 }
