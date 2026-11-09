@@ -829,13 +829,18 @@ pub mod wire;
 ///
 /// - v31: the `block` credit word ([`credit::CreditShared`]) grows from 24 to
 ///   32 bytes with a `released` word at byte 24, the sticky per-consumer slot
-///   release, and the publish increment reads it before counting. A node
-///   library compiles its own copy of that increment (the publisher's) and of
-///   the drain (the subscriber's `BlockProbe`), both reached through the
-///   `CreditWord` the host hands it, so the two copies must agree on the
-///   word's layout: a library built against v30 or earlier counts into a
-///   released slot and reads the word at its 24-byte size. `BackpressureCounters`,
-///   held by the same probe, gains `block_slot_releases_count`.
+///   release, and the publish increment reads it before counting. Its `u64`
+///   at byte 0 packs four counts (frames queued, frames a timeout release
+///   forgave that are still queued, and frames held in the matcher's slots,
+///   counted and forgiven), and a `connections` word at byte 28 sizes the
+///   consumer's queues for the forgiven backlog. A node library compiles its
+///   own copy of that increment (the publisher's) and of the drain (the
+///   subscriber's `BlockProbe`), both reached through the `CreditWord` the
+///   host hands it, so the two copies must agree on the word's layout: a
+///   library built against v30 or earlier counts into a released slot, reads
+///   the packed `u64` as one count, and reads the word at its 24-byte size.
+///   `BackpressureCounters`, held by the same probe, gains
+///   `block_slot_releases_count`.
 ///   [`graph::node::InputMeta`] gains `accumulate`, and a node library's info
 ///   JSON carries it as an input key, so the host can refuse a graph key that
 ///   contradicts the attribute. The wire header and the trace format are

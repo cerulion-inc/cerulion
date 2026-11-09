@@ -2485,7 +2485,8 @@ impl CerulionSubscriber {
     /// The mirror moves in the SAME direction the frames did:
     ///
     /// * a frame that entered a slot was already decremented at its pop, so the
-    ///   mirror is credited back by 1 — occupancy did not fall, it moved;
+    ///   mirror is credited back by 1: occupancy did not fall, it moved; the
+    ///   word counts it as held, apart from its queued frames;
     /// * a frame that left a slot really has been consumed, so the mirror is
     ///   debited (saturating — `outstanding == 0` is the floor, and a lost
     ///   decrement must never be able to wrap it to `u64::MAX` and defer the
@@ -2532,16 +2533,18 @@ impl CerulionSubscriber {
         }
         if let Some(probe) = self.block_probe() {
             if held > debt {
-                // The credit-BACK direction — the same
-                // `fetch_add(Release)` this site wrote inline, through the
-                // word's own API so a mapped edge moves the SHARED page.
-                probe.outstanding.record_published_n(u64::from(held - debt));
+                // The credit-BACK direction, through the word's own API so a
+                // mapped edge moves the SHARED page. `record_slot_held` counts
+                // the frames as held rather than queued: they are out of the
+                // queue, and the word's eviction bound reads the queue alone.
+                probe.outstanding.record_slot_held(u64::from(held - debt));
             } else {
                 // The RELEASE direction really frees a slot, so it goes through
-                // `record_drained` and therefore RINGS the wake word — a
-                // decrement that freed room without ringing would leave a
-                // cross-process producer parked on room that already exists.
-                probe.outstanding.record_drained(u64::from(debt - held));
+                // `record_slot_freed`, which RINGS the wake word: a decrement
+                // that freed room without ringing would leave a cross-process
+                // producer parked on room that already exists. A held frame a
+                // timeout release forgave is paid off first.
+                probe.outstanding.record_slot_freed(u64::from(debt - held));
             }
         }
         self.block_slot_debt = held;

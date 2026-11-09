@@ -1850,9 +1850,28 @@ fn block_edges_defer(producer: &str, edges: &[BlockDeferEdge], now_ns: u64) -> b
     use crate::scheduler::block::{judge_slot, ReleaseReason, SlotReading, SlotVerdict};
     let mut deferred = false;
     for e in edges {
-        let reading = SlotReading::of(&e.outstanding, e.threshold);
-        let (verdict, mark) = judge_slot(reading, e.stall_clock.load(), now_ns, e.timeout_ns);
-        e.stall_clock.store(mark);
+        // Read, judge and forgive under the slot's stall-cell lock. Every
+        // producer of the topic shares the cell, so a second producer judges
+        // the mark this one stored, never the one it replaced, and one stall
+        // releases the slot once.
+        let (reading, verdict, forgiven) = e.stall_clock.update(|mark| {
+            let reading = SlotReading::of(&e.outstanding, e.threshold);
+            let (verdict, next) = judge_slot(reading, mark, now_ns, e.timeout_ns);
+            let forgiven = match verdict {
+                SlotVerdict::TimedOut { .. } => {
+                    if crate::oracle_mutant::active("block_shared_release") {
+                        edges
+                            .iter()
+                            .map(|other| other.outstanding.forgive_outstanding())
+                            .fold(0, u64::max)
+                    } else {
+                        e.outstanding.forgive_outstanding()
+                    }
+                }
+                SlotVerdict::Room | SlotVerdict::Released | SlotVerdict::Full => 0,
+            };
+            (next, (reading, verdict, forgiven))
+        });
         match verdict {
             SlotVerdict::Full => {
                 // `e.stall` (Some only on a mapped edge) warns once per regime
@@ -1879,15 +1898,8 @@ fn block_edges_defer(producer: &str, edges: &[BlockDeferEdge], now_ns: u64) -> b
                 deferred = true;
             }
             SlotVerdict::TimedOut { held_ns } => {
-                let forgiven = if crate::oracle_mutant::active("block_shared_release") {
-                    edges
-                        .iter()
-                        .map(|other| other.outstanding.forgive_outstanding())
-                        .fold(0, u64::max)
-                } else {
-                    e.outstanding.forgive_outstanding()
-                };
-                // Zero: another producer of this edge forgave it first.
+                // Zero: the consumer drained every counted frame between the
+                // reading and the release, so nothing was released.
                 if forgiven != 0 {
                     emit_block_slot_release(
                         producer,
@@ -6881,6 +6893,12 @@ impl GraphRuntime {
                         ),
                     })?;
                 let outstanding = crate::credit::CreditWord::local(word_depth);
+                // Each in-graph producer of the topic publishes through its own
+                // connection, which iceoryx2 gives a queue of `depth` frames. A
+                // topic takes at most 16 publishers (the `multi_publisher_topics`
+                // ceiling), so the count fits a `u32`.
+                outstanding
+                    .set_connections(u32::try_from(flow.producers.len()).unwrap_or(u32::MAX));
                 let counters = Arc::new(BackpressureCounters::new());
                 // One warn edge-trigger per consumer edge, shared
                 // by every producer of the topic (see `BlockDeferEdge::armed`).
@@ -7201,6 +7219,14 @@ impl GraphRuntime {
                     .entry(binding.topic.clone())
                     .or_default()
                     .push(word.clone());
+                // Each producer of the edge publishes through its own
+                // connection into the consumer's input (at most 16, so the
+                // count fits a `u32`). Only this half publishes, so only this
+                // half reads the count.
+                word.set_connections(
+                    u32::try_from(binding.producer_nodes.len().max(producers.len()))
+                        .unwrap_or(u32::MAX),
+                );
                 // The slot must be present on a producer
                 // binding. It is not derivable here — this process's subgraph
                 // cannot see the edge's other producers — and a missing one

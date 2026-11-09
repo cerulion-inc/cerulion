@@ -8,6 +8,9 @@
 //!   publish in the step it was made, and records no defer or drop;
 //! - `block_timeout_ms` releases the stalled consumer's slot and the producer
 //!   resumes, and the release touches that slot only;
+//! - after a timeout release, a FIFO consumer that resumes between two
+//!   publishes receives every frame published after the release, on a local
+//!   and on a split word;
 //! - a consumer node that stops with a fatal error has its slot released;
 //! - the live loop's wait sizing holds a deferred producer until its slot's
 //!   `block_timeout_ms` deadline, or until the drain that frees it, instead of
@@ -24,20 +27,25 @@
 //!   multi-process worker logs its plan's warnings in place of its own view.
 //!
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
-//! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off` and
-//! `block_accumulate_refusal_off` each make a row here fail.
+//! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off`,
+//! `block_accumulate_refusal_off` and `block_forgiven_drain_spends_credit`
+//! each make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use cerulion_core::clock::VirtualClock;
+use cerulion_core::credit::{credit_edge_id, CreditShared, CreditWord, MappedCredit};
 use cerulion_core::graph::config::{
     GraphConfig, InputBackpressure, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef,
 };
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
+use cerulion_core::scheduler::BackpressureCounters;
+use cerulion_core::transport::{TransportConfig, TransportManager};
+use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use tracing_test::traced_test;
@@ -513,6 +521,145 @@ fn a_timeout_release_touches_only_the_timed_out_slot() {
         2,
         "the held consumer still defers the producer after the release"
     );
+}
+
+/// Publish one `Vector3` carrying `x` on `publisher` and count it on `word`,
+/// as a `block` producer's publish does.
+fn publish_counted(publisher: &mut CerulionPublisher, word: &CreditShared, x: u32) {
+    let mut p = publisher.loan_proxy::<Vector3>().expect("loan");
+    p.x = f64::from(x);
+    drop(p);
+    word.record_published();
+}
+
+/// One `block` FIFO input over a real depth-2 iceoryx2 queue, released by a
+/// timeout while it holds two frames, then resumed between two publishes.
+///
+/// `consumer` is the word the input's probe drains through and `producer` the
+/// word the producer's gate reads and its publish counts on: one word on a
+/// local edge, two mappings of one page on a split edge. Frames carry
+/// `x = 1, 2, ...` in publish order. The consumer drains one frame after the
+/// first publish that follows the release, then the producer publishes while
+/// its gate allows (at most 4 more), then the consumer drains what is queued.
+/// Returns the frames published after the release and the frames the consumer
+/// received after the release.
+fn resume_after_a_timeout_release(
+    tag: &str,
+    consumer: CreditWord,
+    producer: &CreditShared,
+) -> (Vec<u32>, Vec<u32>) {
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("bsr_{tag}"),
+            clock: Arc::new(cerulion_core::clock::RealClock),
+            subscriber_buffer_size: 2,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = format!("bsr_forgive_{tag}");
+    let mut publisher = mgr
+        .create_publisher(&topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("publisher");
+    let mut sub = mgr.create_subscriber(&topic).expect("subscriber");
+    sub.register_block_probe_for_test(
+        consumer,
+        2,
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        2,
+    );
+    sub.mark_fifo_consume_for_test();
+    let read = |sub: &mut CerulionSubscriber| {
+        sub.try_view::<Vector3, u32>(|v| v.x as u32)
+            .expect("the FIFO read does not fail")
+    };
+
+    for x in 1..=2 {
+        assert!(producer.try_claim(), "frame {x} fits the depth-2 slot");
+        publish_counted(&mut publisher, producer, x);
+    }
+    assert!(!producer.try_claim(), "precondition: the slot is full");
+    // The `block_timeout_ms` release: the runtime's pre-fire calls this on
+    // the slot that stayed full with nothing drained.
+    assert_eq!(
+        producer.forgive_outstanding(),
+        2,
+        "both frames are forgiven"
+    );
+
+    let mut published = Vec::new();
+    assert!(
+        producer.try_claim(),
+        "the release lets the producer publish"
+    );
+    publish_counted(&mut publisher, producer, 3);
+    published.push(3);
+    // The queue holds 2: frame 1 was evicted by frame 3, which the release
+    // event announces. The consumer resumes and drains one forgiven frame.
+    assert_eq!(read(&mut sub), Some(2), "the oldest queued frame is 2");
+    for x in 4..8 {
+        if !producer.try_claim() {
+            break;
+        }
+        publish_counted(&mut publisher, producer, x);
+        published.push(x);
+    }
+    let mut received = Vec::new();
+    while let Some(x) = read(&mut sub) {
+        received.push(x);
+    }
+    (published, received)
+}
+
+/// After a `block_timeout_ms` release, the consumer's drains of the frames
+/// queued at the release do not free credit that belongs to frames published
+/// after it: the producer is held again once 2 frames published after the
+/// release are queued, and every one of them reaches the consumer. A drain of
+/// frame 2 that spent frame 3's credit would let the producer publish 4 and 5,
+/// and the queue would evict 3 with no release event and no count.
+#[test]
+fn frames_published_after_a_timeout_release_are_never_evicted() {
+    let local = CreditWord::local(2);
+    let (published, received) =
+        resume_after_a_timeout_release("forgive_local", local.clone(), &local);
+    assert_eq!(
+        published,
+        vec![3, 4],
+        "the producer is held once frames 3 and 4 fill the slot (received {received:?})"
+    );
+    assert_eq!(
+        received, published,
+        "every frame published after the release is received"
+    );
+    assert_eq!(local.outstanding(), 0, "the drains emptied the slot");
+}
+
+/// The same release on a split edge: the consumer's process drains through
+/// its own mapping of the page and the producer's gate reads another.
+#[test]
+fn frames_published_after_a_timeout_release_on_a_split_edge_are_never_evicted() {
+    let ns = format!("bsr_{}_forgive", std::process::id());
+    let id = credit_edge_id("/bsr/forgive", "consumer", "inp");
+    let _owner = MappedCredit::create_owned(&ns, &id, 2).expect("the supervisor's word");
+    let consumer = Arc::new(MappedCredit::open_unowned(&ns, &id).expect("consumer mapping"));
+    let producer = MappedCredit::open_unowned(&ns, &id).expect("producer mapping");
+    let (published, received) = resume_after_a_timeout_release(
+        "forgive_mapped",
+        CreditWord::mapped(Arc::clone(&consumer)),
+        &producer,
+    );
+    assert_eq!(
+        published,
+        vec![3, 4],
+        "the producer is held once frames 3 and 4 fill the slot (received {received:?})"
+    );
+    assert_eq!(
+        received, published,
+        "every frame published after the release is received"
+    );
+    assert_eq!(producer.outstanding(), 0, "the drains emptied the slot");
 }
 
 #[test]

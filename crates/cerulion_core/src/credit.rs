@@ -96,16 +96,20 @@
 //! topic, and every other topic, as it was. Two releases exist:
 //!
 //! - [`CreditShared::release_slot`] is STICKY: it marks the slot released,
-//!   zeroes `outstanding` and rings the wake word. From then on
+//!   zeroes every count and rings the wake word. From then on
 //!   [`CreditShared::is_full`] is `false` and [`CreditShared::record_published`]
 //!   no longer counts, so the producer stops deferring on this consumer for
 //!   the rest of the run. The supervisor calls it when the consumer's process
 //!   dies; the runtime calls it when the consumer node stops with a fatal
 //!   error.
-//! - [`CreditShared::forgive_outstanding`] zeroes `outstanding` and rings the
-//!   wake word without marking the slot. The producer gets `depth` more
-//!   publishes before the slot can defer it again. The `block_timeout_ms`
-//!   release uses it.
+//! - [`CreditShared::forgive_outstanding`] moves every counted frame into the
+//!   slot's forgiven backlog and rings the wake word without marking the
+//!   slot. The producer gets `depth` more publishes before the slot can defer
+//!   it again, and a publish that overflows the consumer's queue evicts a
+//!   forgiven frame. The consumer's later drains pay the backlog off before
+//!   any counted frame, so draining a forgiven frame never frees the credit
+//!   of a frame published after the release. The `block_timeout_ms` release
+//!   uses it.
 //!
 //! Whoever releases emits the loud event; this module only moves the word.
 //!
@@ -160,11 +164,35 @@ pub const CREDIT_BYTES: usize = 64;
 #[derive(Debug)]
 #[repr(C)]
 pub struct CreditShared {
-    /// Frames PUBLISHED minus frames DRAINED — the shared mirror of the
-    /// consumer's iceoryx2 queue depth. Bumped (`Release`) by the producer on
-    /// every successful send, decremented (saturating) by the consumer on every
-    /// drain.
-    outstanding: AtomicU64,
+    /// The slot's four frame counts, packed so that every transition is one
+    /// RMW on one `u64` (`Counts` names them):
+    ///
+    /// - bits 0..32, `queued`: frames published and not yet drained, less the
+    ///   ones a timeout release forgave. The shared mirror of the consumer's
+    ///   iceoryx2 queue depth: the producer bumps it on every successful send,
+    ///   the consumer's drain takes it down (saturating).
+    /// - bits 32..48, `backlog`: frames [`Self::forgive_outstanding`] forgave
+    ///   that are still in the consumer's queue.
+    /// - bits 48..56, `held`: frames the consumer's matcher holds in its slots
+    ///   ([`Self::record_slot_held`]), counted against `depth`.
+    /// - bits 56..64, `held_forgiven`: held frames a release forgave.
+    ///
+    /// The producer's gate compares `queued + held` with `depth`
+    /// ([`Self::outstanding`]).
+    ///
+    /// # Memory ordering
+    ///
+    /// Every operation is ONE `try_update` (or `store`) on this word, so a
+    /// reader sees the four counts of one instant, and the publish (the
+    /// producer), the drain and the slot moves (the consumer) and the
+    /// releases (the producer, or the supervisor) apply in the word's single
+    /// modification order: none can land inside another. Writes are `Release`
+    /// (the timeout release `AcqRel`) and every read `Acquire`, so the
+    /// producer's gate read observes every drain that happened before it. The
+    /// local word (one heap value shared by a co-located edge's consumer and
+    /// any number of producer threads) and the mapped page (two processes) run
+    /// this same arithmetic.
+    counts: AtomicU64,
     /// The declared `#[input(depth = N)]` ceiling, stamped by the OWNER at
     /// create time.
     ///
@@ -253,6 +281,13 @@ pub struct CreditShared {
     /// once [`Self::release_slot`] gave it up. Read by [`Self::is_full`] and by
     /// the publish increment; set once per run, never cleared on a live page.
     released: AtomicU32,
+    /// How many publisher connections feed the consumer's input. iceoryx2
+    /// gives each connection its own queue of `depth` frames, so the
+    /// consumer's queues hold at most `depth * connections` frames, and a
+    /// publish takes the forgiven backlog down to what still fits beside the
+    /// counted frames ([`Self::record_published_n`]). Stamped `1` at create;
+    /// [`Self::set_connections`] raises it for a topic with several producers.
+    connections: AtomicU32,
 }
 
 // SHM mapping across processes requires a stable, atomics-only `repr(C)` layout.
@@ -263,8 +298,8 @@ const _: () = assert!(
     "CreditShared layout changed: SHM cross-process mapping requires the 32-byte atomics-only repr(C)"
 );
 const _: () = assert!(
-    core::mem::offset_of!(CreditShared, outstanding) == 0,
-    "outstanding must sit at offset 0"
+    core::mem::offset_of!(CreditShared, counts) == 0,
+    "counts must sit at offset 0"
 );
 const _: () = assert!(
     core::mem::offset_of!(CreditShared, depth) == 8,
@@ -289,13 +324,139 @@ const _: () = assert!(
     "released must sit at offset 24, the sticky per-consumer slot release"
 );
 const _: () = assert!(
+    core::mem::offset_of!(CreditShared, connections) == 28,
+    "connections must sit at offset 28, the publisher connection count"
+);
+const _: () = assert!(
     core::mem::align_of::<CreditShared>() >= 8,
-    "CreditShared must be >=8-byte aligned so its `outstanding` field (offset 0) is a valid 8-byte-aligned atomic target"
+    "CreditShared must be >=8-byte aligned so its `counts` field (offset 0) is a valid 8-byte-aligned atomic target"
 );
 const _: () = assert!(
     core::mem::size_of::<CreditShared>() <= CREDIT_BYTES,
     "CreditShared must fit the region MappedCredit maps"
 );
+
+/// The four counts [`CreditShared`]'s first word packs (its `counts` field
+/// docs give the bit ranges). Each transition is a pure function from one
+/// `Counts` to the next, which the word applies as one RMW.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Counts {
+    /// Frames published and not drained, less the forgiven ones.
+    queued: u32,
+    /// Forgiven frames still in the consumer's queue.
+    backlog: u16,
+    /// Frames held in the consumer's matcher slots, counted against depth.
+    held: u8,
+    /// Held frames a release forgave.
+    held_forgiven: u8,
+}
+
+/// `n` as a `u32`, saturating: a count past `u32::MAX` is past any depth.
+fn saturate_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// `n` as a `u8`, saturating: a slot count past `u8::MAX` is past the two
+/// slots a matcher has.
+fn saturate_u8(n: u64) -> u8 {
+    u8::try_from(n).unwrap_or(u8::MAX)
+}
+
+impl Counts {
+    fn unpack(v: u64) -> Self {
+        Self {
+            queued: (v & 0xFFFF_FFFF) as u32,
+            backlog: ((v >> 32) & 0xFFFF) as u16,
+            held: ((v >> 48) & 0xFF) as u8,
+            held_forgiven: (v >> 56) as u8,
+        }
+    }
+
+    fn pack(self) -> u64 {
+        u64::from(self.queued)
+            | (u64::from(self.backlog) << 32)
+            | (u64::from(self.held) << 48)
+            | (u64::from(self.held_forgiven) << 56)
+    }
+
+    /// Frames counted against depth: queued and held, forgiven ones excluded.
+    fn outstanding(self) -> u64 {
+        u64::from(self.queued) + u64::from(self.held)
+    }
+
+    /// Frames a release forgave that the consumer still holds.
+    fn forgiven(self) -> u64 {
+        u64::from(self.backlog) + u64::from(self.held_forgiven)
+    }
+
+    /// `n` frames entered the consumer's queue. Its queues hold `capacity()`
+    /// frames; past that the overflow evicts the oldest queued frames, which
+    /// are the forgiven ones, so the backlog keeps only what fits beside the
+    /// queued count. `capacity` is read only while a backlog exists.
+    fn published(self, n: u64, capacity: impl Fn() -> u64) -> Self {
+        let queued = self.queued.saturating_add(saturate_u32(n));
+        let backlog = if self.backlog == 0 {
+            0
+        } else {
+            let room = capacity().saturating_sub(u64::from(queued));
+            // A room past `u16::MAX` exceeds any backlog, which keeps it all.
+            u16::try_from(room).map_or(self.backlog, |room| self.backlog.min(room))
+        };
+        Self {
+            queued,
+            backlog,
+            ..self
+        }
+    }
+
+    /// `removed` frames left the consumer's queue, oldest first: the
+    /// forgiven frames go first, then counted ones (saturating at zero).
+    fn drained(self, removed: u64) -> Self {
+        let paid = if crate::oracle_mutant::active("block_forgiven_drain_spends_credit") {
+            0
+        } else {
+            u16::try_from(removed).map_or(self.backlog, |r| r.min(self.backlog))
+        };
+        Self {
+            backlog: self.backlog - paid,
+            queued: self
+                .queued
+                .saturating_sub(saturate_u32(removed - u64::from(paid))),
+            ..self
+        }
+    }
+
+    /// `k` popped frames now sit in the consumer's slots.
+    fn slot_held(self, k: u64) -> Self {
+        Self {
+            held: self.held.saturating_add(saturate_u8(k)),
+            ..self
+        }
+    }
+
+    /// `k` frames left the consumer's slots: the forgiven held frames go
+    /// first, then counted ones (saturating at zero).
+    fn slot_freed(self, k: u64) -> Self {
+        let paid = u8::try_from(k).map_or(self.held_forgiven, |k| k.min(self.held_forgiven));
+        Self {
+            held_forgiven: self.held_forgiven - paid,
+            held: self.held.saturating_sub(saturate_u8(k - u64::from(paid))),
+            ..self
+        }
+    }
+
+    /// The timeout release: every counted frame becomes forgiven. The
+    /// backlog is capped at `capacity`, the most the queues can hold.
+    fn forgive(self, capacity: u64) -> Self {
+        let backlog = (u64::from(self.backlog) + u64::from(self.queued)).min(capacity);
+        Self {
+            queued: 0,
+            backlog: u16::try_from(backlog).unwrap_or(u16::MAX),
+            held: 0,
+            held_forgiven: self.held_forgiven.saturating_add(self.held),
+        }
+    }
+}
 
 impl CreditShared {
     /// Create a credit word for a consumer input whose declared depth is
@@ -305,17 +466,60 @@ impl CreditShared {
     /// const-initialized region.
     pub const fn new(depth: u32) -> Self {
         Self {
-            outstanding: AtomicU64::new(0),
+            counts: AtomicU64::new(0),
             depth: AtomicU32::new(depth),
             wake_seq: AtomicU32::new(0),
             parked: AtomicU32::new(0),
             epoch: AtomicU32::new(0),
             released: AtomicU32::new(0),
+            connections: AtomicU32::new(1),
         }
     }
 
-    /// Re-initialize a freshly-mapped segment: zero the outstanding count, the
-    /// wake epoch and the parked mask, stamp `depth`, and BUMP the re-arm epoch.
+    /// Apply `step` to the counts as ONE RMW (`order` on success, `Acquire`
+    /// on every load) and return the counts it replaced and the counts it
+    /// stored. `step` may run more than once when another side wins the race;
+    /// only its last run is stored.
+    fn update_counts(
+        &self,
+        order: Ordering,
+        mut step: impl FnMut(Counts) -> Counts,
+    ) -> (Counts, Counts) {
+        let mut next = Counts::default();
+        let prev = match self.counts.try_update(order, Ordering::Acquire, |v| {
+            next = step(Counts::unpack(v));
+            Some(next.pack())
+        }) {
+            // `step` always returns a value, so the update always lands: the
+            // `Err` arm carries the same previous value and is never taken.
+            Ok(v) | Err(v) => v,
+        };
+        (Counts::unpack(prev), next)
+    }
+
+    /// The most frames the consumer's queues hold: `depth * connections`.
+    fn queue_capacity(&self) -> u64 {
+        u64::from(self.depth.load(Ordering::Acquire))
+            .saturating_mul(u64::from(self.connections.load(Ordering::Acquire).max(1)))
+    }
+
+    /// Stamp how many publisher connections feed the consumer's input (`0`
+    /// stamps `1`). The runtime calls it at wiring time, before the first
+    /// publish, with the number of producers of the topic.
+    pub fn set_connections(&self, connections: u32) {
+        self.connections
+            .store(connections.max(1), Ordering::Release);
+    }
+
+    /// The publisher connection count [`Self::set_connections`] stamped
+    /// (`Acquire`).
+    pub fn connections(&self) -> u32 {
+        self.connections.load(Ordering::Acquire)
+    }
+
+    /// Re-initialize a freshly-mapped segment: zero the counts, the wake epoch
+    /// and the parked mask, stamp `depth` and one connection, and BUMP the
+    /// re-arm epoch.
     ///
     /// Used by [`MappedCredit::create_owned`] after an unlink-then-`O_EXCL`
     /// create. POSIX zero-initializes a new SHM object, so every store but the
@@ -351,11 +555,12 @@ impl CreditShared {
              Graph validation enforces depth >= 1 (GraphTopology::validate); a 0 here is a \
              plan-stamping bug, not an operator input."
         );
-        self.outstanding.store(0, Ordering::Release);
+        self.counts.store(0, Ordering::Release);
         self.depth.store(depth, Ordering::Release);
         self.wake_seq.store(0, Ordering::Release);
         self.parked.store(0, Ordering::Release);
         self.released.store(0, Ordering::Release);
+        self.connections.store(1, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Release);
     }
 
@@ -364,7 +569,8 @@ impl CreditShared {
     /// every drain that happens-before).
     ///
     /// This is the mapped form of `BlockDeferEdge`'s
-    /// `outstanding.load(Acquire) >= threshold`, unchanged in shape.
+    /// `outstanding() >= threshold`, unchanged in shape: the count is the
+    /// queued and held frames, forgiven ones excluded.
     ///
     /// A word stamped `depth == 0` reads full unconditionally; see the
     /// `reinit` note on why that is a plan-stamping bug rather than a
@@ -372,9 +578,7 @@ impl CreditShared {
     ///
     /// A released slot ([`Self::release_slot`]) is never full.
     pub fn is_full(&self) -> bool {
-        !self.is_released()
-            && self.outstanding.load(Ordering::Acquire)
-                >= u64::from(self.depth.load(Ordering::Acquire))
+        !self.is_released() && self.outstanding() >= u64::from(self.depth.load(Ordering::Acquire))
     }
 
     /// Try to CLAIM room for one frame — `true` if the producer may enter its
@@ -418,50 +622,42 @@ impl CreditShared {
     /// DIFFERENT instant, and the consumer is free to drain in between — so an
     /// over-depth count created here can be gone before anybody looks, which
     /// makes a later read useless as a ceiling check (the whole point of the
-    /// [`try_claim`](Self::try_claim) gate). `fetch_add` returns the PREVIOUS
-    /// value and the transition is atomic, so `prev + 1` is exactly the count
+    /// [`try_claim`](Self::try_claim) gate). The RMW returns the counts it
+    /// stored and the transition is atomic, so its count is exactly the one
     /// that existed at the instant of the publish, whatever happens next.
     ///
-    /// `wrapping_add` mirrors the store: `fetch_add` wraps, so at the (utterly
-    /// unreachable) `u64::MAX` boundary the reported value still equals what the
-    /// word now holds rather than panicking in a debug build.
+    /// The queued count saturates at `u32::MAX`, past any depth, and the
+    /// reported value is what the word holds after the RMW.
     pub fn record_published(&self) -> u64 {
         self.record_published_n(1)
     }
 
-    /// Record that `n` frames were published to (or RETURNED to) this edge's
-    /// queue — the `n`-at-a-time form of [`record_published`](Self::record_published),
-    /// which delegates here so there is ONE increment implementation.
+    /// Record that `n` frames were published to this edge's queue: the
+    /// `n`-at-a-time form of [`record_published`](Self::record_published),
+    /// which delegates here so there is ONE increment implementation. The
+    /// publish path moves one frame at a time.
     ///
-    /// Returns the `outstanding` count this call created, for the same
-    /// race-free reason [`record_published`](Self::record_published) gives: the
-    /// RMW's own result is the only reading that describes the instant of the
+    /// Returns the count against depth ([`Self::outstanding`]) this call
+    /// created, for the same race-free reason
+    /// [`record_published`](Self::record_published) gives: the RMW's own
+    /// result is the only reading that describes the instant of the
     /// increment, and a later load is a different instant.
     ///
-    /// # Why an `n` form exists at all
+    /// `n == 0` is still an RMW returning the current value, a correct no-op
+    /// rather than a special case.
     ///
-    /// The publish path really does move one frame at a time, so `n > 1` is
-    /// never a batched publish. It is the held-head SLOT DEBT
-    /// re-derivation (`transport::subscriber`'s `reconcile_block_slot_debt`),
-    /// which restates occupancy from the slots rather than applying a `+1`/`-1`
-    /// per site: a frame that moved from the queue into a matcher slot was
-    /// already decremented at its pop, so the mirror is CREDITED BACK.
+    /// # The forgiven backlog
     ///
-    /// `held - debt` is 0, 1 or 2 by ARITHMETIC — `held` is two booleans summed
-    /// — but 2 is not reachable through any public seam: every transition that
-    /// fills a slot re-derives the debt before another can fill, so the delta
-    /// observed in practice is always 1. Recorded because it is the difference
-    /// between this being an `n` form and being a second spelling of
-    /// [`record_published`](Self::record_published), and because hard-coding
-    /// this argument to `1` (the change that would prove otherwise) makes no
-    /// observable difference: nothing can distinguish the two.
-    /// Without this form that site would reach past the word's own API into the
-    /// atomic, which is exactly the second spelling of the arithmetic this type
-    /// exists to prevent.
-    ///
-    /// `n == 0` is still an RMW returning the current value — the callers
-    /// short-circuit before reaching here, and a zero increment is a correct
-    /// no-op rather than a special case.
+    /// The consumer's queues hold `depth * connections` frames. When the
+    /// queued count and the forgiven backlog together pass that, iceoryx2's
+    /// overflow evicts the oldest queued frames, and the forgiven ones are the
+    /// oldest, so the same RMW takes the backlog down to
+    /// `depth * connections - queued`. On one connection that is the exact
+    /// eviction count. On several it is a lower bound, because one connection
+    /// can overflow while another has room: the backlog can then stay above
+    /// the forgiven frames really queued, a later drain pays that excess
+    /// instead of a counted frame, and the count reads high, so the producer
+    /// defers early and never publishes past `depth`.
     ///
     /// Deliberately issues NO wake: nothing ever parks waiting for the count to
     /// RISE (the release direction is [`record_drained`](Self::record_drained),
@@ -473,14 +669,21 @@ impl CreditShared {
         if self.is_released() {
             return 0;
         }
-        self.outstanding
-            .fetch_add(n, Ordering::Release)
-            .wrapping_add(n)
+        let (_, next) = self.update_counts(Ordering::Release, |c| {
+            c.published(n, || self.queue_capacity())
+        });
+        next.outstanding()
     }
 
     /// Record that `removed` samples were drained from the consumer's queue —
     /// decrement the mirror and FREE the credit (bumping the wake epoch and
     /// waking any parked producer).
+    ///
+    /// The forgiven backlog is paid first: each connection's queue is FIFO
+    /// and the frames a timeout release forgave are its oldest, so the first
+    /// `backlog` frames a drain removes are forgiven ones and free no credit.
+    /// Such a drain still rings, because the consumer moved, which restarts
+    /// the `block_timeout_ms` clock.
     ///
     /// Saturating, and that matters MORE cross-process than it did in-process:
     /// an interleaving non-drain removal (a late joiner's history replay) could
@@ -495,20 +698,41 @@ impl CreditShared {
         if removed == 0 {
             return;
         }
-        // The result is INFALLIBLE by construction: `try_update` returns `Err`
-        // only when the closure returns `None`, and this closure always returns
-        // `Some`. So the discard drops a `Result` that cannot be `Err`, never a
-        // failure signal.
-        let _ = self
-            .outstanding
-            .try_update(Ordering::Release, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(removed))
-            });
+        self.update_counts(Ordering::Release, |c| c.drained(removed));
+        self.note_credit_freed();
+    }
+
+    /// Record that `k` frames the consumer popped from its queue now sit in
+    /// its matcher's slots, unserved: they count against `depth` again (the
+    /// pop's [`record_drained`](Self::record_drained) took them off). Counted
+    /// apart from the queued frames, because a held frame is out of the queue
+    /// and the eviction bound in [`record_published_n`](Self::record_published_n)
+    /// reads the queue alone.
+    ///
+    /// Issues no wake: nothing parks waiting for the count to rise. Counts
+    /// nothing on a released slot.
+    pub fn record_slot_held(&self, k: u64) {
+        if k == 0 || self.is_released() {
+            return;
+        }
+        self.update_counts(Ordering::Release, |c| c.slot_held(k));
+    }
+
+    /// Record that `k` held frames left the consumer's slots (served, skipped,
+    /// discarded, or dropped with the subscriber). Held frames a timeout
+    /// release forgave are paid first, then counted ones (saturating). Rings
+    /// the wake word like [`record_drained`](Self::record_drained); `k == 0`
+    /// is a no-op.
+    pub fn record_slot_freed(&self, k: u64) {
+        if k == 0 {
+            return;
+        }
+        self.update_counts(Ordering::Release, |c| c.slot_freed(k));
         self.note_credit_freed();
     }
 
     /// Give up this consumer's slot for the rest of the run: mark it
-    /// released, zero `outstanding`, and ring the wake word so a parked
+    /// released, zero every count, and ring the wake word so a parked
     /// producer re-derives its gate at once.
     ///
     /// Returns `true` for the call that released the slot and `false` when it
@@ -528,7 +752,7 @@ impl CreditShared {
         {
             return false;
         }
-        self.outstanding.store(0, Ordering::Release);
+        self.counts.store(0, Ordering::Release);
         self.note_credit_freed();
         true
     }
@@ -538,15 +762,23 @@ impl CreditShared {
         self.released.load(Ordering::Acquire) != 0
     }
 
-    /// Zero `outstanding` and ring the wake word, leaving the slot armed.
-    /// Returns the count that was forgiven.
+    /// Forgive every frame counted against `depth`, leaving the slot armed:
+    /// one RMW moves the queued count into the backlog and the held count
+    /// into the held-forgiven count, then the wake word rings. Returns the
+    /// count that was forgiven.
     ///
-    /// The frames the consumer has not drained stay in its queue; the
-    /// producer may now publish `depth` more, so the queue's own drop-oldest
-    /// overflow evicts the oldest of them. The `block_timeout_ms` release
-    /// uses this.
+    /// The forgiven frames stay where they are. The producer may now publish
+    /// `depth` more, and a publish that overflows the consumer's queue evicts
+    /// its oldest frame, a forgiven one
+    /// ([`record_published_n`](Self::record_published_n)). A drain or a slot
+    /// exit pays the forgiven frames off before any counted frame, so the slot
+    /// holds the producer again once `depth` frames published after the
+    /// release are queued or held, and none of those is evicted. The
+    /// `block_timeout_ms` release uses this.
     pub fn forgive_outstanding(&self) -> u64 {
-        let forgiven = self.outstanding.swap(0, Ordering::AcqRel);
+        let capacity = self.queue_capacity();
+        let (prev, _) = self.update_counts(Ordering::AcqRel, |c| c.forgive(capacity));
+        let forgiven = prev.outstanding();
         if forgiven != 0 {
             self.note_credit_freed();
         }
@@ -795,11 +1027,20 @@ impl CreditShared {
         self.parked.load(Ordering::Acquire)
     }
 
-    /// Frames currently outstanding on this edge (`Acquire`) — a
-    /// test/diagnostic accessor (Principle #3), never a control input; the gate
-    /// is [`try_claim`](Self::try_claim).
+    /// Frames counted against `depth` on this edge (`Acquire`): queued and
+    /// held, forgiven ones excluded. A test/diagnostic accessor
+    /// (Principle #3), never a control input; the gate is
+    /// [`try_claim`](Self::try_claim).
     pub fn outstanding(&self) -> u64 {
-        self.outstanding.load(Ordering::Acquire)
+        Counts::unpack(self.counts.load(Ordering::Acquire)).outstanding()
+    }
+
+    /// Frames a timeout release forgave that the consumer still holds, queued
+    /// or in a slot (`Acquire`), as the word bounds them: on a topic with
+    /// several producers it can read above the frames really there (see
+    /// [`record_published_n`](Self::record_published_n)). Diagnostic only.
+    pub fn forgiven(&self) -> u64 {
+        Counts::unpack(self.counts.load(Ordering::Acquire)).forgiven()
     }
 
     /// The declared depth stamped into this word (`Acquire`).
@@ -1807,7 +2048,7 @@ pub use imp::MappedCredit;
 /// locked stack op), on aarch64 to `dmb ish` — a store-buffer drain, tens of
 /// cycles when the buffer is dirty. What it is NOT is a syscall, an
 /// allocation, or a lock: the handle is cloned only at graph-build time, and
-/// the publish path pays nothing new (a `fetch_add` either way). That price
+/// the publish path pays one RMW on the word either way. That price
 /// buys ONE arithmetic across the local and mapped arms, which is the trade
 /// this type is designed to make; a `block` drain is per-frame on a lossless
 /// edge, not per-sample on every topic.
@@ -1879,12 +2120,13 @@ mod tests {
         // the same facts readable in a test run and pins the mapped region.
         assert_eq!(core::mem::size_of::<CreditShared>(), 32);
         assert!(core::mem::align_of::<CreditShared>() >= 8);
-        assert_eq!(core::mem::offset_of!(CreditShared, outstanding), 0);
+        assert_eq!(core::mem::offset_of!(CreditShared, counts), 0);
         assert_eq!(core::mem::offset_of!(CreditShared, depth), 8);
         assert_eq!(core::mem::offset_of!(CreditShared, wake_seq), 12);
         assert_eq!(core::mem::offset_of!(CreditShared, parked), 16);
         assert_eq!(core::mem::offset_of!(CreditShared, epoch), 20);
         assert_eq!(core::mem::offset_of!(CreditShared, released), 24);
+        assert_eq!(core::mem::offset_of!(CreditShared, connections), 28);
         assert_eq!(CREDIT_BYTES, 64);
     }
 
@@ -1975,8 +2217,7 @@ mod tests {
         assert_eq!(w.record_published_n(3), 4, "three more create count 4");
         assert_eq!(w.record_published_n(2), 6);
         assert_eq!(w.outstanding(), 6, "and the word holds what was returned");
-        // The `n` form is the slot-debt credit-back, so it has to be
-        // exactly reversible by the drain it pairs with.
+        // The drain of the same frames takes the count back to zero.
         w.record_drained(6);
         assert_eq!(w.outstanding(), 0);
     }
@@ -2075,8 +2316,8 @@ mod tests {
         assert_eq!(other.outstanding(), 2);
     }
 
-    /// `forgive_outstanding` zeroes the count and rings, but leaves the slot
-    /// armed: it fills and defers again.
+    /// `forgive_outstanding` moves the count into the backlog and rings, but
+    /// leaves the slot armed: it fills and defers again.
     #[test]
     fn a_forgiven_slot_stays_armed() {
         let w = CreditWord::local(2);
@@ -2093,6 +2334,158 @@ mod tests {
         );
         w.record_published_n(2);
         assert!(w.is_full(), "the slot holds the producer again");
+    }
+
+    /// The pack round-trips every count, and no count bleeds into another.
+    #[test]
+    fn the_four_counts_pack_into_one_word_and_back() {
+        let c = Counts {
+            queued: u32::MAX,
+            backlog: 0x1234,
+            held: 2,
+            held_forgiven: 0xAB,
+        };
+        assert_eq!(Counts::unpack(c.pack()), c);
+        assert_eq!(Counts::unpack(0), Counts::default());
+        let q = Counts {
+            queued: u32::MAX,
+            ..Counts::default()
+        }
+        .published(5, || 0);
+        assert_eq!(
+            (q.queued, q.backlog),
+            (u32::MAX, 0),
+            "the queued count saturates instead of carrying into the backlog"
+        );
+    }
+
+    /// A depth-2 slot: forgive frames 1 and 2 while both are queued, publish 3
+    /// (the overflow evicts 1), the consumer drains 2. The drain pays the
+    /// backlog, so 3 is still counted and the producer is held after 4: frame
+    /// 5 would evict 3.
+    #[test]
+    fn a_drain_after_a_release_pays_the_forgiven_frames_first() {
+        let w = CreditWord::local(2);
+        w.record_published_n(2);
+        assert_eq!(w.forgive_outstanding(), 2);
+        assert_eq!((w.outstanding(), w.forgiven()), (0, 2));
+        assert_eq!(w.record_published(), 1, "frame 3");
+        assert_eq!(
+            (w.outstanding(), w.forgiven()),
+            (1, 1),
+            "frame 3 evicted forgiven frame 1 from the depth-2 queue"
+        );
+        w.record_drained(1);
+        assert_eq!(
+            (w.outstanding(), w.forgiven()),
+            (1, 0),
+            "draining frame 2 pays the backlog, not frame 3's credit"
+        );
+        assert!(w.try_claim());
+        assert_eq!(w.record_published(), 2, "frame 4");
+        assert!(!w.try_claim(), "frame 5 must wait: 3 and 4 fill the slot");
+        w.record_drained(2);
+        assert_eq!((w.outstanding(), w.forgiven()), (0, 0));
+    }
+
+    /// A drain larger than the backlog pays the backlog, then the counted
+    /// frames, and floors at zero.
+    #[test]
+    fn a_drain_past_the_backlog_pays_counted_frames_and_floors_at_zero() {
+        let w = CreditWord::local(4);
+        w.record_published_n(3);
+        w.forgive_outstanding();
+        w.record_published_n(1);
+        assert_eq!((w.outstanding(), w.forgiven()), (1, 3), "3 + 1 fit in 4");
+        w.record_drained(10);
+        assert_eq!((w.outstanding(), w.forgiven()), (0, 0));
+    }
+
+    /// Frames held in the matcher's slots count against depth, are forgiven
+    /// with the rest, and stay out of the eviction bound: a held frame is not
+    /// in the queue, so a publish does not count it as evicted.
+    #[test]
+    fn held_frames_count_against_depth_and_their_forgiven_exit_frees_no_credit() {
+        let w = CreditWord::local(2);
+        w.record_published_n(2);
+        // The matcher pops frame 1 into its head slot.
+        w.record_drained(1);
+        w.record_slot_held(1);
+        assert_eq!(w.outstanding(), 2, "the held frame still counts");
+        assert!(!w.try_claim());
+        assert_eq!(w.forgive_outstanding(), 2);
+        assert_eq!((w.outstanding(), w.forgiven()), (0, 2));
+        assert_eq!(w.record_published(), 1, "frame 3");
+        assert_eq!(
+            w.forgiven(),
+            2,
+            "the queue holds forgiven frame 2 and frame 3: nothing was evicted"
+        );
+        let seq = w.wake_seq_snapshot();
+        w.record_slot_freed(1);
+        assert!(w.wake_seq_snapshot() > seq, "a slot exit rings");
+        assert_eq!(
+            (w.outstanding(), w.forgiven()),
+            (1, 1),
+            "the forgiven held frame left: frame 3 is still counted"
+        );
+        w.record_drained(1);
+        assert_eq!((w.outstanding(), w.forgiven()), (1, 0), "frame 2 drained");
+        assert_eq!(w.record_published(), 2, "frame 4 fills the slot");
+        assert!(!w.try_claim());
+        w.record_slot_held(0);
+        w.record_slot_freed(0);
+        assert_eq!(w.outstanding(), 2, "zero slot moves change nothing");
+    }
+
+    /// On several connections the eviction bound is a lower bound: the
+    /// backlog can stay above what is queued, and a drain then pays it
+    /// instead of a counted frame, so the count reads high and the producer
+    /// defers early. It never reads low.
+    #[test]
+    fn several_connections_bound_evictions_from_below_and_never_undercount() {
+        let w = CreditWord::local(2);
+        w.set_connections(2);
+        assert_eq!(w.connections(), 2);
+        // One frame on each connection, then the release.
+        w.record_published_n(2);
+        assert_eq!(w.forgive_outstanding(), 2);
+        // Connection 1 publishes two more: its own queue (depth 2) evicts its
+        // forgiven frame, which the word cannot see.
+        w.record_published_n(2);
+        assert_eq!(
+            (w.outstanding(), w.forgiven()),
+            (2, 2),
+            "4 frames fit 2 connections of depth 2, so no eviction is counted"
+        );
+        assert!(!w.try_claim(), "the two new frames hold the producer");
+        // The consumer drains the forgiven frame of connection 2, then the two
+        // new frames of connection 1.
+        w.record_drained(1);
+        assert!(!w.try_claim(), "a forgiven frame's drain frees no credit");
+        w.record_drained(2);
+        assert_eq!(
+            w.outstanding(),
+            1,
+            "the missed eviction leaves the count one high, never low"
+        );
+        w.set_connections(0);
+        assert_eq!(w.connections(), 1, "a zero stamp reads as one connection");
+    }
+
+    /// The sticky release zeroes the backlog and the held counts too.
+    #[test]
+    fn a_sticky_release_zeroes_every_count() {
+        let w = CreditWord::local(2);
+        w.record_published_n(1);
+        w.record_slot_held(1);
+        w.forgive_outstanding();
+        w.record_published_n(1);
+        assert!(w.forgiven() > 0 && w.outstanding() > 0);
+        assert!(w.release_slot());
+        assert_eq!((w.outstanding(), w.forgiven()), (0, 0));
+        w.record_slot_held(1);
+        assert_eq!(w.outstanding(), 0, "a released slot counts no held frame");
     }
 
     /// The edge id is the three-component key, separator-delimited, and the

@@ -1333,9 +1333,9 @@ fn a_both_role_binding_wires_one_word_for_a_co_located_edge() {
 /// The slot-debt re-derivation moves the MAPPED page in BOTH
 /// directions, and the RELEASE direction rings the wake word.
 ///
-/// The credit-back direction (`held > debt`) goes through `record_published_n`
-/// and the release direction (`held < debt`) through `record_drained`, which is
-/// what makes the release ring `note_credit_freed`. Ringing is not decoration
+/// The credit-back direction (`held > debt`) goes through `record_slot_held`
+/// and the release direction (`held < debt`) through `record_slot_freed`, which
+/// is what makes the release ring `note_credit_freed`. Ringing is not decoration
 /// on a split edge: a producer parked in another process on this exact word is
 /// woken by that bump, and a raw decrement would leave it asleep on room that
 /// already exists.
@@ -1413,7 +1413,7 @@ fn the_held_head_slot_debt_moves_the_mapped_page_both_ways_and_the_release_rings
         seq_before_credit + 1,
         "EXACTLY one ring across this transition, and it is the POP's: the boundary drain \
          decrements (which rings) and the re-derivation credits the frame back through \
-         `record_published_n` (which must NOT ring — nothing waits for the count to RISE). A \
+         `record_slot_held` (which must NOT ring: nothing waits for the count to RISE). A \
          `>=` here would be unfalsifiable on a monotonic counter; a second ring would mean the \
          credit-back went through the drain path"
     );

@@ -24,6 +24,11 @@
 //! drains at any rate moves the epoch and restarts the clock, so a slow
 //! consumer never times out; a stopped one does.
 //!
+//! The producers of a topic share one [`StallCell`] per consumer slot. The
+//! caller reads the slot, judges it and forgives it inside
+//! [`StallCell::update`], under the cell's lock, so a second producer judges
+//! the mark the first one stored and one stall releases the slot once.
+//!
 //! The release lands at the first evaluation at or after the deadline;
 //! [`release_deadline_ns`] gives that deadline to a caller that sizes a wait.
 //!
@@ -277,6 +282,16 @@ impl StallCell {
     pub fn store(&self, mark: StallMark) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = mark;
     }
+
+    /// Run `f` on the stored mark under the cell's lock, store the mark `f`
+    /// returns, and return `f`'s other result. Every other `load`, `store`
+    /// and `update` on the cell waits until `f` returns.
+    pub fn update<R>(&self, f: impl FnOnce(StallMark) -> (StallMark, R)) -> R {
+        let mut mark = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, out) = f(*mark);
+        *mark = next;
+        out
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +460,72 @@ mod tests {
         assert_eq!(c.load(), m);
         c.store(StallMark::default());
         assert_eq!(c.load().full_since_ns, None);
+    }
+
+    /// Producers sharing a cell each read, judge and forgive under its lock:
+    /// of many threads that find one timed-out slot, exactly one releases it,
+    /// and every frame a thread publishes after that release stays counted,
+    /// where a second release would have forgiven it.
+    #[test]
+    fn producers_sharing_a_cell_release_one_stall_once() {
+        use crate::credit::CreditWord;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+        const THREADS: usize = 8;
+        for _ in 0..200 {
+            let word = CreditWord::local(2);
+            word.record_published_n(2);
+            let cell = Arc::new(StallCell::default());
+            cell.store(StallMark {
+                full_since_ns: Some(0),
+                seq: word.wake_seq_snapshot(),
+            });
+            let releases = Arc::new(AtomicU64::new(0));
+            let publishes = Arc::new(AtomicU64::new(0));
+            let start = Arc::new(Barrier::new(THREADS));
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (word, cell, releases, publishes, start) = (
+                        word.clone(),
+                        Arc::clone(&cell),
+                        Arc::clone(&releases),
+                        Arc::clone(&publishes),
+                        Arc::clone(&start),
+                    );
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let (verdict, forgiven) = cell.update(|mark| {
+                            let reading = SlotReading::of(&word, 2);
+                            let (verdict, next) = judge_slot(reading, mark, 1_000, Some(1_000));
+                            let forgiven = match verdict {
+                                SlotVerdict::TimedOut { .. } => word.forgive_outstanding(),
+                                _ => 0,
+                            };
+                            (next, (verdict, forgiven))
+                        });
+                        if forgiven != 0 {
+                            releases.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if !verdict.defers() {
+                            word.record_published();
+                            publishes.fetch_add(1, Ordering::AcqRel);
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("a producer thread panicked");
+            }
+            assert_eq!(
+                releases.load(Ordering::Acquire),
+                1,
+                "one stall releases the slot once"
+            );
+            assert_eq!(
+                word.outstanding(),
+                publishes.load(Ordering::Acquire),
+                "every frame published after the one release is still counted"
+            );
+        }
     }
 }
