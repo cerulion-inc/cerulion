@@ -998,6 +998,16 @@ impl CerulionPublisher {
         self.event_service.dynamic_config().number_of_listeners()
     }
 
+    /// Test-only: the backpressure strategy this publisher's iceoryx2 port
+    /// was built with, which sets what a send does at a full queue on a
+    /// service created without safe overflow.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn backpressure_strategy_for_test(
+        &self,
+    ) -> iceoryx2::port::backpressure_strategy::BackpressureStrategy {
+        self.publisher.backpressure_strategy()
+    }
+
     /// `block`: record that one frame was published to this topic
     /// — bump every registered consumer's outstanding counter (each
     /// subscriber's queue just gained one sample). Called on every

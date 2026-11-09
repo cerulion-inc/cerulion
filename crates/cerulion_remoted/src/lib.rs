@@ -9,9 +9,9 @@
 //!
 //! - **One key, one endpoint, one process.** A device's 32-byte ed25519 secret is
 //!   BOTH its iroh [`EndpointId`](cerulion_link::EndpointId) AND its
-//!   `cerulion_pairing` `DeviceIdentity` seed, and iroh multiplexes both protocols
+//!   `cerulion_pairing` `DeviceIdentity` seed, and iroh multiplexes every protocol
 //!   on ONE endpoint. So exactly one process owns that endpoint, dispatching
-//!   `cerulion/wire/2` and `cerulion/ops/1` at accept.
+//!   `cerulion/wire/2`, `cerulion/ops/1` and `cerulion/rcp/1` at accept.
 //! - **Always on from boot.** Operations and pairing must be reachable when NO graph
 //!   is running (deploy, restart, inventory and pair at rest), and topic data exists
 //!   only while a graph runs, so the endpoint host is a robot-level service, NOT the
@@ -27,7 +27,8 @@
 //!   through a [`KeyProvider`] and binds the endpoint; [`BoundPlane::serve`] runs
 //!   the accept loop. The daemon's [`run`] serves
 //!   [`RemotedConfig::daemon_plane`] with the [`KeyFiles`] provider; a library
-//!   host refuses the daemon-only `restart` and `engage-estop` verbs by name.
+//!   host refuses the daemon-only `restart`, `engage-estop` and act verbs by
+//!   name.
 //! - [`daemon`]: the kill switch, then the serving core: the `accept_one` loop dispatching on
 //!   the negotiated protocol. Each accepted connection is classified by the
 //!   authorizer and handed to the wire plane or the ops plane; a connection that is
@@ -67,7 +68,11 @@
 //!   stream to `cerud::OpsServer::serve_connection` via a `QuicOpsStream` adapter.
 //! - [`pairing_verbs`]: the self-gating bootstrap and safety verbs (`claim`, `pair`,
 //!   `code-pair-start`, `code-pair-finish`, `engage-estop`).
+//! - [`estop_lease`]: the control lease shared with a count of the e-stop engages
+//!   waiting for its lock, which the act verbs read before each send.
 //! - [`flashback`]: publishes a capture request when the ops-plane e-stop is engaged.
+//! - [`rcp`]: the `cerulion/rcp/1` plane, an MCP proxy from a paired desk to the
+//!   robot's local `cerulion-rcpd`, checking every message per MCP method.
 //! - [`clock`]: the robot's TRUSTED clock for pairing verification (never a
 //!   client-supplied time).
 //!
@@ -83,6 +88,7 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod act_verbs;
 pub mod authorizer;
 pub mod beacon_facts;
 pub mod clock;
@@ -91,6 +97,7 @@ pub mod daemon;
 pub mod device_index;
 pub mod epoch_pull;
 pub mod error;
+pub mod estop_lease;
 pub mod flashback;
 pub mod forward;
 pub mod host;
@@ -99,6 +106,7 @@ pub mod ops;
 pub mod pairing_verbs;
 mod private_file;
 pub mod provision;
+pub mod rcp;
 pub mod robot_settings;
 pub mod tap;
 pub mod trust;
@@ -113,14 +121,17 @@ pub use config::{
     NetworkSetting, RemotedConfig,
 };
 pub use daemon::{
-    handle_accepted, handle_accepted_with_wire, run, serve, serve_endpoint, serve_with_wire,
+    handle_accepted, handle_accepted_planes, handle_accepted_with_wire, run, serve, serve_endpoint,
+    serve_planes, serve_with_wire,
 };
 pub use device_index::DeviceAccountIndex;
 pub use error::RemotedError;
+pub use estop_lease::EstopLease;
 pub use flashback::{EstopCaptureAsk, TransportAsk};
 pub use host::{BoundPlane, KeyFiles, KeyProvider, RemotePlane};
 pub use local_schema::SchemaSource;
 pub use ops::OpsServing;
+pub use rcp::{RcpLink, RcpPlane};
 pub use tap::TapManager;
 pub use trust::{KeyAccess, SharedTrust, TrustError};
 pub use wire::{

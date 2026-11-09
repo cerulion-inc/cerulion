@@ -141,10 +141,11 @@ fn dropping_a_heartbeat_stuck_in_a_tick_is_bounded() {
 }
 
 /// A fresh consent home for one test: `CERULION_HOME` points at an empty
-/// directory under the system temp dir and the environment opt-outs are
-/// cleared, so consent resolves enabled and the anonymous id is minted
-/// there. The variable is left set: a starter thread that outlives its test
-/// must never fall back to the real home.
+/// directory under the system temp dir, and the environment opt-outs and
+/// both network kill-switch variables are cleared, so consent resolves
+/// enabled, the switch is off and the anonymous id is minted there. The
+/// variable is left set: a starter thread that outlives its test must never
+/// fall back to the real home.
 fn isolated_home(tag: &str) -> PathBuf {
     let home = std::env::temp_dir().join(format!(
         "cerulion-vizd-telemetry-{}-{tag}",
@@ -154,6 +155,8 @@ fn isolated_home(tag: &str) -> PathBuf {
     std::env::set_var("CERULION_HOME", &home);
     std::env::remove_var("DO_NOT_TRACK");
     std::env::remove_var("CERULION_TELEMETRY");
+    std::env::remove_var("CERULION_NETWORK");
+    std::env::remove_var("CERULION_VIZD_NETWORK");
     home
 }
 
@@ -459,6 +462,86 @@ fn the_daemon_sends_nothing_until_the_cli_has_shown_its_notice() {
     assert_eq!(started["properties"]["ci"], false);
 
     telemetry.shutdown();
+    std::env::remove_var("POSTHOG_API_KEY");
+    std::env::remove_var("POSTHOG_HOST");
+    drop(collector);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// The network kill switch stops the daemon's telemetry: `CERULION_NETWORK`
+/// or `CERULION_VIZD_NETWORK` set to anything that is not blank, under the
+/// CLI's fail-closed parse, starts no client, so no `vizd_started` and no
+/// heartbeat reach the collector. A blank value leaves the switch off.
+#[test]
+fn the_daemon_sends_nothing_under_the_network_kill_switch() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let home = isolated_home("switch");
+    let _restore = CiVarsCleared::new();
+    let mut collector = Collector::start();
+    std::env::set_var("POSTHOG_API_KEY", "phc_test");
+    std::env::set_var("POSTHOG_HOST", &collector.host);
+    consent::mark_notice_shown().expect("notice shown");
+
+    for (name, value) in [
+        ("CERULION_NETWORK", "off"),
+        ("CERULION_NETWORK", " OFF "),
+        ("CERULION_NETWORK", "typo"),
+        ("CERULION_VIZD_NETWORK", "off"),
+        ("CERULION_VIZD_NETWORK", "OFF"),
+    ] {
+        std::env::set_var(name, value);
+        assert!(
+            Telemetry::start().is_none(),
+            "{name}={value:?}: the daemon starts no telemetry under the switch"
+        );
+        Telemetry::start_in_background().shutdown();
+        std::env::remove_var(name);
+    }
+    let sent = collector.settled(Duration::from_millis(500), Duration::from_secs(3));
+    assert!(sent.is_empty(), "sent under the switch: {sent:?}");
+
+    std::env::set_var("CERULION_NETWORK", "  ");
+    let telemetry = Telemetry::start().expect("a blank value leaves the switch off");
+    let started = collector.next(Duration::from_secs(5));
+    assert_eq!(started["event"], "vizd_started");
+    telemetry.shutdown();
+
+    std::env::remove_var("CERULION_NETWORK");
+    std::env::remove_var("POSTHOG_API_KEY");
+    std::env::remove_var("POSTHOG_HOST");
+    drop(collector);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// The heartbeat stops with the switch too: a background start on the
+/// production path, beating every 20 ms, sends no `vizd_started` and no
+/// `vizd_heartbeat` under the switch; the same start without it sends both.
+#[test]
+fn no_heartbeat_reaches_the_collector_under_the_network_kill_switch() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let home = isolated_home("switch-beat");
+    let _restore = CiVarsCleared::new();
+    let mut collector = Collector::start();
+    std::env::set_var("POSTHOG_API_KEY", "phc_test");
+    std::env::set_var("POSTHOG_HOST", &collector.host);
+    consent::mark_notice_shown().expect("notice shown");
+    let beat = Duration::from_millis(20);
+
+    std::env::set_var("CERULION_NETWORK", "off");
+    let starting = Telemetry::start_in_background_every(beat);
+    std::thread::sleep(Duration::from_millis(300));
+    starting.shutdown();
+    let sent = collector.settled(Duration::from_millis(500), Duration::from_secs(3));
+    assert!(sent.is_empty(), "sent under the switch: {sent:?}");
+
+    std::env::remove_var("CERULION_NETWORK");
+    let starting = Telemetry::start_in_background_every(beat);
+    let started = collector.next(Duration::from_secs(5));
+    assert_eq!(started["event"], "vizd_started");
+    let beat_event = collector.next(Duration::from_secs(5));
+    assert_eq!(beat_event["event"], "vizd_heartbeat");
+    starting.shutdown();
+
     std::env::remove_var("POSTHOG_API_KEY");
     std::env::remove_var("POSTHOG_HOST");
     drop(collector);

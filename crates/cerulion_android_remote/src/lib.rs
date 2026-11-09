@@ -20,7 +20,8 @@
 //! The plane reads the app's topics on the app's own transport and names
 //! their schemas from the start's schema serving, so the app runs no network
 //! daemon. A desk reads the catalog, schemas and topic frames; it cannot
-//! publish into the app, and `restart` and `engage-estop` are refused.
+//! publish into the app, and `restart`, `engage-estop` and the act verbs are
+//! refused.
 
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 

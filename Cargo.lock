@@ -1380,6 +1380,7 @@ dependencies = [
  "cerulion_discovery",
  "cerulion_hygiene",
  "cerulion_mdns",
+ "cerulion_msgio",
  "cerulion_netd",
  "cerulion_pairing",
  "clap",
@@ -1589,6 +1590,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerulion_msgio"
+version = "2.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "cerulion_core",
+ "image",
+ "native_ros2_messages",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
 name = "cerulion_netd"
 version = "2.0.0"
 dependencies = [
@@ -1692,19 +1708,28 @@ dependencies = [
  "cerud",
  "cerulion_core",
  "cerulion_link",
+ "cerulion_msgio",
  "cerulion_netd",
  "cerulion_pairing",
+ "cerulion_rcpd",
  "cerulion_remoted",
+ "cerulion_wireclient",
  "clap",
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iceoryx2",
  "iroh",
  "libc",
+ "native_ros2_messages",
  "postcard",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2 0.10.9",
  "subtle",
  "tempfile",
@@ -9344,6 +9369,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_macro_consume_latest_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_macro_data_trigger_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9361,6 +9394,14 @@ dependencies = [
 
 [[package]]
 name = "test_node_macro_external_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_macro_gate_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",

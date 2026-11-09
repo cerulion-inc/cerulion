@@ -155,7 +155,7 @@ Package: [campaign directory](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fix
 On macOS 14.4 and later a producer's publish rings a shared-memory wake word
 that a parked consumer in another process is kernel-blocked on, so a
 two-process hop wakes on the data rather than on the park's recheck timer
-([`deployment_tuning.md`](deployment_tuning.md), "macOS data-wake doorbell").
+([`deployment_tuning.md`](deployment_tuning.md), "Data-wake doorbell").
 Measured before and after that change on one Apple M3 Max (16 cores, macOS
 26.0.1): `benches/latency` round trip, quiescent pacing, default settings, no
 pinning, five reps per cell per build with the two builds alternating within

@@ -234,7 +234,9 @@ re-executed per rank rather than refused. The RECORDER is available too, and
 free-run is the flagless default: a multi-process `graph run --record` produces
 a `free_run` bag unless the run opted out with `CERULION_EXECUTION_MODE=lockstep`
 (see [`docs/multi_process.md`](multi_process.md)), and a `lockstep` bag is
-either that opt-out or a monolith recording (`--single-process --record`).
+either that opt-out or a monolith recording (`--single-process --record` of a
+graph that is one executor unit; one whose nodes split into several units
+records a `free_run` bag, one rank per unit).
 
 ### Fires come from the trace; the verifier re-derives
 
@@ -272,8 +274,9 @@ what the demotion exists for.
 
 What still surfaces structurally: rank-LOCAL decisions the verifier can
 re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
-clock, `Sync` alignment, FIFO pop counts from the read log) are re-derived and
-positionally compared, so policy or declaration drift on those is still caught.
+clock, `Sync` alignment, FIFO pop counts from the read log, and a
+`consume = latest` node's one fire per step from the read log's drains) are
+re-derived and positionally compared, so policy or declaration drift on those is still caught.
 
 ### Divergence LOCALIZES to the producing rank
 

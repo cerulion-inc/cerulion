@@ -82,7 +82,9 @@
 //!   A caller may pass its own GUID instead: `rmw_cerulion` passes a
 //!   host-unique entity gid (process id included), which differs per run,
 //!   so a restarted `rmw_cerulion` client replies on a new topic.
-//! - Sequence numbers are a per-client monotonic counter starting at 1.
+//! - Sequence numbers are a per-client monotonic counter starting at 1,
+//!   or at the number the caller gives
+//!   [`ServiceClient::start_sequence_at`].
 //! - Which clients a server still holds (see "Topology") depends on whether
 //!   their reply subscribers are attached when a new client's first request
 //!   is taken, so the request-sequence diagnostics of a client that left and
@@ -138,7 +140,7 @@ use super::frame_drop_latch::{
 };
 use super::publisher::CerulionPublisher;
 use super::subscriber::CerulionSubscriber;
-use super::{TopicServiceConfig, TransportManager};
+use super::{FullQueueSend, TopicServiceConfig, TransportManager};
 
 /// Correlation envelope carried on every service frame, immediately
 /// after the `WireHeader`. Mirrors `rmw_request_id_t` exactly:
@@ -353,6 +355,16 @@ impl ServiceClient {
     /// for correlation with
     /// [`try_take_one_response`](Self::try_take_one_response).
     pub fn send_request(&mut self, payload: &[u8]) -> TransportResult<i64> {
+        self.send_request_counted(payload)
+            .map(|(sequence, _servers)| sequence)
+    }
+
+    /// [`Self::send_request`], also returning how many servers the request
+    /// was delivered to: the recipient count of the request publisher's
+    /// send. A server whose request queue was full is not counted when the
+    /// client was built with [`FullQueueSend::Discard`]
+    /// ([`TransportManager::create_service_client_with`]).
+    pub fn send_request_counted(&mut self, payload: &[u8]) -> TransportResult<(i64, usize)> {
         // Mint the sequence but COMMIT it only after a successful
         // publish — a failed send must not burn a number, or the
         // server's gap detector would report a spurious "request LOST"
@@ -370,7 +382,7 @@ impl ServiceClient {
             sequence as u32,
             self.clock.now_ns(),
         )?;
-        self.request_pub.publish_raw(&frame)?;
+        let servers = self.request_pub.publish_raw(&frame)?;
         // Publish succeeded — commit the sequence number.
         self.next_sequence += 1;
         // Drain our own publisher-side listener BEFORE notifying: the
@@ -411,7 +423,16 @@ impl ServiceClient {
             size_bytes = payload.len(),
             "service request sent"
         );
-        Ok(sequence)
+        Ok((sequence, servers))
+    }
+
+    /// Number this client's next request `first` (at least 1) instead of
+    /// the next number of its own count. A response carries the sequence of
+    /// the request it answers, so a late response to an earlier client on
+    /// the same GUID matches none of this client's requests while their
+    /// numbers differ from every number the earlier client sent.
+    pub fn start_sequence_at(&mut self, first: i64) {
+        self.next_sequence = first.max(1);
     }
 
     /// The client's GUID (envelope identity).
@@ -523,6 +544,21 @@ impl ServiceClient {
         self.transport
             .topic_subscriber_count(&request_topic(&self.service))
             > 0
+    }
+
+    /// How many servers are subscribed to this service's request topic now,
+    /// from every process on this host.
+    pub fn server_count(&self) -> usize {
+        self.transport
+            .topic_subscriber_count(&request_topic(&self.service))
+    }
+
+    /// The backpressure strategy of the request publisher's port.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn request_backpressure_strategy_for_test(
+        &self,
+    ) -> iceoryx2::prelude::BackpressureStrategy {
+        self.request_pub.backpressure_strategy_for_test()
     }
 
     /// The service name.
@@ -881,6 +917,30 @@ impl TransportManager {
         request_schema_hash: u64,
         response_schema_hash: u64,
     ) -> TransportResult<ServiceClient> {
+        self.create_service_client_with(
+            service,
+            client_guid,
+            max_slice_len,
+            request_schema_hash,
+            response_schema_hash,
+            FullQueueSend::ConfigDefault,
+        )
+    }
+
+    /// [`Self::create_service_client`] with the request publisher's
+    /// full-queue send set by `full_queue`. With [`FullQueueSend::Discard`]
+    /// [`ServiceClient::send_request_counted`] returns without waiting on a
+    /// server whose request queue is full, and counts only the servers the
+    /// request reached.
+    pub fn create_service_client_with(
+        self: &Arc<Self>,
+        service: &str,
+        client_guid: [u8; 16],
+        max_slice_len: MaxSliceLen,
+        request_schema_hash: u64,
+        response_schema_hash: u64,
+        full_queue: FullQueueSend,
+    ) -> TransportResult<ServiceClient> {
         validate_service_name(service).map_err(|reason| {
             crate::error::TransportError::PublisherCreation {
                 // The raw input — NOT request_topic(service), which for a
@@ -893,11 +953,12 @@ impl TransportManager {
         // Explicit role-based provisioning. The client's
         // request publisher fans into a multi-writer request topic; its
         // reply subscriber opens a single-writer per-client reply topic.
-        let request_pub = self.create_publisher_with_topic_config(
+        let request_pub = self.create_publisher_sending(
             &request_topic(service),
             max_slice_len,
             0,
             TopicServiceConfig::for_service_request(self.subscriber_buffer_size()),
+            full_queue,
         )?;
         let reply_sub = self.create_subscriber_with_buffers(
             &reply_topic(service, &client_guid),
