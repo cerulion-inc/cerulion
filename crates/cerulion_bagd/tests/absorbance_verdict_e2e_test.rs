@@ -34,14 +34,17 @@
 
 mod common;
 
+use std::cell::RefCell;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cerulion_bagd::absorbance::{ABSORBANCE_MIN_RATE_SPAN, ABSORBANCE_VERDICT_QUANTILE};
 use cerulion_bagd::{
-    run_bagd, AbsorbanceVerdict, BagdConfig, BagdSummary, FlashbackSettings, TapSpec,
-    TopicAbsorbance,
+    run_bagd, AbsorbanceVerdict, BagdConfig, BagdSummary, DrainGapHistogram, FlashbackSettings,
+    TapSpec, TopicAbsorbance,
 };
 use cerulion_core::flashback::retention::RetentionCaps;
 use cerulion_core::flashback::switch::TriggerPosture;
@@ -81,16 +84,33 @@ const BORROW: usize = 4;
 /// comfortably under the ~10 ms pacing tick the stall produces.
 const FAST_PERIOD: Duration = Duration::from_micros(2_500);
 
-/// The SLOW topic's publish period. 100 ms = 10 Hz, so `DEPTH / rate` is 200 ms
-/// — comfortably OVER the same tail. The control arm.
+/// The SLOW topic's publish period. 200 ms = 5 Hz, so `DEPTH / rate` is 400 ms,
+/// OVER the drain-gap ladder's top edge (250 ms). The control arm.
 ///
-/// The margin is deliberate rather than tuned to the observed tail: the stall
-/// paces the drive loop at `WAIT_TICK` (10 ms), which lands in the 25 ms rung,
-/// and a loaded runner can push it to the 50 ms one. 200 ms clears both by a
-/// factor of four, so the control cannot flip on load — and the arms assert
-/// against the row's OWN reported tail rather than against a constant, so a
-/// runner that stalls harder still fails loudly instead of silently.
-const SLOW_PERIOD: Duration = Duration::from_millis(100);
+/// Over the top edge because the verdict compares the absorbance with the UPPER
+/// edge of the bucket the tail lands in, and a host that coalesces timers moves
+/// the tail into the top bucket without stalling anything: macOS background QoS
+/// lets a timer fire up to 100 ms late (`kern.timer_coalesce_bg_ns_max`), so the
+/// drive loop's 10 ms idle sleep can land past 100 ms, which the histogram files
+/// in the (100, 250] ms bucket and serves as 250 ms. A tap holding 200 ms reads
+/// `Short` against that. At 400 ms every in-ladder tail is covered, so the only
+/// tail that can deny the control `Absorbs` is an OVERFLOW one, which the verdict
+/// arms report as a stalled runner. They still assert against the row's OWN
+/// reported tail rather than against a constant.
+const SLOW_PERIOD: Duration = Duration::from_millis(200);
+
+/// The band, `[2/3, 3/2]` of the COMMANDED rate, that an arm priced at that rate
+/// needs the recorder's MEASURED rate to sit in. See [`rate_band`].
+///
+/// The measured rate is the tap's committed sequence delta over the DRAIN-clock
+/// span between its first and last drained frames. With the grid-paced
+/// [`publish_until`], that span is off from the committed frames' own span by at
+/// most one drain gap plus one publish lateness, and the band holds whenever the
+/// span is at least three times that error: an in-ladder gap (at most 250 ms)
+/// plus a lateness under 400 ms against the two seconds and more every arm here
+/// runs for. A publisher committing at half its period's rate falls outside it.
+const RATE_BAND_LOW: (u64, u64) = (2, 3);
+const RATE_BAND_HIGH: (u64, u64) = (3, 2);
 
 /// How long the drain is held shut. Long enough that the paced idle passes
 /// DOMINATE the histogram (a 0.999 quantile has to see them), and long enough
@@ -190,17 +210,36 @@ fn row(summary: &BagdSummary, topic: &str) -> TopicAbsorbance {
     a
 }
 
-/// Publish `body` on `pubr` every `period` until `stop` flips, returning how
-/// many frames really went out (the arm's own denominator sanity check).
+/// Publish `body` on `pubr` on an ABSOLUTE grid of `period` until `stop` flips,
+/// returning how many frames really went out (the arm's own denominator sanity
+/// check).
+///
+/// Slot `k` falls due at `start + k * period`, and every publish attempt takes
+/// one slot. The thread sleeps only until the next slot is due, so a wake that
+/// lands past one or more due slots publishes them back to back and the commit
+/// rate over any window of a few periods is the commanded one, however late
+/// each wake lands. A relative `sleep(period)` after each publish adds every
+/// wake's lateness to the period instead, and under timer coalescing (macOS
+/// background QoS fires a timer up to 100 ms late) a 100 ms period then commits
+/// near 5 Hz, which prices the tap at a rate the arm never commanded.
 fn publish_until(
     pubr: &mut cerulion_core::transport::publisher::CerulionPublisher,
     period: Duration,
     stop: &AtomicBool,
     body: &[u8],
 ) -> u32 {
+    let start = std::time::Instant::now();
+    let mut slot = 0u32;
     let mut seq = 0u32;
     let mut sent = 0u32;
     while !stop.load(Ordering::Relaxed) {
+        let due = start + period * slot;
+        let now = std::time::Instant::now();
+        if now < due {
+            std::thread::sleep(due - now);
+            continue;
+        }
+        slot += 1;
         // The wire `sequence` is what the rate window differences, so it
         // advances by exactly one per COMMIT — which is what makes the frames
         // this queue drops still count toward the rate.
@@ -219,9 +258,175 @@ fn publish_until(
             sent += 1;
             seq = seq.wrapping_add(1);
         }
-        std::thread::sleep(period);
     }
     sent
+}
+
+/// A rate in millihertz: `frames` committed over `over`.
+fn millihertz(frames: u128, over: Duration) -> u64 {
+    u64::try_from(frames * 1_000_000_000_000u128 / over.as_nanos().max(1))
+        .expect("a plausible rate")
+}
+
+/// PRECONDITION for an arm priced at its COMMANDED rate: the recorder's measured
+/// rate for `row` sits between [`RATE_BAND_LOW`] and [`RATE_BAND_HIGH`] of
+/// `1 / period`.
+///
+/// It never skips. A miss is told apart by the ACHIEVED rate, `sent` frames over
+/// `published_for`:
+///
+/// * achieved OUTSIDE the band: the publisher fell behind its grid, so the run
+///   did not set up the scenario the arm checks. `Err` carries the rates, and
+///   the arm returns the attempt as non-probative (see [`rerun_non_probative`]).
+/// * achieved INSIDE the band, and the measured rate outside it or absent: the
+///   rate window disagrees with what was published, which is the code under
+///   test. That PANICS, so it fails a probative attempt and nothing re-runs.
+fn rate_band(
+    what: &str,
+    row: &TopicAbsorbance,
+    period: Duration,
+    sent: u32,
+    published_for: Duration,
+) -> Result<(), String> {
+    let commanded_mhz = millihertz(1, period);
+    let achieved_mhz = millihertz(u128::from(sent), published_for);
+    let (lo_n, lo_d) = RATE_BAND_LOW;
+    let (hi_n, hi_d) = RATE_BAND_HIGH;
+    let in_band =
+        |mhz: u64| mhz * lo_d >= commanded_mhz * lo_n && mhz * hi_d <= commanded_mhz * hi_n;
+    if row.rate_mhz.is_some_and(in_band) {
+        return Ok(());
+    }
+    let measured = row
+        .rate_mhz
+        .map_or_else(|| "NO rate".to_string(), |m| format!("{m} mHz"));
+    let rates = format!(
+        "{what} is priced at its commanded {commanded_mhz} mHz, where depth {DEPTH} holds {} \
+         us, inside a band of [{lo_n}/{lo_d}, {hi_n}/{hi_d}] of it; the recorder measured \
+         {measured}, and the publisher committed {sent} frames in {published_for:?} \
+         (~{achieved_mhz} mHz)",
+        DEPTH * 1_000_000_000 / commanded_mhz.max(1)
+    );
+    if !in_band(achieved_mhz) {
+        let way = if achieved_mhz * lo_d < commanded_mhz * lo_n {
+            "fell behind"
+        } else {
+            "ran ahead of"
+        };
+        return Err(format!(
+            "PRECONDITION: {rates}. The publisher {way} its grid, so this run did not set up \
+             the scenario the arm checks"
+        ));
+    }
+    panic!(
+        "PRECONDITION: {rates}. The publisher ran inside the band and the measured rate did \
+         not, so the rate window disagrees with what was published: {row:?}"
+    );
+}
+
+/// How many attempts [`rerun_non_probative`] gives an arm's scenario.
+const ATTEMPTS: u32 = 3;
+
+/// What one attempt of an arm's scenario showed about itself.
+enum Attempt {
+    /// The run set up the arm's scenario, and every assertion on it ran and held.
+    Probative,
+    /// The run did not set up the arm's scenario, by this attempt's own
+    /// measurements of the host. Carries that evidence.
+    NonProbative(String),
+}
+
+/// Run an arm's scenario, and run it again ONLY after an attempt proves itself
+/// non-probative, up to [`ATTEMPTS`] attempts in all.
+///
+/// `attempt(n)` builds every piece of state it uses (transport manager, topics,
+/// recorder, Flashback directory, bag) and removes it before it returns, so
+/// nothing one attempt did reaches the next. It runs inside an
+/// `absorbance_attempt{attempt=n}` span entered on this thread, the thread the
+/// log-capturing arms run `run_bagd` on, so [`attempt_lines`] keeps one
+/// attempt's captured lines apart from another's.
+///
+/// The attempt runs the arm's assertions itself, and a wrong answer on a
+/// probative attempt panics there: that failure is final and nothing re-runs.
+/// [`Attempt::NonProbative`] comes back only from checks an arm makes AHEAD of
+/// the assertions they would leave ungrounded, and only for two conditions read
+/// off this attempt's own run: a drive-loop gap over the drain-gap ladder's
+/// 250 ms top edge, against which the verdict contract rules out `Absorbs` and a
+/// measured tail, or a publisher whose achieved rate missed the band its arm is
+/// priced at ([`rate_band`]).
+///
+/// Each non-probative attempt's evidence goes to the process's stderr outside
+/// the test harness's capture, so a run that passed on a later attempt still
+/// shows what the earlier ones measured. When every attempt is non-probative the
+/// arm fails, naming each one.
+fn rerun_non_probative(what: &str, mut attempt: impl FnMut(u32) -> Attempt) {
+    let mut seen = Vec::new();
+    for n in 1..=ATTEMPTS {
+        let span = tracing::info_span!("absorbance_attempt", attempt = n);
+        match span.in_scope(|| attempt(n)) {
+            Attempt::Probative => return,
+            Attempt::NonProbative(evidence) => {
+                let line =
+                    format!("{what}: attempt {n} of {ATTEMPTS} was NON-PROBATIVE: {evidence}");
+                writeln!(std::io::stderr(), "{line}").ok();
+                seen.push(line);
+            }
+        }
+    }
+    panic!(
+        "NON-PROBATIVE: all {ATTEMPTS} attempts of {what} ran on a host that invalidated \
+         them, so this runner cannot check the arm. That is a stalled runner, not a verdict \
+         regression:\n{}",
+        seen.join("\n")
+    );
+}
+
+/// The captured `lines` that attempt `n` logged: those inside its
+/// `absorbance_attempt` span (see [`rerun_non_probative`]).
+fn attempt_lines(lines: &[String], n: u32) -> Vec<String> {
+    let span = format!(":absorbance_attempt{{attempt={n}}}:");
+    lines
+        .iter()
+        .filter(|l| l.contains(&span))
+        .cloned()
+        .collect()
+}
+
+/// One tap in an attempt's evidence: `(what, row, period, sent, published_for)`.
+type TapEvidence<'a> = (&'a str, &'a TopicAbsorbance, Duration, u32, Duration);
+
+/// One attempt's EVIDENCE: the drain-gap histogram its verdicts were ranked
+/// against, and each tap's commanded, measured and achieved rates.
+fn attempt_evidence(gaps: &DrainGapHistogram, taps: &[TapEvidence<'_>]) -> String {
+    let mut out = format!(
+        "gaps per bucket {:?} over edges up to {:?} us, {} of them over the top edge",
+        gaps.counts,
+        gaps.edges_us.last(),
+        overflow_gaps(gaps)
+    );
+    for (what, row, period, sent, published_for) in taps {
+        out.push_str(&format!(
+            "; {what}: commanded {} mHz, measured {:?} mHz, achieved ~{} mHz ({sent} frames \
+             in {published_for:?}), verdict {:?}",
+            millihertz(1, *period),
+            row.rate_mhz,
+            millihertz(u128::from(*sent), *published_for),
+            row.verdict
+        ));
+    }
+    out
+}
+
+/// The gaps `gaps` counted in its unbounded OVERFLOW bucket, past the ladder's
+/// top edge.
+fn overflow_gaps(gaps: &DrainGapHistogram) -> u64 {
+    gaps.counts.get(gaps.edges_us.len()).copied().unwrap_or(0)
+}
+
+/// Whether this run's 0.999 drain-gap reading fell in the OVERFLOW bucket: the
+/// tail against which no tap can rank `Absorbs` or carry a measured tail.
+fn tail_overflowed(gaps: &DrainGapHistogram) -> bool {
+    !gaps.is_vacant() && gaps.quantile_us(ABSORBANCE_VERDICT_QUANTILE).is_none()
 }
 
 /// THE HEADLINE: one recorder, one measured stall, two rates — and two
@@ -233,6 +438,12 @@ fn publish_until(
 /// rate exactly.
 #[test]
 fn a_tap_too_shallow_for_the_measured_stall_is_short_while_its_slower_sibling_absorbs() {
+    rerun_non_probative("the headline", headline_attempt);
+}
+
+/// One attempt of the headline's scenario, on its own manager, recorder, topics
+/// and bag (see [`rerun_non_probative`]).
+fn headline_attempt(attempt: u32) -> Attempt {
     let mgr = make_manager(16);
     let dir = temp_dir("headline");
     let fast_topic = unique_topic("absorb_fast");
@@ -314,15 +525,58 @@ fn a_tap_too_shallow_for_the_measured_stall_is_short_while_its_slower_sibling_ab
     shutdown.store(true, Ordering::Relaxed);
     let summary = join_bagd(handle, &shutdown, "the absorbance headline").expect("recorder");
 
+    let fast_row = row(&summary, &fast_topic);
+    let slow_row = row(&summary, &slow_topic);
+    let gaps = &summary.record_health.drain_gaps;
+    let evidence = attempt_evidence(
+        gaps,
+        &[
+            ("the fast tap", &fast_row, FAST_PERIOD, fast_sent, wall),
+            ("the slow control", &slow_row, SLOW_PERIOD, slow_sent, wall),
+        ],
+    );
+    eprintln!("the headline, attempt {attempt}: {evidence}");
+    // NON-PROBATIVE (the runner-stall pattern), read off this attempt's own
+    // histogram. While the 0.999 reading sits in the overflow bucket (a drive-loop
+    // gap over the ladder's 250 ms top edge) the slow control's 400 ms absorbance
+    // is `Unrankable` and the fast row carries no tail, whatever the code under
+    // test does. The live wait reads the same state: a status feed that never
+    // showed the control absorbing, with `slow=unrankable` beside `fast=short` on
+    // a run whose overflow bucket counted a gap, timed out on it. The same frame
+    // on a run with an EMPTY overflow bucket is not that, and fails below.
+    // Both escapes read the overflow bucket's own count, so a 0.999 walk that
+    // lands past the ladder on a histogram whose overflow bucket is empty fails
+    // below as a verdict regression instead of re-running.
+    let live_unrankable = matches!(
+        &live,
+        Err(Some((f, s, _))) if f == "short" && s == "unrankable"
+    );
+    if (tail_overflowed(gaps) || live_unrankable) && overflow_gaps(gaps) > 0 {
+        cleanup_artifacts(&out, &dir, &ready);
+        return Attempt::NonProbative(format!(
+            "a drive-loop gap over the ladder's 250 ms top edge left the slow control \
+             unrankable{}; {evidence}",
+            if live_unrankable {
+                " and the live wait timed out on it"
+            } else {
+                ""
+            }
+        ));
+    }
+    // PRECONDITION: the control is priced at its commanded 5 Hz, which is what
+    // puts its absorbance over the ladder's top edge (see `SLOW_PERIOD`).
+    if let Err(behind) = rate_band("the slow control", &slow_row, SLOW_PERIOD, slow_sent, wall) {
+        cleanup_artifacts(&out, &dir, &ready);
+        return Attempt::NonProbative(format!("{behind}; {evidence}"));
+    }
+    let live = live.unwrap_or_else(live_never_converged);
+
     // PRECONDITION, asserted rather than assumed: the two publishers really did
     // run at different rates over the same window.
     assert!(
         fast_sent > slow_sent * 4,
         "the fixture must really separate the two rates: fast={fast_sent} slow={slow_sent}"
     );
-
-    let fast_row = row(&summary, &fast_topic);
-    let slow_row = row(&summary, &slow_topic);
 
     // PRECONDITION: the stall really was measured. Both rows read the SAME
     // recorder-wide histogram, so one assertion covers both.
@@ -333,19 +587,18 @@ fn a_tap_too_shallow_for_the_measured_stall_is_short_while_its_slower_sibling_ab
     // and one preempted pass moves it. This fixture's run is ~3 s, i.e. a few
     // hundred passes, so it is squarely in that regime: the arms below are up
     // against the worst pass of the run, and they say so.
-    let gaps = &summary.record_health.drain_gaps;
     let total_gaps = gaps.total();
     assert!(
         total_gaps > 0,
         "the recorder must have measured its own cadence, or there is no tail          to be short of"
     );
-    // NON-PROBATIVE ESCAPE (the runner-stall pattern): a runner stalled past the
-    // ladder's top edge makes the comparison unrankable rather than wrong, and
-    // an unrankable run must fail as an ATTRIBUTABLE stall rather than as a
-    // regression in the code under test.
+    // The overflow reading re-runs the attempt above, so this run's 0.999 reading
+    // is an in-ladder edge, and a fast row that does not carry it is the code
+    // under test.
     let Some(tail) = fast_row.measured_tail_us else {
         panic!(
-            "NON-PROBATIVE: this run's 0.999 drain-gap reading fell in the              histogram's unbounded overflow bucket (> 250 ms), so neither arm              can be ranked. That is a stalled runner, not a verdict regression              — {total_gaps} gaps measured, fast={fast_row:?}"
+            "this run's 0.999 drain-gap reading is inside the ladder, so the fast row must \
+             carry it as its measured tail: {total_gaps} gaps measured, fast={fast_row:?}"
         );
     };
     assert_eq!(
@@ -360,17 +613,17 @@ fn a_tap_too_shallow_for_the_measured_stall_is_short_while_its_slower_sibling_ab
          got a {tail} us tail over {total_gaps} gaps, so this run measured no \
          stall to be short of"
     );
-    // The SLOW control is only meaningful while its absorbance clears the tail
-    // with room; if a runner stalled hard enough to close that gap, this arm
-    // proves nothing and says so rather than reporting a regression.
+    // The SLOW control clears every in-ladder tail with room: the rate band caps
+    // its measured rate at 3/2 of 5 Hz, where depth 2 holds about 267 ms, over
+    // the ladder's 250 ms top edge, and an overflow tail re-runs the attempt
+    // above. A tail at or past its absorbance is one this ladder cannot serve.
     let slow_abs_pre = slow_row
         .absorbance_us
         .expect("the slow row has a rate and a depth");
     assert!(
         slow_abs_pre > tail,
-        "NON-PROBATIVE: the control tap's absorbance ({slow_abs_pre} us) no \
-         longer clears this run's measured tail ({tail} us) — a stalled runner, \
-         not a verdict regression"
+        "the control tap's in-band absorbance ({slow_abs_pre} us) must clear this run's \
+         in-ladder tail ({tail} us): {slow_row:?}"
     );
 
     // THE VERDICTS.
@@ -482,6 +735,7 @@ fn a_tap_too_shallow_for_the_measured_stall_is_short_while_its_slower_sibling_ab
     );
 
     cleanup_artifacts(&out, &dir, &ready);
+    Attempt::Probative
 }
 
 /// THE LOUD LINE: a tap that cannot absorb says so ONCE per regime, naming what
@@ -505,6 +759,21 @@ fn a_tap_too_shallow_for_the_measured_stall_is_short_while_its_slower_sibling_ab
 #[test]
 #[tracing_test::traced_test]
 fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_caveat() {
+    let captured = || {
+        let all = RefCell::new(Vec::new());
+        logs_assert(|lines: &[&str]| {
+            *all.borrow_mut() = lines.iter().map(|l| (*l).to_string()).collect();
+            Ok(())
+        });
+        all.into_inner()
+    };
+    rerun_non_probative("the loud arm", |attempt| loud_attempt(attempt, &captured));
+}
+
+/// One attempt of the loud arm's scenario, on its own manager, recorder, topic
+/// and bag (see [`rerun_non_probative`]). `captured` returns every line the
+/// test's log capture holds, which [`attempt_lines`] narrows to this attempt's.
+fn loud_attempt(attempt: u32, captured: &dyn Fn() -> Vec<String>) -> Attempt {
     let mgr = make_manager(16);
     let dir = temp_dir("loud");
     let topic = unique_topic("absorb_loud");
@@ -538,6 +807,7 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
     let stimulus = std::thread::spawn(move || {
         await_bagd_ready(&stim_ready, "the absorbance loud arm");
         let body = vec![0xAB; 256];
+        let pumping = std::time::Instant::now();
         let pump =
             std::thread::spawn(move || publish_until(&mut pubr, FAST_PERIOD, &stim_stop, &body));
         // STUTTER: each OPEN window drains the backlog and advances the rate
@@ -555,17 +825,29 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
         std::thread::sleep(Duration::from_millis(300));
         stop.store(true, Ordering::Relaxed);
         let sent = pump.join().expect("publisher");
+        let published_for = pumping.elapsed();
         stim_shutdown.store(true, Ordering::Relaxed);
-        sent
+        (sent, published_for)
     });
 
     let summary = run_bagd(mgr.clone(), cfg, shutdown.clone()).expect("clean finalize");
-    let sent = stimulus.join().expect("stimulus");
-    assert!(sent > 100, "the fixture must really publish: {sent}");
+    let (sent, published_for) = stimulus.join().expect("stimulus");
 
     // PRECONDITION: the run really did end SHORT, so the log assertions below
     // are about a condition that occurred.
     let a = row(&summary, &topic);
+    let evidence = attempt_evidence(
+        &summary.record_health.drain_gaps,
+        &[("the loud arm's tap", &a, FAST_PERIOD, sent, published_for)],
+    );
+    eprintln!("the loud arm, attempt {attempt}: {evidence}");
+    // PRECONDITION: it is short at the rate the arm commanded. A depth-2 queue at
+    // 400 Hz holds 5 ms, under the 10 ms the closed drain paces the loop at.
+    if let Err(behind) = rate_band("the loud arm's tap", &a, FAST_PERIOD, sent, published_for) {
+        cleanup_artifacts(&out, &dir, &ready);
+        return Attempt::NonProbative(format!("{behind}; {evidence}"));
+    }
+    assert!(sent > 100, "the fixture must really publish: {sent}");
     assert_eq!(a.verdict, AbsorbanceVerdict::Short, "{a:?}");
     // The one STICKY field on the row, and the only thing that keeps a topic
     // which fell short EARLIER in a run on the terminal roll-up once it
@@ -577,8 +859,14 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
         a.short_evaluations >= 2,
         "the recorder must COUNT the evaluations that found this tap short: {a:?}"
     );
+    // The histogram's unbounded OVERFLOW bucket, read off the run's own document
+    // for the head's escape below. Counts only grow, so an overflow gap the head
+    // was evaluated against is still counted here.
+    let gap_counts = summary.record_health.drain_gaps.counts.clone();
+    let overflow_gaps = overflow_gaps(&summary.record_health.drain_gaps);
 
-    logs_assert(|lines: &[&str]| {
+    // `Ok(Some(why))` is the head's non-probative escape below, `Err` a failure.
+    let check = |lines: &[&str]| -> Result<Option<String>, String> {
         let heads: Vec<&&str> = lines
             .iter()
             // The TERMINAL roll-up is a WARN on the same subject, so the head
@@ -646,13 +934,7 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
         if !has_field(head, "tap_buffer_depth", "2") {
             return Err(format!("the head must carry tap_buffer_depth=2: {head}"));
         }
-        for key in [
-            "required_depth",
-            "absorbance_us",
-            "measured_tail_us",
-            "shortfall_at_least_us",
-            "rate_mhz",
-        ] {
+        let measured = |key: &str| -> Result<(), String> {
             let Some(tok) = field_token(head, key) else {
                 return Err(format!("the head must carry `{key}=`: {head}"));
             };
@@ -662,6 +944,31 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
                      fabricated zero; got `{tok}`: {head}"
                 ));
             }
+            Ok(())
+        };
+        // The fields a short verdict measures whatever its tail.
+        for key in ["absorbance_us", "shortfall_at_least_us", "rate_mhz"] {
+            measured(key)?;
+        }
+        // NON-PROBATIVE ESCAPE (the runner-stall pattern) for the two fields an
+        // OVERFLOW tail leaves unknown by contract. A drive-loop gap over the
+        // ladder's 250 ms top edge puts the 0.999 reading in the unbounded
+        // bucket (over a few hundred passes that reading is the run MAXIMUM),
+        // and a head evaluated then carries `measured_tail_us=None` and
+        // `required_depth=None` because that tail has no number. Such a run
+        // cannot check them, and the attempt is non-probative. A `None` tail on
+        // a run whose overflow bucket is EMPTY cannot be that, and the checks
+        // below report it.
+        if field_token(head, "measured_tail_us") == Some("None") && overflow_gaps > 0 {
+            return Ok(Some(format!(
+                "the head was evaluated against an OVERFLOW tail ({overflow_gaps} \
+                 drive-loop gap(s) over 250 ms; gaps per bucket {gap_counts:?}), so \
+                 `measured_tail_us` and `required_depth` are unknown by contract and this \
+                 run cannot check them: {head}"
+            )));
+        }
+        for key in ["required_depth", "measured_tail_us"] {
+            measured(key)?;
         }
         // The TERMINAL roll-up rides the same run, and names the topic.
         let terminal: Vec<&&str> = lines
@@ -683,10 +990,21 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
                 terminal[0]
             ));
         }
-        Ok(())
-    });
+        Ok(None)
+    };
+    let lines = attempt_lines(&captured(), attempt);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    match check(&lines) {
+        Ok(None) => {}
+        Ok(Some(why)) => {
+            cleanup_artifacts(&out, &dir, &ready);
+            return Attempt::NonProbative(format!("{why}; {evidence}"));
+        }
+        Err(msg) => panic!("the loud arm's log assertions returned an error: {msg}"),
+    }
 
     cleanup_artifacts(&out, &dir, &ready);
+    Attempt::Probative
 }
 
 /// THE ANTI-TAUTOLOGY CONTROL: a recorder whose taps absorb everything it
@@ -698,6 +1016,21 @@ fn a_tap_that_cannot_absorb_says_so_once_per_regime_and_names_the_counting_cavea
 #[test]
 #[tracing_test::traced_test]
 fn a_recorder_whose_taps_absorb_is_silent_and_still_carries_its_verdict() {
+    let captured = || {
+        let all = RefCell::new(Vec::new());
+        logs_assert(|lines: &[&str]| {
+            *all.borrow_mut() = lines.iter().map(|l| (*l).to_string()).collect();
+            Ok(())
+        });
+        all.into_inner()
+    };
+    rerun_non_probative("the quiet arm", |attempt| quiet_attempt(attempt, &captured));
+}
+
+/// One attempt of the quiet arm's scenario, on its own manager, recorder, topic
+/// and bag (see [`rerun_non_probative`]). `captured` returns every line the
+/// test's log capture holds, which [`attempt_lines`] narrows to this attempt's.
+fn quiet_attempt(attempt: u32, captured: &dyn Fn() -> Vec<String>) -> Attempt {
     let mgr = make_manager(16);
     let dir = temp_dir("quiet");
     let topic = unique_topic("absorb_quiet");
@@ -725,56 +1058,103 @@ fn a_recorder_whose_taps_absorb_is_silent_and_still_carries_its_verdict() {
     let stimulus = std::thread::spawn(move || {
         await_bagd_ready(&stim_ready, "the absorbance quiet arm");
         let body = vec![0xAB; 256];
+        let pumping = std::time::Instant::now();
         let pump = std::thread::spawn(move || {
-            // SLOW only, and no stall: a depth-2 queue at 10 Hz holds 200 ms,
-            // which covers anything an unblocked drive loop can produce.
+            // SLOW only, and no stall: a depth-2 queue at 5 Hz holds 400 ms, over
+            // the ladder's top edge, so it covers every in-ladder tail an
+            // unblocked drive loop can produce (see `SLOW_PERIOD`).
             publish_until(&mut pubr, SLOW_PERIOD, &stim_stop, &body)
         });
         std::thread::sleep(Duration::from_millis(2_500));
         stop.store(true, Ordering::Relaxed);
         let sent = pump.join().expect("publisher");
+        let published_for = pumping.elapsed();
         stim_shutdown.store(true, Ordering::Relaxed);
-        sent
+        (sent, published_for)
     });
 
     let summary = run_bagd(mgr.clone(), cfg, shutdown.clone()).expect("clean finalize");
-    let sent = stimulus.join().expect("stimulus");
-    assert!(sent > 10, "the fixture must really publish: {sent}");
+    let (sent, published_for) = stimulus.join().expect("stimulus");
     // The positive control for the absence guard below — see there.
     tracing::warn!("{QUIET_PROBE}");
 
     // The row EXISTS and it ABSORBS — the half that makes the silence meaningful
     // rather than a recorder that evaluated nothing.
     let a = row(&summary, &topic);
+    let gaps = &summary.record_health.drain_gaps;
+    let evidence = attempt_evidence(
+        gaps,
+        &[("the quiet arm's tap", &a, SLOW_PERIOD, sent, published_for)],
+    );
+    eprintln!("the quiet arm, attempt {attempt}: {evidence}");
+    // NON-PROBATIVE (the runner-stall pattern) for an OVERFLOW tail. A drive-loop
+    // gap over the ladder's 250 ms top edge leaves the 0.999 reading in the
+    // unbounded bucket, and against that no tap can rank `Absorbs`: the verdict is
+    // `Unrankable` for an absorbance over the edge and `Short` for one at or under
+    // it, whatever the code under test does. Read off this run's own histogram,
+    // the one the final verdict was taken against: the 0.999 reading past the
+    // ladder AND a gap counted in the overflow bucket. A reading past the ladder
+    // with that bucket empty is the quantile walk itself failing, and it fails
+    // below as a verdict regression instead of re-running.
+    if tail_overflowed(gaps) && overflow_gaps(gaps) > 0 {
+        cleanup_artifacts(&out, &dir, &ready);
+        return Attempt::NonProbative(format!(
+            "this run's 0.999 drain-gap reading fell in the histogram's unbounded overflow \
+             bucket, so no tap can rank `Absorbs` against it; {evidence}"
+        ));
+    }
+    // PRECONDITION: the tap is priced at its commanded 5 Hz, which is what puts
+    // its absorbance over the ladder's top edge. Ahead of the assertions below, so
+    // a publisher that fell behind re-runs the attempt naming the rates it ran at.
+    if let Err(behind) = rate_band("the quiet arm's tap", &a, SLOW_PERIOD, sent, published_for) {
+        cleanup_artifacts(&out, &dir, &ready);
+        return Attempt::NonProbative(format!("{behind}; {evidence}"));
+    }
     assert!(
         a.rate_mhz.is_some(),
         "the tap must have measured a rate, or its silence proves nothing: {a:?}"
     );
-    // NON-PROBATIVE ESCAPE (the runner-stall pattern), and this arm needs one more
-    // than its siblings do. The tail is `quantile_us(0.999)` and over a run of a
-    // few hundred passes `rank = ceil(0.999 * total)` IS `total`, i.e. the run
-    // MAXIMUM — so one preempted drive pass longer than this tap's own
-    // absorbance flips the verdict to `Short`, and without an escape a loaded
-    // runner reports that as a regression in the code under test.
-    //
-    // Read against the row's OWN numbers rather than a constant, so the escape
-    // tracks whatever depth and rate this run actually achieved.
+    // ANTI-VACUITY, bounded by the rate the recorder minted rather than by a
+    // throughput this runner had to reach. `RateWindow::estimate` mints a rate
+    // only over a drain-clock span of at least `ABSORBANCE_MIN_RATE_SPAN`, and the
+    // band above puts it at no less than `RATE_BAND_LOW` of the commanded rate, so
+    // the window counted at least `low * span / period` commits past its anchor
+    // frame, and the publisher committed that anchor too. A count of grid slots
+    // instead (the window holds 13) also loses every slot that falls due after
+    // the publisher's last wake before the stop flag, which is the host's
+    // scheduling and not the recorder.
+    let (lo_n, lo_d) = RATE_BAND_LOW;
+    let min_sent = 1
+        + (u128::from(lo_n) * ABSORBANCE_MIN_RATE_SPAN.as_nanos())
+            .div_ceil(u128::from(lo_d) * SLOW_PERIOD.as_nanos());
+    assert!(
+        u128::from(sent) >= min_sent,
+        "the recorder minted {:?} mHz over at least {ABSORBANCE_MIN_RATE_SPAN:?}, which \
+         accounts for at least {min_sent} committed frames, but the fixture committed \
+         {sent}: {a:?}",
+        a.rate_mhz
+    );
+    // The row's tail sits under its absorbance. The tail is `quantile_us(0.999)`,
+    // which over a run of a few hundred passes is the run MAXIMUM (`rank =
+    // ceil(0.999 * total)` IS `total`). The rate band caps the measured rate at
+    // 3/2 of 5 Hz, where depth 2 holds about 267 ms, over the ladder's 250 ms top
+    // edge, and an overflow tail re-runs the attempt above, so a tail at or past
+    // this absorbance is one the ladder cannot serve. Read against the row's OWN
+    // numbers rather than a constant.
     if let (Some(tail), Some(absorbance)) = (a.measured_tail_us, a.absorbance_us) {
         assert!(
             tail < absorbance,
-            "NON-PROBATIVE: this run's worst drive-loop pass ({tail} us) met or exceeded \
-             what this unstalled tap can hold ({absorbance} us), so `Absorbs` is not the \
-             correct answer for THIS run and the silence below is about nothing. That is a \
-             stalled runner, not a verdict regression: {a:?}"
+            "this run's in-ladder tail ({tail} us) must sit under what this in-band tap \
+             can hold ({absorbance} us): {a:?}"
         );
     }
     assert_eq!(
         a.verdict,
         AbsorbanceVerdict::Absorbs,
-        "an unstalled recorder's 10 Hz tap must absorb its own gaps: {a:?}"
+        "an unstalled recorder's 5 Hz tap must absorb its own gaps: {a:?}"
     );
 
-    logs_assert(|lines: &[&str]| {
+    let check = |lines: &[&str]| -> Result<(), String> {
         // POSITIVE CONTROL FIRST: an absence guard over an EMPTY
         // capture passes vacuously, so this closure proves the capture is live
         // before it proves anything is missing from it. The probe is emitted by
@@ -795,9 +1175,15 @@ fn a_recorder_whose_taps_absorb_is_silent_and_still_carries_its_verdict() {
             }
         }
         Ok(())
-    });
+    };
+    let lines = attempt_lines(&captured(), attempt);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    if let Err(msg) = check(&lines) {
+        panic!("the quiet arm's log assertions returned an error: {msg}");
+    }
 
     cleanup_artifacts(&out, &dir, &ready);
+    Attempt::Probative
 }
 
 /// U4: a Flashback CAPTURE carries the recorder's own health document, so a bag
@@ -1052,6 +1438,9 @@ fn await_status_verdict(
     })
 }
 
+/// One `/bagd/status` frame's `(fast verdict, slow verdict, loss_counting_basis)`.
+type LiveFrame = (String, String, String);
+
 /// Wait for a `/bagd/status` frame whose verdicts have CONVERGED to
 /// `(fast = short, slow = absorbs)`, and return
 /// `(fast verdict, slow verdict, loss_counting_basis)` off that ONE frame.
@@ -1073,9 +1462,12 @@ fn await_status_verdict(
 /// The oracle still bites: a live surface that never states the boundary (the
 /// status absorbance map deleted), a verdict that always answers `absorbs`,
 /// and one that always answers `short` (the slow control flips) all exhaust
-/// the deadline and panic naming the last both-verdict frame seen — which
-/// also separates a genuine regression from a runner stalled hard enough that
-/// the measured tail exceeded the slow control's 200 ms absorbance.
+/// the deadline and return `Err` with the last both-verdict frame seen, which
+/// the headline fails on through [`live_never_converged`]. The one frame it
+/// does not fail on is `slow=unrankable` beside `fast=short` on a run whose
+/// histogram counted a gap over the ladder's 250 ms top edge: that tail leaves
+/// the slow control's 400 ms absorbance `unrankable`, and the attempt is
+/// non-probative.
 ///
 /// The frames are drained in chunks of the DEFAULT borrow budget: an
 /// `OwnedInboundSample` holds its SHM borrow until dropped, so asking for more
@@ -1085,10 +1477,10 @@ fn await_status_verdicts(
     sub: &mut cerulion_core::transport::subscriber::DataOnlySubscriber,
     fast: &str,
     slow: &str,
-) -> (String, String, String) {
+) -> Result<LiveFrame, Option<LiveFrame>> {
     const BORROW_BUDGET: usize = 2;
     let mut found = None;
-    let mut last_seen: Option<(String, String, String)> = None;
+    let mut last_seen: Option<LiveFrame> = None;
     common::await_condition(Duration::from_secs(30), || {
         loop {
             let mut batch = Vec::new();
@@ -1131,22 +1523,28 @@ fn await_status_verdicts(
         }
         found.is_some()
     });
-    found.unwrap_or_else(|| match last_seen {
+    found.ok_or(last_seen)
+}
+
+/// The headline's failure for a live wait that never converged (see
+/// [`await_status_verdicts`]): `last_seen` is the last frame that carried a
+/// verdict for both topics, if any did.
+fn live_never_converged(last_seen: Option<LiveFrame>) -> LiveFrame {
+    match last_seen {
         Some((f, s, b)) => panic!(
             "no /bagd/status frame converged to (fast=short, slow=absorbs) while the \
              run was live; the last both-verdict frame carried (fast={f}, slow={s}, \
-             basis={b}). `slow=short` beside `fast=short` is NON-PROBATIVE (the \
-             runner-stall pattern): a runner stalled hard enough that its worst drive \
-             pass exceeded the control's 200 ms absorbance, not a verdict \
-             regression. Anything else is the live surface failing to state the \
+             basis={b}). The runner-stall pattern (`slow=unrankable` beside \
+             `fast=short` on a run with a drive pass over the ladder's 250 ms top edge) \
+             re-runs the attempt, so this is the live surface failing to state the \
              absorbance boundary DURING the run"
         ),
         None => panic!(
-            "no /bagd/status frame carried a verdict for both topics at all — the \
+            "no /bagd/status frame carried a verdict for both topics at all: the \
              live status feed is the one surface that states the absorbance boundary \
              DURING the run"
         ),
-    })
+    }
 }
 
 /// A TWO-WRITER topic gets a LABELLED FLOOR, never a confident number — while
@@ -1414,15 +1812,14 @@ fn a_topic_that_stops_publishing_makes_no_claim_on_status_and_at_finalize() {
     // rate this runner had to achieve.
     //
     // This asked for `sent > 100`, which is a THROUGHPUT claim wearing a
-    // fixture's clothes: `publish_until` sleeps 5 ms per frame, so 100 frames
-    // demands the loop really ran at ~200 Hz for half a second before the status
-    // feed served a rate. Load pushes an achieved publish rate only DOWN — and
-    // on macOS CI's background QoS the timer slack is charged PER WAKEUP, so a
-    // nominal 5 ms sleep lands near 29 ms — which makes it a gate a loaded
-    // runner FAILS while behaving perfectly (macOS shard 2: 70 frames across the
-    // same ~2 s window that yields ~400 on an idle desk, an effective ~35 Hz).
-    // That is exactly the load-inverted class: a bound whose failing side is
-    // the healthy behaviour of a slow machine.
+    // fixture's clothes: `publish_until` commits one frame per 5 ms grid slot, so
+    // 100 frames demands that the publisher thread got the CPU across half a
+    // second of slots before the status feed served a rate. The grid publishes
+    // the slots a late wake overran, but only once the thread runs again, so a
+    // host that keeps the thread off the CPU still holds the count below the
+    // slots elapsed at the instant the stop flag flips, while the recorder
+    // behaves perfectly. That is exactly the load-inverted class: a bound whose
+    // failing side is the healthy behaviour of a slow machine.
     //
     // What the guard is FOR is that the topic genuinely streamed before it went
     // quiet — and the recorder has already said so, far better than a frame
