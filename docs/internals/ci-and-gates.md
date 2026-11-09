@@ -27,6 +27,24 @@ regression introduced by a shared dependency outside those paths. It is not a
 required context. Its `android-emulator` Cargo cache restores by default and
 saves only when the cache policy opts that namespace in.
 
+## Period park lanes
+
+`Period park (x86_64 Linux)` and `Period park (aarch64 Linux)` build, lint and
+test `rmw_cerulion` with `--features period-park`, one on `ubuntu-latest` and
+one on the hosted `ubuntu-24.04-arm` runner, on every run of the CI workflow:
+pull requests, merge-queue runs, pushes to `main` and manual runs. Each leg runs
+clippy with `-D warnings` over all targets with the feature on and off, then
+over the bare lib with and without it (the only build of the lib without
+`test-seams`), then the crate's tests serially with the feature on. The aarch64
+leg then runs the tests again with default features, since no other job tests
+the default build on aarch64 Linux. The steps run when the path classifier
+selects `rmw_cerulion`. This is the only job that runs clippy on Linux aarch64,
+where `c_char` is `u8` rather than `i8`, so an `as` cast between `c_char` and
+`u8` lints there and nowhere else. It is not a required context (see
+`tools/ci/required_contexts.txt`). Its cache namespaces are `period-park-X64`
+and `period-park-ARM64`; the default save policy is restore-only until they are
+opted in.
+
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,

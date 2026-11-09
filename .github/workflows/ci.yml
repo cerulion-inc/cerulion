@@ -115,7 +115,8 @@ env:
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
   # token being the key text between `cargo-` and the scope segment with any
   # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
-  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`, and
+  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`,
+  # `period-park-X64`, `period-park-ARM64`, and
   # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
   # hash>`, whose header hash is a cache generation rather than part of the
   # namespace), or `all`. The default lives HERE, so a repository with no
@@ -1672,6 +1673,157 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_android (selected: $SELECTED)"
+
+  # THE `period-park` FEATURE OF `rmw_cerulion`, built, linted and tested on
+  # both Linux architectures. Every other job builds `rmw_cerulion` with its
+  # default features, so the code behind the feature in
+  # `src/api/guard_wait.rs` (the predicted wait and its doorbell tests) is
+  # built nowhere else.
+  #
+  # TWO LEGS, one per architecture, because the code differs between them: the
+  # park's monitor wait is `WFE` on aarch64 and `UMWAIT` on x86_64 (when the
+  # CPU has WAITPKG; the stock wait otherwise), and `c_char` is `u8` on Linux
+  # aarch64 and `i8` on x86_64, so a cast between it and `u8` lints on aarch64
+  # only. `lint` and the test shards run on x86_64 alone.
+  #
+  # THE BARE LIB is linted twice more. `rmw_cerulion` dev-depends on itself
+  # with `test-seams`, so every command that builds a test target turns that
+  # feature on; `cargo clippy -p rmw_cerulion` with no `--all-targets` is the
+  # only build of the lib without it.
+  #
+  # THE DEFAULT BUILD is tested on the aarch64 leg as well. With the feature
+  # on, a regular publisher takes the predicted wait, so the feature run does
+  # not cover the default idle park (`WFE`) that every aarch64 Linux build
+  # ships; the test shards cover the default build on x86_64.
+  #
+  # Serial (`--test-threads=1`) for the same reason as the shard step: the
+  # tests touch the iceoryx2 singleton.
+  period-park:
+    name: Period park (${{ matrix.arch }} Linux)
+    needs: [changes]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      # Each leg reports on its own: a red aarch64 leg says nothing about
+      # x86_64.
+      fail-fast: false
+      matrix:
+        # The list form, with the runner picked in `runs-on:` above: the
+        # coverage walk in `ci_test_coverage_test.rs` expands a list matrix
+        # into the job's context names, and reads no legs at all from one
+        # that carries `include:` or `exclude:`.
+        arch: [x86_64, aarch64]
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The runner has no ROS, so the build takes the vendored bindings; the
+      # claim tests read this to tell that from a silent fallback.
+      CERULION_RMW_EXPECT_BINDINGS: vendored
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Free disk space
+        if: >-
+          runner.environment == 'github-hosted'
+          && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: |
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /usr/local/share/powershell \
+                      /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      # Keyed on `runner.arch`, because both legs report `runner.os` as
+      # `Linux` and an archive built on one architecture is no use to the
+      # other.
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-period-park-${{ runner.arch }}-main-
+
+      - name: Clippy (rmw_cerulion --features period-park, all targets)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion --features period-park --all-targets -- -D warnings
+
+      - name: Clippy (rmw_cerulion default features, all targets)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion --all-targets -- -D warnings
+
+      - name: Clippy (rmw_cerulion bare lib, default features)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion -- -D warnings
+
+      - name: Clippy (rmw_cerulion bare lib, --features period-park)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion --features period-park -- -D warnings
+
+      - name: rmw_cerulion tests with period-park (serial)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo test -p rmw_cerulion --features period-park -- --test-threads=1
+
+      - name: rmw_cerulion tests, default features (serial)
+        if: >-
+          matrix.arch == 'aarch64'
+          && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo test -p rmw_cerulion -- --test-threads=1
+
+      - name: selection marker, rmw_cerulion
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped rmw_cerulion (selected: $SELECTED)"
+
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' period-park-{0} ', runner.arch)))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
 
   examples:
     name: Examples (cargo check)
