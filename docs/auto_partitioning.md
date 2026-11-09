@@ -205,8 +205,9 @@ whose producer is not in its subgraph and **refuses to build**.
 The cross-process form of that mirror (a **shared-memory credit word** both
 workers operate on, minted per edge by the supervisor) makes a split edge
 lossless, and it is admitted at plan time for exactly the shape it can
-describe: **one in-graph producer, no non-`block` consumers**. Such a split is
-accepted; every other one still meets the refusal above.
+describe: **exactly one in-graph producer**, with one word per split `block`
+consumer. The topic's other consumers hold no word and do not count. Such a
+split is accepted; every other one still meets the refusal above.
 
 The derivation co-locates the whole credited flow regardless: crossing a process
 boundary costs a real
@@ -249,8 +250,8 @@ worth knowing:
   `--single-process`, and there is nothing to co-locate it with.
 
 A **hand-written** `process_groups:` that splits a `block` edge is ACCEPTED
-when the edge can be credited (one in-graph producer, no non-`block`
-consumers) and refused at plan time otherwise, by `graph run` before any
+when the edge can be credited (exactly one in-graph producer, one word per
+split `block` consumer) and refused at plan time otherwise, by `graph run` before any
 worker spawns and by `graph levels`. The refusal names the topic, the
 producer, the consumer and its input, both groups, the fix, and **which bar it
 hit**:

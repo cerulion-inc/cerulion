@@ -495,8 +495,8 @@ never the fire set/order.
 A `block` edge is lossless because the producer reads the consumer's `outstanding` counter
 before it fires. Split the two across process groups and that read is gone, so such
 a split is accepted only for a **creditable** edge
-(exactly one in-graph producer, no non-`block` consumers), which gets a shared word to
-read instead.
+(exactly one in-graph producer; the topic's non-`block` consumers hold no word and do
+not count), which gets a shared word to read instead.
 
 **One word per EDGE, not per topic.** The identity is
 `credit_edge_id(topic, consumer_node, consumer_input)`
