@@ -60,8 +60,10 @@ const WRITER_STOP_GRACE: Duration = Duration::from_millis(250);
 const CATALOG_PEEK_BUDGET: Duration = Duration::from_millis(750);
 
 /// One demanded topic's live handle: the shared channel plus the two half-lives
-/// (the drain thread + the writer task). Dropping it does NOT stop the halves —
-/// call [`Self::stop`] to tear down cleanly (releasing the SHM slot).
+/// (the drain thread + the writer task). Dropping it signals both halves to
+/// stop (see the `Drop` impl below), but it does not wait for them. Call
+/// [`Self::stop`] to also wait for the teardown: it joins the drain thread,
+/// so the SHM slot is released before it returns, and it reaps the writer.
 struct DemandedTopic {
     channel: Arc<ForwardChannel>,
     drain: Option<JoinHandle<()>>,

@@ -339,6 +339,7 @@ nodes:
                 depth: 1,
                 backpressure: cerulion_core::prelude::BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -470,6 +471,7 @@ nodes:
                 depth: 1,
                 backpressure: cerulion_core::prelude::BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -626,6 +628,7 @@ nodes:
                 depth: 1,
                 backpressure: cerulion_core::prelude::BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             vec![],
         )

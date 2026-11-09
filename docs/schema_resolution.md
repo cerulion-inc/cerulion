@@ -82,6 +82,25 @@ A type the chain already resolves is never handed to the acquisition ladder.
 The store also makes hand-dropping a `.msg` a first-class workflow: drop a file
 in `schemas/<pkg>/msg/` and it resolves at the next attach.
 
+Service types sit beside the messages as `schemas/<pkg>/srv/<Type>.srv` (a
+ROS 2 `.srv` file copied verbatim). `cerulion service call` reads the one it
+names; its request and response parts are the messages `<pkg>/<Type>_Request`
+and `<pkg>/<Type>_Response`, laid out against the store and the built-in corpus
+like any store message. Attach and the other schema surfaces do not read
+`srv/`.
+
+A nested type a store `.msg` or `.srv` writes without its package is read as
+ROS 2 reads it: a bare `Type` the resolved set holds in the file's own package
+is `<pkg>/Type` (`Item item` in a `demo_msgs` file is `demo_msgs/Item`), and a
+bare `Header` the package does not define is `std_msgs/Header`. Resolution
+writes that package into the reference, so the field hashes under the name
+ROS 2 introspection gives it, the name `rmw_cerulion` hashes it with. Every
+surface resolves before it hashes (the CLI, `cerulion-remoted`, the Python and
+Android front ends, workspace message generation, and a desk reading a robot's
+served types), so they all hash a store type alike. Any other bare reference
+(a workspace YAML type, a type the set lacks) keeps its spelling and resolves
+by the rest of the nested-reference ladder.
+
 Store types are first-class across the CLI's schema surfaces, not just at
 attach (msg-store parity): they participate in `graph run`'s
 schema-hash-divergence check, `graph run --record`'s recorded per-channel

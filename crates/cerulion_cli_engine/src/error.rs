@@ -73,6 +73,12 @@ pub enum CliError {
         )).collect::<Vec<_>>().join(VERDICT_LINE_SEP)
     )]
     WorkerNodeFatal { groups: Vec<String> },
+    /// A `--single-process` run whose one worker process (the process that
+    /// hosts every executor unit) stopped a node on `NodeError::Fatal`. That
+    /// process printed the node's own `Error:` line, so the CLI prints nothing
+    /// more for this error and exits [`EXIT_NODE_FATAL`].
+    #[error("a node of this run stopped on a fatal error (the `Error:` line above names it)")]
+    WorkerNodeFatalAnnounced,
 }
 
 /// Exit status of a `graph run` in which a node was stopped by a fatal error.

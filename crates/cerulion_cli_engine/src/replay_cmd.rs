@@ -1319,6 +1319,9 @@ pub struct ReplayOptions {
     /// has no shared axis at all — each rank numbers its own steps — which is
     /// what the bound in TIME buys.
     pub duration_bound_ns: Option<u64>,
+    /// `--feed-index-budget BYTES`: bytes a fed replay's frame index may take.
+    /// `None` = the engine default.
+    pub feed_index_budget: Option<u64>,
     /// Write the [`ReplayOutcome`] JSON to this path (`--report`).
     pub report_path: Option<PathBuf>,
     /// Path to the tolerance YAML (`--tolerance`). Parsed +
@@ -1351,6 +1354,9 @@ pub struct ReplayOptions {
     /// topic to a fresh bag here. `None` writes nothing. The path must not
     /// exist; the surface refuses one that does.
     pub record_out_path: Option<PathBuf>,
+    /// What the re-execution is for (`--verify` or a neutral `--resim`), which
+    /// decides whether reads are fed by recorded identity.
+    pub purpose: replay_engine::ReplayPurpose,
 }
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
@@ -1472,12 +1478,12 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
     // fill has nothing to fill. It still fires for an older bag, recorded
     // from a graph file with no `prefix:` line, which replays only on a host
     // whose hostname matches the recorder's — re-record to fix.
-    let mut config = cerulion_core::graph::parse_graph(graph_yaml).map_err(|e| {
-        ReplayError::BagInvalidAttachment {
-            name: GRAPH_ATTACHMENT.to_string(),
-            reason: describe_graph_attachment_parse_failure(&e.to_string()),
-        }
-    })?;
+    let mut config =
+        cerulion_core::graph::parse_recorded_graph(graph_yaml, &bag.display().to_string())
+            .map_err(|e| ReplayError::BagInvalidAttachment {
+                name: GRAPH_ATTACHMENT.to_string(),
+                reason: describe_graph_attachment_parse_failure(&e.to_string()),
+            })?;
     cerulion_core::graph::validate_graph(&config).map_err(|e| {
         ReplayError::BagInvalidAttachment {
             name: GRAPH_ATTACHMENT.to_string(),
@@ -1901,6 +1907,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         recorder,
         record_health,
         duration_bound_ns: opts.duration_bound_ns,
+        feed_index_budget: opts.feed_index_budget,
         report_path: opts.report_path,
         fire_tap: None,
         tolerance,
@@ -1908,6 +1915,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         allow_param_change: opts.allow_param_change,
         ros2_entries_skipped,
         record_out,
+        purpose: opts.purpose,
     };
     let nodes = ReplayNodes::Cdylib {
         workspace_root,

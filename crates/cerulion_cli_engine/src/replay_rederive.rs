@@ -185,6 +185,10 @@ pub enum Decider {
     Sync,
     /// Per-message FIFO: fires per step against the read log's `popped`.
     FifoPop,
+    /// A `consume = latest` data trigger: at most one fire per step, and
+    /// exactly one on a step whose trigger drain popped a frame unless the
+    /// node is throttled.
+    LatestFire,
     /// The cross-rank `block` credit edge. **Never re-derived** — it appears
     /// only on [`StandDown`]s and [`ConservationFinding`]s, so a reader of a
     /// stand-down list can tell "we declined to judge this node's schedule
@@ -228,6 +232,10 @@ pub(crate) struct PassRestore {
     /// `node id -> (input -> wire stamp)`: what the anchor's framework section
     /// stated as each Sync node's `sync_input_timestamps` at the anchor step.
     sync_heads: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The pass resumed from an anchor, so its first step may fire a frame a
+    /// step before the recording's first retained one popped
+    /// ([`fifo_resume_seed`]).
+    resumed: bool,
 }
 
 impl PassRestore {
@@ -235,13 +243,17 @@ impl PassRestore {
     pub(crate) const fn none() -> Self {
         Self {
             sync_heads: BTreeMap::new(),
+            resumed: false,
         }
     }
 
     /// The heads a resume plan restored (`ResumePlan::sync_input_timestamps`,
     /// exactly what `Scheduler::restore_sync_input_timestamps` was handed).
     pub(crate) fn from_sync_heads(sync_heads: BTreeMap<String, BTreeMap<String, u64>>) -> Self {
-        Self { sync_heads }
+        Self {
+            sync_heads,
+            resumed: true,
+        }
     }
 
     /// The restored heads of ONE node, if the anchor stated any.
@@ -438,6 +450,7 @@ impl Decider {
             Self::Throttle => "throttle_ms gate",
             Self::Sync => "sync alignment",
             Self::FifoPop => "FIFO pop count",
+            Self::LatestFire => "consume = latest fire count",
             Self::BlockCredit => "block credit",
             Self::ReadLog => "the recorded read log",
         }
@@ -496,6 +509,11 @@ pub enum TriggerDecl {
     },
     /// A data-trigger node.
     Data {
+        /// The `#[input(trigger)]`-marked inputs, in declaration order.
+        trigger_inputs: Vec<String>,
+    },
+    /// A data-trigger node whose trigger input declares `consume = latest`.
+    DataLatest {
         /// The `#[input(trigger)]`-marked inputs, in declaration order.
         trigger_inputs: Vec<String>,
     },
@@ -1596,6 +1614,18 @@ pub(crate) fn verify(
                         trigger_inputs,
                         block_gated,
                         trust,
+                        restore.resumed,
+                        stops.stop_point(&node.node_id),
+                        &mut report,
+                    );
+                }
+                TriggerDecl::DataLatest { trigger_inputs } => {
+                    verify_latest(
+                        node,
+                        steps,
+                        trigger_inputs,
+                        block_gated,
+                        trust,
                         stops.stop_point(&node.node_id),
                         &mut report,
                     );
@@ -1675,7 +1705,10 @@ fn census_read_sites(
     }
     let mut pending: Vec<(String, Decider, Vec<String>)> = Vec::new();
     for f in &report.findings {
-        if !matches!(f.decider, Decider::Sync | Decider::FifoPop) {
+        if !matches!(
+            f.decider,
+            Decider::Sync | Decider::FifoPop | Decider::LatestFire
+        ) {
             continue;
         }
         let Some(node) = nodes.iter().find(|n| n.node_id == f.node_id) else {
@@ -1684,7 +1717,8 @@ fn census_read_sites(
         let inputs = match &node.trigger {
             TriggerDecl::Sync { trigger_inputs, .. }
             | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
-            | TriggerDecl::Data { trigger_inputs } => trigger_inputs.clone(),
+            | TriggerDecl::Data { trigger_inputs }
+            | TriggerDecl::DataLatest { trigger_inputs } => trigger_inputs.clone(),
             _ => continue,
         };
         pending.push((f.node_id.clone(), f.decider, inputs));
@@ -2130,11 +2164,12 @@ fn unproducible_read_shape(read: &RecordedRead, trust: RoleTrust) -> bool {
             ReadOutcomeKind::DrainedBatch
             | ReadOutcomeKind::Decimated
             | ReadOutcomeKind::Truncated
-            | ReadOutcomeKind::Producer => false,
+            | ReadOutcomeKind::Producer
+            | ReadOutcomeKind::BatchFrame => false,
         },
         ReadSiteRole::Peek => !matches!(
             read.kind,
-            ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Producer
+            ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Producer | ReadOutcomeKind::BatchFrame
         ),
         // A body site mints every read kind, and an unbelieved role convicts
         // nothing (guarded above).
@@ -2861,12 +2896,15 @@ fn carried_heads(wide_carry: &BTreeMap<String, Vec<u64>>, input: &str) -> u32 {
         .map_or(0, |v| u32::try_from(v.len()).unwrap_or(u32::MAX))
 }
 
+// Eight parameters, each a distinct type, mirroring `verify_sync`'s.
+#[allow(clippy::too_many_arguments)]
 fn verify_fifo(
     node: &NodeDecl,
     steps: &[RecordedStep],
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
+    resumed: bool,
     stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
@@ -2881,11 +2919,186 @@ fn verify_fifo(
         return;
     }
 
+    // A frame the previous step's burst popped and froze unfired (see
+    // `fifo_step_carry`): this step's first fire serves it without a pop.
+    let mut carried_in = false;
+    let mut first = true;
     for step in steps {
         // After the step that stopped the node, the drain still pops its
         // inputs, but a stopped node owes no fire for them.
         if stop.is_some_and(|s| step.step > s.step) {
             if recorded_fire_after_stop(node, step, Decider::FifoPop, false, report) {
+                return;
+            }
+            continue;
+        }
+        let popped = match fifo_step_pops(&node.node_id, trigger_inputs, &step.reads, trust) {
+            Ok(popped) => popped,
+            Err(reason) => {
+                report.stand_downs.push(StandDown {
+                    node_id: node.node_id.clone(),
+                    decider: Decider::FifoPop,
+                    reason,
+                });
+                return;
+            }
+        };
+        let recorded = recorded_fires(step, &node.node_id, false);
+        carried_in |= fifo_resume_seed(resumed && first, popped, recorded.count);
+        first = false;
+        let supply = popped.saturating_add(u32::from(carried_in));
+
+        // The stopping step's burst ends at the stopping fire: one fire per
+        // pop up to it, so exactly as many as the re-execution performed, at
+        // least one and at most `supply`.
+        let agrees = match stop.filter(|s| s.step == step.step) {
+            Some(s) => recorded.count == s.fires && (1..=supply).contains(&recorded.count),
+            None => match fifo_step_carry(
+                carried_in,
+                popped,
+                recorded.count,
+                node.throttle_ns.is_some(),
+            ) {
+                Ok(carried_out) => {
+                    carried_in = carried_out;
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if !agrees {
+            report.findings.push(ScheduleFinding {
+                node_id: node.node_id.clone(),
+                step: step.step,
+                decider: Decider::FifoPop,
+                expected: StepFires::count(supply),
+                recorded,
+            });
+            return;
+        }
+    }
+}
+
+/// PURE: a FIFO `Data` node's frames POPPED at its trigger inputs in one
+/// step's reads: the drain-site `DrainedBatch` pops, the per-message FIFO
+/// pop (`Served` / `Held` are body reads of an already-popped frame, and on a
+/// role-stamped bag so is a body `DrainedBatch`).
+///
+/// # Errors
+///
+/// The [`StandDownReason`] a read shape forbids a pop count over: a
+/// `(kind, role)` pair no mint site produces, a `Truncated` marker, or a
+/// `Decimated` read.
+pub(crate) fn fifo_step_pops(
+    node_id: &str,
+    trigger_inputs: &[String],
+    reads: &[RecordedRead],
+    trust: RoleTrust,
+) -> Result<u32, StandDownReason> {
+    let mut popped = 0u32;
+    for read in reads
+        .iter()
+        .filter(|r| r.node_id == node_id && trigger_inputs.contains(&r.input))
+    {
+        if unproducible_read_shape(read, trust) {
+            return Err(StandDownReason::ImpossibleReadShape);
+        }
+        match read.kind {
+            ReadOutcomeKind::Truncated => return Err(StandDownReason::TruncatedReadLog),
+            ReadOutcomeKind::Decimated => return Err(StandDownReason::DecimatedRead),
+            ReadOutcomeKind::DrainedBatch if is_drain_site_read(read, trust) => {
+                popped = popped.saturating_add(read.popped);
+            }
+            _ => {}
+        }
+    }
+    Ok(popped)
+}
+
+/// A FIFO `Data` step whose recorded fires no carry rule explains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FifoCarryMismatch {
+    /// Frames the step had to fire on: its pops plus a frame carried in.
+    pub supply: u32,
+    /// Fires the recording holds for the step.
+    pub fires: u32,
+}
+
+/// PURE: the frame a FIFO `Data` node's burst carries OUT of one step.
+///
+/// The live burst (`Scheduler::tick_data_burst`) fires once per frame and,
+/// when its signalled count is spent, asks the refill hook for another frame
+/// before it checks the [`cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP`]
+/// cap and the node's pre-fire check. When either stops the burst there, the
+/// refilled frame stays frozen unfired and the next step's first fire serves
+/// it without a pop; a throttle that defers the first fire leaves the boundary
+/// drain's frame frozen the same way. So with `supply = popped + carried_in`:
+///
+/// * `fires == supply`: nothing carries out (`Ok(false)`);
+/// * `supply == fires + 1`, and `fires` is the cap or the node is throttled
+///   (`deferrable`): one frame carries out (`Ok(true)`).
+///
+/// # Errors
+///
+/// [`FifoCarryMismatch`] for every other pair: more than one frame unfired, a
+/// frame unfired below the cap on a node with no throttle, or more fires than
+/// frames.
+pub(crate) fn fifo_step_carry(
+    carried_in: bool,
+    popped: u32,
+    fires: u32,
+    deferrable: bool,
+) -> Result<bool, FifoCarryMismatch> {
+    let cap = u32::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap_or(u32::MAX);
+    let supply = popped.saturating_add(u32::from(carried_in));
+    if fires == supply {
+        Ok(false)
+    } else if supply == fires.saturating_add(1) && (fires == cap || deferrable) {
+        Ok(true)
+    } else {
+        Err(FifoCarryMismatch { supply, fires })
+    }
+}
+
+/// PURE: does a RESUMED pass's first step of a FIFO `Data` node start with a
+/// carried frame? Its recording begins after the anchor, so a frame the step
+/// before it popped and left unfired has no pop record here: the first step
+/// then fires exactly one more time than it pops. Only on the first step of
+/// a resumed pass (`first_resumed`).
+pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> bool {
+    first_resumed && fires == popped.saturating_add(1)
+}
+
+/// The `consume = latest` data-trigger rule.
+///
+/// A latest node's step fires it at most once, and a step whose trigger drain
+/// popped a frame fires it exactly once: the read drains the queue to its
+/// newest frame, so no popped frame is owed a fire of its own. A step that
+/// popped nothing may still fire once, on a frame an earlier step popped and
+/// no tick read (a deferred fire, or a tick that never reached the input), so
+/// it is held to the bound alone. A `throttle_ms` node may defer a step that
+/// popped, so it too is held to the bound alone; the throttle rule judges its
+/// spacing. The stop and read-shape handling is [`verify_fifo`]'s.
+fn verify_latest(
+    node: &NodeDecl,
+    steps: &[RecordedStep],
+    trigger_inputs: &[String],
+    block_gated: bool,
+    trust: RoleTrust,
+    stop: Option<StopPoint>,
+    report: &mut RederivationReport,
+) {
+    if block_gated {
+        report.stand_downs.push(StandDown {
+            node_id: node.node_id.clone(),
+            decider: Decider::LatestFire,
+            reason: StandDownReason::BlockGated,
+        });
+        return;
+    }
+    for step in steps {
+        if stop.is_some_and(|s| step.step > s.step) {
+            if recorded_fire_after_stop(node, step, Decider::LatestFire, false, report) {
                 return;
             }
             continue;
@@ -2896,16 +3109,10 @@ fn verify_fifo(
             .iter()
             .filter(|r| r.node_id == node.node_id && trigger_inputs.contains(&r.input))
         {
-            // A `(kind, role)` pair no mint site
-            // can produce is evidence about the RECORDING, not about Sync — so
-            // it is asked here too, on the same predicate, rather than only
-            // where the Sync verdict happens to ask it. A FIFO pop count
-            // derived from a stream carrying one would be arithmetic over
-            // records the recorder cannot have written.
             if unproducible_read_shape(read, trust) {
                 report.stand_downs.push(StandDown {
                     node_id: node.node_id.clone(),
-                    decider: Decider::FifoPop,
+                    decider: Decider::LatestFire,
                     reason: StandDownReason::ImpossibleReadShape,
                 });
                 return;
@@ -2914,7 +3121,7 @@ fn verify_fifo(
                 ReadOutcomeKind::Truncated => {
                     report.stand_downs.push(StandDown {
                         node_id: node.node_id.clone(),
-                        decider: Decider::FifoPop,
+                        decider: Decider::LatestFire,
                         reason: StandDownReason::TruncatedReadLog,
                     });
                     return;
@@ -2922,37 +3129,27 @@ fn verify_fifo(
                 ReadOutcomeKind::Decimated => {
                     report.stand_downs.push(StandDown {
                         node_id: node.node_id.clone(),
-                        decider: Decider::FifoPop,
+                        decider: Decider::LatestFire,
                         reason: StandDownReason::DecimatedRead,
                     });
                     return;
                 }
-                // Per-message FIFO: one pop, one fire. `Served` / `Held` are
-                // body reads of an already-popped frame, so counting them would
-                // double-count the fire they belong to — and on a ROLE-STAMPED
-                // bag so is a BODY `DrainedBatch`, which the role branch
-                // excludes exactly.
                 ReadOutcomeKind::DrainedBatch if is_drain_site_read(read, trust) => {
                     popped = popped.saturating_add(read.popped)
                 }
                 _ => {}
             }
         }
-
         let recorded = recorded_fires(step, &node.node_id, false);
-        // The stopping step's burst ends at the stopping fire: one fire per
-        // pop up to it, so exactly as many as the re-execution performed, at
-        // least one and at most `popped`.
-        let agrees = match stop.filter(|s| s.step == step.step) {
-            Some(s) => recorded.count == s.fires && (1..=popped).contains(&recorded.count),
-            None => recorded.count == popped,
-        };
-        if !agrees {
+        let owes_one =
+            popped > 0 && node.throttle_ns.is_none() && !stop.is_some_and(|s| s.step == step.step);
+        let expected = if owes_one { 1 } else { recorded.count.min(1) };
+        if recorded.count != expected {
             report.findings.push(ScheduleFinding {
                 node_id: node.node_id.clone(),
                 step: step.step,
-                decider: Decider::FifoPop,
-                expected: StepFires::count(popped),
+                decider: Decider::LatestFire,
+                expected: StepFires::count(expected),
                 recorded,
             });
             return;
@@ -3042,7 +3239,9 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
         return CreditBasis::Undecidable;
     };
     match &node.trigger {
-        TriggerDecl::Data { trigger_inputs } if trigger_inputs.contains(&edge.consumer_input) => {
+        TriggerDecl::Data { trigger_inputs } | TriggerDecl::DataLatest { trigger_inputs }
+            if trigger_inputs.contains(&edge.consumer_input) =>
+        {
             CreditBasis::BodyOnly
         }
         TriggerDecl::Sync { trigger_inputs, .. }
@@ -3162,6 +3361,9 @@ fn verify_conservation(
                     ReadOutcomeKind::Truncated => truncated = true,
                     // Its `popped` slot is part of the producer token.
                     ReadOutcomeKind::Producer => {}
+                    // One frame of the read that follows; that read carries
+                    // the pop count.
+                    ReadOutcomeKind::BatchFrame => {}
                     ReadOutcomeKind::Served
                     | ReadOutcomeKind::Held
                     | ReadOutcomeKind::NoFrame
@@ -5158,6 +5360,235 @@ mod tests {
         assert_eq!(bad.findings[0].decider, Decider::FifoPop);
         assert_eq!(bad.findings[0].expected, StepFires::count(3));
         assert_eq!(bad.findings[0].recorded, StepFires::count(2));
+    }
+
+    /// The carry rule of a FIFO burst over one step, against hand oracles: no
+    /// carry when fires equal the frames supplied; one frame carried out when
+    /// the burst fired the cap with one frame left; a mismatch otherwise.
+    #[test]
+    fn a_fifo_step_carries_one_frame_out_only_at_the_burst_cap() {
+        let cap = u32::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap();
+        // Below the cap: one fire per frame, nothing carried.
+        assert_eq!(fifo_step_carry(false, 3, 3, false), Ok(false));
+        // A carried-in frame is fired without a pop.
+        assert_eq!(fifo_step_carry(true, 2, 3, false), Ok(false));
+        // The cap with one frame left over: the trailing refill carries it.
+        assert_eq!(fifo_step_carry(false, cap + 1, cap, false), Ok(true));
+        // A carried-in frame plus a full cap of pops carries one out again.
+        assert_eq!(fifo_step_carry(true, cap, cap, false), Ok(true));
+        // The step after a carry: its first fire serves the carried frame.
+        assert_eq!(fifo_step_carry(true, cap - 1, cap, false), Ok(false));
+        // A frame unfired below the cap.
+        assert_eq!(
+            fifo_step_carry(false, 5, 4, false),
+            Err(FifoCarryMismatch {
+                supply: 5,
+                fires: 4
+            })
+        );
+        // Two frames unfired at the cap.
+        assert_eq!(
+            fifo_step_carry(false, cap + 2, cap, false),
+            Err(FifoCarryMismatch {
+                supply: cap + 2,
+                fires: cap
+            })
+        );
+        // More fires than frames.
+        assert_eq!(
+            fifo_step_carry(false, 2, 3, false),
+            Err(FifoCarryMismatch {
+                supply: 2,
+                fires: 3
+            })
+        );
+        // A throttled node carries one frame below the cap: a refill after its
+        // last fire, or a deferred first fire on the boundary's frame.
+        assert_eq!(fifo_step_carry(false, 5, 4, true), Ok(true));
+        assert_eq!(fifo_step_carry(false, 1, 0, true), Ok(true));
+        assert_eq!(fifo_step_carry(true, 0, 1, true), Ok(false));
+        // Still never two.
+        assert_eq!(
+            fifo_step_carry(false, 6, 4, true),
+            Err(FifoCarryMismatch {
+                supply: 6,
+                fires: 4
+            })
+        );
+        // The resume seed: only the first step of a resumed pass, and only one
+        // fire more than pops.
+        assert!(fifo_resume_seed(true, 3, 4));
+        assert!(!fifo_resume_seed(false, 3, 4));
+        assert!(!fifo_resume_seed(true, 3, 3));
+        assert!(!fifo_resume_seed(true, 3, 5));
+    }
+
+    /// A burst that fires the cap with one frame left over pops one more frame
+    /// than it fires, and the next step fires that frame without a pop: the
+    /// pop-count rule reads both steps clean. Without the carry it convicts
+    /// the cap step (cap + 1 pops against cap fires).
+    #[test]
+    fn a_capped_fifo_burst_carries_its_trailing_frame_into_the_next_step() {
+        let cap = usize::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap();
+        let nodes = vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )];
+        let step = |n: u64, fires: usize, pops: usize| RecordedStep {
+            step: n,
+            clock_ns: EPOCH + n,
+            fires: (0..fires).map(|_| fire("sink", EPOCH + n)).collect(),
+            reads: (0..pops)
+                .map(|_| read("sink", "inp", ReadOutcomeKind::DrainedBatch, 1, None))
+                .collect(),
+        };
+        let steps = vec![step(0, cap, cap + 1), step(1, cap, cap - 1), step(2, 3, 3)];
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        // Below the cap, one frame unfired is still a finding.
+        let below = vec![step(0, 3, 4)];
+        let bad = verify_unrestored(&nodes, &below, &[], RoleTrust::Declined);
+        assert_eq!(bad.findings.len(), 1, "{:?}", bad.findings);
+        assert_eq!(bad.findings[0].expected, StepFires::count(4));
+        assert_eq!(bad.findings[0].recorded, StepFires::count(3));
+    }
+
+    /// A RESUMED pass's first step fires a frame the step before the anchor
+    /// popped, so it fires one more time than it pops: clean on a resumed
+    /// pass, a finding on a from-start one.
+    #[test]
+    fn a_resumed_fifo_pass_seeds_the_frame_carried_across_its_anchor() {
+        let nodes = vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )];
+        let steps = vec![
+            RecordedStep {
+                step: 5,
+                clock_ns: EPOCH,
+                fires: vec![fire("sink", EPOCH), fire("sink", EPOCH)],
+                reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 1, None)],
+            },
+            RecordedStep {
+                step: 6,
+                clock_ns: EPOCH + 1,
+                fires: vec![fire("sink", EPOCH + 1)],
+                reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 1, None)],
+            },
+        ];
+        let resumed = verify(
+            &nodes,
+            &steps,
+            &[],
+            RoleTrust::Declined,
+            &PassRestore::from_sync_heads(BTreeMap::new()),
+            &PassStops::none(),
+        );
+        assert!(resumed.is_clean(), "unexpected: {:?}", resumed.findings);
+        let from_start = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert_eq!(from_start.findings.len(), 1, "{:?}", from_start.findings);
+    }
+
+    // -- consume = latest ---------------------------------------------------
+
+    fn latest_node() -> Vec<NodeDecl> {
+        vec![node(
+            "sink",
+            TriggerDecl::DataLatest {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )]
+    }
+
+    /// A latest node's drain pops a whole burst and fires ONCE; a step that
+    /// popped nothing fires at most once (a held frame re-offered).
+    #[test]
+    fn a_latest_node_fires_once_per_step_that_popped() {
+        let steps = vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: EPOCH,
+                fires: vec![fire("sink", EPOCH)],
+                reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 5, None)],
+            },
+            step(1, EPOCH + 1, vec![]),
+            step(2, EPOCH + 2, vec![fire("sink", EPOCH + 2)]),
+        ];
+        let report = verify_unrestored(&latest_node(), &steps, &[], RoleTrust::Declined);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        // The FIFO rule on the same log expects five fires at step 0: the
+        // declaration is what decides.
+        let fifo = vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )];
+        let as_fifo = verify_unrestored(&fifo, &steps, &[], RoleTrust::Declined);
+        assert_eq!(as_fifo.findings[0].expected, StepFires::count(5));
+    }
+
+    /// Both directions of the latest rule are caught: a second fire in one
+    /// step, and no fire on a step whose drain popped.
+    #[test]
+    fn a_latest_node_that_fires_twice_or_not_at_all_on_a_pop_is_caught() {
+        let popped = |fires| RecordedStep {
+            step: 0,
+            clock_ns: EPOCH,
+            fires,
+            reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 3, None)],
+        };
+        let twice = verify_unrestored(
+            &latest_node(),
+            &[popped(vec![fire("sink", EPOCH), fire("sink", EPOCH)])],
+            &[],
+            RoleTrust::Declined,
+        );
+        assert_eq!(twice.findings[0].decider, Decider::LatestFire);
+        assert_eq!(twice.findings[0].expected, StepFires::count(1));
+        assert_eq!(twice.findings[0].recorded, StepFires::count(2));
+
+        let none = verify_unrestored(&latest_node(), &[popped(vec![])], &[], RoleTrust::Declined);
+        assert_eq!(none.findings[0].expected, StepFires::count(1));
+        assert_eq!(none.findings[0].recorded, StepFires::count(0));
+
+        let mut held = step(0, EPOCH, vec![fire("sink", EPOCH), fire("sink", EPOCH)]);
+        held.reads.clear();
+        let twice_unpopped = verify_unrestored(&latest_node(), &[held], &[], RoleTrust::Declined);
+        assert_eq!(
+            twice_unpopped.findings[0].recorded,
+            StepFires::count(2),
+            "the bound holds on a step that popped nothing too"
+        );
+    }
+
+    /// A throttled latest node may defer a step that popped: it is held to the
+    /// one-fire bound only.
+    #[test]
+    fn a_throttled_latest_node_may_skip_a_step_that_popped() {
+        let mut nodes = latest_node();
+        nodes[0].throttle_ns = Some(5_000_000);
+        let steps = vec![RecordedStep {
+            step: 0,
+            clock_ns: EPOCH,
+            fires: vec![],
+            reads: vec![read("sink", "inp", ReadOutcomeKind::DrainedBatch, 2, None)],
+        }];
+        let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.decider != Decider::LatestFire),
+            "{:?}",
+            report.findings
+        );
     }
 
     /// A truncated read log is a deterministic HOLE, so the pop-count rule

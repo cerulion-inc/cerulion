@@ -68,14 +68,18 @@ pub const RECORD_TYPE_STEP_BOUNDARY: u32 = 3;
 /// - `step` — the CONSUMER's logical step (unchanged meaning),
 /// - `fire_time_ns` — the SERVED wire `sequence` as a `u64`
 ///   ([`READ_OUTCOME_NO_FRAME`] = no frame was served),
-/// - `duration_ns` — packed aux via [`pack_read_outcome_aux`]: low 32 bits =
-///   frames popped by this drain, high 32 bits = reserved 0 (the
-///   re-offer-count reservation; see [`unpack_read_outcome_popped`]). The ONE
-///   exception is the [`READ_OUTCOME_PRODUCER`] ANNOTATION kind, whose aux
-///   slot is the FULL 64-bit producer token — which does not collide with the
-///   reservation, because the format reserves the high 32 bits of a READ record's
-///   aux (it is defined as a count on "the successor record"), and a
-///   `Producer` record is not a read,
+/// - `duration_ns`: packed aux via [`pack_read_outcome_aux_run`]: low 32 bits =
+///   frames popped by this drain, high 32 bits = the RUN COUNT of a folded
+///   record (`0` on an unfolded one, which decodes as one occurrence; see
+///   [`unpack_read_outcome_run`]). The ONE exception is the
+///   [`READ_OUTCOME_PRODUCER`] ANNOTATION kind, whose aux slot is the FULL
+///   64-bit producer token: a `(Producer, read)` pair folds as one unit and
+///   carries its count on the READ half, so the annotation never needs one.
+///   From `trace_format` 8 on, every edge carries such annotations: before
+///   every read of a multi-writer edge, and on every other edge before each
+///   read whose writer differs from the writer the previous annotation of the
+///   same stage and read site named, so every serving read is attributed to
+///   the last annotation of its site before it,
 /// - `node_idx` — the CONSUMER node (manifest-indexed, unchanged meaning),
 /// - `global_level` — packed via [`pack_read_outcome_meta`]: high 16 bits =
 ///   the input's index into the node's manifest input table
@@ -121,6 +125,9 @@ pub const READ_OUTCOME_TRUNCATED: u16 = ReadOutcomeKind::Truncated as u16;
 /// served sequence (a redundant join key); the aux word is the FULL 64-bit
 /// token (see [`TraceRingRecord::read_outcome_producer`]).
 pub const READ_OUTCOME_PRODUCER: u16 = ReadOutcomeKind::Producer as u16;
+/// One consumed frame of a multi-frame read other than the frame the read
+/// names; the read record that follows on the same stage and site popped it.
+pub const READ_OUTCOME_BATCH_FRAME: u16 = ReadOutcomeKind::BatchFrame as u16;
 
 /// The "no frame" sentinel for a kind-6 record's served-seq slot
 /// (`fire_time_ns`). A real wire sequence is a `u32`, so the two ranges can
@@ -129,8 +136,8 @@ pub const READ_OUTCOME_NO_FRAME: u64 = u64::MAX;
 
 /// The outcome-kind subfield of a kind-6 record's `global_level`
 /// slot — bits 0..14. It NARROWED from 16 bits when the role bits took the top
-/// of the kind half; the highest kind in use is 7
-/// ([`READ_OUTCOME_PRODUCER`]) and `read_outcome_kind_from_wire` already
+/// of the kind half; the highest kind in use is 8
+/// ([`READ_OUTCOME_BATCH_FRAME`]) and `read_outcome_kind_from_wire` already
 /// answers "unknown" for anything it does not recognise, so the narrowing
 /// changes no reachable behaviour.
 pub const READ_OUTCOME_KIND_MASK: u16 = 0x3FFF;
@@ -3403,6 +3410,7 @@ mod tests {
             ReadOutcomeKind::Decimated,
             ReadOutcomeKind::Truncated,
             ReadOutcomeKind::Producer,
+            ReadOutcomeKind::BatchFrame,
         ] {
             let constant = match kind {
                 ReadOutcomeKind::Served => READ_OUTCOME_SERVED,
@@ -3412,6 +3420,7 @@ mod tests {
                 ReadOutcomeKind::Decimated => READ_OUTCOME_DECIMATED,
                 ReadOutcomeKind::Truncated => READ_OUTCOME_TRUNCATED,
                 ReadOutcomeKind::Producer => READ_OUTCOME_PRODUCER,
+                ReadOutcomeKind::BatchFrame => READ_OUTCOME_BATCH_FRAME,
             };
             assert_eq!(kind.wire(), constant);
         }
