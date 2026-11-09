@@ -1680,11 +1680,17 @@ fn build_into(
     //     subscription holds every frame a node sends from `tick`. A frame
     //     a node sends from `init` reaches it only through the output's
     //     `history_size`, which the node's publisher delivers at the live
-    //     loop's history pump while the node keeps that publisher. A
-    //     subscriber that exists when a publisher sends keeps the frame
-    //     after that publisher is dropped (iceoryx2 keeps a connection that
-    //     holds undelivered data), which is what lets `poll` read a run that
-    //     finished.
+    //     loop's history pump while the node keeps that publisher. A frame
+    //     outlives the drop of the publisher that sent it only over an
+    //     established connection: one the subscriber opened while that
+    //     publisher was alive. iceoryx2 keeps such a connection while it
+    //     holds undelivered data, which is what lets `poll` read a run that
+    //     finished. A subscriber opens a connection to each publisher that
+    //     exists when it is created, which here includes every app publisher and
+    //     every publisher the graph build made. It opens a connection to a
+    //     later publisher only when `poll` reads. A frame from a publisher
+    //     that is created and dropped between two reads can be lost, even
+    //     though the subscriber exists.
     create_subscriptions(&plan.subscribes, &manager, &mut run.subscriptions)?;
 
     // 4. The recorder runs before any producer, as `armed_before_producers`
@@ -3105,6 +3111,7 @@ nodes:
             depth,
             backpressure: Default::default(),
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let infos = [("a", Some(depth_a)), ("b", Some(depth_b)), ("c", None)]
             .into_iter()

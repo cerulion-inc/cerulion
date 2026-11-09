@@ -121,6 +121,8 @@ pub struct ResimOptions {
     pub allow_param_change: bool,
     /// `--record-out PATH` (legal in both modes).
     pub record_out_path: Option<PathBuf>,
+    /// `--feed-index-budget BYTES` (requires `--verify`).
+    pub feed_index_budget: Option<u64>,
 }
 
 /// Which nodes re-execute.
@@ -185,6 +187,8 @@ pub struct PlayFlags {
     pub allow_param_change: bool,
     /// `--record-out PATH`: resim only, in EITHER mode.
     pub record_out: Option<PathBuf>,
+    /// `--feed-index-budget BYTES`: resim + `--verify` only.
+    pub feed_index_budget: Option<u64>,
 }
 
 /// What a legal `bag play` invocation resolved to.
@@ -277,6 +281,10 @@ const RESIM_ONLY: &[(&str, &str)] = &[
         "plain playback republishes the recorded frames and re-executes nothing, so \
          there is no re-executed output to write",
     ),
+    (
+        "--feed-index-budget",
+        "plain playback feeds no reads, so it builds no feed index to budget",
+    ),
 ];
 
 /// Resolve a `bag play` invocation, refusing every illegal flag combination
@@ -313,6 +321,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         strict_state,
         allow_param_change,
         record_out,
+        feed_index_budget,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
     // before anything else: a bound nobody can act on is a usage error, not a
@@ -322,13 +331,14 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 6] = [
+        let present: [bool; 7] = [
             verify,
             report.is_some(),
             tolerance.is_some(),
             strict_state,
             allow_param_change,
             record_out.is_some(),
+            feed_index_budget.is_some(),
         ];
         if let Some((flag, why)) = RESIM_ONLY
             .iter()
@@ -388,6 +398,15 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         }
     }
 
+    if !verify && feed_index_budget.is_some() {
+        return Err(
+            "`--feed-index-budget` needs `--verify`: only a verifying resim feeds reads by \
+             recorded identity, so a bare `--resim all` builds no feed index to budget. Add \
+             `--verify` or drop the flag."
+                .to_string(),
+        );
+    }
+
     // `--record-out` shapes what the run PRODUCES, so it is legal in both modes.
     // One file cannot be both the verdict and the bag: refuse the collision by
     // name rather than let the second writer clobber the first.
@@ -411,6 +430,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             strict_state,
             allow_param_change,
             record_out_path: record_out,
+            feed_index_budget,
         },
     })
 }
@@ -913,7 +933,7 @@ pub fn run_resim(
             return EXIT_USAGE;
         }
     }
-    match replay_cmd::run_replay(bag, engine_options(options)) {
+    match replay_cmd::run_replay(bag, engine_options(options, verify)) {
         Ok(outcome) => {
             let report = ResimReport::from_outcome(&outcome);
             if verify {
@@ -948,7 +968,7 @@ pub fn run_resim(
 /// from-start bag, so an e2e over any bag this repo's CLI tests can build would
 /// pass with it discarded.
 #[cfg(unix)]
-fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
+fn engine_options(o: ResimOptions, verify: bool) -> replay_cmd::ReplayOptions {
     let ResimOptions {
         duration_bound_ns,
         report_path,
@@ -956,14 +976,24 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         strict_state,
         allow_param_change,
         record_out_path,
+        feed_index_budget,
     } = o;
     replay_cmd::ReplayOptions {
         duration_bound_ns,
+        feed_index_budget,
         report_path,
         tolerance_path,
         strict_state,
         allow_param_change,
         record_out_path,
+        // `--verify` feeds reads by recorded identity; a neutral resim keeps
+        // the queue re-creation, so the candidate's frames reach its in-rank
+        // consumers.
+        purpose: if verify {
+            crate::replay_engine::ReplayPurpose::Verify
+        } else {
+            crate::replay_engine::ReplayPurpose::Resim
+        },
     }
 }
 
@@ -1287,6 +1317,7 @@ mod tests {
                     strict_state: true,
                     allow_param_change: true,
                     record_out_path: None,
+                    feed_index_budget: None,
                 },
             }
         );
@@ -1553,7 +1584,7 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 6] = [
+        let cases: [(&str, PlayFlags); 7] = [
             (
                 "--record-out",
                 PlayFlags {
@@ -1596,6 +1627,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "--feed-index-budget",
+                PlayFlags {
+                    feed_index_budget: Some(1),
+                    ..Default::default()
+                },
+            ),
         ];
         for (flag, flags) in cases {
             let err = resolve_play_mode(flags).unwrap_err();
@@ -1633,6 +1671,40 @@ mod tests {
                 "must say WHY a neutral resim has no verdict to shape: {err}"
             );
         }
+    }
+
+    /// `--feed-index-budget` under a resim without `--verify` is refused by
+    /// name, naming `--verify` as the remedy: a neutral resim builds no feed
+    /// index. CONTROL: with `--verify` the same budget resolves and reaches
+    /// the engine's options.
+    #[test]
+    fn the_feed_index_budget_needs_verify_not_merely_resim() {
+        let err = resolve_play_mode(PlayFlags {
+            feed_index_budget: Some(4096),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(err.contains("`--feed-index-budget`"), "{err}");
+        assert!(err.contains("`--verify`"), "must name the remedy: {err}");
+        assert!(
+            err.contains("builds no feed index"),
+            "must say why a neutral resim has nothing to budget: {err}"
+        );
+        let mode = resolve_play_mode(PlayFlags {
+            feed_index_budget: Some(4096),
+            verify: true,
+            ..resim("all")
+        })
+        .expect("a verifying resim takes the budget");
+        let PlayMode::Resim {
+            verify: true,
+            options,
+            ..
+        } = mode
+        else {
+            panic!("a verifying resim: {mode:?}");
+        };
+        assert_eq!(options.feed_index_budget, Some(4096));
     }
 
     #[test]
@@ -2103,14 +2175,24 @@ mod tests {
     fn every_knob_survives_the_conversion_into_the_engines_options() {
         // The drop-a-knob guard. Asserted field by field rather than by struct
         // equality because `ReplayOptions` deliberately derives no `PartialEq`.
-        let got = engine_options(ResimOptions {
-            duration_bound_ns: Some(7_000_000_000),
-            report_path: Some(PathBuf::from("/tmp/r.json")),
-            tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
-            strict_state: true,
-            allow_param_change: true,
-            record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
-        });
+        let got = engine_options(
+            ResimOptions {
+                duration_bound_ns: Some(7_000_000_000),
+                report_path: Some(PathBuf::from("/tmp/r.json")),
+                tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
+                strict_state: true,
+                allow_param_change: true,
+                record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
+                feed_index_budget: Some(4096),
+            },
+            true,
+        );
+        assert_eq!(got.feed_index_budget, Some(4096));
+        assert_eq!(
+            got.purpose,
+            crate::replay_engine::ReplayPurpose::Verify,
+            "`--verify` must reach the engine as the identity-fed purpose"
+        );
         assert_eq!(got.duration_bound_ns, Some(7_000_000_000));
         assert_eq!(
             got.record_out_path.as_deref(),
@@ -2134,7 +2216,12 @@ mod tests {
         );
 
         // And the negative: a knob nobody set must not be invented.
-        let none = engine_options(ResimOptions::default());
+        let none = engine_options(ResimOptions::default(), false);
+        assert_eq!(
+            none.purpose,
+            crate::replay_engine::ReplayPurpose::Resim,
+            "a neutral resim keeps the queue re-creation"
+        );
         assert_eq!(none.duration_bound_ns, None);
         assert!(none.report_path.is_none());
         assert!(none.tolerance_path.is_none());

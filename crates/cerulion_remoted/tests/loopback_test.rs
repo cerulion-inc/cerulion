@@ -13,9 +13,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cerud::client::OpsClient;
 use cerulion_link::{
     accept_one, alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame,
-    write_frame, Endpoint, EndpointAddr, EndpointConfig, EndpointId, RelayConfig,
+    write_frame, Endpoint, EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream, RelayConfig,
 };
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
@@ -360,6 +361,8 @@ async fn run_accepts_a_store_bound_to_this_device() {
     drop(ep);
 
     let cfg = write_state(dir.path(), secret, real_id);
+    let token_file = cfg.rcp.token_file.clone();
+    assert!(!token_file.exists());
     // An immediately-ready shutdown: `run` builds the endpoint, passes the
     // binding check, then the accept loop breaks at once → Ok(()).
     let result = bounded("run(match)", run(cfg, async {})).await;
@@ -367,4 +370,145 @@ async fn run_accepts_a_store_bound_to_this_device() {
         result.is_ok(),
         "a matching store must bind + serve then exit cleanly, got {result:?}"
     );
+    // `run` provisioned the rcpd token file the rcp plane reads.
+    let token = cerulion_remoted::rcp::load_token(&token_file).expect("rcp.token written by run");
+    assert_eq!(token.len(), 64);
+}
+
+/// One ops call on its own connection from `desk` to `addr`.
+#[cfg(unix)]
+async fn run_ops_call(
+    desk: &Endpoint,
+    addr: EndpointAddr,
+    verb: &'static str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, cerud::CerudError> {
+    let conn = bounded("dial ops", dial(desk, addr, alpn::OPS))
+        .await
+        .expect("dial ops");
+    let (send, recv) = bounded("open ops stream", open_frame_stream(&conn))
+        .await
+        .expect("open ops stream");
+    let result = bounded(
+        "ops call",
+        tokio::task::spawn_blocking(move || {
+            let mut client =
+                OpsClient::connect_current(QuicOpsStream::new(send, recv)).expect("handshake");
+            client.call(verb, args)
+        }),
+    )
+    .await
+    .expect("ops task");
+    conn.close(0u32.into(), b"done");
+    result
+}
+
+/// A group-readable rcpd token file does not stop `run`: the ops plane
+/// answers a paired desk, the rcp plane answers its `estop` and engages the
+/// ops e-stop latch the act verbs obey, and the file is left as it was.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_serves_the_ops_plane_over_a_shared_rcp_token_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let secret = [222u8; 32];
+    let ep = disabled_endpoint(secret).await;
+    let robot_id = ep.id();
+    drop(ep);
+    let cfg = write_state(dir.path(), secret, *robot_id.as_bytes());
+    let desk = disabled_endpoint([223u8; 32]).await;
+    let mut index = DeviceAccountIndex::new().with_path(cfg.index_file.clone());
+    index.bind(PublicKey(*desk.id().as_bytes()), OWNER);
+    index.save(WIRING_MAC_KEY).unwrap();
+    std::fs::write(&cfg.rcp.token_file, "CERULION_RCP_TOKEN=abc\n").unwrap();
+    std::fs::set_permissions(&cfg.rcp.token_file, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let facts_file = cfg.beacon_facts_file.clone();
+    let token_file = cfg.rcp.token_file.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut daemon = tokio::spawn(run(cfg, async {
+        let _ = stopped.await;
+    }));
+    // `run` writes the beacon facts once its endpoint is bound.
+    let port = bounded("the daemon binds", async {
+        loop {
+            tokio::select! {
+                ended = &mut daemon => panic!("run ended before serving: {ended:?}"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            if let Ok(facts) = cerulion_remoted::BeaconFacts::load(&facts_file) {
+                break facts.iroh_port;
+            }
+        }
+    })
+    .await;
+    // The published port is the first bound socket's; dial it on both
+    // loopback families.
+    let addr = direct_addr(
+        robot_id,
+        [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        ],
+    );
+    let inventory = run_ops_call(&desk, addr.clone(), "inventory", serde_json::json!({})).await;
+    assert!(inventory.is_ok(), "the ops plane answers: {inventory:?}");
+
+    // The shipped `run` serves the rcp plane too, under the ops e-stop latch:
+    // an rcp `estop` is answered (rcpd is unreachable: the token file is
+    // shared) and engages the latch the ops act verbs obey.
+    let publish = serde_json::json!({
+        "topic": "/loopback/latch",
+        "type": "nope_msgs/msg/Nope",
+        "message": {},
+    });
+    let verb_error = |r: Result<serde_json::Value, cerud::CerudError>| match r {
+        Err(cerud::CerudError::Remote { kind, message }) if kind == "verb_error" => message,
+        other => panic!("expected the verb's error, got {other:?}"),
+    };
+    let before =
+        verb_error(run_ops_call(&desk, addr.clone(), "topic-publish", publish.clone()).await);
+    assert!(
+        before.starts_with("verb error: usage: unknown message type"),
+        "clear: {before}"
+    );
+    let rcp = bounded("dial rcp", dial(&desk, addr.clone(), alpn::RCP))
+        .await
+        .expect("dial rcp");
+    let (mut send, mut recv) = bounded("open rcp stream", open_frame_stream(&rcp))
+        .await
+        .expect("open rcp stream");
+    let estop = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                    "params": { "name": "estop", "arguments": {} } });
+    bounded(
+        "estop",
+        write_frame(&mut send, estop.to_string().as_bytes()),
+    )
+    .await
+    .expect("write");
+    let frame = bounded("estop answer", read_frame(&mut recv, 1 << 20))
+        .await
+        .expect("an answer");
+    let answer: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(answer["id"], serde_json::json!(1), "{answer}");
+    assert_eq!(
+        answer["error"]["code"],
+        serde_json::json!(-32603),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["error"]["message"],
+        serde_json::json!("rcpd is not reachable on this robot"),
+        "{answer}"
+    );
+    rcp.close(0u32.into(), b"done");
+    let after = verb_error(run_ops_call(&desk, addr, "topic-publish", publish).await);
+    assert_eq!(
+        after,
+        "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+    );
+    let _ = stop.send(());
+    let result = bounded("run stops", daemon).await.expect("daemon task");
+    assert!(result.is_ok(), "{result:?}");
+    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "the token file is left as it was");
 }

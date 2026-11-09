@@ -55,12 +55,27 @@ pub(super) fn decide(robots: &[String], window_elapsed_cleanly: bool) -> Outcome
     }
 }
 
+/// The names of the robots that answered, without repeats, sorted as they
+/// print. A name is LAN-supplied text, so each goes through
+/// [`crate::topic_cmd::sanitize_display`]: a peer cannot put terminal escapes
+/// into the summary. Repeats go before that, on the names as sent, so two
+/// names that differ only in a control character still count as two.
+pub(super) fn answered_robots(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut sent: Vec<String> = names.into_iter().collect();
+    sent.sort();
+    sent.dedup();
+    let mut robots: Vec<String> = sent
+        .iter()
+        .map(|name| crate::topic_cmd::sanitize_display(name))
+        .collect();
+    robots.sort();
+    robots
+}
+
 fn run(_ctx: &Context) -> Outcome {
     let report =
         crate::mdns_discovery::browse_rung_report(crate::discovery_ladder::MDNS_RUNG_BUDGET);
-    let mut robots: Vec<String> = report.peers.into_iter().map(|p| p.robot).collect();
-    robots.sort();
-    robots.dedup();
+    let robots = answered_robots(report.peers.into_iter().map(|p| p.robot));
     decide(&robots, report.window_elapsed_cleanly)
 }
 
@@ -84,6 +99,33 @@ mod tests {
              drops multicast shows none too)"
         );
         assert_eq!(two.readings.get("robots"), Some(&Reading::Int(2)));
+    }
+
+    #[test]
+    fn a_control_character_in_a_peer_name_never_reaches_the_summary() {
+        let robots = answered_robots([
+            "lab".to_string(),
+            "go2\u{1b}[2J\r".to_string(),
+            "lab".to_string(),
+        ]);
+        assert_eq!(robots, ["go2\u{FFFD}[2J\u{FFFD}", "lab"]);
+        let o = decide(&robots, true);
+        assert!(!o.summary.chars().any(char::is_control), "{:?}", o.summary);
+    }
+
+    #[test]
+    fn two_names_that_differ_only_in_a_control_character_count_as_two() {
+        let robots = answered_robots(["go2\r".to_string(), "go2\n".to_string()]);
+        assert_eq!(robots, ["go2\u{FFFD}", "go2\u{FFFD}"]);
+        let o = decide(&robots, true);
+        assert_eq!(o.readings.get("robots"), Some(&Reading::Int(2)));
+        assert!(o.summary.contains("2 answered"), "{:?}", o.summary);
+    }
+
+    #[test]
+    fn the_names_sort_as_they_print() {
+        let robots = answered_robots(["lab".to_string(), "\u{1}go2".to_string()]);
+        assert_eq!(robots, ["lab", "\u{FFFD}go2"]);
     }
 
     #[test]

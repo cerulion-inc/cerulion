@@ -526,3 +526,76 @@ fn a_verb_family_runs_on_a_machine_that_signed_in() {
         "the family ran its normal path; stdout={stdout}"
     );
 }
+
+#[test]
+fn rcp_under_the_network_switch_exits_2_before_the_login_gate() {
+    // `cerulion rcp` under the kill-switch reaches nothing: on a machine that
+    // never signed in it exits 2 with its own refusal, and the login gate
+    // never runs, so there is no sign-in prompt and no account-service
+    // contact. The account service here is a listener this test owns; a run
+    // that dialled it leaves a connection in its backlog.
+    for (extra, network) in [(&["--network", "off"][..], ""), (&[][..], "off")] {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+        let account = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let service = format!("http://{}", account.local_addr().unwrap());
+        let mut args = vec!["rcp", "bench-arm"];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = run_cerulion_at(
+            home.path(),
+            cwd.path(),
+            &[
+                ("CERULION_NETWORK", network),
+                ("CERULION_ACCOUNT_SERVICE", service.as_str()),
+            ],
+            &args,
+        );
+        assert_eq!(
+            code,
+            Some(2),
+            "{args:?} network={network:?}: stderr={stderr}"
+        );
+        // Hand-written from the refusal `cerulion rcp` prints, not read back
+        // off the code that prints it.
+        assert!(
+            stderr.contains("cerulion rcp reaches the robot over the network, which"),
+            "{args:?} network={network:?}: the rcp refusal; stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("never signed in") && !stderr.contains("cerulion login"),
+            "{args:?} network={network:?}: no sign-in prompt; stderr={stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "{args:?} network={network:?}: stdout={stdout}"
+        );
+        account.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(account.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{args:?} network={network:?}: the run contacted the account service"
+        );
+        assert_no_identity_was_written(home.path());
+    }
+}
+
+#[test]
+fn rcp_without_the_network_switch_stays_behind_the_login_gate() {
+    // The control for the arm above: with the switch off, `cerulion rcp` on a
+    // machine that never signed in is refused by the gate like every gated
+    // verb, so the arm above cannot pass on a verb that skipped the gate.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[("CERULION_NETWORK", "")],
+        &["rcp", "bench-arm"],
+    );
+    assert!(
+        stderr.contains(REFUSAL_A_USER_READS),
+        "rcp prints the whole refusal a user reads; stderr={stderr}"
+    );
+    assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert_no_identity_was_written(home.path());
+}

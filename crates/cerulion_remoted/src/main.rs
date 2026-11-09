@@ -65,6 +65,9 @@ struct Cli {
     // `CERULION_STATE_ROOT`, which BOTH processes honor — so `beacon_facts_file`
     // stays derived from the state root in `RemotedConfig::from_state_root` and is
     // never independently overridable.
+    #[command(flatten)]
+    rcp: cerulion_remoted::rcp::RcpFlags,
+
     /// Self-hosted relay URL (prod). Default: n0 public relays.
     #[arg(long, env = "CERULION_RELAY_URL")]
     relay_url: Option<String>,
@@ -106,6 +109,7 @@ impl Cli {
         if let Some(p) = self.index_file {
             config.index_file = p;
         }
+        self.rcp.apply(&mut config.rcp);
         // No `beacon_facts_file` override here on purpose — it is a cross-process
         // handoff file redirected only via --state-root/CERULION_STATE_ROOT (see
         // the field-absence note on the `Cli` struct); it stays derived from the

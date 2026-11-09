@@ -289,7 +289,7 @@ fn build_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -298,7 +298,7 @@ fn build_graph(
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -831,7 +831,7 @@ fn build_one_input_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -840,7 +840,7 @@ fn build_one_input_graph(
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -886,7 +886,7 @@ fn data_trigger_consumer_holds_silent_context() {
         prefix: "nthtrigctx".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "trig_producer".to_string(),
@@ -895,7 +895,7 @@ fn data_trigger_consumer_holds_silent_context() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ctx_producer".to_string(),
@@ -904,7 +904,7 @@ fn data_trigger_consumer_holds_silent_context() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1387,7 +1387,7 @@ fn two_non_trigger_inputs_hold_independently() {
         prefix: "nthtwo".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
@@ -1396,7 +1396,7 @@ fn two_non_trigger_inputs_hold_independently() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
@@ -1405,7 +1405,7 @@ fn two_non_trigger_inputs_hold_independently() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1650,7 +1650,7 @@ fn build_external_snapshot_graph(
         identity: "non_trigger_hold_ext".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
@@ -1856,7 +1856,7 @@ fn build_producer_via_worker_path(
         identity: format!("{prefix}_prod"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "producer".to_string(),
@@ -2195,7 +2195,7 @@ fn external_topic_excluded_from_union_and_harvest() {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -2204,7 +2204,7 @@ fn external_topic_excluded_from_union_and_harvest() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "extcons".to_string(),
@@ -2345,7 +2345,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
@@ -2354,7 +2354,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
@@ -2495,7 +2495,7 @@ fn build_producer_override_graph(
         identity: format!("{prefix}_prod"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "producer".to_string(),

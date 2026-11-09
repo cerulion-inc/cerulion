@@ -7,6 +7,10 @@
 # tool from source — minutes per job, on every job, for a binary upstream
 # already publishes. So this fetches the OFFICIAL pre-built tarball from
 # nextest's own domain, which is the install route nextest documents for CI.
+# get.nexte.st answers with a redirect to the asset on nextest's GitHub release;
+# when get.nexte.st itself fails, the script fetches that same asset from the
+# GitHub release directly, and the one pinned checksum per platform below
+# verifies the bytes from either route.
 #
 # PINNED, never `latest`, and pinned BY CONTENT as well as by version. The
 # whole point of the fence in `.config/nextest.toml` is that the runner's
@@ -96,12 +100,14 @@ fi
 case "$(uname -s)" in
     Linux)
         case "$(uname -m)" in
-            x86_64|amd64)   platform=linux;     expected=$NEXTEST_SHA256_linux ;;
-            aarch64|arm64)  platform=linux-arm; expected=$NEXTEST_SHA256_linux_arm ;;
+            x86_64|amd64)
+                platform=linux;     target=x86_64-unknown-linux-gnu;  expected=$NEXTEST_SHA256_linux ;;
+            aarch64|arm64)
+                platform=linux-arm; target=aarch64-unknown-linux-gnu; expected=$NEXTEST_SHA256_linux_arm ;;
             *) die "unsupported Linux arch '$(uname -m)' — add it here or install cargo-nextest by hand" ;;
         esac
         ;;
-    Darwin) platform=mac; expected=$NEXTEST_SHA256_mac ;;
+    Darwin) platform=mac; target=universal-apple-darwin; expected=$NEXTEST_SHA256_mac ;;
     *)      die "unsupported OS '$(uname -s)' — add it here or install cargo-nextest by hand" ;;
 esac
 
@@ -111,53 +117,84 @@ esac
 dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
 
-url="https://get.nexte.st/${NEXTEST_VERSION}/${platform}"
-printf 'install_nextest: fetching %s\n' "$url"
+# VERIFY BEFORE EXTRACTING. Everything after the checksum runs code that came
+# off the network, so the checksum is the last moment it is still just bytes.
+if command -v shasum >/dev/null 2>&1; then
+    sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+elif command -v sha256sum >/dev/null 2>&1; then
+    sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+else
+    die "neither shasum nor sha256sum is available, so the download cannot be verified; refusing to run it"
+fi
+
+# Two routes to the SAME bytes, tried in order: get.nexte.st, then the asset
+# on nextest's GitHub release that get.nexte.st redirects to. The checksum is
+# the pinned one above for both; it is never read from either host.
+#
+# NEXTEST_PRIMARY_URL replaces the first route. It changes where the bytes come
+# from, not what runs, because whatever it serves must still match the pinned
+# checksum. Pointing it at a closed port exercises the second route.
+primary_url="${NEXTEST_PRIMARY_URL:-https://get.nexte.st/${NEXTEST_VERSION}/${platform}}"
+fallback_url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${target}.tar.gz"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+tarball="$tmp/nextest.tar.gz"
 
-# `--fail` so an HTTP error is an ERROR and not a tarball made of an error
-# page; `--location` because the pinned URL redirects to the release asset.
+# fetch_verified URL: download URL to $tarball and compare it with the pinned
+# checksum. Returns 0 only when $tarball holds the pinned release; otherwise
+# deletes it, prints the reason on stderr and returns 1.
 #
-# `--retry-all-errors` and not `--retry` alone, and the difference is the whole
-# reason this line changed. curl's `--retry` covers TRANSIENT errors as curl
-# defines them: a timeout, and the 408 / 429 / 5xx replies. It does not cover a
-# connection that is reset mid-transfer, which is what a hosted runner produced
-# here:
+# `--fail` makes an HTTP error a failed download, not a tarball made of an
+# error page. `--location` follows get.nexte.st's redirect to the release
+# asset, and `--proto-redir '=https'` keeps every hop of it on HTTPS.
 #
-#   curl: (35) Recv failure: Connection reset by peer
+# `--retry-all-errors` widens `--retry` from curl's transient class (a timeout,
+# and HTTP 408, 429, 500, 502, 503 and 504) to every failure, including a
+# connection reset (`curl: (35) Recv failure: Connection reset by peer`), which
+# `--retry` alone gives up on. That is five retries at least five seconds
+# apart, longer when the server sends a Retry-After; curl discards a partial
+# file before each retry. `--connect-timeout` and `--max-time` bound one
+# attempt, and `--retry-max-time` starts no new attempt after 120 s, so a host
+# that stalls hands over to the next route.
 #
-# so the retry budget went unspent and the job died on the first reset.
-# `--retry-all-errors` retries the transport failures too. The cost is that a
-# genuine 404 (a version that does not exist) is now attempted 4 times before
-# the `die` below names it, which is 6 seconds on a path that is already
-# failing. The checksum gate is untouched: a retry re-downloads bytes that are
-# still verified before anything is extracted.
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    --retry 3 --retry-delay 2 --retry-all-errors --max-time 180 \
-    "$url" -o "$tmp/nextest.tar.gz" \
-    || die "download failed for $url (version '$NEXTEST_VERSION' may not exist)"
+# A checksum mismatch also counts as a failed route: an error page served with
+# a 200, or a stale cache object, is a failed delivery, and the next route's
+# bytes face the same pinned checksum.
+fetch_verified() {
+    local src=$1 actual
+    printf 'install_nextest: fetching %s\n' "$src"
+    rm -f "$tarball"
+    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --fail --silent --show-error --location \
+        --retry 5 --retry-delay 5 --retry-all-errors --retry-max-time 120 \
+        --connect-timeout 30 --max-time 180 --url "$src" -o "$tarball"; then
+        printf 'install_nextest: download failed for %s\n' "$src" >&2
+        rm -f "$tarball"
+        return 1
+    fi
+    actual=$(sha256_of "$tarball")
+    if [ "$actual" != "$expected" ]; then
+        printf 'install_nextest: checksum mismatch for %s\n  expected %s\n  actual   %s\n' \
+            "$src" "$expected" "$actual" >&2
+        rm -f "$tarball"
+        return 1
+    fi
+    printf 'install_nextest: sha256 %s verified\n' "$actual"
+}
 
-# VERIFY BEFORE EXTRACTING. Everything below this point runs code that came off
-# the network, so the checksum is the last moment it is still just bytes.
-if command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$tmp/nextest.tar.gz" | cut -d' ' -f1)
-elif command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$tmp/nextest.tar.gz" | cut -d' ' -f1)
-else
-    die "neither shasum nor sha256sum is available — refusing to run an unverified download"
+if ! fetch_verified "$primary_url"; then
+    printf '::warning::install_nextest: %s did not deliver the pinned release; falling back to the GitHub release asset\n' \
+        "$primary_url" >&2
+    fetch_verified "$fallback_url" \
+        || die "no route delivered the pinned cargo-nextest $NEXTEST_VERSION (errors above).
+If NEXTEST_PINNED_VERSION was just bumped, the pinned checksums in this script
+must be bumped with it (the header shows how to regenerate them). A checksum
+mismatch on a route means the bytes it offered are not the release this repo
+pinned: do not run them."
 fi
-if [ "$actual" != "$expected" ]; then
-    die "checksum mismatch for $url
-  expected $expected
-  actual   $actual
-If NEXTEST_VERSION was just bumped, the pinned checksums in this script must be
-bumped with it (the header shows how to regenerate them). Otherwise the
-download is not the release this repo pinned — do not run it."
-fi
 
-tar -xzf "$tmp/nextest.tar.gz" -C "$tmp" || die "the download was not a gzip tarball"
+tar -xzf "$tarball" -C "$tmp" || die "the download was not a gzip tarball"
 [ -f "$tmp/cargo-nextest" ] || die "the tarball did not contain a cargo-nextest binary"
 
 chmod +x "$tmp/cargo-nextest"

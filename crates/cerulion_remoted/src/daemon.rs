@@ -8,6 +8,8 @@
 //!   ([`crate::ops`]) — deploy/inventory/pair/claim/e-stop;
 //! - `cerulion/wire/2` (WireAdmit) → the demand-driven SHM tap plane
 //!   ([`crate::wire`]);
+//! - `cerulion/rcp/1` (RcpAdmit) → the MCP proxy to the local `cerulion-rcpd`
+//!   ([`crate::rcp`]);
 //! - everything else (Refuse / unknown ALPN, or a plane not wired) → a
 //!   deadline-bounded skeleton control-frame report that surfaces the
 //!   [`AcceptDecision`] so the classification stays observable end-to-end.
@@ -33,6 +35,7 @@ use crate::error::RemotedError;
 use crate::host::{OpsHost, PlaneFiles, DAEMON_SERVER_NAME};
 use crate::ops::OpsServing;
 use crate::pairing_verbs::SharedCodePairSessions;
+use crate::rcp::{RcpLink, RcpPlane};
 use crate::trust::SharedTrust;
 use crate::wire::WirePlane;
 
@@ -60,7 +63,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// engaged, it logs loudly and exits cleanly WITHOUT binding an endpoint.
 /// Otherwise it serves the same library entry a host embeds
 /// ([`RemotedConfig::daemon_plane`] with the [`RemotedConfig::key_files`]
-/// provider), which keeps `restart` and `engage-estop`.
+/// provider), which keeps `restart`, `engage-estop` and the rcp plane.
 pub async fn run(
     config: RemotedConfig,
     shutdown: impl std::future::Future<Output = ()>,
@@ -132,6 +135,7 @@ pub async fn serve_endpoint(
         access_clock,
         sweep_interval,
         base,
+        Some(config.rcp.clone()),
         shutdown,
     )
     .await
@@ -140,8 +144,9 @@ pub async fn serve_endpoint(
 /// The serving core every entry shares (its endpoint already built + device-bound):
 /// build the LIVE shared trust state (accept gate reads it, pairing verbs mutate it, so a
 /// claim/pair takes effect at the next accept with no restart), the ops plane with the
-/// `ops_host` verb set announcing `server_name`, and the authorizer-wired wire plane over
-/// `base`, then serve until `shutdown`.
+/// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
+/// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
+/// `shutdown`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_core(
     files: &PlaneFiles,
@@ -154,6 +159,7 @@ pub(crate) async fn serve_core(
     access_clock: RemotedClock,
     sweep_interval: Option<Duration>,
     base: WirePlane,
+    rcp: Option<RcpLink>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     let shared =
@@ -170,6 +176,15 @@ pub(crate) async fn serve_core(
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
     let sessions = SharedCodePairSessions::new();
+    // The daemon's e-stop lease, for the rcp plane below: the same instance the
+    // `engage-estop` and act verbs use, so its latch and its engage count are
+    // shared. A library host has none, and serves no rcp plane.
+    let estop_lease = ops_host.estop_lease();
+    // On the daemon, `engage-estop` also sends an `estop` to the rcpd the rcp
+    // plane forwards to, over the same link, until rcpd answers; the delivery
+    // in flight ends when the planes stop.
+    let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
+    let rcpd_estop = ops_host.rcpd_estop();
     let ops = Arc::new(OpsServing::for_host(
         ops_host,
         shared,
@@ -200,10 +215,23 @@ pub(crate) async fn serve_core(
         wire_plane = wire_plane.with_revocation_sweep_interval(interval);
     }
     let wire = Arc::new(wire_plane);
+    // The rcp plane authorizes each MCP message against the SAME live handle,
+    // under the SAME e-stop lease as the ops verbs.
+    let rcpd = rcp.as_ref().map(|link| link.addr);
+    let rcp = match (rcp, estop_lease) {
+        (Some(link), Some(lease)) => Some(Arc::new(RcpPlane::new(
+            link,
+            classify.shared().clone(),
+            lease,
+        ))),
+        _ => None,
+    };
     tracing::info!(
         endpoint_id = %endpoint.id(),
         robot = %wire.robot(),
-        "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops; always-on)"
+        rcpd = ?rcpd,
+        "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops, plus rcp on the daemon; \
+         always-on)"
     );
 
     // The robot's own revocation fetch: the supervisor's sync worker leaves
@@ -218,8 +246,19 @@ pub(crate) async fn serve_core(
         )
     });
     let poller = AbortOnDrop(pull.clone().map(|pull| tokio::spawn(pull.run())));
-    let served =
-        serve_with_epoch_pull(endpoint, classify, Some(ops), Some(wire), pull, shutdown).await;
+    let served = serve_planes(
+        endpoint,
+        classify,
+        Some(ops),
+        Some(wire),
+        pull,
+        rcp,
+        shutdown,
+    )
+    .await;
+    if let Some(rcpd_estop) = rcpd_estop {
+        rcpd_estop.shut_down().await;
+    }
     poller.stop().await;
     served
 }
@@ -317,6 +356,21 @@ pub async fn serve_with_epoch_pull(
     pull: Option<Arc<EpochPull>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
+    serve_planes(endpoint, classify, ops, wire, pull, None, shutdown).await
+}
+
+/// [`serve_with_epoch_pull`], plus the rcp plane: when `rcp` is `Some`, an
+/// admitted `cerulion/rcp/1` connection is served by
+/// [`crate::rcp::serve_rcp_connection`].
+pub async fn serve_planes(
+    endpoint: &Endpoint,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    pull: Option<Arc<EpochPull>>,
+    rcp: Option<Arc<RcpPlane>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -339,8 +393,9 @@ pub async fn serve_with_epoch_pull(
                         let classify = classify.clone();
                         let ops = ops.clone();
                         let wire = wire.clone();
+                        let rcp = rcp.clone();
                         tokio::spawn(async move {
-                            handle_accepted_with_wire(a, classify, ops, wire).await;
+                            handle_accepted_planes(a, classify, ops, wire, rcp).await;
                         });
                     }
                     // A SINGLE inbound connection failed its handshake (a scanner
@@ -401,6 +456,19 @@ pub async fn handle_accepted_with_wire(
     ops: Option<Arc<OpsServing>>,
     wire: Option<Arc<WirePlane>>,
 ) {
+    handle_accepted_planes(accepted, classify, ops, wire, None).await
+}
+
+/// [`handle_accepted_with_wire`], plus the rcp arm: an `RcpAdmit` connection
+/// is handed to [`crate::rcp::serve_rcp_connection`] as a long-lived session
+/// when `rcp` is `Some`; with `None` it falls through to the skeleton report.
+pub async fn handle_accepted_planes(
+    accepted: Accepted,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    rcp: Option<Arc<RcpPlane>>,
+) {
     let (decision, unpaired) = classify
         .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
     tracing::info!(
@@ -433,6 +501,15 @@ pub async fn handle_accepted_with_wire(
         }
         // WireAdmit but no wire plane wired (ops-only builds + the
         // accept-classification tests): fall through to the skeleton report.
+    }
+
+    // ── The rcp-ALPN dispatch arm ───────────────────────────
+    if matches!(decision, AcceptDecision::RcpAdmit) {
+        if let Some(plane) = rcp {
+            let key = *accepted.remote_id.as_bytes();
+            crate::rcp::serve_rcp_connection(accepted.connection, key, plane).await;
+            return;
+        }
     }
 
     // A refused key on the ops ALPN (a cloud row while the allow-from-cloud

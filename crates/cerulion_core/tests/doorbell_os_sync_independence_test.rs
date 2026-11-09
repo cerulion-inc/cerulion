@@ -23,9 +23,11 @@
 //! with the env it wants and reads the answer off stdout, the shape
 //! `credit_os_sync_independence_test` uses.
 //!
-//! **Why macOS-only.** The wake word and its switch are macOS concepts; off
-//! macOS `wake_word_block_primitive_available` is a compile-time `false` and
-//! there is nothing to observe.
+//! **Why macOS-only.** The switch is a macOS concept: the os_sync family it
+//! guards exists only there. On Linux and Android the wake word is a shared
+//! futex with no backend to resolve and no switch of its own, so
+//! `wake_word_block_primitive_available` is a compile-time `true` and there is
+//! no coupling to observe.
 #![cfg(target_os = "macos")]
 
 use std::process::Command;
