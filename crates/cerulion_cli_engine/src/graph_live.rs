@@ -1315,6 +1315,7 @@ pub fn follow_fires(
             break FiresEnd::Window;
         }
         let mut read_on = false;
+        let asked_at = pacer.elapsed();
         match source.fires(&run.robot, &run.run_id, stream.cursor()) {
             FiresPoll::Reply(reply) if reply.run_id != run.run_id => {
                 break FiresEnd::Failed(format!(
@@ -1371,7 +1372,10 @@ pub fn follow_fires(
             }
         }
         if !read_on {
-            pacer.sleep(FIRES_POLL_INTERVAL);
+            // The ask's own gather window counts toward the interval, so asks
+            // start every FIRES_POLL_INTERVAL rather than that long apart.
+            let asking = pacer.elapsed().saturating_sub(asked_at);
+            pacer.sleep(FIRES_POLL_INTERVAL.saturating_sub(asking));
         }
     };
     write_fires_summary(out, run, &stream, &end, pacer.elapsed(), json)?;
@@ -1591,7 +1595,38 @@ fn netd_harvest(
 // The commands.
 // ---------------------------------------------------------------------------
 
+/// The refusal `verb` gives while a query-side kill switch
+/// ([`crate::graph_cmd::query_network_kill`]) keeps this machine local-only.
+/// `None` when neither switch is engaged. `--connect` does not override an
+/// engaged switch.
+fn network_refusal(verb: &str, kill: &crate::graph_cmd::QueryNetworkKill) -> Option<String> {
+    let mut labels: Vec<String> = kill.network.refusal_label().into_iter().collect();
+    if kill.netd_off {
+        labels.push(format!("{}=off", crate::graph_cmd::NETD_NETWORK_ENV));
+    }
+    if labels.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "cerulion {verb}: asking robots is disabled by {}, so this command stays local-only and \
+         contacts no robot; {} to ask robots through cerulion-netd or --connect",
+        labels.join(" and "),
+        kill.unset_remedy()
+    ))
+}
+
+/// Refuse `verb` before it opens `cerulion-netd` or a session of its own
+/// while a kill switch is engaged: a runs or fires query is network traffic,
+/// and a fires query arms recording on the robot.
+fn refuse_under_kill_switch(verb: &str) -> CliResult<()> {
+    match network_refusal(verb, &crate::graph_cmd::query_network_kill()) {
+        Some(refusal) => Err(CliError::Validation(refusal)),
+        None => Ok(()),
+    }
+}
+
 fn runs_source(target: &RemoteTarget) -> CliResult<Box<dyn RunsSource>> {
+    refuse_under_kill_switch("graph live")?;
     if target.connect.is_empty() {
         Ok(Box::new(NetdRuns))
     } else {
@@ -1697,6 +1732,7 @@ pub fn graph_fires(
     running: Arc<AtomicBool>,
 ) -> CliResult<()> {
     let window = fires_window(follow, for_secs)?;
+    refuse_under_kill_switch("graph fires")?;
     if target.connect.is_empty() {
         return Err(fires_needs_netd_protocol_10());
     }
@@ -3067,6 +3103,58 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             }
             other => panic!("expected the netd refusal, got {other:?}"),
         }
+    }
+
+    /// Either query-side kill switch refuses both verbs, naming every engaged
+    /// variable and the unset remedy; with neither engaged they proceed.
+    #[test]
+    fn a_kill_switch_refuses_asking_robots() {
+        use crate::graph_cmd::query_network_kill_from;
+        assert_eq!(
+            network_refusal("graph live", &query_network_kill_from(None, None)),
+            None
+        );
+        assert_eq!(
+            network_refusal(
+                "graph fires",
+                &query_network_kill_from(Some(" ".into()), Some("OFF"))
+            ),
+            None
+        );
+        assert_eq!(
+            network_refusal(
+                "graph live",
+                &query_network_kill_from(Some(" Off ".into()), None)
+            )
+            .as_deref(),
+            Some(
+                "cerulion graph live: asking robots is disabled by CERULION_NETWORK=off, so this \
+                 command stays local-only and contacts no robot; unset CERULION_NETWORK to ask \
+                 robots through cerulion-netd or --connect"
+            )
+        );
+        assert_eq!(
+            network_refusal("graph fires", &query_network_kill_from(None, Some("off"))).as_deref(),
+            Some(
+                "cerulion graph fires: asking robots is disabled by CERULION_NETD_NETWORK=off, so \
+                 this command stays local-only and contacts no robot; unset CERULION_NETD_NETWORK \
+                 to ask robots through cerulion-netd or --connect"
+            )
+        );
+        assert_eq!(
+            network_refusal(
+                "graph fires",
+                &query_network_kill_from(Some("on\u{1b}[2J".into()), Some("off"))
+            )
+            .as_deref(),
+            Some(
+                "cerulion graph fires: asking robots is disabled by CERULION_NETWORK=on\u{fffd}[2J \
+                 (an unrecognized value, which fails closed to local-only) and \
+                 CERULION_NETD_NETWORK=off, so this command stays local-only and contacts no \
+                 robot; unset CERULION_NETWORK and CERULION_NETD_NETWORK to ask robots through \
+                 cerulion-netd or --connect"
+            )
+        );
     }
 
     /// `--follow` with `--for`, and a zero window, are refused before any
