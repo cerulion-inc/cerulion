@@ -29,7 +29,9 @@
 //!    chain (`ticker`(Period) → `relay` → `sink`) is the repo's standard record
 //!    fixture. `--single-process` is deliberate: one worker means ONE trace
 //!    ring and ONE state ring, which is the shape the shared judge can call
-//!    resimmable at all (several state rings is its `MultiRing` arm).
+//!    resimmable at all (several state rings is its `MultiRing` arm). The run
+//!    anchors at a third of the shipped post window (`ANCHOR_CADENCE_MS`), so
+//!    the checkpoint the capture resumes from is taken well before it closes.
 //! 2. **CAPTURE** — `cerulion flashback`, the operator's own verb, into a
 //!    per-run `CERULION_FLASHBACK_DIR`.
 //! 3. **RESIM** — `cerulion bag play <capture> --resim all` on the capture.
@@ -130,6 +132,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use cerulion_core::flashback::trigger::DEFAULT_FLASHBACK_POST_WINDOW_MS;
+use cerulion_core::flashback::FLASHBACK_CADENCE_MS_ENV;
 use serial_test::serial;
 
 /// Liveness ceilings, in seconds. Load can only DELAY these, never invert them
@@ -141,6 +145,28 @@ const BAG_APPEARS: Duration = Duration::from_secs(90);
 const CAPTURE_COMPLETES: Duration = Duration::from_secs(180);
 const RUN_EXITS: Duration = Duration::from_secs(60);
 const RESIM_COMPLETES: Duration = Duration::from_secs(300);
+
+/// The anchor cadence the run is given, in milliseconds: a third of the shipped
+/// post window.
+///
+/// The capture is triggered as soon as the recorder is live, so the window it
+/// claims starts at the run's own start (`claimed_window_start_ns` saturates to
+/// 0) and no checkpoint sits at or before it. `AnchorWindow::select` then serves
+/// the OLDEST retained checkpoint, labelled `newer_than_the_claimed_window`, and
+/// the capture trims its trace to the steps after that checkpoint and ends it at
+/// the last step the trace proves complete.
+///
+/// The capture closes one post window after the trigger. At the shipped cadence,
+/// which equals the post window, a recorder that did not read the run's step 0
+/// checkpoint holds only the first cadence checkpoint, taken a fraction of a
+/// second before that close. The writer thread banks the trace and admits
+/// checkpoints in its own cycles, so on a loaded host the close can see that
+/// checkpoint while the trace it holds reaches no complete step past it: the
+/// recorder then reports the capture as not resimmable ("no scheduler trace in
+/// this capture") and this arm fails before the resim it exists for. At a third
+/// of the post window the first cadence checkpoint is taken about a third of the
+/// way into the capture, so the trace past it spans about two cadences of steps.
+const ANCHOR_CADENCE_MS: u64 = DEFAULT_FLASHBACK_POST_WINDOW_MS / 3;
 
 /// SIGKILL + reap on drop so a panicking test never leaks the run.
 struct ChildGuard(Child);
@@ -281,6 +307,25 @@ fn read_file(p: &Path) -> String {
     std::fs::read_to_string(p).unwrap_or_default()
 }
 
+/// `text` without its ANSI escape sequences (`ESC [ ... m`): the run's log
+/// wraps each field name and its `=` in their own escapes.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// THE CLOSED LOOP — see the module docs.
 #[test]
 #[serial]
@@ -320,6 +365,8 @@ fn a_capture_taken_off_a_real_record_run_is_a_bag_bag_play_resim_accepts() {
             // kill-switch keeps this LOCAL-ONLY with no scouting session.
             .env("CERULION_NETWORK", "off")
             .env("CERULION_FLASHBACK_DIR", &flashbacks)
+            // SET, never inherited: see `ANCHOR_CADENCE_MS`.
+            .env(FLASHBACK_CADENCE_MS_ENV, ANCHOR_CADENCE_MS.to_string())
             .env("RUST_LOG", "cerulion=info,cerulion_bagd=info")
             .stdout(Stdio::from(std::fs::File::create(&run_out).unwrap()))
             .stderr(Stdio::from(std::fs::File::create(&run_err).unwrap()))
@@ -400,6 +447,19 @@ fn a_capture_taken_off_a_real_record_run_is_a_bag_bag_play_resim_accepts() {
     assert!(
         run_status.success(),
         "the run must shut down cleanly: {run_status:?} — stderr:\n{}",
+        read_file(&run_err)
+    );
+    // The cadence the run ARMED at, read off its own arm report. A run that
+    // did not take `FLASHBACK_CADENCE_MS_ENV` anchors at the shipped cadence, and
+    // the capture below is then cut against the timing `ANCHOR_CADENCE_MS`
+    // moves it off.
+    let armed_at = format!("cadence_ms={ANCHOR_CADENCE_MS}");
+    assert!(
+        strip_ansi(&read_file(&run_err))
+            .lines()
+            .any(|l| l.contains("capture plane ARMED") && l.contains(&armed_at)),
+        "the run must arm its capture plane at the cadence this fixture sets ({armed_at}); \
+         stderr:\n{}",
         read_file(&run_err)
     );
 
