@@ -3087,7 +3087,7 @@ pub fn cdylib_platform_check() -> Result<(), String> {
 ///
 /// `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0004
 /// use cerulion_core::graph::node::TriggerProbe;
 /// fn fires(p: TriggerProbe) -> bool {
 ///     match p {
@@ -4199,8 +4199,11 @@ pub struct DylibNodeEntry {
     /// ([`NodeEntry::probe_trigger_input`]), which crosses the head-op symbol
     /// as op code [`SYNC_HEAD_OP_PROBE_NEXT`] once per level boundary while the
     /// input has a counted or carried arrival. Its OWN latch: a failing probe
-    /// and a failing per-set Sync op each get their loud head.
-    trigger_probe_error_latched: bool,
+    /// and a failing per-set Sync op each get their loud head. One latch per
+    /// input ([`keyed_flood_log_action`]): the names of the inputs whose last
+    /// probe failed, so an input whose probe answers leaves another input's
+    /// failing regime latched.
+    trigger_probe_error_latched: std::collections::HashSet<String>,
     /// OPTIONAL external-source FFI symbol
     /// (`cerulion_node_external_source(handle, out_fd) -> i32`), resolved
     /// best-effort by `load` (mirrors [`SnapshotFns`]). `None` for a non-external
@@ -4813,11 +4816,9 @@ impl DylibNodeEntry {
                 .map(|sym| *sym)
         };
         // OPTIONAL `consume = latest` body-probe capability: handle-less,
-        // read ONCE here (the capability map is captured before `init`). A
-        // positive return declares that op code 0 of the head-op symbol above
-        // answers a Data trigger input from the subscriber its tick reads.
-        // Without the head-op symbol there is no op to cross, so the answer is
-        // `false` whatever the export says. ADDITIVE, no ABI bump.
+        // read ONCE here (the capability map is captured before `init`), and
+        // decided by `dylib_probes_trigger_input` together with the head-op
+        // symbol above. ADDITIVE, no ABI bump.
         // Safety: same convention as every other symbol lookup.
         let probes_trigger_input_fn = unsafe {
             library
@@ -4825,15 +4826,12 @@ impl DylibNodeEntry {
                 .ok()
                 .map(|sym| *sym)
         };
-        let probes_trigger_input = match (probes_trigger_input_fn, sync_head_op_ffi) {
-            (Some(f), Some(_)) => {
-                // SAFETY: resolved by name and signature; a present symbol is
-                // trusted to match the ABI, exactly as every other lookup here.
-                let ret = unsafe { f() };
-                ret > 0
-            }
-            _ => false,
-        };
+        // SAFETY: resolved by name and signature; a present symbol is trusted
+        // to match the ABI, exactly as every other lookup here. The export
+        // takes no handle, so calling it before `init` is within its contract.
+        let probes_trigger_input_ret = probes_trigger_input_fn.map(|f| unsafe { f() });
+        let probes_trigger_input =
+            dylib_probes_trigger_input(probes_trigger_input_ret, sync_head_op_ffi.is_some());
 
         // OPTIONAL state symbols — resolved best-effort, exactly
         // like the snapshot / external-source / drain symbols above. A raw-FFI
@@ -5016,7 +5014,7 @@ impl DylibNodeEntry {
             sync_head_op_ffi,
             probes_trigger_input,
             sync_head_op_error_latched: false,
-            trigger_probe_error_latched: false,
+            trigger_probe_error_latched: std::collections::HashSet::new(),
             external_source_fn,
             external_is_doorbell_fd: false,
             leak_library_on_drop: false,
@@ -6850,8 +6848,9 @@ impl NodeEntry for DylibNodeEntry {
     /// unprobed input.
     ///
     /// A call that produces no answer is reported on its own flood latch
-    /// (`trigger_probe_error_latched`), apart from the per-set Sync ops':
-    /// first failure at `error!`, then `debug!`, then one `info!` on recovery.
+    /// (`trigger_probe_error_latched`, one per input), apart from the per-set
+    /// Sync ops': first failure at `error!`, then `debug!`, then one `info!`
+    /// on recovery.
     fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
         let Some(SyncHeadOpCall {
             ret,
@@ -6861,7 +6860,11 @@ impl NodeEntry for DylibNodeEntry {
         else {
             return TriggerProbe::Unknown;
         };
-        match flood_log_action(&mut self.trigger_probe_error_latched, decoded.is_none()) {
+        match keyed_flood_log_action(
+            &mut self.trigger_probe_error_latched,
+            input_name,
+            decoded.is_none(),
+        ) {
             FloodLogAction::FirstFailure => {
                 let detail = self.take_last_error().unwrap_or_else(|| {
                     format!(
@@ -7077,6 +7080,40 @@ pub(crate) fn flood_log_action(latched: &mut bool, failed: bool) -> FloodLogActi
         }
         (false, false) => FloodLogAction::Quiet,
     }
+}
+
+/// A [`DylibNodeEntry`]'s [`NodeEntry::probes_trigger_input`], from what
+/// `load` resolved: `export_ret` is the return of
+/// `cerulion_node_probes_trigger_input` (`None` when the library does not
+/// export it), and `has_head_op` is whether `cerulion_node_sync_head_op`, the
+/// symbol op code [`SYNC_HEAD_OP_PROBE_NEXT`] crosses, resolved. `true` only
+/// for a positive return beside the head-op symbol; a zero, a negative return
+/// (the exporter could not answer) or an absent symbol is `false`.
+fn dylib_probes_trigger_input(export_ret: Option<i32>, has_head_op: bool) -> bool {
+    has_head_op && export_ret.is_some_and(|ret| ret > 0)
+}
+
+/// [`flood_log_action`] with one latch per `key`. `latched` holds the keys
+/// whose last call failed; a key is inserted on its first failure and removed
+/// on its recovery, so one key's failures and recoveries leave another key's
+/// latch as it was.
+fn keyed_flood_log_action(
+    latched: &mut std::collections::HashSet<String>,
+    key: &str,
+    failed: bool,
+) -> FloodLogAction {
+    let mut key_latched = latched.contains(key);
+    let action = flood_log_action(&mut key_latched, failed);
+    match action {
+        FloodLogAction::FirstFailure => {
+            latched.insert(key.to_owned());
+        }
+        FloodLogAction::Recovered => {
+            latched.remove(key);
+        }
+        FloodLogAction::SuppressedFailure | FloodLogAction::Quiet => {}
+    }
+    action
 }
 
 /// Decode an FFI error code into a human-readable description.
@@ -7461,6 +7498,67 @@ mod tests {
             FloodLogAction::FirstFailure
         );
         assert!(latched);
+    }
+
+    /// One latch per key: input `b` failing on every call while input `a`
+    /// answers gives one loud line for `b` and nothing for `a`, never a
+    /// recovery for `b` that `a`'s answer would fake on a shared latch.
+    #[test]
+    fn keyed_flood_log_action_latches_each_key_apart() {
+        let mut latched = std::collections::HashSet::new();
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            actions.push(keyed_flood_log_action(&mut latched, "b", true));
+            actions.push(keyed_flood_log_action(&mut latched, "a", false));
+        }
+        assert_eq!(
+            actions,
+            vec![
+                FloodLogAction::FirstFailure,
+                FloodLogAction::Quiet,
+                FloodLogAction::SuppressedFailure,
+                FloodLogAction::Quiet,
+                FloodLogAction::SuppressedFailure,
+                FloodLogAction::Quiet,
+            ]
+        );
+        assert_eq!(
+            keyed_flood_log_action(&mut latched, "b", false),
+            FloodLogAction::Recovered
+        );
+        assert!(latched.is_empty(), "a recovered key leaves no latch behind");
+        assert_eq!(
+            keyed_flood_log_action(&mut latched, "b", true),
+            FloodLogAction::FirstFailure,
+            "a new regime on the same key is loud again"
+        );
+    }
+
+    /// The probe capability a `DylibNodeEntry` reads at load: only a positive
+    /// return of `cerulion_node_probes_trigger_input` beside the head-op
+    /// symbol declares it. Each row is `(export return, has head op, probes)`.
+    #[test]
+    fn dylib_probe_capability_needs_a_positive_return_and_the_head_op() {
+        let rows = [
+            (None, false, false),
+            (None, true, false),
+            (Some(0), false, false),
+            (Some(0), true, false),
+            (Some(-1), false, false),
+            (Some(-1), true, false),
+            (Some(i32::MIN), true, false),
+            (Some(1), false, false),
+            (Some(1), true, true),
+            (Some(2), false, false),
+            (Some(2), true, true),
+        ];
+        for (export_ret, has_head_op, probes) in rows {
+            assert_eq!(
+                dylib_probes_trigger_input(export_ret, has_head_op),
+                probes,
+                "export return {export_ret:?}, head op {has_head_op}"
+            );
+        }
     }
 
     #[test]

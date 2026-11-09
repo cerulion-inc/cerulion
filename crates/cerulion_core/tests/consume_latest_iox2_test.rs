@@ -1379,6 +1379,56 @@ fn a_failed_cdylib_body_probe_says_so_on_its_own_latch() {
     });
 }
 
+/// A cdylib's probe latch is per input. With the fault armed for input `b`,
+/// alternating probes of a failing `b` and an answering `a` give one loud
+/// line for `b` and no recovery line: `a`'s answer leaves `b`'s regime
+/// latched, as a shared latch would not.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_cdylib_body_probe_failing_on_one_input_stays_latched_while_another_answers() {
+    use cerulion_core::graph::node::{AnySubscriber, DylibNodeEntry};
+    use cerulion_core::testing::TestTransport;
+
+    let _fault = EnvVarGuard::set("CER_FAIL_MODE", "sync_op_fail");
+    let tt = TestTransport::with_buffer_size(4);
+    let mut subscribers: IndexMap<String, AnySubscriber> = IndexMap::new();
+    subscribers.insert(
+        "a".to_string(),
+        AnySubscriber::Ipc(tt.subscriber("test/consume_latest/probe_latch/a")),
+    );
+    let mut entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
+        "test_node_sync_op_fail_cdylib",
+    ))
+    .expect("load raw head-op fixture cdylib");
+    entry
+        .init(NodeContext::for_tests(IndexMap::new(), subscribers))
+        .expect("init the raw head-op fixture");
+    for _ in 0..3 {
+        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unknown);
+        assert_eq!(entry.probe_trigger_input("a"), TriggerProbe::Empty);
+    }
+    logs_assert(|lines: &[&str]| {
+        let heads = lines
+            .iter()
+            .filter(|l| l.contains("ERROR") && l.contains("consume = latest body probe"))
+            .count();
+        if heads != 1 {
+            return Err(format!("one loud line for the failing probe, got {heads}"));
+        }
+        let recoveries = lines
+            .iter()
+            .filter(|l| l.contains("body probe recovered"))
+            .count();
+        if recoveries != 0 {
+            return Err(format!(
+                "the answering input recovers no other input's latch, got {recoveries} lines"
+            ));
+        }
+        Ok(())
+    });
+}
+
 /// Wraps an entry and times each [`NodeEntry::probe_trigger_input`] call.
 struct TimedProbe<E> {
     inner: E,
