@@ -9,6 +9,9 @@
 //! - `block_timeout_ms` releases the stalled consumer's slot and the producer
 //!   resumes, and the release touches that slot only;
 //! - a consumer node that stops with a fatal error has its slot released;
+//! - the live loop's wait sizing holds a deferred producer until its slot's
+//!   `block_timeout_ms` deadline, or until the drain that frees it, instead of
+//!   re-evaluating it at the 1 ms floor;
 //! - the graph's `backpressure:` key turns a `drop_oldest` input into `block`;
 //! - a ring of `block` edges, `block` on a `network.ingress` topic, and the
 //!   graph's `backpressure: block` or `depth:` on an `#[input(accumulate)]`
@@ -459,6 +462,100 @@ fn a_consumer_that_stops_with_a_fatal_error_releases_its_slot() {
     assert!(
         produced >= 85,
         "the producer resumes after the consumer stops (fires {produced}; held it would stay near 4)"
+    );
+}
+
+/// The live loop's shortest wait.
+const FLOOR: Duration = Duration::from_millis(1);
+/// The live loop's longest wait (its liveliness sweep).
+const SWEEP: Duration = Duration::from_millis(250);
+
+fn deferred(rt: &GraphRuntime, consumer: &str) -> u64 {
+    rt.node_handle(consumer)
+        .unwrap()
+        .backpressure_block_fires_deferred_count("inp")
+}
+
+/// Step until `consumer`'s slot first defers the producer; returns the step
+/// count.
+fn step_until_deferred(rt: &mut GraphRuntime, consumer: &str) -> u64 {
+    for step in 1..=10 {
+        rt.step(Duration::from_millis(10));
+        if deferred(rt, consumer) > 0 {
+            return step;
+        }
+    }
+    panic!("the producer was never deferred on {consumer}");
+}
+
+#[test]
+fn a_held_producer_waits_for_its_release_deadline_not_the_floor() {
+    let mut rt = build(config(
+        "bsr_wait_to",
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node(
+                "stuck",
+                "host_block",
+                vec![with_timeout(input("producer/out"), 50)],
+                vec![],
+            ),
+        ],
+    ))
+    .expect("build");
+    step_until_deferred(&mut rt, "stuck");
+    // The producer's period has passed, so it is due; its slot is full with
+    // nothing drained, so it cannot fire before the 50 ms release.
+    let first = rt.live_timeout_for_test();
+    assert!(
+        first > Duration::from_millis(40) && first <= Duration::from_millis(50),
+        "the wait runs to the release deadline 50 ms out, not the {FLOOR:?} floor: {first:?}"
+    );
+    rt.step(Duration::from_millis(10));
+    rt.step(Duration::from_millis(10));
+    let later = rt.live_timeout_for_test();
+    assert!(
+        later > Duration::from_millis(20) && later <= Duration::from_millis(30),
+        "20 ms later the wait is 20 ms shorter: {later:?}"
+    );
+    rt.step(Duration::from_millis(10));
+    rt.step(Duration::from_millis(10));
+    assert_eq!(releases(&rt, "stuck"), 0, "40 ms held is short of 50");
+    rt.step(Duration::from_millis(10));
+    assert_eq!(
+        releases(&rt, "stuck"),
+        1,
+        "the release lands at the step at the deadline"
+    );
+}
+
+#[test]
+fn a_held_producer_with_no_timeout_waits_for_the_drain_that_frees_it() {
+    let mut rt = build(config(
+        "bsr_wait_drain",
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node("held", "host_block", vec![input("producer/out")], vec![]),
+        ],
+    ))
+    .expect("build");
+    step_until_deferred(&mut rt, "held");
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        SWEEP,
+        "only the consumer's drain on this level loop frees the slot, so the held producer \
+         adds no deadline and the loop does not wake every {FLOOR:?} to defer it again"
+    );
+    rt.trigger_external("held").expect("trigger");
+    rt.step(Duration::from_millis(10));
+    assert!(
+        outstanding(&rt, "held") < 2,
+        "anti-vacuity: the consumer drained"
+    );
+    let freed = rt.live_timeout_for_test();
+    assert!(
+        freed <= Duration::from_millis(10),
+        "once the slot has room the producer's own period stands: {freed:?}"
     );
 }
 

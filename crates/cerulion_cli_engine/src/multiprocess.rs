@@ -3152,6 +3152,130 @@ mod tests {
         }
     }
 
+    /// A process that hosts several executor units keeps a `block` edge inside
+    /// one of them, and a `block` edge to another process gets its credit word
+    /// between that unit's rank and the other process's.
+    ///
+    /// `host` runs `src`, its `block` consumer `near`, and `iso`, which
+    /// declares `isolate: true` and so takes a unit of its own; `remote` runs
+    /// `far`, a second `block` consumer of the same topic. The supervisor
+    /// reports a dead host as every one of its units, so the death of `remote`
+    /// releases `far`'s slot, and the death of `host` (both units) only
+    /// clears the dead producer's parked bit.
+    #[test]
+    fn a_host_of_several_units_keeps_its_block_edge_in_one_unit_and_credits_the_split_one() {
+        use cerulion_core::graph::node::MacroPolicy;
+        let mut iso = node("iso", &[], &["beat"]);
+        iso.isolate = Some(true);
+        let mut config = config_with(vec![
+            node("src", &[], &["out"]),
+            node("near", &[("gate", "src/out")], &[]),
+            iso,
+            node("far", &[("gate", "src/out")], &[]),
+        ]);
+        config.process_groups = groups(&[("host", &["src", "near", "iso"]), ("remote", &["far"])]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        for id in ["src", "iso"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![], vec![])
+                    .with_policy(MacroPolicy::Period { period_ms: 10 }),
+            );
+        }
+        for id in ["near", "far"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![block_meta("gate", 2)], vec![]).with_policy(
+                    MacroPolicy::DataTrigger {
+                        input_name: "gate".to_string(),
+                    },
+                ),
+            );
+        }
+
+        let units = plan_executor_units(&config, &infos, ExecutionMode::FreeRun, true, None)
+            .expect("plan the executor units");
+        let host_units: Vec<Vec<String>> = units.plan.units["host"]
+            .iter()
+            .map(|u| u.nodes.clone())
+            .collect();
+        assert_eq!(
+            host_units,
+            vec![
+                vec!["src".to_string(), "near".to_string()],
+                vec!["iso".to_string()]
+            ],
+            "the block edge src -> near stays in one unit and iso runs in its own"
+        );
+        assert_eq!(units.plan.units["remote"].len(), 1);
+
+        let levels = levels_for(
+            &units.config,
+            &[("near", "/p/src/out"), ("far", "/p/src/out")],
+        );
+        let mut plan = plan_deployment(&units.config, &levels, None, "units").expect("plan");
+        stamp_hosts(&mut plan, &units.plan.hosts);
+        let rank_of = |node_id: &str| -> usize {
+            plan.workers
+                .iter()
+                .find(|w| w.subgraph.nodes.iter().any(|n| n.id == node_id))
+                .map(|w| w.rank)
+                .unwrap_or_else(|| panic!("no worker runs {node_id}"))
+        };
+        assert_eq!(rank_of("src"), rank_of("near"), "one rank for the unit");
+        assert_ne!(rank_of("src"), rank_of("iso"), "iso's unit is its own rank");
+        let node_rank: std::collections::HashMap<&str, usize> = plan
+            .workers
+            .iter()
+            .flat_map(|w| w.subgraph.nodes.iter().map(|n| (n.id.as_str(), w.rank)))
+            .collect();
+        let topo = GraphTopology::build(&units.config, &infos).expect("topology");
+        let edges = credit_edges_for(&topo, &node_rank).expect("mint");
+        assert_eq!(
+            shape_edges(&edges),
+            vec![(
+                "/p/src/out".to_string(),
+                "far".to_string(),
+                "gate".to_string(),
+                2,
+                vec![rank_of("src")],
+                rank_of("far")
+            )],
+            "only the split edge gets a credit word; near keeps its unit's local word"
+        );
+
+        // The supervisor's dead batch for a host is every unit it hosts.
+        let host_ranks = |host: &str| -> Vec<u32> {
+            host_spawn_order(&plan)
+                .into_iter()
+                .find(|(h, _)| h == host)
+                .map(|(_, idxs)| idxs.iter().map(|&i| plan.workers[i].rank as u32).collect())
+                .unwrap_or_else(|| panic!("no spawn entry for {host}"))
+        };
+        assert_eq!(
+            host_ranks("host").len(),
+            2,
+            "host is one process of two units"
+        );
+        let none = std::collections::BTreeSet::new();
+        let remote_dead = credit_death_actions(&edges, &host_ranks("remote"), &none);
+        assert_eq!(remote_dead.len(), 1);
+        assert_eq!(
+            remote_dead[0].role,
+            CreditDeathRole::Consumer {
+                deferred_producers: vec![rank_of("src")]
+            },
+            "the remote consumer's death is a consumer death on far's edge, which the \
+             supervisor answers by releasing that slot"
+        );
+        let host_dead = credit_death_actions(&edges, &host_ranks("host"), &none);
+        assert_eq!(host_dead.len(), 1);
+        assert!(
+            matches!(host_dead[0].role, CreditDeathRole::Producer { .. }),
+            "the host's death is the producer's on far's edge: no slot is released"
+        );
+    }
+
     /// THE oracle: a single-producer, all-`block` flow split across two ranks
     /// mints exactly one entry, carrying the LOADED topology's depth.
     #[test]

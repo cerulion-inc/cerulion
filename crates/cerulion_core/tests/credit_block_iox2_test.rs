@@ -3166,3 +3166,137 @@ fn prc_a_lockstep_barrier_rank_credit_blocked_at_depth_does_not_wedge() {
     );
     rt.shutdown();
 }
+
+/// A drain that lands between the live loop's wait sizing and its park entry
+/// still wakes the park.
+///
+/// The sizing may hold a deferred producer past its due time on the promise
+/// that the peer's drain wakes it. A drain landing before the park takes its
+/// baseline would otherwise read as "the edge has room" at park entry, gate the
+/// credit predicate off, and leave the producer parked for the whole window.
+/// The sizing marks the edge full, and the park's baseline takes that mark, so
+/// the loop top sees the freed credit and returns.
+#[test]
+#[serial]
+fn prc_a_drain_between_the_wait_sizing_and_the_park_still_wakes_it() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("sizedfull", "consumer", "inp", DEPTH as u32);
+    let clock = Arc::new(VirtualClock::new());
+    let bind = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Producer,
+    )];
+    let mgr = manager("cb_sizedfull_p", ix, Arc::clone(&clock));
+    let (cfg, fac) = producer_graph("cbsf");
+    let mut rt = GraphRuntime::build_live_free_run(
+        cfg,
+        fac,
+        &mgr,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        None,
+        forced_park_policy(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .expect("build the producer context with its credit binding");
+    w.producer_side.record_published_n(DEPTH);
+    assert!(
+        w.producer_side.is_full(),
+        "precondition: the producer defers"
+    );
+
+    // Size the wait with the edge full, then free credit before the park.
+    let _ = rt.live_timeout_for_test();
+    w.consumer_side.record_drained(1);
+
+    let credit_before = rt.park_wakes_credit_count_for_test();
+    let (_, _, _, timeout_before) = rt.park_wake_counts();
+    rt.run_live_step_once_for_test(Duration::from_millis(PARK_WINDOW_MS));
+    let credit = rt.park_wakes_credit_count_for_test() - credit_before;
+    let (_, _, _, timeout_after) = rt.park_wake_counts();
+    rt.shutdown();
+    assert!(
+        credit > 0,
+        "the drain that landed after the sizing must wake the park through the credit word"
+    );
+    assert_eq!(
+        timeout_after, timeout_before,
+        "and the park must not run out its window"
+    );
+}
+
+/// The live loop's shortest wait.
+const WAIT_FLOOR: Duration = Duration::from_millis(1);
+
+/// The `block_timeout_ms` the wait-sizing arms below declare.
+const HOLD_TIMEOUT_MS: u64 = 200;
+
+/// A producer held on a mapped edge that declares `block_timeout_ms` waits for
+/// the release deadline, or for the peer's drain, not the 1 ms floor; on a
+/// mapped edge without a timeout it keeps the floor re-evaluation, which paces
+/// the edge's stall count.
+#[test]
+#[serial]
+fn prc_a_held_producer_on_a_timeout_edge_waits_for_its_release_deadline() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("holdto", "consumer", "inp", DEPTH as u32);
+    let clock = Arc::new(VirtualClock::new());
+    let mut bind = binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Producer,
+    );
+    bind.block_timeout_ms = Some(HOLD_TIMEOUT_MS);
+    let (_mgr, mut rt) = producer_ctx("cbhto", &ix, "cb_holdto_p", &clock, &[bind]);
+    w.producer_side.record_published_n(DEPTH);
+    step_free_run(&mut rt, &clock, 0);
+    assert_eq!(
+        rt.node_handle("producer").unwrap().fire_count(),
+        0,
+        "precondition: the full edge deferred the producer's due fire"
+    );
+    let first = rt.live_timeout_for_test();
+    assert!(
+        first > Duration::from_millis(HOLD_TIMEOUT_MS - 10)
+            && first <= Duration::from_millis(HOLD_TIMEOUT_MS),
+        "the wait runs to the release deadline, not the {WAIT_FLOOR:?} floor: {first:?}"
+    );
+    clock.set((PERIOD_MS + 100) * 1_000_000);
+    let later = rt.live_timeout_for_test();
+    assert!(
+        later > Duration::from_millis(HOLD_TIMEOUT_MS - 110)
+            && later <= Duration::from_millis(HOLD_TIMEOUT_MS - 100),
+        "100 ms later the wait is 100 ms shorter: {later:?}"
+    );
+    w.consumer_side.record_drained(1);
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        WAIT_FLOOR,
+        "once the peer drains, the producer is due at once"
+    );
+    rt.shutdown();
+
+    let w2 = supervisor_word("holdnone", "consumer", "inp", DEPTH as u32);
+    let clock2 = Arc::new(VirtualClock::new());
+    let bind2 = binding(
+        &w2.producer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Producer,
+    );
+    let (_mgr2, mut rt2) = producer_ctx("cbhnt", &ix, "cb_holdnone_p", &clock2, &[bind2]);
+    w2.producer_side.record_published_n(DEPTH);
+    step_free_run(&mut rt2, &clock2, 0);
+    assert_eq!(rt2.node_handle("producer").unwrap().fire_count(), 0);
+    assert_eq!(
+        rt2.live_timeout_for_test(),
+        WAIT_FLOOR,
+        "without a timeout the mapped edge keeps the floor re-evaluation"
+    );
+    rt2.shutdown();
+}

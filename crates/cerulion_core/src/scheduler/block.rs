@@ -27,6 +27,16 @@
 //! The release lands at the first evaluation at or after the deadline;
 //! [`release_deadline_ns`] gives that deadline to a caller that sizes a wait.
 //!
+//! # Wait sizing
+//!
+//! A held producer is due by every other signal the scheduler reads (its
+//! period passed, or its trigger frame is queued). [`slot_hold`] and
+//! [`node_hold`] tell the live loop's wait sizing when such a producer can
+//! next fire: at the earliest timeout release of a full slot, or only after a
+//! drain or a release, each of which wakes the loop on its own. A slot the
+//! loop may not wait on keeps the node due, so the loop re-evaluates it at
+//! its floor as before.
+//!
 //! # Replay
 //!
 //! None of this runs in a replay: the runtime's replay bypass skips the block
@@ -165,6 +175,91 @@ pub fn node_defers(verdicts: impl IntoIterator<Item = SlotVerdict>) -> bool {
     verdicts.into_iter().any(SlotVerdict::defers)
 }
 
+/// How one slot holds its producer, as the live loop's wait sizing reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotHold {
+    /// The slot has room or was released: it holds nothing.
+    Free,
+    /// The slot is full and the next evaluation decides something this read
+    /// cannot: its stall clock has not started, a drain moved the epoch since
+    /// it started, or the loop may not wait on this slot.
+    Evaluate,
+    /// The slot is full and times out at this instant.
+    Until(u64),
+    /// The slot is full with no timeout; only a drain or a release frees it,
+    /// and each wakes the loop.
+    Wake,
+}
+
+/// Read one slot for the wait sizing. `mark` is the slot's stall mark as the
+/// last [`judge_slot`] left it, `timeout_ns` the edge's `block_timeout_ms` in
+/// ns, and `may_wait` whether the live loop may wait for this slot's free
+/// instead of re-evaluating it: a drain or a release of the slot must wake the
+/// loop (a local slot's consumer drains on the same level loop; a mapped
+/// slot's peer drain rings the producer's credit park).
+pub fn slot_hold(
+    reading: SlotReading,
+    mark: StallMark,
+    timeout_ns: Option<u64>,
+    may_wait: bool,
+) -> SlotHold {
+    if reading.released || reading.outstanding < reading.depth {
+        return SlotHold::Free;
+    }
+    if !may_wait {
+        return SlotHold::Evaluate;
+    }
+    let started = mark.full_since_ns.is_some() && mark.seq == reading.wake_seq;
+    match (timeout_ns, started) {
+        (None, _) => SlotHold::Wake,
+        (Some(_), false) => SlotHold::Evaluate,
+        (Some(t), true) => match release_deadline_ns(mark, Some(t)) {
+            Some(deadline) => SlotHold::Until(deadline),
+            None => SlotHold::Evaluate,
+        },
+    }
+}
+
+/// When a node with `block` slots can next fire, for the live loop's wait
+/// sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockHold {
+    /// No slot holds the node past what the scheduler already reads, or one
+    /// needs an evaluation: the node's own deadline stands.
+    Clear,
+    /// Held; the earliest timeout release of a full slot lands at this
+    /// instant, and the loop evaluates the node then.
+    Until(u64),
+    /// Held by slots that only a drain or a release frees, each of which wakes
+    /// the loop: the node contributes no deadline.
+    UntilWake,
+}
+
+/// Fold the [`slot_hold`] of every `block` slot of one node. Any slot that
+/// needs an evaluation keeps the node due; otherwise the node is held while
+/// any slot is full, until the earliest timeout among them, or until a wake
+/// when none times out.
+pub fn node_hold(holds: impl IntoIterator<Item = SlotHold>) -> BlockHold {
+    let mut held = false;
+    let mut until: Option<u64> = None;
+    for h in holds {
+        match h {
+            SlotHold::Free => {}
+            SlotHold::Evaluate => return BlockHold::Clear,
+            SlotHold::Until(t) => {
+                held = true;
+                until = Some(until.map_or(t, |u| u.min(t)));
+            }
+            SlotHold::Wake => held = true,
+        }
+    }
+    match (held, until) {
+        (false, _) => BlockHold::Clear,
+        (true, Some(t)) => BlockHold::Until(t),
+        (true, None) => BlockHold::UntilWake,
+    }
+}
+
 /// A [`StallMark`] held across evaluations by a live call site that may run on
 /// more than one thread (every producer of a topic shares one per consumer).
 /// One lock, so a reader never sees one field of a mark with the other of the
@@ -268,6 +363,74 @@ mod tests {
         assert!(!node_defers([]));
         assert!(!node_defers([Room, Released, TimedOut { held_ns: 1 }]));
         assert!(node_defers([Room, Full, Released]));
+    }
+
+    #[test]
+    fn a_full_slot_with_a_started_clock_holds_until_its_deadline() {
+        let t = Some(1_000);
+        let (_, m) = judge_slot(reading(2, 2, 5), StallMark::default(), 4_000, t);
+        assert_eq!(
+            slot_hold(reading(2, 2, 5), m, t, true),
+            SlotHold::Until(5_000)
+        );
+        assert_eq!(
+            slot_hold(reading(2, 2, 5), m, None, true),
+            SlotHold::Wake,
+            "no timeout: only a drain or a release frees it"
+        );
+    }
+
+    #[test]
+    fn a_slot_the_next_evaluation_must_judge_keeps_its_node_due() {
+        let t = Some(1_000);
+        assert_eq!(
+            slot_hold(reading(2, 2, 5), StallMark::default(), t, true),
+            SlotHold::Evaluate,
+            "the stall clock has not started"
+        );
+        let (_, m) = judge_slot(reading(2, 2, 5), StallMark::default(), 0, t);
+        assert_eq!(
+            slot_hold(reading(2, 2, 6), m, t, true),
+            SlotHold::Evaluate,
+            "a drain moved the epoch, so the clock restarts at the next evaluation"
+        );
+        assert_eq!(
+            slot_hold(reading(2, 2, 5), m, t, false),
+            SlotHold::Evaluate,
+            "a slot the loop may not wait on is found free only by evaluating"
+        );
+        assert_eq!(
+            slot_hold(reading(2, 2, 5), m, None, false),
+            SlotHold::Evaluate
+        );
+    }
+
+    #[test]
+    fn a_slot_with_room_or_released_holds_nothing() {
+        let (_, m) = judge_slot(reading(2, 2, 0), StallMark::default(), 0, Some(9));
+        assert_eq!(
+            slot_hold(reading(1, 2, 0), m, Some(9), true),
+            SlotHold::Free
+        );
+        let released = SlotReading {
+            released: true,
+            ..reading(2, 2, 0)
+        };
+        assert_eq!(slot_hold(released, m, Some(9), true), SlotHold::Free);
+    }
+
+    #[test]
+    fn the_node_is_held_until_its_earliest_timeout_or_a_wake() {
+        use SlotHold::*;
+        assert_eq!(node_hold([]), BlockHold::Clear);
+        assert_eq!(node_hold([Free, Free]), BlockHold::Clear);
+        assert_eq!(node_hold([Until(9), Wake, Until(7)]), BlockHold::Until(7));
+        assert_eq!(node_hold([Free, Wake]), BlockHold::UntilWake);
+        assert_eq!(
+            node_hold([Until(7), Evaluate, Wake]),
+            BlockHold::Clear,
+            "one slot to evaluate keeps the node due"
+        );
     }
 
     #[test]

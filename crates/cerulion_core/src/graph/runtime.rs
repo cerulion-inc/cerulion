@@ -1377,6 +1377,14 @@ struct BlockDeferEdge {
     stall_clock: Arc<crate::scheduler::block::StallCell>,
     /// The edge's `block_timeout_ms` in ns; `None` when it declares none.
     timeout_ns: Option<u64>,
+    /// Whether the wait sizing may hold the producer until this slot's free
+    /// wakes the loop ([`crate::scheduler::block::slot_hold`]). `true` on a
+    /// local edge, whose consumer drains on this level loop, and on a mapped
+    /// edge that declares `block_timeout_ms` and is in the credit park's watch
+    /// list, whose peer drain rings the park. `false` on any other mapped
+    /// edge: the producer keeps the floor re-evaluation, which paces the edge's
+    /// `CreditStallWatch` count.
+    may_wait: bool,
 }
 
 /// One `block` slot a consumer node holds, kept by that node's tick callback
@@ -1626,6 +1634,14 @@ struct CreditParkEdge {
     /// advance test. Written once per park by the live-loop thread; atomic only
     /// because `monitor_wait_block` takes `&self`.
     baseline_seq: std::sync::atomic::AtomicU32,
+    /// Was this edge at or over threshold when the live loop sized its wait?
+    /// On an edge that declares `block_timeout_ms` the sizing holds a deferred
+    /// producer until the release deadline ([`crate::scheduler::block::BlockHold`]),
+    /// counting on this edge's drain to wake it sooner, so the park takes this
+    /// into `baseline_full`: a drain landing between the sizing and the park
+    /// entry then wakes the park instead of being absorbed into its baseline.
+    /// Cleared by the park that reads it.
+    sized_full: std::sync::atomic::AtomicBool,
 }
 
 /// The retained, READ-ONLY half of one `block` consumer edge —
@@ -1824,6 +1840,21 @@ fn block_edges_defer(producer: &str, edges: &[BlockDeferEdge], now_ns: u64) -> b
         }
     }
     deferred
+}
+
+/// The wait-sizing read of a producer's `block` slots: when the producer can
+/// next fire ([`crate::scheduler::block::node_hold`]). Reads the same words and
+/// stall marks [`block_edges_defer`] judges, and writes neither.
+fn block_edges_hold(edges: &[BlockDeferEdge]) -> crate::scheduler::block::BlockHold {
+    use crate::scheduler::block::{node_hold, slot_hold, SlotReading};
+    node_hold(edges.iter().map(|e| {
+        slot_hold(
+            SlotReading::of(&e.outstanding, e.threshold),
+            e.stall_clock.load(),
+            e.timeout_ns,
+            e.may_wait,
+        )
+    }))
 }
 
 /// The loud event for one released `block` slot: the consumer input's
@@ -6821,6 +6852,7 @@ impl GraphRuntime {
                             timeout_ns: edge
                                 .block_timeout_ms
                                 .map(|ms| ms.saturating_mul(1_000_000)),
+                            may_wait: true,
                         });
                 }
                 // Retain the READ-ONLY half of this consumer edge
@@ -7113,13 +7145,15 @@ impl GraphRuntime {
                 // predicate and the kernel-block arm are ALL skipped by the
                 // same one check, and the switch costs one cached atomic load
                 // per build instead of a branch per recheck.
-                if stall.is_some() && crate::credit::credit_wake_enabled() {
+                let parks = stall.is_some() && crate::credit::credit_wake_enabled();
+                if parks {
                     credit_park_edges.push(CreditParkEdge {
                         word: word.clone(),
                         slot,
                         threshold: binding.depth,
                         baseline_full: std::sync::atomic::AtomicBool::new(false),
                         baseline_seq: std::sync::atomic::AtomicU32::new(0),
+                        sized_full: std::sync::atomic::AtomicBool::new(false),
                     });
                 }
                 let stall_clock = Arc::new(crate::scheduler::block::StallCell::default());
@@ -7140,6 +7174,7 @@ impl GraphRuntime {
                             timeout_ns: binding
                                 .block_timeout_ms
                                 .map(|ms| ms.saturating_mul(1_000_000)),
+                            may_wait: parks && binding.block_timeout_ms.is_some(),
                         });
                 }
             }
@@ -9206,7 +9241,8 @@ impl GraphRuntime {
         // edge for.
         let block_gate_replay_bypass = Arc::new(AtomicBool::new(false));
         for node_id in prefire_node_ids {
-            let edges = producer_block_edges.remove(&node_id).unwrap_or_default();
+            let edges: Arc<[BlockDeferEdge]> =
+                Arc::from(producer_block_edges.remove(&node_id).unwrap_or_default());
             // The throttle gate reads the scheduler's CANONICAL last_fire_ns
             // + fire_count via the node's handle (no second source of truth),
             // so it gates on the last ACTUAL fire.
@@ -9230,6 +9266,21 @@ impl GraphRuntime {
             // other would silently keep the old polling behaviour.
             if let Some((throttle_ns, _)) = &throttle {
                 scheduler.set_throttle_ns(&node_id, *throttle_ns)?;
+            }
+            // The wait sizing's read of the same slots, so a held producer
+            // waits for its release deadline or its wake instead of the 1 ms
+            // floor. Installed in the same iteration as the pre-fire check,
+            // and silent under the same replay bypass.
+            if !edges.is_empty() {
+                let hold_edges = Arc::clone(&edges);
+                let hold_bypass = Arc::clone(&block_gate_replay_bypass);
+                scheduler.set_block_hold(&node_id, move || {
+                    if hold_bypass.load(Ordering::Relaxed) {
+                        crate::scheduler::block::BlockHold::Clear
+                    } else {
+                        block_edges_hold(&hold_edges)
+                    }
+                })?;
             }
             let replay_bypass = Arc::clone(&block_gate_replay_bypass);
             let producer: Arc<str> = Arc::from(node_id.as_str());
@@ -14265,7 +14316,10 @@ impl GraphRuntime {
         // epoch advance left to see.
         for e in &self.credit_park_edges {
             let seq = e.word.wake_seq_snapshot();
-            let full = e.word.outstanding() >= e.threshold;
+            let sized_full = e
+                .sized_full
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            let full = e.word.outstanding() >= e.threshold || sized_full;
             e.baseline_seq
                 .store(seq, std::sync::atomic::Ordering::Release);
             e.baseline_full.store(
@@ -15290,6 +15344,13 @@ impl GraphRuntime {
         const LIVELINESS_SWEEP_NS: u64 = 250_000_000;
         const MIN_TIMEOUT_NS: u64 = 1_000_000;
         let now_ns = self.live_deadline_now_ns();
+        // Read BEFORE the `block` holds below: a producer the holds keep
+        // waiting on its mapped edge's drain must not lose a drain that lands
+        // between this read and the park entry (`CreditParkEdge::sized_full`).
+        for e in &self.credit_park_edges {
+            e.sized_full
+                .store(e.word.outstanding() >= e.threshold, Ordering::Release);
+        }
         let next_fire_ns = self.scheduler.ns_until_next_fire(now_ns);
         let mut wake_ns = next_fire_ns.unwrap_or(LIVELINESS_SWEEP_NS);
         // Under a FIXED-quantum gating clock a step advances gating by exactly

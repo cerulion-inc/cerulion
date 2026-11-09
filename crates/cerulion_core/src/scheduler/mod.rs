@@ -653,6 +653,14 @@ struct ScheduledNode {
     /// sizing is byte-identical.
     throttle_ns: Option<u64>,
 
+    /// The `block` hold of a producer with `block` consumers, read only by
+    /// [`Scheduler::ns_until_next_fire`]: when a due node held by a full
+    /// credit slot can next fire ([`crate::scheduler::block::node_hold`]).
+    /// The decision stays in `pre_fire_check`; both read the same slots and
+    /// stall marks, and this read changes neither. `None` for every node
+    /// without a `block` consumer, which contributes nothing.
+    block_hold: Option<Arc<dyn Fn() -> crate::scheduler::block::BlockHold + Send + Sync>>,
+
     /// How many times a TRACE-DRIVEN fire burst
     /// ([`FireKind::Replay`]) asked this node's [`TriggerRefill`] hook for the
     /// next FIFO frame and got NOTHING.
@@ -2163,7 +2171,8 @@ impl Scheduler {
     /// or `None` if no enabled Period node has a pending deadline and no
     /// enabled Data node carries a FIFO backlog (which reports due-NOW). PURE
     /// READ — reads only `policy` + `next_fire_ns` + `pending_data_count` +
-    /// `data_backlog_hint` + the disabled flag; performs no
+    /// `data_backlog_hint` + the disabled flag, and a due node's throttle
+    /// window and `block` hold (a read of its credit slots); performs no
     /// `advance`/`fire`/trace/mutation. Called ONLY from the live loop
     /// (`GraphRuntime::run_live`) to size the WaitSet timeout so a `period_ms`
     /// node fires on time between data events. NEVER called from
@@ -2213,14 +2222,25 @@ impl Scheduler {
                 // cannot reach this arm anyway (`throttle_ms` and `period_ms`
                 // are mutually exclusive at the macro), so in practice this
                 // lifts a `Some(0)` to the remaining window.
-                //
-                // BLOCK-deferred nodes are deliberately NOT covered: block has
-                // its own wake channel (the credit word), and a deadline the
-                // loop polls toward would race the wake it now has.
-                Some(match n.throttle_remaining_ns(now_ns) {
+                let due = match n.throttle_remaining_ns(now_ns) {
                     Some(remaining) => due.max(remaining),
                     None => due,
-                })
+                };
+                // A node held by a full `block` slot is due by the same
+                // signals and cannot run either. It runs at the earliest
+                // `block_timeout_ms` release of its full slots, or after a
+                // drain or a release, each of which wakes the loop itself (the
+                // consumer drains on this level loop, or the peer's drain
+                // rings the credit park). A slot the loop may not wait on, or
+                // whose stall clock the next evaluation must start, keeps the
+                // node due.
+                match n.block_hold.as_ref().map(|hold| hold()) {
+                    None | Some(crate::scheduler::block::BlockHold::Clear) => Some(due),
+                    Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
+                        Some(due.max(at_ns.saturating_sub(now_ns)))
+                    }
+                    Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+                }
             })
             .min()
     }
@@ -2473,6 +2493,7 @@ impl Scheduler {
             // Installed at graph build for nodes that
             // declare `throttle_ms`; absent means the node has no rate cap.
             throttle_ns: None,
+            block_hold: None,
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
             replay_trailing_refill: false,
@@ -4367,6 +4388,29 @@ impl Scheduler {
                 node_id: node_id.to_string(),
             })?;
         node.throttle_ns = Some(throttle_ns);
+        Ok(())
+    }
+
+    /// Install `node_id`'s `block` hold, so [`Self::ns_until_next_fire`]
+    /// reports when a node held by a full credit slot can next fire instead
+    /// of `Some(0)` for as long as it is held.
+    ///
+    /// Paired with [`Self::set_pre_fire_check`] at the graph build, over the
+    /// same slots: the closure owns the decision, this owns the wake sizing.
+    /// Without it a held node keeps the 1 ms floor re-evaluation.
+    // hot-path-alloc-ok-fn: cold: a graph-BUILD setter; the `to_string` names
+    // an unknown node on a refusal that ends the build.
+    pub fn set_block_hold<F>(&mut self, node_id: &str, hold: F) -> TransportResult<()>
+    where
+        F: Fn() -> crate::scheduler::block::BlockHold + Send + Sync + 'static,
+    {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        node.block_hold = Some(Arc::new(hold));
         Ok(())
     }
 
