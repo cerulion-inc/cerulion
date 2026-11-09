@@ -2622,15 +2622,15 @@ different program.
 | The consumer is WOKEN by the edge (`#[input(trigger)]`, or the one input of a data-triggered node). | `latest-value-read` |
 | Exactly one node in the graph publishes the topic. | `no-in-graph-producer`, `multiple-producers` |
 | The topic has exactly one consumer edge, and the producer feeds exactly one qualifying edge. A chain ends at a fan-out: the second consumer would otherwise wait for the first consumer's whole chain. | `fan-out`, `producer-branches` |
-| Producer and consumer run in the same process. Another address space has no slot to hand over. | `separate-processes` |
-| The input declares neither `block` nor `sample(N)`. `block` defers the producer while the consumer is at threshold, and a consumer that runs inside the producer's own fire never reaches it; `sample(N)` says the consumer reads less often than the producer publishes, and a direct call reads in lockstep. | `block`, `sample` |
+| Producer and consumer run in the same process. A node in another process is not in the runtime that runs the chain head, so the end of the head's level cannot call it. | `separate-processes` |
+| The input declares neither `block` nor `sample(N)`. An input on `block` or `sample(N)` is read through a second subscriber that counts arrivals, and a chain member's trigger input is drained through the node's own subscriber. | `block`, `sample` |
 | The consumer fires on THIS frame: a data trigger, not `period_ms`, `sync_window_ms`, `unbounded_sync` or `external`, and this edge is its only trigger. | `consumer-policy`, `join` |
-| The consumer sits on the level RIGHT AFTER the producer's. A derived levelization already guarantees that for a single-trigger consumer, but a `level_assignments:` block may place one further down while the executor still opens the levels in between, so a direct call would fire it a step early. | `level-not-adjacent` |
-| The consumer declares no `throttle_ms`. A rate cap defers a fire, and a direct call has nowhere to defer to. | `throttle` |
+| The consumer sits on the level RIGHT AFTER the producer's. A derived levelization already guarantees that for a single-trigger consumer, but a `level_assignments:` block may place one further down while the executor still opens the levels in between, so calling it when the producer's level ends would fire it before those levels, which a queued run fires first. | `level-not-adjacent` |
+| The consumer declares no `throttle_ms`. A rate cap can defer a fire past the step its frame arrives in, and a chain member is called to fire on that step. | `throttle` |
 | Neither end is on a `block` topic; those nodes are already fired serially against a shared outstanding count. | `block-involved` |
-| The consumer reads no latest-value input written by a node at or after the CHAIN HEAD's level. Everything below the head's level has ticked before the head fires, so its values are final; a node at or after the head's level may not have ticked when the chain is called. | `late-context-input` |
+| The consumer reads no latest-value input written by a node at or after the CHAIN HEAD's level. Everything below the head's level has ticked before the head fires, so its values are final. The chain is called when the head's level ends: a writer above that level may not have ticked by then, so the member could freeze a different value from a queued run's. A writer on the head's own level has ticked by then, and is refused as well. | `late-context-input` |
 | No node reads one of the consumer's outputs as a latest value at a level after the chain head's level and at or before the consumer's own. A fused consumer would be called when the head's level ends, so such a reader would freeze the consumer's new frame one level early. | `early-latest-value-reader` |
-| The chain holds at most 32 nodes, which bounds the call depth. | `length-ceiling` |
+| The chain holds at most 32 nodes, which bounds how many members are called back to back when one chain head's level ends. | `length-ceiling` |
 
 A refused edge CUTS its chain rather than killing it: the refused consumer heads a new chain,
 judged against its own level.
