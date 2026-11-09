@@ -266,8 +266,7 @@ unsafe fn loan_has_shadow(subscription: *const ffi::rmw_subscription_t, key: *mu
 unsafe fn decode_failure_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     sub_data(subscription)
         .decode_failures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .read()
         .total_failures()
 }
 
