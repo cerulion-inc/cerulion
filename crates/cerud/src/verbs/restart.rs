@@ -12,6 +12,14 @@
 //! injection into the transient-unit command). Execution goes through the
 //! injectable [`RestartRunner`] seam, so dispatch + validation are testable
 //! without invoking systemd.
+//!
+//! A verb built with [`RestartVerb::with_gate`] asks its [`RestartGate`]
+//! before each step: [`RestartStep::Stop`] first, before the args are read,
+//! and [`RestartStep::Start`] after the stop command and before the start
+//! command. An `Err` from the gate ends the verb with that error, so a
+//! refused `Stop` runs no command and a refused `Start` runs no start
+//! command. A verb built with [`RestartVerb::new`] or
+//! [`RestartVerb::with_runner`] has no gate.
 
 use serde::Deserialize;
 
@@ -21,6 +29,7 @@ use crate::verbs::VerbHandler;
 /// The `restart` verb.
 pub struct RestartVerb {
     runner: Box<dyn RestartRunner>,
+    gate: Option<Box<dyn RestartGate>>,
 }
 
 impl RestartVerb {
@@ -30,14 +39,46 @@ impl RestartVerb {
     pub fn new() -> Self {
         RestartVerb {
             runner: default_runner(),
+            gate: None,
         }
     }
 
     /// A verb with an injected runner (used by tests to capture the argv or
     /// force the unsupported-host arm).
     pub fn with_runner(runner: Box<dyn RestartRunner>) -> Self {
-        RestartVerb { runner }
+        RestartVerb { runner, gate: None }
     }
+
+    /// This verb with `gate` asked before each step ([`RestartStep`]); it
+    /// replaces any gate the verb had.
+    pub fn with_gate(mut self, gate: Box<dyn RestartGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// The gate's answer for `step`; `Ok` when the verb has no gate.
+    fn check(&self, step: RestartStep) -> CerudResult<()> {
+        match &self.gate {
+            Some(gate) => gate.check(step),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The step of a restart a [`RestartGate`] is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStep {
+    /// Asked first, before the args are read and before the stop command.
+    Stop,
+    /// Asked after the stop command, before the start command.
+    Start,
+}
+
+/// A check [`RestartVerb`] runs before each [`RestartStep`]. An `Err` ends the
+/// verb with that error, before the step's command runs.
+pub trait RestartGate: Send + Sync {
+    /// `Ok` lets `step` run; an `Err` is the verb's error.
+    fn check(&self, step: RestartStep) -> CerudResult<()>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +96,7 @@ impl VerbHandler for RestartVerb {
     }
 
     fn execute(&self, args: &serde_json::Value) -> CerudResult<serde_json::Value> {
+        self.check(RestartStep::Stop)?;
         let args: RestartArgs = serde_json::from_value(args.clone())
             .map_err(|e| CerudError::Verb(format!("invalid restart args: {e}")))?;
         validate_graph_name(&args.graph)?;
@@ -69,6 +111,7 @@ impl VerbHandler for RestartVerb {
         // succeed. Both commands are built from the validated graph name.
         let stop = build_stop_command(&args.graph)?;
         let _ = self.runner.run(&stop);
+        self.check(RestartStep::Start)?;
         let start = build_start_command(&args.graph)?;
         self.runner.run(&start)?;
 

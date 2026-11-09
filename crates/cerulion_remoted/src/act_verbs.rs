@@ -275,20 +275,22 @@ fn estop_reads_engaged(lease: &EstopLease) -> bool {
     }
 }
 
-/// Refuse when the robot's e-stop is engaged or an engage is counted; a
-/// counted engage refuses without taking the lease's lock.
+/// Refuse `verb` while the robot's e-stop holds ([`EstopLease::holds`]): the
+/// latch is engaged or an engage is counted. A counted engage refuses without
+/// taking the lease's lock.
 fn refuse_under_estop(lease: &EstopLease, verb: &str) -> CerudResult<()> {
-    let engaged = lease.engage_pending()
-        || match lease.lock() {
-            Ok(lease) => !matches!(lease.estop(), EstopState::Clear),
-            Err(_) => true,
-        };
-    if engaged {
-        return Err(verb_error(VerbError::Unavailable(format!(
-            "the robot's e-stop is engaged, so {verb} is refused"
-        ))));
+    if lease.holds() {
+        return Err(estop_refusal(verb));
     }
     Ok(())
+}
+
+/// The error [`refuse_under_estop`] answers for `verb`:
+/// `unavailable: the robot's e-stop is engaged, so <verb> is refused`.
+pub(crate) fn estop_refusal(verb: &str) -> CerudError {
+    verb_error(VerbError::Unavailable(format!(
+        "the robot's e-stop is engaged, so {verb} is refused"
+    )))
 }
 
 /// Run `send` while holding `lease`'s lock, if under that lock its e-stop
