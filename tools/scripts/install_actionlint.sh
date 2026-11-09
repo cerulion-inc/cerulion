@@ -96,7 +96,7 @@ trap 'rm -rf "$tmp"' EXIT
 tarball="actionlint_${ACTIONLINT_VERSION}_${platform}.tar.gz"
 url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
 
-curl -sSL --fail --retry 3 --retry-delay 2 "$url" -o "$tmp/$tarball" \
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$url" -o "$tmp/$tarball" \
   || die "download failed: $url"
 
 # Verify BEFORE unpacking: an unverified archive is not extracted at all.

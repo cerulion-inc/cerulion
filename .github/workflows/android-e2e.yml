@@ -157,8 +157,11 @@ jobs:
           set -euo pipefail
           url=https://services.gradle.org/distributions/gradle-8.9-bin.zip
           expected=d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab
-          curl -fsSL "$url" -o /tmp/gradle-8.9-bin.zip
-          published="$(curl -fsSL "$url.sha256" | awk '{print $1}')"
+          # Both fetches write to a file: curl discards a partial file before a
+          # retry, which it cannot do for output sent into a pipe.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/gradle-8.9-bin.zip "$url"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/gradle-8.9-bin.zip.sha256 "$url.sha256"
+          published="$(awk '{print $1}' /tmp/gradle-8.9-bin.zip.sha256)"
           test "$published" = "$expected"
           echo "$expected  /tmp/gradle-8.9-bin.zip" | sha256sum -c -
           mkdir -p "$HOME/gradle-8.9"

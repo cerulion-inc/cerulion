@@ -5872,7 +5872,7 @@ jobs:
         run: |
           set -eu
           url=https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
-          curl -sSL --retry 3 -o cargo-deny.tgz "$url"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o cargo-deny.tgz "$url"
           echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tgz" | sha256sum -c -
           tar -xzf cargo-deny.tgz
           install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
