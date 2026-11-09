@@ -311,8 +311,13 @@ snapshot (`topic-snapshot`).
   AND role ≥ VIEWER (non-vacuous: `Role` is an open `u16`, so a role less
   privileged than VIEWER holding `CAP_OBSERVE` is representable, and denied);
   lifecycle mutation needs role ≥ OPERATOR; `teleop` needs `CAP_TELEOP` AND
-  role ≥ OPERATOR; an UNCLASSIFIED verb is DENIED, never fail-open. Lower
-  `Role` value = higher privilege.
+  role ≥ OPERATOR; `clear-estop` needs the OPERATOR role or higher and is
+  refused to a row whose principal is cloud whether the allow-from-cloud switch
+  is on or off (class `NonCloud`: the authorizer refuses it before dispatch, so
+  the refusal is receipted `Denied`); `estop-status` needs `CAP_OBSERVE` AND the
+  VIEWER role or higher; no host registers either e-stop verb yet, so a caller
+  the authorizer admits gets `unknown_verb`; an UNCLASSIFIED verb is DENIED,
+  never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read
   from client args (`pairing_verbs.rs` module docs; `ops_loopback_test.rs`).
   Validity, anti-rollback and the CPace TTL are evaluated against the robot's
@@ -385,7 +390,8 @@ or call checks the latch every 10 ms and stops when it engages, a call
 stopped before its request goes out sends none, and a publish sends each
 frame, and a call its request, only while it holds the lease's lock and reads
 the latch clear. The rcp plane shares this latch: an rcp `estop` engages it,
-and while it is engaged rcp tool calls are refused (the rcp plane below). A
+and while it is engaged rcp tool calls other than `estop` are refused (the rcp
+plane below). A
 publish is
 refused when its subscriber wait plus its frames at the rate exceed 90 s, and
 is stopped if it is still running 100 s after it started (a frame that takes
@@ -499,16 +505,33 @@ frame cut off, or a robot frame over the 16 MiB cap;
 boundary) each end the desk process with status 1 and an error line, the
 break's cause passed through `sanitize_peer_text`.
 
-One e-stop latch covers the ops act verbs and the rcp plane (`restart` does
-not read it): the ops plane's
-`cerud::lease::ControlLease` behind one `EstopLease` (the lease plus the
-count of e-stop engages waiting for its lock). The daemon builds it once
+One e-stop latch covers the ops act verbs, `restart` and the rcp plane: the
+ops plane's `cerud::lease::ControlLease` behind one `EstopLease` (the lease
+plus the count of e-stop engages waiting for its lock). The daemon builds it once
 (`OpsHost::daemon`); `serve_core` hands it to `OpsServing` (for
-`engage-estop` and the act verbs) and a clone to `RcpPlane`, so both planes
+`engage-estop`, `restart` and the act verbs) and a clone to `RcpPlane`, so both planes
 share the latch and the count. `serve_core` also gives the daemon host an
 `rcp::RcpdEstop` over the same `RcpLink` (`OpsHost::with_rcpd_estop`), which
 `EngageEstopVerb` holds. A library host has no lease, no `RcpdEstop` and
-serves no rcp plane. The session reader engages it through `EstopLease::engage` for an
+serves no rcp plane. `EstopLease::holds` is the blocking read of the latch that the act verbs'
+refusal, the rcp plane's Act check and `restart` share: an engage is counted
+(read without the lock, and again under it, so an engage that counts itself
+in while the read waits for the lock is not missed), or the latch reads
+engaged under the lock, held for those reads only, and a poisoned lock reads
+engaged. The act verbs' 10 ms
+watcher and their send path read the latch themselves (above). The daemon
+registers `restart` as `RestartVerb::new().with_gate(..)` over an
+`ops::EstopRestartGate`, and cerud asks the gate before each step. It asks
+for `RestartStep::Stop` before it parses the args, so the refusal reads the
+same on every host and nothing runs. It asks for `RestartStep::Start` after
+the stop command and before the start command, so after an engage during
+`systemctl stop` the start command does not run; that refusal is
+`unavailable: ` followed by `ops::RESTART_STOPPED_NOT_STARTED`. The pure
+decision is `estop_policy::restart_check`. Each check takes the lease's lock
+at most once, for one read, and never holds it across a command, so an engage
+after the second check does not stop the graph that `systemd-run` starts. A
+library host still refuses `restart` by name. The session reader engages the
+latch through `EstopLease::engage` for an
 authorized `RcpClass::Estop` message right after `rcp_authorize`, before the
 upstream check and the e-stop bound, so an unreachable rcpd or a spent bound
 still leaves it engaged; a forward failure never undoes it. The engage is
@@ -516,7 +539,7 @@ counted before it waits for the lease's lock, so an act verb sends nothing
 more once it is counted. The engager is the session's caller string. A
 direct engage writes no ops receipt; rcpd still receipts the forwarded
 `estop`. For an `RcpClass::Act` message the reader reads the count, then the
-latch under the lock (a poisoned lock reads engaged), and while an engage is
+count and the latch under the lock (a poisoned lock reads engaged), and while an engage is
 counted or the latch is engaged answers `-32001` `refused: the robot's
 e-stop is engaged`, or for `estop_clear` (still `RcpClass::Act`) `refused:
 the robot's ops e-stop is engaged; it clears when cerulion-remoted

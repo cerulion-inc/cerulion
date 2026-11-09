@@ -44,7 +44,7 @@ use super::config::{GraphConfig, DEFAULT_MAX_SLICE_LEN};
 use super::node::{
     flood_log_action, AnyPublisher, AnySubscriber, BackpressurePolicy, ExternalSource,
     FloodLogAction, InputConsume, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo,
-    OutputMeta, ShutdownSignal,
+    OutputMeta, ShutdownSignal, TriggerProbe,
 };
 use super::run_topology::{
     RunTopology, TopologyNode, TopologyPort, TopologyTrigger, RUN_TOPOLOGY_VERSION,
@@ -861,6 +861,11 @@ enum DrainSource {
     /// so they'd never fire / would lose data if unified) and `Block` /
     /// `Sample(N)` backpressure inputs (unifying would change FIRE semantics).
     /// The `Ipc` subscriber's bundled listener is the WaitSet wake source.
+    ///
+    /// The two subscribers are popped at different points of the step (the
+    /// trigger one at the boundary, the body one by the tick's read), so a
+    /// `consume = latest` binding asks the body whether a read finds a frame
+    /// before it mints an arrival; see [`DataTriggerBinding::probes_body`].
     Separate { sub_idx: usize },
 }
 
@@ -1058,6 +1063,40 @@ fn topic_is_writable_from_outside(
     edge_needs_producer_annotation(config, topic, provisioning)
 }
 
+/// Ask `node_id`'s entry, through its lock, whether a read of `input` now
+/// finds a frame no read has taken (see [`NodeEntry::probe_trigger_input`]).
+/// A poisoned lock or an absent node answers [`TriggerProbe::Unknown`], which
+/// the caller mints on as an unprobed binding does.
+fn probe_trigger_body(
+    nodes: &IndexMap<String, Arc<Mutex<Box<dyn NodeEntry>>>>,
+    node_id: &str,
+    input: &str,
+) -> TriggerProbe {
+    match nodes.get(node_id) {
+        Some(arc) => match arc.lock() {
+            Ok(mut g) => g.probe_trigger_input(input),
+            Err(_) => {
+                tracing::error!(
+                    node_id = %node_id,
+                    "node mutex poisoned; consume = latest body probe skipped"
+                );
+                TriggerProbe::Unknown
+            }
+        },
+        None => {
+            debug_assert!(
+                false,
+                "probed trigger binding node '{node_id}' absent from self.nodes"
+            );
+            tracing::error!(
+                node_id = %node_id,
+                "probed trigger node absent; consume = latest body probe skipped"
+            );
+            TriggerProbe::Unknown
+        }
+    }
+}
+
 /// Mapping from data-trigger topic to scheduler node ID for pre-step drain bridging.
 struct DataTriggerBinding {
     /// Scheduler node ID to signal.
@@ -1100,6 +1139,18 @@ struct DataTriggerBinding {
     /// and serve the newest frame, and the node fires at most once per step.
     /// `false` for the `fifo` default.
     consume_latest: bool,
+    /// A `consume = latest` binding on the separate discipline whose entry
+    /// answers [`NodeEntry::probe_trigger_input`]. `drain_level` then signals a
+    /// counted arrival only while the body subscriber still holds a frame.
+    /// `false` on every other binding.
+    probes_body: bool,
+    /// The trigger subscriber counted an arrival that the body probe answered
+    /// [`TriggerProbe::Empty`] for, and no signal has been minted since.
+    /// The next boundary probes again even when its drain pops nothing: the
+    /// frame may still have been on its way to the body queue (iceoryx2
+    /// delivers to one subscriber queue at a time, and the publisher notifies
+    /// after the last one).
+    unconfirmed_arrival: bool,
 }
 
 /// Per-input drain binding for a `Sync`/`UnboundedSync` node — the
@@ -5288,6 +5339,10 @@ impl GraphRuntime {
         // (never a silent semantics fork — two Sync semantics must be visible).
         let mut supports_sync_head_ops: HashMap<String, bool> = HashMap::new();
         let mut supports_sync_capture_stamps: HashMap<String, bool> = HashMap::new();
+        // Capture each node's `probes_trigger_input` beside them, under the
+        // same static-answer contract: whether a `consume = latest` input read
+        // through two subscribers can ask its body for an unread frame.
+        let mut probes_trigger_input: HashMap<String, bool> = HashMap::new();
         for (id, entry) in &node_factories {
             entry_infos.insert(id.clone(), entry.info()?);
             performs_input_snapshot.insert(id.clone(), entry.performs_input_snapshot());
@@ -5296,6 +5351,7 @@ impl GraphRuntime {
             refills_trigger_input.insert(id.clone(), entry.refills_trigger_input());
             supports_sync_head_ops.insert(id.clone(), entry.supports_sync_head_ops());
             supports_sync_capture_stamps.insert(id.clone(), entry.supports_sync_capture_stamps());
+            probes_trigger_input.insert(id.clone(), entry.probes_trigger_input());
         }
         // Per capture-time Sync node: its stamp locations and window, filled by
         // the per-node validation below and consumed where the sync ops are
@@ -7879,6 +7935,8 @@ impl GraphRuntime {
                         drain: DrainSource::Unified { listener_idx: idx },
                         topic: Arc::<str>::from(trigger_topic.as_str()),
                         consume_latest,
+                        probes_body: false,
+                        unconfirmed_arrival: false,
                     });
                     // Mark the BODY
                     // subscriber this Unified binding drains through, arming
@@ -8122,6 +8180,9 @@ impl GraphRuntime {
                         drain: DrainSource::Separate { sub_idx: idx },
                         topic: Arc::<str>::from(trigger_topic.as_str()),
                         consume_latest,
+                        probes_body: consume_latest
+                            && probes_trigger_input.get(&node_def.id) == Some(&true),
+                        unconfirmed_arrival: false,
                     });
                 }
             }
@@ -9444,6 +9505,33 @@ impl GraphRuntime {
                     }
                 })?;
             }
+        }
+        // A `consume = latest` input read through two subscribers whose entry
+        // answers no body probe fires on every arrival its trigger subscriber
+        // counts, including a frame the tick's read already drained. Named
+        // once, as `node.input`.
+        let latest_unprobed: Vec<String> = data_trigger_bindings
+            .iter()
+            .filter(|b| {
+                b.consume_latest
+                    && !b.probes_body
+                    && matches!(b.drain, DrainSource::Separate { .. })
+            })
+            .map(|b| format!("{}.{}", b.node_id, b.input_name.as_deref().unwrap_or("?")))
+            .collect();
+        if !latest_unprobed.is_empty() {
+            tracing::warn!(
+                inputs = %latest_unprobed.join(","),
+                "consume = latest inputs read through two subscribers, each on a node \
+                 that cannot tell whether its read will find a frame. Each fires on \
+                 every arrival its trigger subscriber counts, including a frame an \
+                 earlier read already took, and that fire reads nothing. A node built \
+                 with `#[cerulion_node]` answers; a raw-FFI node library answers by \
+                 exporting `cerulion_node_probes_trigger_input` returning a positive \
+                 value beside `cerulion_node_sync_head_op`, whose op code 0 then \
+                 answers for the input; a hand-written entry answers by implementing \
+                 `NodeEntry::probes_trigger_input` and `probe_trigger_input`."
+            );
         }
         if !refill_incapable.is_empty() {
             refill_incapable.sort();
@@ -18702,6 +18790,33 @@ impl GraphRuntime {
                         );
                     }
 
+                    // `consume = latest` on two subscribers: the trigger
+                    // subscriber's pops above include any frame that landed
+                    // after the previous boundary drain and before that
+                    // fire's read, which drained it off the BODY subscriber.
+                    // So ask the body whether a read now finds a frame, and
+                    // mint only if it does: `Empty` mints nothing and carries
+                    // the arrival, so the next boundary asks again even if it
+                    // pops nothing; `Unread` mints, one signal for a carried
+                    // arrival alone; `Unknown` mints as an unprobed binding
+                    // does. The watchdog reset below runs for every popped
+                    // frame either way.
+                    let (mint_arrivals, mint_carried) = if self.data_trigger_bindings[i].probes_body
+                        && (!timestamps.is_empty()
+                            || self.data_trigger_bindings[i].unconfirmed_arrival)
+                    {
+                        let probe = match input_name.as_deref() {
+                            Some(name) => probe_trigger_body(&self.nodes, &node_id, name),
+                            None => TriggerProbe::Unknown,
+                        };
+                        self.data_trigger_bindings[i].unconfirmed_arrival =
+                            probe == TriggerProbe::Empty;
+                        let mint = probe != TriggerProbe::Empty;
+                        (mint, mint && timestamps.is_empty())
+                    } else {
+                        (true, false)
+                    };
+
                     // Iterate by ref (`&ts`) — the buffer is reused
                     // across bindings, not consumed. `ts` stays `u64` (Copy), so
                     // the body is unchanged.
@@ -18745,6 +18860,9 @@ impl GraphRuntime {
                                 );
                             }
                         }
+                        if !mint_arrivals {
+                            continue;
+                        }
                         if let Err(e) = self.scheduler.signal_data(&node_id) {
                             tracing::warn!(
                                 node_id = %node_id,
@@ -18753,6 +18871,17 @@ impl GraphRuntime {
                                 error = %e,
                                 "scheduler.signal_data failed; data-trigger fire is dropped \
                                  for this timestamp"
+                            );
+                        }
+                    }
+                    if mint_carried {
+                        if let Err(e) = self.scheduler.signal_data(&node_id) {
+                            tracing::warn!(
+                                node_id = %node_id,
+                                input_name = ?input_name.as_deref(),
+                                error = %e,
+                                "scheduler.signal_data failed; the carried consume = latest \
+                                 arrival's fire is dropped"
                             );
                         }
                     }
@@ -18902,9 +19031,11 @@ impl GraphRuntime {
                     // answer is behind the `(u64, Option<u64>)` FFI return the
                     // cdylib drain shares, so keying on it is an ABI change for
                     // a decision the pending count already makes correctly.
-                    // The SEPARATE discipline is untouched — it drains a
+                    // The SEPARATE discipline takes no such gate: it drains a
                     // dedicated subscriber that never re-offers, so its
-                    // per-frame signals are per-frame truth.
+                    // per-frame signals are per-frame truth. (A `consume =
+                    // latest` input there mints only while its body subscriber
+                    // still holds a frame; see `DataTriggerBinding::probes_body`.)
                     // A `consume = latest` drain pops the whole queue, so its
                     // count may exceed one; the gate below mints at most one
                     // signal either way, which is the one fire a latest input

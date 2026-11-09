@@ -144,7 +144,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use cerud::lease::EstopState;
 use cerulion_link::{accept_frame_stream, read_frame, write_frame, Connection, SendStream};
 use cerulion_pairing::format::{AccountId, Role, Scope};
 use cerulion_pairing::verify::AccessRow;
@@ -1196,27 +1195,16 @@ fn engage_estop(lease: &EstopLease, caller: &str) {
     tracing::warn!(by = %caller, "cerulion_remoted: e-stop ENGAGED by an rcp estop");
 }
 
-/// Whether the e-stop on `lease` stops Act messages: an engage is counted
-/// (read without the lease's lock), or the latch reads engaged under the
-/// lock, which is held for that read only. A poisoned lock reads engaged.
-fn estop_engaged(lease: &EstopLease) -> bool {
-    lease.engage_pending()
-        || match lease.lock() {
-            Ok(latch) => !matches!(latch.estop(), EstopState::Clear),
-            Err(_) => true,
-        }
-}
-
-/// The refusal for the Act message `message` while the e-stop on `lease` is
-/// engaged or an engage is counted ([`estop_engaged`]), `None` while it
-/// reads clear.
+/// The refusal for the Act message `message` while the e-stop on `lease`
+/// holds ([`EstopLease::holds`]: the latch is engaged or an engage is
+/// counted), `None` while it reads clear.
 fn estop_refusal(lease: &EstopLease, message: &RcpMessage) -> Option<&'static str> {
     estop_refusal_of(lease, &message.canonical)
 }
 
 /// [`estop_refusal`] for the Act message whose canonical form is `canonical`.
 fn estop_refusal_of(lease: &EstopLease, canonical: &[u8]) -> Option<&'static str> {
-    if !estop_engaged(lease) {
+    if !lease.holds() {
         return None;
     }
     if calls_tool(canonical, ESTOP_CLEAR_TOOL) {
@@ -2583,7 +2571,7 @@ impl SseBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cerud::lease::ControlLease;
+    use cerud::lease::{ControlLease, EstopState};
 
     fn class_of(text: &str) -> Result<RcpClass, RcpRefusal> {
         classify_message(text.as_bytes()).map(|m| m.class)

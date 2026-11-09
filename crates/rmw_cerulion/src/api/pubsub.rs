@@ -2697,10 +2697,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 adopt_registered: Vec::with_capacity(forgeable_members),
             }),
             gid,
-            decode_failures: std::sync::Mutex::new(
+            decode_failures: crate::gated_latch::GatedLatch::new(
                 crate::decode_failure_latch::DecodeFailureLatch::new(),
             ),
-            hash_mismatches: std::sync::Mutex::new(
+            hash_mismatches: crate::gated_latch::GatedLatch::new(
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             ),
             loan_refusals: std::sync::Mutex::new(
@@ -3024,9 +3024,7 @@ unsafe fn take_impl_live(
             // somebody redeploys — on a 100 Hz topic that is ~100
             // lines/s forever, the disk-fill class. Loud once
             // per regime, counted always.
-            let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-                &data.hash_mismatches,
-            );
+            let mut latch = data.hash_mismatches.lock_failure();
             cerulion_core::transport::frame_drop_latch::report_schema_hash_mismatch(
                 &mut latch,
                 cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
@@ -3040,14 +3038,13 @@ unsafe fn take_impl_live(
             // Recovery is observed HERE — the hash gate passing is the
             // whole condition; whether the bridge can then DECODE the
             // frame is a different condition with its own latch.
-            let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-                &data.hash_mismatches,
-            );
-            cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
-                &mut latch,
-                cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
-                &data.topic,
-            );
+            data.hash_mismatches.on_success(|latch| {
+                cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
+                    latch,
+                    cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
+                    &data.topic,
+                )
+            });
         }
         // A member this build's C++ typesupport gives no way to WRITE
         // (a `bool[]` before Humble: the generator emits no `assign` for
@@ -3446,9 +3443,7 @@ unsafe fn take_adopted(
         // Same regime latch + semantics as the copying take: the
         // frame is consumed and dropped, `taken` stays false.
         drop(owned);
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
+        let mut latch = data.hash_mismatches.lock_failure();
         cerulion_core::transport::frame_drop_latch::report_schema_hash_mismatch(
             &mut latch,
             cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
@@ -3459,14 +3454,13 @@ unsafe fn take_adopted(
         return RMW_RET_OK;
     }
     {
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
-        cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
-            &mut latch,
-            cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
-            &data.topic,
-        );
+        data.hash_mismatches.on_success(|latch| {
+            cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
+                latch,
+                cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
+                &data.topic,
+            )
+        });
     }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
@@ -4229,9 +4223,7 @@ unsafe fn take_loaned_impl(
         if let Some(s) = shadow.take() {
             inner.shadows.release(s);
         }
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
+        let mut latch = data.hash_mismatches.lock_failure();
         cerulion_core::transport::frame_drop_latch::report_schema_hash_mismatch(
             &mut latch,
             cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
@@ -4245,14 +4237,13 @@ unsafe fn take_loaned_impl(
         // Recovery is observed HERE — the hash gate passing is the whole
         // condition (same split as `take_impl`: framing is a different
         // condition with its own latch).
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
-        cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
-            &mut latch,
-            cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
-            &data.topic,
-        );
+        data.hash_mismatches.on_success(|latch| {
+            cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
+                latch,
+                cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
+                &data.topic,
+            )
+        });
     }
     // The type-level blocker (see the copying take's arm): a member this
     // build cannot write refuses the frame HERE, before the forge writes its

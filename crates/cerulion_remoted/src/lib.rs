@@ -98,6 +98,7 @@ pub mod device_index;
 pub mod epoch_pull;
 pub mod error;
 pub mod estop_lease;
+mod estop_policy;
 pub mod flashback;
 pub mod forward;
 pub mod host;

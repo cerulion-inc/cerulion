@@ -84,6 +84,12 @@ const REPLAY_PUBLISHER: &str = "a replay publishes on an eye topic";
 /// Long enough for the eye's loop to read everything published before it.
 const SETTLE: Duration = Duration::from_millis(300);
 
+/// The depth the ask topic is created with. The eye's subscriber takes the
+/// depth of the topic it opens, and this one holds every ask the test
+/// publishes, so an eye that stalls during the sweep reads the asks queued
+/// behind the stall late instead of losing the oldest to newer ones.
+const ASK_DEPTH: usize = 256;
+
 /// The host's clock less a fixed lag: a run's clock after a pause of that
 /// length.
 struct Behind(u64);
@@ -222,13 +228,19 @@ impl Answers {
 
 /// Wait until the status file in `state_dir` counts `n` asks dropped from
 /// a replay, so a replay leaves only after the eye has read and named it.
+/// A count other than `n` after 10 s fails with the whole status file.
 fn wait_replayed(state_dir: &Path, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let counted = || read_status(state_dir).map_or(0, |s| s.replay_asks_today);
     while counted() < n as u64 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(counted(), n as u64, "the asks dropped from a replay so far");
+    let status = read_status(state_dir);
+    let count = status.as_ref().map_or(0, |s| s.replay_asks_today);
+    assert_eq!(
+        count, n as u64,
+        "the asks dropped from a replay so far; status: {status:?}"
+    );
 }
 
 /// The eye receipts in the log at `path`.
@@ -309,6 +321,14 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         let hour = 3_600_000_000_000_u64;
         let sent = || requests.load(Ordering::SeqCst);
         let mut played = 0_usize;
+        // The ask topic is created deeper than the transport's default, as a
+        // graph creates the topics its nodes publish, before any asker opens
+        // it at the default.
+        let mut deep = live_mgr.default_topic_config();
+        deep.subscriber_max_buffer_size = ASK_DEPTH;
+        let _ask_topic = live_mgr
+            .precreate_topic_services(&jev.ask_topic, deep)
+            .expect("the ask topic");
         let mut live = Asker::open(&live_mgr, &jev);
         eye_common::wait_for_subscribers(&live_mgr, &jev.frame_topic, 1);
         eye_common::wait_for_subscribers(&live_mgr, &jev.ask_topic, 1);
