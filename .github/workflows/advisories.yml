@@ -68,17 +68,26 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # The release archive, version and checksum `ci.yml`'s Dependency Audit
-      # job installs. cargo-deny runs against the runner image's own cargo, so
-      # there is no toolchain step and no cache.
-      - name: Install cargo-deny 0.20.2
+      # The installer, version and checksum `ci.yml`'s Dependency Audit job
+      # uses, behind a restore of the pinned tool tarballs `ci.yml`'s
+      # `tool-tarballs` job saves on `main`; a miss downloads. cargo-deny runs
+      # against the runner image's own cargo, so there is no toolchain step and
+      # no cargo cache, and nothing here saves.
+      - name: Tool tarball cache key
+        id: tool-tarballs-key
+        run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Restore the pinned tool tarballs
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+
+      - name: Install cargo-deny
+        env:
+          CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
         run: |
-          set -eu
-          url=https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o cargo-deny.tgz "$url"
-          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tgz" | sha256sum -c -
-          tar -xzf cargo-deny.tgz
-          install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+          ./tools/scripts/install_cargo_deny.sh
           cargo deny --version
 
       # `shell: bash` runs this under `bash --noprofile --norc -eo pipefail`, so
