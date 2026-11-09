@@ -2260,7 +2260,7 @@ fn an_empty_wait_never_spins_under_a_nonzero_budget() {
 }
 
 /// The park tier: a publish wakes a PARKED wait through the topic
-/// DOORBELL — the SHM line the rmw publisher armed at create and rings right
+/// DOORBELL, the SHM line the rmw publisher armed at create and rings right
 /// after every send (`ring_doorbell`). Default env
 /// (`CERULION_MONITOR_WAIT` unset = auto ON): on Linux the wait must map
 /// exactly the one subscription topic's bell, park the FIRST block of every
@@ -3274,8 +3274,12 @@ unsafe fn listener_fd_of(subscription: *mut ffi::rmw_subscription_t) -> std::os:
 /// the publish (one fd or doorbell wake), the take ran no listener drain, and the
 /// listener is still readable after the take. Across the rounds fd wakes stay at
 /// one per round at most: a notification left readable into a later block would
-/// fire it before the publish. The last wait, with nothing published, times out
-/// with no fd wake and leaves the listener drained. Run on the fd tier
+/// fire it before the publish. In the middle round a second publish lands between
+/// the take and the next wait, while the listener still holds that round's
+/// notification (so the publish adds none of its own): that wait returns it from its
+/// entry pass, with no fd block or park entered and the listener drained, and the
+/// rounds go on. The last wait, with nothing published, times out with no fd wake
+/// and leaves the listener drained. Run on the fd tier
 /// (`CERULION_MONITOR_WAIT=0`) and on the platform default, which parks on the
 /// topic doorbell on Linux aarch64.
 #[test]
@@ -3361,6 +3365,67 @@ unsafe fn deferred_drain_rounds(tier: &str) {
             fd_readable_within(listener, Duration::from_secs(1)),
             "{tier} round {round}: the wake's notification is still on the listener"
         );
+        if round == ROUNDS / 2 {
+            // A publish between this take and the next wait, while the listener
+            // still holds this round's notification, so the publish adds no
+            // notification of its own (a notify into a listener that holds an
+            // unconsumed wake skips the send): the next wait's entry pass drains
+            // the listener and its full probe returns the message without
+            // entering a block.
+            let blocks0 = (
+                data.fd_blocks.load(Ordering::Relaxed),
+                data.park_blocks.load(Ordering::Relaxed),
+            );
+            let late = CPoint {
+                x: round as f64,
+                y: -2.0,
+                z: 4.0,
+            };
+            assert_eq!(
+                rmw_publish(
+                    publisher,
+                    &late as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            let handle = wait_on_sub_in_thread((*subscription).data, ws, Duration::from_secs(5));
+            let (ret, ready) = handle.join().expect("late wait thread");
+            assert_eq!(
+                ret, RMW_RET_OK,
+                "{tier} round {round}: the wait after the late publish returns"
+            );
+            assert!(ready, "{tier} round {round}: the late publish is ready");
+            assert_eq!(
+                (
+                    data.fd_blocks.load(Ordering::Relaxed) - blocks0.0,
+                    data.park_blocks.load(Ordering::Relaxed) - blocks0.1,
+                ),
+                (0, 0),
+                "{tier} round {round}: the entry pass serves the late publish, so no fd \
+                 block and no park (fd_blocks, park_blocks deltas)"
+            );
+            assert!(
+                !fd_readable_within(listener, Duration::ZERO),
+                "{tier} round {round}: the entry pass drained the listener"
+            );
+            let mut out = CPoint::default();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    subscription,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            assert!(
+                taken,
+                "{tier} round {round}: the take after the late wait delivers"
+            );
+            assert_eq!(out, late, "{tier} round {round}: the late message");
+        }
     }
     let fd_wakes = data.fd_wakes.load(Ordering::Relaxed) - fd_wakes0;
     eprintln!(

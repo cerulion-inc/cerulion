@@ -1517,7 +1517,7 @@ impl CerulionPublisher {
     /// `enable_doorbell` ran at build, so a publisher without one pays one
     /// branch. A consumer parked in a shallow CPU monitor-wait on the same line
     /// wakes the instant of this store.
-    /// FIREWALL: a wake signal only — never the data path (the sample is
+    /// FIREWALL: a wake signal only, never the data path (the sample is
     /// already enqueued; the consumer still reads it from SHM).
     pub fn ring_doorbell(&self) {
         if let Some(db) = &self.doorbell {

@@ -781,7 +781,7 @@ pub struct WaitSetData {
     /// the one full pass per call the rmw contract needs (a second queued
     /// sample has no notification left to fire an fd for).
     pub probes_entry: AtomicU64,
-    /// SHM readiness probes run AFTER a wake — the fired entities, or the
+    /// SHM readiness probes run AFTER a wake: the fired entities, or the
     /// rung bell's subscriptions; never the whole set (a wake whose probe finds
     /// nothing ready probes them again after its drain).
     pub probes_wake: AtomicU64,
@@ -876,12 +876,6 @@ impl WaitSetData {
         if let Some(ended) = decode_window_end(window_end.swap(0, Ordering::Relaxed)) {
             st.learners.end_window(ended);
         }
-        Self::apply_kept_note(bells, st);
-    }
-
-    /// The kept note of the last bell wake alone, at the wake's instant, against the
-    /// bell set it was taken from.
-    fn apply_kept_note(bells: &mut ParkBells, st: &mut PeriodState) {
         if let Some((at, generation)) = bells.rung_note.take() {
             if st.learners.is_mapped(generation) {
                 let now = ns_since(*st.epoch.get_or_insert(at), at);
@@ -1282,7 +1276,9 @@ impl WaitSetData {
     /// After a block that returned on bell `idx`: the subscription slots behind it,
     /// copied into `subs` from the call's map. With `note_at` (a predicting call), the
     /// wake's instant and every mapped bell's seq are kept for the learners' next note
-    /// (`apply_rung_note`, feature `period-park`), under the same lock.
+    /// (`apply_rung_note`, feature `period-park`), under the same lock. No earlier note
+    /// is kept at that point: a predicting block reads its plan first
+    /// (`predicted_plan`), and that read applies it.
     fn bell_woke(&self, idx: usize, note_at: Option<Instant>, subs: &mut Vec<usize>) {
         #[cfg_attr(not(feature = "period-park"), allow(unused_mut))]
         let mut pb = self.park_bells.lock().unwrap_or_else(|e| e.into_inner());
@@ -1290,13 +1286,10 @@ impl WaitSetData {
         subs.extend_from_slice(pb.subs_of(idx));
         #[cfg(feature = "period-park")]
         if let Some(at) = note_at {
-            if pb.rung_note.is_some() {
-                // An earlier wake's note still kept (a block that computed no
-                // predicted plan first): it came before this block's window end,
-                // so it is applied alone and the end stays kept.
-                let mut st = self.period.lock().unwrap_or_else(|e| e.into_inner());
-                Self::apply_kept_note(&mut pb, &mut st);
-            }
+            debug_assert!(
+                pb.rung_note.is_none(),
+                "a predicting block's plan read applies the kept note before its wake"
+            );
             let ParkBells {
                 bells,
                 rung_seqs,
@@ -2995,7 +2988,7 @@ unsafe fn rmw_wait_live(
                             if this_block_parks || predicted.is_some() {
                                 // A park that woke via the fd path with silent
                                 // bells may be reporting a STALE bell (producer
-                                // re-created) — re-map before the probe serves
+                                // re-created), so re-map before the probe serves
                                 // the frame.
                                 ws.reconcile_stale_bells(subscriptions);
                             }
