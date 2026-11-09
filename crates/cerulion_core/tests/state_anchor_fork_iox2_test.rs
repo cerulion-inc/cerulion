@@ -254,7 +254,7 @@ fn graph(prefix: &str, ids: &[&str]) -> GraphConfig {
         nodes: ids
             .iter()
             .map(|id| NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),

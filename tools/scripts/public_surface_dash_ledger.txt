@@ -159,7 +159,7 @@
 6 crates/cerulion_core/src/transport/ingress_build.rs
 60 crates/cerulion_core/src/transport/liveness.rs
 24 crates/cerulion_core/src/transport/mirror_registry.rs
-70 crates/cerulion_core/src/transport/mod.rs
+68 crates/cerulion_core/src/transport/mod.rs
 2 crates/cerulion_core/src/transport/notify_delivery_latch.rs
 5 crates/cerulion_core/src/transport/output_proxy.rs
 13 crates/cerulion_core/src/transport/publisher.rs
@@ -246,7 +246,7 @@
 1 crates/native_ros2_messages/src/lib.rs
 27 crates/rmw_cerulion/build.rs
 12 crates/rmw_cerulion/src/adopt_take.rs
-9 crates/rmw_cerulion/src/api/guard_wait.rs
+8 crates/rmw_cerulion/src/api/guard_wait.rs
 4 crates/rmw_cerulion/src/api/init.rs
 1 crates/rmw_cerulion/src/api/misc.rs
 28 crates/rmw_cerulion/src/api/pubsub.rs

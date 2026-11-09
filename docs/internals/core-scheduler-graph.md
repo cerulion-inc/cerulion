@@ -351,8 +351,15 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
   wakes hot). That arm tries three kernel blocks before it paces, in order: a credit
   word, barrier arrival, and the primary topic's doorbell epoch (macOS, Linux and
-  Android). A process
-  blocks on one address, so the first that applies owns it.
+  Android). A live loop
+  (a process, or one executor unit of a process) blocks on one address, so the first that
+  applies owns it. The doorbell rung arms the first declared trigger or sync-input topic
+  written from outside the loop's own graph, a unit's cut when the process hosts several
+  units; a ring on any other topic is seen at the next recheck, so a join in a unit of its
+  own takes the kernel wake on its first such input only
+  (https://github.com/cerulion-inc/cerulion/issues/755). Units are opt in: the planner
+  (`graph::executor::derive_units`) runs a process as one unit unless the graph's profile or a
+  node's `isolate: true` splits it.
 - The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is

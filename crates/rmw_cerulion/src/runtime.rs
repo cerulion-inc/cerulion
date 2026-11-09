@@ -1063,7 +1063,7 @@ pub struct SubscriptionData {
     /// schema-hash gate but that the bridge cannot DECODE. Without the latch
     /// such a frame would drop silently (no log, no counter),
     /// indistinguishable from an empty queue.
-    pub decode_failures: Mutex<crate::decode_failure_latch::DecodeFailureLatch>,
+    pub decode_failures: crate::decode_failure_latch::EntityDecodeLatch,
     /// Flood-suppressed loudness + an unconditional counter for
     /// frames dropped on the schema-hash gate. SEPARATE from
     /// `decode_failures` on purpose — a hash mismatch (the two ends
@@ -1071,7 +1071,9 @@ pub struct SubscriptionData {
     /// type and disagree on the framing) are different conditions with
     /// different remedies, and sharing one latch would let either
     /// condition's regime mask the other's loud head.
-    pub hash_mismatches: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
+    pub hash_mismatches: crate::gated_latch::GatedLatch<
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    >,
     /// Forged loaned take: flood-suppressed loudness + an unconditional counter
     /// for loaned takes REFUSED on a budget (the shadow pool, or the
     /// transport's borrow budget) — see [`crate::loan_refusal_latch`].
@@ -1129,7 +1131,7 @@ pub struct ServiceData {
     pub server: Mutex<cerulion_core::transport::service::ServiceServer>,
     /// See [`SubscriptionData::decode_failures`] — a request the
     /// bridge cannot decode must not be dropped silently.
-    pub decode_failures: Mutex<crate::decode_failure_latch::DecodeFailureLatch>,
+    pub decode_failures: crate::decode_failure_latch::EntityDecodeLatch,
 }
 
 // No manual Send/Sync impls — the server is over
@@ -1147,7 +1149,7 @@ pub struct ClientData {
     pub gid: [u8; 16],
     /// See [`SubscriptionData::decode_failures`] — a response the
     /// bridge cannot decode must not be dropped silently.
-    pub decode_failures: Mutex<crate::decode_failure_latch::DecodeFailureLatch>,
+    pub decode_failures: crate::decode_failure_latch::EntityDecodeLatch,
 }
 
 // No manual Send/Sync impls — the client is over

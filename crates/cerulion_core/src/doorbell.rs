@@ -136,16 +136,18 @@
 //! # Who a ring serves
 //!
 //! A kernel wake reaches a consumer only while that consumer is blocked, and a
-//! consumer can be blocked while a publish happens only when the two are in
-//! different processes: inside one process the publish runs in a step the parking
-//! thread itself drives. The two sides are gated separately, and only one of them
-//! asks who the peer is. A PRODUCER arms a doorbell for EVERY topic it publishes
+//! consumer can be blocked while a publish happens only when the two run on
+//! different live loops: two processes, or two executor units of one process.
+//! Inside one live loop the publish runs in a step the parking thread itself
+//! drives. The two sides are gated separately, and only one of them asks who the
+//! peer is. A PRODUCER arms a doorbell for EVERY topic it publishes
 //! while the policy permits one, because the consumers a ring can reach are not
 //! knowable from the publishing graph: a graph running beside another one, an
 //! `rmw_cerulion` wait set and a tool that subscribes are all blocked readers
 //! this build never hears about. A CONSUMER opens a page only when one of its
-//! declared trigger or sync-input topics admits a writer outside its process
-//! ([`crate::graph`]'s `rung_topics`), which it reads off its own declarations.
+//! declared trigger or sync-input topics admits a writer outside the graph its
+//! live loop runs (its process's graph, or its executor unit's cut of it;
+//! [`crate::graph`]'s `rung_topics`), which it reads off its own declarations.
 //!
 //! What a producer pays for a page nobody blocks on is one atomic on the ring
 //! counter per publish, plus one load of the page's `parked` count on Linux and

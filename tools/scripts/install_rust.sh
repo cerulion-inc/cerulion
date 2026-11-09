@@ -124,7 +124,11 @@ else
     temp=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-rust.XXXXXX") ||
         die "could not create Rust bootstrap directory"
     printf 'Installing Rust/Cargo %s with rustup\n' "$release"
-    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$temp/rustup-init.sh" ||
+    # Plain --retry, which every curl accepts (--retry-all-errors needs 7.71).
+    # --connect-timeout and --max-time bound one attempt, so a stalled
+    # connection times out and is retried.
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 \
+        --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o "$temp/rustup-init.sh" ||
         die "could not download the official rustup installer"
     sh "$temp/rustup-init.sh" -y --profile minimal --default-toolchain "$release" --no-modify-path ||
         die "Rust/Cargo installation failed; Cerulion binaries have not been replaced"

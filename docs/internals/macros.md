@@ -209,12 +209,13 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 | `cerulion_node_external_source` | External-trigger source classification (external nodes). |
 | `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs` | OPTIONAL input-hold capability pair. |
 | `cerulion_node_drain_trigger_input` | OPTIONAL unified trigger-drain capability. |
+| `cerulion_node_probes_trigger_input` | OPTIONAL, handle-less `() -> i32`, read once at load as `NodeEntry::probes_trigger_input`. A positive return beside `cerulion_node_sync_head_op` declares that op code 0 of that export answers a `consume = latest` Data trigger input read through two subscribers from the subscriber the tick reads; the macro returns 1. Absent, zero or negative, or without the head-op export, the input is not probed: it fires on every counted arrival and the graph build names it. |
 | `cerulion_node_init_with_params` | OPTIONAL: `cerulion_node_init` plus the node's resolved `params:` as one UTF-8 JSON object (`params_to_json`). Shares one body with `cerulion_node_init`; the host calls it instead of the plain init when the node carries params, so values land before the user's `init`. A cdylib without it loads unchanged; `params:` on such a node is refused at graph build, and a cdylib whose info JSON declares params without exporting it is refused when its info is read (`DylibNodeEntry::info`). |
 | `cerulion_take_last_error_kind` | OPTIONAL typed error kind: the `NodeErrorKind` wire code of the last error (`0` = none), read by the host after a code-1 / handle-0 return so a node error arrives as `TransportError::NodeFailed`. Absent: the error stays the untyped `NodeError` (and a `Fatal` does not stop the node). |
 
 Return-code semantics (part of the ABI; the host and the replay verdicts classify on
 them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
-panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex is poisoned; `4`
+panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex or the instance's own lock is poisoned; `4`
 handle not found. The macros convert a user `NodeError` at the boundary with
 `NodeError::into_transport`, which keeps its kind; the `NodeErrorKind` wire codes are
 part of the same contract (never renumber one).

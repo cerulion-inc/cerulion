@@ -13,14 +13,39 @@ zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
 **What ships today.** The lease, deadman and e-stop state machine, and the
 remote `engage-estop` verb. Engaging the e-stop records the engaged state and
-its engager; it does not stop motion by itself, and the state is held in the
-daemon's memory, so a daemon restart clears it. Nothing outside the daemon can
-read that state yet: an engage returns a reply to the caller, writes a warning
-to the log, and asks Flashback to save a recording. A robot still needs its own
-stop path (a hardwired e-stop) to stop motion. Only the `cerulion-remoted`
-daemon serves `engage-estop`, `restart` and the act verbs (`topic-publish`,
-`service-call`, `topic-snapshot`, `topic-echo-once`): a process that hosts the
-remote plane as a library refuses each with an `unsupported_host` error. An Android app can
+its engager and sends an `estop` to the robot's `cerulion-rcpd`, again until
+rcpd answers, which closes rcpd's own latch and publishes an e-stop frame to
+the graph; neither stops motion by itself. The engaged state is held in the daemon's memory, so a
+daemon restart clears it, and nothing else does; rcpd's latch, once that
+`estop` closed it, clears only through its `estop_clear` or by deleting its
+latch file and restarting rcpd.
+No verb returns that state yet; a verb or rcp tool call that it refuses says
+so in its error. An `engage-estop` returns
+a reply to the caller, writes a warning to the log, sends that `estop` and
+asks Flashback to save a recording; an `estop` over the rcp plane engages the
+latch without that ask.
+It is the one e-stop latch the ops act verbs, `restart` and the
+`cerulion/rcp/1` plane obey: while it is engaged, the ops act verbs `topic-publish` and
+`service-call`, the ops verb `restart` and every tool call over the
+`cerulion/rcp/1` plane except `estop` are refused, and an `estop` over that
+plane engages it too (see
+[`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
+reads it before it stops the graph and again before it starts it: an engage
+during the stop means the start command does not run, and an engage after
+the second read does not stop the graph it starts. LAN ingress does not read
+it. An `engage-estop`
+refuses each rcp tool call other than `estop` that the plane has not yet sent
+to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
+rcpd just before each send), then sends an `estop` to rcpd without waiting
+for it, and sends it again while rcpd is not reachable or answers with an
+error, logging the failure, until rcpd answers that its latch closed. That
+latch then refuses the mutating calls rcpd holds and has not yet published;
+an `estop` over the rcp plane closes rcpd's own latch too. A robot still needs its own stop path (a hardwired e-stop) to
+stop motion. Only the `cerulion-remoted` daemon serves
+`engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
+`topic-snapshot`, `topic-echo-once`) and the `cerulion/rcp/1` plane: a process
+that hosts the remote plane as a library refuses each of those verbs with an
+`unsupported_host` error and serves no rcp plane. An Android app can
 host the plane in its own process (see
 [Host the paired remote plane](android.md#host-the-paired-remote-plane)); a
 paired desk reads its catalog, schemas and topics there and cannot publish
@@ -67,6 +92,7 @@ act verbs, work on the robot's own shared memory; with `--robot`,
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
+`cerulion rcp` is refused the same way.
 
 The only other desk to robot topic path today is LAN ingress (an `ingress:`
 block in a graph), which proves no identity per peer and is closed when

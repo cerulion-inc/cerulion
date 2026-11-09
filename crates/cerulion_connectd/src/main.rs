@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion-connectd` — the desk-side iroh sibling binary.
 //!
-//! Two subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
+//! Three subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
 //! and SPAWNS this, exactly as it spawns the gateway / `vizd`):
 //!
 //! - `cerulion-connectd connect …`, dial a robot's `cerulion/wire/2` ALPN, demand
@@ -12,8 +12,13 @@
 //!   Deterministic STDOUT state lines (`pairing:` / `paired:`); a distinct exit
 //!   code per outcome (see [`cerulion_connectd::pair`]).
 //!
-//! Both subcommands are spawned by `cerulion connect` / `cerulion pair`; users run
-//! those verbs, not this binary directly. All logic lives in the library.
+//! - `cerulion-connectd rcp …`: bridge stdio to the robot's `cerulion/rcp/1`
+//!   ALPN, so the robot's `cerulion-rcpd` serves as a local stdio MCP server.
+//!   STDOUT carries only MCP messages.
+//!
+//! The subcommands are spawned by `cerulion connect` / `cerulion pair` /
+//! `cerulion rcp`; users run those verbs, not this binary directly. All logic
+//! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -27,6 +32,7 @@ use cerulion_connectd::config::{
     ConnectConfig, DemandSet, DEFAULT_ROBOT_TIMEOUT,
 };
 use cerulion_connectd::pair::{run_pair, PairConfig, EXIT_INTERRUPTED, EXIT_USAGE};
+use cerulion_connectd::rcp::{run_rcp, stdin_reader, RcpConfig};
 use cerulion_connectd::resolve_epoch_dir_from_env;
 use cerulion_connectd::sanitize_peer_text;
 use cerulion_connectd::worker::run_connect;
@@ -46,7 +52,7 @@ use cerulion_link::{RelayConfig, RelayUrl};
 #[command(
     name = "cerulion-connectd",
     version,
-    about = "The helper that `cerulion connect` and `cerulion pair` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
+    about = "The helper that `cerulion connect`, `cerulion pair` and `cerulion rcp` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
     long_about = None
 )]
 struct Cli {
@@ -77,6 +83,19 @@ enum ConnectdCommand {
     ///   the robot could not be reached in time, `4` the robot refused the
     ///   call or does not serve the verb.
     Act(ActCli),
+    /// Serve a robot's cerulion-rcpd as a local stdio MCP server.
+    ///
+    /// Dials the robot's rcp plane with the desk device key and bridges one
+    /// MCP session: newline-delimited JSON-RPC on stdin and stdout. Stdout
+    /// carries only MCP messages; logs go to stderr.
+    ///
+    /// # Exit codes
+    ///
+    /// - `0` stdin reached EOF and the robot finished answering, `1` any
+    ///   other end: the robot refused this desk, revoked its access or ended
+    ///   the session, the dial failed, or a configuration error (the stderr
+    ///   line says which).
+    Rcp(RcpCli),
 }
 
 /// `cerulion-connectd act`: one act-verb call.
@@ -108,6 +127,36 @@ struct ActCli {
     relay_disabled: bool,
     /// Kill-switch: pass `off` to refuse the call before the endpoint is
     /// bound. `CERULION_NETWORK=off` also engages it.
+    #[arg(long)]
+    network: Option<String>,
+}
+
+/// `cerulion-connectd rcp`: the stdio MCP bridge flags.
+#[derive(Parser, Debug)]
+struct RcpCli {
+    /// The robot's iroh endpoint id (64-char hex).
+    #[arg(long, value_name = "HEX")]
+    eid: String,
+
+    /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable.
+    #[arg(long = "addr", value_name = "IP:PORT")]
+    addrs: Vec<String>,
+
+    /// The desk device key file (32 raw bytes). The robot admits only a key
+    /// it has paired; without one an ephemeral key is used and refused.
+    #[arg(long, value_name = "PATH")]
+    key_file: Option<PathBuf>,
+
+    /// Self-hosted relay URL. Default: n0 public relays.
+    #[arg(long, env = "CERULION_RELAY_URL")]
+    relay_url: Option<String>,
+
+    /// Disable all relays (LAN or direct-dial only).
+    #[arg(long)]
+    relay_disabled: bool,
+
+    /// Kill-switch: pass `off` to refuse to connect. `CERULION_NETWORK=off`
+    /// also engages it.
     #[arg(long)]
     network: Option<String>,
 }
@@ -295,7 +344,7 @@ fn resolve_relay(
 }
 
 /// Whether the `off` kill-switch is engaged (either the flag or the env) for
-/// the subcommand `command` (`connect`, `act`). Warns on an unrecognized
+/// the subcommand `command` (`connect`, `act`, `rcp`). Warns on an unrecognized
 /// non-`off` value (a mistyped `--network of` must never be a
 /// silently-ineffective switch).
 fn network_off(command: &'static str, flag: Option<&str>, env: Option<&str>) -> bool {
@@ -329,6 +378,19 @@ fn act_network_refusal(flag: Option<&str>, env: Option<&str>, verb: &str) -> Opt
         )
     })
 }
+
+/// The `rcp` refusal while the kill-switch is engaged ([`network_off`] over
+/// `--network` and `CERULION_NETWORK`, the reading `connect` and `act` use);
+/// `None` when it is not engaged.
+fn rcp_network_refusal(flag: Option<&str>, env: Option<&str>) -> Option<&'static str> {
+    network_off("rcp", flag, env).then_some(RCP_NETWORK_REFUSAL)
+}
+
+/// The `rcp` refusal [`rcp_network_refusal`] returns, logged as
+/// `cerulion rcp: <refusal>`.
+const RCP_NETWORK_REFUSAL: &str = "network kill-switch engaged (--network off / \
+                                   CERULION_NETWORK=off): refusing to open the robot's rcp \
+                                   session; nothing was sent";
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -430,6 +492,7 @@ async fn main() -> ExitCode {
         ConnectdCommand::Connect(c) => run_connect_command(c).await,
         ConnectdCommand::Pair(p) => run_pair_command(p).await,
         ConnectdCommand::Act(a) => run_act_command(a).await,
+        ConnectdCommand::Rcp(r) => run_rcp_command(r).await,
     }
 }
 
@@ -498,6 +561,55 @@ async fn run_act_command(cli: ActCli) -> ExitCode {
             ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// The `rcp` subcommand: bridge stdio to the robot's rcp plane until the
+/// session ends.
+async fn run_rcp_command(cli: RcpCli) -> ExitCode {
+    // Read before the endpoint is bound: binding with the default relays
+    // already contacts them, and the dial follows.
+    if rcp_network_refusal(
+        cli.network.as_deref(),
+        std::env::var("CERULION_NETWORK").ok().as_deref(),
+    )
+    .is_some()
+    {
+        tracing::error!("cerulion rcp: {RCP_NETWORK_REFUSAL}");
+        return ExitCode::FAILURE;
+    }
+    let config = match rcp_config(&cli) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "cerulion rcp: configuration error");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run_rcp(config, stdin_reader(), tokio::io::stdout()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(ConnectError::Refused(reason)) => {
+            tracing::error!(
+                reason = %sanitize_peer_text(&reason),
+                "cerulion rcp: the robot refused the rcp session"
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %sanitize_peer_text(&e.to_string()),
+                "cerulion rcp: session failed"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn rcp_config(cli: &RcpCli) -> Result<RcpConfig, ConnectError> {
+    Ok(RcpConfig {
+        robot_eid: parse_eid(&cli.eid)?,
+        direct_addrs: parse_addrs(&cli.addrs)?,
+        desk_seed: resolve_desk_seed(cli.key_file.as_deref())?,
+        relay: resolve_relay(cli.relay_url.as_deref(), cli.relay_disabled)?,
+    })
 }
 
 /// The `connect` subcommand: dial the wire plane + re-inject until Ctrl-C / the
@@ -833,6 +945,35 @@ mod tests {
         }
         let hostile = act_network_refusal(None, Some("off"), "x\u{1b}[2J").unwrap();
         assert!(!hostile.chars().any(char::is_control), "{hostile:?}");
+    }
+
+    /// `rcp` reads the kill-switch as `connect` and `act` do: the exact value
+    /// `off` in `--network` or `CERULION_NETWORK` refuses; an empty, unset or
+    /// other value does not.
+    #[test]
+    fn rcp_refuses_under_the_kill_switch_as_connect_reads_it() {
+        for (flag, env) in [
+            (Some("off"), None),
+            (None, Some("off")),
+            (Some("x"), Some("off")),
+        ] {
+            assert_eq!(
+                rcp_network_refusal(flag, env),
+                Some(
+                    "network kill-switch engaged (--network off / CERULION_NETWORK=off): \
+                     refusing to open the robot's rcp session; nothing was sent"
+                ),
+                "{flag:?} {env:?}"
+            );
+        }
+        for (flag, env) in [
+            (None, None),
+            (Some(""), Some("")),
+            (None, Some("OFF")),
+            (Some("of"), None),
+        ] {
+            assert_eq!(rcp_network_refusal(flag, env), None, "{flag:?} {env:?}");
+        }
     }
 
     #[test]

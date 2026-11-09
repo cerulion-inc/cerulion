@@ -132,7 +132,7 @@ pub unsafe extern "C" fn rmw_create_service(
             request_bridge: info.request_bridge,
             response_bridge: info.response_bridge,
             server: std::sync::Mutex::new(server),
-            decode_failures: std::sync::Mutex::new(
+            decode_failures: crate::gated_latch::GatedLatch::new(
                 crate::decode_failure_latch::DecodeFailureLatch::new(),
             ),
         });
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn rmw_create_client(
             response_bridge: info.response_bridge,
             client: std::sync::Mutex::new(client),
             gid: guid,
-            decode_failures: std::sync::Mutex::new(
+            decode_failures: crate::gated_latch::GatedLatch::new(
                 crate::decode_failure_latch::DecodeFailureLatch::new(),
             ),
         });

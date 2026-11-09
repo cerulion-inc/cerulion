@@ -365,7 +365,7 @@ def read_metadata(source):
 # dev-dependency edges dropped)`, and LIVE_MEMBER_COUNT is the workspace member
 # count, all measured off this workspace independently of this script. The two
 # sizes in a row differ wherever a dev-dependency edge carries the closure, and
-# `cerulion_bag` is the extreme case: 64 packages can observe a change to it,
+# `cerulion_bag` is the extreme case: 66 packages can observe a change to it,
 # ten of them without dev-dependency edges. That gap is what proves the edges
 # are followed on the real graph rather than only on a fixture.
 #
@@ -377,16 +377,16 @@ def read_metadata(source):
 # LIVE_ORACLE_MEASURED is False while a measurement is outstanding, and the live
 # arm then reports a miss rather than passing on numbers nobody measured.
 LIVE_ORACLE_MEASURED = True
-LIVE_MEMBER_COUNT = 81
+LIVE_MEMBER_COUNT = 83
 LIVE_ORACLE = {
-    'cerulion_bag': (64, 10),
+    'cerulion_bag': (66, 10),
     'cerulion_cli': (1, 1),
-    'cerulion_cli_engine': (64, 6),
-    'cerulion_core': (64, 64),
+    'cerulion_cli_engine': (66, 6),
+    'cerulion_core': (66, 66),
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (64, 51),
+    'native_ros2_messages': (66, 53),
 }
 
 

@@ -748,18 +748,20 @@ jobs:
       # A publish that stops at a crate name new to crates.io (the new-crate
       # rate-limit shape) would otherwise leave this smoke GREEN while
       # `cargo install cerulion_cli` resolves nothing. The umbrella is added to
-      # the list only when the checked-out tag contains crates/cerulion: a
-      # smoke-only dispatch against a release cut before the umbrella existed
-      # never published it.
+      # the list only when the checked-out tag contains crates/cerulion, and
+      # cerulion_android only when it contains crates/cerulion_android: a
+      # smoke-only dispatch against a release cut before a crate existed
+      # never published that crate.
       - name: Wait for crates.io publication
         run: |
           crates="cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd"
           if [ -f source-checkout/crates/cerulion/Cargo.toml ]; then
             crates="$crates cerulion"
           fi
-          # v1.0.0 predates cerulion_android on crates.io; every later release
-          # publishes it.
-          if [ "$TAG" != v1.0.0 ]; then
+          # Same rule for cerulion_android: a tag cut before that crate
+          # existed, such as v1.0.0 or a 1.0.x tag cut from it, never
+          # published it.
+          if [ -f source-checkout/crates/cerulion_android/Cargo.toml ]; then
             crates="$crates cerulion_android"
           fi
           # shellcheck disable=SC2086 # one crate name per word

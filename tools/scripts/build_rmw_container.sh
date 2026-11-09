@@ -48,7 +48,11 @@ apt-get install -y --no-install-recommends \
     curl ca-certificates binutils file
 rm -rf /var/lib/apt/lists/*
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+# Plain --retry, which every curl accepts (--retry-all-errors needs 7.71).
+# --connect-timeout and --max-time bound one attempt, so a stalled connection
+# times out and is retried.
+curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 5 \
+    --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o /tmp/rustup-init.sh
 # rustfmt is NOT in the minimal profile, and rmw_cerulion's build.rs runs
 # bindgen with formatting on, which shells out to `rustfmt` for the
 # generated bindings: without the component the build script fails with

@@ -21,6 +21,8 @@
 //! | `restart` / `deploy` | Normal | Role ≥ `OPERATOR` (a lifecycle mutation; no fine-grained cap models it, so the role IS the gate). |
 //! | `teleop` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR` — actuation. |
 //! | `cloud-access` | Normal | Role `OWNER`; the handler also requires a non-cloud owner row. |
+//! | `clear-estop` | **NonCloud** | Role `OPERATOR` or higher, and never a row whose principal is cloud, whatever the allow-from-cloud switch says. |
+//! | `estop-status` | Normal | `CAP_OBSERVE` and role `VIEWER` or higher: read the e-stop latch. |
 //! | `topic-publish` / `service-call` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR`: act on the robot's shared memory (`act_verbs`). |
 //! | `topic-snapshot` / `topic-echo-once` | Normal | `CAP_OBSERVE` (role ≥ `VIEWER`): read one frame. |
 //! | *any other* | — | **DENY** (deny-by-default; an unclassified verb is refused, never fail-open — a new mutating verb must be classified here). |
@@ -29,23 +31,32 @@
 //! [`KeyAccess::CloudRefused`] (a cloud row while the allow-from-cloud switch
 //! is OFF) is denied for every verb, bootstrap and e-stop included.
 //!
+//! A **NonCloud** verb is decided as a Normal one, with one more deny: an
+//! allowed row whose principal is [`PrincipalKind::Cloud`] is refused before
+//! its role and capabilities are read. The row comes from the same locked
+//! read as the access state ([`SharedTrust::snapshot_row_for_key`]). With the
+//! switch OFF a cloud row is already [`KeyAccess::CloudRefused`], so the
+//! refusal names the switch; with it ON the refusal names the principal.
+//!
 //! "Role ≥ X" means numerically ≤ X's value — a lower `Role` value is higher
 //! privilege (`OWNER=1 < OPERATOR=2 < VIEWER=3`).
 //!
 //! ## Accept-time plane routing
 //!
-//! [`PairingAuthorizer::classify_accept`] is the accept gate for the two ALPNs:
+//! [`PairingAuthorizer::classify_accept`] is the accept gate for the three ALPNs:
 //! the ops plane admits a paired key to the full surface and an unpaired /
 //! unclaimed key to the bootstrap surface only; the wire plane refuses an
 //! unpaired peer outright (catalog/demand require a paired `CAP_OBSERVE` account
 //! — the `cerulion_q` marker).
+//! The rcp plane admits only a paired key on the access list, and
+//! [`crate::rcp`] checks each MCP message it carries.
 
 use cerud::authz::{Authorizer, AuthzDecision};
 use cerud::transport::CallerIdentity;
 use cerulion_core::transport::demand_authorizer::{
     DemandAuthorizer, DemandDecision, DemandSubject,
 };
-use cerulion_pairing::format::{Role, Scope};
+use cerulion_pairing::format::{PrincipalKind, Role, Scope};
 use cerulion_pairing::verify::TrustStore;
 
 use crate::device_index::DeviceAccountIndex;
@@ -62,6 +73,10 @@ enum VerbClass {
     EstopFloor,
     /// A normal verb, gated on the access list AND this requirement.
     Normal(AccessRequirement),
+    /// A normal verb that is also refused to an allowed row whose principal
+    /// is [`PrincipalKind::Cloud`], whether the allow-from-cloud switch is ON
+    /// or OFF.
+    NonCloud(AccessRequirement),
 }
 
 /// The access requirement for a normal verb: ALL `required_caps` bits must be
@@ -84,6 +99,14 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
         | verbs::CODE_PAIR_START
         | verbs::CODE_PAIR_FINISH => VerbClass::Bootstrap,
         verbs::ENGAGE_ESTOP => VerbClass::EstopFloor,
+        verbs::CLEAR_ESTOP => VerbClass::NonCloud(AccessRequirement {
+            required_caps: 0,
+            max_role: Role::OPERATOR,
+        }),
+        verbs::ESTOP_STATUS => VerbClass::Normal(AccessRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        }),
         verbs::INVENTORY | verbs::LOG_TAIL => VerbClass::Normal(AccessRequirement {
             required_caps: Scope::CAP_OBSERVE,
             max_role: Role::VIEWER,
@@ -134,6 +157,9 @@ pub enum AcceptDecision {
     OpsBootstrapOnly,
     /// Wire plane admitted (a paired `CAP_OBSERVE` account).
     WireAdmit,
+    /// Rcp plane admitted (a paired key whose account is on the access list).
+    /// Every message is still checked per MCP method in [`crate::rcp`].
+    RcpAdmit,
     /// Refused outright (wire plane, unpaired/unclaimed) — close, serve nothing.
     Refuse {
         /// The diagnosable reason.
@@ -152,7 +178,9 @@ pub enum AcceptDecision {
 /// bootstrap verbs mutate, so a `claim` / `pair` / `code-pair` takes
 /// effect at the very next accept WITHOUT a daemon restart (the always-on
 /// contract). Every decision reads the claimed flag + the key's access state under
-/// ONE lock ([`SharedTrust::snapshot_for_key`]) so it never observes a torn view.
+/// ONE lock ([`SharedTrust::snapshot_for_key`], or
+/// [`SharedTrust::snapshot_row_for_key`] for a NonCloud verb) so it never observes
+/// a torn view.
 #[derive(Debug)]
 pub struct PairingAuthorizer {
     shared: SharedTrust,
@@ -201,8 +229,18 @@ impl PairingAuthorizer {
             }
         };
 
-        // 3. One torn-free read of (claimed, access) for this key.
-        let (claimed, access) = self.shared.snapshot_for_key(&device_key);
+        // 3. One torn-free read of (claimed, access) for this key. A NonCloud
+        // verb also takes the allowing row's principal from the same read.
+        let (claimed, access, principal) = match class {
+            VerbClass::NonCloud(_) => {
+                let (claimed, access, row) = self.shared.snapshot_row_for_key(&device_key);
+                (claimed, access, row.map(|row| row.principal_kind))
+            }
+            _ => {
+                let (claimed, access) = self.shared.snapshot_for_key(&device_key);
+                (claimed, access, None)
+            }
+        };
 
         // 3a. A cloud row on a robot whose allow-from-cloud switch is OFF is
         // refused for EVERY verb class, the bootstrap and e-stop verbs included.
@@ -255,8 +293,18 @@ impl PairingAuthorizer {
                 ),
             },
 
-            // Normal verb: paired AND meets the capability + role requirement.
-            VerbClass::Normal(req) => match access {
+            // NonCloud verb: an allowed cloud row is refused whatever its
+            // scope. `principal` is `Some` only for an allowed row.
+            VerbClass::NonCloud(_) if principal == Some(PrincipalKind::Cloud) => {
+                AuthzDecision::deny(format!(
+                    "verb '{verb}' refused: the e-stop is cleared only from a device that \
+                     is not a cloud principal"
+                ))
+            }
+
+            // Normal or NonCloud verb: paired AND meets the capability + role
+            // requirement.
+            VerbClass::Normal(req) | VerbClass::NonCloud(req) => match access {
                 KeyAccess::CloudRefused => AuthzDecision::deny(format!(
                     "verb '{verb}' refused: cloud access is off on this robot"
                 )),
@@ -328,6 +376,13 @@ impl PairingAuthorizer {
             // (the cerulion_q marker). Unpaired → refuse outright.
             match wire_admittable(claimed, access) {
                 Ok(()) => AcceptDecision::WireAdmit,
+                Err(reason) => AcceptDecision::Refuse { reason },
+            }
+        } else if alpn == cerulion_link::alpn::RCP {
+            // Rcp plane: the rcp entry point's accept gate (a paired, allowed
+            // key); the per-message class check runs in the proxy.
+            match crate::rcp::authorize_key(&self.shared, remote_id, None) {
+                Ok(()) => AcceptDecision::RcpAdmit,
                 Err(reason) => AcceptDecision::Refuse { reason },
             }
         } else {
@@ -533,6 +588,22 @@ mod tests {
             classify_verb(verbs::ENGAGE_ESTOP),
             Some(VerbClass::EstopFloor)
         ));
+        // The e-stop clear: the operator role, never a cloud principal.
+        assert_eq!(
+            classify_verb(verbs::CLEAR_ESTOP),
+            Some(VerbClass::NonCloud(AccessRequirement {
+                required_caps: 0,
+                max_role: Role::OPERATOR,
+            }))
+        );
+        // The e-stop read: observe-class.
+        assert_eq!(
+            classify_verb(verbs::ESTOP_STATUS),
+            Some(VerbClass::Normal(AccessRequirement {
+                required_caps: Scope::CAP_OBSERVE,
+                max_role: Role::VIEWER,
+            }))
+        );
         // Observe-class.
         for v in [verbs::INVENTORY, verbs::LOG_TAIL] {
             assert_eq!(

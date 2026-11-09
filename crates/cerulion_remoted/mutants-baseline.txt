@@ -1,0 +1,22 @@
+# Mutation baseline for cerulion_remoted: the e-stop policy's pure decisions.
+#
+# Scope: the one pure policy file. The rest of the crate holds the lease,
+# transport and file paths that the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_remoted \
+#            -f crates/cerulion_remoted/src/estop_policy.rs -- --lib
+# Result:  1 mutant: 0 caught, 1 unviable (does not compile), 0 missed.
+#
+# restart_check: the one mutant cargo-mutants generates replaces its body with
+# `Default::default()`, which does not compile because `RestartCheck` has no
+# default. Its match has no `_ =>` arm, so no arm is deleted; the four
+# (step, holds) cells are asserted exactly by
+# `estop_policy::tests::restart_runs_each_step_while_the_estop_does_not_hold`
+# and `estop_policy::tests::restart_is_refused_at_the_step_the_estop_holds_at`,
+# so changing what any arm returns fails one of them.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)

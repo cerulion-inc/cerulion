@@ -258,7 +258,10 @@ checkout uses `path` dependencies, which no patch moves; take
 and `rev`. Once crates.io lists `cerulion_android`, a version requirement
 equal to the node workspace's pins replaces the git source and the two
 entries, for example `cerulion_android = "=2.0.0"` beside nodes made by
-`cerulion` 2.0.0.
+`cerulion` 2.0.0. An app that hosts the remote plane keeps the git or `path`
+source: `cerulion_android_remote` is not on crates.io, so it and
+`cerulion_android` come from the same `rev` or checkout (see
+[Host the paired remote plane](#host-the-paired-remote-plane)).
 
 Whatever the source of `cerulion_android`, crates.io included, an app
 copies two things into its own build from the Cerulion release or commit it
@@ -393,7 +396,8 @@ frame, in publish order; a burst larger than the input's `depth` (default 10)
 drops its oldest frames. The runtime creates each `publish` topic with a queue
 as deep as the deepest graph input that reads it, so any `depth` a node can
 declare, up to 64, holds that many frames, recorded or not. A node that
-reports a deeper input fails the start before the app creates any topic:
+reports a deeper input fails the start before the app creates any topic
+and before the `init` of any node in the graph runs:
 `status` reports `state` `failed` with `last_error.code` 5 and a message that
 names the input, its depth and the limit of 64. A plain `#[input]` on a
 `period_ms` node holds the latest frame: the node produces nothing until the
@@ -503,7 +507,8 @@ returns an error code if the runtime is not ready or the message cannot be
 encoded. When `start` returns `OK`, status has already transitioned to `starting`
 and may have advanced to `running` before the next read. `publish` can return `BUSY`
 while start or stop is in progress, including while the start worker is finishing
-its lifecycle after status first reports `running`; retry a `BUSY` publish rather
+its lifecycle after status first reports `running`. It also returns `BUSY` while
+another `publish` or a `poll` holds the runtime lock. Retry a `BUSY` publish rather
 than dropping it. A `stop` issued while startup is still in flight is accepted
 and runs once startup finishes. Starting again after a failure or a finished
 graph first stops what is left of the previous run and closes LAN access, even
@@ -810,8 +815,9 @@ above for subscribe schemas.
 ### Choose which topics leave the device
 
 An `open` gateway sends every topic the app serves. To open a desk connection
-while some topics stay on the device, list the topics a LAN peer may receive
-in `egress`:
+while some topics stay off the LAN, list the topics a LAN peer may receive
+in `egress`. The hosted remote plane is not limited by this list (see the end
+of this section):
 
 ```json
 {
@@ -1030,10 +1036,37 @@ While it serves, `status` reports it:
 An unspecified address (`0.0.0.0` or `[::]`) means every interface: a desk
 dials the device's own address with that port. A stop waits up to 5 seconds
 for the plane to close its endpoint; when the plane does not stop cleanly,
-`status` reports `state` `failed` with `last_error.code` 18, and every later
-start with `remote.enabled` in that process fails with code 18 too, since the
-old plane may still answer under the device key. Restart the app process to
-host the plane again.
+`status` reports `state` `failed` with `last_error.code` 18. The old plane
+may still answer under the device key, so no plane binds again in that
+process. Restart the app process to host the plane again.
+
+A plane that does not stop stays in `status.remote` with its stop error, so
+the app and a desk can see why remote access is down:
+
+```json
+"remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close"}
+```
+
+This also applies when the plane does not stop at a restart, or in the
+teardown after a panic. The restart does not fail because of it. Every later
+start in that process, with or without `remote.enabled`, and also of a new
+runtime, starts its graph, local work runs, and `status.remote` names the
+stuck plane. A start with `remote.enabled` starts with remote off for that
+run: it does not bind a plane, and `status.remote` adds `off_reason`, which
+says that remote is off because an earlier plane did not stop. This is also
+true when the stop of another runtime has failed while that start binds:
+
+```json
+"remote": {"endpoint_id": "8a1f...", "bound_sockets": ["0.0.0.0:51234"], "stop_error": "the endpoint did not close", "off_reason": "remote is off for this run: an earlier remote plane in this process did not stop and may still answer under this device key; restart the app process to host the plane again"}
+```
+
+Remote off applies once a stop has failed. While the stop of another runtime
+still runs, its plane is still up, so a start with `remote.enabled` fails with
+code 18. Try the start again when that stop ends.
+
+Every other bind failure keeps its code. `off_reason` stays until that run
+stops. `stop_error` and `off_reason` are not in the JSON while a plane serves.
+Remote comes back after the app process restarts.
 
 While it binds, the plane's iroh endpoint lists the network interfaces
 through netlink and through `/sys/class/net`. Android refuses both to apps,
@@ -1069,7 +1102,7 @@ Enable the feature on the dependency used by the app:
 
 ```toml
 [dependencies]
-cerulion_core = { version = "1", features = ["local-transport"] }
+cerulion_core = { version = "=2.0.0", features = ["local-transport"] }
 ```
 
 ## Emulator end-to-end test
@@ -1134,7 +1167,8 @@ The lane also checks the sample app's linked graph nodes:
   through the plane the app hosts;
 - no SELinux denial is logged for the app's domain in any run, except the two
   refusals of network interface listing (`netlink_route_socket` and
-  `sysfs_net`) that Android gives every app while the hosted plane binds.
+  `sysfs_net`) that Android gives every app. The hosted plane causes them
+  while it binds, but the lane accepts them in every run it scans.
 
 Run it locally with a booted API 30 emulator:
 
@@ -1163,7 +1197,8 @@ code of every echo (device and host timer, paired and open heartbeat, the
 app's timer and relay), the report of every demand probe run
 (`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`), the report of
 both remote metadata probe runs (`remoted-probe-served.txt`,
-`remoted-probe-absent.txt`), and the pulled
+`remoted-probe-absent.txt`), the hosted plane's start status and paired desk
+read (`hosted-status.txt`, `hosted-desk.txt`), and the pulled
 MCAP files (`phase-a.mcap`, `app.mcap`, `app-restart.mcap`) there. The script
 needs a dedicated device: it refuses to start while a `cerulion` or
 `cerulion-netd` process is running, and clears only its own directory

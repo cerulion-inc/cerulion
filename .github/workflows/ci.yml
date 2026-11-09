@@ -115,7 +115,8 @@ env:
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
   # token being the key text between `cargo-` and the scope segment with any
   # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
-  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`, and
+  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`,
+  # `period-park-X64`, `period-park-ARM64`, and
   # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
   # hash>`, whose header hash is a cache generation rather than part of the
   # namespace), or `all`. The default lives HERE, so a repository with no
@@ -699,6 +700,31 @@ jobs:
 
       - name: Rust and Cargo bootstrap self-test
         run: ./tools/scripts/test_install_rust.sh
+
+      # Offline: `curl` is a PATH shim serving fixture tarballs, so the route
+      # fallback, its annotations and the pin recipe run here on every pull
+      # request without touching either download host.
+      - name: Nextest installer self-test
+        run: ./tools/scripts/test_install_nextest.sh
+
+      - name: actionlint installer self-test
+        run: ./tools/scripts/test_install_actionlint.sh
+
+      - name: cargo-deny installer self-test
+        run: ./tools/scripts/test_install_cargo_deny.sh
+
+      - name: Tool tarball cache key self-test
+        run: ./tools/scripts/test_tool_tarball_cache.sh
+
+      # Every download in the workflows and in the tool and toolchain fetchers
+      # (`tools/scripts/install_*.sh`, `tools/scripts/build_*_container.sh`)
+      # is retried, has each attempt bounded and writes to a file. The
+      # checker's self-test runs first, so a reader that finds nothing cannot
+      # pass, and the check itself exits 2 when it finds no download at all.
+      - name: Tool downloads are retried and bounded
+        run: |
+          python3 -B tools/scripts/check_tool_downloads.py --self-test
+          python3 -B tools/scripts/check_tool_downloads.py
 
       # The rendered formula is Ruby, and parsing it is the headline assertion
       # of the self-test, which refuses to skip that check under CI. No other
@@ -1673,6 +1699,157 @@ jobs:
         run: |
           echo "selection: skipped cerulion_android (selected: $SELECTED)"
 
+  # THE `period-park` FEATURE OF `rmw_cerulion`, built, linted and tested on
+  # both Linux architectures. Every other job builds `rmw_cerulion` with its
+  # default features, so the code behind the feature in
+  # `src/api/guard_wait.rs` (the predicted wait and its doorbell tests) is
+  # built nowhere else.
+  #
+  # TWO LEGS, one per architecture, because the code differs between them: the
+  # park's monitor wait is `WFE` on aarch64 and `UMWAIT` on x86_64 (when the
+  # CPU has WAITPKG; the stock wait otherwise), and `c_char` is `u8` on Linux
+  # aarch64 and `i8` on x86_64, so a cast between it and `u8` lints on aarch64
+  # only. `lint` and the test shards run on x86_64 alone.
+  #
+  # THE BARE LIB is linted twice more. `rmw_cerulion` dev-depends on itself
+  # with `test-seams`, so every command that builds a test target turns that
+  # feature on; `cargo clippy -p rmw_cerulion` with no `--all-targets` is the
+  # only build of the lib without it.
+  #
+  # THE DEFAULT BUILD is tested on the aarch64 leg as well. With the feature
+  # on, a regular publisher takes the predicted wait, so the feature run does
+  # not cover the default idle park (`WFE`) that every aarch64 Linux build
+  # ships; the test shards cover the default build on x86_64.
+  #
+  # Serial (`--test-threads=1`) for the same reason as the shard step: the
+  # tests touch the iceoryx2 singleton.
+  period-park:
+    name: Period park (${{ matrix.arch }} Linux)
+    needs: [changes]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      # Each leg reports on its own: a red aarch64 leg says nothing about
+      # x86_64.
+      fail-fast: false
+      matrix:
+        # The list form, with the runner picked in `runs-on:` above: the
+        # coverage walk in `ci_test_coverage_test.rs` expands a list matrix
+        # into the job's context names, and reads no legs at all from one
+        # that carries `include:` or `exclude:`.
+        arch: [x86_64, aarch64]
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The runner has no ROS, so the build takes the vendored bindings; the
+      # claim tests read this to tell that from a silent fallback.
+      CERULION_RMW_EXPECT_BINDINGS: vendored
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Free disk space
+        if: >-
+          runner.environment == 'github-hosted'
+          && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: |
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /usr/local/share/powershell \
+                      /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      # Keyed on `runner.arch`, because both legs report `runner.os` as
+      # `Linux` and an archive built on one architecture is no use to the
+      # other.
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-period-park-${{ runner.arch }}-main-
+
+      - name: Clippy (rmw_cerulion --features period-park, all targets)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion --features period-park --all-targets -- -D warnings
+
+      - name: Clippy (rmw_cerulion default features, all targets)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion --all-targets -- -D warnings
+
+      - name: Clippy (rmw_cerulion bare lib, default features)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion -- -D warnings
+
+      - name: Clippy (rmw_cerulion bare lib, --features period-park)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo clippy -p rmw_cerulion --features period-park -- -D warnings
+
+      - name: rmw_cerulion tests with period-park (serial)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo test -p rmw_cerulion --features period-park -- --test-threads=1
+
+      - name: rmw_cerulion tests, default features (serial)
+        if: >-
+          matrix.arch == 'aarch64'
+          && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        run: cargo test -p rmw_cerulion -- --test-threads=1
+
+      - name: selection marker, rmw_cerulion
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped rmw_cerulion (selected: $SELECTED)"
+
+      # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
+      - name: Cache cargo (prune the namespace to the current key)
+        id: cache-prune
+        if: >-
+          github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Saved as the LAST step so a green job stores what it built, and never
+      # from a merge-queue build: its branch is deleted after the batch, so
+      # nothing could restore what it saved, and the upload only adds eviction
+      # pressure on the store.
+      - name: Cache cargo (save)
+        if: >-
+          steps.cache-restore-1.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+          && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && steps.cache-prune.outputs.proceed == 'true'
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' period-park-{0} ', runner.arch)))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-period-park-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
   examples:
     name: Examples (cargo check)
     runs-on: ubuntu-latest
@@ -2286,7 +2463,21 @@ jobs:
       - name: Report free disk after the workspace build
         run: df -h / || true
 
+      # The pinned tool tarballs the `tool-tarballs` job verified and saved.
+      # On a miss the install below downloads, as it does with no cache.
+      - name: Tool tarball cache key
+        id: tool-tarballs-key
+        run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Restore the pinned tool tarballs
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+
       - name: Install cargo-nextest
+        env:
+          CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
         run: ./tools/scripts/install_nextest.sh
 
       # Whole cerulion_core suite (every integration test binary + the lib
@@ -2818,6 +3009,11 @@ jobs:
       - name: cerulion_android nested publish integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
+      # The `local-transport` job runs this file on the in-process transport.
+      # This step runs it on the default cross-process transport.
+      - name: cerulion_android subscribe and poll integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_subscribe_poll_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test sample_graph_asset_test
@@ -3314,7 +3510,21 @@ jobs:
       - name: Build test cdylibs
         run: cargo build --workspace
 
+      # The pinned tool tarballs the `tool-tarballs` job verified and saved.
+      # On a miss the install below downloads, as it does with no cache.
+      - name: Tool tarball cache key
+        id: tool-tarballs-key
+        run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Restore the pinned tool tarballs
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+
       - name: Install cargo-nextest
+        env:
+          CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
         run: ./tools/scripts/install_nextest.sh
 
       # ---------------------------------------------------------------
@@ -3974,16 +4184,19 @@ jobs:
   # ceiling era (see the notes on their `timeout-minutes`); adding four
   # crypto/iroh/web dependency trees to them buys a cancellation, not coverage.
   #
-  # PARALLEL (no `--test-threads=1`) for every package, and that is a READ of
-  # the tests rather than an assumption. `cerulion_remoted` is the only package
-  # that builds real iceoryx2 transports at all. One of its files,
-  # `tests/act_verbs_test.rs`, calls `TransportManager::get_or_init()`, the
-  # process-global manager on the default namespace; every test in it carries
-  # `#[serial]`, which takes one lock shared by the whole test binary, so no
-  # two of them run at once. Its other transport files mint ISOLATED per-test
-  # SHM roots via `TransportManager::init_for_test` (their own headers say
-  # "parallel-safe without `#[serial]`"), which is the same property that lets
-  # the `cerulion_connectd` step above run parallel.
+  # PARALLEL (no `--test-threads=1`) for every package except
+  # `cerulion_android_remote`. That package runs on the in-process transport,
+  # and its hosted plane test starts the process runtime, so its step uses one
+  # thread. For the other packages that is a READ of the tests rather than an
+  # assumption. `cerulion_remoted` is the only one of them that builds real
+  # iceoryx2 transports at all. One of its files, `tests/act_verbs_test.rs`,
+  # calls `TransportManager::get_or_init()`, the process-global manager on the
+  # default namespace; every test in it carries `#[serial]`, which takes one
+  # lock shared by the whole test binary, so no two of them run at once. Its
+  # other transport files mint ISOLATED per-test SHM roots via
+  # `TransportManager::init_for_test` (their own headers say "parallel-safe
+  # without `#[serial]`"), which is the same property that lets the
+  # `cerulion_connectd` step above run parallel.
   # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
   # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
@@ -5853,6 +6066,53 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-machete
           key: cargo-machete-bin-${{ runner.os }}-v0.9.2
+  # The pinned nextest and cargo-deny release tarballs, in one actions/cache
+  # archive keyed by `tools/scripts/tool_tarball_cache.sh key`, which hashes
+  # both installers' pins and the platform lists `fill` fetches. The jobs that
+  # install either tool restore this archive and point CERULION_TOOL_TARBALLS
+  # at it, and the installer uses a cached tarball only after the same pinned
+  # checksum test a download faces. A restored archive serves an install while
+  # get.nexte.st or the GitHub release is unreachable.
+  #
+  # A TOOL cache under the save policy's TOOL_CACHE rule: no lockfile hash in
+  # the key, so no prune and no namespace gate; the save keeps the cache-hit and
+  # merge-queue tests. It runs on `main` pushes and manual runs only. A pull
+  # request restores `main`'s archive; the key moves with a pin, so a pull
+  # request that moves one restores nothing and downloads until it lands.
+  tool-tarballs:
+    name: Pinned tool tarball cache
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Tool tarball cache key
+        id: tool-tarballs-key
+        run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Cache the pinned tool tarballs (restore)
+        id: cache-restore-tool-tarballs
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+
+      - name: Fetch and verify the pinned tool tarballs
+        if: steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'
+        env:
+          CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
+        run: ./tools/scripts/tool_tarball_cache.sh fill
+
+      - name: Cache the pinned tool tarballs (save)
+        if: >-
+          steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+
   deps:
     name: Dependency Audit (cargo-deny)
     runs-on: ubuntu-latest
@@ -5860,14 +6120,23 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install cargo-deny 0.20.2
+      # The pinned tool tarballs the `tool-tarballs` job verified and saved.
+      # On a miss the install below downloads, as it does with no cache.
+      - name: Tool tarball cache key
+        id: tool-tarballs-key
+        run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Restore the pinned tool tarballs
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+
+      - name: Install cargo-deny
+        env:
+          CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
         run: |
-          set -eu
-          url=https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
-          curl -sSL --retry 3 -o cargo-deny.tgz "$url"
-          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tgz" | sha256sum -c -
-          tar -xzf cargo-deny.tgz
-          install -m 0755 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+          ./tools/scripts/install_cargo_deny.sh
           cargo deny --version
 
       - name: Run cargo-deny

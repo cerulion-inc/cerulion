@@ -50,6 +50,7 @@ use cerulion_pairing::PairingError;
 use crate::clock::RemotedClock;
 use crate::estop_lease::EstopLease;
 use crate::flashback::{EstopCaptureAsk, TransportAsk};
+use crate::rcp::RcpdEstop;
 use crate::trust::{SharedTrust, CODE_PAIR_SCOPE};
 
 // ── verb-name constants (mirror `crate::verbs`) ─────────────────────────────
@@ -635,6 +636,15 @@ impl VerbHandler for CodePairFinishVerb {
 /// floor from the first engager. (The Remote Plane design record,
 /// §Q6; pinned by
 /// `cerud/tests/lease_test.rs` + `cerulion_remoted/tests/estop_starvation_test.rs`.)
+///
+/// ## The robot's rcpd
+///
+/// On the `cerulion-remoted` daemon each engage also sends an `estop` tool
+/// call to the robot's `cerulion-rcpd`, which closes rcpd's own latch, and
+/// sends it again until rcpd answers that it did ([`crate::rcp`]). The
+/// delivery starts after the lease has flipped, runs on a task of its own,
+/// and the verb answers without waiting for it; an engage while a delivery
+/// is in flight starts none.
 pub struct EngageEstopVerb {
     lease: EstopLease,
     /// Who to tell that an incident was declared.
@@ -645,6 +655,9 @@ pub struct EngageEstopVerb {
     /// [`EngageEstopVerb::with_capture_ask`], which is the ONLY way to substitute
     /// one and is compiled out of a plain `cargo build`.
     capture: Arc<dyn EstopCaptureAsk>,
+    /// The robot's rcpd, sent an `estop` after each engage until it answers;
+    /// `None` unless the daemon wired its rcp link in.
+    rcpd: Option<Arc<RcpdEstop>>,
 }
 
 impl EngageEstopVerb {
@@ -660,6 +673,7 @@ impl EngageEstopVerb {
         EngageEstopVerb {
             lease,
             capture: Arc::new(TransportAsk::new()),
+            rcpd: None,
         }
     }
 
@@ -680,7 +694,16 @@ impl EngageEstopVerb {
         EngageEstopVerb {
             lease: lease.into(),
             capture,
+            rcpd: None,
         }
+    }
+
+    /// The verb that also sends an `estop` to the robot's rcpd through `rcpd`
+    /// after each engage, until rcpd answers ([`crate::rcp`]). Only the
+    /// daemon's serving core, which holds the rcp link, builds one.
+    pub(crate) fn with_rcpd_estop(mut self, rcpd: Arc<RcpdEstop>) -> Self {
+        self.rcpd = Some(rcpd);
+        self
     }
 }
 
@@ -701,6 +724,21 @@ impl VerbHandler for EngageEstopVerb {
     ) -> CerudResult<serde_json::Value> {
         let safe = self.lease.engage(&caller.id);
         tracing::warn!(by = %caller.id, "cerulion_remoted: e-stop ENGAGED (safety floor)");
+        // rcpd's own latch closes on an `estop` tool call. The delivery runs
+        // on a task of its own and `send` returns at once, after the lease
+        // has flipped; nothing the delivery does reaches this verb's answer.
+        if let Some(rcpd) = &self.rcpd {
+            match caller_device_key(caller) {
+                Ok(engager) => {
+                    rcpd.send(&engager);
+                }
+                Err(e) => tracing::warn!(
+                    by = %caller.id,
+                    error = %e,
+                    "cerulion_remoted: no estop sent to rcpd: the engager is not a device key"
+                ),
+            }
+        }
         // A human declared an incident; ask the machine's
         // recorder for the moment.
         //

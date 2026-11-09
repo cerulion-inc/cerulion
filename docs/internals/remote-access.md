@@ -19,9 +19,10 @@ robot exposes ONE iroh endpoint whose identity IS its ed25519 device key: the
 ONE 32-byte SECRET seeds both the iroh endpoint and the pairing
 `DeviceIdentity` (`client.rs::from_seed` consumes it), and its PUBLIC half
 doubles as the iroh `EndpointId` and the pairing transport public key; the
-seed is never the public half. iroh multiplexes both ALPNs on that endpoint
+seed is never the public half. iroh multiplexes every ALPN on that endpoint
 (`cerulion_link::alpn`: `cerulion/wire/2` = raw topic frames, `cerulion/ops/1` =
-ops verbs; the trailing `/1` is each plane's protocol-version boundary). Exactly
+ops verbs, `cerulion/rcp/1` = MCP sessions with the robot's `cerulion-rcpd`; the
+trailing number is each plane's protocol-version boundary). Exactly
 one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accept
 (`daemon::handle_accepted`; pinned over real loopback endpoints by
 `crates/cerulion_remoted/tests/loopback_test.rs`), or a host process that embeds
@@ -310,8 +311,13 @@ snapshot (`topic-snapshot`).
   AND role ≥ VIEWER (non-vacuous: `Role` is an open `u16`, so a role less
   privileged than VIEWER holding `CAP_OBSERVE` is representable, and denied);
   lifecycle mutation needs role ≥ OPERATOR; `teleop` needs `CAP_TELEOP` AND
-  role ≥ OPERATOR; an UNCLASSIFIED verb is DENIED, never fail-open. Lower
-  `Role` value = higher privilege.
+  role ≥ OPERATOR; `clear-estop` needs the OPERATOR role or higher and is
+  refused to a row whose principal is cloud whether the allow-from-cloud switch
+  is on or off (class `NonCloud`: the authorizer refuses it before dispatch, so
+  the refusal is receipted `Denied`); `estop-status` needs `CAP_OBSERVE` AND the
+  VIEWER role or higher; no host registers either e-stop verb yet, so a caller
+  the authorizer admits gets `unknown_verb`; an UNCLASSIFIED verb is DENIED,
+  never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read
   from client args (`pairing_verbs.rs` module docs; `ops_loopback_test.rs`).
   Validity, anti-rollback and the CPace TTL are evaluated against the robot's
@@ -383,7 +389,10 @@ the e-stop latch (`cerud::lease::ControlLease`) is engaged; a running publish
 or call checks the latch every 10 ms and stops when it engages, a call
 stopped before its request goes out sends none, and a publish sends each
 frame, and a call its request, only while it holds the lease's lock and reads
-the latch clear. A publish is
+the latch clear. The rcp plane shares this latch: an rcp `estop` engages it,
+and while it is engaged rcp tool calls other than `estop` are refused (the rcp
+plane below). A
+publish is
 refused when its subscriber wait plus its frames at the rate exceed 90 s, and
 is stopped if it is still running 100 s after it started (a frame that takes
 longer to send than its period delays the rest). A topic under
@@ -408,9 +417,9 @@ iroh + real iceoryx2: `wire_plane_test.rs` (byte-for-byte against hand oracles).
   stream permanently. Never `select!` on them; one dedicated task per stream
   drives them to completion. Every consumer in the family obeys this
   (wireclient's reader, connectd's worker, netd's iroh plane, remoted's serve
-  loop); the pattern is documented at each site. *The rule itself has no single
-  structural gate, verified at `crates/cerulion_link/src/framing.rs` module docs +
-  each caller.*
+  loop and rcp stream reader); the pattern is documented at each site. *The
+  rule itself has no single structural gate, verified at
+  `crates/cerulion_link/src/framing.rs` module docs + each caller.*
 - **The tap set is the gate** (`tap.rs`): a demand attaches remoted's own
   listener-less `DataOnlySubscriber`; un-demanding drops the tap; an
   un-demanded topic costs nothing. Taps are observation-only: the drain thread
@@ -432,6 +441,157 @@ iroh + real iceoryx2: `wire_plane_test.rs` (byte-for-byte against hand oracles).
   account streams on), and, against the inert-wiring class,
   `daemon_demand_gate_test.rs` (the authorizer wired by the production
   `serve_endpoint` seam itself, so reverting the one wiring line fails a test).
+
+### The rcp plane (`cerulion_remoted::rcp`)
+
+Each bidi stream on `cerulion/rcp/1` is one MCP session; each frame is one
+JSON-RPC 2.0 message. The robot is an MCP streamable HTTP client of its local
+`cerulion-rcpd` (`--http`, default `127.0.0.1:7801`): every admitted message is
+one `POST` with rcpd's bearer token (read per session from
+`remoted/rcp.token`), the session id and protocol version rcpd issued, and
+`x-cerulion-caller: iroh:<device hex>/account:<account hex>`. rcpd runs the call
+under that caller (`cerulion_rcpd::caller`), so its receipts and the journaled
+call frame name the remote desk.
+
+A task of its own reads each stream's frames, and the session reader selects
+on that task's channel, never on the framing. The session reader never waits
+on rcpd: it admits each message (the class check, the e-stop engage or
+refusal, the one-initialize check and the slot) and hands it, without waiting,
+to the stream's forwarder task. The forwarder sends the messages to rcpd in
+the order they were admitted; it waits for a lifecycle message's response
+head, and for the `initialize` result, before the next, and hands Observe, Act
+and Estop messages to tasks of their own, which send them and relay the
+answers. Such a task opens its connection to rcpd, then runs `rcp::SendCheck`
+just before the send: `rcp_authorize` for an Observe or Act message's class
+again, and for an Act message the e-stop latch again, so a call is refused
+after a revoke or an engage that lands while it waits in the queue or for its
+connection. A `notifications/cancelled` naming a request whose response head
+is not in yet is sent by a task of its own once that head is in, within
+`RcpLimits::head_timeout`. rcpd (rmcp's stateful streamable HTTP server) sends
+a request's SSE head once the request is in the MCP session, before the tool
+runs, so the cancel reaches rcpd after rcpd has taken the call it names, or
+once `--rcp-head-timeout-ms` passes; requests stay concurrent up to
+`--rcp-in-flight`, and the forwarder never waits on a cancel.
+Its bounded queue holds `in_flight + estops_in_flight + 4`: a request holds
+its slot while queued and a notification one of four notification places
+(`rcp::FORWARD_NOTIFICATION_ROOM`), so a request that holds a slot always
+fits; a notification with no place free is dropped. The forwarder stops once
+the stream's writer has stopped (a revoke closes the connection from the
+writer) and is aborted with its session. So an `estop` engages the ops latch
+while rcpd holds a lifecycle request.
+
+`rcp::rcp_authorize` is the one decision function, over one locked read
+(`SharedTrust::snapshot_row_for_key`: claimed flag, key access, allowing row).
+At accept (`classify_accept`) it needs a claimed robot and an allowed key. Each
+message is parsed strictly (`classify_message`: one object, `jsonrpc` `"2.0"`,
+string `method`, object `params`, string or integer `id`, no other member) and
+classified by method: lifecycle needs an allowed row, `resources/*`,
+`subscriptions/listen` and `tools/list` need `CAP_OBSERVE` with role value
+`<= VIEWER`, `tools/call` naming `estop` needs an allowed row (the e-stop
+floor), any other `tools/call` needs `CAP_TELEOP` with role value `<= OPERATOR`
+(`rcp::requirement`). The canonical re-serialization is what reaches rcpd. Each
+frame back is checked against the class that produced it, and the session
+floor every `RcpLimits::revoke_check` (`--rcp-revoke-check-ms`); a key that fails the floor has its
+connection closed. Pinned end to end against a
+real rcpd by `rcp_forward_e2e_test.rs`. The desk half is `cerulion rcp`
+(`cerulion-connectd rcp`, `connectd::rcp::bridge`): stdin lines to frames,
+frames to stdout lines. A robot frame that is not a JSON-RPC 2.0 message is
+never written to stdout: the accept decision of a refused key, an
+application close with `rcp::CLOSE_REVOKED` or `rcp::CLOSE_SUPERSEDED`
+(mirrored as `connectd::rcp::CLOSE_*`), the robot ending the stream
+before stdin's EOF, and a stream that breaks (a reset, a lost connection, a
+frame cut off, or a robot frame over the 16 MiB cap;
+`cerulion_link::read_frame_or_end` tells these from a finish at a frame
+boundary) each end the desk process with status 1 and an error line, the
+break's cause passed through `sanitize_peer_text`.
+
+One e-stop latch covers the ops act verbs, `restart` and the rcp plane: the
+ops plane's `cerud::lease::ControlLease` behind one `EstopLease` (the lease
+plus the count of e-stop engages waiting for its lock). The daemon builds it once
+(`OpsHost::daemon`); `serve_core` hands it to `OpsServing` (for
+`engage-estop`, `restart` and the act verbs) and a clone to `RcpPlane`, so both planes
+share the latch and the count. `serve_core` also gives the daemon host an
+`rcp::RcpdEstop` over the same `RcpLink` (`OpsHost::with_rcpd_estop`), which
+`EngageEstopVerb` holds. A library host has no lease, no `RcpdEstop` and
+serves no rcp plane. `EstopLease::holds` is the blocking read of the latch that the act verbs'
+refusal, the rcp plane's Act check and `restart` share: an engage is counted
+(read without the lock, and again under it, so an engage that counts itself
+in while the read waits for the lock is not missed), or the latch reads
+engaged under the lock, held for those reads only, and a poisoned lock reads
+engaged. The act verbs' 10 ms
+watcher and their send path read the latch themselves (above). The daemon
+registers `restart` as `RestartVerb::new().with_gate(..)` over an
+`ops::EstopRestartGate`, and cerud asks the gate before each step. It asks
+for `RestartStep::Stop` before it parses the args, so the refusal reads the
+same on every host and nothing runs. It asks for `RestartStep::Start` after
+the stop command and before the start command, so after an engage during
+`systemctl stop` the start command does not run; that refusal is
+`unavailable: ` followed by `ops::RESTART_STOPPED_NOT_STARTED`. The pure
+decision is `estop_policy::restart_check`. Each check takes the lease's lock
+at most once, for one read, and never holds it across a command, so an engage
+after the second check does not stop the graph that `systemd-run` starts. A
+library host still refuses `restart` by name. The session reader engages the
+latch through `EstopLease::engage` for an
+authorized `RcpClass::Estop` message right after `rcp_authorize`, before the
+upstream check and the e-stop bound, so an unreachable rcpd or a spent bound
+still leaves it engaged; a forward failure never undoes it. The engage is
+counted before it waits for the lease's lock, so an act verb sends nothing
+more once it is counted. The engager is the session's caller string. A
+direct engage writes no ops receipt; rcpd still receipts the forwarded
+`estop`. For an `RcpClass::Act` message the reader reads the count, then the
+count and the latch under the lock (a poisoned lock reads engaged), and while an engage is
+counted or the latch is engaged answers `-32001` `refused: the robot's
+e-stop is engaged`, or for `estop_clear` (still `RcpClass::Act`) `refused:
+the robot's ops e-stop is engaged; it clears when cerulion-remoted
+restarts`. The lease guard is held only for that read or that state change,
+never across an `.await` and never with a connection, session, trust or
+receipt lock. The latch is read when a desk's message arrives and again on
+the open connection to rcpd just before the plane sends it. A call already
+sent to rcpd is stopped by rcpd's own latch, which an rcp `estop` closes in
+its stream and an ops `engage-estop` closes through `RcpdEstop::send`: after
+`EstopLease::engage` and its warning, the verb decodes the caller's device
+key and calls `send`, which returns at once. `send` takes the in-flight flag
+(one `AtomicBool`, compare-and-swap); when a delivery holds it, the engage
+starts none and logs that at info. Otherwise it spawns, on the runtime handle
+`serve_core` captured, a task that owns the flag's guard and runs
+`Delivery::run`, a loop of `estop_rcpd` attempts until one returns `Ok`.
+Each attempt reads the token through `load_token`, then sends `initialize`,
+`notifications/initialized` and `tools/call` `estop` with `reason`
+`rcp::OPS_ESTOP_REASON`, each POST on a fresh loopback connection with the
+headers `Upstream::request` builds (`x-cerulion-caller` is
+`caller_identity(key, account_for_key(key))`), its response head within
+`RcpLimits::head_timeout` and its answer within the target's answer timeout
+(`OPS_ESTOP_ANSWER`, 10 s) after it, then a `DELETE` of the session it
+opened. It returns `Ok` only when the call's result says `"estopped": true`
+(`estop_outcome`). After a failed attempt the loop sleeps `retry_in`
+(`OPS_ESTOP_RETRY_FIRST`, 100 ms, doubled after each failure up to
+`OPS_ESTOP_RETRY_CAP`, 2 s), logs the first failure at error with `reason`
+and then at most one line per `OPS_ESTOP_LOG_EVERY` (30 s) with `attempts`
+(rcpd's text through `sanitize_peer_text`), and logs the closed latch at
+warn. Both the attempt and the sleep race the stop flag, a `watch` that
+`RcpdEstop::shut_down` sets once `serve_planes` returns; `shut_down` then
+waits for the task within `CONNECT_TIMEOUT`, and a delivery cut short logs
+at warn. Nothing the delivery does reaches the verb's answer or the
+lease. rcpd refuses each mutating call it holds that it
+has not yet published once its latch closes; the one it is running was
+already published. `ControlLease::clear_estop` has no caller, so the latch
+clears only when `cerulion-remoted` restarts; then rcpd's own latch clears
+through its `estop_clear` (`limits.estop_clear: agent`) or by deleting
+`<receipts>.estop` and restarting rcpd.
+
+When rcpd answers HTTP 404 to a request that carried its session id (rcpd
+restarted and lost the session), the request is answered `-32603`, and the
+session reader reads on until the desk ends its side or `--rcp-drain-ms`
+passes, sending nothing more to rcpd: an authorized `estop` engages the ops
+latch through `EstopLease::engage` and is answered `-32603` with a message
+that says only the ops latch is engaged, every other request gets the
+session-lost error, and notifications are dropped. Its `select!` is biased to
+take a frame already read before the loss. The forwarder still sends what it
+holds, the tasks drain within what is left of the drain bound, and the stream
+finishes. A response body that ends without the response to its request (rcpd
+stopped mid-call, or a `notifications/cancelled` closed it) is answered
+`-32603` as well. A notification takes no in-flight slot, so a cancel reaches rcpd while
+every slot is taken.
 
 ## 7. The desk half: connect, pair, and the client substrate
 
@@ -703,7 +863,13 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   library host supplies both keys through its own `KeyProvider` and writes no
   key file),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
-  root), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
+  root), `rcp.token` (the local `cerulion-rcpd` bearer token, bare or one
+  `CERULION_RCP_TOKEN=<token>` line; `cerulion-remoted` creates it at startup
+  when absent, one `CERULION_RCP_TOKEN=<64 hex>` line, mode 0600, owned by
+  the user it runs as; one that is not a regular file or gives its group or
+  others any permission, execute included, is logged at error, and the rcp
+  plane answers every request with an error until it is a regular file only
+  its owner has any permission on), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
   `beacon_facts_test.rs`).
 
@@ -715,10 +881,12 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   the registration bootstrap provision the robot again. That discards the trust
   store, so desks pair again. Keep `<state_root>/robot-registration.json` only
   while the device certificate inside it is still valid, which is 7 days from
-  issue: provisioning verifies that certificate again, and an expired one is
-  refused. After that, remove `robot-registration.json` as well, so the
-  bootstrap runs its first-registration path again; that path needs a current
-  `cerulion login` on the robot. Under netd's robot supervisor, a bootstrap
+  issue (the account service's default, `CaConfig::device_cert_ttl_ns` in
+  `crates/cerulion_accountd/src/ca.rs`): provisioning verifies that
+  certificate again, and an expired one is refused. After that, remove
+  `robot-registration.json` as well, so the bootstrap runs its
+  first-registration path again; that path needs a current `cerulion login`
+  on the robot. Under netd's robot supervisor, a bootstrap
   that gave up needs a `cerulion-netd` restart. A library host restores or
   streams its keys again through its own `KeyProvider`.
 
@@ -760,6 +928,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
 | `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
 | `crates/cerulion_connectd/tests/act_network_switch_test.rs` | The real `cerulion-connectd act` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same call dials it |
+| `crates/cerulion_connectd/tests/rcp_network_switch_test.rs` | The real `cerulion-connectd rcp` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same command dials it |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |

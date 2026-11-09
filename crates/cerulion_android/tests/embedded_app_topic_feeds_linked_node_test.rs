@@ -9,7 +9,8 @@
 //! - a trigger input gets every frame, one tick per frame;
 //! - a latest-value input of a period node holds each frame;
 //! - a node that reports an input deeper than 64 frames fails the start with
-//!   the depth limit named;
+//!   the depth limit named, before the `init` of any node in the graph runs,
+//!   also a valid node listed before it;
 //! - a trigger input 64 frames deep, the deepest an input can declare, gets a
 //!   burst of 64 frames that piles up in its queue, with none lost.
 //!
@@ -18,6 +19,7 @@
 //! registry and the transport are process state, so this file is its own
 //! binary and holds ONE test that runs its steps in order.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cerulion_android::{codes, EmbedError, EmbeddedRuntime, RuntimeState};
@@ -33,12 +35,47 @@ cerulion_android::embed_nodes! {
     "test_node_macro_deep_relay" => DeepRelayNodeEntry,
     "test_node_macro_period_input_cdylib" => test_node_macro_period_input_cdylib::PeriodInputNodeEntry,
     "too_deep_relay" => TooDeepRelayEntry,
+    "valid_relay" => ValidRelayEntry,
+}
+
+/// The relay, unchanged: its trigger input has the default depth. Its `init`
+/// sets [`VALID_INIT_RAN`], so the test can see that a refused start ran the
+/// `init` of no node, also a valid node listed before the refused one.
+struct ValidRelayEntry(test_node_macro_relay_rlib::RelayNodeEntry);
+
+/// Set when a [`ValidRelayEntry`] runs its `init`.
+static VALID_INIT_RAN: AtomicBool = AtomicBool::new(false);
+
+impl ValidRelayEntry {
+    fn new() -> Self {
+        Self(test_node_macro_relay_rlib::RelayNodeEntry::new())
+    }
+}
+
+impl NodeEntry for ValidRelayEntry {
+    fn info(&self) -> TransportResult<NodeInfo> {
+        self.0.info()
+    }
+
+    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        VALID_INIT_RAN.store(true, Ordering::SeqCst);
+        self.0.init(context)
+    }
+
+    fn tick(&mut self) -> TransportResult<()> {
+        self.0.tick()
+    }
 }
 
 /// The deep relay, reporting its trigger input one frame deeper than any
 /// input may declare. The node macro refuses such a declaration at compile
-/// time, so only a node entry written by hand can report it.
+/// time, so only a node entry written by hand can report it. Its `init` sets
+/// [`TOO_DEEP_INIT_RAN`], so the test can see that a refused start ran no
+/// node's `init`.
 struct TooDeepRelayEntry(DeepRelayNodeEntry);
+
+/// Set when a [`TooDeepRelayEntry`] runs its `init`.
+static TOO_DEEP_INIT_RAN: AtomicBool = AtomicBool::new(false);
 
 impl TooDeepRelayEntry {
     fn new() -> Self {
@@ -58,10 +95,16 @@ impl NodeEntry for TooDeepRelayEntry {
                 meta
             })
             .collect();
-        Ok(NodeInfo::with_meta(inputs, info.output_meta().to_vec()))
+        let too_deep = NodeInfo::with_meta(inputs, info.output_meta().to_vec());
+        // Keep the trigger policy, so the depth is the only fault.
+        Ok(match info.policy() {
+            Some(policy) => too_deep.with_policy(policy),
+            None => too_deep,
+        })
     }
 
     fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+        TOO_DEEP_INIT_RAN.store(true, Ordering::SeqCst);
         self.0.init(context)
     }
 
@@ -71,6 +114,9 @@ impl NodeEntry for TooDeepRelayEntry {
 }
 
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
+/// The frames in the deep relay's burst: the deepest queue an input can
+/// declare.
+const BURST: usize = 64;
 const VECTOR3: &str = "geometry_msgs/Vector3";
 
 /// A graph of one node whose input `input` reads the app topic `source`
@@ -245,9 +291,11 @@ fn latest_value_input_holds_each_app_frame_in_order(runtime: &mut EmbeddedRuntim
 /// the app publishes a burst of 64, so at least 63 frames wait in the queue
 /// at once (a 16-frame queue would drop the oldest of them). Frame `i`
 /// carries `x = i`, and the relay writes its tick count into `z`, so a lost
-/// frame leaves every later echo with `x` above `z`. The test subscriber's
-/// own queue is shallower than the burst and can drop old echoes, but it
-/// always keeps the newest one, `(64, 64)`.
+/// frame leaves every later echo with `x` above `z`. The test subscriber
+/// creates the echo topic before the start with a 64-frame queue, so it
+/// keeps every echo of the burst and the check covers all 64 of them, not
+/// only the newest one. The relay's publisher opens that existing topic, so
+/// the subscriber keeps its 64-frame buffer.
 fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntime, pid: u32) {
     let app_topic = format!("/app_feed_deep_{pid}/cmd");
     let prefix = format!("app_feed_deep_graph_{pid}");
@@ -260,22 +308,26 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
         "echo",
     );
     let hold = hold_deep_relay();
+    // The earlier steps started the runtime, so the process manager exists.
+    let manager = TransportManager::get().expect("transport manager");
+    let mut echo_config = manager.default_topic_config();
+    echo_config.subscriber_max_buffer_size = BURST;
+    let subscriber = manager
+        .create_subscriber_with_buffers(&echo_topic, echo_config, BURST)
+        .expect("subscribe to the deep relay output with a queue for the whole burst");
     runtime
         .start(&start_config(&graph, &app_topic))
         .expect("a graph that reads an app topic on a 64-deep trigger input starts");
     assert_running_one_node(runtime);
 
-    let subscriber = TransportManager::get()
-        .expect("transport manager")
-        .create_subscriber(&echo_topic)
-        .expect("subscribe to the deep relay output");
-    for i in 1..=64 {
+    let burst = u32::try_from(BURST).expect("the burst fits in a u32");
+    for i in 1..=burst {
         publish_x(runtime, &app_topic, f64::from(i));
     }
     drop(hold);
     let mut echoes = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while echoes.last() != Some(&(64.0, 64.0)) && Instant::now() < deadline {
+    while echoes.len() < BURST && Instant::now() < deadline {
         subscriber
             .wait_for_message(Duration::from_millis(200), |message| {
                 echoes.push(x_and_z(message.payload()));
@@ -291,28 +343,46 @@ fn deep_trigger_input_gets_a_burst_of_64_app_frames(runtime: &mut EmbeddedRuntim
             })
             .expect("wait for deep relay output");
     }
-    assert_eq!(echoes.last(), Some(&(64.0, 64.0)), "{echoes:?}");
-    assert!(
-        echoes.iter().all(|&(x, z)| x == z),
-        "an echo with x != z means a frame was lost or reordered: {echoes:?}"
-    );
-    assert!(
-        echoes.windows(2).all(|pair| pair[0].1 < pair[1].1),
-        "echoes arrive in tick order: {echoes:?}"
-    );
+    // Every echo of the burst, in tick order: an echo with x != z means a
+    // frame was lost or reordered, and a missing or extra echo shows as a
+    // length difference.
+    let expected: Vec<(f64, f64)> = (1..=burst).map(|i| (f64::from(i), f64::from(i))).collect();
+    assert_eq!(echoes, expected);
     runtime.stop().expect("stop the deep trigger graph");
 }
 
 /// An app topic read by an input deeper than 64 frames fails the start with
 /// a graph error that names the input, its depth and the limit, before the
-/// app creates the topic.
+/// app creates the topic. The graph lists a valid node `first` before the
+/// refused node `logic`, and both read the app topic: the start runs the
+/// `init` of neither node.
 fn an_input_deeper_than_64_fails_the_start_with_the_limit_named(
     runtime: &mut EmbeddedRuntime,
     pid: u32,
 ) {
     let app_topic = format!("/app_feed_too_deep_{pid}/cmd");
     let prefix = format!("app_feed_too_deep_graph_{pid}");
-    let graph = graph_yaml(&prefix, "too_deep_relay", "cmd", &app_topic, "echo");
+    let graph = format!(
+        "prefix: {prefix}
+nodes:
+  - id: first
+    type: valid_relay
+    inputs:
+      - name: cmd
+        source: {app_topic}
+    outputs:
+      - name: echo
+        schema: {VECTOR3}
+  - id: logic
+    type: too_deep_relay
+    inputs:
+      - name: cmd
+        source: {app_topic}
+    outputs:
+      - name: echo
+        schema: {VECTOR3}
+"
+    );
     let error = runtime
         .start(&start_config(&graph, &app_topic))
         .expect_err("an input deeper than 64 frames cannot start");
@@ -334,6 +404,14 @@ fn an_input_deeper_than_64_fails_the_start_with_the_limit_named(
         .expect("a failed start records its error");
     assert_eq!(last_error.code, codes::GRAPH, "{status:?}");
     assert_eq!(&last_error.message, message, "{status:?}");
+    assert!(
+        !VALID_INIT_RAN.load(Ordering::SeqCst),
+        "a start refused for its input depth must not run the init of a valid node listed first"
+    );
+    assert!(
+        !TOO_DEEP_INIT_RAN.load(Ordering::SeqCst),
+        "a start refused for its input depth must not run the init of the refused node"
+    );
 }
 
 #[test]

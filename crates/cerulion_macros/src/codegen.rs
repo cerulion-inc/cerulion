@@ -846,6 +846,14 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 Some(ms) => quote! { ::std::option::Option::Some(#ms) },
                 None => quote! { ::std::option::Option::None },
             };
+            let consume_tok: TokenStream = match i.consume {
+                Some(crate::parse::ParsedConsume::Latest) => {
+                    quote! { #__cer_root::graph::node::InputConsume::Latest }
+                }
+                Some(crate::parse::ParsedConsume::Fifo) | None => {
+                    quote! { #__cer_root::graph::node::InputConsume::Fifo }
+                }
+            };
             quote! {
                 #__cer_root::graph::node::InputMeta {
                     name: #name.to_string(),
@@ -854,6 +862,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     depth: #depth_tok,
                     backpressure: #backpressure_tok,
                     expect_within_ms: #expect_within_tok,
+                    consume: #consume_tok,
                 }
             }
         })
@@ -982,6 +991,16 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         // make a runtime capability a function of a declaration the graph is
         // free to override.
         fn supports_sync_head_ops(&self) -> bool {
+            true
+        }
+
+        // Declare the `consume = latest` body probe. The trait default
+        // `probe_trigger_input` asks `sync_head_op(ProbeNext)`, which the
+        // forward above hands to `NodeContext::sync_head_op`; for a Data input
+        // that reports whether the subscriber the generated tick reads holds a
+        // frame. The cdylib form declares the same through
+        // `cerulion_node_probes_trigger_input`.
+        fn probes_trigger_input(&self) -> bool {
             true
         }
     };
@@ -1514,6 +1533,15 @@ fn gen_cdylib(
                 }
                 None => {}
             }
+            // The declared `consume`. ADDITIVE, like `wire_fixed_size` on the
+            // outputs: emitted only for `latest`, and an absent key is the
+            // host's `fifo` default, so a host that predates the key reads
+            // every node this macro emitted for `fifo` exactly as before.
+            // An explicit `consume = fifo` emits nothing, because it means
+            // the same as no declaration.
+            if i.consume == Some(crate::parse::ParsedConsume::Latest) {
+                suffix.push_str(r#","consume":"latest""#);
+            }
             suffix
         })
         .collect();
@@ -1638,23 +1666,33 @@ fn gen_cdylib(
                         ));
                         return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
                     }
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_external_source: NODES mutex poisoned",
                             ));
                             return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_external_source: node instance mutex poisoned",
+                            ));
+                            return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
-                            // NODES poison containment: drive
+                            // Instance-lock poison containment: drive
                             // the user's `external_source()` under an INNER
                             // `catch_unwind` so a panicking override does NOT unwind
-                            // through the LIVE `NODES` MutexGuard (`guard`) - an
-                            // unwind through it would POISON `NODES` and brick every
-                            // node of this cdylib in-process. `external_source` is a
+                            // through the live instance guard (`guard`): an
+                            // unwind through it would poison the instance lock and
+                            // brick this node instance. `external_source` is a
                             // one-shot pre-binding query; unlike `tick`, torn node
                             // state is no concern — on panic the node simply stays
                             // inert and never ticks. The guard then drops NORMALLY
@@ -1878,8 +1916,26 @@ fn gen_cdylib(
             static NEXT_HANDLE: ::std::sync::atomic::AtomicU64 =
                 ::std::sync::atomic::AtomicU64::new(1); // 0 = error sentinel
 
-            static NODES: ::std::sync::Mutex<Option<::std::collections::HashMap<u64, #entry_name>>> =
+            // One lock per node INSTANCE, so two instances of this library in one
+            // process (on two executors, or on two fire-pool threads) tick
+            // concurrently. `NODES` maps a handle to its instance and is held
+            // only for the lookup, the insert and the remove, never across a
+            // call into node code. The inner `Option` is `None` once the
+            // instance is shut down, so a call racing the shutdown reports the
+            // handle as not found.
+            type __CerInstance = ::std::sync::Arc<::std::sync::Mutex<Option<#entry_name>>>;
+
+            static NODES: ::std::sync::Mutex<Option<::std::collections::HashMap<u64, __CerInstance>>> =
                 ::std::sync::Mutex::new(None);
+
+            /// The instance for `handle`: `Ok(None)` for an unknown handle,
+            /// `Err(())` when `NODES` is poisoned.
+            fn __cer_instance(handle: u64) -> ::std::result::Result<Option<__CerInstance>, ()> {
+                match NODES.lock() {
+                    Ok(guard) => Ok(guard.as_ref().and_then(|m| m.get(&handle)).cloned()),
+                    Err(_) => Err(()),
+                }
+            }
 
             // Per-cdylib thread-local
             // for the most recent FFI error message. Populated by tick /
@@ -2181,7 +2237,10 @@ fn gen_cdylib(
                     };
                     let map = guard.get_or_insert_with(::std::collections::HashMap::new);
                     let handle = NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-                    map.insert(handle, entry);
+                    map.insert(
+                        handle,
+                        ::std::sync::Arc::new(::std::sync::Mutex::new(Some(entry))),
+                    );
                     handle
                 }));
                 match result {
@@ -2236,16 +2295,26 @@ fn gen_cdylib(
             pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     use #__cer_root::graph::node::NodeEntry;
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_tick: NODES mutex poisoned",
                             ));
                             return 3_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_tick: node instance mutex poisoned",
+                            ));
+                            return 3_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => match node.tick() {
                             ::std::result::Result::Ok(()) => 0,
                             ::std::result::Result::Err(e) => {
@@ -2275,22 +2344,32 @@ fn gen_cdylib(
             // Mirror of `cerulion_node_tick` that
             // services quiescent late joiners. `pump_history()` returns
             // `()`, so the success path returns 0; the error codes match
-            // tick exactly (3 NODES poisoned / 4 handle not found /
+            // tick exactly (3 NODES or instance lock poisoned / 4 handle not found /
             // 2 panic).
             #[no_mangle]
             pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     use #__cer_root::graph::node::NodeEntry;
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_pump_history: NODES mutex poisoned",
                             ));
                             return 3_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_pump_history: node instance mutex poisoned",
+                            ));
+                            return 3_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             node.pump_history();
                             0
@@ -2332,7 +2411,24 @@ fn gen_cdylib(
                     // Returning 0 instead would make a buggy
                     // loader sending a stale or never-registered handle
                     // look like a successful shutdown.
-                    let mut node = match guard.as_mut().and_then(|m| m.remove(&handle)) {
+                    let removed = guard.as_mut().and_then(|m| m.remove(&handle));
+                    drop(guard);
+                    // The instance lock waits out a call still running on it;
+                    // taking the entry out leaves `None` for any later caller.
+                    // A poisoned instance (a tick that panicked under its lock)
+                    // is refused with code 3: the node's `shutdown()` is not
+                    // called on state a panic may have left half-written.
+                    let taken = match removed.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(mut slot)) => slot.take(),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_shutdown: node instance mutex poisoned",
+                            ));
+                            return 3_i32;
+                        }
+                    };
+                    let mut node = match taken {
                         Some(n) => n,
                         None => {
                             __cer_set_last_error(::std::format!(
@@ -2384,7 +2480,7 @@ fn gen_cdylib(
             //
             // FFI return codes (negative = failure; the host pulls LAST_ERROR):
             //   0  = success
-            //  -1  = NODES mutex poisoned
+            //  -1  = NODES or instance lock poisoned
             //  -2  = handle not found
             //  -3  = name(s) not valid UTF-8 (set_snapshot_inputs +
             //        drain_trigger_input)
@@ -2429,16 +2525,26 @@ fn gen_cdylib(
                             }
                         }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_set_snapshot_inputs: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_set_snapshot_inputs: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             node.__snapshot_input_names = names;
                             0
@@ -2470,16 +2576,26 @@ fn gen_cdylib(
             #[no_mangle]
             pub extern "C" fn cerulion_node_snapshot_inputs(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_snapshot_inputs: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_snapshot_inputs: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             // Disjoint field borrows: bind the shared borrow of
                             // `__snapshot_input_names` first, then take the mutable
@@ -2556,16 +2672,26 @@ fn gen_cdylib(
                             return -3_i32;
                         }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_drain_trigger_input: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_drain_trigger_input: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let (popped, latest_ts) = match node.context.as_mut() {
                                 Some(ctx) => ctx.drain_trigger_input(name),
@@ -2656,16 +2782,26 @@ fn gen_cdylib(
                             return -3_i32;
                         }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_refill_trigger_input: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_refill_trigger_input: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let (popped, latest_ts) = match node.context.as_mut() {
                                 Some(ctx) => ctx.refill_trigger_input(name),
@@ -2770,7 +2906,7 @@ fn gen_cdylib(
             // out-params were NOT written. -1..-4 are the drain export's codes
             // with the drain export's meanings:
             //   0  = success
-            //  -1  = NODES mutex poisoned
+            //  -1  = NODES or instance lock poisoned
             //  -2  = handle not found
             //  -3  = name was not valid UTF-8
             //  -4  = panic caught by catch_unwind
@@ -2930,16 +3066,26 @@ fn gen_cdylib(
                         ));
                         return -7_i32;
                     }
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_sync_head_op: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_sync_head_op: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let answer = match node.context.as_mut() {
                                 Some(ctx) => ctx.sync_head_op(name, head_op),
@@ -3003,6 +3149,19 @@ fn gen_cdylib(
                 }
             }
 
+            // `cerulion_node_probes_trigger_input`: 1 declares that op code 0
+            // of `cerulion_node_sync_head_op` above answers a Data trigger
+            // input from the subscriber the generated tick reads, because the
+            // export hands that op to `NodeContext::sync_head_op`. Handle-less
+            // and constant: the host reads it ONCE at load, before `init`, as
+            // `NodeEntry::probes_trigger_input`. OPTIONAL and ADDITIVE, no ABI
+            // bump: a library without it keeps its `consume = latest` inputs
+            // unprobed, and the graph build names them.
+            #[no_mangle]
+            pub extern "C" fn cerulion_node_probes_trigger_input() -> i32 {
+                1
+            }
+
             // ================================================================
             // THE KEYSTONE: state capture/restore across the wall
             // ================================================================
@@ -3042,7 +3201,7 @@ fn gen_cdylib(
             //
             // Return codes extend the set documented above:
             //   0  = success
-            //  -1  = NODES mutex poisoned
+            //  -1  = NODES or instance lock poisoned
             //  -2  = handle not found
             //  -3  = invalid argument (null sink / null payload with a length /
             //        null out-pointer)
@@ -3194,7 +3353,7 @@ fn gen_cdylib(
             // question about the INSTANCE: is any lock in its state graph held
             // right now?
             //
-            // `try_lock` on `NODES`, never `lock`. This runs on the node thread
+            // `try_lock` on `NODES` and on the instance, never `lock`. This runs on the node thread
             // at a step boundary, where the executor's only blocking primitive
             // must be none at all — and a probe that BLOCKED to answer "is
             // anything blocking?" would be the very stall it exists to detect.
@@ -3205,15 +3364,21 @@ fn gen_cdylib(
             #[no_mangle]
             pub extern "C" fn cerulion_node_cer_probe(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    let guard = match NODES.try_lock() {
-                        Ok(g) => g,
+                    let instance = match NODES.try_lock() {
+                        Ok(g) => g.as_ref().and_then(|m| m.get(&handle)).cloned(),
                         Err(_) => {
                             // Contended or poisoned — either way this cdylib is
                             // not in a state to be forked from.
                             return 0_i32;
                         }
                     };
-                    match guard.as_ref().and_then(|m| m.get(&handle)) {
+                    // The same `try_lock` on the instance: a held instance
+                    // lock is a call in flight, which is not quiescent.
+                    let guard = match instance.as_deref().map(::std::sync::Mutex::try_lock) {
+                        Some(Ok(g)) => g,
+                        _ => return 0_i32,
+                    };
+                    match guard.as_ref() {
                         Some(node) => i32::from(
                             #__cer_root::state::CerulionState::cer_probe(&node.inner),
                         ),
@@ -3251,16 +3416,26 @@ fn gen_cdylib(
                             return -3_i32;
                         }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_capture_state: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_capture_state: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let mut out = __CerFfiStateSink {
                                 sink,
@@ -3281,16 +3456,16 @@ fn gen_cdylib(
                             // Drive the user's encoder under an
                             // INNER `catch_unwind` so a panicking
                             // `CerulionState` impl does NOT unwind through the
-                            // LIVE `NODES` MutexGuard (`guard`). The state
+                            // live instance guard (`guard`). The state
                             // contract is explicit that a capture panic escaping
                             // the guard is not a mere poisoned mutex: it kills
-                            // every SUBSEQUENT operation on every node of this
-                            // cdylib for the process lifetime, and misreports
+                            // every SUBSEQUENT operation on this node instance
+                            // for the process lifetime, and misreports
                             // the cause as a tick panic that never happened.
                             // The inline carrier wraps its own capture for
                             // exactly this reason ("the node mutex is NOT
-                            // poisoned"), and the cdylib's `NODES` is that
-                            // mutex's twin on this side of the wall. Same
+                            // poisoned"), and the cdylib's instance lock is
+                            // that mutex's twin on this side of the wall. Same
                             // containment as `cerulion_node_external_source`'s
                             // INNER `catch_unwind` above; the OUTER one stays the
                             // backstop for a panic raised outside this call.
@@ -3397,23 +3572,33 @@ fn gen_cdylib(
                         // bytes, valid for this call; we only read it.
                         unsafe { ::std::slice::from_raw_parts(payload_ptr, payload_len) }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_restore_state: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_restore_state: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let mut cursor =
                                 #__cer_root::state::StateCursor::new(payload);
                             // The same INNER `catch_unwind` as the capture
                             // export, for the same reason — a panicking
-                            // decoder must not poison `NODES` and brick every
-                            // node of this cdylib. UNLIKE the capture, a
+                            // decoder must not poison the instance lock and
+                            // brick this node instance. UNLIKE the capture, a
                             // restore MUTATES, so an unwound one leaves the
                             // node PARTIALLY restored: that is reported with
                             // the same words the `Err` arm below uses, because
@@ -3517,7 +3702,9 @@ mod advertised_attribute_parity_tests {
     //! ADVERTISE to the user, so the two halves cannot drift apart either.
 
     use super::gen_cdylib;
-    use crate::parse::{FieldInputAttr, FieldOutputAttr, NodeLevelAttrs, ParsedBackpressurePolicy};
+    use crate::parse::{
+        FieldInputAttr, FieldOutputAttr, NodeLevelAttrs, ParsedBackpressurePolicy, ParsedConsume,
+    };
     use std::collections::BTreeSet;
 
     /// Node-level attributes that are deliberately compile-time-only — they
@@ -3564,6 +3751,7 @@ mod advertised_attribute_parity_tests {
             backpressure: None,
             expect_within_ms: None,
             accumulate: None,
+            consume: None,
         }
     }
 
@@ -3757,6 +3945,16 @@ mod advertised_attribute_parity_tests {
                     ..base
                 },
                 r#""depth":51"#.to_string(),
+            ),
+            // `consume = latest` reaches the cdylib host as an additive key;
+            // the host's absent-key default is `fifo`.
+            "consume" => (
+                FieldInputAttr {
+                    trigger: true,
+                    consume: Some(ParsedConsume::Latest),
+                    ..base
+                },
+                r#""consume":"latest""#.to_string(),
             ),
             _ => return None,
         })
