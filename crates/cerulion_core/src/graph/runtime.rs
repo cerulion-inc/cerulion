@@ -9481,8 +9481,9 @@ impl GraphRuntime {
                  every arrival its trigger subscriber counts, including a frame an \
                  earlier read already took, and that fire reads nothing. A node built \
                  with `#[cerulion_node]` answers; a raw-FFI node library answers by \
-                 exporting `cerulion_node_sync_head_op` and answering op code 0; a \
-                 hand-written entry answers by implementing \
+                 exporting `cerulion_node_probes_trigger_input` returning a positive \
+                 value beside `cerulion_node_sync_head_op`, whose op code 0 then \
+                 answers for the input; a hand-written entry answers by implementing \
                  `NodeEntry::probes_trigger_input` and `probe_trigger_input`."
             );
         }
