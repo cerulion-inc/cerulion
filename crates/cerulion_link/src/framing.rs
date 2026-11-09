@@ -17,7 +17,7 @@
 //!
 //! [`WireHeader`]: https://docs.rs/cerulion-wire
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendStream};
 
 use crate::error::LinkError;
 
@@ -180,10 +180,33 @@ pub async fn write_frame(send: &mut SendStream, frame: &[u8]) -> Result<(), Link
 /// }
 /// ```
 pub async fn read_frame(recv: &mut RecvStream, max_len: usize) -> Result<Vec<u8>, LinkError> {
+    read_frame_or_end(recv, max_len)
+        .await?
+        .ok_or_else(|| LinkError::Stream(Box::new(ReadExactError::FinishedEarly(0))))
+}
+
+/// [`read_frame`], except that the peer finishing the stream at a frame
+/// boundary, before any byte of a next frame, is `Ok(None)`. A reset, a lost
+/// connection, a finish inside a frame and an over-cap length are errors, as
+/// they are for [`read_frame`], which returns a [`LinkError::Stream`] for the
+/// finish at a boundary too.
+///
+/// NOT cancel-safe, for the reason [`read_frame`] gives: drive it from a task
+/// of its own.
+///
+/// # Errors
+///
+/// As [`read_frame`], without the finish at a frame boundary.
+pub async fn read_frame_or_end(
+    recv: &mut RecvStream,
+    max_len: usize,
+) -> Result<Option<Vec<u8>>, LinkError> {
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| LinkError::Stream(Box::new(e)))?;
+    match recv.read_exact(&mut len_buf).await {
+        Ok(()) => {}
+        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(e) => return Err(LinkError::Stream(Box::new(e))),
+    }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > max_len {
         return Err(LinkError::FrameExceedsMaxLen { len, max: max_len });
@@ -192,5 +215,5 @@ pub async fn read_frame(recv: &mut RecvStream, max_len: usize) -> Result<Vec<u8>
     recv.read_exact(&mut buf)
         .await
         .map_err(|e| LinkError::Stream(Box::new(e)))?;
-    Ok(buf)
+    Ok(Some(buf))
 }

@@ -173,26 +173,21 @@ enum MonitorWaitBackend {
     )]
     ArmWfeEventStream,
     /// No real primitive — the caller falls back to the blocking WaitSet wait.
-    /// Constructed on `linux + x86_64` without WAITPKG (the CPUID-clear else) and
-    /// on every NON-Linux / other-arch target (the `not(any(...))` arm). It is
-    /// NOT constructed on `linux + aarch64` — there `resolve_backend`
-    /// unconditionally returns `ArmWfeEventStream` — so it needs a per-variant
-    /// dead-code allow for EXACTLY that one cell (mirroring the other two
-    /// variants' per-target allows). Without it, `dead_code = deny` hard-fails
-    /// the whole-crate build on `aarch64-unknown-linux-gnu` — the Jetson/Orin
-    /// robotics target, and the one cfg cell neither aarch64-macOS (which
-    /// constructs via `not(any)`) nor x86_64-linux (which constructs via
-    /// the else) nor CI (ubuntu-x86 + macos-aarch64) ever compiles.
-    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
+    /// Constructed on every target by `CERULION_MONITOR_WAIT_PRIMITIVE=0`, on
+    /// `linux + x86_64` without WAITPKG (the CPUID-clear else) and on every
+    /// NON-Linux / other-arch target (the `not(any(...))` arm). On
+    /// `linux + aarch64` the knob is the only route to it, which is why it needs
+    /// no per-target dead-code allow there.
     Unavailable,
 }
 
 /// Resolve the backend for THIS target (uncached — `current_backend` caches it).
 ///
 /// `linux + x86_64`: probe CPUID leaf 7 sub-leaf 0, ECX bit 5 (WAITPKG); set
-/// ⇒ `WaitpkgUmwait`, else `Unavailable`. `linux + aarch64`: always
+/// ⇒ `WaitpkgUmwait`, else `Unavailable`. `linux + aarch64`:
 /// `ArmWfeEventStream` (the `WFE` + event-stream idiom is ARMv8 baseline).
-/// Every other target ⇒ `Unavailable`.
+/// Every other target ⇒ `Unavailable`. On every target
+/// `CERULION_MONITOR_WAIT_PRIMITIVE=0` resolves `Unavailable` before the probe.
 ///
 /// **WAITPKG on virtualized x86:** selection is
 /// purely the CPUID WAITPKG bit; some hypervisors enumerate WAITPKG yet trap
@@ -217,7 +212,29 @@ unsafe fn waitpkg_enumerated() -> bool {
     (core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 5)) != 0
 }
 
+/// Hidden measurement knob `CERULION_MONITOR_WAIT_PRIMITIVE`: `0` resolves the
+/// backend to `Unavailable`, so a host whose CPU carries WAITPKG or WFE parks on
+/// the tier a host without one parks on (the bounded sleep-recheck nap, and the
+/// doorbell's kernel wake word where the target has one). Read once, with the
+/// backend; unset or any other value leaves the CPU probe in charge.
+fn primitive_disabled_by_env() -> bool {
+    primitive_disabled_from(
+        std::env::var("CERULION_MONITOR_WAIT_PRIMITIVE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The pure rule of [`primitive_disabled_by_env`] over an injected value: only
+/// an exact `0` disables the primitive.
+fn primitive_disabled_from(raw: Option<&str>) -> bool {
+    raw == Some("0")
+}
+
 fn resolve_backend() -> MonitorWaitBackend {
+    if primitive_disabled_by_env() {
+        return MonitorWaitBackend::Unavailable;
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         // SAFETY: `waitpkg_enumerated` only does a baseline CPUID read (see its
@@ -397,7 +414,7 @@ pub fn monitor_wait_available() -> bool {
 /// return WITHOUT parking via its lost-wakeup guard (the layer-1 pre-arm
 /// early-out and the layer-2 arm-time recheck) when the doorbell moved after
 /// the caller's `expected` snapshot; a caller keeping slice telemetry
-/// (`park_yields`) must not count such a return as a completed slice, which a
+/// (`park_slices`) must not count such a return as a completed slice, which a
 /// plain `bool` could not express. (A park cut short at the DEADLINE boundary
 /// still reads `Parked` — pre-existing, bounded at one per park window, and
 /// the caller's own loop-top deadline check fires first in practice.)
@@ -1194,6 +1211,16 @@ mod tests {
             "a park slice must be short enough that a co-located peer runs \
              well inside 100 µs (two-to-five slices per same-core hop)"
         );
+    }
+
+    #[test]
+    fn only_an_exact_zero_disables_the_primitive() {
+        assert!(primitive_disabled_from(Some("0")));
+        assert!(!primitive_disabled_from(None));
+        assert!(!primitive_disabled_from(Some("")));
+        assert!(!primitive_disabled_from(Some("1")));
+        assert!(!primitive_disabled_from(Some("off")));
+        assert!(!primitive_disabled_from(Some(" 0")));
     }
 
     #[test]

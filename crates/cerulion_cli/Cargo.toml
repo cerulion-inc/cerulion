@@ -31,6 +31,10 @@ workspace = true
 [[bin]]
 name = "cerulion"
 path = "src/main.rs"
+# The umbrella library crate is also named `cerulion`, and rustdoc writes both to
+# target/doc/cerulion. Under `cargo doc --workspace` the two outputs race and the docs
+# gate can fail with missing files (cargo issue 6313), so the binary is not documented.
+doc = false
 
 [dependencies]
 cerulion_cli_engine = { workspace = true }
@@ -83,6 +87,8 @@ default = ["telemetry"]
 # a no-op, `cerulion telemetry status` reports "not compiled", and no network
 # dependency is linked.
 telemetry = ["cerulion_telemetry/posthog"]
+# Oracle mutant seams for the timing and replay oracles (`--features oracle-mutants`).
+oracle-mutants = ["cerulion_cli_engine/oracle-mutants"]
 
 # bagd is folded into this binary as the
 # `cerulion bagd` subcommand (`BagdArgs` + `bagd_cli_main`). Unix-gated —

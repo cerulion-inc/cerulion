@@ -340,26 +340,41 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   carries a 4-byte wake epoch beside the counter: the publisher bumps both and, while a
   consumer holds the page's `parked` claim, issues `os_sync_wake_by_address_all`, and
   the consumer kernel-blocks on the epoch instead of pacing
-  (`CERULION_DOORBELL_OS_SYNC=0` drops that block).
+  (`CERULION_DOORBELL_OS_SYNC=0` drops that block). The Linux and Android page has the
+  same layout with a futex word: the publisher bumps the counter, reads `parked`, and
+  only while a consumer holds a claim bumps the word and issues a shared `FUTEX_WAKE`,
+  so a host whose consumers park in hardware pays one increment and one load per ring.
 - Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT) / AMD MWAITX where
   present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
   cannot hit the cache-flushing deep C-state); no-primitive targets (macOS included) run
   the park default-ON in a degraded chunked short-sleep-recheck: never a busy-spin,
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
   wakes hot). That arm tries three kernel blocks before it paces, in order: a credit
-  word, barrier arrival, and on macOS the primary topic's doorbell epoch. A process
-  blocks on one address, so the first that applies owns it.
+  word, barrier arrival, and the primary topic's doorbell epoch (macOS, Linux and
+  Android). A live loop
+  (a process, or one executor unit of a process) blocks on one address, so the first that
+  applies owns it. The doorbell rung arms the first declared trigger or sync-input topic
+  written from outside the loop's own graph, a unit's cut when the process hosts several
+  units; a ring on any other topic is seen at the next recheck, so a join in a unit of its
+  own takes the kernel wake on its first such input only
+  (https://github.com/cerulion-inc/cerulion/issues/755). Units are opt in: the planner
+  (`graph::executor::derive_units`) runs a process as one unit unless the graph's profile or a
+  node's `isolate: true` splits it.
 - The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is
   one event-stream period, next bullet; rmw's `park_block` uses the same constant) and ends
-  EVERY park-loop iteration with `yield_now()` (`park_yields`, record-only); a
+  every hardware slice with `yield_now()` (`park_core_yields`, record-only; completed slices
+  of every tier are counted apart in `park_slices`); a
   co-located runnable peer gets the core within one slice instead of at CFS wakeup
   granularity; without the yield a same-core pinned ping-pong measures p50 6.997 ms
   (`rmw_cerulion`'s `rmw_wait_pingpong_discriminator_test`, the `#[ignore]`'d
   `same_core_pair_park_on_spin_off_stays_under_100us` arm). The degraded sleep and
-  wake-word arms keep their measured ~100 µs pacing (a sleeping thread already released
-  its core); `CERULION_MW_SINGLE_PARK=1` (measurement-only) removes the yield boundary.
+  wake-word arms keep their measured ~100 µs pacing and end with no yield: a sleeping
+  thread already released its core, and on macOS a `sched_yield` with another thread
+  runnable on the processor depresses the caller's priority for up to one 10 ms scheduler
+  quantum, which a consumer just woken by a ring would wait out before its next poll;
+  `CERULION_MW_SINGLE_PARK=1` (measurement-only) removes the yield boundary.
   On aarch64 the slice is coarser: base WFE has no timeout operand, so a bounded wait
   rides the generic-timer event stream and the EFFECTIVE slice is one event-stream
   period, which is machine-specific (kernel target ~100 µs). A same-core ROUND-TRIP

@@ -265,7 +265,9 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   block scalars. It splits lines at every break the parser reads (LF, CR, CRLF, NEL,
   LS, PS), so a CR-only document is not one long line. A block scalar's content is what is more indented than the node that
   owns it (the key of `- key: |`, not the dash), so a sibling key is still scanned. A multi-line plain scalar whose continuation line starts with `&` or
-  `*` is a false refusal (quote the string).
+  `*` is a false refusal (quote the string). `dynamic::find_anchor_or_alias` is the
+  same scan for a caller that parses message YAML itself: `cerulion_msgio` runs it
+  before it fills omitted fields and hands the codec the filled text.
 - **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
   of `x as f32` whose shortest form reads back to the parsed `f64` (two `f32` values
   round twice under a plain cast; bit pattern `363742205` is pinned). Every NaN prints
