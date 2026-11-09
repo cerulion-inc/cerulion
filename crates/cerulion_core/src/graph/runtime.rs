@@ -1121,13 +1121,102 @@ struct ChainCalls {
     skip_dequeue_mutant: bool,
 }
 
+/// Why a census chain is cut at a member: that member and every member after
+/// it fire at their own levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainCallCut {
+    /// The member sits on another level than the one its chain position
+    /// names (`None`: on no level).
+    OffLevel {
+        expected: usize,
+        actual: Option<usize>,
+    },
+    /// The member is outside its level's non-block set.
+    BlockSet,
+    /// The member has this many data-trigger bindings; a call drains one.
+    Bindings { count: usize },
+    /// The member's binding drains on the separate discipline; a call drains
+    /// only a binding read through its node's body subscriber.
+    SeparateDrain,
+}
+
+impl std::fmt::Display for ChainCallCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OffLevel {
+                expected,
+                actual: Some(actual),
+            } => write!(
+                f,
+                "on level {actual}, while its chain position names level {expected}"
+            ),
+            Self::OffLevel {
+                expected,
+                actual: None,
+            } => write!(
+                f,
+                "on no level, while its chain position names level {expected}"
+            ),
+            Self::BlockSet => f.write_str("outside its level's non-block set"),
+            Self::Bindings { count: 0 } => f.write_str("no data-trigger binding"),
+            Self::Bindings { count } => write!(f, "{count} data-trigger bindings, not one"),
+            Self::SeparateDrain => {
+                f.write_str("its trigger input drains on the separate discipline")
+            }
+        }
+    }
+}
+
+/// The data-trigger binding a call of census chain member `member` drains,
+/// or why the chain is cut at it. `level` is the level its chain position
+/// names.
+fn chain_call_binding(
+    member: &str,
+    level: usize,
+    bindings: &[DataTriggerBinding],
+    levels: &Levels,
+    level_plans: &[LevelPlan],
+) -> Result<usize, ChainCallCut> {
+    let actual = levels.level_of(member);
+    if actual != Some(level) {
+        return Err(ChainCallCut::OffLevel {
+            expected: level,
+            actual,
+        });
+    }
+    if !level_plans
+        .get(level)
+        .is_some_and(|p| p.other_ids.iter().any(|id| id == member))
+    {
+        return Err(ChainCallCut::BlockSet);
+    }
+    let mut own = bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.node_id.as_ref() == member);
+    let (Some((binding, b)), None) = (own.next(), own.next()) else {
+        let count = bindings
+            .iter()
+            .filter(|b| b.node_id.as_ref() == member)
+            .count();
+        return Err(ChainCallCut::Bindings { count });
+    };
+    if !matches!(b.drain, DrainSource::Unified { .. }) {
+        return Err(ChainCallCut::SeparateDrain);
+    }
+    Ok(binding)
+}
+
 impl ChainCalls {
     /// Turn the census chains into calls over this build's bindings.
     ///
     /// A member becomes a call when it sits on the level its chain position
     /// names, is in its level's non-block set, has exactly one data-trigger
-    /// binding and that binding drains unified; the chain is cut at the first
-    /// member that is not, which keeps the queued path from there on.
+    /// binding and that binding drains unified ([`chain_call_binding`]); the
+    /// chain is cut at the first member that is not, which keeps the queued
+    /// path from there on. Each cut logs one `warn` naming the chain head,
+    /// the member and the [`ChainCallCut`], and the build then logs one
+    /// `info` naming the members it calls, or saying it calls none and why.
     /// Every member and its producer must be nodes of this build: a census
     /// judged against another graph would name nodes this runtime does not
     /// run, and the build then calls nothing rather than half a chain.
@@ -1153,34 +1242,35 @@ impl ChainCalls {
                     return None;
                 }
                 let level = chain.head_level + pos;
-                if levels.level_of(member) != Some(level)
-                    || !level_plans
-                        .get(level)
-                        .is_some_and(|p| p.other_ids.iter().any(|id| id == member))
-                {
-                    break;
+                match chain_call_binding(member, level, bindings, levels, level_plans) {
+                    Ok(binding) => by_head.push((
+                        chain.head_level,
+                        ChainCall {
+                            binding,
+                            node_id: Arc::from(member.as_str()),
+                            level,
+                        },
+                    )),
+                    Err(cut) => {
+                        tracing::warn!(
+                            chain_head = %chain.nodes[0],
+                            member = %member,
+                            reason = %cut,
+                            "chain fusion: a census chain is cut at this member; it and \
+                             every member after it fire at their own levels"
+                        );
+                        break;
+                    }
                 }
-                let mut own = bindings
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| b.node_id.as_ref() == member.as_str());
-                let (Some((binding, b)), None) = (own.next(), own.next()) else {
-                    break;
-                };
-                if !matches!(b.drain, DrainSource::Unified { .. }) {
-                    break;
-                }
-                by_head.push((
-                    chain.head_level,
-                    ChainCall {
-                        binding,
-                        node_id: Arc::from(member.as_str()),
-                        level,
-                    },
-                ));
             }
         }
         if by_head.is_empty() {
+            let reason = if chains.is_empty() {
+                "the census found no chain"
+            } else {
+                "every census chain is cut at its first member"
+            };
+            tracing::info!(reason = %reason, "chain fusion: this build calls no chain member");
             return None;
         }
         // Stable: chain order survives within one head level.
@@ -1199,6 +1289,12 @@ impl ChainCalls {
             binding_is_call[call.binding] = true;
         }
         let calls: Arc<[ChainCall]> = by_head.into_iter().map(|(_, c)| c).collect();
+        let called: Vec<&str> = calls.iter().map(|c| c.node_id.as_ref()).collect();
+        tracing::info!(
+            members = calls.len(),
+            called = ?called,
+            "chain fusion: the chain members this build calls when their chain head's level ends"
+        );
         Some(Self {
             calls,
             after_level: after_level.into_boxed_slice(),
@@ -1207,6 +1303,258 @@ impl ChainCalls {
             skip_dequeue_mutant: std::env::var_os(super::chain::CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV)
                 .is_some(),
         })
+    }
+}
+
+#[cfg(test)]
+mod chain_call_cut_tests {
+    use super::{build_trigger_edges, ChainCalls, DataTriggerBinding, DrainSource, LevelPlan};
+    use crate::graph::chain::FusedChain;
+    use crate::graph::node::{NodeContext, NodeEntry, NodeInfo};
+    use crate::graph::topology::{GraphTopology, Levels};
+    use crate::scheduler::RestWalk;
+    use crate::ClosureNodeEntry;
+    use indexmap::IndexMap;
+    use std::sync::{Arc, Mutex};
+    use tracing_test::traced_test;
+
+    /// `a -> b -> c`. With no node infos every input is a trigger edge, so
+    /// the derived levels are 0, 1 and 2.
+    const GRAPH: &str = "prefix: t\nnodes:\n  \
+        - id: a\n    type: a\n    outputs:\n      - name: out\n        schema: std_msgs/Int32\n  \
+        - id: b\n    type: b\n    inputs:\n      - name: inp\n        source: a/out\n    \
+          outputs:\n      - name: out\n        schema: std_msgs/Int32\n  \
+        - id: c\n    type: c\n    inputs:\n      - name: inp\n        source: b/out\n";
+
+    fn levels() -> Levels {
+        let config = crate::graph::parse_graph_raw(GRAPH).expect("the graph parses");
+        let infos = IndexMap::new();
+        let topology = GraphTopology::build(&config, &infos).expect("the topology builds");
+        let levels = topology
+            .derive_levels(&build_trigger_edges(&config, &infos))
+            .expect("the graph is acyclic");
+        for (node, level) in [("a", 0), ("b", 1), ("c", 2)] {
+            assert_eq!(levels.level_of(node), Some(level), "{node}'s level");
+        }
+        levels
+    }
+
+    /// One plan per level: `block` names the nodes outside the non-block set.
+    fn plans(block: &[&str]) -> Vec<LevelPlan> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                let (other_ids, block_ids) = if block.contains(&id) {
+                    (Vec::new(), vec![id.to_string()])
+                } else {
+                    (vec![id.to_string()], Vec::new())
+                };
+                LevelPlan {
+                    other_ids,
+                    block_ids,
+                    rest_walk: RestWalk::Unconstrained,
+                }
+            })
+            .collect()
+    }
+
+    fn nodes() -> IndexMap<String, Arc<Mutex<Box<dyn NodeEntry>>>> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                let entry: Box<dyn NodeEntry> = Box::new(ClosureNodeEntry::new(
+                    NodeInfo::from_names(vec!["inp".to_string()], vec!["out".to_string()]),
+                    |_ctx: &mut NodeContext| Ok(()),
+                ));
+                (id.to_string(), Arc::new(Mutex::new(entry)))
+            })
+            .collect()
+    }
+
+    /// A binding of `node`'s `inp`, unified on listener `idx` or separate on
+    /// subscriber `idx`.
+    fn binding(node: &str, unified: bool, idx: usize) -> DataTriggerBinding {
+        DataTriggerBinding {
+            node_id: Arc::from(node),
+            drain: if unified {
+                DrainSource::Unified { listener_idx: idx }
+            } else {
+                DrainSource::Separate { sub_idx: idx }
+            },
+            input_name: Some(Arc::from("inp")),
+            warn_suppressed: false,
+            topic: Arc::from(format!("t/{node}/inp").as_str()),
+            consume_latest: false,
+            probes_body: false,
+            unconfirmed_arrival: false,
+        }
+    }
+
+    fn chain(head_level: usize) -> FusedChain {
+        FusedChain {
+            nodes: vec!["a".into(), "b".into(), "c".into()],
+            topics: vec!["t/a/out".into(), "t/b/out".into()],
+            head_level,
+        }
+    }
+
+    /// The lines of the captured log that carry `needle`.
+    fn lines_with<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+
+    const CUT: &str = "chain fusion: a census chain is cut at this member";
+    const NONE_CALLED: &str = "chain fusion: this build calls no chain member";
+    const CALLED: &str = "chain fusion: the chain members this build calls";
+
+    /// One census chain `a -> b -> c` with its head on `head_level`, judged
+    /// over `bindings` with the `block` nodes outside their level's non-block
+    /// set: the chain must be cut at `member` for `reason`, after `called`
+    /// members are called.
+    struct Case {
+        bindings: Vec<DataTriggerBinding>,
+        block: &'static [&'static str],
+        head_level: usize,
+        member: &'static str,
+        reason: &'static str,
+        called: usize,
+    }
+
+    /// Each way a census chain member cannot be called cuts the chain there,
+    /// and the build says so once, naming the chain head, the member and the
+    /// reason, then names the members it calls, or none and why.
+    #[test]
+    #[traced_test]
+    fn a_chain_is_cut_at_the_first_member_a_call_cannot_drain_and_the_build_says_why() {
+        let levels = levels();
+        let nodes = nodes();
+        let cases = [
+            Case {
+                bindings: vec![
+                    binding("b", true, 0),
+                    binding("b", true, 1),
+                    binding("c", true, 2),
+                ],
+                block: &[],
+                head_level: 0,
+                member: "b",
+                reason: "reason=2 data-trigger bindings, not one",
+                called: 0,
+            },
+            Case {
+                bindings: vec![binding("c", true, 0)],
+                block: &[],
+                head_level: 0,
+                member: "b",
+                reason: "reason=no data-trigger binding",
+                called: 0,
+            },
+            Case {
+                bindings: vec![binding("b", true, 0), binding("c", false, 0)],
+                block: &[],
+                head_level: 0,
+                member: "c",
+                reason: "reason=its trigger input drains on the separate discipline",
+                called: 1,
+            },
+            Case {
+                bindings: vec![binding("b", true, 0), binding("c", true, 1)],
+                block: &["b"],
+                head_level: 0,
+                member: "b",
+                reason: "reason=outside its level's non-block set",
+                called: 0,
+            },
+            Case {
+                bindings: vec![binding("b", true, 0), binding("c", true, 1)],
+                block: &[],
+                head_level: 1,
+                member: "b",
+                reason: "reason=on level 1, while its chain position names level 2",
+                called: 0,
+            },
+        ];
+        for case in &cases {
+            let calls = ChainCalls::from_census(
+                &[chain(case.head_level)],
+                &case.bindings,
+                &levels,
+                &plans(case.block),
+                &nodes,
+            );
+            assert_eq!(
+                calls.as_ref().map_or(0, |c| c.calls.len()),
+                case.called,
+                "members called when the chain is cut at {} ({})",
+                case.member,
+                case.reason
+            );
+        }
+        logs_assert(|lines: &[&str]| {
+            let cuts = lines_with(lines, CUT);
+            if cuts.len() != cases.len() {
+                return Err(format!(
+                    "{} cut lines for {} cuts: {cuts:#?}",
+                    cuts.len(),
+                    cases.len()
+                ));
+            }
+            for case in &cases {
+                let hits = lines_with(&cuts, case.reason);
+                let [line] = hits.as_slice() else {
+                    return Err(format!(
+                        "one cut line must carry {:?}: {hits:#?}",
+                        case.reason
+                    ));
+                };
+                let member_field = format!("member={}", case.member);
+                for want in ["WARN", "chain_head=a", member_field.as_str()] {
+                    if !line.contains(want) {
+                        return Err(format!("the cut line lacks {want:?}: {line}"));
+                    }
+                }
+            }
+            let none = lines_with(lines, NONE_CALLED);
+            let cut_first = lines_with(
+                &none,
+                "reason=every census chain is cut at its first member",
+            );
+            if none.len() != 4 || cut_first.len() != 4 {
+                return Err(format!(
+                    "four builds call no member, each saying why: {none:#?}"
+                ));
+            }
+            let called = lines_with(lines, CALLED);
+            let [line] = called.as_slice() else {
+                return Err(format!("one build calls a member: {called:#?}"));
+            };
+            if !line.contains("members=1") || !line.contains(r#"called=["b"]"#) {
+                return Err(format!("the called line names the members called: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// A build with the seam on whose census found no chain says it calls no
+    /// member, and why.
+    #[test]
+    #[traced_test]
+    fn a_census_with_no_chain_calls_no_member_and_says_so() {
+        let calls = ChainCalls::from_census(&[], &[], &levels(), &plans(&[]), &nodes());
+        assert!(calls.is_none());
+        logs_assert(|lines: &[&str]| {
+            let none = lines_with(lines, NONE_CALLED);
+            match none.as_slice() {
+                [line] if line.contains("reason=the census found no chain") => Ok(()),
+                _ => Err(format!(
+                    "one line says no member is called, and why: {none:#?}"
+                )),
+            }
+        });
     }
 }
 
@@ -5556,8 +5904,10 @@ impl GraphRuntime {
         // `CERULION_FUSE_CHAINS` seam; the census beside it says which edges
         // the graph's declarations allow and, for every other consumer edge,
         // the reason it keeps the queued path. With the seam on, the census
-        // chains become this build's chain calls (`ChainCalls::from_census`);
-        // with it off nothing below reads either, so the build is
+        // chains become this build's chain calls (`ChainCalls::from_census`,
+        // which logs each member a chain is cut at and the members it calls);
+        // with it off `called_chains` stays `None`, nothing below reads the
+        // census and no chain call is formed or logged, so the build is
         // byte-identical to one made before either existed. It is resolved
         // HERE, beside the other build-time seams, because a decision read
         // twice in one build could disagree with itself and a fusion set that
@@ -5569,7 +5919,7 @@ impl GraphRuntime {
         // runtime is built from its own subgraph, where an input fed from
         // another unit names an absolute topic no node of the build produces:
         // that edge is no chain link, so a chain call never leaves its unit.
-        let mut called_chains: Vec<super::chain::FusedChain> = Vec::new();
+        let mut called_chains: Option<Vec<super::chain::FusedChain>> = None;
         {
             let decision = super::chain::resolve_fusion();
             let colocation = if config.has_process_groups() {
@@ -5587,7 +5937,7 @@ impl GraphRuntime {
             );
             super::chain::log_fusion_decision(&decision, &census);
             if decision.enabled() {
-                called_chains = census.chains().to_vec();
+                called_chains = Some(census.chains().to_vec());
             }
         }
         // Take ownership of the full `Levels` struct for the
@@ -9760,22 +10110,20 @@ impl GraphRuntime {
             None
         };
 
-        let chain_calls = ChainCalls::from_census(
-            &called_chains,
-            &data_trigger_bindings,
-            &levels,
-            &level_plans,
-            &nodes,
-        );
+        let chain_calls = called_chains.as_deref().and_then(|chains| {
+            ChainCalls::from_census(
+                chains,
+                &data_trigger_bindings,
+                &levels,
+                &level_plans,
+                &nodes,
+            )
+        });
         if let Some(calls) = chain_calls.as_ref() {
             for call in calls.calls.iter() {
                 let marked = scheduler.mark_chain_member(&call.node_id);
                 debug_assert!(marked, "chain member {} not in the scheduler", call.node_id);
             }
-            tracing::info!(
-                members = calls.calls.len(),
-                "chain fusion: chain members are called when their chain head's level ends"
-            );
         }
 
         Ok(Self {

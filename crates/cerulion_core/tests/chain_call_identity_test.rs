@@ -47,6 +47,15 @@
 //! the member's binding is no unified one, so the chain call is cut there and
 //! the member runs at its own level.
 //!
+//! The build's log is checked as well. With the seam on, a chain is cut at
+//! the first member a call cannot drain, and the build logs one warning per
+//! cut naming the chain head, the member and the reason, then one line naming
+//! the members it calls, or saying it calls none and why. In
+//! `src -> one -> bare -> end`, where `bare` is a hand-written entry with no
+//! trigger policy and so no data-trigger binding, the build calls `one` alone;
+//! the `consume = latest` graph on the separate drain calls none. With the seam
+//! off or unset the build logs none of these lines.
+//!
 //! ```bash
 //! cargo test -p cerulion_core --test chain_call_identity_test -- --test-threads=1
 //! ```
@@ -56,7 +65,7 @@ use std::time::Duration;
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::chain::{census_chains, ChainBar, Colocation};
-use cerulion_core::graph::node::{NodeEntry, NodeInfo};
+use cerulion_core::graph::node::{NodeContext, NodeEntry, NodeInfo};
 use cerulion_core::graph::topology::GraphTopology;
 use cerulion_core::graph::{
     build_trigger_edges, derive_units, parse_graph, resolve_levels, resolve_source, validate_graph,
@@ -68,6 +77,7 @@ use cerulion_core::transport::{TransportConfig, TransportManager};
 use indexmap::IndexMap;
 use native_ros2_messages::std_msgs::Int32;
 use serial_test::serial;
+use tracing_test::traced_test;
 
 /// Every value every node read, tagged with the node and input it came
 /// through, in tick order. The comparison groups it per tag: a called member
@@ -766,6 +776,14 @@ impl Drop for DrainEnv {
     }
 }
 
+fn latest_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let mut f: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    f.insert("pace".into(), Box::new(CountEntry::new()));
+    f.insert("pick".into(), Box::new(PickerEntry::new()));
+    f.insert("last".into(), Box::new(LastSinkEntry::new()));
+    f
+}
+
 fn latest_run(fused: bool, separate: bool) -> Run {
     let _drain = separate.then(|| {
         std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
@@ -775,11 +793,7 @@ fn latest_run(fused: bool, separate: bool) -> Run {
         let _env = FuseEnv::set(if fused { "1" } else { "0" });
         let config = parse_graph(LATEST_GRAPH).expect("the latest graph must parse");
         validate_graph(&config).expect("the latest graph must validate");
-        let mut f: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
-        f.insert("pace".into(), Box::new(CountEntry::new()));
-        f.insert("pick".into(), Box::new(PickerEntry::new()));
-        f.insert("last".into(), Box::new(LastSinkEntry::new()));
-        GraphRuntime::build_for_test(config, f, Arc::new(VirtualClock::new()), 8)
+        GraphRuntime::build_for_test(config, latest_factories(), Arc::new(VirtualClock::new()), 8)
             .expect("the latest graph must build")
     };
     step_through(runtime)
@@ -1194,6 +1208,240 @@ fn infos_of(config: &GraphConfig, all: &IndexMap<String, NodeInfo>) -> IndexMap<
             (id, info)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// What the build says about the chain calls it forms.
+//
+// `src -> one -> bare -> end`: the census chains all four. `one` is called.
+// `bare` is a hand-written entry that declares no trigger policy, so the
+// runtime fires it on any input arrival and gives it no data-trigger binding
+// for a call to drain: the chain is cut there, and `bare` and `end` fire at
+// their own levels. In `pace -> pick -> last` on the separate drain the chain
+// is cut at its first member, so that build calls no member.
+// ---------------------------------------------------------------------------
+
+relay!(OneRelay, "one");
+sink!(EndSink, "end");
+
+const CUT_GRAPH: &str = r#"
+prefix: test/chain_call_cut
+nodes:
+  - id: src
+    type: count
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: one
+    type: relay
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: bare
+    type: bare
+    inputs:
+      - name: inp
+        source: one/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: end
+    type: sink
+    inputs:
+      - name: inp
+        source: bare/out
+"#;
+
+fn cut_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let mut f: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    f.insert("src".into(), Box::new(CountEntry::new()));
+    f.insert("one".into(), Box::new(OneRelayEntry::new()));
+    f.insert(
+        "bare".into(),
+        Box::new(ClosureNodeEntry::new(
+            NodeInfo::from_names(vec!["inp".into()], vec!["out".into()]),
+            |_ctx: &mut NodeContext| Ok(()),
+        )),
+    );
+    f.insert("end".into(), Box::new(EndSinkEntry::new()));
+    f
+}
+
+/// Build `yaml` with the seam at `seam` (`None` leaves it unset) and the
+/// drain forced separate when `separate`, and return the census chains the
+/// build judged.
+fn build_with_seam(
+    yaml: &str,
+    factories: IndexMap<String, Box<dyn NodeEntry>>,
+    seam: Option<&str>,
+    separate: bool,
+) -> Vec<Vec<String>> {
+    let _drain = separate.then(|| {
+        std::env::set_var("CERULION_DRAIN_DISCIPLINE", "separate");
+        DrainEnv
+    });
+    let _env = match seam {
+        Some(v) => Some(FuseEnv::set(v)),
+        None => {
+            std::env::remove_var(FUSE_CHAINS_ENV);
+            None
+        }
+    };
+    let config = parse_graph(yaml).expect("the graph must parse");
+    validate_graph(&config).expect("the graph must validate");
+    let infos: IndexMap<String, NodeInfo> = factories
+        .iter()
+        .map(|(id, e)| (id.clone(), e.info().expect("a macro node has its info")))
+        .collect();
+    let topology = GraphTopology::build(&config, &infos).expect("the topology");
+    let trigger_edges = build_trigger_edges(&config, &infos);
+    let levels = resolve_levels(&config, &topology, &trigger_edges).expect("levels");
+    let census = census_chains(
+        &config,
+        &infos,
+        &topology,
+        &trigger_edges,
+        &levels,
+        Colocation::SingleProcess,
+    );
+    GraphRuntime::build_for_test(config, factories, Arc::new(VirtualClock::new()), 8)
+        .expect("the graph must build");
+    census.chains().iter().map(|c| c.nodes.clone()).collect()
+}
+
+fn names(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|s| s.to_string()).collect()
+}
+
+/// The lines of the captured log that carry `needle`.
+fn lines_with<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
+    lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains(needle))
+        .collect()
+}
+
+const CUT: &str = "chain fusion: a census chain is cut at this member";
+const NONE_CALLED: &str = "chain fusion: this build calls no chain member";
+const CALLED: &str = "chain fusion: the chain members this build calls";
+const DECISION: &str = "chain fusion: the decision is resolved";
+const CENSUS: &str = "chain fusion: the chains this graph's declarations allow";
+
+/// One `warn` per cut, naming the chain head, the member and the reason, and
+/// one line naming the members the build calls.
+#[test]
+#[serial]
+#[traced_test]
+fn the_build_names_the_member_a_chain_is_cut_at_and_the_members_it_calls() {
+    let chains = build_with_seam(CUT_GRAPH, cut_factories(), Some("1"), false);
+    assert_eq!(chains, vec![names(&["src", "one", "bare", "end"])]);
+    logs_assert(|lines: &[&str]| {
+        let cuts = lines_with(lines, CUT);
+        let [cut] = cuts.as_slice() else {
+            return Err(format!("one cut, one cut line: {cuts:#?}"));
+        };
+        for want in [
+            "WARN",
+            "chain_head=src",
+            "member=bare",
+            "reason=no data-trigger binding",
+        ] {
+            if !cut.contains(want) {
+                return Err(format!("the cut line lacks {want:?}: {cut}"));
+            }
+        }
+        let called = lines_with(lines, CALLED);
+        let [line] = called.as_slice() else {
+            return Err(format!("one line names the members called: {called:#?}"));
+        };
+        if !line.contains("members=1") || !line.contains(r#"called=["one"]"#) {
+            return Err(format!("the called line names `one` alone: {line}"));
+        }
+        if !lines_with(lines, NONE_CALLED).is_empty() {
+            return Err("a build that calls a member says it calls none".into());
+        }
+        let decision = lines_with(lines, DECISION);
+        match decision.as_slice() {
+            [d] if d.contains("every callable chain member is called") => Ok(()),
+            _ => Err(format!(
+                "the decision line says every callable member: {decision:#?}"
+            )),
+        }
+    });
+}
+
+/// A chain cut at its first member: the build calls no member and says why.
+#[test]
+#[serial]
+#[traced_test]
+fn a_build_whose_every_chain_is_cut_at_its_first_member_says_it_calls_none() {
+    let chains = build_with_seam(LATEST_GRAPH, latest_factories(), Some("1"), true);
+    assert_eq!(chains, vec![names(&["pace", "pick", "last"])]);
+    logs_assert(|lines: &[&str]| {
+        let cuts = lines_with(lines, CUT);
+        let [cut] = cuts.as_slice() else {
+            return Err(format!("one cut, one cut line: {cuts:#?}"));
+        };
+        for want in [
+            "WARN",
+            "chain_head=pace",
+            "member=pick",
+            "reason=its trigger input drains on the separate discipline",
+        ] {
+            if !cut.contains(want) {
+                return Err(format!("the cut line lacks {want:?}: {cut}"));
+            }
+        }
+        let none = lines_with(lines, NONE_CALLED);
+        match none.as_slice() {
+            [line] if line.contains("reason=every census chain is cut at its first member") => {}
+            _ => {
+                return Err(format!(
+                    "one line says no member is called, and why: {none:#?}"
+                ))
+            }
+        }
+        if lines_with(lines, CALLED).is_empty() {
+            Ok(())
+        } else {
+            Err("a build that calls no member names members it calls".into())
+        }
+    });
+}
+
+/// With the seam off or unset the build forms no chain call and says nothing
+/// about one; the census lines it always logs are there.
+#[test]
+#[serial]
+#[traced_test]
+fn with_the_seam_off_the_build_says_nothing_about_chain_calls() {
+    let mut builds = 0;
+    for seam in [Some("0"), None] {
+        for separate in [false, true] {
+            build_with_seam(CUT_GRAPH, cut_factories(), seam, separate);
+            build_with_seam(LATEST_GRAPH, latest_factories(), seam, separate);
+            builds += 2;
+        }
+    }
+    logs_assert(|lines: &[&str]| {
+        let census = lines_with(lines, CENSUS).len();
+        if census != builds {
+            return Err(format!("{census} census lines for {builds} builds"));
+        }
+        for phrase in [CUT, NONE_CALLED, CALLED] {
+            let hits = lines_with(lines, phrase);
+            if !hits.is_empty() {
+                return Err(format!(
+                    "the seam is off and the build logs {phrase:?}: {hits:#?}"
+                ));
+            }
+        }
+        Ok(())
+    });
 }
 
 /// The mutants: each breaks one obligation of the chain call, and the

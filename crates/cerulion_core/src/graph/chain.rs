@@ -5,8 +5,8 @@
 //! Pure build-time analysis over [`GraphTopology`], [`TriggerEdges`],
 //! [`Levels`] and the run's colocation. It decides nothing at run time. The
 //! chains block of `cerulion graph levels` and the run directory's manifest
-//! print it, and when [`resolve_fusion`] is on the graph build turns its chains
-//! into chain calls.
+//! print it, and when [`resolve_fusion`] is on the graph build calls every
+//! callable member of its chains.
 //!
 //! # What a fused chain is
 //!
@@ -1187,8 +1187,15 @@ impl FusionSource {
 /// environment in one build could disagree, and a decision that varied within
 /// a build would make a replay a different program.
 ///
-/// When it is on, the graph build turns every census chain into chain calls
-/// (see [`GraphRuntime::chain_calls_made`](crate::graph::GraphRuntime::chain_calls_made)).
+/// When it is on, the graph build calls every callable member of each census
+/// chain (see
+/// [`GraphRuntime::chain_calls_made`](crate::graph::GraphRuntime::chain_calls_made)):
+/// a chain is cut at the first member that sits off the level its chain
+/// position names, is outside its level's non-block set, has a data-trigger
+/// binding count other than one, or drains on the separate discipline, and
+/// that member and the rest of its chain fire at their own levels. The build
+/// logs each cut at `warn`, naming the chain head, the member and the reason,
+/// and names the members it calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionDecision {
     enabled: bool,
@@ -1281,8 +1288,8 @@ pub fn log_fusion_decision(decision: &FusionDecision, census: &ChainCensus) {
     tracing::info!(
         enabled = decision.enabled(),
         decided_by = decision.source().label(),
-        "chain fusion: the decision is resolved; when enabled, every chain member is called \
-         from the step thread when its chain head's level ends"
+        "chain fusion: the decision is resolved; when enabled, every callable chain member is \
+         called from the step thread when its chain head's level ends"
     );
     tracing::info!(
         chains = census.chains().len(),
