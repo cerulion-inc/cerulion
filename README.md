@@ -19,7 +19,7 @@ For robotics engineers who run a ROS 2 stack or write native Rust nodes.
 
 ![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
 
-Install, sign in, then check your current code against a recording:
+Install, sign in, and once you have a recording, check your current code against it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
@@ -34,6 +34,8 @@ Connect your agent to Hindsight, which investigates MCAP recordings and cites to
 ```bash
 claude mcp add --transport stdio hindsight -- hindsight mcp
 ```
+
+The [agent guide](https://cerulion.com/guides/debug-robot-recordings-with-ai) shows the setup for Codex and Cursor.
 
 **[Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides) · [Benchmarks](https://cerulion.com/benchmarks) · [Talk to the team](https://cerulion.com/demo)**
 
@@ -439,6 +441,8 @@ Register the hosted endpoints with your client:
 claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
 claude mcp add --transport http hindsight https://mcp.cerulion.com/mcp/hindsight
 ```
+
+If you registered the local Hindsight server as `hindsight` above, give the hosted one another name, such as `hindsight-cloud`.
 
 For screenshots and viewport control, use Studio's built-in agent. Cerulion MCP exposes runtime tools and does not include Studio's viewport tools.
 
