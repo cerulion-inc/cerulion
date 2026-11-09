@@ -2174,9 +2174,11 @@ impl Scheduler {
         }
     }
 
-    /// Nanoseconds until the soonest pending `Period` fire,
-    /// or `None` if no enabled Period node has a pending deadline and no
-    /// enabled Data node carries a FIFO backlog (which reports due-NOW). PURE
+    /// Nanoseconds until the soonest pending fire, or `None` if no enabled
+    /// node has one. A Period node reports its next deadline; a node due NOW
+    /// reports 0: a Data node carrying a FIFO backlog, a Sync node carrying a
+    /// Sync backlog (a complete aligned set it has not fired), or an External
+    /// node with a pending mark (a fire a pre-fire check deferred). PURE
     /// READ — reads only `policy` + `next_fire_ns` + `pending_data_count` +
     /// `data_backlog_hint` + `sync_backlog_hint` + `external_triggered` + the
     /// disabled flag, and a due node's throttle
@@ -2217,13 +2219,14 @@ impl Scheduler {
                     // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
                     TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
                     // An External node whose mark the last step left set owes
-                    // a fire that nothing will ring for again: the sweep
-                    // drained its doorbell or pipe when it set the mark, and
-                    // a pre-fire check (a full `block` slot or `throttle_ms`)
-                    // deferred the fire. It is due NOW, so the throttle window
-                    // and the `block` hold below bound the wait at the instant
-                    // it can fire. An unmarked External node owes nothing and
-                    // adds no deadline.
+                    // a fire that a pre-fire check (a full `block` slot or
+                    // `throttle_ms`) deferred. For a doorbell or pipe source
+                    // nothing rings for it again: the sweep drained the source
+                    // when it set the mark. A device fd source stays ready
+                    // until the node reads it. Either way the node is due NOW,
+                    // so the throttle window and the `block` hold below bound
+                    // the wait at the instant it can fire. An unmarked
+                    // External node owes nothing and adds no deadline.
                     TriggerPolicy::External if n.external_triggered => Some(0),
                     _ => None,
                 }?;

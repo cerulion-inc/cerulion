@@ -290,6 +290,13 @@ pub struct CrossProcessWiring<'a> {
     /// built at least as deep as. `None` on every build but a replay pass,
     /// which builds a bag-fed input as deep as its recorded schedule fills it.
     pub(crate) input_depth_floors: Option<&'a std::collections::BTreeMap<(String, String), usize>>,
+    /// The paced-topic warnings this build logs. `None` (every single-process
+    /// build): the build derives them from its own topology, which is the
+    /// whole graph. `Some(list)` (a multi-process worker): it logs exactly
+    /// `list`, the warnings its supervisor derived from the whole graph for
+    /// the topics whose producer node this worker builds, because the
+    /// worker's own topology holds only its subgraph's consumers.
+    pub(crate) paced_topic_warnings: Option<&'a [super::topology::PacedTopicWarning]>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -301,6 +308,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_topics: None,
             sibling_consumed_topics: None,
             input_depth_floors: None,
+            paced_topic_warnings: None,
         }
     }
 
@@ -318,6 +326,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_topics: None,
             sibling_consumed_topics: None,
             input_depth_floors: None,
+            paced_topic_warnings: None,
         }
     }
 
@@ -335,6 +344,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_topics: None,
             sibling_consumed_topics: None,
             input_depth_floors: None,
+            paced_topic_warnings: None,
         }
     }
 
@@ -371,6 +381,19 @@ impl<'a> CrossProcessWiring<'a> {
         self.input_depth_floors
             .and_then(|floors| floors.get(&(node.to_string(), input.to_string())))
             .map_or(declared, |floor| declared.max(*floor))
+    }
+
+    /// Log exactly `warnings` as this build's paced-topic warnings, in place of
+    /// the ones its own topology would give. Chained onto one of the
+    /// constructors above: a multi-process worker passes its plan's list, and
+    /// a replay pass passes an empty one, because a replay takes its fires
+    /// from the recording and no producer defers.
+    pub fn with_paced_topic_warnings(
+        mut self,
+        warnings: &'a [super::topology::PacedTopicWarning],
+    ) -> Self {
+        self.paced_topic_warnings = Some(warnings);
+        self
     }
 
     /// Name the topics a SIBLING group PRODUCES for this worker, the inbound
@@ -5649,6 +5672,24 @@ impl GraphRuntime {
         // to the earlier path (incl. the algebraic-cycle diagnostic,
         // which now lives in `resolve_levels`).
         let levels = super::topology::resolve_levels(&config, &topology, &trigger_edges)?;
+        // One warning per topic whose `block` consumers pace its `drop_oldest`
+        // and `sample(N)` consumers, logged once here at load and never from a
+        // step. A planning build is torn down before any of its nodes runs, so
+        // it logs none; the worker that runs the producer logs its plan's.
+        if purpose == BuildPurpose::Execution {
+            let derived;
+            let paced: &[super::topology::PacedTopicWarning] =
+                match cross_process.paced_topic_warnings {
+                    Some(planned) => planned,
+                    None => {
+                        derived = topology.paced_topic_warnings();
+                        &derived
+                    }
+                };
+            for warning in paced {
+                warning.log(config.identity());
+            }
+        }
 
         // CHAIN FUSION, resolved once and logged once. The decision combines
         // the `CERULION_FUSE_CHAINS` seam with the per-node `fuse: false`

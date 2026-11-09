@@ -331,6 +331,104 @@ impl TopicFlow {
     pub fn sum_consumer_depths(&self) -> usize {
         self.consumers.iter().map(|c| c.depth).sum()
     }
+
+    /// The load-time warning for a topic whose `block` consumers pace its
+    /// `drop_oldest` and `sample(N)` consumers, or `None` unless the topic has
+    /// an in-graph producer, at least one `block` consumer and at least one
+    /// consumer of another policy.
+    ///
+    /// `block` consumers are listed smallest depth first; at one depth, one
+    /// with no `block_timeout_ms` (never released) first, then the longest
+    /// timeout; ties keep graph order. The paced consumers keep graph order.
+    // hot-path-alloc-ok-fn: cold: graph build, once per topic, before the first step
+    pub fn paced_topic_warning(&self) -> Option<PacedTopicWarning> {
+        let mut blocks: Vec<&ConsumerEdge> = self
+            .consumers
+            .iter()
+            .filter(|c| matches!(c.policy, BackpressurePolicy::Block))
+            .collect();
+        let paced: Vec<String> = self
+            .consumers
+            .iter()
+            .filter_map(|c| match c.policy {
+                BackpressurePolicy::Block => None,
+                BackpressurePolicy::DropOldest => {
+                    Some(format!("{}.{} (drop_oldest)", c.node_id, c.input))
+                }
+                BackpressurePolicy::Sample(ms) => {
+                    Some(format!("{}.{} (sample({ms}))", c.node_id, c.input))
+                }
+            })
+            .collect();
+        if self.producers.is_empty() || blocks.is_empty() || paced.is_empty() {
+            return None;
+        }
+        blocks.sort_by_key(|c| {
+            (
+                c.depth,
+                c.block_timeout_ms.is_some(),
+                std::cmp::Reverse(c.block_timeout_ms),
+            )
+        });
+        let block_consumers = blocks
+            .iter()
+            .map(|c| match c.block_timeout_ms {
+                Some(ms) => format!(
+                    "{}.{} (depth {}, block_timeout_ms {ms})",
+                    c.node_id, c.input, c.depth
+                ),
+                None => format!("{}.{} (depth {})", c.node_id, c.input, c.depth),
+            })
+            .collect();
+        Some(PacedTopicWarning {
+            topic: self.topic.clone(),
+            producer_nodes: self.producers.clone(),
+            block_consumers,
+            paced_consumers: paced,
+        })
+    }
+}
+
+/// One topic whose `block` consumers pace its `drop_oldest` and `sample(N)`
+/// consumers: the producer node defers while any `block` consumer's queue is
+/// full, so the others receive frames at the pace the `block` consumers allow.
+/// Built by [`TopicFlow::paced_topic_warning`] and logged once per build by
+/// [`Self::log`].
+///
+/// A multi-process supervisor builds these from the whole graph and hands each
+/// worker the ones whose producer node it builds, so a consumer in another
+/// process group is named too.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PacedTopicWarning {
+    /// The resolved absolute topic.
+    pub topic: String,
+    /// The topic's in-graph producer node ids.
+    pub producer_nodes: Vec<String>,
+    /// Each `block` consumer as `node.input (depth N)` or
+    /// `node.input (depth N, block_timeout_ms M)`, slowest declared first.
+    pub block_consumers: Vec<String>,
+    /// Each `drop_oldest` and `sample(N)` consumer as `node.input (drop_oldest)`
+    /// or `node.input (sample(N))`, in graph order.
+    pub paced_consumers: Vec<String>,
+}
+
+impl PacedTopicWarning {
+    /// Log this warning at `warn!`, naming `graph`.
+    // hot-path-alloc-ok-fn: cold: graph build, once per paced topic
+    pub fn log(&self, graph: &str) {
+        tracing::warn!(
+            graph = %graph,
+            topic = %self.topic,
+            producer_nodes = %self.producer_nodes.join(", "),
+            block_consumers = %self.block_consumers.join(", "),
+            paced_consumers = %self.paced_consumers.join(", "),
+            "mixed `block` topic: its `drop_oldest` and `sample(N)` consumers receive frames at \
+             the pace its `block` consumers allow, because the producer node defers while any \
+             `block` consumer's queue is full and a deferred node publishes on none of its \
+             outputs. `block_consumers` lists the slowest declared first"
+        );
+    }
 }
 
 /// Static, build-time model of the graph's dataflow (see module docs).
@@ -768,6 +866,15 @@ impl GraphTopology {
     /// Iterate every topic's flow, in deterministic graph order.
     pub fn topics(&self) -> impl Iterator<Item = &TopicFlow> {
         self.topics.values()
+    }
+
+    /// Every topic's [`TopicFlow::paced_topic_warning`], in graph order.
+    // hot-path-alloc-ok-fn: cold: graph build, once per build
+    pub fn paced_topic_warnings(&self) -> Vec<PacedTopicWarning> {
+        self.topics
+            .values()
+            .filter_map(TopicFlow::paced_topic_warning)
+            .collect()
     }
 
     /// The in-graph producer node ids for `topic` (empty when the topic is

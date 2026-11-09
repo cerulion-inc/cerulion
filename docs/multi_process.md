@@ -59,7 +59,14 @@ recording's per-edge read log offline).
   `block` consumer in another process. A split multi-producer `block` edge is
   still refused PRE-SPAWN (the word counts one producer's outstanding frames),
   and the refusal names the bar. The topic's non-`block` consumers hold no
-  word and may sit in any group. The derived partition still co-locates every
+  word and may sit in any group. A `block` consumer, split or not, defers the
+  producer's whole node, so wherever those `drop_oldest` and `sample(N)`
+  consumers sit they receive frames at the pace the `block` consumers allow.
+  The worker that runs the producer logs one load-time warning per such
+  topic, naming the consumers of every group, from the list the supervisor
+  derives from the whole graph (see
+  [Mixed topics](user-api.md#mixed-topics-each-block-consumer-holds-its-own-slot)).
+  The derived partition still co-locates every
   `block` topic's WHOLE FLOW automatically (crossing a boundary costs a real
   hop): its producers and all its consumers (shown in `graph partition`'s
   consent preview). When a `block` consumer's worker dies, the supervisor

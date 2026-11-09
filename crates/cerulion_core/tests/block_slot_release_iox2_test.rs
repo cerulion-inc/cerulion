@@ -18,7 +18,10 @@
 //! - the graph's `backpressure:` key turns a `drop_oldest` input into `block`;
 //! - a ring of `block` edges, `block` on a `network.ingress` topic, and the
 //!   graph's `backpressure: block` or `depth:` on an `#[input(accumulate)]`
-//!   input, are refused at build.
+//!   input, are refused at build;
+//! - a topic with `block` and `drop_oldest` or `sample(N)` consumers logs one
+//!   load-time warning naming who paces whom, and no other topic logs it; a
+//!   multi-process worker logs its plan's warnings in place of its own view.
 //!
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
 //! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off` and
@@ -37,6 +40,7 @@ use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
+use tracing_test::traced_test;
 
 const STEPS: u64 = 100;
 
@@ -107,6 +111,26 @@ struct HostDropOldest {
 
 #[cerulion_node_impl]
 impl HostDropOldest {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        Ok(())
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
+/// `sample(15)`, depth 2, ticks only when the test triggers it.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct HostSample {
+    #[input(backpressure = sample(15), depth = 2)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl HostSample {
     fn tick(&mut self) -> Result<(), NodeError> {
         let _ = self.inp.x;
         Ok(())
@@ -269,6 +293,7 @@ fn entry(ty: &str) -> Box<dyn NodeEntry> {
         "host_block" => Box::new(HostBlockEntry::new()),
         "fatal_block" => Box::new(FatalBlockEntry::new()),
         "host_drop_oldest" => Box::new(HostDropOldestEntry::new()),
+        "host_sample" => Box::new(HostSampleEntry::new()),
         "fast_drop_oldest" => Box::new(FastDropOldestEntry::new()),
         "relay" => Box::new(RelayEntry::new()),
         "host_accumulate" => Box::new(HostAccumulateEntry::new()),
@@ -863,4 +888,205 @@ fn the_graph_cannot_make_an_accumulate_input_block() {
     );
     // Control: the same graph without the keys builds.
     build(accumulate_graph(input("producer/out"))).expect("a plain accumulate input builds");
+}
+
+/// The message of the load-time warning a mixed `block` topic logs.
+const PACED_MESSAGE: &str = "mixed `block` topic: its `drop_oldest` and `sample(N)` consumers \
+     receive frames at the pace its `block` consumers allow, because the producer node defers \
+     while any `block` consumer's queue is full and a deferred node publishes on none of its \
+     outputs. `block_consumers` lists the slowest declared first";
+
+fn with_depth(mut i: InputDef, depth: usize) -> InputDef {
+    i.depth = Some(depth);
+    i
+}
+
+/// The captured lines that carry the paced-topic warning.
+fn paced_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains(PACED_MESSAGE))
+        .collect()
+}
+
+/// Exactly one paced-topic warning line, carrying `want` verbatim.
+fn one_paced_line(lines: &[&str], want: &str) -> Result<(), String> {
+    match paced_lines(lines).as_slice() {
+        [line] if line.contains(want) => Ok(()),
+        [line] => Err(format!(
+            "the warning line\n  {line}\ndoes not carry\n  {want}"
+        )),
+        other => Err(format!(
+            "expected exactly 1 paced-topic warning line, got {}: {other:#?}",
+            other.len()
+        )),
+    }
+}
+
+#[test]
+#[traced_test]
+fn a_mixed_topic_warns_once_at_load_naming_who_paces_whom() {
+    let topic = || input("producer/out");
+    let mut rt = build(config(
+        "bsr_warn",
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node("slow", "host_block", vec![topic()], vec![]),
+            node("fast", "fast_drop_oldest", vec![topic()], vec![]),
+            node(
+                "timed",
+                "host_block",
+                vec![with_timeout(topic(), 50)],
+                vec![],
+            ),
+            node("sampled", "host_sample", vec![topic()], vec![]),
+            node(
+                "tight",
+                "host_block",
+                vec![with_timeout(with_depth(topic(), 1), 200)],
+                vec![],
+            ),
+            node(
+                "long",
+                "host_block",
+                vec![with_timeout(topic(), 500)],
+                vec![],
+            ),
+        ],
+    ))
+    .expect("build");
+    // Smallest depth first; at one depth, no timeout (never released) first,
+    // then the longest timeout. The paced consumers keep graph order.
+    let want = format!(
+        "{PACED_MESSAGE} graph=bsr_warn_graph topic=/bsr_warn/producer/out \
+         producer_nodes=producer block_consumers=tight.inp (depth 1, block_timeout_ms 200), \
+         slow.inp (depth 2), long.inp (depth 2, block_timeout_ms 500), \
+         timed.inp (depth 2, block_timeout_ms 50) \
+         paced_consumers=fast.inp (drop_oldest), sampled.inp (sample(15))"
+    );
+    logs_assert(|lines: &[&str]| one_paced_line(lines, &want));
+    run(&mut rt, None, |_| {});
+    assert!(
+        deferred(&rt, "tight") > 0,
+        "the run defers its producer, so the steps below are ones a per-frame or per-defer \
+         warning would have logged in"
+    );
+    // Still one line after a hundred steps of publishes, defers and releases.
+    logs_assert(|lines: &[&str]| one_paced_line(lines, &want));
+}
+
+#[test]
+#[traced_test]
+fn only_a_topic_with_block_and_paced_consumers_warns() {
+    let mut rt = build(config(
+        "bsr_nowarn",
+        vec![
+            // All `block`.
+            node("all_block", "producer", vec![], vec![output("out")]),
+            node("b1", "host_block", vec![input("all_block/out")], vec![]),
+            node("b2", "host_block", vec![input("all_block/out")], vec![]),
+            // No `block`.
+            node("no_block", "producer", vec![], vec![output("out")]),
+            node(
+                "d1",
+                "fast_drop_oldest",
+                vec![input("no_block/out")],
+                vec![],
+            ),
+            node("s1", "host_sample", vec![input("no_block/out")], vec![]),
+            // Mixed.
+            node("mixed", "producer", vec![], vec![output("out")]),
+            node("b3", "host_block", vec![input("mixed/out")], vec![]),
+            node("d2", "fast_drop_oldest", vec![input("mixed/out")], vec![]),
+        ],
+    ))
+    .expect("build");
+    run(&mut rt, None, |_| {});
+    logs_assert(|lines: &[&str]| {
+        one_paced_line(
+            lines,
+            "topic=/bsr_nowarn/mixed/out producer_nodes=mixed block_consumers=b3.inp (depth 2) \
+             paced_consumers=d2.inp (drop_oldest)",
+        )
+    });
+    assert!(
+        !logs_contain("topic=/bsr_nowarn/all_block/out producer_nodes")
+            && !logs_contain("topic=/bsr_nowarn/no_block/out producer_nodes"),
+        "an all-`block` topic and a topic with no `block` consumer log no paced-topic warning"
+    );
+}
+
+/// The local graph of a multi-process worker that builds the producer of a
+/// mixed topic: `block` and `drop_oldest` consumers on the producer's topic.
+fn worker_graph(prefix: &str) -> GraphConfig {
+    config(
+        prefix,
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node("slow", "host_block", vec![input("producer/out")], vec![]),
+            node(
+                "fast",
+                "fast_drop_oldest",
+                vec![input("producer/out")],
+                vec![],
+            ),
+        ],
+    )
+}
+
+fn build_worker(
+    cfg: GraphConfig,
+    planned: &[cerulion_core::graph::PacedTopicWarning],
+) -> GraphRuntime {
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    for n in &cfg.nodes {
+        factories.insert(n.id.clone(), entry(&n.node_type));
+    }
+    GraphRuntime::build_for_test_with_policy_and_wiring(
+        cfg,
+        factories,
+        Arc::new(VirtualClock::new()),
+        64,
+        cerulion_core::MonitorWaitPolicy::off(),
+        cerulion_core::graph::CrossProcessWiring::none().with_paced_topic_warnings(planned),
+    )
+    .expect("build")
+}
+
+#[test]
+#[traced_test]
+fn a_worker_logs_its_plans_warning_in_place_of_its_own_view() {
+    // The supervisor's whole-graph warning names a consumer in another process
+    // group, which this worker's own topology cannot see.
+    let planned = vec![cerulion_core::graph::PacedTopicWarning {
+        topic: "/bsr_wplan/producer/out".to_string(),
+        producer_nodes: vec!["producer".to_string()],
+        block_consumers: vec!["slow.inp (depth 2)".to_string()],
+        paced_consumers: vec![
+            "fast.inp (drop_oldest)".to_string(),
+            "remote.inp (sample(40))".to_string(),
+        ],
+    }];
+    let _rt = build_worker(worker_graph("bsr_wplan"), &planned);
+    logs_assert(|lines: &[&str]| {
+        one_paced_line(
+            lines,
+            "graph=bsr_wplan_graph topic=/bsr_wplan/producer/out producer_nodes=producer \
+             block_consumers=slow.inp (depth 2) \
+             paced_consumers=fast.inp (drop_oldest), remote.inp (sample(40))",
+        )
+    });
+}
+
+#[test]
+#[traced_test]
+fn a_worker_whose_plan_names_no_paced_topic_logs_none() {
+    let _rt = build_worker(worker_graph("bsr_wnone"), &[]);
+    logs_assert(|lines: &[&str]| match paced_lines(lines).as_slice() {
+        [] => Ok(()),
+        other => Err(format!(
+            "a worker logs its plan's list, not its own view: {other:#?}"
+        )),
+    });
 }

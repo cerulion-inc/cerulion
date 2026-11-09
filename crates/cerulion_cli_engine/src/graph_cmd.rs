@@ -7648,7 +7648,8 @@ pub fn graph_run_worker(
         &credit_bindings,
     )
     .with_sibling_topics(&plan.sibling_topics)
-    .with_sibling_consumed_topics(&plan.sibling_consumed_topics);
+    .with_sibling_consumed_topics(&plan.sibling_consumed_topics)
+    .with_paced_topic_warnings(&plan.paced_topic_warnings);
 
     // (6) resolve the subgraph's node cdylibs. The plan's subgraph already holds
     // ONLY this worker's nodes, so this shares `graph_run`'s loader filtered to
@@ -10405,6 +10406,29 @@ fn stamp_credit_edges(
     }
 }
 
+/// Stamp into each worker plan the paced-topic warnings whose producer node is
+/// in that worker's subgraph. A `block` topic's producers all run in the unit
+/// of its `block` consumers (a split multi-producer `block` edge is refused),
+/// so one worker logs each warning. Pure (plan in, plan out).
+fn stamp_paced_topic_warnings(
+    plan: &mut crate::multiprocess::DeploymentPlan,
+    warnings: &[cerulion_core::graph::PacedTopicWarning],
+) {
+    for w in &mut plan.workers {
+        let members: std::collections::HashSet<&str> =
+            w.subgraph.nodes.iter().map(|n| n.id.as_str()).collect();
+        w.paced_topic_warnings = warnings
+            .iter()
+            .filter(|p| {
+                p.producer_nodes
+                    .iter()
+                    .any(|n| members.contains(n.as_str()))
+            })
+            .cloned()
+            .collect();
+    }
+}
+
 /// Stamp the user's `--no-cpu-dma-lock` opt-out into EVERY
 /// worker plan — if `graph_run_worker`'s (8.7) cap block hardcoded
 /// `CpuDmaLockMode::Auto`, an explicit opt-out would be silently ignored by
@@ -11570,6 +11594,13 @@ fn graph_run_supervisor(
         return Err(CliError::Validation(reason));
     }
     stamp_credit_edges(&mut plan, &credit_edges);
+    // Each worker logs the paced-topic warnings of the topics whose producer
+    // node it builds, derived here from the whole graph so a `drop_oldest` or
+    // `sample(N)` consumer in another process group is named too.
+    stamp_paced_topic_warnings(
+        &mut plan,
+        &loaded_topology_for_reconcile.paced_topic_warnings(),
+    );
     if !credit_edges.is_empty() {
         // Name the EDGES, not just a count. An
         // operator asking "did my split `block` edge really get a word?" is
@@ -42342,6 +42373,7 @@ mod worker_tests {
             sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
+            paced_topic_warnings: Vec::new(),
             // Not recording (every case fails before the ring seam).
             recording_ring: None,
             trace_ring: None,
@@ -43673,6 +43705,7 @@ mod supervisor_tests {
             sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
             sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             credit_edges: Vec::new(),
+            paced_topic_warnings: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,
             trace_ring: None,
@@ -44198,6 +44231,57 @@ mod supervisor_tests {
         empty.workers.clear();
         stamp_credit_edges(&mut empty, &edges);
         assert!(empty.workers.is_empty());
+    }
+
+    /// `stamp_paced_topic_warnings` hands each worker the warnings of the
+    /// topics whose producer node it builds, and no others, and the stamped
+    /// list survives the plan file.
+    #[test]
+    fn stamp_paced_topic_warnings_goes_to_the_producers_worker() {
+        use cerulion_core::graph::PacedTopicWarning;
+        let mut plan = bare_plan();
+        let node = |id: &str| cerulion_core::graph::config::NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: id.to_string(),
+            node_type: id.to_string(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        plan.workers[0].subgraph.nodes = vec![node("cam"), node("slow")];
+        plan.workers[1].subgraph.nodes = vec![node("lidar"), node("viz")];
+        let warning = |topic: &str, producer: &str| PacedTopicWarning {
+            topic: topic.to_string(),
+            producer_nodes: vec![producer.to_string()],
+            block_consumers: vec!["slow.inp (depth 2)".to_string()],
+            paced_consumers: vec!["viz.inp (drop_oldest)".to_string()],
+        };
+        let warnings = vec![
+            warning("/g/cam/out", "cam"),
+            warning("/g/lidar/out", "lidar"),
+        ];
+        stamp_paced_topic_warnings(&mut plan, &warnings);
+        assert_eq!(
+            plan.workers[0].paced_topic_warnings,
+            vec![warnings[0].clone()]
+        );
+        assert_eq!(
+            plan.workers[1].paced_topic_warnings,
+            vec![warnings[1].clone()]
+        );
+        let json = serde_json::to_string(&plan.workers[0]).expect("serialize the plan");
+        let back: WorkerPlan = serde_json::from_str(&json).expect("parse the plan");
+        assert_eq!(
+            back.paced_topic_warnings,
+            plan.workers[0].paced_topic_warnings
+        );
+        // A topic none of a worker's nodes produce stamps nothing on it.
+        stamp_paced_topic_warnings(&mut plan, &[warning("/g/far/out", "far")]);
+        assert!(plan
+            .workers
+            .iter()
+            .all(|w| w.paced_topic_warnings.is_empty()));
     }
 
     /// The ONE-RECIPE depth cross-check accepts an agreeing pair

@@ -262,7 +262,9 @@ hit**:
 | two or more in-graph producers | refused | the word counts ONE producer's outstanding frames; two writers would each spend the other's credit |
 
 A topic's non-`block` consumers are never constrained: they hold no credit and
-may sit in any group.
+may sit in any group. In any group they receive frames at the pace the topic's
+`block` consumers allow, because a `block` consumer defers the producer's whole
+node.
 
 It is a refusal rather than an automatic repair because the only degrade
 available would be silently rewriting `block` to `drop_oldest`, i.e. losing

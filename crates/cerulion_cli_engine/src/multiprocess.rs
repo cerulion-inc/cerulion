@@ -954,6 +954,15 @@ pub struct WorkerPlan {
     /// `block` edge representable, independent of how the ranks coordinate).
     #[serde(default)]
     pub credit_edges: Vec<CreditEdgePlan>,
+    /// The paced-topic warnings this worker logs at its build: one per topic
+    /// whose producer node is in this worker's subgraph and which has, in the
+    /// WHOLE graph, at least one `block` consumer and at least one
+    /// `drop_oldest` or `sample(N)` consumer. The supervisor derives them from
+    /// its loaded full-graph topology, so a consumer in another process group
+    /// is named. The worker logs exactly this list, not its own subgraph's
+    /// view. `#[serde(default)]`: a plan file without the key carries none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paced_topic_warnings: Vec<cerulion_core::graph::PacedTopicWarning>,
     /// Multi-process recording: the trace-ring tag this worker
     /// creates its scheduler-trace ring under
     /// (`cerulion_core::trace_ring::TraceRingOwner::create`), set by the
@@ -2262,6 +2271,10 @@ pub fn plan_deployment(
             // topology in the credit-wiring commit; the pure planner holds no
             // `NodeInfo`s and cannot see a `block` policy, so it mints none.
             credit_edges: Vec::new(),
+            // Derived by the supervisor from the loaded full-graph topology
+            // (`graph_cmd::stamp_paced_topic_warnings`); the pure planner
+            // cannot see a `block` policy, so it derives none.
+            paced_topic_warnings: Vec::new(),
             // The supervisor stamps the recording-ring tag
             // post-plan when `--record` is active; the pure planner
             // leaves it None (not recording).
