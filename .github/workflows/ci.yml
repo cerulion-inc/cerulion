@@ -4216,7 +4216,7 @@ jobs:
   # (it needs a live CycloneDDS peer), so what runs here is the pure decision
   # engine. The `humble` variant stays CHECK-only, as the project docs say.
   #
-  # TIMEOUT 40 -> 60. 40 was set at 2.4x the worst of this job's first six
+  # TIMEOUT 40 -> 75. 40 was set at 2.4x the worst of this job's first six
   # green legs (7.8 to 16.6 min). The job has since gained steps
   # (`cerulion_rcpd`, the umbrella crate, `cerulion_android_remote`) and a
   # larger `cerulion_remoted` suite, and the median green macOS leg on `main`
@@ -4238,16 +4238,20 @@ jobs:
   # on Linux. The 110 macOS legs of push, merge-queue and manual runs (which
   # run every step) from 11-07 to 11-10: p50 31.0, p95 at least 38.2 counting
   # the two cut at 40, worst green 39.1. Five such legs were cut at 40 from
-  # 11-03 to 11-10, four of them inside the umbrella step, the last step.
+  # 11-03 to 11-10, four of them inside the umbrella step, the last test step.
   # Linux over 11-07 to 11-10: p95 26.8, worst 27.6, none cut.
   #
-  # 60 is 1.57x that 38.2 and 1.53x the worst green leg, the 1.5x margin over
-  # the worst observed leg that `test-linux` keeps. A linear fit of job time on
-  # the speed index over the green macOS legs from 11-07, applied to all 439
-  # index values measured since 09-21, puts 10 of them over 40 and none over 60
-  # (the slowest lands just under it). The ceiling guards a HUNG job rather
-  # than rationing a healthy one, which is the rule this file applies
-  # everywhere; at 40 it cut legs that were slow, not hung.
+  # 75 is the 1.5x margin over the worst observed leg that `test-linux` keeps,
+  # taken over the legs that were cut rather than over the worst green one
+  # (39.1): a cut leg is only known to have run past 40. A linear fit of job
+  # time on the speed index over the green macOS legs from 11-07 puts the
+  # three cut legs of 11-04 and 11-06 at about 48 min had they run on, and 75
+  # is 1.56x that. Applied to all 439 index values measured since 09-21, the
+  # same fit puts 10 of them over 40 and the slowest at about 60, so a ceiling
+  # of 60 would leave no margin on that runner; 75 is 1.25x it. Linux takes
+  # the same value: the matrix shares one ceiling. The ceiling guards a HUNG
+  # job rather than rationing a healthy one, which is the rule this file
+  # applies everywhere; at 40 it cut legs that were slow, not hung.
   # ==========================================================================
 
       # Deletes from `target/` every unit no cargo command in this job read
@@ -4325,7 +4329,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       # `line-tables-only`, matching the other TEST jobs: backtraces keep
       # file:line (what makes a red run diagnosable) while the target dir stays
