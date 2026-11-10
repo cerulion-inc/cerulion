@@ -47,6 +47,14 @@
 //! the member's binding is no unified one, so the chain call is cut there and
 //! the member runs at its own level.
 //!
+//! A fourth graph gives a chain member an output topic that a node on no chain
+//! publishes too: `head -> relay -> member` sits on levels 0 to 2, and `other`
+//! publishes `member`'s topic at level 1. Queued, `other` publishes first;
+//! called, `member` does. A subscriber holds one queue per publisher and a
+//! read takes the next frame of the first queue, in connection order, that
+//! holds one, so a FIFO reader and a `consume = latest` reader of the topic at
+//! level 3 read the same frames in the same order in both runs.
+//!
 //! The build's log is checked as well. With the seam on, a chain is cut at
 //! the first member a call cannot drain, and the build logs one warning per
 //! cut naming the chain head, the member and the reason, then one line naming
@@ -1442,6 +1450,341 @@ fn with_the_seam_off_the_build_says_nothing_about_chain_calls() {
         }
         Ok(())
     });
+}
+
+// ---------------------------------------------------------------------------
+// A chain member that publishes a topic another node publishes too.
+//
+// `head -> relay -> member` sits on levels 0 to 2. `member` publishes
+// `/test/chain_call_shared/aux`, and so does `other`, at level 1 and on no
+// chain: `beat/out` also feeds `tap`, so `beat -> other` is a fan-out. `fifo`
+// reads every frame of the shared topic and `newest` the newest of each step,
+// both at level 3. Queued, `other` publishes at level 1 and `member` at level
+// 2; called, `member` publishes when level 0 ends, before `other` fires.
+//
+// A subscriber holds one queue per publisher and a read takes the next frame
+// of the first queue, in connection order, that holds one. So `fifo` reads a
+// step's frames one publisher at a time in the same order whichever of the
+// two published first, and `newest` reads the last of them.
+// ---------------------------------------------------------------------------
+
+relay!(SharedRelay, "relay");
+sink!(TapSink, "tap");
+sink!(FifoSink, "fifo");
+
+/// Publishes its frame on the shared topic.
+#[cerulion_node]
+#[derive(Default)]
+struct SharedMember {
+    #[input(trigger)]
+    inp: Int32,
+    #[output]
+    aux: Int32,
+}
+
+#[cerulion_node_impl]
+impl SharedMember {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let v = self.inp.data;
+        note("member", v);
+        self.aux.data = v;
+        Ok(())
+    }
+}
+
+/// Publishes its frame negated on the shared topic, so a reader can tell
+/// its frames from `member`'s.
+#[cerulion_node]
+#[derive(Default)]
+struct SharedOther {
+    #[input(trigger)]
+    inp: Int32,
+    #[output]
+    aux: Int32,
+}
+
+#[cerulion_node_impl]
+impl SharedOther {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let v = self.inp.data;
+        note("other", v);
+        self.aux.data = -v;
+        Ok(())
+    }
+}
+
+/// Fired by the newest frame of its `consume = latest` input.
+#[cerulion_node]
+#[derive(Default)]
+struct NewestSink {
+    #[input(trigger, consume = latest)]
+    inp: Int32,
+}
+
+#[cerulion_node_impl]
+impl NewestSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        note("newest", self.inp.data);
+        Ok(())
+    }
+}
+
+const SHARED_GRAPH: &str = r#"
+prefix: test/chain_call_shared
+multi_publisher_topics:
+  - /test/chain_call_shared/aux
+nodes:
+  - id: head
+    type: count
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: beat
+    type: count
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: relay
+    type: relay
+    inputs:
+      - name: inp
+        source: head/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: other
+    type: other
+    inputs:
+      - name: inp
+        source: beat/out
+    outputs:
+      - name: aux
+        schema: std_msgs/Int32
+        topic: /test/chain_call_shared/aux
+  - id: tap
+    type: sink
+    inputs:
+      - name: inp
+        source: beat/out
+  - id: member
+    type: member
+    inputs:
+      - name: inp
+        source: relay/out
+    outputs:
+      - name: aux
+        schema: std_msgs/Int32
+        topic: /test/chain_call_shared/aux
+  - id: fifo
+    type: sink
+    inputs:
+      - name: inp
+        source: /test/chain_call_shared/aux
+  - id: newest
+    type: newest
+    inputs:
+      - name: inp
+        source: /test/chain_call_shared/aux
+"#;
+
+fn shared_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let mut f: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    f.insert("head".into(), Box::new(CountEntry::new()));
+    f.insert("beat".into(), Box::new(CountEntry::new()));
+    f.insert("relay".into(), Box::new(SharedRelayEntry::new()));
+    f.insert("other".into(), Box::new(SharedOtherEntry::new()));
+    f.insert("tap".into(), Box::new(TapSinkEntry::new()));
+    f.insert("member".into(), Box::new(SharedMemberEntry::new()));
+    f.insert("fifo".into(), Box::new(FifoSinkEntry::new()));
+    f.insert("newest".into(), Box::new(NewestSinkEntry::new()));
+    f
+}
+
+fn shared_run(fused: bool) -> Run {
+    // Each run publishes under its own prefix, so its build creates the shared
+    // topic's service afresh, and a reader's connection order to the two
+    // publishers follows that build alone.
+    let prefix = if fused {
+        "chain_call_shared_called"
+    } else {
+        "chain_call_shared_queued"
+    };
+    let yaml = SHARED_GRAPH.replace("chain_call_shared", prefix);
+    let runtime = {
+        let _env = FuseEnv::set(if fused { "1" } else { "0" });
+        let config = parse_graph(&yaml).expect("the shared graph must parse");
+        validate_graph(&config).expect("the shared graph must validate");
+        GraphRuntime::build_for_test(config, shared_factories(), Arc::new(VirtualClock::new()), 8)
+            .expect("the shared graph must build")
+    };
+    step_through(runtime)
+}
+
+/// The steps a node fired at, one entry per fire, in trace order.
+fn fire_steps(run: &Run, node: &str) -> Vec<u64> {
+    run.trace
+        .iter()
+        .filter(|r| r.0 == node)
+        .map(|r| r.1)
+        .collect()
+}
+
+/// The shape both runs must have, and what `fifo` and `newest` read.
+///
+/// Returns, for every step in which `fifo` read frames of both publishers,
+/// whether the first frame it read that step was `member`'s.
+fn assert_shared_oracle(run: &Run, label: &str) -> Vec<bool> {
+    for (node, level) in [
+        ("head", 0),
+        ("beat", 0),
+        ("relay", 1),
+        ("other", 1),
+        ("member", 2),
+        ("fifo", 3),
+        ("newest", 3),
+    ] {
+        let levels: std::collections::BTreeSet<usize> = run
+            .trace
+            .iter()
+            .filter(|r| r.0 == node)
+            .map(|r| r.3)
+            .collect();
+        assert_eq!(
+            levels,
+            std::collections::BTreeSet::from([level]),
+            "{label}: {node} fires at level {level}"
+        );
+    }
+    let (member, other) = (stream(&run.frames, "member"), stream(&run.frames, "other"));
+    assert!(
+        member.len() >= STEPS + STEPS / 2 && other.len() >= STEPS + STEPS / 2,
+        "{label}: member read {} frames and other {} in {STEPS} steps; the multi-fire \
+         steps must reach both",
+        member.len(),
+        other.len()
+    );
+    // `fifo` reads every frame the two publish, one per fire.
+    let fifo = stream(&run.frames, "fifo");
+    let fifo_steps = fire_steps(run, "fifo");
+    assert_eq!(
+        fifo.len(),
+        fifo_steps.len(),
+        "{label}: one frame per fifo fire"
+    );
+    let mut published: Vec<i32> = member
+        .iter()
+        .copied()
+        .chain(other.iter().map(|v| -v))
+        .collect();
+    let mut read = fifo.clone();
+    published.sort_unstable();
+    read.sort_unstable();
+    assert_eq!(
+        read, published,
+        "{label}: fifo reads every frame published on the topic"
+    );
+    // Per step: `member`'s frames in its publish order, then or after `other`'s,
+    // never interleaved, and `newest` reads the last of them.
+    let newest = stream(&run.frames, "newest");
+    let newest_steps = fire_steps(run, "newest");
+    assert_eq!(
+        newest.len(),
+        newest_steps.len(),
+        "{label}: one frame per newest fire"
+    );
+    assert_eq!(
+        newest_steps.len(),
+        STEPS,
+        "{label}: newest fires once in every step"
+    );
+    let mut member_first = Vec::new();
+    for (s, newest_frame) in newest_steps.iter().zip(&newest) {
+        let frames: Vec<i32> = fifo_steps
+            .iter()
+            .zip(&fifo)
+            .filter(|(fs, _)| *fs == s)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(
+            frames.last(),
+            Some(newest_frame),
+            "{label}: at step {s} newest read {newest_frame} and fifo read {frames:?}"
+        );
+        let switches = frames
+            .windows(2)
+            .filter(|w| (w[0] > 0) != (w[1] > 0))
+            .count();
+        assert!(
+            switches <= 1,
+            "{label}: at step {s} fifo read the two publishers' frames interleaved: {frames:?}"
+        );
+        if switches == 1 {
+            member_first.push(frames[0] > 0);
+        }
+    }
+    assert!(
+        member_first.len() >= STEPS / 2,
+        "{label}: fifo read both publishers' frames in {} steps of {STEPS}",
+        member_first.len()
+    );
+    member_first
+}
+
+/// The census this graph's declarations give.
+fn shared_census_chains() -> Vec<Vec<String>> {
+    let config = parse_graph(SHARED_GRAPH).expect("the shared graph must parse");
+    let factories = shared_factories();
+    let infos: IndexMap<String, NodeInfo> = factories
+        .iter()
+        .map(|(id, e)| (id.clone(), e.info().expect("a macro node has its info")))
+        .collect();
+    let topology = GraphTopology::build(&config, &infos).expect("the topology");
+    let trigger_edges = build_trigger_edges(&config, &infos);
+    let levels = resolve_levels(&config, &topology, &trigger_edges).expect("levels");
+    let census = census_chains(
+        &config,
+        &infos,
+        &topology,
+        &trigger_edges,
+        &levels,
+        Colocation::SingleProcess,
+    );
+    census.chains().iter().map(|c| c.nodes.clone()).collect()
+}
+
+#[test]
+#[serial]
+fn a_member_publishing_a_topic_another_node_publishes_is_read_as_it_is_queued() {
+    assert_eq!(
+        shared_census_chains(),
+        vec![names(&["head", "relay", "member"])],
+        "the census chains head, relay and member"
+    );
+    let queued = shared_run(false);
+    let fused = shared_run(true);
+    assert_eq!(queued.calls, 0, "the queued run makes no chain call");
+    assert_eq!(
+        fused.calls,
+        (STEPS * 2) as u64,
+        "relay and member are called every step"
+    );
+    let queued_order = assert_shared_oracle(&queued, "queued");
+    let fused_order = assert_shared_oracle(&fused, "fused");
+    // Queued, `other` publishes before `member` in every step; called, after.
+    // `fifo` reads them in one order in every step of both runs.
+    let first = queued_order[0];
+    assert!(
+        queued_order.iter().chain(&fused_order).all(|m| *m == first),
+        "fifo reads the two publishers in one connection order: queued {queued_order:?}, \
+         fused {fused_order:?}"
+    );
+    eprintln!(
+        "fifo reads {}'s frames first in every step of both runs",
+        if first { "member" } else { "other" }
+    );
+    if let Err(e) = compare(&queued, &fused) {
+        panic!("{e}");
+    }
 }
 
 /// The mutants: each breaks one obligation of the chain call, and the

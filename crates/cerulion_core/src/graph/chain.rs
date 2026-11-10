@@ -92,6 +92,17 @@
 //! freezes them after the member's own level, when the queued member has
 //! published too. So a member may have no latest-value reader in that band.
 //!
+//! A member may publish a topic another in-graph node publishes too, and
+//! neither rule refuses it. Calling the member moves its publish ahead of the
+//! other producer's when that producer sits above the head's level and below
+//! the member's. A subscriber holds one queue per publisher, and a read takes
+//! the next frame of the first queue, in connection order, that holds one, so
+//! a reader that reads after both publishes reads the same frames in the same
+//! order whichever came first. A trigger reader of the topic sits above every
+//! producer's level and reads after both. A latest-value reader that could
+//! read between them sits at a level above the head's and at or below the
+//! member's, which is the reader rule's band.
+//!
 //! Both rules are scoped to in-graph nodes, which is what level order decides.
 //! A non-trigger input fed from outside the graph is frozen when the member is
 //! called rather than at the start of its own level, earlier in the same step:
