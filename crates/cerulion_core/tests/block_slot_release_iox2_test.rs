@@ -12,7 +12,9 @@
 //!   publishes receives every frame published after the release;
 //! - a multi-process worker refuses `block_timeout_ms` on a consumer input
 //!   its plan binds to a credit word shared with a producer in another
-//!   process, and builds the same input without the key;
+//!   process, and builds the same input without the key; a worker whose
+//!   plan binds another consumer of the topic builds a local input with the
+//!   key, releases that slot once and never forgives the shared word;
 //! - a single-producer edge with `block_timeout_ms` loads, is released once,
 //!   and its consumer then receives every frame published after the release
 //!   with the slot's count equal to the frames still queued;
@@ -936,6 +938,100 @@ fn block_timeout_on_a_split_edge_is_refused_at_the_consumers_build() {
         credit.mapped && !credit.block_timeout,
         "the input counts on the mapped word and carries no timeout: {credit:?}"
     );
+}
+
+/// A multi-process worker refuses `block_timeout_ms` per edge, not per topic
+/// or per plan. This worker runs the producer `src` and its `block` consumer
+/// `near` (depth 2, `block_timeout_ms: 50`), and its plan binds the same
+/// topic's consumer `far` in another process to a mapped word (depth 2), as
+/// in an executor unit that holds a producer and one of its consumers. The
+/// worker builds. `src` fires twice and fills both slots. `near` counts on a
+/// local word with its timeout, and once it has been full for 50 ms its slot
+/// is released exactly once: the mapped word still holds `src`, so `near`'s
+/// slot never fills again. The mapped word keeps its 2 frames, never forgiven or
+/// released. One drain on the far side frees `src` to fire a third frame,
+/// which `near`'s slot counts alone.
+#[test]
+fn a_timeout_beside_a_mapped_edge_of_its_topic_builds_and_is_released_once() {
+    let prefix = "bsr_split_near";
+    let topic = format!("/{prefix}/src/out");
+    let cfg = config(
+        prefix,
+        vec![
+            node("src", "producer", vec![], vec![output("out")]),
+            node(
+                "near",
+                "host_block",
+                vec![with_timeout(input("src/out"), 50)],
+                vec![],
+            ),
+        ],
+    );
+    let ns = format!("bsr_{}_{prefix}", std::process::id());
+    let id = credit_edge_id(&topic, "far", "inp");
+    let _owner = MappedCredit::create_owned(&ns, &id, 2).expect("the supervisor's word");
+    let producer_side =
+        Arc::new(MappedCredit::open_unowned(&ns, &id).expect("the producer's mapping"));
+    let far = MappedCredit::open_unowned(&ns, &id).expect("the far consumer's mapping");
+    let bind = [cerulion_core::graph::CreditBinding {
+        topic: topic.clone(),
+        consumer_node: "far".to_string(),
+        consumer_input: "inp".to_string(),
+        depth: 2,
+        role: cerulion_core::graph::CreditRole::Producer,
+        word: CreditWord::mapped(producer_side),
+        producer_slot: Some(cerulion_core::credit::ProducerSlot::new(0)),
+        producer_nodes: vec!["src".to_string()],
+    }];
+    let clock = Arc::new(VirtualClock::new());
+    let factories = factories_for(&cfg);
+    let mut rt = GraphRuntime::build_for_test_with_policy_and_wiring(
+        cfg,
+        factories,
+        Arc::clone(&clock),
+        64,
+        cerulion_core::MonitorWaitPolicy::off(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .expect("a local timeout edge beside a mapped edge of its topic builds");
+    let near = rt
+        .block_credits()
+        .find(|c| c.consumer_node == "near")
+        .expect("the local input reports its credit");
+    assert!(
+        !near.mapped && near.block_timeout,
+        "the local input counts on a local word and keeps its timeout: {near:?}"
+    );
+    // The build is a free-run one: it reads the clock and never advances it,
+    // so each step sets the clock one producer period on.
+    fn step(rt: &mut GraphRuntime, clock: &VirtualClock, k: u64) {
+        clock.set((k + 1) * 10_000_000);
+        rt.step(Duration::from_millis(10));
+    }
+    for k in 0..STEPS {
+        step(&mut rt, &clock, k);
+    }
+    assert_eq!(fires(&rt, "src"), 2, "both depth-2 slots filled, then held");
+    assert_eq!(releases(&rt, "near"), 1, "the timed-out local slot, once");
+    assert_eq!(outstanding(&rt, "near"), 0, "its 2 frames were forgiven");
+    assert_eq!(
+        (far.outstanding(), far.forgiven(), far.is_released()),
+        (2, 0, false),
+        "the mapped word still counts its 2 frames: nothing forgave or released it"
+    );
+    far.record_drained(1);
+    step(&mut rt, &clock, STEPS);
+    assert_eq!(
+        fires(&rt, "src"),
+        3,
+        "the far drain freed one frame and the released local slot held nothing"
+    );
+    assert_eq!(
+        outstanding(&rt, "near"),
+        1,
+        "the local slot counts the one frame published after its release"
+    );
+    assert_eq!(releases(&rt, "near"), 1, "and is not released again");
 }
 
 /// One `block` FIFO input fed by two publishers over real depth-2 iceoryx2
