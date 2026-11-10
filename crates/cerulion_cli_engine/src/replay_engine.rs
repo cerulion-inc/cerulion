@@ -4342,6 +4342,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 consults_recorded,
                 stages_every_consult,
                 stages_batch_frames,
+                identity: edge_identity,
                 kind_width,
                 catchup_onset,
                 trace: &trace,
@@ -8204,6 +8205,11 @@ struct PassInputs<'a> {
     /// multi-frame read, the shape this bag's recorder wrote
     /// (`replay_stages_batch_frames`)?
     stages_batch_frames: bool,
+    /// The producer annotation rule this bag's recorder staged its read log
+    /// under, the one this pass's read stages are wired with
+    /// (`ReplayWiring::identity`): [`cerulion_core::replay_feed::EdgeIdentity::EveryEdge`]
+    /// from [`READ_IDENTITY_MIN_TRACE_FORMAT`] on.
+    identity: cerulion_core::replay_feed::EdgeIdentity,
     /// How wide this bag's kind-6 kind field is.
     ///
     /// A SECOND term beside `roles_stamped` rather than a re-derivation of it,
@@ -10840,11 +10846,17 @@ impl PassVerification {
 /// verifier and the replay run ONE clamp (the Period rule derives the cap per
 /// step from it, exactly as the live scheduler does). A `None` minted here
 /// would run the re-derivation unclamped against a clamped recording.
+///
+/// `identity` is the producer annotation rule the recording staged its read
+/// log under, which a `consume = latest` input's declaration carries so the
+/// judge reads its writer runs as they were staged.
 fn node_trigger_decl(
     info: &cerulion_core::graph::NodeInfo,
     node_inputs: &[cerulion_core::graph::config::InputDef],
     arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     recorded_separate: &dyn Fn(&str) -> Option<bool>,
+    writers: &dyn Fn(&str) -> Option<u32>,
+    identity: cerulion_core::replay_feed::EdgeIdentity,
 ) -> replay_rederive::TriggerDecl {
     use cerulion_core::graph::node::MacroPolicy;
     // Trigger-marked ∩ WIRED, from the ONE shared rule the
@@ -10875,14 +10887,21 @@ fn node_trigger_decl(
             trigger_inputs,
         },
         Some(MacroPolicy::DataTrigger { input_name }) => {
-            if consumes_latest(info, &input_name) {
+            if let Some(depth) = latest_input_depth(info, &input_name) {
                 // The recording's own stage set, where the bag states one;
-                // the declared backpressure otherwise.
-                let separate_drain = recorded_separate(&input_name)
-                    .unwrap_or_else(|| reads_through_two_subscribers(info, &input_name));
+                // what the declaration settles otherwise.
+                let drain = match recorded_separate(&input_name) {
+                    Some(true) => replay_rederive::LatestDrain::Separate,
+                    Some(false) => replay_rederive::LatestDrain::Unified,
+                    None => declared_latest_drain(info, &input_name),
+                };
+                let writers = writers(&input_name);
                 replay_rederive::TriggerDecl::DataLatest {
                     trigger_inputs: vec![input_name],
-                    separate_drain,
+                    drain,
+                    writers,
+                    depth,
+                    identity,
                 }
             } else {
                 replay_rederive::TriggerDecl::Data {
@@ -11001,6 +11020,39 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
     m
 }
 
+/// The rank's nodes whose fire a `block` input in the same rank can hold, for
+/// [`replay_rederive::NodeDecl::feeds_local_block_edge`].
+///
+/// The rank's runtime builds a `GraphTopology` from the same subgraph and node
+/// infos, and installs a block pre-fire check on every in-graph producer of a
+/// topic whose every consumer reads it with `backpressure = block`
+/// (`TopicFlow::is_all_block`). A topic that mixes `block` with another policy
+/// degrades its `block` consumers to `drop_oldest` and installs none. This is
+/// that producer set, read off the same build.
+///
+/// # Errors
+///
+/// [`ReplayError::Internal`] when the topology does not build. The pass's
+/// runtime build calls the same `GraphTopology::build` on the same inputs and
+/// refuses it the same way.
+fn local_block_producers(
+    subgraph: &GraphConfig,
+    node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    rank: u32,
+) -> Result<BTreeSet<String>, ReplayError> {
+    let topology = cerulion_core::graph::topology::GraphTopology::build(subgraph, node_infos)
+        .map_err(|e| ReplayError::Internal {
+            reason: format!(
+                "failed to build rank {rank}'s graph topology for the fire re-derivation: {e}"
+            ),
+        })?;
+    Ok(topology
+        .topics()
+        .filter(|flow| flow.is_all_block())
+        .flat_map(|flow| flow.producers.iter().cloned())
+        .collect())
+}
+
 /// How ONE input's drain consumes its queue.
 ///
 /// The rule is the graph runtime's own, at the one site that knows it: a
@@ -11028,25 +11080,88 @@ fn input_consume_mode(
 /// Does `input` declare `consume = latest`? Read from the node's own
 /// `InputMeta`, the declaration the graph runtime wires from.
 fn consumes_latest(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
-    info.input_meta()
-        .iter()
-        .any(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
+    latest_input_depth(info, input).is_some()
 }
 
-/// Does this data-trigger input's declared backpressure keep it on two
-/// subscribers (`block` or `sample(N)`, the inputs `NodeInfo::unifies_data_trigger`
-/// refuses on policy)? The judge's latest rule reads it as
-/// `TriggerDecl::DataLatest::separate_drain` on a bag that states no per-input
-/// stage set ([`recorded_separate_drain`]).
-fn reads_through_two_subscribers(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+/// The declared queue depth of `input` when it declares `consume = latest`,
+/// read from the same `InputMeta` entry: the depth the graph runtime sizes the
+/// input's subscriber queues to on each publisher connection. `None` for an
+/// input that does not declare `consume = latest`.
+fn latest_input_depth(info: &cerulion_core::graph::NodeInfo, input: &str) -> Option<u32> {
+    info.input_meta()
+        .iter()
+        .find(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
+        .map(|m| u32::try_from(m.depth).unwrap_or(u32::MAX))
+}
+
+/// The drain a `consume = latest` data-trigger input's DECLARATION settles, for
+/// a bag that states no per-input stage set ([`recorded_separate_drain`]
+/// answers `None`).
+///
+/// `block` and `sample(N)` never read through one subscriber
+/// (`NodeInfo::unifies_data_trigger` refuses them on policy), so they are
+/// [`replay_rederive::LatestDrain::Separate`]. Every other input reads through
+/// one subscriber only when its entry answers `NodeEntry::unifies_trigger_drain`
+/// (a node library through its unified drain export, a closure unless built
+/// with `ClosureNodeEntry::with_unified_drain(false)`) and
+/// `CERULION_DRAIN_DISCIPLINE=separate` did not force two at the graph build.
+/// Such a bag records neither, and the replayed entry need not be the recorded
+/// one, so the input is
+/// [`replay_rederive::LatestDrain::Unrecorded`] and the judge stands the
+/// one-subscriber rule down on it.
+fn declared_latest_drain(
+    info: &cerulion_core::graph::NodeInfo,
+    input: &str,
+) -> replay_rederive::LatestDrain {
     use cerulion_core::graph::node::BackpressurePolicy;
-    info.input_meta().iter().any(|m| {
+    let never_unifies = info.input_meta().iter().any(|m| {
         m.name == input
             && matches!(
                 m.backpressure,
                 BackpressurePolicy::Block | BackpressurePolicy::Sample(_)
             )
-    })
+    });
+    if never_unifies {
+        replay_rederive::LatestDrain::Separate
+    } else {
+        replay_rederive::LatestDrain::Unrecorded
+    }
+}
+
+/// The writer a kind-6 record names, for
+/// [`replay_rederive::RecordedRead::writer`]: the whole aux word of a
+/// [`ReadOutcomeKind::Producer`] annotation, which is its producer token, and
+/// `None` on every other kind, whose aux word carries a pop count.
+fn recorded_writer(kind: ReadOutcomeKind, aux: u64) -> Option<u64> {
+    (kind == ReadOutcomeKind::Producer).then_some(aux)
+}
+
+/// The publishers the graph provisions `input`'s topic with, for
+/// [`replay_rederive::TriggerDecl::DataLatest`]'s `writers`.
+///
+/// A topic a graph node produces is provisioned single-writer
+/// (`max_publishers = 1`), so its writers are its graph producers; one the
+/// graph lists in `multi_publisher_topics` is provisioned with the shared
+/// [`cerulion_core::transport::MULTI_PUBLISHER_LOOSE_MAX`] cap, out-of-graph
+/// publishers included. A topic no graph node produces is provisioned with no
+/// publisher cap, so it has none (`None`), and so does an input `node_inputs`
+/// does not wire. The cap is what the graph asks for, and the transport
+/// enforces it only on a service the graph created, so the judge also counts
+/// the writers the read log names on the input.
+fn live_writer_cap(
+    config: &GraphConfig,
+    producers_by_topic: &BTreeMap<String, BTreeSet<(String, String)>>,
+    node_inputs: &[cerulion_core::graph::config::InputDef],
+    input: &str,
+) -> Option<u32> {
+    let source = &node_inputs.iter().find(|i| i.name == input)?.source;
+    let topic = cerulion_core::graph::resolve_source(&config.prefix, source);
+    let producers = producers_by_topic.get(&topic)?;
+    if config.is_multi_publisher(&topic) {
+        u32::try_from(cerulion_core::transport::MULTI_PUBLISHER_LOOSE_MAX).ok()
+    } else {
+        u32::try_from(producers.len()).ok()
+    }
 }
 
 /// How the recording read `node`'s `input`, from the per-input stage set its
@@ -11999,7 +12114,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// ELEVEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// TWELVE arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -12029,6 +12144,10 @@ fn prepare_pass_verification(
     // The armed capture plane the recording ran under, handed to the
     // Period rule so its per-step clamp mirrors the scheduler's.
     catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
+    // The producer annotation rule the recording staged its read log under,
+    // handed to the latest rule so it reads the writer runs as they were
+    // staged.
+    identity: cerulion_core::replay_feed::EdgeIdentity,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -12853,11 +12972,13 @@ fn prepare_pass_verification(
                 // agree on every archived bag and the flag is what makes the
                 // gate explicit rather than incidental.
                 role: r.role,
+                writer: recorded_writer(kind, r.aux),
             });
     }
 
     let producers = producers_by_topic(config);
     let local_nodes: BTreeSet<&str> = plan.members().iter().map(String::as_str).collect();
+    let block_producers = local_block_producers(plan.subgraph(), node_infos, plan.rank())?;
     let decls: Vec<replay_rederive::NodeDecl> = plan
         .members()
         .iter()
@@ -12871,13 +12992,19 @@ fn prepare_pass_verification(
                 .iter()
                 .find(|n| &n.id == id)
                 .map_or(&[], |n| n.inputs.as_slice());
-            let trigger = node_trigger_decl(info, wired, catchup_onset, &|input| {
-                recorded_separate_drain(&recorded_rims, &recorded_inputs, id, input)
-            });
+            let trigger = node_trigger_decl(
+                info,
+                wired,
+                catchup_onset,
+                &|input| recorded_separate_drain(&recorded_rims, &recorded_inputs, id, input),
+                &|input| live_writer_cap(config, &producers, wired, input),
+                identity,
+            );
             Some(replay_rederive::NodeDecl {
                 node_id: id.clone(),
                 trigger,
                 throttle_ns: info.throttle_ms().map(|ms| ms.saturating_mul(1_000_000)),
+                feeds_local_block_edge: block_producers.contains(id.as_str()),
                 has_non_trigger_inputs: node_has_non_trigger_inputs(info, wired),
                 trigger_input_capacities: trigger_input_capacities(
                     info,
@@ -13380,6 +13507,7 @@ fn plan_pass_verification(
         pass.roles_stamped,
         pass.kind_width,
         pass.catchup_onset,
+        pass.identity,
     )?;
     Ok(verification)
 }
@@ -18006,10 +18134,17 @@ impl InjectionWindow {
 
 #[cfg(test)]
 mod node_trigger_decl_tests {
-    use super::{node_trigger_decl, replay_rederive::TriggerDecl};
+    use super::{
+        node_trigger_decl,
+        replay_rederive::{LatestDrain, TriggerDecl},
+    };
     use cerulion_core::graph::config::InputDef;
     use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
+    use cerulion_core::replay_feed::EdgeIdentity;
     use cerulion_core::scheduler::sync_stamp::HeaderStampLocation;
+
+    /// The annotation rule every recording this build makes stages.
+    const EVERY_EDGE: EdgeIdentity = EdgeIdentity::EveryEdge;
 
     fn info(capture: bool) -> NodeInfo {
         let meta = |name: &str| InputMeta {
@@ -18051,14 +18186,28 @@ mod node_trigger_decl_tests {
     fn a_capture_time_sync_node_is_declared_apart_from_a_publish_time_one() {
         let both = vec!["cam".to_string(), "lidar".to_string()];
         assert_eq!(
-            node_trigger_decl(&info(false), &wired(), None, &|_| None),
+            node_trigger_decl(
+                &info(false),
+                &wired(),
+                None,
+                &|_| None,
+                &|_| None,
+                EVERY_EDGE
+            ),
             TriggerDecl::Sync {
                 window_ns: Some(10_000_000),
                 trigger_inputs: both.clone(),
             }
         );
         assert_eq!(
-            node_trigger_decl(&info(true), &wired(), None, &|_| None),
+            node_trigger_decl(
+                &info(true),
+                &wired(),
+                None,
+                &|_| None,
+                &|_| None,
+                EVERY_EDGE
+            ),
             TriggerDecl::SyncOnCaptureTime {
                 trigger_inputs: both
             }
@@ -18097,11 +18246,47 @@ mod node_trigger_decl_tests {
         let cam = vec!["cam".to_string()];
         let latest = data(InputConsume::Latest);
         let fifo = data(InputConsume::Fifo);
+        // The depth is the trigger input's declared one, 4.
+        let latest_on = |drain, writers| TriggerDecl::DataLatest {
+            trigger_inputs: cam.clone(),
+            drain,
+            writers,
+            depth: 4,
+            identity: EVERY_EDGE,
+        };
+        // A `drop_oldest` input on a bag that states no stage set: the bag
+        // records none of what decides its drain. The writer cap is the
+        // caller's, asked for the trigger input.
         assert_eq!(
-            node_trigger_decl(&latest, &wired, None, &|_| None),
+            node_trigger_decl(
+                &latest,
+                &wired,
+                None,
+                &|_| None,
+                &|input| {
+                    assert_eq!(input, "cam");
+                    Some(1)
+                },
+                EVERY_EDGE
+            ),
+            latest_on(LatestDrain::Unrecorded, Some(1))
+        );
+        // The annotation rule is the recording's, handed through.
+        assert_eq!(
+            node_trigger_decl(
+                &latest,
+                &wired,
+                None,
+                &|_| None,
+                &|_| Some(1),
+                EdgeIdentity::MultiWriterEdges
+            ),
             TriggerDecl::DataLatest {
                 trigger_inputs: cam.clone(),
-                separate_drain: false,
+                drain: LatestDrain::Unrecorded,
+                writers: Some(1),
+                depth: 4,
+                identity: EdgeIdentity::MultiWriterEdges,
             }
         );
         // `block` and `sample(N)` keep the input on two subscribers.
@@ -18111,47 +18296,194 @@ mod node_trigger_decl_tests {
                     &data_with(InputConsume::Latest, backpressure),
                     &wired,
                     None,
-                    &|_| None
+                    &|_| None,
+                    &|_| None,
+                    EVERY_EDGE
                 ),
-                TriggerDecl::DataLatest {
-                    trigger_inputs: cam.clone(),
-                    separate_drain: true,
-                },
+                latest_on(LatestDrain::Separate, None),
                 "{backpressure:?}"
             );
         }
         // The recording's stage set, where the bag states one, decides over
         // the declaration in both directions.
         assert_eq!(
-            node_trigger_decl(&latest, &wired, None, &|input| {
-                assert_eq!(input, "cam");
-                Some(true)
-            }),
-            TriggerDecl::DataLatest {
-                trigger_inputs: cam.clone(),
-                separate_drain: true,
-            }
+            node_trigger_decl(
+                &latest,
+                &wired,
+                None,
+                &|input| {
+                    assert_eq!(input, "cam");
+                    Some(true)
+                },
+                &|_| None,
+                EVERY_EDGE
+            ),
+            latest_on(LatestDrain::Separate, None)
         );
         assert_eq!(
             node_trigger_decl(
                 &data_with(InputConsume::Latest, BackpressurePolicy::Block),
                 &wired,
                 None,
-                &|_| Some(false)
+                &|_| Some(false),
+                &|_| None,
+                EVERY_EDGE
             ),
-            TriggerDecl::DataLatest {
-                trigger_inputs: cam.clone(),
-                separate_drain: false,
-            }
+            latest_on(LatestDrain::Unified, None)
         );
         assert_eq!(
-            node_trigger_decl(&fifo, &wired, None, &|_| None),
+            node_trigger_decl(&fifo, &wired, None, &|_| None, &|_| None, EVERY_EDGE),
             TriggerDecl::Data {
                 trigger_inputs: cam
             }
         );
         assert_eq!(input_consume_mode(&latest, "cam"), ConsumeMode::Latest);
         assert_eq!(input_consume_mode(&fifo, "cam"), ConsumeMode::EachFifo);
+    }
+
+    /// An older bag's `drop_oldest` latest input, whose node read it through
+    /// two subscribers (a library without the unified drain export, an
+    /// opted-out closure, or the drain override), recorded a step that popped
+    /// a frame an earlier read already took and fired nothing. Judged as one
+    /// subscriber that step is a false finding; declared from what the bag
+    /// records it re-derives clean and the step stands down by name. The same
+    /// declaration still convicts a node that never fires on its counted
+    /// frames.
+    #[test]
+    fn an_older_bags_drop_oldest_latest_input_stands_down_instead_of_being_judged_unified() {
+        use super::replay_rederive::{
+            verify, Decider, NodeDecl, PassRestore, PassStops, RecordedFire, RecordedRead,
+            RecordedStep, RoleTrust, StandDownReason,
+        };
+        use cerulion_core::graph::node::InputConsume;
+        use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+        let info = NodeInfo::with_meta(
+            vec![InputMeta {
+                name: "cam".to_string(),
+                schema_hash: 0,
+                trigger: true,
+                depth: 4,
+                backpressure: BackpressurePolicy::DropOldest,
+                expect_within_ms: None,
+                consume: InputConsume::Latest,
+            }],
+            vec![],
+        )
+        .with_policy(MacroPolicy::DataTrigger {
+            input_name: "cam".to_string(),
+        });
+        let wired = vec![InputDef {
+            name: "cam".to_string(),
+            source: "/cam".to_string(),
+        }];
+        let decl = |trigger| NodeDecl {
+            node_id: "sink".to_string(),
+            trigger,
+            throttle_ns: None,
+            feeds_local_block_edge: false,
+            has_non_trigger_inputs: false,
+            trigger_input_capacities: Default::default(),
+        };
+        let declared = decl(node_trigger_decl(
+            &info,
+            &wired,
+            None,
+            &|_| None,
+            &|_| Some(1),
+            cerulion_core::replay_feed::EdgeIdentity::EveryEdge,
+        ));
+        let rd = |kind, seq, popped, role| RecordedRead {
+            node_id: "sink".to_string(),
+            input: "cam".to_string(),
+            kind,
+            served_seq: Some(seq),
+            popped,
+            wire_stamp_ns: None,
+            role,
+            writer: None,
+        };
+        let at = |step: u64, fired: bool, reads| RecordedStep {
+            step,
+            clock_ns: step + 1,
+            fires: if fired {
+                vec![RecordedFire {
+                    node_id: "sink".to_string(),
+                    fire_time_ns: step + 1,
+                }]
+            } else {
+                vec![]
+            },
+            reads,
+        };
+        let took_it_already = vec![
+            at(
+                0,
+                true,
+                vec![
+                    rd(ReadOutcomeKind::DrainedBatch, 1, 1, ReadSiteRole::Drain),
+                    rd(ReadOutcomeKind::Served, 2, 2, ReadSiteRole::Body),
+                ],
+            ),
+            at(
+                1,
+                false,
+                vec![rd(ReadOutcomeKind::DrainedBatch, 2, 1, ReadSiteRole::Drain)],
+            ),
+        ];
+        let judge = |node: &NodeDecl, steps: &[RecordedStep]| {
+            verify(
+                std::slice::from_ref(node),
+                steps,
+                &[],
+                RoleTrust::from_stamped(true, true),
+                &PassRestore::none(),
+                &PassStops::none(),
+            )
+        };
+        let report = judge(&declared, &took_it_already);
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(report.stand_downs.len(), 1, "{:?}", report.stand_downs);
+        assert_eq!(report.stand_downs[0].decider, Decider::LatestFire);
+        assert_eq!(
+            report.stand_downs[0].reason,
+            StandDownReason::LatestDrainUnrecorded
+        );
+
+        // The anti-tautology half: the one-subscriber rule convicts that step.
+        let unified = decl(node_trigger_decl(
+            &info,
+            &wired,
+            None,
+            &|_| Some(false),
+            &|_| Some(1),
+            cerulion_core::replay_feed::EdgeIdentity::EveryEdge,
+        ));
+        assert_eq!(judge(&unified, &took_it_already).findings[0].step, 1);
+
+        // One frame counted a step and no fire: past the reads, the two
+        // frames one writer can be delivering and, before the first fire, one
+        // queue of the declared depth 4, the seventh count owes the fire. The
+        // annotation before the first count names the writer of every count.
+        let mut never_fired: Vec<RecordedStep> = (0..8u32)
+            .map(|s| {
+                at(
+                    u64::from(s),
+                    false,
+                    vec![rd(ReadOutcomeKind::DrainedBatch, s, 1, ReadSiteRole::Drain)],
+                )
+            })
+            .collect();
+        never_fired[0].reads.insert(
+            0,
+            RecordedRead {
+                writer: Some(0x5EED),
+                ..rd(ReadOutcomeKind::Producer, 0, 0, ReadSiteRole::Drain)
+            },
+        );
+        let regressed = judge(&declared, &never_fired);
+        assert_eq!(regressed.findings.len(), 1, "{:?}", regressed.findings);
+        assert_eq!(regressed.findings[0].step, 6);
+        assert!(regressed.findings[0].unread.is_some());
     }
 
     /// The recording's stage set names a latest input's drain discipline: a
@@ -31634,6 +31966,109 @@ mod trigger_input_capacity_tests {
         );
     }
 
+    /// A producer annotation hands the judge its whole 64-bit token, not the
+    /// low half its pop-count slot reads, and no other kind names a writer.
+    #[test]
+    fn a_producer_annotation_hands_the_judge_its_whole_token() {
+        const TOKEN: u64 = 0xDEAD_BEEF_0000_0007;
+        assert_eq!(
+            recorded_writer(ReadOutcomeKind::Producer, TOKEN),
+            Some(TOKEN)
+        );
+        for kind in [
+            ReadOutcomeKind::DrainedBatch,
+            ReadOutcomeKind::BatchFrame,
+            ReadOutcomeKind::Served,
+            ReadOutcomeKind::Truncated,
+        ] {
+            assert_eq!(recorded_writer(kind, TOKEN), None, "{kind:?}");
+        }
+    }
+
+    /// The writer cap a `consume = latest` input's unread-frame rule takes is
+    /// the topic's provisioned publisher cap while the recording ran: its one
+    /// graph producer on an unlisted topic, the shared loose cap on a listed
+    /// one (out-of-graph publishers may attach there), and none on a topic no
+    /// graph node produces or an input the node does not wire.
+    #[test]
+    fn a_latest_inputs_writer_cap_is_its_topics_provisioned_publisher_cap() {
+        use cerulion_core::graph::config::InputDef;
+        let yaml = "name: sb\nprefix: sb\nmulti_publisher_topics: [/sb/bus]\nnodes:\n\
+            \x20 - id: left\n    type: w\n    outputs:\n      - name: bus\n        schema: geometry_msgs/Vector3\n        topic: /sb/bus\n\
+            \x20 - id: right\n    type: w\n    outputs:\n      - name: bus\n        schema: geometry_msgs/Vector3\n        topic: /sb/bus\n\
+            \x20 - id: solo\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
+        let producers = producers_by_topic(&config);
+        let wired = |source: &str| {
+            vec![InputDef {
+                name: "cam".to_string(),
+                source: source.to_string(),
+            }]
+        };
+        let cap = |source: &str| live_writer_cap(&config, &producers, &wired(source), "cam");
+        assert_eq!(cap("/sb/solo/out"), Some(1));
+        assert_eq!(
+            cap("/sb/bus"),
+            u32::try_from(cerulion_core::transport::MULTI_PUBLISHER_LOOSE_MAX).ok()
+        );
+        assert_eq!(cap("/sb/ext"), None, "no graph producer: no cap");
+        assert_eq!(
+            live_writer_cap(&config, &producers, &wired("/sb/solo/out"), "lidar"),
+            None,
+            "an input the node does not wire"
+        );
+    }
+
+    /// A node is a local `block` producer when it produces a topic every
+    /// consumer in the rank reads with `backpressure = block`, the producers the
+    /// runtime installs a block pre-fire check on. `c` feeds `d`'s `block`
+    /// input; `e` feeds a `block` input and a `drop_oldest` one, which degrades
+    /// the `block` one and installs no check; `p` feeds a `drop_oldest` input.
+    #[test]
+    fn a_local_block_producer_is_a_producer_of_a_topic_every_rank_consumer_blocks_on() {
+        use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
+        let yaml = "name: lb\nprefix: lb\nnodes:\n\
+            \x20 - id: p\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+            \x20 - id: c\n    type: w\n    inputs:\n      - name: cam\n        source: p/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+            \x20 - id: d\n    type: w\n    inputs:\n      - name: cmd\n        source: c/out\n\
+            \x20 - id: e\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+            \x20 - id: f\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n\
+            \x20 - id: g\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
+        let reads = |name: &str, backpressure| {
+            NodeInfo::with_meta(
+                vec![InputMeta {
+                    name: name.to_string(),
+                    schema_hash: 0,
+                    trigger: true,
+                    depth: 1,
+                    backpressure,
+                    expect_within_ms: None,
+                    consume: InputConsume::Latest,
+                }],
+                vec![],
+            )
+        };
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert(
+            "c".to_string(),
+            reads("cam", BackpressurePolicy::DropOldest),
+        );
+        infos.insert("d".to_string(), reads("cmd", BackpressurePolicy::Block));
+        infos.insert("f".to_string(), reads("x", BackpressurePolicy::Block));
+        infos.insert("g".to_string(), reads("x", BackpressurePolicy::DropOldest));
+        let producers = local_block_producers(&config, &infos, 0).expect("builds");
+        assert_eq!(producers, BTreeSet::from(["c".to_string()]));
+
+        infos.insert("g".to_string(), reads("x", BackpressurePolicy::Block));
+        let producers = local_block_producers(&config, &infos, 0).expect("builds");
+        assert_eq!(
+            producers,
+            BTreeSet::from(["c".to_string(), "e".to_string()]),
+            "every consumer of e's topic blocks once g does"
+        );
+    }
+
     /// The connections a rank's consumer sees
     /// — every local producer publishes live (one connection each), the whole
     /// foreign set arrives through the pass's ONE injector. Hand oracles over
@@ -31837,6 +32272,7 @@ mod trailing_refill_tests {
                 trigger_inputs: vec!["inp".to_string()],
             },
             throttle_ns: throttled.then_some(1_000_000),
+            feeds_local_block_edge: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
         }
@@ -31852,6 +32288,7 @@ mod trailing_refill_tests {
                 popped: 1,
                 wire_stamp_ns: None,
                 role: ReadSiteRole::Drain,
+                writer: None,
             })
             .collect()
     }
