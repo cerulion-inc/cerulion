@@ -5,12 +5,12 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::transport::{TransportConfig, TransportManager};
@@ -24,6 +24,9 @@ use serde_json::{json, Value};
 const CATALOG_REFUSAL: &str = "account catalog authorization revoked";
 const SCHEMA_REFUSAL: &str = "account schema authorization revoked";
 const ROUTE_REFUSAL: &str = "account robot route requires 64 lowercase hexadecimal digits";
+/// SO_RCVTIMEO and SO_SNDTIMEO on the test client's control socket: each recv
+/// or send gives up after this long.
+const BOUND: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct RefusingPlane {
@@ -76,12 +79,8 @@ struct Client {
 impl Client {
     fn connect(socket: &std::path::Path) -> Self {
         let writer = UnixStream::connect(socket).expect("connect test daemon");
-        writer
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        writer
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        writer.set_read_timeout(Some(BOUND)).unwrap();
+        writer.set_write_timeout(Some(BOUND)).unwrap();
         let mut reader = BufReader::new(writer.try_clone().unwrap());
         let mut hello = String::new();
         reader.read_line(&mut hello).expect("read hello");
@@ -90,9 +89,23 @@ impl Client {
     }
 
     fn request(&mut self, request: Value) -> Value {
+        let started = Instant::now();
         writeln!(self.writer, "{request}").expect("write request");
         let mut reply = String::new();
-        assert_ne!(self.reader.read_line(&mut reply).unwrap(), 0);
+        match self.reader.read_line(&mut reply) {
+            Ok(read) => assert_ne!(
+                read, 0,
+                "the daemon closed the connection before it answered {request}"
+            ),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                panic!(
+                    "no complete reply to {request} within {BOUND:?} ({:?} elapsed, \
+                     received {reply:?}): {error}",
+                    started.elapsed()
+                )
+            }
+            Err(error) => panic!("reading the reply to {request}: {error}"),
+        }
         serde_json::from_str(&reply).expect("reply JSON")
     }
 
