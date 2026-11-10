@@ -26,7 +26,12 @@
 //! the woken entities it found ready readable for the next call's entry pass
 //! (and a subscription take leaves its listener the same way) and drains the
 //! woken entities it found not ready; a wake that finds nothing ready drains,
-//! then probes again. The 20 ms
+//! then probes again. A pass on which `pump_publisher_events` ran probes every
+//! attached entity instead, so it drains the woken entities first and then
+//! probes, as an entry pass does: its ready return leaves drained whatever
+//! notification the woken entities held at that drain, and a notification that
+//! lands after a bell wake's drain stays readable for the next call's entry
+//! pass. The 20 ms
 //! cap keeps `pump_publisher_events` at its TRANSIENT_LOCAL late-joiner
 //! cadence, and makes the loop a strict SUPERSET of a plain polling loop: a
 //! missed, dropped or never-sent wake degrades to a 20 ms cadence, never a
@@ -346,9 +351,11 @@ enum ParkRef {
 enum Phase {
     /// Call entry: nothing is known — one `poll(fds, 0)` + a FULL SHM probe.
     Entry,
-    /// A block WOKE (fd or bell): drain/probe only what fired.
+    /// A block WOKE (fd or bell): drain/probe only what fired. A pass whose
+    /// publisher-event pump ran drains what fired, then probes every entity.
     Woke,
-    /// A block timed out with nothing: nothing new can be ready.
+    /// A block timed out with nothing: nothing new can be ready. A pass whose
+    /// publisher-event pump ran still probes every entity.
     Timeout,
 }
 
@@ -781,9 +788,11 @@ pub struct WaitSetData {
     /// the one full pass per call the rmw contract needs (a second queued
     /// sample has no notification left to fire an fd for).
     pub probes_entry: AtomicU64,
-    /// SHM readiness probes run AFTER a wake: the fired entities, or the
-    /// rung bell's subscriptions; never the whole set (a wake whose probe finds
-    /// nothing ready probes them again after its drain).
+    /// SHM readiness probes run by every pass but an entry pass. After a wake:
+    /// the fired entities, or the rung bell's subscriptions (a wake whose probe
+    /// finds nothing ready probes them again after its drain); after a timed-out
+    /// block: none. A pass whose publisher-event pump ran, woken or after a
+    /// timed-out block, probes every attached entity.
     pub probes_wake: AtomicU64,
     /// The entity behind each watched fd, parallel to `fd_set`.
     fd_entities: Mutex<Vec<EntityRef>>,

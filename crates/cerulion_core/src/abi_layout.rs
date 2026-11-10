@@ -81,8 +81,8 @@
 //! | the `Box` itself | `NodeContext`, `ShutdownSignal` |
 //! | its two `IndexMap` values | `AnyPublisher`, `AnySubscriber` |
 //! | those enums' payloads | `CerulionPublisher`, `CerulionSubscriber` |
-//! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
-//! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch` |
+//! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `DrainClipLatch`, `FailureRegimeLatch`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
+//! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch`, `BlockSendHook` |
 //! | the v12/v16 read-outcome chain | `ReadOutcomeStage`, `StageInner`, `StagedReadOutcome`, `ReadOutcomeKind`, `ReadSiteRole`, `ReadStageRole` |
 //! | the QoS store the node drains | `QosEventStore` |
 //! | `NodeContext.transport` (`graph/node.rs`) | `TransportManager` |
@@ -328,7 +328,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 31;
+const EXPECTED_ABI: u32 = 32;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -410,6 +410,8 @@ static EXPECTED: &[Expected] = &[
             "fault_inject_publish_raw_after",
             "fault_inject_send_overflow_frame_after",
             "fault_inject_send_raw_loan",
+            // v31: the send-window test seam, `None` outside a test.
+            "block_send_hook",
             "frames_dropped_overflow",
             "frames_dropped_invariant_violation",
             "frames_dropped_send_fail",
@@ -433,14 +435,25 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS_AND_DOORBELL,
-            // Re-measured at ABI 26 on aarch64-apple-darwin, the one target this
-            // row's arm judges: the doorbell field's rank moved from 19 to 3 and
-            // the sixteen fields ranked 3 to 18 each moved up by one. No other
-            // field moved, and the field SET did not change.
+            // Re-measured at ABI 31 on aarch64-apple-darwin, the one target this
+            // row's arm judges (`dump_measured_table`): `block_send_hook` takes
+            // rank 2, and every field ranked 2 or above before it moves up by
+            // one.
             ranks: &[
-                8, 9, 0, 1, 12, 35, 6, 29, 30, 10, 28, 13, 14, 31, 15, 4, 5, 32, 16, 17, 18, 2, 19,
-                3, 11, 20, 21, 36, 33, 37, 22, 23, 24, 25, 26, 34, 7, 27,
+                9, 10, 0, 1, 13, 36, 7, 30, 31, 11, 29, 14, 15, 32, 16, 5, 6, 33, 2, 17, 18, 19, 3,
+                20, 4, 12, 21, 22, 37, 34, 38, 23, 24, 25, 26, 27, 35, 8, 28,
             ],
+        },
+    },
+    // v31: the send-window test seam the publisher holds by value. Its
+    // variants hold a `std` box or nothing.
+    Expected {
+        name: "BlockSendHook",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 8,
+            offsets: &[],
         },
     },
     Expected {
@@ -487,11 +500,12 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS,
-            // Re-measured at ABI 30 on aarch64-apple-darwin (`dump_measured_table`):
-            // `batch_frames` takes rank 2 and every field ranked 2 or above
-            // before it moves up by one.
+            // Re-measured at ABI 31 on aarch64-apple-darwin (`dump_measured_table`):
+            // `probe` grows with `BlockProbe` and moves from rank 10 to rank 8,
+            // and `topic` and `drain_scratch`, ranked 8 and 9 before it, each
+            // move up by one.
             ranks: &[
-                8, 11, 6, 0, 10, 7, 12, 2, 13, 14, 9, 15, 20, 1, 3, 25, 21, 4, 5, 26, 16, 22, 23,
+                9, 11, 6, 0, 8, 7, 12, 2, 13, 14, 10, 15, 20, 1, 3, 25, 21, 4, 5, 26, 16, 22, 23,
                 17, 24, 18, 19,
             ],
         },
@@ -548,11 +562,36 @@ static EXPECTED: &[Expected] = &[
             "regime_started_ns",
             "regime_count",
             "buffer_capacity",
+            // v31: the flood-suppression latch of drains clipped at 0.
+            "drain_clips",
         ],
+        // v31: `drain_clips` (a 56-byte `RefCell<DrainClipLatch>`) lands at
+        // 72 and moves `armed` from 72 to 128; the struct grows 80 -> 136
+        // (MEASURED via `dump_measured_table`).
         layout: Layout::Pinned {
-            size: 80,
+            size: 136,
             align: 8,
-            offsets: &[0, 40, 16, 24, 72, 48, 56, 64],
+            offsets: &[0, 40, 16, 24, 128, 48, 56, 64, 72],
+        },
+    },
+    // v31: held by value in `BlockProbe.drain_clips`, inside a `RefCell`.
+    Expected {
+        name: "DrainClipLatch",
+        fields: &["latch", "clean_run", "close_after"],
+        layout: Layout::Pinned {
+            size: 48,
+            align: 8,
+            offsets: &[16, 0, 8],
+        },
+    },
+    // v31: held by value in `DrainClipLatch.latch`.
+    Expected {
+        name: "FailureRegimeLatch",
+        fields: &["failing", "suppressed", "total_failures", "next_decade"],
+        layout: Layout::Pinned {
+            size: 32,
+            align: 8,
+            offsets: &[24, 0, 8, 16],
         },
     },
     Expected {
@@ -563,18 +602,18 @@ static EXPECTED: &[Expected] = &[
             ranks: &[0, 2, 3, 1],
         },
     },
-    // This row did NOT move when `BlockProbe` grew 72 -> 80.
-    // An enum is sized by its LARGEST variant, and that is `DropOldestProbe`
-    // (120) — so the 8-byte growth of a smaller variant is absorbed by padding
-    // that already existed. Recorded because the obvious reading of "BlockProbe
-    // grew" is that its enclosing enum grew too, and a future reader
-    // re-snapshotting on that assumption would be chasing a number that is
-    // correct.
+    // An enum is at least as large as its LARGEST variant, plus room for its
+    // tag unless a niche of that variant holds it. This row did not move when
+    // `BlockProbe` grew 72 -> 80, because `DropOldestProbe` (120) was the
+    // largest and the growth fit in padding that already existed. At v31
+    // `BlockProbe` grows 80 -> 136 and becomes the largest variant, and the
+    // enum measures 136, the same size, so its tag sits in a niche of
+    // `BlockProbe` (MEASURED via `dump_measured_table`).
     Expected {
         name: "BackpressureProbe",
         fields: &[],
         layout: Layout::Pinned {
-            size: 120,
+            size: 136,
             align: 8,
             offsets: &[],
         },
@@ -1011,6 +1050,7 @@ static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
         ),
     ),
     ("ConsumeMode", EnumPayload::NothingFirstParty),
+    ("BlockSendHook", EnumPayload::NothingFirstParty),
     ("ReadOutcomeKind", EnumPayload::NothingFirstParty),
     ("ReadSiteRole", EnumPayload::NothingFirstParty),
     ("ReadStageRole", EnumPayload::NothingFirstParty),
@@ -1052,6 +1092,8 @@ fn measured() -> Vec<MeasuredStruct> {
     all.extend(crate::transport::adaptive_sizer::abi_layout_pins());
     all.extend(crate::transport::notify_delivery_latch::abi_layout_pins());
     all.extend(crate::transport::output_discard_latch::abi_layout_pins());
+    all.extend(crate::transport::failure_regime_latch::abi_layout_pins());
+    all.extend(crate::transport::drain_clip_latch::abi_layout_pins());
     all.extend(crate::wire::abi_layout_pins());
     all.extend(crate::read_outcome::abi_layout_pins());
     all.extend(crate::scheduler::handle::abi_layout_pins());

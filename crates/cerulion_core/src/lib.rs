@@ -827,18 +827,42 @@ pub mod wire;
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
-/// - v31: the `block` credit word ([`credit::CreditShared`]) grows from 24 to
+/// - v31: a `block` frame is counted on its credit words BEFORE `send()`
+///   makes it visible, and the count is taken back when the send errs.
+///   `OutputProxy`'s drop is generic, so the count runs in code compiled into
+///   every node library: a library built against an earlier core still counts
+///   after `send()` returns, where a consumer in another process can pop the
+///   frame and record its drain first, and the late count leaves the word one
+///   frame above an empty queue. `CerulionPublisher` gains `block_send_hook`,
+///   the send-window test seam (`transport::publisher::BlockSendHook`,
+///   `None` outside a test), and `BlockProbe` gains `drain_clips`, the
+///   `DrainClipLatch` that reports a drain the word's saturating subtraction
+///   clipped at 0, so `BlockProbe` grows from 80 to 136 bytes and the
+///   `BackpressureProbe` that holds it from 120 to 136.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+///
+/// - v32: the `block` credit word ([`credit::CreditShared`]) grows from 24 to
 ///   32 bytes with a `released` word at byte 24, the sticky per-consumer slot
-///   release, and the publish increment reads it before counting. Its `u64`
+///   release, and the publish count reads it before counting. Its `u64`
 ///   at byte 0 packs four counts (frames queued, frames a timeout release
 ///   forgave that are still queued, and frames held in the matcher's slots,
 ///   counted and forgiven), and a `connections` word at byte 28 sizes the
-///   consumer's queues for the forgiven backlog. A node library compiles its
-///   own copy of that increment (the publisher's) and of the drain (the
-///   subscriber's `BlockProbe`), both reached through the `CreditWord` the
-///   host hands it, so the two copies must agree on the word's layout: a
-///   library built against v30 or earlier counts into a released slot, reads
-///   the packed `u64` as one count, and reads the word at its 24-byte size.
+///   consumer's queues for the forgiven backlog. `CerulionPublisher`'s
+///   `block_outstanding` holds one `BlockCountSlot` per `block` consumer of
+///   the topic: the consumer's credit word and the take-back of the frame
+///   being sent ([`credit::PublishUndo`]). A publish counts on every slot
+///   word before `send()`; a send that errs puts a slot word back by
+///   compare-exchange to the counts the count replaced, the forgiven backlog
+///   included, or subtracts one queued frame when another writer moved the
+///   word since the count. A drain returns [`credit::Drained`], the forgiven
+///   frames it paid and the frames it clipped at 0. A node library compiles
+///   its own copy of the count and the take-back (the publisher's) and of
+///   the drain (the subscriber's `BlockProbe`), both reached through the
+///   `CreditWord` the host hands it, so the two copies must agree on the
+///   word's layout: a library built against v31 or earlier reads the packed
+///   `u64` as one count, takes a count back by subtracting from it, counts
+///   into a released slot, and reads the word at its 24-byte size.
 ///   `BackpressureCounters`, held by the same probe, gains
 ///   `block_slot_releases_count`.
 ///   [`graph::node::InputMeta`] gains `accumulate`, and a node library's info
@@ -847,7 +871,12 @@ pub mod wire;
 ///   unchanged.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 31;
+///
+///   RENUMBERED 31 -> 32 at the merge of `main`. This change and `main`'s
+///   v31 count before `send()` were developed in parallel and each bumped
+///   30 -> 31 for a DIFFERENT layout. The merged host is v32 and refuses both
+///   v30 and v31 cdylibs.
+pub const CERULION_ABI_VERSION: u32 = 32;
 
 // Re-export commonly used types
 #[cfg(unix)]

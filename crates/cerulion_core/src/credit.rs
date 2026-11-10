@@ -78,6 +78,60 @@
 //! overwhelmingly common shape) get this word. [`CreditShared::try_claim`] is
 //! sound as a CLAIM only under that fence; see its docs.
 //!
+//! # When the count is exact, and where it stops
+//!
+//! A producer counts a frame on the word BEFORE the frame becomes visible:
+//! every send path of `CerulionPublisher` counts on each block word, then
+//! sends, and takes the count back when the send errs
+//! ([`CreditShared::record_published_with_undo`],
+//! [`CreditShared::record_unpublished`]).
+//! iceoryx2 publishes a frame to a consumer with a `Release` store inside
+//! `send()`, the consumer's pop is an `Acquire` load of it and its drain comes
+//! after the pop, so a drain never finds the word without the count of a frame
+//! it removes, however the two processes are scheduled.
+//!
+//! The take-back is exact under iceoryx2's default safe overflow (on) and
+//! default degradation action (`Warn`): with both, a `send()` that returns
+//! `Err` delivered the frame to no connection. Cerulion sets neither. No
+//! publisher sets a degradation handler, and safe overflow comes from the
+//! iceoryx2 configuration the process loads, which an operator `iceoryx2.toml`
+//! can change: with `enable-safe-overflow = false`, a `send()` to several
+//! consumers can return `Err` after some of their queues took the frame, and
+//! the take-back then leaves each of those words one frame below its queue.
+//! `credit_block_iox2_test::the_block_publisher_keeps_safe_overflow_and_the_default_degradation`
+//! reads safe overflow from a block topic's service built under the test
+//! configuration, which carries iceoryx2's compiled-in defaults, and scans the
+//! workspace for a degradation handler, so it pins those defaults and no
+//! operator file.
+//!
+//! What this does NOT cover. Each case leaves the word off by the frames
+//! involved for as long as the edge runs:
+//!
+//! - **Frames the word never counts.** Native history delivered to a late
+//!   joiner (graph build warns about a `block` topic with `history_size > 0`),
+//!   and a writer outside the graph on a `multi_publisher_topics` topic. Their
+//!   drains leave the word BELOW the queue, so the producer can overrun the
+//!   declared depth. A drain that removes more frames than the word counts
+//!   clips the word at 0, and is reported once per regime and counted by the
+//!   consumer (`CerulionSubscriber::block_drains_clipped`); a drain the word's
+//!   count still covers is indistinguishable from a counted drain.
+//! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
+//!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
+//!   without touching the word, so a `block` input read through them leaves
+//!   the word ABOVE the queue.
+//! - **A send that returns `Ok` without reaching this consumer's queue**, such
+//!   as one to a consumer whose port connected after the send updated its
+//!   connections: the frame stays counted and no drain ever pays for it.
+//! - **Several in-graph producers across processes on one edge.** Graph
+//!   planning refuses that shape (`CreditBar::MultipleProducers`) rather than
+//!   counting it.
+//!
+//! One window is transient rather than lasting: a frame moving from the queue
+//! into a per-set Sync matcher slot is drained at its pop and credited back as
+//! held by the slot re-derivation just after, so between the two the word reads
+//! one frame low. A publish admitted in that instant cannot evict a counted
+//! frame, because the frame being moved has already left the queue.
+//!
 //! # Scope of this module
 //!
 //! The primitive ONLY. The runtime, the scheduler and the plan
@@ -418,6 +472,16 @@ impl Counts {
         }
     }
 
+    /// A frame [`Self::published`] counted reached no queue: one queued
+    /// frame comes off, saturating at zero. The backlog and the held counts
+    /// stay.
+    fn unpublished(self) -> Self {
+        Self {
+            queued: self.queued.saturating_sub(1),
+            ..self
+        }
+    }
+
     /// `removed` frames left the consumer's queue, oldest first: the
     /// forgiven frames go first, then counted ones (saturating at zero).
     fn drained(self, removed: u64) -> Self {
@@ -507,6 +571,55 @@ impl Counts {
             backlog: u16::try_from(backlog).unwrap_or(u16::MAX),
             held: 0,
             held_forgiven: self.held_forgiven.saturating_add(self.held),
+        }
+    }
+}
+
+/// The take-back of one count
+/// [`CreditShared::record_published_with_undo`] took: the packed counts its
+/// RMW replaced and the packed counts it stored.
+/// [`CreditShared::record_unpublished`] consumes it when the frame's send
+/// reaches no queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishUndo {
+    replaced: u64,
+    stored: u64,
+}
+
+/// What one drain RMW did to a credit word, read off the counts it replaced
+/// and the counts it stored ([`CreditShared::record_drained`]).
+///
+/// The drain removes the forgiven backlog first, then queued frames, and
+/// saturates at 0, so `removed` frames split three ways: `paid` forgiven
+/// frames, the queued frames the drain took off, and `clipped` frames past
+/// both. Held frames take no part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Drained {
+    /// Forgiven backlog frames this drain paid: the first frames it removed,
+    /// so the last frame removed is a forgiven one only when every removed
+    /// frame was. `0` on a word no timeout release forgave.
+    pub paid: u64,
+    /// Frames removed past the forgiven backlog and the queued count, which
+    /// the saturating subtraction could not take off once the word reached 0.
+    /// The publisher counts a frame before its send makes it visible, so a
+    /// clip means the drain removed frames the word never counted (a late
+    /// joiner's history replay, a writer outside the graph on a
+    /// `multi_publisher_topics` topic, or a count another drain already
+    /// took). The consumer's block probe reports it once per regime
+    /// (`CerulionSubscriber::block_drains_clipped`).
+    pub clipped: u64,
+}
+
+impl Drained {
+    /// The split of a drain of `removed` frames whose RMW replaced `prev`
+    /// with `next`. In `u64`, so a `removed` past `u32::MAX`, where the queued
+    /// subtraction saturates, still clips by the frames it did not take off.
+    fn between(removed: u64, prev: Counts, next: Counts) -> Self {
+        let paid = u64::from(prev.backlog - next.backlog);
+        let taken = u64::from(prev.queued - next.queued);
+        Self {
+            paid,
+            clipped: removed - paid - taken,
         }
     }
 }
@@ -660,9 +773,21 @@ impl CreditShared {
         !self.is_full()
     }
 
-    /// Record that one frame was published to this edge's topic — the consumer's
-    /// queue just gained a sample. Returns the `outstanding` count THIS publish
-    /// created.
+    /// Record that one frame is being published to this edge's topic. Returns
+    /// the `outstanding` count THIS publish created.
+    ///
+    /// The publisher takes this count through
+    /// [`record_published_with_undo`](Self::record_published_with_undo)
+    /// BEFORE `send()` makes the frame visible
+    /// (`CerulionPublisher::send_counted`), and takes it back with
+    /// [`record_unpublished`](Self::record_unpublished) when the send reaches
+    /// no queue. The order is what keeps a consumer in another process exact:
+    /// the count is sequenced before the queue push, the push is a `Release`
+    /// store and the consumer's pop an `Acquire` load of it, and the drain is
+    /// sequenced after the pop, so the drain of a frame always finds that
+    /// frame's count on the word. A count taken after `send()` returns can land
+    /// after the drain of the frame it counts; the drain then saturates at 0
+    /// and the late count leaves the word one frame above an empty queue.
     ///
     /// `Release` so the producer's own subsequent `Acquire` defer-read, and the
     /// consumer's, see a consistent count. Deliberately issues NO wake: nothing
@@ -738,6 +863,85 @@ impl CreditShared {
         next.outstanding()
     }
 
+    /// Count one frame as [`record_published`](Self::record_published) does,
+    /// and return the token that takes exactly this count back. The publisher
+    /// calls this on every block word BEFORE `send()` makes the frame visible
+    /// (`CerulionPublisher::send_counted`) and hands the token to
+    /// [`record_unpublished`](Self::record_unpublished) when the send reaches
+    /// no queue.
+    ///
+    /// The token holds the packed counts the RMW replaced and the counts it
+    /// stored, so a take-back can restore the forgiven backlog the count
+    /// clamped as well as the queued count it raised.
+    ///
+    /// `None` on a released slot ([`Self::release_slot`]): the count counts
+    /// nothing there, so there is nothing to take back.
+    #[must_use = "the token is the only way to take this count back when the send fails"]
+    pub fn record_published_with_undo(&self) -> Option<PublishUndo> {
+        if self.is_released() {
+            return None;
+        }
+        let (prev, next) = self.update_counts(Ordering::Release, |c| {
+            c.published(1, || self.queue_capacity())
+        });
+        Some(PublishUndo {
+            replaced: prev.pack(),
+            stored: next.pack(),
+        })
+    }
+
+    /// Take back the count [`record_published_with_undo`](Self::record_published_with_undo)
+    /// took for a send that reached no queue. Returns the count against depth
+    /// ([`Self::outstanding`]) after the take-back.
+    ///
+    /// The inverse of the count, for the one publish whose `send()` returned
+    /// an error: with safe overflow on and the default degradation action, an
+    /// iceoryx2 send that errs pushed the frame to no connection, so no
+    /// consumer can ever drain it and the count it took must not stand.
+    ///
+    /// When the word still holds the counts the count stored, ONE
+    /// compare-exchange puts back the counts it replaced, the forgiven backlog
+    /// included. That is the arm a local word takes: its producer and consumer
+    /// fire one at a time on one thread, so nothing moves the word between the
+    /// count and the take-back. A word equal to the stored counts is exact to
+    /// restore even after other writes in between, because their net effect
+    /// on the word is then nothing.
+    ///
+    /// When another writer moved the word since the count (a consumer in
+    /// another process drained it, or [`Self::release_slot`] zeroed it), the
+    /// take-back subtracts one queued frame, saturating at 0: a drain of a
+    /// frame the word never counted can take the count away first, and a
+    /// wrapping subtraction would then read `u32::MAX`, which defers the
+    /// producer forever. That subtraction is exact because such a word holds
+    /// no backlog: graph load refuses `block_timeout_ms` on an edge that
+    /// counts on a [`CreditWord::Mapped`] word and on a topic with several
+    /// producers, and a released slot holds no counts.
+    ///
+    /// Issues no wake on either arm: the frame never reached a queue, so no
+    /// room a producer could be parked for has been freed.
+    pub fn record_unpublished(&self, undo: PublishUndo) -> u64 {
+        if self
+            .counts
+            .compare_exchange(
+                undo.stored,
+                undo.replaced,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Counts::unpack(undo.replaced).outstanding();
+        }
+        let (_, next) = self.update_counts(Ordering::Release, |c| {
+            debug_assert_eq!(
+                c.backlog, 0,
+                "a take-back subtracts only on a word with no forgiven backlog"
+            );
+            c.unpublished()
+        });
+        next.outstanding()
+    }
+
     /// Record that `removed` samples were drained from the consumer's queue —
     /// decrement the mirror and FREE the credit (bumping the wake epoch and
     /// waking any parked producer).
@@ -758,17 +962,16 @@ impl CreditShared {
     /// Under k-fires-per-step this is called PER POPPED FRAME by the post-FIFO
     /// drain, which is why the epoch bump has to be cheap when nobody parks.
     ///
-    /// Returns how many of the `removed` frames were forgiven ones, the
-    /// backlog this RMW paid. They are the first frames the drain removed, so
-    /// the last one removed is forgiven only when every removed frame was. A
-    /// word no release forgave returns `0`.
-    pub fn record_drained(&self, removed: u64) -> u64 {
+    /// Returns what the drain did, read off this one RMW ([`Drained`]): the
+    /// forgiven frames it paid, and the frames it removed past both the
+    /// backlog and the queued count, which the subtraction clipped at 0.
+    pub fn record_drained(&self, removed: u64) -> Drained {
         if removed == 0 {
-            return 0;
+            return Drained::default();
         }
         let (prev, next) = self.update_counts(Ordering::Release, |c| c.drained(removed));
         self.note_credit_freed();
-        u64::from(prev.backlog - next.backlog)
+        Drained::between(removed, prev, next)
     }
 
     /// [`Self::record_drained`] and the empty-queue resync in ONE RMW: the
@@ -779,18 +982,18 @@ impl CreditShared {
     /// zero word is one load. Private to this module: [`CreditWord`] calls it
     /// on a local word only.
     ///
-    /// Returns the forgiven frames the drain half paid, as
-    /// [`Self::record_drained`] does; the backlog the resync zeroes left the
-    /// queue unread and is not counted.
-    fn record_drained_and_emptied(&self, removed: u64) -> u64 {
+    /// Returns what the drain half did, as [`Self::record_drained`] does; the
+    /// queued count and the backlog the resync zeroes left the queue unread,
+    /// so they are neither paid nor clipped.
+    fn record_drained_and_emptied(&self, removed: u64) -> Drained {
         let mut changed = false;
-        let mut paid = 0;
+        let mut drain = Drained::default();
         let _ = self
             .counts
             .try_update(Ordering::Release, Ordering::Acquire, |v| {
                 let current = Counts::unpack(v);
                 let drained = current.drained(removed);
-                paid = current.backlog - drained.backlog;
+                drain = Drained::between(removed, current, drained);
                 let next = drained.emptied();
                 changed = next != current;
                 changed.then(|| next.pack())
@@ -798,7 +1001,7 @@ impl CreditShared {
         if removed != 0 || changed {
             self.note_credit_freed();
         }
-        u64::from(paid)
+        drain
     }
 
     /// Record that frames the consumer popped from its queue now sit in its
@@ -2240,7 +2443,8 @@ impl CreditWord {
     /// `receive` and the RMW, and the runtime's local wiring guarantees it:
     /// every producer and consumer of a `block` topic fires one at a time on
     /// the thread that steps their level loop, an executor unit keeps them
-    /// together, and a publish counts its frame after sending it. It clears
+    /// together, and a publish counts its frame and sends it inside its
+    /// producer's fire, so no count is ever left waiting for its push. It clears
     /// the excess the backlog bound leaves on a word with several connections
     /// ([`CreditShared::record_published_n`]): once the consumer has drained
     /// everything it was sent, the slot counts only the frames its matcher's
@@ -2254,9 +2458,12 @@ impl CreditWord {
     /// carries no timeout, and graph load refuses `block_timeout_ms` on such
     /// an edge), so it holds no backlog for a zeroing to clear.
     ///
-    /// Returns the forgiven frames the drain paid, as
-    /// [`CreditShared::record_drained`] does: `0` on a mapped word.
-    pub fn record_drained_to_empty(&self, removed: u64) -> u64 {
+    /// Returns what the drain did, as [`CreditShared::record_drained`] does:
+    /// the forgiven frames it paid, `0` on a mapped word, and the frames it
+    /// clipped at 0. On a local word both come from the drain half of the
+    /// RMW: the queued count and the backlog the resync zeroes were never
+    /// removed, so they count as neither.
+    pub fn record_drained_to_empty(&self, removed: u64) -> Drained {
         match self {
             Self::Local(shared) => shared.record_drained_and_emptied(removed),
             Self::Mapped(mapped) => mapped.record_drained(removed),
@@ -2412,6 +2619,96 @@ mod tests {
         // wrapping to u64::MAX and deferring the producer forever.
         w.record_drained(99);
         assert_eq!(w.outstanding(), 0);
+    }
+
+    /// `record_unpublished` takes back the one count its token recorded and
+    /// returns the count it left. Oracle, by hand, on a depth-4 word holding
+    /// 3: a counted publish reads 4 and its take-back leaves 3. On a word at
+    /// 0: a counted publish reads 1, a drain of 1 takes the word to 0 before
+    /// the take-back, and the take-back then leaves it at 0 and returns 0. A
+    /// wrapping subtraction there would read `u32::MAX`, past any depth.
+    #[test]
+    fn a_take_back_removes_one_count_and_stops_at_zero() {
+        let w = CreditShared::new(4);
+        assert_eq!(w.record_published_n(3), 3);
+        let undo = w
+            .record_published_with_undo()
+            .expect("an armed slot counts the publish");
+        assert_eq!(w.outstanding(), 4, "the count before the send");
+        assert_eq!(w.record_unpublished(undo), 3, "4 -> 3");
+        assert_eq!(w.outstanding(), 3);
+
+        let w = CreditShared::new(4);
+        let undo = w
+            .record_published_with_undo()
+            .expect("an armed slot counts the publish");
+        assert_eq!(w.outstanding(), 1);
+        w.record_drained(1);
+        assert_eq!(w.outstanding(), 0, "a drain took the count first");
+        assert_eq!(w.record_unpublished(undo), 0, "a take-back on a word at 0");
+        assert_eq!(w.outstanding(), 0, "leaves the word at 0, never u32::MAX");
+        assert!(w.try_claim(), "so the producer is admitted");
+    }
+
+    /// A take-back rings no wake on either arm: the frame never reached a
+    /// queue, so it freed no room a parked producer waits for. Oracle:
+    /// `wake_seq` reads the same before and after the restore arm (the word
+    /// still holds what the count stored) and the subtract arm (a second
+    /// count moved the word: 2 -> 1), where a drain of one frame bumps it by
+    /// one.
+    #[test]
+    fn a_take_back_rings_no_wake() {
+        let w = CreditShared::new(2);
+        let undo = w
+            .record_published_with_undo()
+            .expect("an armed slot counts the publish");
+        let before = w.wake_seq_snapshot();
+        assert_eq!(w.record_unpublished(undo), 0, "the restore arm");
+        assert_eq!(w.wake_seq_snapshot(), before, "no ring on a restore");
+        let undo = w
+            .record_published_with_undo()
+            .expect("an armed slot counts the publish");
+        w.record_published();
+        assert_eq!(w.record_unpublished(undo), 1, "the subtract arm");
+        assert_eq!(w.wake_seq_snapshot(), before, "no ring on a subtract");
+        assert_eq!(w.record_drained(1), Drained::default());
+        assert_eq!(
+            w.wake_seq_snapshot(),
+            before.wrapping_add(1),
+            "the control: a drain of one counted frame rings once"
+        );
+    }
+
+    /// On a word no release forgave, `record_drained` pays nothing and
+    /// returns as clipped the frames its subtraction could not take off
+    /// because the word reached 0. Oracle vectors, by hand, as `(word before,
+    /// removed) -> (clipped, word after)`: `(2, 1) -> (0, 1)`, `(1, 1) -> (0,
+    /// 0)`, `(1, 99) -> (98, 0)`, `(0, 1) -> (1, 0)`, `(3, 0) -> (0, 3)`, and
+    /// a removal past `u32::MAX`, `(3, u64::MAX) -> (u64::MAX - 3, 0)`.
+    #[test]
+    fn a_drain_returns_the_frames_it_could_not_take_off() {
+        let vectors: [(u64, u64, u64, u64); 6] = [
+            (2, 1, 0, 1),
+            (1, 1, 0, 0),
+            (1, 99, 98, 0),
+            (0, 1, 1, 0),
+            (3, 0, 0, 3),
+            (3, u64::MAX, u64::MAX - 3, 0),
+        ];
+        for (before, removed, clipped, after) in vectors {
+            let w = CreditShared::new(4);
+            assert_eq!(w.record_published_n(before), before);
+            assert_eq!(
+                w.record_drained(removed),
+                Drained { paid: 0, clipped },
+                "a drain of {removed} on a word at {before} pays nothing and clips {clipped}"
+            );
+            assert_eq!(
+                w.outstanding(),
+                after,
+                "and leaves the word at {after} (drain of {removed} on {before})"
+            );
+        }
     }
 
     /// Two clones of one LOCAL word are one word — the property every wiring
@@ -2703,7 +3000,7 @@ mod tests {
         assert_eq!(w.outstanding(), 2, "no resync on a mapped word");
         let seq = w.wake_seq_snapshot();
         assert_eq!(
-            w.record_drained_to_empty(1),
+            w.record_drained_to_empty(1).paid,
             0,
             "a word no release forgave pays no forgiven frame"
         );
@@ -2836,7 +3133,7 @@ mod tests {
         w.record_published_n(2);
         assert_eq!(w.forgive_outstanding(), 2);
         assert_eq!(
-            w.record_drained(1),
+            w.record_drained(1).paid,
             1,
             "the pop of frame 1 pays the backlog"
         );
@@ -2881,7 +3178,11 @@ mod tests {
         w.record_published_n(2);
         assert_eq!(w.forgive_outstanding(), 2);
         for frame in 1..=2 {
-            assert_eq!(w.record_drained(1), 1, "frame {frame} pays the backlog");
+            assert_eq!(
+                w.record_drained(1).paid,
+                1,
+                "frame {frame} pays the backlog"
+            );
             w.record_slot_held(0, 1);
         }
         assert_eq!(
@@ -2911,14 +3212,14 @@ mod tests {
         w.forgive_outstanding();
         w.record_published_n(1);
         assert_eq!((w.outstanding(), w.forgiven()), (1, 3));
-        assert_eq!(w.record_drained(2), 2, "two forgiven frames");
+        assert_eq!(w.record_drained(2).paid, 2, "two forgiven frames");
         assert_eq!(
-            w.record_drained(2),
+            w.record_drained(2).paid,
             1,
             "the last forgiven frame, then frame 4"
         );
-        assert_eq!(w.record_drained(1), 0, "nothing forgiven is left");
-        assert_eq!(w.record_drained(0), 0, "an idle drain pays nothing");
+        assert_eq!(w.record_drained(1).paid, 0, "nothing forgiven is left");
+        assert_eq!(w.record_drained(0).paid, 0, "an idle drain pays nothing");
         assert_eq!((w.outstanding(), w.forgiven()), (0, 0));
 
         let two = CreditWord::local(2);
@@ -2929,11 +3230,15 @@ mod tests {
         assert_eq!((two.outstanding(), two.forgiven()), (2, 2));
         assert_eq!(
             two.record_drained_to_empty(1),
-            1,
-            "the drain half pays one forgiven frame; the resync zeroes the other"
+            Drained {
+                paid: 1,
+                clipped: 0,
+            },
+            "the drain half pays one forgiven frame; the resync zeroes the other \
+             and clips nothing"
         );
         assert_eq!((two.outstanding(), two.forgiven()), (0, 0));
-        assert_eq!(two.record_drained_to_empty(0), 0);
+        assert_eq!(two.record_drained_to_empty(0).paid, 0);
     }
 
     /// Each held count saturates at `u8::MAX` in its own field and never
@@ -3033,7 +3338,7 @@ mod tests {
         // queued forgiven frame 2, and the pop of frame 3 pays nothing.
         w.forgive_outstanding();
         w.record_published_n(2);
-        assert_eq!(w.record_drained(1), 0);
+        assert_eq!(w.record_drained(1).paid, 0);
         let seq = w.wake_seq_snapshot();
         w.record_slot_replaced(false);
         assert_eq!(
@@ -3060,7 +3365,7 @@ mod tests {
             .pack(),
             Ordering::Release,
         );
-        assert_eq!(falls.record_drained(1), 1, "the pop pays the backlog");
+        assert_eq!(falls.record_drained(1).paid, 1, "the pop pays the backlog");
         let seq = falls.wake_seq_snapshot();
         falls.record_slot_replaced(true);
         assert_eq!(
@@ -3107,7 +3412,7 @@ mod tests {
         // survivor rule names the popped frame.
         let pop = |queue: &mut VecDeque<bool>| -> Option<bool> {
             let forgiven = queue.pop_front()?;
-            let paid = w.record_drained(1);
+            let paid = w.record_drained(1).paid;
             let held_forgiven = survivor_forgiven(1, paid);
             assert_eq!(held_forgiven, forgiven, "the word names the popped frame");
             Some(forgiven)
