@@ -45,6 +45,7 @@ use crate::scheduler::{
 use crate::wire::WireHeader;
 
 use super::events::PubSubEvent;
+use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use super::input_view::InputView;
 use super::shm_sample::SampleHandle;
 use super::CerService;
@@ -210,6 +211,11 @@ struct BlockProbe {
     /// (see the sibling probes' field docs for the rationale).
     regime_count: u64,
     buffer_capacity: usize,
+    /// Flood suppression for drains the word's saturating subtraction clipped
+    /// at 0 ([`CerulionSubscriber::block_drains_clipped`]). Every drain
+    /// records through `&self`, so the latch sits in a `RefCell`; the
+    /// subscriber is used from one thread at a time (it is `Send`, not `Sync`).
+    drain_clips: std::cell::RefCell<FailureRegimeLatch>,
 }
 
 /// The single backpressure probe installed on an input.
@@ -2396,6 +2402,7 @@ impl CerulionSubscriber {
             regime_started_ns: 0,
             regime_count: 0,
             buffer_capacity,
+            drain_clips: std::cell::RefCell::new(FailureRegimeLatch::new()),
         }));
     }
 
@@ -2477,8 +2484,70 @@ impl CerulionSubscriber {
             // slice — the wedge the wake word exists to prevent. On a LOCAL
             // word nobody can be parked, so the ring is a `wake_seq` bump plus
             // a `parked`-mask read and no syscall.
-            counter.record_drained(removed);
+            let clipped = counter.record_drained(removed);
+            self.report_block_drain(clipped);
         }
+    }
+
+    /// `block`: report one drain through the probe's [`FailureRegimeLatch`].
+    /// `clipped` is what [`crate::credit::CreditShared::record_drained`]
+    /// returned: the frames the drain removed that its word, already at 0,
+    /// could not take off. The first clipping drain of a regime warns, repeats
+    /// log at `debug!` and are counted, each decade of the running total warns
+    /// again, and the first clean drain after a counted repeat logs one
+    /// recovery line. A no-op unless a block probe is installed.
+    #[inline]
+    fn report_block_drain(&self, clipped: u64) {
+        let Some(probe) = self.block_probe() else {
+            return;
+        };
+        let mut latch = probe.drain_clips.borrow_mut();
+        if clipped == 0 {
+            if let Some(suppressed) = latch.on_success() {
+                let total_failures = latch.total_failures();
+                drop(latch);
+                tracing::info!(
+                    topic = %self.topic,
+                    suppressed_count = suppressed,
+                    total_failures,
+                    "block credit drains match the word's count again"
+                );
+            }
+            return;
+        }
+        let decision = latch.on_failure();
+        let total_failures = latch.total_failures();
+        drop(latch);
+        match decision {
+            RegimeDecision::Loud => tracing::warn!(
+                topic = %self.topic,
+                total_failures,
+                "block credit drain removed frames its word never counted, so the word reads \
+                 below the queue and the producer can overrun the declared depth; look for a \
+                 writer outside the graph or `history_size` on this block topic"
+            ),
+            RegimeDecision::StillFailing { suppressed, .. } => tracing::warn!(
+                topic = %self.topic,
+                total_failures,
+                suppressed_count = suppressed,
+                "block credit drains still remove frames their word never counted"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                topic = %self.topic,
+                total_failures,
+                suppressed_count = suppressed,
+                "block credit drain clipped at zero again"
+            ),
+        }
+    }
+
+    /// `block`: how many drains of this input removed frames their word,
+    /// already at 0, could not take off: drains of frames the word never
+    /// counted (see [`crate::credit::CreditShared::record_drained`]). A
+    /// running total, never reset. `0` unless this input is wired `block`.
+    pub fn block_drains_clipped(&self) -> u64 {
+        self.block_probe()
+            .map_or(0, |probe| probe.drain_clips.borrow().total_failures())
     }
 
     /// Re-state this input's `block` occupancy from the SLOTS, after
@@ -2554,7 +2623,8 @@ impl CerulionSubscriber {
                 // `record_drained` and therefore RINGS the wake word — a
                 // decrement that freed room without ringing would leave a
                 // cross-process producer parked on room that already exists.
-                probe.outstanding.record_drained(u64::from(debt - held));
+                let clipped = probe.outstanding.record_drained(u64::from(debt - held));
+                self.report_block_drain(clipped);
             }
         }
         self.block_slot_debt = held;
@@ -6157,7 +6227,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             armed,
             regime_started_ns,
             regime_count,
-            buffer_capacity
+            buffer_capacity,
+            drain_clips
         }),
         abi_pin_struct!(StreamObservation {
             id,

@@ -3304,7 +3304,7 @@ fn word_state(word: &MappedCredit) -> (u64, u32, u32, u32, u32) {
     )
 }
 
-/// Issue #817, on every send path. A consumer in another process pops a frame
+/// The lost-count race, on every send path. A consumer in another process pops a frame
 /// and records its drain while the producer is still inside its publish. A
 /// count taken after `send()` lands on a word the drain already left at zero,
 /// so the word reads one frame over an empty queue: at depth 1 that holds the
@@ -3491,7 +3491,7 @@ fn run_the_send_window_scenario(tag: &str) -> WindowRun {
     }
 }
 
-/// The strong pin for issue #817: after a drain inside the send window, the
+/// The strong pin for the lost-count race: after a drain inside the send window, the
 /// producer's own gate opens again and its next frame reaches the consumer.
 ///
 /// Oracle, by hand, at depth 1 over two steps: step 0 reads the word at 0 and
@@ -3518,5 +3518,302 @@ fn the_producer_publishes_again_after_a_drain_inside_the_send_window() {
     assert_eq!(
         run.word.0, 0,
         "and the word is back at 0, every frame drained"
+    );
+}
+
+/// A send that reaches no queue takes its count back, and the producer's next
+/// frame is admitted and delivered.
+///
+/// The producer's first send is refused after its count
+/// ([`BlockSendHook::FailNextSend`]): the sample is released unsent and the
+/// publish path takes the `Err` arm a `send()` that reached no queue takes.
+/// Oracle, by hand, at depth 1: after step 0 the word reads 0 and the queue is
+/// empty; step 1 reads the word at 0, fires and publishes frame 1, which the
+/// consumer then reads. A count left standing after the refused send holds the
+/// word at 1, step 1 defers, and the consumer reads nothing.
+#[test]
+#[serial]
+fn a_send_that_reaches_no_queue_takes_its_count_back() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("cbwundo", "consumer", "inp", WINDOW_DEPTH);
+    let bind_p = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        u64::from(WINDOW_DEPTH),
+        CreditRole::Producer,
+    )];
+    let clock_p = Arc::new(VirtualClock::new());
+    let (_mgr_p, mut rt_p) = window_producer_ctx(
+        "cbwundo",
+        &ix,
+        "cbwundo_p",
+        &clock_p,
+        &bind_p,
+        BlockSendHook::FailNextSend,
+    );
+    let mgr_c = manager("cbwundo_c", ix, Arc::new(VirtualClock::new()));
+    let mut consumer = window_consumer(&mgr_c, &w.consumer_side);
+
+    step_free_run(&mut rt_p, &clock_p, 0);
+    assert_eq!(
+        rt_p.node_handle("producer").expect("h").fire_count(),
+        1,
+        "step 0 fired, and its send was refused"
+    );
+    assert_eq!(
+        w.consumer_side.outstanding(),
+        0,
+        "the refused send took its count back: no consumer can ever drain a frame that \
+         reached no queue"
+    );
+    assert_eq!(
+        consumer.try_view_raw(x_of).expect("the consumer reads"),
+        None,
+        "and the refused frame is in no queue"
+    );
+
+    step_free_run(&mut rt_p, &clock_p, 1);
+    assert_eq!(
+        rt_p.node_handle("producer").expect("h").fire_count(),
+        2,
+        "step 1 is admitted: the gate read the word the take-back left at 0"
+    );
+    assert_eq!(
+        consumer.try_view_raw(x_of).expect("the consumer reads"),
+        Some(1.0),
+        "and frame 1 reaches the consumer"
+    );
+    assert_eq!(
+        w.consumer_side.outstanding(),
+        0,
+        "every delivered frame drained"
+    );
+    rt_p.shutdown();
+}
+
+/// The configuration that makes an `Err` from `send()` mean that no consumer's
+/// queue received the frame, which is what lets the take-back above be exact.
+///
+/// Read in the pinned iceoryx2 revision (282f479):
+///
+/// - `iceoryx2/src/port/publisher.rs:373-384`: `send_sample` fails before it
+///   delivers anything when the port is inactive or `update_connections`
+///   fails, and otherwise returns what `deliver_offset` returns.
+/// - `iceoryx2/src/port/details/sender.rs:292-340`: `deliver_offset`'s own
+///   error arms are `UnableToDeliver` and `InternalError`, which only the
+///   waiting `blocking_send` raises, and `ConnectionCorrupted`, which the
+///   default `Warn` degradation logs and leaves out of the recipient count
+///   (`:330`) and only `DegradeAndFail` returns (`:335`).
+/// - `iceoryx2-cal/src/zero_copy_connection/common.rs:751`: with safe overflow
+///   on, `blocking_send` skips its wait and calls `try_send` (`:823`), whose
+///   only full-queue error needs safe overflow off (`:687`).
+/// - `iceoryx2/src/service/port_factory/publisher.rs:145` and `:175`: a
+///   publisher's degradation action is `Warn` unless a handler is set.
+///
+/// So the pin is two facts: the service a graph's block topic is created on
+/// keeps safe overflow on, read from the service's own static config through a
+/// raw iceoryx2 node, and no Rust file under `crates/` sets a publisher's
+/// degradation handler.
+#[test]
+#[serial]
+fn the_block_publisher_keeps_safe_overflow_and_the_default_degradation() {
+    use iceoryx2::service::port_factory::PortFactory as _;
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("cbwcfg", "consumer", "inp", WINDOW_DEPTH);
+    let bind_p = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        u64::from(WINDOW_DEPTH),
+        CreditRole::Producer,
+    )];
+    let clock = Arc::new(VirtualClock::new());
+    let (mgr_p, rt_p) = producer_ctx("cbwcfg", &ix, "cbwcfg_p", &clock, &bind_p);
+    let node = iceoryx2::node::NodeBuilder::new()
+        .config(&mgr_p.iox_config())
+        .create::<iceoryx2::service::ipc_threadsafe::Service>()
+        .expect("a raw iceoryx2 node");
+    let name: iceoryx2::service::service_name::ServiceName = format!("{TOPIC}/data")
+        .as_str()
+        .try_into()
+        .expect("service name");
+    let service = node
+        .service_builder(&name)
+        .publish_subscribe::<[u8]>()
+        .open()
+        .expect("the block topic's data service, as the graph created it");
+    assert!(
+        service.static_config().has_safe_overflow(),
+        "the block topic's service must keep safe overflow on: without it a full queue makes \
+         `send()` wait or fail per connection, and an `Err` no longer proves the frame reached \
+         no queue, so taking the count back could under-count a lossless edge"
+    );
+    rt_p.shutdown();
+
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crates directory");
+    let needle = concat!(".set_degradation", "_handler(");
+    let mut setters = Vec::new();
+    let mut pending = vec![crates.to_path_buf()];
+    let mut scanned = 0usize;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+            let path = entry.expect("a source entry").path();
+            if path.is_dir() {
+                // A build directory holds generated code, not the workspace's.
+                if path.file_name().is_some_and(|name| name != "target") {
+                    pending.push(path);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                scanned += 1;
+                let text = std::fs::read_to_string(&path).expect("read a source file");
+                if text.contains(needle) {
+                    setters.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the scan must reach the workspace's sources, it read {scanned} files"
+    );
+    assert_eq!(
+        setters,
+        Vec::<String>::new(),
+        "no publisher may set a degradation handler: `DegradeAndFail` makes `send()` return \
+         `Err` after it pushed the frame to a corrupted connection, and the take-back would \
+         then remove the count of a frame that is queued"
+    );
+}
+
+/// Determinism (Principle #7): the send-window scenario run twice leaves the
+/// word in the same state and delivers the same frames, and both runs equal
+/// the hand oracle.
+///
+/// Oracle, by hand: frames `[0, 1]`, two fires, and the word at `(outstanding
+/// 0, depth 1, wake_seq 2, parked 0, epoch 1)`: each of the two drains rings
+/// the wake word once, nothing parks, and the supervisor's create armed the
+/// page once.
+#[test]
+#[serial]
+fn the_send_window_scenario_is_bit_identical_across_two_runs() {
+    let first = run_the_send_window_scenario("cbwdet1");
+    let second = run_the_send_window_scenario("cbwdet2");
+    let oracle = WindowRun {
+        delivered: vec![0.0, 1.0],
+        errors: Vec::new(),
+        fires: 2,
+        word: (0, WINDOW_DEPTH, 2, 0, 1),
+    };
+    assert_eq!(first, oracle, "the first run equals the hand oracle");
+    assert_eq!(
+        second, first,
+        "and the second run is identical to the first"
+    );
+}
+
+/// The text of the loud line a clipped drain logs.
+const CLIP_LOUD: &str = "block credit drain removed frames its word never counted";
+/// The text of the recovery line.
+const CLIP_RECOVERED: &str = "block credit drains match the word's count again";
+
+/// A drain the word's saturating subtraction clips at 0 is reported loudly once
+/// per regime, its repeats are counted, and the first clean drain after them
+/// logs one recovery line.
+///
+/// An outside writer (a publisher the word does not count, as a second writer
+/// on a `multi_publisher_topics` topic is) sends two frames the consumer
+/// drains: the first drain is the loud head of a regime and the second a
+/// suppressed repeat. A counted frame then drains cleanly and closes the regime.
+/// A last counted frame whose count a foreign drain took first clips again and
+/// opens a second regime. Oracle, by hand: three clipped drains, two loud lines,
+/// one recovery line.
+#[test]
+#[serial]
+#[traced_test]
+fn a_drain_clipped_at_zero_is_reported_once_per_regime() {
+    const DEPTH_CLIP: u32 = 4;
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("clip", "consumer", "inp", DEPTH_CLIP);
+    let clock = Arc::new(VirtualClock::new());
+    let mgr_p = manager("cb_clip_p", ix.clone(), Arc::clone(&clock));
+    let mgr_c = manager("cb_clip_c", ix, Arc::clone(&clock));
+    let mut publisher = mgr_p
+        .create_publisher(TOPIC, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("the writer's publisher");
+    let mut sub = mgr_c
+        .create_subscriber_with_buffers(TOPIC, mgr_c.default_topic_config(), DEPTH_CLIP as usize)
+        .expect("the consumer's input port");
+    sub.register_block_probe_for_test(
+        CreditWord::mapped(Arc::clone(&w.consumer_side)),
+        u64::from(DEPTH_CLIP),
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        DEPTH_CLIP as usize,
+    );
+    let publish = |publisher: &mut CerulionPublisher, x: f64| {
+        let mut frame = publisher.loan_proxy::<Vector3>().expect("loan");
+        frame.x = x;
+        drop(frame);
+    };
+    let read = |sub: &mut CerulionSubscriber| sub.try_view::<Vector3, f64>(|v| v.x).expect("read");
+
+    // Regime 1: two frames the word never counted.
+    publish(&mut publisher, 1.0);
+    assert_eq!(read(&mut sub), Some(1.0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        1,
+        "the first uncounted drain clipped"
+    );
+    publish(&mut publisher, 2.0);
+    assert_eq!(read(&mut sub), Some(2.0));
+    assert_eq!(sub.block_drains_clipped(), 2, "and the second");
+
+    // Recovery: the writer's frames are counted from here on.
+    publisher.register_block_outstanding_for_test(CreditWord::mapped(Arc::clone(&w.producer_side)));
+    publish(&mut publisher, 3.0);
+    assert_eq!(read(&mut sub), Some(3.0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        2,
+        "a counted frame drains without a clip"
+    );
+    assert_eq!(w.consumer_side.outstanding(), 0);
+
+    // Regime 2: a counted frame whose count a foreign drain took first.
+    publish(&mut publisher, 4.0);
+    assert_eq!(
+        w.producer_side.record_drained(1),
+        0,
+        "the foreign drain found the count"
+    );
+    assert_eq!(read(&mut sub), Some(4.0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        3,
+        "the consumer's drain of it clipped"
+    );
+    assert_eq!(
+        w.consumer_side.outstanding(),
+        0,
+        "the word never wraps below 0"
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let loud = lines.iter().filter(|l| l.contains(CLIP_LOUD)).count();
+        let recovered = lines.iter().filter(|l| l.contains(CLIP_RECOVERED)).count();
+        match (loud, recovered) {
+            (2, 1) => Ok(()),
+            _ => Err(format!(
+                "expected two loud heads and one recovery line, got {loud} and {recovered}"
+            )),
+        }
+    });
+    assert!(
+        logs_contain("total_failures=3"),
+        "the second head carries the running total of clipped drains"
     );
 }

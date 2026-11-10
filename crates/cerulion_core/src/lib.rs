@@ -833,7 +833,10 @@ pub mod wire;
 ///   frame and record its drain first, and the late count leaves the word one
 ///   frame above an empty queue. `CerulionPublisher` gains `block_send_hook`,
 ///   the send-window test seam (`transport::publisher::BlockSendHook`,
-///   `None` outside a test).
+///   `None` outside a test), and `BlockProbe` gains `drain_clips`, the
+///   `FailureRegimeLatch` that reports a drain the word's saturating
+///   subtraction clipped at 0, so `BlockProbe` grows from 80 to 120 bytes
+///   and the `BackpressureProbe` that holds it from 120 to 128.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 pub const CERULION_ABI_VERSION: u32 = 31;

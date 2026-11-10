@@ -78,6 +78,51 @@
 //! overwhelmingly common shape) get this word. [`CreditShared::try_claim`] is
 //! sound as a CLAIM only under that fence; see its docs.
 //!
+//! # When the count is exact, and where it stops
+//!
+//! A producer counts a frame on the word BEFORE the frame becomes visible:
+//! every send path of `CerulionPublisher` counts on each block word, then
+//! sends, and takes the count back when the send errs
+//! ([`CreditShared::record_published`], [`CreditShared::record_unpublished`]).
+//! iceoryx2 publishes a frame to a consumer with a `Release` store inside
+//! `send()`, the consumer's pop is an `Acquire` load of it and its drain comes
+//! after the pop, so a drain never finds the word without the count of a frame
+//! it removes, however the two processes are scheduled.
+//!
+//! The take-back is exact because, as Cerulion configures iceoryx2, a `send()`
+//! that returns `Err` delivered the frame to no connection: the topic's
+//! service keeps safe overflow on and no publisher sets a degradation handler,
+//! which `credit_block_iox2_test::the_block_publisher_keeps_safe_overflow_and_the_default_degradation`
+//! pins.
+//!
+//! What this does NOT cover. Each case leaves the word off by the frames
+//! involved for as long as the edge runs:
+//!
+//! - **Frames the word never counts.** Native history delivered to a late
+//!   joiner (graph build warns about a `block` topic with `history_size > 0`),
+//!   and a writer outside the graph on a `multi_publisher_topics` topic. Their
+//!   drains leave the word BELOW the queue, so the producer can overrun the
+//!   declared depth. A drain that clips the word at 0 is reported once per
+//!   regime and counted by the consumer
+//!   (`CerulionSubscriber::block_drains_clipped`); one that lands on a word
+//!   still above 0 is indistinguishable from a counted drain.
+//! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
+//!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
+//!   without touching the word, so a `block` input read through them leaves
+//!   the word ABOVE the queue.
+//! - **A send that returns `Ok` without reaching this consumer's queue**, such
+//!   as one to a consumer whose port connected after the send updated its
+//!   connections: the frame stays counted and no drain ever pays for it.
+//! - **Several in-graph producers across processes on one edge.** Graph
+//!   planning refuses that shape (`CreditBar::MultipleProducers`) rather than
+//!   counting it.
+//!
+//! One window is transient rather than lasting: a frame moving from the queue
+//! into a per-set Sync matcher slot is drained at its pop and credited back as
+//! held by the slot re-derivation just after, so between the two the word reads
+//! one frame low. A publish admitted in that instant cannot evict a counted
+//! frame, because the frame being moved has already left the queue.
+//!
 //! # Scope of this module
 //!
 //! The primitive ONLY. The runtime, the scheduler and the plan
@@ -510,20 +555,34 @@ impl CreditShared {
     /// idle drain pass never taxes a parked producer with a spurious wake.
     /// Under k-fires-per-step this is called PER POPPED FRAME by the post-FIFO
     /// drain, which is why the epoch bump has to be cheap when nobody parks.
-    pub fn record_drained(&self, removed: u64) {
+    ///
+    /// Returns how many of the `removed` frames the subtraction could NOT take
+    /// off because the word had already reached 0: 0 for every drain whose
+    /// frames the word counted. Since the publisher counts a frame before its
+    /// send makes it visible, a clip means the drain removed frames the word
+    /// never counted (a late joiner's history replay, a writer outside the
+    /// graph on a `multi_publisher_topics` topic, or a count another drain
+    /// already took). The consumer's block probe reports it once per regime
+    /// (`CerulionSubscriber::block_drains_clipped`); a force-release through a
+    /// mapping (`record_drained(u64::MAX)`, see the [module docs](self))
+    /// clips by design and may ignore it.
+    pub fn record_drained(&self, removed: u64) -> u64 {
         if removed == 0 {
-            return;
+            return 0;
         }
-        // The result is INFALLIBLE by construction: `try_update` returns `Err`
-        // only when the closure returns `None`, and this closure always returns
-        // `Some`. So the discard drops a `Result` that cannot be `Err`, never a
-        // failure signal.
-        let _ = self
-            .outstanding
-            .try_update(Ordering::Release, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(removed))
-            });
+        // INFALLIBLE: the closure always returns `Some`, so `try_update`
+        // returns `Ok(previous)`; the `Err` arm carries the same value and is
+        // matched only to read it without a discard.
+        let previous =
+            match self
+                .outstanding
+                .try_update(Ordering::Release, Ordering::Acquire, |v| {
+                    Some(v.saturating_sub(removed))
+                }) {
+                Ok(previous) | Err(previous) => previous,
+            };
         self.note_credit_freed();
+        removed.saturating_sub(previous)
     }
 
     // ==================== the producer park's wake word ====================
