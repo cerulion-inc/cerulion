@@ -471,6 +471,33 @@ impl Counts {
         }
     }
 
+    /// One held frame left a slot and a frame popped from the queue took its
+    /// place. The leaving frame is a forgiven one when a held frame is
+    /// forgiven, as [`Self::slot_freed`] pays them first, and the entering
+    /// frame is forgiven when `forgiven_entering`. A counted frame for a
+    /// counted one, or a forgiven frame for a forgiven one, changes nothing.
+    fn slot_replaced(self, forgiven_entering: bool) -> Self {
+        let leaving_forgiven = self.held_forgiven != 0;
+        if leaving_forgiven == forgiven_entering
+            || crate::oracle_mutant::active("block_replaced_head_unpaid")
+        {
+            return self;
+        }
+        if forgiven_entering {
+            Self {
+                held: self.held.saturating_sub(1),
+                held_forgiven: self.held_forgiven.saturating_add(1),
+                ..self
+            }
+        } else {
+            Self {
+                held: self.held.saturating_add(1),
+                held_forgiven: self.held_forgiven - 1,
+                ..self
+            }
+        }
+    }
+
     /// The timeout release: every counted frame becomes forgiven. The
     /// backlog is capped at `capacity`, the most the queues can hold.
     fn forgive(self, capacity: u64) -> Self {
@@ -805,6 +832,33 @@ impl CreditShared {
         }
         self.update_counts(Ordering::Release, |c| c.slot_freed(k));
         self.note_credit_freed();
+    }
+
+    /// Record that a held frame left the consumer's slots and a frame the
+    /// consumer popped from its queue took its slot, in ONE RMW, after the
+    /// pop's [`record_drained`](Self::record_drained). A held forgiven frame
+    /// leaves first, and the entering frame is held forgiven when
+    /// `forgiven_entering` (its pop paid the backlog a timeout release
+    /// forgave). A counted frame for a counted one stores nothing and rings
+    /// nothing, so on a word no release forgave the replacement is the pop
+    /// alone. Rings the wake word only when the count falls (a counted frame
+    /// leaves and a forgiven one enters). Counts nothing on a released slot.
+    pub fn record_slot_replaced(&self, forgiven_entering: bool) {
+        if self.is_released() {
+            return;
+        }
+        let mut freed = false;
+        let _ = self
+            .counts
+            .try_update(Ordering::Release, Ordering::Acquire, |v| {
+                let current = Counts::unpack(v);
+                let next = current.slot_replaced(forgiven_entering);
+                freed = next.outstanding() < current.outstanding();
+                (next != current).then(|| next.pack())
+            });
+        if freed {
+            self.note_credit_freed();
+        }
     }
 
     /// Give up this consumer's slot for the rest of the run: mark it
@@ -2916,6 +2970,121 @@ mod tests {
         assert_eq!(counts_of(&w), Counts::default());
     }
 
+    /// A replaced head moves at most one frame between the two held counts:
+    /// a held forgiven frame leaves first, the entering frame lands in the
+    /// count `forgiven_entering` names, like for like changes nothing, and
+    /// the queued count and the backlog never move.
+    #[test]
+    fn a_replaced_head_moves_one_frame_between_the_held_counts() {
+        let counts = |held, held_forgiven| Counts {
+            queued: 3,
+            backlog: 2,
+            held,
+            held_forgiven,
+        };
+        // (held, held_forgiven, forgiven_entering) -> (held, held_forgiven)
+        for (held, held_forgiven, forgiven_entering, want) in [
+            (1, 0, false, (1, 0)),
+            (0, 1, true, (0, 1)),
+            (0, 1, false, (1, 0)),
+            (1, 0, true, (0, 1)),
+            (1, 1, false, (2, 0)),
+            (1, 1, true, (1, 1)),
+            (0, 0, false, (0, 0)),
+            (0, 0, true, (0, 1)),
+            (255, 1, false, (255, 0)),
+            (2, 255, true, (2, 255)),
+            (1, 255, false, (2, 254)),
+            (3, 0, true, (2, 1)),
+        ] {
+            assert_eq!(
+                counts(held, held_forgiven).slot_replaced(forgiven_entering),
+                counts(want.0, want.1),
+                "held {held}, held forgiven {held_forgiven}, forgiven entering {forgiven_entering}"
+            );
+        }
+    }
+
+    /// The replacement is one RMW: a counted frame for a counted one stores
+    /// and rings nothing, a counted frame entering for a forgiven one raises
+    /// the count without a ring, a forgiven frame entering for a counted one
+    /// lowers it and rings, and a released slot counts nothing.
+    #[test]
+    fn a_replaced_head_rings_only_when_its_count_falls() {
+        let w = CreditWord::local(2);
+        w.record_published_n(2);
+        w.record_drained(1);
+        w.record_slot_held(1, 0);
+        let seq = w.wake_seq_snapshot();
+        w.record_slot_replaced(false);
+        assert_eq!(
+            counts_of(&w),
+            Counts {
+                queued: 1,
+                backlog: 0,
+                held: 1,
+                held_forgiven: 0,
+            },
+            "like for like"
+        );
+        assert_eq!(w.wake_seq_snapshot(), seq, "like for like rings nothing");
+
+        // The release forgives both frames, then frames 3 and 4 evict the
+        // queued forgiven frame 2, and the pop of frame 3 pays nothing.
+        w.forgive_outstanding();
+        w.record_published_n(2);
+        assert_eq!(w.record_drained(1), 0);
+        let seq = w.wake_seq_snapshot();
+        w.record_slot_replaced(false);
+        assert_eq!(
+            counts_of(&w),
+            Counts {
+                queued: 1,
+                backlog: 0,
+                held: 1,
+                held_forgiven: 0,
+            },
+            "the forgiven head leaves and frame 3 is held counted"
+        );
+        assert_eq!((w.outstanding(), w.forgiven()), (2, 0));
+        assert_eq!(w.wake_seq_snapshot(), seq, "a rising count rings nothing");
+
+        let falls = CreditWord::local(2);
+        falls.counts.store(
+            Counts {
+                queued: 0,
+                backlog: 1,
+                held: 1,
+                held_forgiven: 0,
+            }
+            .pack(),
+            Ordering::Release,
+        );
+        assert_eq!(falls.record_drained(1), 1, "the pop pays the backlog");
+        let seq = falls.wake_seq_snapshot();
+        falls.record_slot_replaced(true);
+        assert_eq!(
+            counts_of(&falls),
+            Counts {
+                queued: 0,
+                backlog: 0,
+                held: 0,
+                held_forgiven: 1,
+            }
+        );
+        assert_eq!(
+            falls.wake_seq_snapshot(),
+            seq + 1,
+            "a falling count rings once"
+        );
+
+        assert!(falls.release_slot());
+        let seq = falls.wake_seq_snapshot();
+        falls.record_slot_replaced(true);
+        assert_eq!(counts_of(&falls), Counts::default(), "a released slot");
+        assert_eq!(falls.wake_seq_snapshot(), seq);
+    }
+
     /// One seeded run of [`a_local_word_with_slots_matches_a_model_of_its_queues_and_slots`]
     /// at `depth` on one connection: the packed word after every step.
     fn slot_model_run(depth: u32, seed: u64) -> Vec<u64> {
@@ -2934,18 +3103,24 @@ mod tests {
         let mut queue: VecDeque<bool> = VecDeque::new();
         let mut head: Option<bool> = None;
         let mut second: Option<bool> = None;
-        // A pop into a slot: the drain pays the backlog first, the survivor
-        // rule names the popped frame, and the slot move records it.
-        let pop_into_slot = |queue: &mut VecDeque<bool>| -> Option<bool> {
+        // A pop for a slot: the drain pays the backlog first, and the
+        // survivor rule names the popped frame.
+        let pop = |queue: &mut VecDeque<bool>| -> Option<bool> {
             let forgiven = queue.pop_front()?;
             let paid = w.record_drained(1);
             let held_forgiven = survivor_forgiven(1, paid);
             assert_eq!(held_forgiven, forgiven, "the word names the popped frame");
-            w.record_slot_held(u64::from(!held_forgiven), u64::from(held_forgiven));
+            Some(forgiven)
+        };
+        // A pop into an empty slot, which the slot move records.
+        let pop_into_slot = |queue: &mut VecDeque<bool>| -> Option<bool> {
+            let forgiven = pop(queue)?;
+            w.record_slot_held(u64::from(!forgiven), u64::from(forgiven));
             Some(forgiven)
         };
         let mut trace = Vec::new();
-        let (mut releases, mut forgiven_holds, mut discards) = (0u32, 0u32, 0u32);
+        let (mut releases, mut forgiven_holds, mut discards, mut replacements) =
+            (0u32, 0u32, 0u32, 0u32);
         for step in 0..4000u32 {
             let at = format!("depth {depth}, step {step}");
             match next(9) {
@@ -2987,14 +3162,29 @@ mod tests {
                     }
                 }
                 6 => {
-                    // The matcher skips the head: it leaves before its
-                    // refill enters.
+                    // The matcher skips the head. The second slot's frame is
+                    // promoted, or the queue refills the head: the refill
+                    // pops first, then the head's exit and the refill's entry
+                    // are one replacement, or the head just leaves when the
+                    // queue is empty.
                     if head.take().is_some() {
                         discards += 1;
-                        w.record_slot_freed(1);
                         head = match second.take() {
-                            Some(promoted) => Some(promoted),
-                            None => pop_into_slot(&mut queue),
+                            Some(promoted) => {
+                                w.record_slot_freed(1);
+                                Some(promoted)
+                            }
+                            None => match pop(&mut queue) {
+                                Some(forgiven) => {
+                                    replacements += 1;
+                                    w.record_slot_replaced(forgiven);
+                                    Some(forgiven)
+                                }
+                                None => {
+                                    w.record_slot_freed(1);
+                                    None
+                                }
+                            },
                         };
                     }
                 }
@@ -3019,8 +3209,9 @@ mod tests {
             trace.push(w.counts.load(Ordering::Acquire));
         }
         assert!(
-            releases > 0 && forgiven_holds > 0 && discards > 0,
-            "depth {depth}: {releases} releases, {forgiven_holds} forgiven holds, {discards} discards"
+            releases > 0 && forgiven_holds > 0 && discards > 0 && replacements > 0,
+            "depth {depth}: {releases} releases, {forgiven_holds} forgiven holds, \
+             {discards} discards, {replacements} replaced heads"
         );
         trace
     }
@@ -3028,9 +3219,9 @@ mod tests {
     /// The word against a model of one connection's queue of `depth` frames
     /// (evicting its oldest on overflow) and a matcher's two slots, for
     /// depths 1, 2 and 4, over seeded random runs of gated publishes, pops
-    /// into the head and the second slot, reads, skips of the head (the head
-    /// leaves, then the second slot is promoted or the queue refills it) and
-    /// timeout releases of a full slot. On one connection the word is exact:
+    /// into the head and the second slot, reads, skips of the head (the second
+    /// slot is promoted, or the queue's pop replaces the head in one update)
+    /// and timeout releases of a full slot. On one connection the word is exact:
     /// after every step it counts the unforgiven frames queued or held, and
     /// its forgiven count is the forgiven frames queued or held. The same
     /// seed gives the same packed word after every step.

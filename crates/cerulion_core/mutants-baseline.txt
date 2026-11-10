@@ -28,6 +28,14 @@
 #     (--lib) and by `block_slot_release_iox2_test`'s
 #     `a_forgiven_frame_the_trigger_refill_holds_leaves_the_producer_its_depth`.
 #
+#   block_replaced_head_unpaid: `credit::Counts::slot_replaced` changes
+#     nothing, so a skipped head the queue's refill replaces leaves the word
+#     as it was: a held forgiven head is never paid and a refill published
+#     after the release is never counted. Caught by
+#     `credit::tests::a_replaced_head_moves_one_frame_between_the_held_counts`
+#     (--lib) and by `block_slot_release_iox2_test`'s
+#     `a_skipped_forgiven_head_refilled_with_a_new_frame_keeps_that_frame_counted`.
+#
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.

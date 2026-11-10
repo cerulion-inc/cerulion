@@ -1217,8 +1217,10 @@ struct DrainOutcome {
     /// True iff the surviving `Sample` is a frame a `block_timeout_ms`
     /// release forgave: its pop paid the forgiven backlog
     /// ([`survivor_forgiven`]). A slot that holds it records it as held
-    /// forgiven ([`CerulionSubscriber::reconcile_block_slot_debt`]). False for
-    /// every other slot and on an input with no `block` probe.
+    /// forgiven ([`CerulionSubscriber::reconcile_block_slot_debt`], or
+    /// [`CerulionSubscriber::restate_replaced_block_head`] when it replaces a
+    /// skipped head). False for every other slot and on an input with no
+    /// `block` probe.
     forgiven: bool,
 }
 
@@ -1550,7 +1552,9 @@ pub struct CerulionSubscriber {
     /// which RE-DERIVES it from the slots rather than counting `+1`/`-1` at
     /// each site: the invariant `debt == (frozen is Sample) + (next_head is
     /// Some)` is then the implementation instead of an assertion a new call
-    /// site has to remember. Nonzero only on a `block`-probed
+    /// site has to remember. A skipped head the queue's refill replaces leaves
+    /// the debt unchanged, and [`Self::restate_replaced_block_head`] moves the
+    /// word for that one case. Nonzero only on a `block`-probed
     /// [`ConsumeMode::EachFifo`] input, which today means a per-set Sync
     /// trigger (a `Data` trigger unifies only under `DropOldest`, and a
     /// `block` non-trigger input is excluded from the step-boundary snapshot).
@@ -2561,9 +2565,10 @@ impl CerulionSubscriber {
     /// any mid-step reader of `outstanding` sees (the consumer's own block
     /// event samples it pre-drain), with one exception a re-derivation cannot
     /// repair: a head replaced in its slot leaves the count equal to the debt,
-    /// so only the skipped head's exit in [`Self::sync_discard_head`], restated
-    /// before its refill enters, makes the word pay a held forgiven head and
-    /// count a refill published after the release. Deleting the boundary ENTRY
+    /// so only [`Self::restate_replaced_block_head`], which
+    /// [`Self::sync_discard_head`] calls after its refill's pop, makes the word
+    /// pay a held forgiven head and count a refill published after the
+    /// release. Deleting the boundary ENTRY
     /// call is a different matter and is observable end to end: on a starved
     /// input no other site runs at all, so nothing repairs it and the producer
     /// publishes `depth + 1`.
@@ -2577,8 +2582,8 @@ impl CerulionSubscriber {
     ///
     /// `forgiven_entering` is the entering frame's [`DrainOutcome::forgiven`]
     /// at a slot ENTRY site (the trigger fill and refill, the descent's peek,
-    /// the skipped head's refill) and `false` at every exit-only site, where
-    /// no frame enters.
+    /// the refill of a skipped head that held no frame) and `false` at every
+    /// exit-only site, where no frame enters.
     fn reconcile_block_slot_debt(&mut self, forgiven_entering: bool) {
         if self.consume_mode != ConsumeMode::EachFifo || self.block_probe().is_none() {
             debug_assert_eq!(
@@ -2617,6 +2622,37 @@ impl CerulionSubscriber {
             }
         }
         self.block_slot_debt = held;
+    }
+
+    /// The one slot move [`Self::reconcile_block_slot_debt`] cannot see: in
+    /// [`Self::sync_discard_head`] the queue's refill took the skipped head's
+    /// slot, so the slot count still equals the debt. Called after the
+    /// refill's pop, it restates the head's exit and the refill's entry in
+    /// ONE RMW
+    /// ([`CreditShared::record_slot_replaced`](crate::credit::CreditShared::record_slot_replaced)):
+    /// the word pays the skipped frame (a held forgiven one first) and holds
+    /// the refill, held forgiven when `forgiven_entering` says its pop paid
+    /// the backlog a `block_timeout_ms` release forgave. A counted frame for
+    /// a counted one stores and rings nothing, so on a word no release
+    /// forgave (every mapped word) the skip is the refill's pop alone, and
+    /// the refill's drain read the slot with the skipped head still counted.
+    /// The debt is unchanged. Same guards as the re-derivation.
+    fn restate_replaced_block_head(&mut self, forgiven_entering: bool) {
+        if self.consume_mode != ConsumeMode::EachFifo || self.block_probe().is_none() {
+            debug_assert_eq!(
+                self.block_slot_debt, 0,
+                "block slot debt is only ever taken on a block-probed EachFifo input"
+            );
+            return;
+        }
+        debug_assert_eq!(
+            self.block_slot_debt,
+            1 + u8::from(self.next_head.is_some()),
+            "a replaced head leaves the slot count equal to the debt"
+        );
+        if let Some(probe) = self.block_probe() {
+            probe.outstanding.record_slot_replaced(forgiven_entering);
+        }
     }
 
     /// Testing-only public wrappers over the four per-set head ops
@@ -5250,13 +5286,9 @@ impl CerulionSubscriber {
         // close any held-head regime, exactly as a served head would. The
         // re-offer streak is a "nobody is reading this" heuristic, and a head
         // the matcher skipped is a head that will never be read.
+        let skipped = matches!(self.frozen, Some(FrozenSlot::Sample(_)));
         self.frozen = None;
         self.note_head_served();
-        // SLOT EXIT (the skipped head): restated here, before a refill from
-        // the queue enters, so the word pays the skipped frame (a held
-        // forgiven one first) and the refill's own restatement below records
-        // the frame that enters, counted or held forgiven.
-        self.reconcile_block_slot_debt(false);
         // R-promote's sibling: the staged next IS the FIFO-correct new head,
         // and it is already ACCOUNTED FOR (the `NeedStamp` pop decremented the
         // mirror and its entry restated the debt), so this hand-off touches the
@@ -5295,8 +5327,9 @@ impl CerulionSubscriber {
                 }
             }
             self.frozen = Some(FrozenSlot::Sample(promoted));
-            // The promotion moves a frame BETWEEN slots: the slots hold what
-            // the exit above left, so this restatement changes nothing.
+            // SLOT EXIT (the skipped head only): the promotion itself
+            // moves a frame BETWEEN slots and changes nothing, so the net here
+            // is exactly the one frame this op discarded.
             self.reconcile_block_slot_debt(false);
             return Ok(ts);
         }
@@ -5369,11 +5402,18 @@ impl CerulionSubscriber {
             }
         }
         let (ts, forgiven) = (outcome.latest_ts, outcome.forgiven);
+        let refilled = matches!(outcome.slot, FrozenSlot::Sample(_));
         self.frozen = Some(outcome.slot);
-        // SLOT ENTRY (the refill): the skipped head's exit was restated
-        // above, so a `Sample` frozen here enters on its own, held forgiven
-        // when its pop paid the forgiven backlog.
-        self.reconcile_block_slot_debt(forgiven);
+        if skipped && refilled {
+            // SLOT REPLACED: the refill took the skipped head's slot, so the
+            // slot count equals the debt and a re-derivation sees nothing.
+            // One RMW restates both, after the refill's pop.
+            self.restate_replaced_block_head(forgiven);
+        } else {
+            // The skipped head EXITED, or a refill ENTERED a head that held
+            // no frame: one re-derivation settles it.
+            self.reconcile_block_slot_debt(forgiven);
+        }
         Ok(ts)
     }
 

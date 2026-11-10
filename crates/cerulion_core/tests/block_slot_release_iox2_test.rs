@@ -16,6 +16,10 @@
 //!   frame published after the release leaves that frame counted, an errored
 //!   refill holds nothing, and each walk equals its hand oracle row for row,
 //!   twice; on a cross-process word a refilled head counts as held;
+//! - a skipped head the queue refills rings the wake word once, at the
+//!   refill's pop, on a local and a cross-process word, and the refill's
+//!   drain does not reopen the consumer's `block` regime; a skipped head
+//!   whose refill fails leaves its slot;
 //! - a multi-process worker refuses `block_timeout_ms` on a consumer input
 //!   its plan binds to a credit word shared with a producer in another
 //!   process, and builds the same input without the key; a worker whose
@@ -50,8 +54,8 @@
 //! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off`,
 //! `block_accumulate_refusal_off`, `block_forgiven_drain_spends_credit`,
 //! `block_empty_resync_off`, `block_shared_timeout_refusal_off`,
-//! `block_split_timeout_refusal_off` and `block_forgiven_hold_counted` each
-//! make a row here fail.
+//! `block_split_timeout_refusal_off`, `block_forgiven_hold_counted` and
+//! `block_replaced_head_unpaid` each make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -896,10 +900,25 @@ type SlotRow<'a> = (&'a str, u64, u64, u8, bool);
 /// A [`SlotRow`] as [`slot_walk`] records it.
 type WalkRow = (String, u64, u64, u8, bool);
 
+/// What one operation of a slot walk signalled: how many times it rang the
+/// word's wake epoch, and whether the input queued its `block` event.
+type Signals = (u32, bool);
+
 /// Run `ops` on a fresh `block` FIFO input over a real depth-2 iceoryx2
 /// queue whose probe counts on `word`, the word the producer's gate reads and
 /// its publish counts on. Frames carry `x = 1, 2, ...` in publish order.
 fn slot_walk(tag: &str, word: CreditWord, ops: &[SlotOp]) -> Vec<WalkRow> {
+    slot_walk_signalled(tag, word, ops).0
+}
+
+/// [`slot_walk`], with what each operation signalled. The input's threshold
+/// is the depth, 2, so its `block` event opens a regime at a drain that
+/// arrives with 2 frames counted and rearms at one that arrives with fewer.
+fn slot_walk_signalled(
+    tag: &str,
+    word: CreditWord,
+    ops: &[SlotOp],
+) -> (Vec<WalkRow>, Vec<Signals>) {
     let mgr = TransportManager::init_for_test(
         TransportConfig {
             node_name: format!("bsr_slot_{tag}"),
@@ -926,7 +945,9 @@ fn slot_walk(tag: &str, word: CreditWord, ops: &[SlotOp]) -> Vec<WalkRow> {
     let site = cerulion_core::SyncAlignSite::Boundary;
     let mut next = 1u32;
     let mut rows = Vec::new();
+    let mut signals = Vec::new();
     for op in ops {
+        let rings_before = word.wake_seq_snapshot();
         let what = match op {
             SlotOp::Publish if word.try_claim() => {
                 publish_counted(&mut publisher, &word, next);
@@ -959,6 +980,18 @@ fn slot_walk(tag: &str, word: CreditWord, ops: &[SlotOp]) -> Vec<WalkRow> {
                 "fail next receive".to_string()
             }
         };
+        let event = sub.try_take_backpressure_event();
+        if let Some(e) = &event {
+            assert_eq!(
+                (e.policy, e.dropped),
+                (BackpressurePolicy::Block, 0),
+                "{what}: a `block` input queues only its lossless event"
+            );
+        }
+        signals.push((
+            word.wake_seq_snapshot().wrapping_sub(rings_before),
+            event.is_some(),
+        ));
         rows.push((
             what,
             word.outstanding(),
@@ -967,7 +1000,20 @@ fn slot_walk(tag: &str, word: CreditWord, ops: &[SlotOp]) -> Vec<WalkRow> {
             word.try_claim(),
         ));
     }
-    rows
+    (rows, signals)
+}
+
+/// Every operation of a slot walk signalled what its hand-written oracle
+/// says, row for row.
+fn assert_walk_signals(rows: &[WalkRow], signals: &[Signals], oracle: &[Signals]) {
+    for (i, (got, want)) in signals.iter().zip(oracle).enumerate() {
+        assert_eq!(
+            got, want,
+            "row {i} ({}): (wake rings, block event queued)",
+            rows[i].0
+        );
+    }
+    assert_eq!(signals.len(), oracle.len(), "one signal row per operation");
 }
 
 /// Every row of a slot walk equals its hand-written oracle row.
@@ -1078,10 +1124,14 @@ fn two_forgiven_frames_the_matcher_holds_do_not_hold_the_producer() {
 /// The matcher skips a head the release forgave and refills it from the
 /// queue with frame 3, published after the release (frame 4 evicted the
 /// forgiven frame 2): the skipped frame leaves forgiven and frame 3 enters
-/// counted, so frames 3 and 4 hold the producer and both are read.
+/// counted, so frames 3 and 4 hold the producer and both are read. The skip
+/// rings the wake word once, at the refill's pop: the head's exit and the
+/// refill's entry are one update that raises the count and frees no credit.
+/// The refill's drain arrives with frames 3 and 4 counted, so it opens the
+/// input's `block` regime.
 #[test]
 fn a_skipped_forgiven_head_refilled_with_a_new_frame_keeps_that_frame_counted() {
-    let rows = slot_walk(
+    let (rows, signals) = slot_walk_signalled(
         "skip",
         CreditWord::local(2),
         &[
@@ -1112,6 +1162,23 @@ fn a_skipped_forgiven_head_refilled_with_a_new_frame_keeps_that_frame_counted() 
             ("serve -> Some(3)", 1, 0, 0, true),
             ("serve -> Some(4)", 0, 0, 0, true),
             ("serve -> None", 0, 0, 0, true),
+        ],
+    );
+    assert_walk_signals(
+        &rows,
+        &signals,
+        &[
+            (0, false),
+            (1, false),
+            (0, false),
+            (1, false),
+            (0, false),
+            (0, false),
+            (1, true),
+            (0, false),
+            (1, false),
+            (1, false),
+            (0, false),
         ],
     );
 }
@@ -1178,6 +1245,10 @@ fn a_forgiven_hold_walk_matches_its_oracle_on_two_runs() {
 /// On a cross-process word, which no release forgives, a skipped head the
 /// matcher refills from the queue keeps the counts a held frame always had:
 /// frame 2 replaces frame 1 in the head slot and the word counts it alone.
+/// The skip rings the wake word once, at the refill's pop: the head's exit
+/// and the refill's entry, a counted frame for a counted one, change no
+/// count. Its drain arrives with frames 1 and 2 counted, so it opens the
+/// input's `block` regime.
 #[test]
 fn a_mapped_word_counts_a_refilled_head_as_held() {
     let ns = format!("bsr_{}_slot_mapped", std::process::id());
@@ -1186,7 +1257,7 @@ fn a_mapped_word_counts_a_refilled_head_as_held() {
     let word = CreditWord::mapped(Arc::new(
         MappedCredit::open_unowned(&ns, &id).expect("the consumer's mapping"),
     ));
-    let rows = slot_walk(
+    let (rows, signals) = slot_walk_signalled(
         "mapped",
         word,
         &[
@@ -1213,6 +1284,150 @@ fn a_mapped_word_counts_a_refilled_head_as_held() {
             ("serve -> Some(2)", 1, 0, 0, true),
             ("serve -> Some(3)", 0, 0, 0, true),
             ("serve -> None", 0, 0, 0, true),
+        ],
+    );
+    assert_walk_signals(
+        &rows,
+        &signals,
+        &[
+            (0, false),
+            (1, false),
+            (0, false),
+            (0, false),
+            (1, true),
+            (0, false),
+            (1, false),
+            (1, false),
+            (0, false),
+        ],
+    );
+}
+
+/// The consumer's `block` regime walk: a full slot, a skipped head, the
+/// descent's peek, then a drain below the slot and a full one.
+const A_SKIP_IN_A_REGIME: [SlotOp; 16] = [
+    SlotOp::Publish,
+    SlotOp::Publish,
+    SlotOp::Fill,
+    SlotOp::Discard,
+    SlotOp::Publish,
+    SlotOp::Peek,
+    SlotOp::Serve,
+    SlotOp::Fill,
+    SlotOp::Serve,
+    SlotOp::Publish,
+    SlotOp::Fill,
+    SlotOp::Publish,
+    SlotOp::Peek,
+    SlotOp::Serve,
+    SlotOp::Serve,
+    SlotOp::Serve,
+];
+
+/// The hand oracle of [`A_SKIP_IN_A_REGIME`]'s counts at depth 2.
+const A_SKIP_IN_A_REGIME_ORACLE: [SlotRow<'static>; 16] = [
+    ("publish 1", 1, 0, 0, true),
+    ("publish 2", 2, 0, 0, false),
+    ("fill -> 1", 2, 0, 1, false),
+    ("discard -> true", 1, 0, 1, true),
+    ("publish 3", 2, 0, 1, false),
+    ("peek -> true", 2, 0, 2, false),
+    ("serve -> Some(2)", 1, 0, 1, true),
+    ("fill -> 1", 1, 0, 1, true),
+    ("serve -> Some(3)", 0, 0, 0, true),
+    ("publish 4", 1, 0, 0, true),
+    ("fill -> 1", 1, 0, 1, true),
+    ("publish 5", 2, 0, 1, false),
+    ("peek -> true", 2, 0, 2, false),
+    ("serve -> Some(4)", 1, 0, 1, true),
+    ("serve -> Some(5)", 0, 0, 0, true),
+    ("serve -> None", 0, 0, 0, true),
+];
+
+/// The hand oracle of what [`A_SKIP_IN_A_REGIME`]'s operations signal. The
+/// fill opens the regime (its drain arrives with 2 frames counted). The
+/// skip's refill drain arrives with the skipped head still counted, so it
+/// stays in that regime and rings once, at its pop, and the peek of frame 3
+/// queues no second event. The fill of frame 4 arrives with 1 frame counted
+/// and rearms, and the peek of frame 5 opens a fresh regime. The fill that
+/// promotes frame 3 drains nothing and rings nothing.
+const A_SKIP_IN_A_REGIME_SIGNALS: [Signals; 16] = [
+    (0, false),
+    (0, false),
+    (1, true),
+    (1, false),
+    (0, false),
+    (1, false),
+    (1, false),
+    (0, false),
+    (1, false),
+    (0, false),
+    (1, false),
+    (0, false),
+    (1, true),
+    (1, false),
+    (1, false),
+    (0, false),
+];
+
+/// A skipped head's refill does not reopen the consumer's `block` regime: the
+/// refill's drain reads the slot with the skipped head still counted, so a
+/// skip inside a full stretch queues no second event for it, and the head's
+/// exit and the refill's entry ring the wake word only at the refill's pop.
+/// Twice on fresh transports, each against the hand oracle.
+#[test]
+fn a_skipped_head_refill_does_not_reopen_the_consumers_block_regime() {
+    for run in ["regime_a", "regime_b"] {
+        let (rows, signals) = slot_walk_signalled(run, CreditWord::local(2), &A_SKIP_IN_A_REGIME);
+        assert_slot_walk(&rows, &A_SKIP_IN_A_REGIME_ORACLE);
+        assert_walk_signals(&rows, &signals, &A_SKIP_IN_A_REGIME_SIGNALS);
+    }
+}
+
+/// A skipped head whose refill read fails leaves its slot: the word pays it
+/// and rings once, the input holds nothing, and the next fill pops the
+/// queued frame.
+#[test]
+fn a_skipped_head_whose_refill_fails_leaves_its_slot_and_rings_once() {
+    let (rows, signals) = slot_walk_signalled(
+        "skip_err",
+        CreditWord::local(2),
+        &[
+            SlotOp::Publish,
+            SlotOp::Fill,
+            SlotOp::Publish,
+            SlotOp::FailNextReceive,
+            SlotOp::Discard,
+            SlotOp::Fill,
+            SlotOp::Serve,
+            SlotOp::Serve,
+        ],
+    );
+    assert_slot_walk(
+        &rows,
+        &[
+            ("publish 1", 1, 0, 0, true),
+            ("fill -> 1", 1, 0, 1, true),
+            ("publish 2", 2, 0, 1, false),
+            ("fail next receive", 2, 0, 1, false),
+            ("discard -> false", 1, 0, 0, true),
+            ("fill -> 1", 1, 0, 1, true),
+            ("serve -> Some(2)", 0, 0, 0, true),
+            ("serve -> None", 0, 0, 0, true),
+        ],
+    );
+    assert_walk_signals(
+        &rows,
+        &signals,
+        &[
+            (0, false),
+            (1, false),
+            (0, false),
+            (0, false),
+            (1, false),
+            (1, false),
+            (1, false),
+            (0, false),
         ],
     );
 }
