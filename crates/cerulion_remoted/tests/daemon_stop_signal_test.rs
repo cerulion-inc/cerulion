@@ -9,12 +9,18 @@
 //! - a participant that fails exits 3, after the rest of the teardown ran;
 //! - with no signal, a stop the endpoint's own close started is still ended by
 //!   the deadline with status 4;
+//! - after the endpoint's own close, the first stop signal counts as a second
+//!   one and exits with status 4, after its warn line;
 //! - with stderr full the graceful stop stalls on serving's own log lines, and
 //!   the deadline still ends it with status 4, within a bound of the deadline
 //!   plus 5 s.
 //!
 //! The stage's participant is the test seam's probe, which logs whether the
-//! rcpd e-stop sender was already stopped when the stage ran it.
+//! rcpd e-stop sender was already stopped when the stage ran it. A test that
+//! asserts the line the exit writes just before `_exit` sets the exit's wait
+//! for that line to 5 s through the test seam (the exit goes on once the line
+//! is written); the full-stderr test keeps the 100 ms a build without the test
+//! seam waits.
 //!
 //! Each daemon serves its own temp state root and device key, relays disabled;
 //! no peer connects, so the lazy wire plane never starts iceoryx2. The child
@@ -34,6 +40,9 @@ use cerulion_pairing::verify::TrustStore;
 const HARD_EXIT_ENV: &str = "CERULION_REMOTED_HARD_EXIT_MS";
 const PROBE_ENV: &str = "CERULION_REMOTED_SHUTDOWN_PROBE_FOR_TEST";
 const CLOSE_ENV: &str = "CERULION_REMOTED_CLOSE_ENDPOINT_FOR_TEST";
+const GRACE_ENV: &str = cerulion_remoted::shutdown::EXIT_LOG_GRACE_FOR_TEST_ENV;
+/// The exit's wait for its line in the tests that assert that line.
+const GRACE_MS: &str = "5000";
 const MAC_KEY: &[u8] = b"stop-signal-mac-key";
 const CHASSIS: &[u8] = b"stop-signal-chassis-secret-not-serial-derived";
 const T_NOW: u64 = 1_000_000_000_000;
@@ -141,6 +150,7 @@ impl Daemon {
             .env_remove(HARD_EXIT_ENV)
             .env_remove(PROBE_ENV)
             .env_remove(CLOSE_ENV)
+            .env_remove(GRACE_ENV)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null());
@@ -296,7 +306,14 @@ fn ctrl_c_still_runs_the_graceful_stop_and_exits_0() {
 #[test]
 fn the_hard_exit_deadline_ends_a_stop_that_cannot_finish_with_4() {
     let deadline = Duration::from_millis(3000);
-    let mut daemon = Daemon::start(0x53, &[(HARD_EXIT_ENV, "3000"), (PROBE_ENV, "stall")]);
+    let mut daemon = Daemon::start(
+        0x53,
+        &[
+            (HARD_EXIT_ENV, "3000"),
+            (PROBE_ENV, "stall"),
+            (GRACE_ENV, GRACE_MS),
+        ],
+    );
     let sent = daemon.signal(libc::SIGTERM);
     let (status, took) = daemon.wait_exit(sent, STOP_BOUND);
     assert_eq!(
@@ -328,7 +345,14 @@ fn the_hard_exit_deadline_ends_a_stop_that_cannot_finish_with_4() {
 
 #[test]
 fn a_second_stop_signal_during_the_stop_exits_with_4() {
-    let mut daemon = Daemon::start(0x54, &[(HARD_EXIT_ENV, "600000"), (PROBE_ENV, "stall")]);
+    let mut daemon = Daemon::start(
+        0x54,
+        &[
+            (HARD_EXIT_ENV, "600000"),
+            (PROBE_ENV, "stall"),
+            (GRACE_ENV, GRACE_MS),
+        ],
+    );
     daemon.signal(libc::SIGTERM);
     daemon.wait_for_line(PROBE_RAN, STOP_BOUND);
     let sent = daemon.signal(libc::SIGINT);
@@ -350,20 +374,29 @@ fn a_second_stop_signal_during_the_stop_exits_with_4() {
 
 #[test]
 fn without_a_signal_the_deadline_ends_a_stop_the_endpoint_close_started_with_4() {
+    // Before the process exists, so before the deadline can arm.
+    let t0 = Instant::now();
     let mut daemon = Daemon::start(
         0x57,
         &[
             (HARD_EXIT_ENV, "3000"),
             (PROBE_ENV, "stall"),
             (CLOSE_ENV, "1"),
+            (GRACE_ENV, GRACE_MS),
         ],
     );
-    let (status, _) = daemon.wait_exit(Instant::now(), STOP_BOUND);
+    // Measured from before the start: the startup, the 3 s deadline and the
+    // exit's wait for its line.
+    let (status, took) = daemon.wait_exit(t0, START_BOUND + STOP_BOUND);
     assert_eq!(
         status.code(),
         Some(4),
         "the deadline ends the stalled stop with 4, got {status:?}; log:\n{}",
         daemon.dump()
+    );
+    assert!(
+        took >= Duration::from_millis(3000),
+        "exited {took:?} after the start, before the 3000 ms hard-exit deadline"
     );
     assert!(
         daemon.line_with(&[ENDPOINT_CLOSED]).is_some(),
@@ -388,6 +421,47 @@ fn without_a_signal_the_deadline_ends_a_stop_the_endpoint_close_started_with_4()
     assert!(
         daemon.line_with(&[STOP_RECEIVED]).is_none(),
         "no stop signal was sent; log:\n{}",
+        daemon.dump()
+    );
+}
+
+#[test]
+fn after_the_endpoint_closed_on_its_own_the_first_stop_signal_exits_4() {
+    let mut daemon = Daemon::start(
+        0x58,
+        &[
+            (HARD_EXIT_ENV, "600000"),
+            (PROBE_ENV, "stall"),
+            (CLOSE_ENV, "1"),
+            (GRACE_ENV, GRACE_MS),
+        ],
+    );
+    daemon.wait_for_line(PROBE_RAN, STOP_BOUND);
+    let sent = daemon.signal(libc::SIGTERM);
+    let (status, _) = daemon.wait_exit(sent, STOP_BOUND);
+    assert_eq!(
+        status.code(),
+        Some(4),
+        "the first SIGTERM after the endpoint's own close exits with 4, got {status:?}; log:\n{}",
+        daemon.dump()
+    );
+    assert!(
+        daemon
+            .line_with(&["a second stop signal during the stop", "signal=\"SIGTERM\""])
+            .is_some(),
+        "the warn line of a second signal names the SIGTERM; log:\n{}",
+        daemon.dump()
+    );
+    assert!(
+        daemon.line_with(&[STOP_RECEIVED]).is_none(),
+        "no stop request reached serving; log:\n{}",
+        daemon.dump()
+    );
+    assert!(
+        daemon
+            .line_with(&["did not finish within the hard-exit deadline"])
+            .is_none(),
+        "the signal, not the deadline, ended the stop; log:\n{}",
         daemon.dump()
     );
 }

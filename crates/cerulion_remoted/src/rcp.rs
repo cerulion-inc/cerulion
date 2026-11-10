@@ -202,8 +202,9 @@ pub const UPSTREAM_CODE: i64 = -32603;
 
 /// How long a TCP connect to rcpd may take. rcpd is on loopback, where a
 /// connect either completes at once or is refused, so this only bounds a
-/// wedged host; not tunable. [`RcpdEstop::shut_down`] waits this long for a
-/// delivery in flight.
+/// wedged host; not tunable. [`RcpdEstop::shut_down`] marks the daemon
+/// stopping, which ends a delivery in flight, then waits this long for the
+/// delivery's task to end; the delivery gets no more time to reach rcpd.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Frames queued for the desk per session; the byte budget

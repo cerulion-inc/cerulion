@@ -190,8 +190,9 @@ const ENDPOINT_CLOSE_ALLOWANCE: Duration = Duration::from_secs(3);
 const SCHEDULING_ALLOWANCE: Duration = Duration::from_secs(4);
 
 /// The default hard-exit deadline, 30 s, chosen as the sum of nominal shares
-/// one after another: the stage's participants (18 s), the wait for an rcpd
-/// e-stop delivery in flight (5 s), the endpoint close (about 3 s) and
+/// one after another: the stage's participants (18 s), the wait for the task
+/// of an rcpd e-stop delivery that the stop has already ended, which gives the
+/// delivery no more time (5 s), the endpoint close (about 3 s) and
 /// scheduling (4 s). The shares bound no real work and their sum proves no
 /// cleanup completed: a participant may keep awaiting work past any of them,
 /// and that work stays pending until the process exits. Past the deadline, or
@@ -307,6 +308,13 @@ pub(crate) fn close_endpoint_for_test(endpoint: &cerulion_link::Endpoint) {
         tokio::spawn(async move { endpoint.close().await });
     }
 }
+
+/// The environment variable that sets, in milliseconds, how long the binary's
+/// exit waits for its log line in place of its 100 ms; a value that is not a
+/// positive whole number keeps the 100 ms.
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub const EXIT_LOG_GRACE_FOR_TEST_ENV: &str = "CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST";
 
 #[cfg(test)]
 mod tests {

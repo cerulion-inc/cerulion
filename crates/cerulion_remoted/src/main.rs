@@ -7,10 +7,12 @@
 //! (`cerulion_remoted::shutdown`). All logic lives in the `cerulion_remoted`
 //! library.
 //!
-//! Exit status: 0 after a graceful stop, and when the network kill switch
-//! refuses to serve; 1 on a configuration or serving error; 2 on a command-line
-//! usage error; 3 when a participant of the shutdown stage did not complete (the
-//! teardown after it still ran); 4 when the hard-exit deadline or a second stop
+//! Exit status: 0 after a graceful stop, also one that starts because the
+//! accept loop stopped on its own, and when the network kill switch refuses to
+//! serve; 1 on a configuration or serving error; 2 on a command-line usage
+//! error; 3 when a participant registered on the shutdown stage failed,
+//! panicked or was cancelled (the teardown after it still ran; this binary
+//! registers none of its own); 4 when the hard-exit deadline or a second stop
 //! signal ends a stop that has not finished.
 
 use std::path::PathBuf;
@@ -337,7 +339,7 @@ fn start_stop_thread(
 /// On the first stop signal, arm the deadline, then send serving the signal's
 /// name, which serving logs. Without one, arm it when serving drops its
 /// shutdown future. From then a stop signal ends the process, after at most
-/// [`EXIT_LOG_GRACE`] for its line, and the deadline ends it if it is still
+/// [`exit_log_grace`] for its line, and the deadline ends it if it is still
 /// running. This thread logs nothing itself: its two lines go through
 /// [`log_aside`], so a full or locked stderr can delay a line, never the stop
 /// request or the exit.
@@ -349,6 +351,9 @@ async fn stop_sequence(
 ) {
     let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
     let expired = tokio::select! {
+        // `ended` first: a signal ready at the same time stays queued for the select below.
+        biased;
+        _ = ended => tokio::time::sleep(deadline),
         first = signals.next() => {
             // `next` yields None only once both signal streams end, which
             // the signal driver of this runtime never does while it runs.
@@ -357,7 +362,6 @@ async fn stop_sequence(
             let _ = request.send(first);
             expired
         }
-        _ = ended => tokio::time::sleep(deadline),
     };
     tokio::pin!(expired);
     let logged = tokio::select! {
@@ -376,7 +380,7 @@ async fn stop_sequence(
             );
         }),
     };
-    let _ = tokio::time::timeout(EXIT_LOG_GRACE, logged).await;
+    let _ = tokio::time::timeout(exit_log_grace(), logged).await;
     // `_exit` ends the process at once: it runs no atexit handler, flushes no
     // stdio buffer and runs no destructor, so no exit-time cleanup can block it.
     // SAFETY: `_exit` takes a status and terminates the process; it touches no
@@ -384,12 +388,30 @@ async fn stop_sequence(
     unsafe { libc::_exit(EXIT_STOP_UNFINISHED) }
 }
 
-/// How long the exit waits for its own log line before `_exit`: 100 ms. A
-/// stderr with room takes one line well within it, on a loaded host too, and a
-/// full or locked stderr delays the exit by no more than it. Not tunable: the
-/// hard-exit deadline is the operator's knob, and this only gives a free stderr
-/// time for one line.
+/// How long the exit waits for its own log line before `_exit`: 100 ms. The
+/// exit goes on as soon as the line is written, and a full or locked stderr
+/// delays it by no more than this. Not tunable: the hard-exit deadline is the
+/// operator's knob, and this only gives a free stderr time for one line. Only
+/// a build with the test seam reads an override, from
+/// `CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST`.
 const EXIT_LOG_GRACE: Duration = Duration::from_millis(100);
+
+/// The exit's wait for its log line: [`EXIT_LOG_GRACE`], or, in a build with
+/// the test seam, the positive whole number of milliseconds its override
+/// variable holds.
+fn exit_log_grace() -> Duration {
+    #[cfg(feature = "test-seam")]
+    {
+        let ms = std::env::var(cerulion_remoted::shutdown::EXIT_LOG_GRACE_FOR_TEST_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0);
+        if let Some(ms) = ms {
+            return Duration::from_millis(ms);
+        }
+    }
+    EXIT_LOG_GRACE
+}
 
 /// Run `log` on a short-lived thread of its own, so a write to a full or
 /// locked stderr blocks only that thread. The receiver resolves once `log` has
