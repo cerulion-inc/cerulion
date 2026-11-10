@@ -44,7 +44,9 @@ use crate::scheduler::{
 };
 use crate::wire::WireHeader;
 
+use super::drain_clip_latch::{DrainClipLatch, DrainClipReport};
 use super::events::PubSubEvent;
+use super::failure_regime_latch::RegimeDecision;
 use super::input_view::InputView;
 use super::shm_sample::SampleHandle;
 use super::CerService;
@@ -195,9 +197,10 @@ struct BlockProbe {
     /// producer is being deferred on this consumer's behalf.
     threshold: u64,
     /// Shared counters — `block_fires_deferred_count` is maintained by the
-    /// PRODUCER pre-fire; the event only reads it. (No `node_id`: this probe
-    /// never warns/bumps — the producer's defer already does both — so it
-    /// needs no attribution beyond `input`.)
+    /// PRODUCER pre-fire; the event only reads it. (No `node_id`: the probe
+    /// bumps none of these counters, the producer's defer warns and bumps, and
+    /// the probe's own warning, the clipped-drain report of `drain_clips`,
+    /// carries the input's `topic`.)
     counters: Arc<BackpressureCounters>,
     input: Arc<str>,
     /// Edge-trigger latch: a below-threshold drain rearms; the first
@@ -210,6 +213,12 @@ struct BlockProbe {
     /// (see the sibling probes' field docs for the rationale).
     regime_count: u64,
     buffer_capacity: usize,
+    /// Flood suppression for drains that removed more frames than the word
+    /// counted, which its saturating subtraction clipped at 0
+    /// ([`CerulionSubscriber::block_drains_clipped`]). Every drain
+    /// records through `&self`, so the latch sits in a `RefCell`; the
+    /// subscriber is used from one thread at a time (it is `Send`, not `Sync`).
+    drain_clips: std::cell::RefCell<DrainClipLatch>,
 }
 
 /// The single backpressure probe installed on an input.
@@ -2396,6 +2405,7 @@ impl CerulionSubscriber {
             regime_started_ns: 0,
             regime_count: 0,
             buffer_capacity,
+            drain_clips: std::cell::RefCell::new(DrainClipLatch::new()),
         }));
     }
 
@@ -2477,8 +2487,75 @@ impl CerulionSubscriber {
             // slice — the wedge the wake word exists to prevent. On a LOCAL
             // word nobody can be parked, so the ring is a `wake_seq` bump plus
             // a `parked`-mask read and no syscall.
-            counter.record_drained(removed);
+            let clipped = counter.record_drained(removed);
+            self.report_block_drain(clipped);
         }
+    }
+
+    /// `block`: report one drain through the probe's [`DrainClipLatch`].
+    /// `clipped` is what [`crate::credit::CreditShared::record_drained`]
+    /// returned: how many more frames the drain removed than its word
+    /// counted, the ones the subtraction could not take off once the word
+    /// reached 0. The first clipping drain of a regime warns, repeats
+    /// log at `debug!` and are counted, the drain that takes the running total
+    /// to each decade warns with a line of its own, and the clean drain that
+    /// completes the regime's closing run logs one recovery line when the
+    /// regime counted a repeat. A no-op unless a block probe is installed.
+    #[inline]
+    fn report_block_drain(&self, clipped: u64) {
+        let Some(probe) = self.block_probe() else {
+            return;
+        };
+        let mut clips = probe.drain_clips.borrow_mut();
+        let report = clips.observe(clipped);
+        let total_failures = clips.total_failures();
+        drop(clips);
+        let decision = match report {
+            DrainClipReport::Quiet => return,
+            DrainClipReport::Recovered { suppressed } => {
+                tracing::info!(
+                    topic = %self.topic,
+                    suppressed_count = suppressed,
+                    total_failures,
+                    "block credit drains match the word's count again"
+                );
+                return;
+            }
+            DrainClipReport::Clipped(decision) => decision,
+        };
+        match decision {
+            RegimeDecision::Loud => tracing::warn!(
+                topic = %self.topic,
+                total_failures,
+                "block credit drain removed frames its word never counted, so the word reads \
+                 below the queue and the producer can overrun the declared depth; look for a \
+                 writer outside the graph or `history_size` on this block topic"
+            ),
+            RegimeDecision::StillFailing { suppressed, .. } => tracing::warn!(
+                topic = %self.topic,
+                total_failures,
+                suppressed_count = suppressed,
+                "block credit drains still remove frames their word never counted"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                topic = %self.topic,
+                total_failures,
+                suppressed_count = suppressed,
+                "block credit drain clipped at zero again"
+            ),
+        }
+    }
+
+    /// `block`: how many drains of this input removed more frames than their
+    /// word counted: drains of frames the word never counted (see
+    /// [`crate::credit::CreditShared::record_drained`]). A
+    /// running total, never reset. `0` unless this input is wired `block`.
+    /// Hidden from the documented API: tests and the runtime read it, and a
+    /// user sees the same condition through the clip report's warning lines.
+    #[doc(hidden)]
+    pub fn block_drains_clipped(&self) -> u64 {
+        self.block_probe()
+            .map_or(0, |probe| probe.drain_clips.borrow().total_failures())
     }
 
     /// Re-state this input's `block` occupancy from the SLOTS, after
@@ -2554,7 +2631,8 @@ impl CerulionSubscriber {
                 // `record_drained` and therefore RINGS the wake word — a
                 // decrement that freed room without ringing would leave a
                 // cross-process producer parked on room that already exists.
-                probe.outstanding.record_drained(u64::from(debt - held));
+                let clipped = probe.outstanding.record_drained(u64::from(debt - held));
+                self.report_block_drain(clipped);
             }
         }
         self.block_slot_debt = held;
@@ -6157,7 +6235,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             armed,
             regime_started_ns,
             regime_count,
-            buffer_capacity
+            buffer_capacity,
+            drain_clips
         }),
         abi_pin_struct!(StreamObservation {
             id,
