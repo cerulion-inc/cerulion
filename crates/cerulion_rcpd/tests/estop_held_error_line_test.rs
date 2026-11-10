@@ -4,7 +4,7 @@
 //! `estop` after its frame is queued, so a log writer that holds that line
 //! does not hold the frame the graph is stopped with.
 //!
-//! Each test makes one tool call on a thread of its own under a scoped
+//! Each test makes its held call on a thread of its own under a scoped
 //! subscriber whose writer holds one line, and keeps a second
 //! dispatcher alive, so tracing-core computes each callsite's interest over
 //! every live dispatcher rather than one thread's default. While the line is
