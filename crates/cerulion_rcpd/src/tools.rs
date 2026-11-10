@@ -168,8 +168,8 @@ impl ReceiptSink {
             })
     }
 
-    /// Arm the next [`ReceiptSink::record`] to fail at its `sync_data`, as a
-    /// full disk would.
+    /// Arm the next receipt append to fail at its `sync_data`, as a full disk
+    /// would.
     #[cfg(feature = "test-helpers")]
     #[doc(hidden)]
     pub fn fail_next_sync_for_test(&self) {
@@ -221,11 +221,35 @@ fn log_receipt_not_written(verb: &str, error: &CerudError) {
 /// What `engage_latch` did inside `latch_io`: the `intent` receipt or why it
 /// was not written, why the latch file was not written, and the future that
 /// waits for the graph's answer to the queued frame.
+#[must_use = "its failed writes are logged by `Engaged::log_failures`"]
 struct Engaged<F> {
     intent: Result<Receipt, CerudError>,
     /// `None` when the file was written or already existed.
     latch_file_error: Option<std::io::Error>,
     answer: F,
+}
+
+impl<F> Engaged<F> {
+    /// Log the latch file at `latch_file` if it was not written, then the
+    /// `intent` receipt if it was not; return the intent and the answer's
+    /// future.
+    fn log_failures(self, latch_file: &Path) -> (Option<Receipt>, F) {
+        if let Some(e) = &self.latch_file_error {
+            tracing::error!(
+                error = %e,
+                latch = %latch_file.display(),
+                "latch file not written; the e-stop will not survive a restart"
+            );
+        }
+        let intent = match self.intent {
+            Ok(receipt) => Some(receipt),
+            Err(e) => {
+                log_receipt_not_written(ESTOP_TOOL, &e);
+                None
+            }
+        };
+        (intent, self.answer)
+    }
 }
 
 /// The tools, the receipt log, the e-stop latch and the journal.
@@ -595,25 +619,13 @@ impl ToolHost {
         let digest = args_digest(&clean);
         let call_id = self.next_call_id();
         let frame = Journal::frame(call_id, ESTOP_TOOL, &clean);
-        let engaged = self.engage_latch(&reason, &digest, call_id, frame);
-        // The frame is queued and `latch_io` is released before either
-        // failed write is logged.
-        if let Some(e) = &engaged.latch_file_error {
-            tracing::error!(
-                error = %e,
-                latch = %self.latch_file.display(),
-                "latch file not written; the e-stop will not survive a restart"
-            );
-        }
-        let intent = match engaged.intent {
-            Ok(receipt) => Some(receipt),
-            Err(e) => {
-                log_receipt_not_written(ESTOP_TOOL, &e);
-                None
-            }
-        };
+        // `engage_latch` returns with the frame queued and `latch_io`
+        // released; its failed writes are logged after that.
+        let (intent, answer) = self
+            .engage_latch(&reason, &digest, call_id, frame)
+            .log_failures(&self.latch_file);
         tracing::warn!(reason = %reason, "e-stop engaged");
-        let answer = engaged.answer.await;
+        let answer = answer.await;
         let (result, graph_error) = match answer {
             Ok(result) => {
                 self.record(ESTOP_TOOL, &digest, ReceiptOutcome::Ok);
@@ -645,9 +657,9 @@ impl ToolHost {
     /// `latch_io`, close the latch again, write the file when it is absent,
     /// write the `intent` receipt, and queue the e-stop frame on the journal's
     /// urgent queue. A clear that takes the lock next queues its own frame
-    /// after this one. Writes no log line: a failed file or receipt write is
-    /// returned in the [`Engaged`], with the future that waits for the
-    /// graph's answer.
+    /// after this one. Writes neither error line itself: a failed file or
+    /// receipt write is returned in the [`Engaged`], with the future that
+    /// waits for the graph's answer.
     fn engage_latch(
         &self,
         reason: &str,
