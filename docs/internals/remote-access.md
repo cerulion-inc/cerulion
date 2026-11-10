@@ -616,11 +616,13 @@ a device key sends nothing and logs that at warn. `RcpdEstop` shares an
 `Owing` with its delivery: a `period` mutex over the period's first engager
 and the last delivery id, an `engages` count and the `running` delivery
 id (0 for none). Under `period`, `send` names the first engager of the
-period, adds one to `engages`, and, when `running` is 0, sets it to a new
-id and spawns `Delivery::run` on the runtime handle `serve_core` captured,
-in the engage's span; otherwise it releases `period` and logs at info that
-the running delivery covers the engage. `period` is held only for those
-steps and never across an `.await`. Each attempt reads `engages` as it
+period, adds one to `engages`, and, when `running` is 0, sets it to a new id
+and builds the delivery; it then releases `period`, spawns `Delivery::run`
+on the runtime handle `serve_core` captured, in the engage's span, and
+keeps the handle of the delivery with the larger id. Otherwise it releases
+`period` and logs at info that the running delivery covers the engage.
+`period` is held only for those steps, never across an `.await`, and
+no log line is written under it. Each attempt reads `engages` as it
 begins, reads the token through `load_token`, then sends `initialize`,
 `notifications/initialized` and `tools/call` `estop` with `reason`
 `rcp::OPS_ESTOP_REASON` (`estop_session`), each POST on a fresh loopback
@@ -631,20 +633,23 @@ engager), its response head within `estop_policy::estop_head_bound` of
 answer within `OPS_ESTOP_ANSWER` (10 s) after it, then a `DELETE` of the
 session rcpd issued it, within `OPS_ESTOP_DELETE` (2 s), also after a
 stop by Ctrl-C or SIGTERM. It succeeds only when the call's result says
-`"estopped": true` (`estop_outcome`); the delivery logs that at warn with
-`failed_attempts`, then runs `Owing::finish` on a blocking thread. `finish`,
-under `period`, asks `estop_policy::after_answer` of the count at the
-attempt's start and now: `Done` ends the period and clears `running` while
-it still holds the delivery's id, so the next engage starts a delivery, and
-`Again` (an engage came during the answered attempt) sends at once again.
+`"estopped": true` (`estop_outcome`); the delivery logs that at
+warn with `failed_attempts`, then calls `Owing::finish` on its
+own task. `finish`, under `period`, writes no log line and asks
+`estop_policy::after_answer` of the count at the attempt's start and
+now: `Done` ends the period and clears `running` while it still holds
+the delivery's id, so the next engage starts a delivery, and `Again`
+(an engage came during the answered attempt) sends at once again.
 After a failed attempt the loop logs through one `FailureRegimeLatch`
 per delivery (the first failure and each decade of failures at warn with
 `reason`, rcpd's text through `sanitize_peer_text`, the others at debug
 with `suppressed`), then sleeps `retry_in` (`OPS_ESTOP_RETRY_FIRST`, 100 ms,
-doubled after each failure up to `OPS_ESTOP_RETRY_CAP`, 2 s). Both the attempt
-and the sleep race the stop flag, a `watch` that `RcpdEstop::shut_down`
-sets once `serve_planes` returns; `shut_down` then waits for the task within
-`CONNECT_TIMEOUT`. A `Running` guard in the delivery clears `running` on
+doubled after each failure up to `OPS_ESTOP_RETRY_CAP`, 2 s).
+Both the attempt and the sleep race the stop flag, a `watch` that
+`RcpdEstop::shut_down` sets once `serve_planes` returns; `shut_down` then
+waits for the task within `CONNECT_TIMEOUT`; a delivery whose `send` has
+not yet stored its handle is not awaited, and it reads the stop and ends
+as on any stop. A `Running` guard in the delivery clears `running` on
 any other end, by compare-and-swap of its own id, and logs at error unless
 rcpd had answered: a stop by Ctrl-C or SIGTERM (`serve_core`'s teardown
 calls `RcpdEstop::shut_down`), a panic, or a runtime dropped with the task.
