@@ -2335,15 +2335,18 @@ impl RcpdEstop {
 
 /// A delivery's mark in `Owing::running`. Its drop clears `running` while
 /// `running` still holds its id, and then logs at error unless rcpd had
-/// answered: after a stop, a panic or a dropped runtime. A delivery rcpd
-/// answered is cleared by [`Owing::finish`] instead.
+/// answered the attempt in flight: after a stop, a panic or a dropped
+/// runtime. A delivery that ends in the session `DELETE` of an attempt rcpd
+/// answered logs nothing. A delivery whose [`Owing::finish`] answers
+/// [`AfterAnswer::Done`] is cleared by `finish` instead.
 struct Running {
     owing: Arc<Owing>,
     id: u64,
     /// The engager's device key, hex.
     by: String,
     attempts: u64,
-    /// Set from rcpd's answer until the delivery sends once more.
+    /// Set when rcpd answers an attempt's estop call with its latch closed,
+    /// before the session `DELETE`, until the delivery sends once more.
     answered: bool,
 }
 
@@ -2382,9 +2385,10 @@ impl Delivery {
     /// [`Owing::finish`], called on this task, answers [`AfterAnswer::Done`];
     /// on [`AfterAnswer::Again`] it sends at once again. Each attempt reads
     /// the token, then sends `initialize`, `notifications/initialized` and the
-    /// [`ESTOP_TOOL`] call with [`OPS_ESTOP_REASON`] ([`estop_session`]) and
-    /// deletes the session rcpd issued, also when the daemon stops mid
-    /// attempt. After a failed attempt it logs through [`log_failure`] and
+    /// [`ESTOP_TOOL`] call with [`OPS_ESTOP_REASON`] ([`estop_session`]),
+    /// records rcpd's answer that its latch closed on the delivery's mark as
+    /// soon as that call returns, and deletes the session rcpd issued, also
+    /// when the daemon stops mid attempt. After a failed attempt it logs through [`log_failure`] and
     /// waits `retry_first`, then twice as long after each further failure, up
     /// to `retry_cap`. The attempt and the wait end when the daemon stops.
     async fn run(mut self) {
@@ -2404,6 +2408,11 @@ impl Delivery {
                         }
                         () = stopping(&mut self.stop) => None,
                     };
+                    // Recorded before the `DELETE`: a delivery that ends in it
+                    // ends after rcpd answered.
+                    if matches!(outcome, Some(Ok(_))) {
+                        self.guard.answered = true;
+                    }
                     if upstream.session_id().is_some() {
                         let _ =
                             tokio::time::timeout(OPS_ESTOP_DELETE, delete_session(&upstream)).await;
@@ -2425,7 +2434,6 @@ impl Delivery {
                         graph_acknowledged,
                         "cerulion_remoted: rcpd's e-stop latch closed by an ops engage-estop"
                     );
-                    self.guard.answered = true;
                     match self.guard.owing.finish(self.guard.id, engages_at_start) {
                         AfterAnswer::Done => return,
                         AfterAnswer::Again => {
@@ -4098,6 +4106,31 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[tracing_test::traced_test]
+    async fn a_delivery_stopped_after_rcpd_answered_with_an_error_logs_its_early_end() {
+        use Turn::{Answer, Error};
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in = ScriptedRcpd::start(vec![Answer, Answer, Error]).await;
+        let mut rcpd = sender_to(dir.path(), stand_in.addr);
+        // The wait after the failed attempt outlasts the test.
+        rcpd.retry_first = Duration::from_secs(600);
+        assert!(rcpd.send(&[1; 32]));
+        // rcpd answers the estop call with an error; the session is deleted.
+        for kind in attempt() {
+            assert_eq!(stand_in.next().await.0, kind);
+        }
+        within("the delivery stops", rcpd.shut_down()).await;
+        assert_eq!(rcpd.owing.running.load(Ordering::Acquire), 0);
+        let by = format!("by={}", hex::encode([1u8; 32]));
+        logs_assert(|logs| {
+            match lines_with(logs, &[ENDED_EARLY, "ERROR", "attempts=1", &by]).len() {
+                1 => Ok(()),
+                n => Err(format!("{n} early-end lines")),
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
     async fn a_resend_stopped_mid_attempt_logs_its_early_end_and_deletes_its_session() {
         use Turn::{Answer, AnswerOnRelease, Hold};
         let dir = tempfile::tempdir().unwrap();
@@ -4168,6 +4201,10 @@ mod tests {
         });
     }
 
+    /// The runtime's drop waits for `finish`, which runs inside the
+    /// delivery's poll; its `Done` ends the period and clears the mark, so
+    /// the guard's drop finds the mark gone and reads no `answered` flag.
+    /// The period's engager is cleared only by that `Done`.
     #[test]
     #[tracing_test::traced_test]
     fn a_delivery_rcpd_answered_logs_no_early_end_when_its_runtime_drops_during_finish() {
@@ -4198,9 +4235,42 @@ mod tests {
         drop(held);
         dropping.join().unwrap();
         assert_eq!(rcpd.owing.running.load(Ordering::Acquire), 0);
+        assert_eq!(
+            rcpd.owing.period.lock().unwrap().engager,
+            None,
+            "the delivery ended before finish ended its period"
+        );
         assert!(
             !logs_contain(ENDED_EARLY),
             "an answered delivery logged an early end"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_delivery_rcpd_answered_logs_no_early_end_when_its_runtime_drops_during_its_delete() {
+        use Turn::{Answer, Hold};
+        let stand_in_runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stand_in =
+            stand_in_runtime.block_on(ScriptedRcpd::start(vec![Answer, Answer, Answer, Hold]));
+        let delivery_runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let link = link_to(dir.path(), stand_in.addr, 0o600);
+        let rcpd = RcpdEstop::new(&link, bare_trust(), delivery_runtime.handle().clone());
+        assert!(rcpd.send(&[1; 32]));
+        // rcpd answers the estop call, then holds the session's `DELETE`.
+        for kind in attempt() {
+            assert_eq!(stand_in_runtime.block_on(stand_in.next()).0, kind);
+        }
+        drop(delivery_runtime);
+        assert_eq!(rcpd.owing.running.load(Ordering::Acquire), 0);
+        assert!(
+            !logs_contain(LATCH_CLOSED),
+            "the delivery got past its DELETE before the runtime dropped"
+        );
+        assert!(
+            !logs_contain(ENDED_EARLY),
+            "a delivery rcpd answered logged an early end during its DELETE"
         );
     }
 
