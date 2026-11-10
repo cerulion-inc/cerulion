@@ -4216,20 +4216,38 @@ jobs:
   # (it needs a live CycloneDDS peer), so what runs here is the pure decision
   # engine. The `humble` variant stays CHECK-only, as the project docs say.
   #
-  # TIMEOUT 60 -> 40, and the open item that asked for this is now closed.
-  # 60 was taken BEFORE the first run of this job, deliberately generous: its
-  # packages cold-compile the ~390-crate iroh tree (`cerulion_link`,
-  # `cerulion_remoted`) and a web stack (`cerulion_accountd`: axum, hyper,
-  # rusqlite), nothing else in this file caches those for them, and a
-  # cold-cache timeout is self-sustaining because the job dies before
-  # `actions/cache` can save. The note asked for two or three green runs to put
-  # a real number on it.
+  # TIMEOUT 40 -> 60. 40 was set at 2.4x the worst of this job's first six
+  # green legs (7.8 to 16.6 min). The job has since gained steps
+  # (`cerulion_rcpd`, the umbrella crate, `cerulion_android_remote`) and a
+  # larger `cerulion_remoted` suite, and the median green macOS leg on `main`
+  # went from 13.2 min (2026-09-21 to 10-21) to 30.6 min (11-06 to 11-10),
+  # Linux from 10.7 to 24.5. The growth is spread over several steps and no
+  # single one explains it: the largest, the umbrella crate, is 5.3 of the
+  # 17.4 macOS minutes.
   #
-  # SIX green legs now have, across four runs and both runners, cache hit and
-  # cache miss: 7.8, 9.4, 11.6, 11.8, 13.8, 16.6 min. The worst of those is the
-  # macOS leg of a run with no cache at all, which is the cold case the 60 was
-  # bought for. 40 is 2.4x it, and it still guards a HUNG job rather than
-  # rationing a healthy one, which is the rule this file applies everywhere.
+  # THE JOB RUNS COLD. Its `crates-<os>` namespace is not in the default
+  # `CACHE_SAVE_NAMESPACES`, so under that default no run saves it and every
+  # restore misses: each leg compiles about 1740 units from scratch, and the
+  # cache state never separates a fast leg from a slow one.
+  #
+  # THE CUTS ARE SLOW RUNNERS on that base. On 11-10, macOS legs on one image,
+  # one region and one toolchain, every one running every step, took from under
+  # 14 min to past 40. A speed index, the summed time of the link, accountd and
+  # dds steps (whose compile work is about constant since 09-21), puts the
+  # slowest runner measured since then at 2.15x the median on macOS and 1.20x
+  # on Linux. The 110 macOS legs of push, merge-queue and manual runs (which
+  # run every step) from 11-07 to 11-10: p50 31.0, p95 at least 38.2 counting
+  # the two cut at 40, worst green 39.1. Five such legs were cut at 40 from
+  # 11-03 to 11-10, four of them inside the umbrella step, the last step.
+  # Linux over 11-07 to 11-10: p95 26.8, worst 27.6, none cut.
+  #
+  # 60 is 1.57x that 38.2 and 1.53x the worst green leg, the 1.5x margin over
+  # the worst observed leg that `test-linux` keeps. A linear fit of job time on
+  # the speed index over the green macOS legs from 11-07, applied to all 439
+  # index values measured since 09-21, puts 10 of them over 40 and none over 60
+  # (the slowest lands just under it). The ceiling guards a HUNG job rather
+  # than rationing a healthy one, which is the rule this file applies
+  # everywhere; at 40 it cut legs that were slow, not hung.
   # ==========================================================================
 
       # Deletes from `target/` every unit no cargo command in this job read
@@ -4307,7 +4325,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       # `line-tables-only`, matching the other TEST jobs: backtraces keep
       # file:line (what makes a red run diagnosable) while the target dir stays
@@ -4549,8 +4567,9 @@ jobs:
       # only way to exercise the claim `cargo add cerulion` makes, because
       # every package inside this workspace also names the runtime crate
       # directly. It runs here rather than in a test shard because it drives
-      # cargo itself, and this job's cache namespace is the one that carries
-      # its dependency closure. The doctests in the same package run with it.
+      # cargo itself. No cache carries its dependency closure: the child check
+      # compiles the whole runtime cold on every run, into the scratch
+      # directory below. The doctests in the same package run with it.
       # Named for the crate rather than starting with it: a step name whose
       # first word is `cerulion` followed by a lowercase word parses as an
       # invocation of the binary to the login-gate walk in `cerulion_hygiene`,
@@ -4558,10 +4577,11 @@ jobs:
       # carries an underscore.
       - name: Umbrella crate tests (cerulion)
         env:
-          # The scratch project's artifacts live outside `target/`, which this
-          # job caches. They are about 1.6 GB and belong to a package set
-          # nothing else here builds, so caching them would cost every run an
-          # upload and a restore to save one cold check.
+          # The scratch project's artifacts live outside `target/`, the path
+          # this job's cache steps archive once its namespace is opted in to
+          # saving. They are about 1.6 GB and belong to a package set nothing
+          # else here builds, so caching them would cost every run an upload
+          # and a restore to save one cold check.
           CERULION_SCRATCH_TARGET_DIR: ${{ runner.temp }}/cerulion-one-dependency-scratch
         run: cargo test -p cerulion
 
