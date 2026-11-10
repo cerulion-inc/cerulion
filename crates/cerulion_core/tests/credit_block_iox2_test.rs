@@ -55,10 +55,10 @@
 //! `depth`, and the once-per-regime `warn!` names the consumer edge.
 //!
 //! Per-test isolated SHM roots + pid/tag-scoped credit namespaces. `#[serial]`
-//! on 18 of the 19 arms: one is `#[traced_test]`, which installs a
-//! PROCESS-GLOBAL subscriber, and a sibling running beside it would both
-//! pollute its capture and race the install. The 19th —
-//! `the_depth_max_consumer_tracks_the_topology_ceiling` — is a pure constant
+//! on 42 of the 43 arms: five are `#[traced_test]`, which installs a
+//! PROCESS-GLOBAL subscriber, and a sibling running beside one would both
+//! pollute its capture and race the install. The 43rd,
+//! `the_depth_max_consumer_tracks_the_topology_ceiling`, is a pure constant
 //! drift guard that touches no transport and needs no turn.
 
 use std::sync::{Arc, Mutex};
@@ -3688,7 +3688,10 @@ fn a_send_that_reaches_no_subscriber_keeps_its_count() {
 /// So the pin is two facts: the service a graph's block topic is created on
 /// keeps safe overflow on, read from the service's own static config through a
 /// raw iceoryx2 node, and no Rust file under `crates/` sets a publisher's
-/// degradation handler.
+/// degradation handler. The graph here runs under `iceoryx_test_config()`,
+/// iceoryx2's compiled-in defaults with an isolated prefix, so the first fact
+/// pins the default; an operator `iceoryx2.toml` that sets
+/// `enable-safe-overflow = false` is outside it.
 #[test]
 #[serial]
 fn the_block_publisher_keeps_safe_overflow_and_the_default_degradation() {
@@ -3902,7 +3905,7 @@ const CLIP_REPEAT: &str = "block credit drain clipped at zero again";
 /// not log the loud line once per frame. The producer's frames drain clean
 /// between the outside ones, so a regime does not close at each of those
 /// clean drains: it closes after a run of clean drains, and every close
-/// doubles the run the next regime needs.
+/// doubles the run the next regime needs, up to 65_536.
 ///
 /// Two writers on one topic: the producer, whose frames the word counts, and a
 /// writer outside the graph, whose frames it does not. Twenty cycles of one

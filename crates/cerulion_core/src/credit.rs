@@ -89,11 +89,19 @@
 //! after the pop, so a drain never finds the word without the count of a frame
 //! it removes, however the two processes are scheduled.
 //!
-//! The take-back is exact because, as Cerulion configures iceoryx2, a `send()`
-//! that returns `Err` delivered the frame to no connection: the topic's
-//! service keeps safe overflow on and no publisher sets a degradation handler,
-//! which `credit_block_iox2_test::the_block_publisher_keeps_safe_overflow_and_the_default_degradation`
-//! pins.
+//! The take-back is exact under iceoryx2's default safe overflow (on) and
+//! default degradation action (`Warn`): with both, a `send()` that returns
+//! `Err` delivered the frame to no connection. Cerulion sets neither. No
+//! publisher sets a degradation handler, and safe overflow comes from the
+//! iceoryx2 configuration the process loads, which an operator `iceoryx2.toml`
+//! can change: with `enable-safe-overflow = false`, a `send()` to several
+//! consumers can return `Err` after some of their queues took the frame, and
+//! the take-back then leaves each of those words one frame below its queue.
+//! `credit_block_iox2_test::the_block_publisher_keeps_safe_overflow_and_the_default_degradation`
+//! reads safe overflow from a block topic's service built under the test
+//! configuration, which carries iceoryx2's compiled-in defaults, and scans the
+//! workspace for a degradation handler, so it pins those defaults and no
+//! operator file.
 //!
 //! What this does NOT cover. Each case leaves the word off by the frames
 //! involved for as long as the edge runs:
@@ -102,10 +110,10 @@
 //!   joiner (graph build warns about a `block` topic with `history_size > 0`),
 //!   and a writer outside the graph on a `multi_publisher_topics` topic. Their
 //!   drains leave the word BELOW the queue, so the producer can overrun the
-//!   declared depth. A drain that clips the word at 0 is reported once per
-//!   regime and counted by the consumer
-//!   (`CerulionSubscriber::block_drains_clipped`); one that lands on a word
-//!   still above 0 is indistinguishable from a counted drain.
+//!   declared depth. A drain that removes more frames than the word counts
+//!   clips the word at 0, and is reported once per regime and counted by the
+//!   consumer (`CerulionSubscriber::block_drains_clipped`); a drain the word's
+//!   count still covers is indistinguishable from a counted drain.
 //! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
 //!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
 //!   without touching the word, so a `block` input read through them leaves

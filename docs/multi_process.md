@@ -71,11 +71,14 @@ recording's per-edge read log offline).
   publishes only, so an out-of-graph writer can fill the consumer's queue
   without raising `outstanding`; the defer then arrives late and the queue can
   evict. That is a property of `block` on a listed topic, co-located or split.
-  A consumer drain that finds `outstanding` already at zero warns
+  A consumer drain that removes more frames than `outstanding` counts warns
   `block credit drain removed frames its word never counted`, naming the
-  topic, once per run of such drains, so the outside writer shows in the log;
-  the [topic naming](user-api.md#topic-naming) table says what it reports and
-  what it misses. See
+  topic, at the start of a run of such drains, so the outside writer shows in
+  the log; while a run lasts, the drain that takes the running total to each
+  power of ten warns a different line,
+  `block credit drains still remove frames their word never counted`. The
+  [topic naming](user-api.md#topic-naming) table names every line of the
+  report, when a run ends, and what the report misses. See
   [Hard constraints](auto_partitioning.md#hard-constraints-block-edges-are-not-a-cost-input).
 - A crashed worker does NOT (by default) kill the deployment: the supervisor
   drops it from the barrier cohort (under the `lockstep` opt-out; a free-run

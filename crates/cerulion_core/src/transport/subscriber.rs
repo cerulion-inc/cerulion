@@ -197,9 +197,10 @@ struct BlockProbe {
     /// producer is being deferred on this consumer's behalf.
     threshold: u64,
     /// Shared counters — `block_fires_deferred_count` is maintained by the
-    /// PRODUCER pre-fire; the event only reads it. (No `node_id`: this probe
-    /// never warns/bumps — the producer's defer already does both — so it
-    /// needs no attribution beyond `input`.)
+    /// PRODUCER pre-fire; the event only reads it. (No `node_id`: the probe
+    /// bumps none of these counters, the producer's defer warns and bumps, and
+    /// the probe's own warning, the clipped-drain report of `drain_clips`,
+    /// carries the input's `topic`.)
     counters: Arc<BackpressureCounters>,
     input: Arc<str>,
     /// Edge-trigger latch: a below-threshold drain rearms; the first
@@ -212,8 +213,9 @@ struct BlockProbe {
     /// (see the sibling probes' field docs for the rationale).
     regime_count: u64,
     buffer_capacity: usize,
-    /// Flood suppression for drains the word's saturating subtraction clipped
-    /// at 0 ([`CerulionSubscriber::block_drains_clipped`]). Every drain
+    /// Flood suppression for drains that removed more frames than the word
+    /// counted, which its saturating subtraction clipped at 0
+    /// ([`CerulionSubscriber::block_drains_clipped`]). Every drain
     /// records through `&self`, so the latch sits in a `RefCell`; the
     /// subscriber is used from one thread at a time (it is `Send`, not `Sync`).
     drain_clips: std::cell::RefCell<DrainClipLatch>,
@@ -2492,12 +2494,13 @@ impl CerulionSubscriber {
 
     /// `block`: report one drain through the probe's [`DrainClipLatch`].
     /// `clipped` is what [`crate::credit::CreditShared::record_drained`]
-    /// returned: the frames the drain removed that its word, already at 0,
-    /// could not take off. The first clipping drain of a regime warns, repeats
-    /// log at `debug!` and are counted, each decade of the running total warns
-    /// again, and the clean drain that completes the regime's closing run logs
-    /// one recovery line when the regime counted a repeat. A no-op unless a
-    /// block probe is installed.
+    /// returned: how many more frames the drain removed than its word
+    /// counted, the ones the subtraction could not take off once the word
+    /// reached 0. The first clipping drain of a regime warns, repeats
+    /// log at `debug!` and are counted, the drain that takes the running total
+    /// to each decade warns with a line of its own, and the clean drain that
+    /// completes the regime's closing run logs one recovery line when the
+    /// regime counted a repeat. A no-op unless a block probe is installed.
     #[inline]
     fn report_block_drain(&self, clipped: u64) {
         let Some(probe) = self.block_probe() else {
@@ -2543,9 +2546,9 @@ impl CerulionSubscriber {
         }
     }
 
-    /// `block`: how many drains of this input removed frames their word,
-    /// already at 0, could not take off: drains of frames the word never
-    /// counted (see [`crate::credit::CreditShared::record_drained`]). A
+    /// `block`: how many drains of this input removed more frames than their
+    /// word counted: drains of frames the word never counted (see
+    /// [`crate::credit::CreditShared::record_drained`]). A
     /// running total, never reset. `0` unless this input is wired `block`.
     pub fn block_drains_clipped(&self) -> u64 {
         self.block_probe()

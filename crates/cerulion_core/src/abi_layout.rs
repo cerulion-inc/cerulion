@@ -82,7 +82,7 @@
 //! | its two `IndexMap` values | `AnyPublisher`, `AnySubscriber` |
 //! | those enums' payloads | `CerulionPublisher`, `CerulionSubscriber` |
 //! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `DrainClipLatch`, `FailureRegimeLatch`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
-//! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch` |
+//! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch`, `BlockSendHook` |
 //! | the v12/v16 read-outcome chain | `ReadOutcomeStage`, `StageInner`, `StagedReadOutcome`, `ReadOutcomeKind`, `ReadSiteRole`, `ReadStageRole` |
 //! | the QoS store the node drains | `QosEventStore` |
 //! | `NodeContext.transport` (`graph/node.rs`) | `TransportManager` |
@@ -502,7 +502,7 @@ static EXPECTED: &[Expected] = &[
             reason: IOX2_PORTS,
             // Re-measured at ABI 31 on aarch64-apple-darwin (`dump_measured_table`):
             // `probe` grows with `BlockProbe` and moves from rank 10 to rank 8,
-            // and `topic` and `max_publishers`, ranked 8 and 9 before it, each
+            // and `topic` and `drain_scratch`, ranked 8 and 9 before it, each
             // move up by one.
             ranks: &[
                 9, 11, 6, 0, 8, 7, 12, 2, 13, 14, 10, 15, 20, 1, 3, 25, 21, 4, 5, 26, 16, 22, 23,
