@@ -8,7 +8,7 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "Command engine for the Cerulion CLI: workspace, node, graph, topic, and schema command logic"
 readme = "README.md"
-keywords = ["robotics", "cli", "zero-copy", "middleware", "cerulion"]
+keywords = ["robotics", "cli", "zero-copy", "ros2", "cerulion"]
 categories = ["science::robotics", "development-tools"]
 # A crates.io download carries this crate's own sources, its README, the
 # text of the license it is published under and this manifest. Whatever else

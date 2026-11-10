@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Cerulion core runtime: zero-copy robotics middleware.
+//! Cerulion core runtime: zero-copy transport, scheduling and graph execution.
 //!
 //! This crate is the runtime a Cerulion node links against. A node author
 //! touches a small part of it: the [`prelude`], the three node macros this

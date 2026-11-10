@@ -2,7 +2,7 @@ exit: Some(2)
 --- stdout
 
 --- stderr
-Cerulion robotics middleware CLI
+Cerulion robot runtime CLI
 
 Usage: cerulion [OPTIONS] <COMMAND>
 

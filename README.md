@@ -8,18 +8,51 @@
   </a>
 </p>
 
-**Run robots. Understand failures. Test every change.**
+**Cerulion (YC S24) gives AI agents a harness to control real robots. Our open-source runtime and harness give any AI agent a physical body, inside safety limits the robot enforces, and tools to autonomously debug recorded robot failures. It's ROS 2 compatible.**
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![crates.io: cerulion_cli 1.0.0](https://img.shields.io/badge/crates.io-cerulion__cli%201.0.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-docs.cerulion.com-blue.svg)](https://docs.cerulion.com)
 
-Cerulion connects the software running on a robot to the tools that inspect it and the tests that keep it working. Run your nodes, see their data in Studio, capture a failure, and re-execute that recording against a code or model change before deploying it.
+## What ships today
 
-Built for **Physical AI**, Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-copy shared memory, a scheduler that follows your node graph, ROS 2 interoperability and secure access to remote robots. The runtime records the data and execution context needed to turn real robot behavior into CI tests.
+- **Agent control, in the next release.** `cerulion-rcpd` is an MCP server on the robot. An agent reads live state and calls only the tools the operator declares in `rcp.yaml`. The daemon checks each argument against the tool's schema, applies safety classes and an e-stop latch, and writes hash-chained receipts. It is not in the 1.0.0 release; build it from this repository with `cargo build --release -p cerulion_rcpd`. It is shown on a simulated arm only: in [`examples/aspire_arm`](examples/aspire_arm/README.md) an agent drives the arm this way, and you supply the agent program. See [Robot Context Protocol](docs/rcp.md).
+- **Record and replay.** Runs record to standard MCAP. `cerulion bag play --resim all --verify` re-runs a supported native recording against new code and compares the outputs. Exit 1 names the topic that changed. ROS 2 nodes get analysis, not re-execution.
+- **Hindsight, in early access.** Recording-analysis tools your agent calls over MCP. Hindsight investigates MCAP recordings and cites topics and timestamps. Hindsight and the hosted MCP server are closed source. [Request access](https://docs.cerulion.com/cerulion/hindsight).
+- **Open source.** The runtime and `cerulion-rcpd` are AGPL-3.0-only, with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side wire crates are MIT OR Apache-2.0.
+- **ROS 2.** `rmw_cerulion` runs ROS 2 nodes on Cerulion's transport and is validated on Jazzy. `cerulion ros2 attach` bridges a running robot's ROS 2 topics. It is validated on Jazzy, and on Foxy and Humble through local type resolution only. See [ROS 2 compatibility](docs/ros2_compatibility.md).
 
-**[Install](#install) · [Architecture](#how-it-fits-together) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack) · [Docs](https://docs.cerulion.com)**
+## Why it's fast
+
+- **Zero-copy shared memory.** Nodes on one machine exchange messages through [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) shared memory. A publisher writes into a loaned slot and other local processes read the same bytes.
+- **Measured round trips.** On one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, stock settings, recording on, nominal 100 Hz load, 2026-09-16), a 1 MiB round trip has a median of 4.08 µs with the default multi-process layout and 10,952 µs on ROS 2 Jazzy with `rmw_fastrtps_cpp` defaults: about 2,700× faster than ROS 2 Jazzy defaults at 1 MiB. One machine, not a guarantee.
+- **Recording stays on.** The Cerulion figures above include the capture plane; the ROS 2 figures do not include a recorder.
+- **Platforms.** Release binaries run on Linux (x86_64, aarch64) and macOS.
+
+The [Performance](#performance) section has the full table, the p99 figures and the timing boundaries. The raw results are in [`docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes`](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md).
+
+![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
+
+Install, sign in, and once you have a recording, check your current code against it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+cerulion login
+cerulion bag play "recordings/obstacle_avoidance_<timestamp>.mcap" --resim all --verify
+```
+
+The [quickstart](#quickstart-run-record-and-verify) builds the example graph and makes that recording with `cerulion graph run --record`.
+
+**[Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides) · [Talk to the founders](https://cerulion.com/demo)**
+
+If Cerulion is useful to you, a star helps other robotics engineers find it.
+
+## The runtime
+
+Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-copy shared memory, a scheduler that follows your node graph, ROS 2 interoperability and secure access to remote robots. The runtime records the data and execution context that re-execution needs.
+
+**[Install](#install) · [Architecture](#how-it-fits-together) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack)**
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/development-loop-dark.svg">
@@ -33,7 +66,7 @@ Built for **Physical AI**, Cerulion combines [iceoryx2](https://github.com/eclip
 - **A scheduler that knows your graph.** Dependency levels are computed ahead of time; trigger policies decide when nodes can run. Eligible nodes in the same level can run in parallel. Event-driven waits, reusable buffers and placement by measured cost reduce overhead; recorded scheduling and input decisions support deterministic replay.
 - **Low latency, including the tail.** A 1 MiB native round trip measures 4.08 µs median and 7.38 µs p99 in the Linux multi-process benchmark, with recording enabled. [See the measurements and configurations](#performance).
 - **Execution you can test.** Periodic, data-triggered, synchronized and external nodes; explicit backpressure and deadlines; recorded execution traces and a virtual clock for deterministic re-execution.
-- **Recordings that become regression tests.** Standard MCAP, byte-exact output comparisons, per-field tolerances and machine-readable verdicts for CI. Test your changed code against the inputs that actually reached the robot.
+- **Recordings you can check code against.** Standard MCAP, byte-exact output comparisons, per-field tolerances and machine-readable verdicts for CI. Test your changed code against the inputs that actually reached the robot.
 - **Flashback when you forgot to record.** Save the moments before and after a failure from a rolling in-memory history, then inspect the incident or replay its recorded topics.
 - **Studio for the whole robot.** Live sensors and 3D scenes, topic discovery, rates and graph inspection in a desktop workspace, with an agent beside the data.
 - **Your robots, wherever they are.** Automatic account-based pairing connects owned and shared robots, with access grants controlling authenticated pub/sub. Discover nearby robots with mDNS; reach remote ones through Iroh hole punching or a relay.
@@ -110,7 +143,7 @@ Studio bundles its visualization, network and workspace daemons; it does not ins
 
 - **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
 - **Across machines:** mDNS discovers nearby robots and LAN topics stream to your computer. Account ownership and grants authorize remote access over Iroh, using direct peer-to-peer connections when possible and a relay when needed. The network daemon mirrors subscribed topics locally for your tools.
-- **At your desk:** Studio renders the robot's data; CLI and MCP tools inspect, record and verify it. Captured failures become inputs to the next regression test.
+- **At your desk:** Studio renders the robot's data; CLI and MCP tools inspect, record and verify it. A captured failure is a recording to inspect. Before re-running it, check `anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` attachment.
 
 Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-multi-process) · [Networking and remote robots](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots) · [Remote access](docs/remote_plane.md)
 
@@ -202,9 +235,7 @@ cerulion node build safety_controller --release
 cerulion bag play "$BAG" --resim all --verify
 ```
 
-This time verification reports a divergence and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot.
-
-![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
+This time verification reports a divergence and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation at the top of this page shows this whole run.
 
 <details>
 <summary>What replay verification checks</summary>
@@ -222,7 +253,7 @@ Comparisons are byte-exact by default. Add `--tolerance` for acceptable per-fiel
 
 Guides: [Quickstart](https://docs.cerulion.com/cerulion/quickstart) · [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay)
 
-## Replay verification turns model changes into regression tests
+## Check a model change against a recording
 
 The [perception example](examples/perception/) records a synthetic camera and pixel-based detector, verifies the baseline, then tests a detector whose boxes move by eight pixels. Its bounding-box overlap tolerance catches the change and names the affected field.
 
@@ -409,7 +440,7 @@ Guides: [Flashback](docs/flashback.md) · [Record and replay](https://docs.cerul
 
 **Hindsight** investigates MCAP recordings with answers grounded in specific topics and timestamps.
 
-Register the hosted endpoints with your client:
+The hosted endpoints are in early access. Register them with your client:
 
 ```bash
 claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
@@ -424,7 +455,7 @@ Guide: [Connect an MCP client](https://docs.cerulion.com/cerulion/guides/connect
 
 ## Roadmap
 
-The direction is **CI/CD for autonomy**: bring recordings, simulations and behavioral evidence into the review process before a change reaches a robot.
+The direction is **review for robot changes**: bring recordings, simulations and behavioral evidence into the review process before a change reaches a robot.
 
 | Area | What's next |
 |---|---|
@@ -471,7 +502,7 @@ Use GitHub's **Cite this repository** button or [CITATION.cff](CITATION.cff):
 ```bibtex
 @software{cerulion,
   author  = {Sharma, Lakshay and Kariyawasam, Raveen and {Cerulion Inc. and contributors}},
-  title   = {Cerulion: a robot runtime with byte-exact re-execution of recorded runs},
+  title   = {Cerulion},
   year    = {2026},
   version = {2.0.0},
   url     = {https://github.com/cerulion-inc/cerulion}
