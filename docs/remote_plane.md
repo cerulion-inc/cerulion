@@ -20,10 +20,10 @@ daemon restart clears it, and nothing else does; rcpd's latch, once that
 `estop` closed it, clears only through its `estop_clear` or by deleting its
 latch file and restarting rcpd.
 No verb returns that state yet; a verb or rcp tool call that it refuses says
-so in its error. An `engage-estop` returns
-a reply to the caller, writes a warning to the log, sends that `estop` and
-asks Flashback to save a recording; an `estop` over the rcp plane engages the
-latch without that ask.
+so in its error. An `engage-estop` engages the latch, sends that `estop`,
+then writes a warning to the log, asks Flashback to save a recording
+and returns a reply to the caller; an `estop` over the rcp plane engages
+the latch without that ask.
 It is the one e-stop latch the ops act verbs, `restart` and the
 `cerulion/rcp/1` plane obey: while it is engaged, the ops act verbs `topic-publish` and
 `service-call`, the ops verb `restart` and every tool call over the
@@ -38,8 +38,12 @@ refuses each rcp tool call other than `estop` that the plane has not yet sent
 to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
 rcpd just before each send), then sends an `estop` to rcpd without waiting
 for it, and sends it again while rcpd is not reachable or answers with an
-error, logging the failure, until rcpd answers that its latch closed. That
-latch then refuses the mutating calls rcpd holds and has not yet published;
+error, until rcpd answers that its latch closed. It logs the first failure and
+the 10th, 100th and so on at warn and the others at debug, and a delivery that
+ends before rcpd answers, as at a stop by Ctrl-C or SIGTERM, at error; a kill,
+a crash, the hard-exit deadline or a second stop signal may end it with no
+line. That latch then refuses the mutating calls rcpd holds when the `estop`
+reaches it and has not yet published;
 an `estop` over the rcp plane closes rcpd's own latch too. A robot still needs its own stop path (a hardwired e-stop) to
 stop motion. Only the `cerulion-remoted` daemon serves
 `engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
