@@ -3794,16 +3794,17 @@ const CLIP_LOUD: &str = "block credit drain removed frames its word never counte
 const CLIP_RECOVERED: &str = "block credit drains match the word's count again";
 
 /// A drain the word's saturating subtraction clips at 0 is reported loudly once
-/// per regime, its repeats are counted, and the first clean drain after them
-/// logs one recovery line.
+/// per regime, its repeats are counted, and the clean drain that closes the
+/// regime logs one recovery line.
 ///
 /// An outside writer (a publisher the word does not count, as a second writer
 /// on a `multi_publisher_topics` topic is) sends two frames the consumer
 /// drains: the first drain is the loud head of a regime and the second a
-/// suppressed repeat. A counted frame then drains cleanly and closes the regime.
-/// A last counted frame whose count a foreign drain took first clips again and
-/// opens a second regime. Oracle, by hand: three clipped drains, two loud lines,
-/// one recovery line.
+/// suppressed repeat. A counted frame then drains cleanly, which is the run of
+/// one clean drain that closes an input's first regime. A last counted frame
+/// whose count a foreign drain took first clips again and opens a second
+/// regime. Oracle, by hand: three clipped drains, two loud lines, one recovery
+/// line.
 #[test]
 #[serial]
 #[traced_test]
@@ -3890,4 +3891,119 @@ fn a_drain_clipped_at_zero_is_reported_once_per_regime() {
         logs_contain("total_failures=3"),
         "the second head carries the running total of clipped drains"
     );
+}
+
+/// The text of the decade line an open regime of clipped drains logs.
+const CLIP_STILL: &str = "block credit drains still remove frames their word never counted";
+/// The text of a counted repeat, logged at `debug`.
+const CLIP_REPEAT: &str = "block credit drain clipped at zero again";
+
+/// An outside writer whose frames interleave with the counted producer's does
+/// not log the loud line once per frame. The producer's frames drain clean
+/// between the outside ones, so a regime does not close at each of those
+/// clean drains: it closes after a run of clean drains, and every close
+/// doubles the run the next regime needs.
+///
+/// Two writers on one topic: the producer, whose frames the word counts, and a
+/// writer outside the graph, whose frames it does not. Twenty cycles of one
+/// counted frame and then one outside frame, each drained on its own, and then
+/// counted frames only. Oracle, by hand, from the latch's rules: twenty clipped
+/// drains. The first cycle's clip opens a regime (loud), and the second
+/// cycle's clean drain is the run of 1 that closes it, with nothing
+/// suppressed, so nothing is logged. The second cycle's clip opens the next
+/// regime (loud), which needs a run of 2; every cycle gives it 1, so it stays
+/// open. The clips of cycles 3 to 9 and 11 to 20 are counted repeats (17 debug
+/// lines), and cycle 10's clip takes the total to 10 and logs the decade line.
+/// After the outside writer stops, the first clean drain logs nothing and the
+/// second closes the regime with one recovery line, `suppressed_count=17` and
+/// `total_failures=20`.
+#[test]
+#[serial]
+#[traced_test]
+fn an_interleaved_outside_writer_does_not_repeat_the_loud_line_per_frame() {
+    const DEPTH_MIX: u32 = 4;
+    const CYCLES: u32 = 20;
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("clipmix", "consumer", "inp", DEPTH_MIX);
+    let clock = Arc::new(VirtualClock::new());
+    let mgr_p = manager("cb_mix_p", ix.clone(), Arc::clone(&clock));
+    let mgr_o = manager("cb_mix_o", ix.clone(), Arc::clone(&clock));
+    let mgr_c = manager("cb_mix_c", ix, Arc::clone(&clock));
+    let mut producer = mgr_p
+        .create_publisher(TOPIC, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("the producer's publisher");
+    producer.register_block_outstanding_for_test(CreditWord::mapped(Arc::clone(&w.producer_side)));
+    let mut outside = mgr_o
+        .create_publisher(TOPIC, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("the outside writer's publisher");
+    let mut sub = mgr_c
+        .create_subscriber_with_buffers(TOPIC, mgr_c.default_topic_config(), DEPTH_MIX as usize)
+        .expect("the consumer's input port");
+    sub.register_block_probe_for_test(
+        CreditWord::mapped(Arc::clone(&w.consumer_side)),
+        u64::from(DEPTH_MIX),
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        DEPTH_MIX as usize,
+    );
+    let publish = |publisher: &mut CerulionPublisher, x: f64| {
+        let mut frame = publisher.loan_proxy::<Vector3>().expect("loan");
+        frame.x = x;
+        drop(frame);
+    };
+    let read = |sub: &mut CerulionSubscriber| sub.try_view::<Vector3, f64>(|v| v.x).expect("read");
+    let count = |text: &str| {
+        let n = std::cell::Cell::new(0usize);
+        logs_assert(|lines: &[&str]| {
+            n.set(lines.iter().filter(|l| l.contains(text)).count());
+            Ok(())
+        });
+        n.get()
+    };
+
+    for cycle in 1..=CYCLES {
+        let x = f64::from(cycle);
+        publish(&mut producer, x);
+        assert_eq!(read(&mut sub), Some(x), "cycle {cycle}: the counted frame");
+        publish(&mut outside, -x);
+        assert_eq!(read(&mut sub), Some(-x), "cycle {cycle}: the outside frame");
+        assert_eq!(
+            sub.block_drains_clipped(),
+            u64::from(cycle),
+            "cycle {cycle}: every outside frame's drain clipped"
+        );
+        assert_eq!(w.consumer_side.outstanding(), 0, "cycle {cycle}");
+    }
+    assert_eq!(
+        (count(CLIP_LOUD), count(CLIP_STILL), count(CLIP_REPEAT)),
+        (2, 1, 17),
+        "two loud heads, one decade line and 17 counted repeats for 20 clipped drains"
+    );
+
+    publish(&mut producer, 100.0);
+    assert_eq!(read(&mut sub), Some(100.0));
+    assert_eq!(
+        count(CLIP_RECOVERED),
+        0,
+        "one clean drain is short of the run of 2 the open regime needs"
+    );
+    publish(&mut producer, 101.0);
+    assert_eq!(read(&mut sub), Some(101.0));
+    assert_eq!(count(CLIP_RECOVERED), 1, "the second clean drain closes it");
+    logs_assert(|lines: &[&str]| {
+        let recovery = lines
+            .iter()
+            .find(|l| l.contains(CLIP_RECOVERED))
+            .ok_or("no recovery line")?;
+        if recovery.contains("suppressed_count=17") && recovery.contains("total_failures=20") {
+            Ok(())
+        } else {
+            Err(format!(
+                "the recovery line must carry the 17 repeats it suppressed and the running \
+                 total of 20: {recovery}"
+            ))
+        }
+    });
+    assert_eq!(sub.block_drains_clipped(), 20, "the total is never reset");
+    assert_eq!(w.consumer_side.outstanding(), 0);
 }

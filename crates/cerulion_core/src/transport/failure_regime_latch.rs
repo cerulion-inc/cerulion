@@ -307,8 +307,8 @@ pub fn lock_regime_latch(
 
 // ---------------------------------------------------------------------------
 // This module's half of the ABI LAYOUT PIN (see `crate::abi_layout`). A
-// subscriber's block probe holds a latch by value, so its layout crosses the
-// node library boundary.
+// subscriber's block probe holds a latch by value, inside its
+// `DrainClipLatch`, so its layout crosses the node library boundary.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {

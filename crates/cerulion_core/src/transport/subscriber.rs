@@ -44,8 +44,9 @@ use crate::scheduler::{
 };
 use crate::wire::WireHeader;
 
+use super::drain_clip_latch::{DrainClipLatch, DrainClipReport};
 use super::events::PubSubEvent;
-use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+use super::failure_regime_latch::RegimeDecision;
 use super::input_view::InputView;
 use super::shm_sample::SampleHandle;
 use super::CerService;
@@ -215,7 +216,7 @@ struct BlockProbe {
     /// at 0 ([`CerulionSubscriber::block_drains_clipped`]). Every drain
     /// records through `&self`, so the latch sits in a `RefCell`; the
     /// subscriber is used from one thread at a time (it is `Send`, not `Sync`).
-    drain_clips: std::cell::RefCell<FailureRegimeLatch>,
+    drain_clips: std::cell::RefCell<DrainClipLatch>,
 }
 
 /// The single backpressure probe installed on an input.
@@ -2402,7 +2403,7 @@ impl CerulionSubscriber {
             regime_started_ns: 0,
             regime_count: 0,
             buffer_capacity,
-            drain_clips: std::cell::RefCell::new(FailureRegimeLatch::new()),
+            drain_clips: std::cell::RefCell::new(DrainClipLatch::new()),
         }));
     }
 
@@ -2489,35 +2490,36 @@ impl CerulionSubscriber {
         }
     }
 
-    /// `block`: report one drain through the probe's [`FailureRegimeLatch`].
+    /// `block`: report one drain through the probe's [`DrainClipLatch`].
     /// `clipped` is what [`crate::credit::CreditShared::record_drained`]
     /// returned: the frames the drain removed that its word, already at 0,
     /// could not take off. The first clipping drain of a regime warns, repeats
     /// log at `debug!` and are counted, each decade of the running total warns
-    /// again, and the first clean drain after a counted repeat logs one
-    /// recovery line. A no-op unless a block probe is installed.
+    /// again, and the clean drain that completes the regime's closing run logs
+    /// one recovery line when the regime counted a repeat. A no-op unless a
+    /// block probe is installed.
     #[inline]
     fn report_block_drain(&self, clipped: u64) {
         let Some(probe) = self.block_probe() else {
             return;
         };
-        let mut latch = probe.drain_clips.borrow_mut();
-        if clipped == 0 {
-            if let Some(suppressed) = latch.on_success() {
-                let total_failures = latch.total_failures();
-                drop(latch);
+        let mut clips = probe.drain_clips.borrow_mut();
+        let report = clips.observe(clipped);
+        let total_failures = clips.total_failures();
+        drop(clips);
+        let decision = match report {
+            DrainClipReport::Quiet => return,
+            DrainClipReport::Recovered { suppressed } => {
                 tracing::info!(
                     topic = %self.topic,
                     suppressed_count = suppressed,
                     total_failures,
                     "block credit drains match the word's count again"
                 );
+                return;
             }
-            return;
-        }
-        let decision = latch.on_failure();
-        let total_failures = latch.total_failures();
-        drop(latch);
+            DrainClipReport::Clipped(decision) => decision,
+        };
         match decision {
             RegimeDecision::Loud => tracing::warn!(
                 topic = %self.topic,

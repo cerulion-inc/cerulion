@@ -285,6 +285,12 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   recovery never buys a still-broken peer a fresh quota.
 - A diagnostic latch never wedges the path it observes and never silently resets its
   regime on a poisoned mutex (`lock_regime_latch` arm).
+- `transport/drain_clip_latch.rs` (`DrainClipLatch`) builds on `FailureRegimeLatch` for a
+  `block` input's drains that its credit word clipped at 0. A clean drain does not close
+  a regime on its own: an outside writer's clipped drains interleave with the counted
+  producer's clean ones, so a regime closes after a run of consecutive clean drains, and
+  every close doubles the run the next regime needs. Pinned by its unit vectors and
+  `credit_block_iox2_test::an_interleaved_outside_writer_does_not_repeat_the_loud_line_per_frame`.
 - The two demand wire header latch tables (`KeyedLatches` in `transport/network.rs`) are
   bounded in key COUNT (`KEYED_LATCHES_CAP`, 256) and key part LENGTH
   (`LATCH_KEY_PART_MAX_LEN`, 256 bytes, the ack peer set's limit). A key the table will not

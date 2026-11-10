@@ -81,7 +81,7 @@
 //! | the `Box` itself | `NodeContext`, `ShutdownSignal` |
 //! | its two `IndexMap` values | `AnyPublisher`, `AnySubscriber` |
 //! | those enums' payloads | `CerulionPublisher`, `CerulionSubscriber` |
-//! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `FailureRegimeLatch`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
+//! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `DrainClipLatch`, `FailureRegimeLatch`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
 //! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch` |
 //! | the v12/v16 read-outcome chain | `ReadOutcomeStage`, `StageInner`, `StagedReadOutcome`, `ReadOutcomeKind`, `ReadSiteRole`, `ReadStageRole` |
 //! | the QoS store the node drains | `QosEventStore` |
@@ -501,10 +501,11 @@ static EXPECTED: &[Expected] = &[
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS,
             // Re-measured at ABI 31 on aarch64-apple-darwin (`dump_measured_table`):
-            // `probe` grows with `BlockProbe` and moves from rank 10 to rank 1,
-            // and every field ranked 1 to 9 before it moves up by one.
+            // `probe` grows with `BlockProbe` and moves from rank 10 to rank 8,
+            // and `topic` and `max_publishers`, ranked 8 and 9 before it, each
+            // move up by one.
             ranks: &[
-                9, 11, 7, 0, 1, 8, 12, 3, 13, 14, 10, 15, 20, 2, 4, 25, 21, 5, 6, 26, 16, 22, 23,
+                9, 11, 6, 0, 8, 7, 12, 2, 13, 14, 10, 15, 20, 1, 3, 25, 21, 4, 5, 26, 16, 22, 23,
                 17, 24, 18, 19,
             ],
         },
@@ -564,16 +565,26 @@ static EXPECTED: &[Expected] = &[
             // v31: the flood-suppression latch of drains clipped at 0.
             "drain_clips",
         ],
-        // v31: `drain_clips` (a 40-byte `RefCell<FailureRegimeLatch>`) lands
-        // at 72 and moves `armed` from 72 to 112; the struct grows 80 -> 120
+        // v31: `drain_clips` (a 56-byte `RefCell<DrainClipLatch>`) lands at
+        // 72 and moves `armed` from 72 to 128; the struct grows 80 -> 136
         // (MEASURED via `dump_measured_table`).
         layout: Layout::Pinned {
-            size: 120,
+            size: 136,
             align: 8,
-            offsets: &[0, 40, 16, 24, 112, 48, 56, 64, 72],
+            offsets: &[0, 40, 16, 24, 128, 48, 56, 64, 72],
         },
     },
     // v31: held by value in `BlockProbe.drain_clips`, inside a `RefCell`.
+    Expected {
+        name: "DrainClipLatch",
+        fields: &["latch", "clean_run", "close_after"],
+        layout: Layout::Pinned {
+            size: 48,
+            align: 8,
+            offsets: &[16, 0, 8],
+        },
+    },
+    // v31: held by value in `DrainClipLatch.latch`.
     Expected {
         name: "FailureRegimeLatch",
         fields: &["failing", "suppressed", "total_failures", "next_decade"],
@@ -591,17 +602,18 @@ static EXPECTED: &[Expected] = &[
             ranks: &[0, 2, 3, 1],
         },
     },
-    // An enum is sized by its LARGEST variant plus room for its tag. This row
-    // did not move when `BlockProbe` grew 72 -> 80, because `DropOldestProbe`
-    // (120) was the largest and the growth fit in padding that already
-    // existed. At v31 `BlockProbe` grows 80 -> 120, as large as
-    // `DropOldestProbe`, and the enum grows 120 -> 128 (MEASURED via
-    // `dump_measured_table`).
+    // An enum is at least as large as its LARGEST variant, plus room for its
+    // tag unless a niche of that variant holds it. This row did not move when
+    // `BlockProbe` grew 72 -> 80, because `DropOldestProbe` (120) was the
+    // largest and the growth fit in padding that already existed. At v31
+    // `BlockProbe` grows 80 -> 136 and becomes the largest variant, and the
+    // enum measures 136, the same size, so its tag sits in a niche of
+    // `BlockProbe` (MEASURED via `dump_measured_table`).
     Expected {
         name: "BackpressureProbe",
         fields: &[],
         layout: Layout::Pinned {
-            size: 128,
+            size: 136,
             align: 8,
             offsets: &[],
         },
@@ -1081,6 +1093,7 @@ fn measured() -> Vec<MeasuredStruct> {
     all.extend(crate::transport::notify_delivery_latch::abi_layout_pins());
     all.extend(crate::transport::output_discard_latch::abi_layout_pins());
     all.extend(crate::transport::failure_regime_latch::abi_layout_pins());
+    all.extend(crate::transport::drain_clip_latch::abi_layout_pins());
     all.extend(crate::wire::abi_layout_pins());
     all.extend(crate::read_outcome::abi_layout_pins());
     all.extend(crate::scheduler::handle::abi_layout_pins());
