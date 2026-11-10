@@ -68,7 +68,8 @@ cerulion_msgio = { path = "../cerulion_msgio" }
 # row is truth).
 cerulion_pairing = { path = "../cerulion_pairing" }
 # The accept loop + per-connection stub handlers run on tokio (the runtime iroh
-# already mandates). `signal` powers the binary's Ctrl-C graceful shutdown;
+# already mandates). `signal` powers the binary's graceful stop on Ctrl-C and
+# SIGTERM;
 # `time` bounds the per-connection control-frame handshake (the accept-path
 # deadline that stops an authed-then-stalled peer holding a task forever — the
 # security review's per-connection resource-hold fix).

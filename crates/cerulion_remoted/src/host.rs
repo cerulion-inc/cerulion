@@ -409,7 +409,8 @@ impl BoundPlane {
 
     /// Serve the wire and ops planes (and the rcp plane, on the daemon) until
     /// `shutdown` resolves or the endpoint closes, then close the endpoint, on
-    /// an error too. Access checks read the wall clock.
+    /// an error too. Access checks read the wall clock. `shutdown` is dropped
+    /// as soon as the accept loop stops, before the shutdown stage runs.
     pub async fn serve(
         self,
         shutdown: impl std::future::Future<Output = ()>,

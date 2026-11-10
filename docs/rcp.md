@@ -464,7 +464,8 @@ its reason, then at most one line every 30 s with the attempt count, and logs
 at warn once rcpd's latch closes. One such delivery is in flight at a time:
 an `engage-estop` while one is in flight starts none, since the one in flight
 keeps sending, and a delivery still in flight when `cerulion-remoted` stops
-ends with a warning.
+gracefully ends with a warning; a stop the hard-exit deadline or a second
+signal ends, or a SIGKILL, may end it with no line.
 
 The latch clears only when `cerulion-remoted` restarts. To recover, restart
 `cerulion-remoted`, then clear rcpd's own latch: `estop_clear` under
