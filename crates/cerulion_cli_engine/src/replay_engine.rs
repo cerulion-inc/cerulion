@@ -18383,6 +18383,7 @@ mod node_trigger_decl_tests {
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
                 consume: InputConsume::Latest,
+                accumulate: false,
             }],
             vec![],
         )
@@ -18392,6 +18393,7 @@ mod node_trigger_decl_tests {
         let wired = vec![InputDef {
             name: "cam".to_string(),
             source: "/cam".to_string(),
+            ..Default::default()
         }];
         let decl = |trigger| NodeDecl {
             node_id: "sink".to_string(),
@@ -32020,6 +32022,7 @@ mod trigger_input_capacity_tests {
             vec![InputDef {
                 name: "cam".to_string(),
                 source: source.to_string(),
+                ..Default::default()
             }]
         };
         let cap = |source: &str| live_writer_cap(&config, &producers, &wired(source), "cam");
@@ -32062,6 +32065,7 @@ mod trigger_input_capacity_tests {
                     backpressure,
                     expect_within_ms: None,
                     consume: InputConsume::Latest,
+                    accumulate: false,
                 }],
                 vec![],
             )
