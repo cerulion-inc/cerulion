@@ -55,7 +55,7 @@ Three nodes forming a reactive pipeline:
   Build the nodes below with the same compiler that built the `cerulion` binary you
   installed above: a node cdylib built by a different rustc release is refused at
   load, loudly. A downloaded release binary is pinned to the exact rustc that built
-  it, named in the archive's `rustc-version.txt` (Rust 1.93.0 for the 1.0.0
+  it, named in the archive's `rustc-version.txt` (Rust 1.95.0 for the 2.0.0
   binaries), and the README's [Install](../../README.md#install) section gives the
   `RUSTUP_TOOLCHAIN=` step for that case. On Homebrew and apt, run
   `cerulion-install-rust` once to install that compiler, then put
@@ -77,7 +77,8 @@ only place wiring lives.
 ## Complete starter source
 
 To read and run complete scanner and controller implementations before writing
-new node types, choose the route for your installed CLI.
+new node types, choose the route for your installed CLI. The 2.0.0 CLI includes
+`--starter`, so it takes the second route; the first is for a 1.0.0 install.
 
 ### Released CLI 1.0.0
 
@@ -1268,9 +1269,9 @@ contributes name-only, and a layout change inside such a target is not caught.
   recording and playback in full.
 
 - **Visualize it:** `cerulion viz` attaches the live topics to the viz daemon and
-  [Cerulion Studio](../../README.md#studio-for-your-computer) connects to that
-  same daemon and renders them. Nothing is added to the graph for either. Name
-  the topics you want, or pass none to attach every decodable local topic:
+  Cerulion Studio connects to that same daemon and renders them. Nothing is
+  added to the graph for either. Name the topics you want, or pass none to
+  attach every decodable local topic:
 
   ```bash
   cerulion viz /demo/lidar_sensor/scan /demo/safety_controller/cmd_vel
