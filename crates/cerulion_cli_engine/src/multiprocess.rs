@@ -383,9 +383,6 @@ pub fn refuse_split_edge_timeouts(
     minted: &[CreditEdgePlan],
     plan: &DeploymentPlan,
 ) -> Result<(), String> {
-    if cerulion_core::oracle_mutant::active("block_split_timeout_refusal_off") {
-        return Ok(());
-    }
     let place = |rank: usize| -> String {
         match plan.workers.iter().find(|w| w.rank == rank) {
             Some(w) => match &w.host {
@@ -396,33 +393,87 @@ pub fn refuse_split_edge_timeouts(
         }
     };
     for e in minted {
-        let timed = topo
-            .topic(&e.topic)
-            .and_then(|f| {
-                f.consumers
+        let refusal =
+            split_edge_timeout_verdict(topo, &e.topic, &e.consumer_node, &e.consumer_input, || {
+                let producer_place = e
+                    .producer_ranks
                     .iter()
-                    .find(|c| c.node_id == e.consumer_node && c.input == e.consumer_input)
-            })
-            .is_some_and(|c| c.block_timeout_ms.is_some());
-        if !timed {
-            continue;
+                    .map(|&r| place(r))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (place(e.consumer_rank), producer_place)
+            });
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
-        let producer_place = e
-            .producer_ranks
-            .iter()
-            .map(|&r| place(r))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(cerulion_core::graph::topology::split_edge_timeout_refusal(
-            &e.topic,
-            &e.consumer_node,
-            &e.consumer_input,
-            &e.producer_nodes,
-            &place(e.consumer_rank),
-            &producer_place,
-        ));
     }
     Ok(())
+}
+
+/// The refusal [`refuse_split_edge_timeouts`] gives the split `block` edge
+/// `edge` of a partition, naming each side by its process group, or `None`
+/// when the edge's input sets no `block_timeout_ms`.
+///
+/// `edge` is one of [`cerulion_core::graph::creditable_split_block_edges`]:
+/// a creditable edge whose producer and consumer the partition puts in
+/// different groups, which is an edge the mint gives a cross-process word. A
+/// group's executor units keep a `block` flow in one unit, so the run refuses
+/// exactly these edges, naming an executor unit where the supervisor plans a
+/// side's group as several units. `graph levels` and `graph partition` read
+/// the verdict here, before any rank is planned, and `graph run` before it
+/// announces an accepted split edge.
+pub(crate) fn split_edge_timeout_refusal_in_groups(
+    topo: &cerulion_core::graph::GraphTopology,
+    edge: &cerulion_core::graph::CreditableSplitEdge,
+) -> Option<String> {
+    split_edge_timeout_verdict(
+        topo,
+        &edge.topic,
+        &edge.consumer_node,
+        &edge.consumer_input,
+        || {
+            (
+                format!("process group '{}'", edge.consumer_group),
+                format!("process group '{}'", edge.producer_group),
+            )
+        },
+    )
+}
+
+/// The refusal of `block_timeout_ms` on the split `block` edge
+/// `consumer_node.consumer_input` of `topic`, or `None` when `topo` gives
+/// that input no `block_timeout_ms`.
+///
+/// The one check behind [`refuse_split_edge_timeouts`] and
+/// [`split_edge_timeout_refusal_in_groups`]: both read the key off `topo`'s
+/// consumer edge and render [`cerulion_core::graph::topology::split_edge_timeout_refusal`]
+/// with the topic's in-graph producers. `places` returns where the consumer
+/// and then the producer run, and is called only for an edge that sets the
+/// key.
+fn split_edge_timeout_verdict(
+    topo: &cerulion_core::graph::GraphTopology,
+    topic: &str,
+    consumer_node: &str,
+    consumer_input: &str,
+    places: impl FnOnce() -> (String, String),
+) -> Option<String> {
+    if cerulion_core::oracle_mutant::active("block_split_timeout_refusal_off") {
+        return None;
+    }
+    let flow = topo.topic(topic)?;
+    flow.consumers
+        .iter()
+        .find(|c| c.node_id == consumer_node && c.input == consumer_input)?
+        .block_timeout_ms?;
+    let (consumer_place, producer_place) = places();
+    Some(cerulion_core::graph::topology::split_edge_timeout_refusal(
+        topic,
+        consumer_node,
+        consumer_input,
+        &flow.producers,
+        &consumer_place,
+        &producer_place,
+    ))
 }
 
 /// The slot `dead_rank` occupies on `edge`, or `None` if it is not
@@ -3560,6 +3611,41 @@ mod tests {
         let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
         assert_eq!(edges.len(), 1);
         assert_eq!(refuse_split_edge_timeouts(&topo, &edges, &plan), Ok(()));
+    }
+
+    /// The verdict `graph levels` and `graph partition` read for a split edge
+    /// of a partition is the supervisor's refusal of that edge, word for word,
+    /// when each group runs as one process; the same edge without the key
+    /// gets none.
+    #[test]
+    fn a_partition_split_edge_with_a_timeout_reads_the_supervisors_refusal() {
+        let split = || groups(&[("cam", &["prod"]), ("plan", &["sink"])]);
+        let edge = cerulion_core::graph::CreditableSplitEdge {
+            topic: "/p/prod/out".to_string(),
+            consumer_node: "sink".to_string(),
+            consumer_input: "gate".to_string(),
+            producer_group: "cam".to_string(),
+            consumer_group: "plan".to_string(),
+        };
+        let (topo, plan) = two_node_plan(Some(50), split());
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        let refusal = split_timeout_refusal(
+            "sink",
+            "prod",
+            "process group 'plan'",
+            "process group 'cam'",
+        );
+        assert_eq!(
+            split_edge_timeout_refusal_in_groups(&topo, &edge),
+            Some(refusal.clone())
+        );
+        assert_eq!(
+            refuse_split_edge_timeouts(&topo, &edges, &plan),
+            Err(refusal)
+        );
+
+        let (topo, _) = two_node_plan(None, split());
+        assert_eq!(split_edge_timeout_refusal_in_groups(&topo, &edge), None);
     }
 
     /// A split MIXED topic (one `block` consumer, one `drop_oldest` sibling)

@@ -3137,6 +3137,10 @@ Note the caveat the line carries itself: `graph levels` judges on SOURCE metadat
 `graph run` re-checks the built cdylibs and refuses on drift, so a stale `.so` can still turn
 a green `levels` into a refused run.
 
+A split edge whose `block` input sets `block_timeout_ms` reads `partition: INVALID` instead,
+with the refusal `graph run` gives that edge before any worker spawns, and the verb exits
+nonzero. Such an edge is not a credited split, so re-deriving over it warns of nothing replaced.
+
 And if you hand-write a creditable split and then re-derive, you are told that it was REPLACED,
 past tense, deliberately: the warn fires strictly AFTER `write_yaml_atomically` has committed the
 new block (`warn_creditable_split_overwritten` in

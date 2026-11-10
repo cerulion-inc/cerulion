@@ -524,6 +524,106 @@ process_groups:
     );
 }
 
+/// `n0 -> n1 -> n2` with `n2.inp` made `block` (depth 2) by the graph and
+/// `extra` appended to that input, split `front: [n0, n1]`, `back: [n2]`, so
+/// the `block` edge `/p/n1/out -> n2.inp` crosses the two groups.
+fn split_block_yaml(extra: &str) -> String {
+    format!(
+        r#"
+name: timed
+prefix: p
+nodes:
+  - id: n0
+    type: src
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: n1
+    type: relay
+    inputs:
+      - name: inp
+        source: n0/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: n2
+    type: sink
+    inputs:
+      - name: inp
+        source: n1/out
+        backpressure: block
+        depth: 2{extra}
+process_groups:
+  front: [n0, n1]
+  back: [n2]
+"#
+    )
+}
+
+/// A hand-written split whose `block` consumer sets `block_timeout_ms` is the
+/// shape `graph run` refuses before any worker spawns, so `graph levels`
+/// reports the same refusal as its partition verdict: the INVALID line
+/// carries the run's text, naming both process groups, and `partition_error`
+/// carries it for the nonzero exit. The same split without the key reads
+/// spawner-consumable with the edge named, and exits 0.
+#[test]
+fn a_split_block_edge_with_a_timeout_reads_invalid_with_the_run_refusal() {
+    let refusal = "input 'n2.inp' on topic '/p/n1/out' sets `block_timeout_ms`, but the input \
+                   runs in process group 'back' and its producer 'n1' in process group 'front', \
+                   so the two fire on different threads and count the edge on one shared credit \
+                   word. A timeout release keeps that count exact only when the producer and the \
+                   consumer fire one at a time on one thread: here a read and a publish can \
+                   interleave after a release, so the slot can count a frame that is gone and \
+                   hold the producer with nothing queued, or miss one and let a frame published \
+                   after the release be evicted. Put both nodes in ONE `process_groups:` group, \
+                   or run `--single-process`, to keep the timeout; or remove `block_timeout_ms`, \
+                   and the slot is still released when the consumer stops for good (a fatal \
+                   error, a tick panic, or its process dying)";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = setup_workspace(tmp.path());
+    write_graph(
+        &ws,
+        "timed",
+        &split_block_yaml("\n        block_timeout_ms: 50"),
+    );
+    let report = graph_cmd::graph_levels(&ws.root, "timed").expect("the report still renders");
+    assert_eq!(
+        report.partition_error.as_deref(),
+        Some(refusal),
+        "the verdict carries the run's refusal, and the binary exits nonzero on it"
+    );
+    let invalid = format!("\n  partition: INVALID — {refusal}\n"); // dash-ok
+    assert_eq!(
+        report.rendered.matches(invalid.as_str()).count(),
+        1,
+        "exactly one INVALID line, with the run's text; got:\n{}",
+        report.rendered
+    );
+    assert!(
+        !report.rendered.contains("spawner-consumable"),
+        "a refused split is never called spawner-consumable; got:\n{}",
+        report.rendered
+    );
+
+    // ANTI-TAUTOLOGY: the same split without the key is credited and passes.
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = setup_workspace(tmp.path());
+    write_graph(&ws, "timed", &split_block_yaml(""));
+    let report = graph_cmd::graph_levels(&ws.root, "timed").expect("levels");
+    assert_eq!(report.partition_error, None, "the untimed split exits 0");
+    let credited = concat!(
+        "\n  partition: spawner-consumable (1 split `block` edge(s) creditable: ",
+        "/p/n1/out -> n2.inp (front -> back); judged on source metadata — ", // dash-ok
+        "`graph run` re-checks the built cdylibs and refuses on drift)\n",
+    );
+    assert!(
+        report.rendered.contains(credited),
+        "the untimed split names its credited edge; got:\n{}",
+        report.rendered
+    );
+}
+
 // ==========================================================================
 // The reference fixture graph (all four trigger policies).
 // ==========================================================================

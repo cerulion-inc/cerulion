@@ -11325,13 +11325,23 @@ fn graph_run_supervisor(
         // down reports what was actually created; this one reports what the
         // plan-time check allowed, and the two being separate is deliberate:
         // if they ever disagree, the reconciliation below refuses and the
-        // operator has both halves of the evidence in the log.
+        // operator has both halves of the evidence in the log. An edge whose
+        // input sets `block_timeout_ms` is not announced: it gets no word, and
+        // `refuse_split_edge_timeouts` refuses it below, through the same
+        // check.
+        let source_topology = cerulion_core::graph::GraphTopology::build(&config, &entry_infos)
+            .map_err(CliError::from)?;
         for edge in cerulion_core::graph::creditable_split_block_edges(
             &config.process_groups,
             &config,
             &entry_infos,
             &trigger_edges,
         ) {
+            if crate::multiprocess::split_edge_timeout_refusal_in_groups(&source_topology, &edge)
+                .is_some()
+            {
+                continue;
+            }
             tracing::info!(
                 graph = %config.identity(),
                 topic = %edge.topic,
@@ -13473,7 +13483,9 @@ pub fn graph_list(graphs_dir: &Path) -> CliResult<Vec<String>> {
 /// `validate_partition` diagnostic (naming the bridge node) for the binary to
 /// map to a nonzero exit AFTER printing — `graph levels` is CI-gateable on
 /// partition validity, matching `graph run`'s enforcement. A valid or absent
-/// `process_groups:` exits 0.
+/// `process_groups:` exits 0. A partition that splits a `block` edge whose
+/// input sets `block_timeout_ms` is INVALID the same way, with the refusal
+/// `graph run` gives that edge before any worker spawns.
 pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphLevelsReport> {
     let graphs_dir = workspace_root.join("graphs");
     let nodes_dir = workspace_root.join("nodes");
@@ -13802,8 +13814,9 @@ pub struct GraphLevelsReport {
     pub rendered: String,
     /// `Some(diagnostic)` when the declared `process_groups:` partition fails
     /// the `validate_partition` spawner-consumability check (the
-    /// diagnostic names the bridge node); `None` for a valid or absent
-    /// partition.
+    /// diagnostic names the bridge node), or splits a `block` edge whose input
+    /// sets `block_timeout_ms` (the refusal `graph run` gives that edge);
+    /// `None` for a valid or absent partition.
     pub partition_error: Option<String>,
 }
 
@@ -13947,24 +13960,37 @@ pub(crate) fn render_levels_report(
                 group.rank, group.name, band, members
             );
         }
-        match cerulion_core::graph::validate_partition(
+        // A creditable split edge whose input sets `block_timeout_ms` is the
+        // edge `graph run` refuses before any worker spawns, through the same
+        // check, so the verdict is that refusal.
+        let verdict = cerulion_core::graph::validate_partition(
             &config.process_groups,
             config,
             entry_infos,
             trigger_edges,
-        ) {
-            Ok(()) => {
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            let creditable = cerulion_core::graph::creditable_split_block_edges(
+                &config.process_groups,
+                config,
+                entry_infos,
+                trigger_edges,
+            );
+            match creditable.iter().find_map(|edge| {
+                crate::multiprocess::split_edge_timeout_refusal_in_groups(topology, edge)
+            }) {
+                Some(refusal) => Err(refusal),
+                None => Ok(creditable),
+            }
+        });
+        match verdict {
+            Ok(creditable) => {
                 // A credited split and an ordinary
                 // co-located flow must not render the SAME line, or the verb an
                 // operator runs to ask "will my hand-written split work?"
                 // answers yes without saying that the answer depends on N
                 // supervisor-minted credit words.
-                let creditable = cerulion_core::graph::creditable_split_block_edges(
-                    &config.process_groups,
-                    config,
-                    entry_infos,
-                    trigger_edges,
-                );
                 if creditable.is_empty() {
                     let _ = writeln!(out, "  partition: spawner-consumable");
                 } else {
@@ -13982,8 +14008,7 @@ pub(crate) fn render_levels_report(
                     );
                 }
             }
-            Err(e) => {
-                let diagnostic = e.to_string();
+            Err(diagnostic) => {
                 let _ = writeln!(out, "  partition: INVALID — {}", diagnostic);
                 partition_error = Some(diagnostic);
             }
