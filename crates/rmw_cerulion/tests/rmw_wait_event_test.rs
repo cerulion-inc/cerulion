@@ -3468,29 +3468,32 @@ unsafe fn deferred_round(
     );
 }
 
-/// The wait's ready return and the take leave the wake's listener notification
-/// in place, and the NEXT wait's entry pass drains it, so no wake is lost and none
-/// re-fires. Each round blocks a waiter, publishes one message into its block and
-/// takes it. Per round: the wait returns that round's message, the take ran no
-/// listener drain, the block woke on the publish (one fd or doorbell wake), and the
-/// listener is still readable after the take. The publisher-event pump is process
-/// wide and runs on whichever `rmw_wait` pass finds it due, and a pass that runs it
-/// probes every attached entity, so before each attempt of a round the test thread
-/// claims the pump's 20 ms interval (`claim_pump_interval`); an attempt the pump
-/// still reached checks only the return and the take, and is run again, up to
-/// `PUMP_ATTEMPTS` times, before the round fails (`deferred_round`). Across the
-/// rounds fd wakes stay at one per attempt at most: a notification left readable
-/// into a later block would fire it before the publish. In the middle round a second
-/// publish lands between the take and the next wait, while the listener still holds
-/// that round's notification (so the publish adds none of its own): that wait returns
-/// it from its entry pass, with no fd block or park entered and the listener drained,
-/// and the rounds go on. The last wait, with nothing published, times out with no fd
-/// wake and leaves the listener drained. Neither of those two waits claims the pump:
-/// the late wait is served by its entry pass, which drains and probes every entity
-/// whether it pumps or not, and the idle wait outlasts the interval, but a pass that
-/// pumps after a timed-out block has nothing fired to drain and nothing to find. Run
-/// on the fd tier (`CERULION_MONITOR_WAIT=0`) and on the platform default, which
-/// parks on the topic doorbell on Linux aarch64.
+/// The wait's ready return and the take leave the wake's listener notification in
+/// place, and the NEXT wait's entry pass drains it, so no wake is lost and none
+/// re-fires. Each round blocks a waiter, publishes one message into its block and takes
+/// it. Per round: the wait returns that round's message, the take ran no listener
+/// drain, the block woke on the publish (one fd or doorbell wake), and the listener is
+/// still readable after the take. That holds on every pass the publisher-event pump
+/// stays out of. A pass that runs it probes every attached entity: woken, it drains the
+/// woken listener before its probe and leaves no notification in place (pinned by
+/// `a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers`), and after a
+/// timed-out block it can serve the message with no wake. The pump is process wide and
+/// runs on whichever `rmw_wait` pass finds it due, so before each attempt of a round
+/// the test thread claims the pump's 20 ms interval (`claim_pump_interval`); an attempt
+/// the pump still reached checks only the return and the take, and is run again, up to
+/// `PUMP_ATTEMPTS` times, before the round fails (`deferred_round`). Across the rounds
+/// fd wakes stay at one per attempt at most: a notification left readable into a later
+/// block would fire it before the publish. In the middle round a second publish lands
+/// between the take and the next wait, while the listener still holds that round's
+/// notification (so the publish adds none of its own): that wait returns it from its
+/// entry pass, with no fd block or park entered and the listener drained, and the
+/// rounds go on. The last wait, with nothing published, times out with no fd wake and
+/// leaves the listener drained. Neither of those two waits claims the pump: the late
+/// wait is served by its entry pass, which drains and probes every entity whether it
+/// pumps or not, and the idle wait outlasts the interval, but a pass that pumps after a
+/// timed-out block has nothing fired to drain and nothing to find. Run on the fd tier
+/// (`CERULION_MONITOR_WAIT=0`) and on the platform default, which parks on the topic
+/// doorbell on Linux aarch64.
 #[test]
 #[serial]
 fn a_wake_left_undrained_by_the_wait_and_the_take_is_drained_by_the_next_entry() {

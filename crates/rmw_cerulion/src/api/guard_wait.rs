@@ -26,7 +26,10 @@
 //! the woken entities it found ready readable for the next call's entry pass
 //! (and a subscription take leaves its listener the same way) and drains the
 //! woken entities it found not ready; a wake that finds nothing ready drains,
-//! then probes again. The 20 ms
+//! then probes again. A pass on which `pump_publisher_events` ran probes every
+//! attached entity instead, so it drains the woken entities first and then
+//! probes, as an entry pass does: its ready return leaves the woken entities'
+//! listeners drained, with nothing of theirs for the next call. The 20 ms
 //! cap keeps `pump_publisher_events` at its TRANSIENT_LOCAL late-joiner
 //! cadence, and makes the loop a strict SUPERSET of a plain polling loop: a
 //! missed, dropped or never-sent wake degrades to a 20 ms cadence, never a
