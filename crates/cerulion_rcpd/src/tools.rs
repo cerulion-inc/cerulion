@@ -34,12 +34,12 @@
 //! way to clear it.
 //!
 //! `estop` closes the latch first, then takes `latch_io`, closes it again,
-//! writes the file and its `intent` receipt, and queues its frame; a file or
-//! receipt it could not write is logged after the frame is queued and the
-//! lock is released. `estop_clear` writes its `intent`, deletes the file and
-//! opens the latch inside `latch_io`. The lock is a std mutex never held
-//! across an await, so the receipt log orders engages and clears as they took
-//! effect.
+//! writes the file and its `intent` receipt, and queues its frame.
+//! `estop_clear` writes its `intent`, deletes the file and opens the latch
+//! inside `latch_io`. A file or receipt either could not write is logged
+//! after the lock is released, by `estop` after its frame is queued. The lock
+//! is a std mutex never held across an await, so the receipt log orders
+//! engages and clears as they took effect.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -249,6 +249,24 @@ impl<F> Engaged<F> {
             }
         };
         (intent, self.answer)
+    }
+}
+
+/// What `open_latch` did inside `latch_io`: the intent and whether the latch
+/// was closed, or the refusal to return, and the receipt it could not write.
+#[must_use = "its failed receipt is logged by `Opened::log_failure`"]
+struct Opened {
+    result: Result<(Receipt, bool), CallToolResult>,
+    receipt_error: Option<CerudError>,
+}
+
+impl Opened {
+    /// Log the receipt that was not written, if any; return the result.
+    fn log_failure(self) -> Result<(Receipt, bool), CallToolResult> {
+        if let Some(e) = &self.receipt_error {
+            log_receipt_not_written(ESTOP_CLEAR_TOOL, e);
+        }
+        self.result
     }
 }
 
@@ -693,41 +711,50 @@ impl ToolHost {
     /// The locked half of `estop_clear`: inside `latch_io`, refuse when an
     /// `estop` was called since `seen` was read from `engages` (receipted
     /// `error:estop_overtaken`, nothing changed); otherwise write the `intent`
-    /// receipt, delete the file and open the latch. Returns the intent and
-    /// whether the latch was closed, or the refusal to return.
-    fn open_latch(&self, digest: &str, seen: u64) -> Result<(Receipt, bool), CallToolResult> {
+    /// receipt, delete the file and open the latch. Writes no error line
+    /// itself: a receipt it could not write is returned in the [`Opened`],
+    /// with the intent and whether the latch was closed, or the refusal.
+    fn open_latch(&self, digest: &str, seen: u64) -> Opened {
         let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
+        let caller = crate::caller::current();
+        let record = |outcome: ReceiptOutcome| {
+            self.receipts
+                .try_record(&caller, ESTOP_CLEAR_TOOL, digest, outcome)
+        };
         if self.engages.load(Ordering::SeqCst) != seen {
-            let receipt = self.record(
-                ESTOP_CLEAR_TOOL,
-                digest,
-                ReceiptOutcome::Error(String::from("estop_overtaken")),
-            );
-            return Err(refusal(
+            let receipt = record(ReceiptOutcome::Error(String::from("estop_overtaken")));
+            let refused = refusal(
                 "estop_overtaken",
                 "an estop engaged after the clear was requested; the e-stop is engaged",
-                receipt.as_ref(),
+                receipt.as_ref().ok(),
                 json!({ "estopped": self.estopped() }),
-            ));
+            );
+            return Opened {
+                result: Err(refused),
+                receipt_error: receipt.err(),
+            };
         }
-        let Some(intent) = self.record(ESTOP_CLEAR_TOOL, digest, ReceiptOutcome::Intent) else {
-            return Err(refusal(
-                "receipt_failed",
-                "the e-stop was not cleared: its receipt could not be written",
-                None,
-                Value::Null,
-            ));
+        let intent = match record(ReceiptOutcome::Intent) {
+            Ok(intent) => intent,
+            Err(e) => {
+                let refused = refusal(
+                    "receipt_failed",
+                    "the e-stop was not cleared: its receipt could not be written",
+                    None,
+                    Value::Null,
+                );
+                return Opened {
+                    result: Err(refused),
+                    receipt_error: Some(e),
+                };
+            }
         };
         match std::fs::remove_file(&self.latch_file) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                self.record(
-                    ESTOP_CLEAR_TOOL,
-                    digest,
-                    ReceiptOutcome::Error(String::from("clear_failed")),
-                );
-                return Err(refusal(
+                let failed = record(ReceiptOutcome::Error(String::from("clear_failed")));
+                let refused = refusal(
                     "clear_failed",
                     &format!(
                         "the e-stop stays engaged: the latch file {} could not be deleted: {e}",
@@ -735,10 +762,17 @@ impl ToolHost {
                     ),
                     Some(&intent),
                     json!({ "estopped": self.estopped() }),
-                ));
+                );
+                return Opened {
+                    result: Err(refused),
+                    receipt_error: failed.err(),
+                };
             }
         }
-        Ok((intent, self.latch.swap(false, Ordering::SeqCst)))
+        Opened {
+            result: Ok((intent, self.latch.swap(false, Ordering::SeqCst))),
+            receipt_error: None,
+        }
     }
 
     /// Journal an `estop_clear` frame, latch-gated: an `estop` that closes the
@@ -774,7 +808,9 @@ impl ToolHost {
         // this clear waits is not cleared by it.
         let seen = self.engages.load(Ordering::SeqCst);
         let _serial = self.call_lock.lock().await;
-        let (intent, was_estopped) = match self.open_latch(&digest, seen) {
+        // `open_latch` returns with `latch_io` released; a receipt it could
+        // not write is logged after that.
+        let (intent, was_estopped) = match self.open_latch(&digest, seen).log_failure() {
             Ok(opened) => opened,
             Err(refused) => return refused,
         };
@@ -939,7 +975,7 @@ mod tests {
         host.engages.fetch_add(1, Ordering::SeqCst);
         latch.store(true, Ordering::SeqCst);
         std::fs::write(latch_path(&receipts), "stop\n").expect("latch file");
-        let Err(refused) = host.open_latch("d", seen) else {
+        let Err(refused) = host.open_latch("d", seen).result else {
             panic!("the clear must be refused");
         };
         let text = refused.content[0].as_text().expect("text").text.clone();
@@ -970,7 +1006,7 @@ mod tests {
         let estop_answer = host.engage_latch("stop", "d", 1, frame).answer;
         // A clear requested after that estop opens the latch and publishes.
         let seen = host.engages.load(Ordering::SeqCst);
-        let (_, was) = host.open_latch("d", seen).expect("clear");
+        let (_, was) = host.open_latch("d", seen).result.expect("clear");
         assert!(was);
         let frame = Journal::frame(2, ESTOP_CLEAR_TOOL, &serde_json::json!({}));
         let cleared = host.journal_clear(2, frame).await;
@@ -999,7 +1035,7 @@ mod tests {
         // `estop` has done its lock-free close; a clear takes the lock first.
         latch.store(true, Ordering::SeqCst);
         let seen = host.engages.load(Ordering::SeqCst);
-        let (_, was) = host.open_latch("d", seen).expect("clear");
+        let (_, was) = host.open_latch("d", seen).result.expect("clear");
         assert!(was);
         assert!(!host.estopped());
         // Then `estop` takes the lock.

@@ -18,16 +18,16 @@ User reference: docs/rcp.md.
 - `estop` closes the latch before anything that can await and publishes on the
   journal's urgent queue; it never waits on `call_lock`.
 - `estop_clear` reads the `engages` counter, then takes `call_lock`; inside
-  `latch_io` (a std mutex never held across an await) it refuses
-  (`estop_overtaken`) if an `estop` bumped the counter since, else writes
-  `intent`, deletes the file and opens the latch; then it journals a
-  LATCH-GATED frame, so an `estop` that lands first stays the graph's last
+  `latch_io` (a std mutex never held across an await or a failed write's log
+  line) it refuses (`estop_overtaken`) if an `estop` bumped the counter since,
+  else writes `intent`, deletes the file and opens the latch; then it journals
+  a LATCH-GATED frame, so an `estop` that lands first stays the graph's last
   frame (`estop_overtaken`). `estop` re-closes the latch, writes its file and
-  `intent`, and queues its urgent frame inside `latch_io` (a failed write is
-  logged outside it), so the receipt log and the calls topic order engages and
-  clears as they took effect (the journal publishes every queued urgent frame
-  before a normal one). An undeletable file leaves the latch closed
-  (`clear_failed`); an unreadable one at start counts as present.
+  `intent`, and queues its urgent frame inside `latch_io`, so the receipt log
+  and the calls topic order engages and clears as they took effect (the journal
+  publishes every queued urgent frame before a normal one). An undeletable file
+  leaves the latch closed (`clear_failed`); an unreadable one at start counts
+  as present.
 - The journal's `gate` reads the latch, then drops a latch-gated request whose
   caller dropped its reply (a cancelled MCP request); estop and read frames
   always publish.
