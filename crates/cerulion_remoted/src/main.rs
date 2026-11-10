@@ -10,17 +10,19 @@
 //! Exit status: 0 after a graceful stop, also one that starts because the
 //! accept loop stopped on its own, and when the network kill switch refuses to
 //! serve; 1 on a configuration or serving error, or when the stop signals
-//! cannot be installed; 2 on a command-line usage error; 3 when a participant
+//! cannot be installed, the log writer thread cannot start or the runtime
+//! cannot be built; 2 on a command-line usage error; 3 when a participant
 //! registered on the shutdown stage failed, panicked or was cancelled (the
 //! teardown after it still ran; this binary registers none of its own); 4 when
 //! the hard-exit deadline or a second stop signal ends a stop that has not
 //! finished, as the first stop signal does after the accept loop stopped on
 //! its own.
 //!
-//! Log lines go to stderr through the bounded queue of
+//! `tracing` log lines go to stderr through the bounded queue of
 //! [`cerulion_remoted::log_writer`]: a full stderr drops and counts them and
-//! holds no thread that logs. Each exit waits at most [`EXIT_LOG_GRACE`] for
-//! that queue.
+//! holds no thread that logs them. The iceoryx2 console logger and the panic
+//! hook still write to stderr directly. Each exit waits at most
+//! [`EXIT_LOG_GRACE`] for that queue.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -164,8 +166,9 @@ fn init_tracing() -> Result<LogWriter, ExitCode> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     // Log to STDERR (a daemon's stdout stays clean); mirrors the workspace's
     // stdout↔stderr discipline (MEMORY: fmt::layer defaults to stdout).
-    // A failed write is dropped: reporting it goes through `eprintln!`, which
-    // panics when stderr cannot be written.
+    // fmt's own report of a failed write goes through `eprintln!`, which
+    // panics when stderr cannot be written, so it is off; the log writer
+    // counts a failed write itself.
     match log_writer::start(queue_limits()) {
         Ok(log) => {
             tracing_subscriber::fmt()
@@ -188,14 +191,14 @@ fn init_tracing() -> Result<LogWriter, ExitCode> {
 }
 
 /// The log queue's bounds: [`Limits::DEFAULT`], or, in a build with the test
-/// seam, the positive line bound its override variable holds.
+/// seam only, a smaller line bound its override variable sets
+/// ([`log_writer::test_queue_lines`]).
 fn queue_limits() -> Limits {
     #[cfg(feature = "test-seam")]
     {
         let lines = std::env::var(log_writer::QUEUE_LINES_FOR_TEST_ENV)
             .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|lines| *lines > 0);
+            .and_then(|value| log_writer::test_queue_lines(&value));
         if let Some(lines) = lines {
             return Limits {
                 lines,
@@ -257,8 +260,9 @@ async fn serve(log: LogWriter) -> ExitCode {
         }
     };
     // Resolves on the first stop signal, which the stop thread sends after it
-    // armed the deadline, or when the stop thread is gone. A full stderr can
-    // hold this line, not the deadline. Serving drops this future when its
+    // armed the deadline, or when the stop thread is gone. The line is queued
+    // for the log writer, so a full stderr holds neither it nor the deadline.
+    // Serving drops this future when its
     // accept loop stops or when it never starts; `ended` then tells the stop
     // thread, which arms the deadline unless a stop signal already did.
     let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
@@ -455,9 +459,10 @@ async fn stop_sequence(
 /// How long an exit waits for the log writer to write the lines still queued:
 /// 100 ms, after the serving runtime is dropped on the return from `main`, and
 /// before `_exit` in the stop thread ([`LogWriter::drain`]). The exit goes on
-/// as soon as no line is queued and none is being written. Lines still queued
-/// at four fifths of it are discarded, and one error line names how many; a
-/// full stderr delays the exit by no more than this. Not tunable: the
+/// as soon as no line is queued and none is being written. At four fifths of
+/// it, all but the newest [`log_writer::KEPT_AT_EXIT`] queued lines are
+/// discarded, and one error line names how many; a full stderr delays the
+/// exit by no more than this. Not tunable: the
 /// hard-exit deadline is the operator's knob, and this only gives a free
 /// stderr time for the last lines. Only a build with the test seam reads an
 /// override, from `CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST`.

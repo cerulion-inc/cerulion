@@ -17,18 +17,22 @@
 //! start; the wire plane's `status` reply carries it as `log_lines_dropped`.
 //!
 //! The writer thread reports drops through a [`FailureRegimeLatch`], one
-//! dropped line being one failure. When a write returns and lines were dropped
-//! since the last one, it writes one warn line naming how many (`dropped`) and
-//! the total (`total_dropped`) when the drops open a regime or take the total
-//! across a power of ten, and a debug line otherwise. When the queue is empty
-//! again with no drop since, it writes one info line saying it caught up, with
-//! the regime's `dropped` and the `total_dropped`; a regime of a single dropped
-//! line ends silently, as the latch decides. These lines are formatted on the
-//! writer thread and written straight to stderr, never queued. A report line
-//! whose own write fails is not counted.
+//! dropped line being one failure. After each write, and when a drop wakes it
+//! while it waits for a line, it reports the lines dropped since its last
+//! report: one warn line naming how many (`dropped`) and the total
+//! (`total_dropped`) when they open a regime or take the total across a power
+//! of ten, and a debug line otherwise. Once the queue is empty, it ends an open
+//! regime with one info line saying it caught up, with the regime's `dropped`
+//! and the `total_dropped`; a regime of a single dropped line ends silently, as
+//! the latch decides. These lines are formatted on the writer thread and
+//! written straight to stderr, never queued. A report line whose own write
+//! fails is not counted.
 //!
 //! The logging threads and the writer thread share one lock, the queue's, held
-//! to push or pop one line and never across a format, a copy or a write.
+//! to push or pop one line, to count a drop, or to cut the queue at an exit,
+//! and never across a format or a write. The queue reserves room for its lines,
+//! up to [`QUEUE_LINES`], when it is built, so a push within that room does not
+//! allocate until an exit cuts the queue.
 //!
 //! [`LogWriter::drain`] is an exit's wait for the queue.
 
@@ -52,15 +56,32 @@ pub const QUEUE_LINES: usize = 4096;
 /// than this alone is always dropped and counted.
 pub const QUEUE_BYTES: usize = 1 << 20;
 
-/// The environment variable that sets, in a build with the test seam, the line
-/// bound of the binary's log queue in place of [`QUEUE_LINES`]; a value that is
-/// not a positive whole number keeps it.
+/// Test-only: the environment variable that, in a build with the test seam,
+/// sets a smaller line bound for the binary's log queue
+/// ([`test_queue_lines`]). A build without the test seam never reads it.
 #[cfg(feature = "test-seam")]
 #[doc(hidden)]
 pub const QUEUE_LINES_FOR_TEST_ENV: &str = "CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST";
 
+/// Test-only: the line bound a [`QUEUE_LINES_FOR_TEST_ENV`] value sets, which
+/// can only shrink the queue: a positive whole number, at most [`QUEUE_LINES`].
+/// Any other value sets none, so the queue keeps [`QUEUE_LINES`]; no value
+/// leaves it unbounded or with no room. Pure.
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn test_queue_lines(value: &str) -> Option<usize> {
+    let lines = value.trim().parse::<usize>().ok()?;
+    (lines > 0).then(|| lines.min(QUEUE_LINES))
+}
+
 /// The name of the writer thread.
 const THREAD_NAME: &str = "remoted-log";
+
+/// The newest queued lines an exit keeps when it discards the others: 8, so
+/// up to that many of the last lines the queue took before the exit cut, such
+/// as the stop thread's reason for the exit, come before the line that counts
+/// the discarded ones.
+pub const KEPT_AT_EXIT: usize = 8;
 
 /// A queue's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +110,10 @@ thread_local! {
 }
 
 /// The process's log writer: a `tracing_subscriber` [`MakeWriter`] whose
-/// writers hand each formatted line to the queue. Clones share one queue; the
-/// writer thread ends once every clone is dropped and the queue is empty.
+/// writers hand each formatted line to the queue. Clones share one queue. The
+/// writer [`start`] built is kept for the process, so its thread runs until the
+/// process exits; another writer's thread ends once every clone is dropped and
+/// its queue is empty.
 #[derive(Clone)]
 pub struct LogWriter {
     inner: Arc<Inner>,
@@ -122,7 +145,6 @@ struct Queue {
     limits: Limits,
 }
 
-#[derive(Default)]
 struct State {
     lines: VecDeque<Vec<u8>>,
     /// The bytes of every line in `lines`.
@@ -136,7 +158,12 @@ struct State {
 impl Queue {
     fn new(limits: Limits) -> Self {
         Self {
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                lines: VecDeque::with_capacity(limits.lines.min(QUEUE_LINES)),
+                bytes: 0,
+                writing: false,
+                closed: false,
+            }),
             ready: Condvar::new(),
             idle: Condvar::new(),
             dropped: AtomicU64::new(0),
@@ -148,18 +175,22 @@ impl Queue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queue `line`, or drop and count it when it does not fit ([`admits`]).
+    /// Queue `line`, or drop and count it when it does not fit ([`admits`]);
+    /// either way, wake the writer thread. A drop is counted under the lock,
+    /// so a writer thread that waits for a line sees it or is woken by it.
     fn hand_over(&self, line: Vec<u8>) {
         let mut state = self.lock();
-        if admits(state.lines.len(), state.bytes, line.len(), self.limits) {
+        let rejected = if admits(state.lines.len(), state.bytes, line.len(), self.limits) {
             state.bytes += line.len();
             state.lines.push_back(line);
-            drop(state);
-            self.ready.notify_one();
+            None
         } else {
-            drop(state);
             self.dropped.fetch_add(1, Ordering::AcqRel);
-        }
+            Some(line)
+        };
+        drop(state);
+        drop(rejected);
+        self.ready.notify_one();
     }
 
     /// Wait until no line is queued and none is being written, for at most
@@ -220,9 +251,10 @@ fn spawn(limits: Limits, mut sink: Box<dyn Write + Send>) -> io::Result<LogWrite
     })
 }
 
-/// The writer thread: write each queued line to `sink` in order, then report
-/// drops ([`Reporter::after_write`]); return once the queue is closed and
-/// empty.
+/// The writer thread: write each queued line to `sink` in order and report
+/// drops after each write, or report drops a drop woke it for
+/// ([`Reporter::after_write`]); return once the queue is closed and empty.
+/// `writing` stays set until the report is written, so a drain waits for it.
 fn write_lines(queue: &Queue, sink: &mut dyn Write) {
     let mut reporter = Reporter::default();
     loop {
@@ -232,7 +264,11 @@ fn write_lines(queue: &Queue, sink: &mut dyn Write) {
                 if let Some(line) = state.lines.pop_front() {
                     state.bytes -= line.len();
                     state.writing = true;
-                    break line;
+                    break Some(line);
+                }
+                if reporter.owes_report(queue) {
+                    state.writing = true;
+                    break None;
                 }
                 if state.closed {
                     return;
@@ -243,17 +279,15 @@ fn write_lines(queue: &Queue, sink: &mut dyn Write) {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        if sink.write_all(&line).is_err() {
-            queue.dropped.fetch_add(1, Ordering::AcqRel);
+        if let Some(line) = line {
+            if sink.write_all(&line).is_err() {
+                queue.dropped.fetch_add(1, Ordering::AcqRel);
+            }
         }
-        drop(line);
-        let empty = {
-            let mut state = queue.lock();
-            state.writing = false;
-            state.lines.is_empty()
-        };
-        queue.idle.notify_all();
+        let empty = queue.lock().lines.is_empty();
         reporter.after_write(queue, empty, sink);
+        queue.lock().writing = false;
+        queue.idle.notify_all();
     }
 }
 
@@ -264,25 +298,28 @@ impl LogWriter {
     }
 
     /// Wait for the queue to be written, for at most `grace`: until no line is
-    /// queued and none is being written, for at most four fifths of `grace`.
-    /// Lines still queued then are discarded and counted, one error line
-    /// naming the count (`discarded`) is queued, and the wait goes on for the
-    /// rest of `grace`. A write blocked in stderr holds the writer thread, not
-    /// this wait.
+    /// queued and none is being written or reported, for at most four fifths
+    /// of `grace`. Then all but the newest [`KEPT_AT_EXIT`] queued lines are
+    /// discarded, one error line naming how many (`discarded`), when there
+    /// are any, is queued after those, and the wait goes on for the rest of
+    /// `grace` or until the queue is written. Discarded lines are
+    /// named in that line only, not in [`LogWriter::dropped`]. A write blocked
+    /// in stderr holds the writer thread, not this wait.
     pub fn drain(&self, grace: Duration) -> Drained {
         let since = Instant::now();
         let queue = &self.inner.queue;
         if queue.wait_idle(since, grace / 5 * 4) {
             return Drained::Written;
         }
-        let discarded = {
+        let older = {
             let mut state = queue.lock();
-            let discarded = state.lines.len();
-            state.lines.clear();
-            state.bytes = 0;
-            discarded
+            let kept_from = state.lines.len().saturating_sub(KEPT_AT_EXIT);
+            let kept = state.lines.split_off(kept_from);
+            state.bytes = kept.iter().map(Vec::len).sum();
+            std::mem::replace(&mut state.lines, kept)
         };
-        let discarded = u64::try_from(discarded).unwrap_or(u64::MAX);
+        let discarded = u64::try_from(older.len()).unwrap_or(u64::MAX);
+        drop(older);
         if discarded > 0 {
             tracing::error!(
                 discarded,
@@ -300,7 +337,7 @@ pub enum Drained {
     /// No line was queued and none was being written.
     Written,
     /// At four fifths of the grace, a write had not returned or lines were
-    /// still queued; `discarded` queued lines were discarded.
+    /// still queued; the `discarded` oldest queued lines were discarded.
     Discarded {
         /// The queued lines discarded.
         discarded: u64,
@@ -363,9 +400,9 @@ impl Drop for EventLine<'_> {
 enum Report {
     /// The batch opened a regime: warn.
     Opened,
-    /// The batch took the total across a power of ten: warn, with the latch's
-    /// total and the failures it downgraded.
-    StillDropping { total: u64, suppressed: u64 },
+    /// The batch took the total across a power of ten: warn, with the
+    /// failures the latch downgraded.
+    StillDropping { suppressed: u64 },
     /// Neither: debug, with the failures the latch downgraded.
     Repeat { suppressed: u64 },
 }
@@ -379,8 +416,8 @@ fn drop_report(latch: &mut FailureRegimeLatch, dropped: u64) -> Report {
     for _ in 0..dropped {
         report = match (report, latch.on_failure()) {
             (Report::Opened, _) | (_, RegimeDecision::Loud) => Report::Opened,
-            (_, RegimeDecision::StillFailing { total, suppressed }) => {
-                Report::StillDropping { total, suppressed }
+            (_, RegimeDecision::StillFailing { suppressed, .. }) => {
+                Report::StillDropping { suppressed }
             }
             (still @ Report::StillDropping { .. }, RegimeDecision::Suppressed { .. }) => still,
             (Report::Repeat { .. }, RegimeDecision::Suppressed { suppressed }) => {
@@ -402,8 +439,13 @@ struct Reporter {
 }
 
 impl Reporter {
-    /// After a write: report the lines dropped since the last report, or,
-    /// with none and the queue `empty`, the end of an open regime.
+    /// Whether lines were dropped since the last report.
+    fn owes_report(&self, queue: &Queue) -> bool {
+        queue.dropped.load(Ordering::Acquire) != self.reported
+    }
+
+    /// After a write: report the lines dropped since the last report, then,
+    /// with the queue `empty`, end an open regime.
     fn after_write(&mut self, queue: &Queue, empty: bool, sink: &mut dyn Write) {
         let total = queue.dropped.load(Ordering::Acquire);
         let dropped = total.saturating_sub(self.reported);
@@ -418,7 +460,7 @@ impl Reporter {
                     "cerulion_remoted: log lines were dropped: the log queue was full or a \
                      write to stderr failed"
                 ),
-                Report::StillDropping { total, suppressed } => tracing::warn!(
+                Report::StillDropping { suppressed } => tracing::warn!(
                     dropped,
                     total_dropped = total,
                     suppressed,
@@ -433,7 +475,8 @@ impl Reporter {
                      write to stderr failed"
                 ),
             });
-        } else if empty && self.latch.is_failing() {
+        }
+        if empty && self.latch.is_failing() {
             let regime = std::mem::take(&mut self.regime);
             if self.latch.on_success().is_some() {
                 write_report(sink, || {
@@ -583,10 +626,7 @@ mod tests {
         // Totals 6 to 11: the 10th crosses a decade; the 11th does not undo it.
         assert_eq!(
             drop_report(&mut latch, 6),
-            Report::StillDropping {
-                total: 10,
-                suppressed: 8
-            }
+            Report::StillDropping { suppressed: 8 }
         );
         assert_eq!(latch.total_failures(), 11);
         assert_eq!(latch.on_success(), Some(9));
@@ -673,24 +713,37 @@ mod tests {
         let mut reporter = Reporter::default();
         formatted_into(&writer, || {
             queue.dropped.store(3, Ordering::Release);
+            assert!(reporter.owes_report(queue));
             reporter.after_write(queue, false, &mut sink);
+            assert!(!reporter.owes_report(queue));
             // No new drop, lines still queued: the regime stays open.
             reporter.after_write(queue, false, &mut sink);
             queue.dropped.store(5, Ordering::Release);
             reporter.after_write(queue, false, &mut sink);
+            // The 10th drop crosses a decade; the line names the counter's 11.
+            queue.dropped.store(11, Ordering::Release);
+            reporter.after_write(queue, false, &mut sink);
             reporter.after_write(queue, true, &mut sink);
             // Healthy and empty: nothing more.
             reporter.after_write(queue, true, &mut sink);
+            // Drops reported by a write that leaves the queue empty: the
+            // regime opens and ends at once.
+            queue.dropped.store(15, Ordering::Release);
+            reporter.after_write(queue, true, &mut sink);
         });
+        const DROPPED: &str = "cerulion_remoted: log lines were dropped: the log queue was full \
+                               or a write to stderr failed";
+        const CAUGHT_UP: &str = "cerulion_remoted: the log writer caught up; the lines it \
+                                 dropped are counted in the wire status reply";
         assert_eq!(
             sink.lines(),
             [
-                " WARN cerulion_remoted: log lines were dropped: the log queue was full or a \
-                 write to stderr failed dropped=3 total_dropped=3\n",
-                "DEBUG cerulion_remoted: log lines were dropped: the log queue was full or a \
-                 write to stderr failed dropped=2 total_dropped=5 suppressed=4\n",
-                " INFO cerulion_remoted: the log writer caught up; the lines it dropped are \
-                 counted in the wire status reply dropped=5 total_dropped=5\n",
+                format!(" WARN {DROPPED} dropped=3 total_dropped=3\n"),
+                format!("DEBUG {DROPPED} dropped=2 total_dropped=5 suppressed=4\n"),
+                format!(" WARN {DROPPED} dropped=6 total_dropped=11 suppressed=8\n"),
+                format!(" INFO {CAUGHT_UP} dropped=11 total_dropped=11\n"),
+                format!(" WARN {DROPPED} dropped=4 total_dropped=15\n"),
+                format!(" INFO {CAUGHT_UP} dropped=4 total_dropped=15\n"),
             ]
         );
         assert!(
@@ -738,8 +791,10 @@ mod tests {
         let writer = spawn(Limits::DEFAULT, Box::new(sink.clone())).unwrap();
         log(&writer, "in flight\n");
         sink.until_a_write_waits();
-        log(&writer, "queued 1\n");
-        log(&writer, "queued 2\n");
+        let queued: Vec<String> = (1..=10).map(|n| format!("queued {n}\n")).collect();
+        for line in &queued {
+            log(&writer, line);
+        }
         let grace = Duration::from_millis(500);
         let since = Instant::now();
         let drained = formatted_into(&writer, || writer.drain(grace));
@@ -749,14 +804,16 @@ mod tests {
         assert!(took < grace + Duration::from_secs(5), "took {took:?}");
         sink.open();
         assert_eq!(writer.drain(LONG), Drained::Written);
-        assert_eq!(
-            sink.lines(),
-            [
-                "in flight\n",
-                "ERROR cerulion_remoted: log lines still queued at the exit were discarded \
-                 discarded=2\n",
-            ]
+        // The two oldest are discarded; the newest eight and then the count
+        // are written.
+        let mut expected = vec!["in flight\n".to_string()];
+        expected.extend(queued[2..].iter().cloned());
+        expected.push(
+            "ERROR cerulion_remoted: log lines still queued at the exit were discarded \
+             discarded=2\n"
+                .to_string(),
         );
+        assert_eq!(sink.lines(), expected);
         assert_eq!(writer.dropped(), 0);
     }
 }
