@@ -17,8 +17,9 @@
 //! - on a word fed by two publishers, a FIFO read over real queues that finds
 //!   the queue empty clears the count a release left high;
 //! - `block_timeout_ms` on a topic with several producers is refused at load
-//!   with one text, however the input is made `block` and on the
-//!   single-process, planning and worker builds; without the key such a
+//!   with one text, however the input is made `block`, on the
+//!   single-process build, the planning build and the free-run live build of
+//!   the whole graph; without the key such a
 //!   consumer that stops for good still has its slot released;
 //! - a consumer node that stops with a fatal error has its slot released;
 //! - the live loop's wait sizing holds a deferred producer until its slot's
@@ -392,7 +393,8 @@ fn planning_refusal(cfg: GraphConfig) -> Option<String> {
     }
 }
 
-/// Build `cfg` on the live free-run path a multi-process worker builds on.
+/// Build the whole of `cfg` on the live free-run build path, with no
+/// cross-process wiring.
 fn build_live(cfg: GraphConfig) -> Result<GraphRuntime, String> {
     let factories = factories_for(&cfg);
     GraphRuntime::build_for_test_with_policy_and_wiring(
@@ -1008,8 +1010,8 @@ fn shared_timeout_refusal(topic: &str, producers: &str) -> String {
 /// refused at load with one text: with the input `block` by the node's
 /// attribute or by the graph's `backpressure:` key, with two in-graph
 /// producers or with one on a listed topic, on the single-process build, the
-/// multi-process supervisor's planning build and a worker's live build. The
-/// same graphs without the key build.
+/// multi-process supervisor's planning build and the free-run live build of
+/// the whole graph. The same graphs without the key build.
 #[test]
 fn block_timeout_on_a_topic_with_several_producers_is_refused_at_load() {
     let timed = |topic: &str| with_timeout(input(topic), 50);
@@ -1050,8 +1052,8 @@ fn block_timeout_on_a_topic_with_several_producers_is_refused_at_load() {
         );
         let err = build_live(cfg)
             .err()
-            .unwrap_or_else(|| panic!("{form}: the worker build must refuse"));
-        assert_eq!(err, want, "{form}: the worker build");
+            .unwrap_or_else(|| panic!("{form}: the live build must refuse"));
+        assert_eq!(err, want, "{form}: the live build");
     }
     let keyed_plain = |topic: &str| {
         let mut i = input(topic);
