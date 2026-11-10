@@ -909,6 +909,15 @@ struct ScheduledNode {
     /// `&mut ScheduledNode` to workers).
     trace_fragment: Vec<TraceEntry>,
 
+    /// The node is a member of a census chain, called by
+    /// [`Scheduler::call_chain_member`] when its chain head's level ends. While
+    /// chain calls are engaged for a step, [`Scheduler::decide_fires`] neither
+    /// runs this node's QoS windows nor decides it at its own level.
+    chain_member: bool,
+    /// The chain call of THIS step fired the node, and its entries wait in
+    /// `trace_fragment` for the node's own level to merge them.
+    chain_prefired: bool,
+
     /// RECORD side: the per-node publish-DISCARD signal, bumped by
     /// this node's publishers (`OutputProxy::Drop`'s all-defer discard,
     /// and `CerulionPublisher::loan_proxy`'s pre-commit loan-failure path) every
@@ -1244,6 +1253,10 @@ pub(crate) struct FireDecision {
     /// same-count reorder).
     pub(crate) idx: usize,
     pub(crate) kind: FireKind,
+    /// A chain call already fired this node in this step: the tick passes do
+    /// not fire it again, and the merge writes the entries waiting in its
+    /// `trace_fragment` at this decision's position. `kind` is unused.
+    pub(crate) prefired: bool,
 }
 
 /// The index-keyed scratch entry [`Scheduler::tick_decided_parallel`]
@@ -1874,6 +1887,14 @@ pub struct Scheduler {
     /// changed is the build-time `info!` `GraphRuntime` emits per (level,
     /// qualifying topic).
     forced_serial_rest_walks: u64,
+    /// Whether the current step calls chain members (set by the runtime at the
+    /// top of every step through [`Self::set_chain_calls_engaged`]).
+    chain_calls_engaged: bool,
+    /// Chain calls made so far (see [`Self::chain_calls_made`]).
+    chain_calls_made: u64,
+    /// The inline-trace mutant, read once when the runtime marks the members.
+    #[cfg(feature = "oracle-mutants")]
+    chain_call_inline_trace_mutant: bool,
     /// The optional recording trace-ring hook (see [`TraceRingHook`]).
     /// `None` (the default, and the only state on non-unix targets) = today's
     /// behavior: the ring arm in [`RingTraceSink::push_entry`] is one
@@ -2072,6 +2093,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2098,6 +2123,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2135,6 +2164,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2166,6 +2199,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2558,6 +2595,8 @@ impl Scheduler {
             // Starts empty; the within-level fire passes grow it once,
             // then reuse its capacity (mem::take / clear / write-back).
             trace_fragment: Vec::new(),
+            chain_member: false,
+            chain_prefired: false,
             // Defaults; the runtime overwrites discard_signal +
             // replay_suppress with the Arcs it shares into the publishers.
             discard_signal,
@@ -5602,8 +5641,26 @@ impl Scheduler {
             self.decide_fires_from_plan(node_ids, new_time);
             return;
         }
+        let chain_calls = self.chain_calls_engaged;
         for id in node_ids {
             if let Some(idx) = self.nodes.get_index_of(id.as_str()) {
+                // A chain member was decided, and fired if due, by its chain
+                // call earlier in this step. A fire it made keeps its place
+                // here so the merge writes its entries at this position.
+                if chain_calls && self.nodes[idx].chain_member {
+                    let node = &mut self.nodes[idx];
+                    if std::mem::take(&mut node.chain_prefired) {
+                        self.fire_decisions.push(FireDecision {
+                            node_id: Arc::clone(&node.node_id),
+                            idx,
+                            kind: FireKind::Single {
+                                fire_time_ns: new_time,
+                            },
+                            prefired: true,
+                        });
+                    }
+                    continue;
+                }
                 self.run_qos_windows(idx, new_time);
                 // SAFETY: `idx` from `get_index_of` two lines above; `run_qos_windows`
                 // does not restructure the map.
@@ -5613,8 +5670,12 @@ impl Scheduler {
                 // returns owned `kind` / `node_id` — so pushing into the
                 // disjoint `self.fire_decisions` field compiles under NLL.
                 if let Some(kind) = Self::decide_node(&node_id, node, new_time, cap_override) {
-                    self.fire_decisions
-                        .push(FireDecision { node_id, idx, kind });
+                    self.fire_decisions.push(FireDecision {
+                        node_id,
+                        idx,
+                        kind,
+                        prefired: false,
+                    });
                 }
             } else {
                 // A level node id absent from the
@@ -5670,10 +5731,113 @@ impl Scheduler {
             };
             if let Some(kind) = self.take_planned_fire(idx, id, new_time) {
                 let node_id = Arc::clone(&self.nodes[idx].node_id);
-                self.fire_decisions
-                    .push(FireDecision { node_id, idx, kind });
+                self.fire_decisions.push(FireDecision {
+                    node_id,
+                    idx,
+                    kind,
+                    prefired: false,
+                });
             }
         }
+    }
+
+    /// Mark `node_id` a chain member (see [`Self::call_chain_member`]). Returns
+    /// false when the scheduler holds no such node.
+    // hot-path-alloc-ok-fn: cold: called once per chain member at graph build
+    pub(crate) fn mark_chain_member(&mut self, node_id: &str) -> bool {
+        #[cfg(feature = "oracle-mutants")]
+        {
+            self.chain_call_inline_trace_mutant =
+                std::env::var_os(crate::graph::CHAIN_CALL_INLINE_TRACE_MUTANT_ENV).is_some();
+        }
+        match self.nodes.get_mut(node_id) {
+            Some(node) => {
+                node.chain_member = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Engage or disengage chain calls for the step about to run. Disengaged,
+    /// every chain member decides and fires at its own level, which is the
+    /// queued path.
+    pub(crate) fn set_chain_calls_engaged(&mut self, engaged: bool) {
+        self.chain_calls_engaged = engaged;
+    }
+
+    /// Whether the recording drives this scheduler's fires (a trace-driven
+    /// fire plan or intra-step pauses are installed).
+    pub(crate) fn replay_drives_fires(&self) -> bool {
+        self.replay_plan.is_some() || self.replay_pauses_armed
+    }
+
+    /// How many chain calls this scheduler has made since build. A call is
+    /// counted whether or not the member was due.
+    #[doc(hidden)]
+    pub fn chain_calls_made(&self) -> u64 {
+        self.chain_calls_made
+    }
+
+    /// Call one chain member: run its QoS windows, decide it, and when it is
+    /// due freeze its latest-value inputs through `snapshot` and fire it into
+    /// its own `trace_fragment`. The member's input was drained by the caller
+    /// just before, exactly as its level's drain would have drained it.
+    ///
+    /// The entries stay in the fragment and the node is marked prefired;
+    /// [`Self::decide_fires`] at the member's own level turns that mark into a
+    /// prefired decision at the member's graph position, and the tick passes
+    /// write the fragment there. `global_level` is the member's own level, so
+    /// every entry carries the level the queued path stamps.
+    ///
+    /// Returns whether the member fired.
+    pub(crate) fn call_chain_member(
+        &mut self,
+        node_id: &str,
+        new_time: u64,
+        global_level: usize,
+        step: u64,
+        snapshot: &mut dyn FnMut(&str),
+    ) -> bool {
+        let Some(idx) = self.nodes.get_index_of(node_id) else {
+            debug_assert!(false, "chain member {node_id} not in the scheduler");
+            return false;
+        };
+        self.chain_calls_made += 1;
+        self.run_qos_windows(idx, new_time);
+        let cap_override = self.catchup_cap_override;
+        let node = &mut self.nodes[idx];
+        let id = Arc::clone(&node.node_id);
+        let Some(kind) = Self::decide_node(&id, node, new_time, cap_override) else {
+            return false;
+        };
+        snapshot(&id);
+        #[cfg(feature = "oracle-mutants")]
+        {
+            if self.chain_call_inline_trace_mutant {
+                let max_trace = self.max_trace_entries;
+                let node = &mut self.nodes[idx];
+                Self::tick_node(
+                    &id,
+                    node,
+                    kind,
+                    global_level,
+                    step,
+                    &mut self.trace,
+                    max_trace,
+                    &mut self.entries_appended,
+                    self.trace_ring.as_mut(),
+                );
+                return true;
+            }
+        }
+        let node = &mut self.nodes[idx];
+        let mut frag = std::mem::take(&mut node.trace_fragment);
+        frag.clear();
+        Self::tick_node_into(&id, node, kind, global_level, step, &mut frag);
+        node.trace_fragment = frag;
+        node.chain_prefired = true;
+        true
     }
 
     /// Lend the filled decision buffer to the runtime (which iterates
@@ -5723,6 +5887,18 @@ impl Scheduler {
             // SAFETY: `idx` was minted by `get_index_of` in `decide_fires` and the
             // IndexMap is not mutated within a step, so the index is valid.
             let (_, node) = self.nodes.get_index_mut(d.idx).unwrap();
+            if d.prefired {
+                let mut sink = RingTraceSink {
+                    trace: &mut self.trace,
+                    max_trace_entries: max_trace,
+                    entries_appended: &mut self.entries_appended,
+                    ring: self.trace_ring.as_mut(),
+                };
+                for e in node.trace_fragment.drain(..) {
+                    sink.push_entry(e);
+                }
+                continue;
+            }
             Self::tick_node(
                 &d.node_id,
                 node,
@@ -5791,6 +5967,11 @@ impl Scheduler {
         // THIS step's clamp (see `decide_fires`).
         let cap_override = self.catchup_cap_override;
         for id in node_ids {
+            debug_assert!(
+                !(self.chain_calls_engaged
+                    && self.nodes.get(id.as_str()).is_some_and(|n| n.chain_member)),
+                "chain member {id} reached the block subset while chain calls are engaged"
+            );
             let Some(idx) = self.nodes.get_index_of(id.as_str()) else {
                 // Same loud desync guard as `decide_fires`: a level node id
                 // absent from the scheduler is a levelization/registration
@@ -8644,6 +8825,11 @@ impl Scheduler {
         // idx/IndexMap-desync branch below — unreachable while the IndexMap is not mutated mid-step
         let mut orphan_ids: Vec<Arc<str>> = Vec::new();
         for d in decisions.iter() {
+            // A prefired decision fires in no pass; PASS 3 merges its
+            // waiting entries at its position like any other fragment.
+            if d.prefired {
+                continue;
+            }
             if d.idx >= n {
                 // Out-of-range idx = idx/IndexMap desync (the IndexMap was
                 // mutated between decide_fires and here). Collect for the loud
@@ -9393,6 +9579,245 @@ mod tests {
                 callback: noop_callback(),
             })
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Chain calls: a member fired early keeps its trace position.
+    // -----------------------------------------------------------------------
+
+    /// Three data nodes on one level, `m` a chain member between `a` and `b`
+    /// in graph order.
+    fn chain_level() -> (Scheduler, Vec<String>) {
+        let mut s = Scheduler::new();
+        for id in ["a", "m", "b"] {
+            add_data(&mut s, id);
+        }
+        assert!(s.mark_chain_member("m"));
+        assert!(!s.mark_chain_member("absent"));
+        (s, vec!["a".to_string(), "m".to_string(), "b".to_string()])
+    }
+
+    fn one_thread_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool")
+    }
+
+    /// Run the level the way the runtime does: decide, then tick.
+    fn run_chain_level(s: &mut Scheduler, ids: &[String], t: u64, step: u64) {
+        s.decide_fires(ids, t);
+        let mut d = s.take_decisions();
+        s.tick_decided_parallel(
+            &mut d,
+            1,
+            step,
+            &one_thread_pool(),
+            &HashSet::new(),
+            RestWalk::Unconstrained,
+        );
+        s.return_decisions(d);
+    }
+
+    fn trace_ids(s: &mut Scheduler) -> Vec<String> {
+        s.trace().iter().map(|e| e.node_id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_called_member_is_written_at_its_graph_position_in_its_own_level() {
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(true);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        for id in &ids {
+            s.signal_data(id).unwrap();
+        }
+        let mut snapshots = Vec::new();
+        let mut note = |id: &str| snapshots.push(id.to_string());
+        assert!(s.call_chain_member("m", t, 1, step, &mut note));
+        assert_eq!(snapshots, vec!["m"], "the call freezes the member's inputs");
+        assert!(s.trace().is_empty(), "the call's entry waits for its level");
+        s.decide_fires(&ids, t);
+        let decisions = s.take_decisions();
+        let prefired: Vec<bool> = decisions.iter().map(|d| d.prefired).collect();
+        assert_eq!(prefired, vec![false, true, false]);
+        s.return_decisions(decisions);
+        // Decide again from scratch on a fresh step to run the full level.
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(true);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        for id in &ids {
+            s.signal_data(id).unwrap();
+        }
+        assert!(s.call_chain_member("m", t, 1, step, &mut |_: &str| {}));
+        run_chain_level(&mut s, &ids, t, step);
+        assert_eq!(trace_ids(&mut s), vec!["a", "m", "b"]);
+        assert!(s
+            .trace()
+            .iter()
+            .all(|e| e.global_level == 1 && e.step == step));
+        assert_eq!(s.chain_calls_made(), 1);
+        // The member does not fire again at its level.
+        assert_eq!(s.pending_data_count("m"), 0);
+    }
+
+    #[test]
+    fn a_called_member_that_is_not_due_leaves_no_decision() {
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(true);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        s.signal_data("a").unwrap();
+        assert!(!s.call_chain_member("m", t, 1, step, &mut |_: &str| {}));
+        assert_eq!(s.chain_calls_made(), 1, "an undue call is still a call");
+        run_chain_level(&mut s, &ids, t, step);
+        assert_eq!(trace_ids(&mut s), vec!["a"]);
+    }
+
+    #[test]
+    fn a_disengaged_step_decides_the_member_at_its_own_level() {
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(false);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        for id in &ids {
+            s.signal_data(id).unwrap();
+        }
+        run_chain_level(&mut s, &ids, t, step);
+        assert_eq!(trace_ids(&mut s), vec!["a", "m", "b"]);
+        assert_eq!(s.chain_calls_made(), 0);
+    }
+
+    /// What the chain call and its trace buffer cost on one node with an empty
+    /// tick, beside the level path's own decide and fire of the same node.
+    ///
+    /// Each row times one operation with a pair of clock reads; the
+    /// `clock-pair` row is that pair alone, the floor every other row sits on.
+    ///
+    /// - `call`: one chain call (QoS windows, decide, freeze, fire into the
+    ///   node's own trace buffer) of a due member.
+    /// - `merge`: the member's level writing that buffer: decide (which turns
+    ///   the mark into a decision) and the tick pass that drains it.
+    /// - `queued-level`: the level path for the same node: decide and fire
+    ///   straight into the trace.
+    /// - `fire-buffered` / `fire-inline`: the fire alone, into the node's
+    ///   buffer or straight into the trace. Their difference and `merge` are
+    ///   what holding an entry costs.
+    ///
+    /// ```bash
+    /// cargo test -p cerulion_core --lib --release -- --ignored --nocapture \
+    ///     --test-threads=1 what_a_chain_call_costs
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+    fn what_a_chain_call_costs() {
+        use std::time::Instant;
+        const N: usize = 20_000;
+        const WARMUP: usize = 2_000;
+        fn report(label: &str, mut v: Vec<u64>) {
+            assert_eq!(v.len(), N, "{label} collected {} samples", v.len());
+            v.sort_unstable();
+            let pct = |p: f64| v[((p / 100.0 * v.len() as f64).ceil() as usize).saturating_sub(1)];
+            println!(
+                "{label:<14} n={:>6} p50={:>6} ns p99={:>6} ns min={:>6} ns",
+                v.len(),
+                pct(50.0),
+                pct(99.0),
+                v[0]
+            );
+        }
+        if cfg!(debug_assertions) {
+            panic!("this measurement is meaningful only in a release build");
+        }
+        let ids = vec!["m".to_string()];
+        let pool = one_thread_pool();
+        let serial = HashSet::new();
+        let mut rows: [Vec<u64>; 6] = Default::default();
+        let mut s = Scheduler::new();
+        add_data(&mut s, "m");
+        s.mark_chain_member("m");
+        s.set_trace_limit(1024);
+        let mut q = Scheduler::new();
+        add_data(&mut q, "m");
+        q.set_trace_limit(1024);
+        for i in 0..(N + WARMUP) {
+            let keep = i >= WARMUP;
+            let a = Instant::now();
+            let b = Instant::now();
+            if keep {
+                rows[0].push((b - a).as_nanos() as u64);
+            }
+            // The chain call, then its merge.
+            s.set_chain_calls_engaged(true);
+            let t = s.begin_step(Duration::from_millis(1));
+            let step = s.current_step();
+            s.signal_data("m").unwrap();
+            let a = Instant::now();
+            let fired = s.call_chain_member("m", t, 1, step, &mut |_: &str| {});
+            let b = Instant::now();
+            assert!(fired);
+            s.decide_fires(&ids, t);
+            let mut d = s.take_decisions();
+            s.tick_decided_parallel(&mut d, 1, step, &pool, &serial, RestWalk::Unconstrained);
+            let c = Instant::now();
+            s.return_decisions(d);
+            if keep {
+                rows[1].push((b - a).as_nanos() as u64);
+                rows[2].push((c - b).as_nanos() as u64);
+            }
+            // The level path for the same node.
+            let t = q.begin_step(Duration::from_millis(1));
+            let step = q.current_step();
+            q.signal_data("m").unwrap();
+            let a = Instant::now();
+            q.decide_fires(&ids, t);
+            let mut d = q.take_decisions();
+            q.tick_decided_parallel(&mut d, 1, step, &pool, &serial, RestWalk::Unconstrained);
+            let b = Instant::now();
+            q.return_decisions(d);
+            if keep {
+                rows[3].push((b - a).as_nanos() as u64);
+            }
+            // The fire alone, buffered and inline.
+            let max_trace = q.max_trace_entries;
+            let kind = FireKind::Data {
+                fire_time_ns: t,
+                fire_count: 1,
+            };
+            let node = q.nodes.get_index_mut(0).unwrap().1;
+            let mut frag = std::mem::take(&mut node.trace_fragment);
+            frag.clear();
+            let a = Instant::now();
+            Scheduler::tick_node_into("m", node, kind, 1, step, &mut frag);
+            let b = Instant::now();
+            node.trace_fragment = frag;
+            node.trace_fragment.clear();
+            let a2 = Instant::now();
+            Scheduler::tick_node(
+                "m",
+                node,
+                kind,
+                1,
+                step,
+                &mut q.trace,
+                max_trace,
+                &mut q.entries_appended,
+                None,
+            );
+            let b2 = Instant::now();
+            if keep {
+                rows[4].push((b - a).as_nanos() as u64);
+                rows[5].push((b2 - a2).as_nanos() as u64);
+            }
+        }
+        let [pair, call, merge, queued, buffered, inline] = rows;
+        report("clock-pair", pair);
+        report("call", call);
+        report("merge", merge);
+        report("queued-level", queued);
+        report("fire-buffered", buffered);
+        report("fire-inline", inline);
     }
 
     fn add_sync(scheduler: &mut Scheduler, id: &str, inputs: &[&str], window: Option<Duration>) {
@@ -10276,6 +10701,7 @@ mod tests {
                 idx,
                 node_id: Arc::from(id.as_str()),
                 kind,
+                prefired: false,
             });
         }
         let pool = rayon::ThreadPoolBuilder::new()

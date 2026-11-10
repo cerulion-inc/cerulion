@@ -1126,6 +1126,218 @@ fn probe_trigger_body(
     }
 }
 
+/// One chain member, called when its chain head's level ends.
+#[derive(Debug, Clone)]
+struct ChainCall {
+    /// The member's data-trigger binding (always a unified one).
+    binding: usize,
+    /// The member's node id.
+    node_id: Arc<str>,
+    /// The member's own level, stamped on its trace entries.
+    level: usize,
+}
+
+/// The chain calls of one graph build, frozen at build.
+#[derive(Debug)]
+struct ChainCalls {
+    /// Every call, grouped by the level after which it runs and in chain
+    /// order within a chain.
+    calls: Arc<[ChainCall]>,
+    /// `after_level[l]` is the range of `calls` run when level `l` ends.
+    after_level: Box<[std::ops::Range<usize>]>,
+    /// `binding_is_call[i]`: data-trigger binding `i` is a call's binding,
+    /// drained by the call and skipped by its level's drain.
+    binding_is_call: Box<[bool]>,
+    /// The skipped-dequeue mutant, read once at build.
+    #[cfg(feature = "oracle-mutants")]
+    skip_dequeue_mutant: bool,
+}
+
+/// Why a census chain is cut at a member: that member and every member after
+/// it fire at their own levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainCallCut {
+    /// The member sits on another level than the one its chain position
+    /// names (`None`: on no level).
+    OffLevel {
+        expected: usize,
+        actual: Option<usize>,
+    },
+    /// The member is outside its level's non-block set.
+    BlockSet,
+    /// The member has this many data-trigger bindings; a call drains one.
+    Bindings { count: usize },
+    /// The member's binding drains on the separate discipline; a call drains
+    /// only a binding read through its node's body subscriber.
+    SeparateDrain,
+}
+
+impl std::fmt::Display for ChainCallCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OffLevel {
+                expected,
+                actual: Some(actual),
+            } => write!(
+                f,
+                "on level {actual}, while its chain position names level {expected}"
+            ),
+            Self::OffLevel {
+                expected,
+                actual: None,
+            } => write!(
+                f,
+                "on no level, while its chain position names level {expected}"
+            ),
+            Self::BlockSet => f.write_str("outside its level's non-block set"),
+            Self::Bindings { count: 0 } => f.write_str("no data-trigger binding"),
+            Self::Bindings { count } => write!(f, "{count} data-trigger bindings, not one"),
+            Self::SeparateDrain => {
+                f.write_str("its trigger input drains on the separate discipline")
+            }
+        }
+    }
+}
+
+/// The data-trigger binding a call of census chain member `member` drains,
+/// or why the chain is cut at it. `level` is the level its chain position
+/// names.
+fn chain_call_binding(
+    member: &str,
+    level: usize,
+    bindings: &[DataTriggerBinding],
+    levels: &Levels,
+    level_plans: &[LevelPlan],
+) -> Result<usize, ChainCallCut> {
+    let actual = levels.level_of(member);
+    if actual != Some(level) {
+        return Err(ChainCallCut::OffLevel {
+            expected: level,
+            actual,
+        });
+    }
+    if !level_plans
+        .get(level)
+        .is_some_and(|p| p.other_ids.iter().any(|id| id == member))
+    {
+        return Err(ChainCallCut::BlockSet);
+    }
+    let mut own = bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.node_id.as_ref() == member);
+    let (Some((binding, b)), None) = (own.next(), own.next()) else {
+        let count = bindings
+            .iter()
+            .filter(|b| b.node_id.as_ref() == member)
+            .count();
+        return Err(ChainCallCut::Bindings { count });
+    };
+    if !matches!(b.drain, DrainSource::Unified { .. }) {
+        return Err(ChainCallCut::SeparateDrain);
+    }
+    Ok(binding)
+}
+
+impl ChainCalls {
+    /// Turn the census chains into calls over this build's bindings.
+    ///
+    /// A member becomes a call when it sits on the level its chain position
+    /// names, is in its level's non-block set, has exactly one data-trigger
+    /// binding and that binding drains unified ([`chain_call_binding`]); the
+    /// chain is cut at the first member that is not, which keeps the queued
+    /// path from there on. Each cut logs one `warn` naming the chain head,
+    /// the member and the [`ChainCallCut`], and the build then logs one
+    /// `info` naming the members it calls, or saying it calls none and why.
+    /// Every member and its producer must be nodes of this build: a census
+    /// judged against another graph would name nodes this runtime does not
+    /// run, and the build then calls nothing rather than half a chain.
+    // hot-path-alloc-ok-fn: cold: runs once per graph build
+    fn from_census(
+        chains: &[super::chain::FusedChain],
+        bindings: &[DataTriggerBinding],
+        levels: &Levels,
+        level_plans: &[LevelPlan],
+        nodes: &IndexMap<String, Arc<Mutex<Box<dyn NodeEntry>>>>,
+    ) -> Option<Self> {
+        let mut by_head: Vec<(usize, ChainCall)> = Vec::new();
+        for chain in chains {
+            for (pos, member) in chain.nodes.iter().enumerate().skip(1) {
+                let producer = &chain.nodes[pos - 1];
+                if !nodes.contains_key(member.as_str()) || !nodes.contains_key(producer.as_str()) {
+                    tracing::error!(
+                        member = %member,
+                        producer = %producer,
+                        "chain fusion: a census chain names a node this build does not run; \
+                         no chain is called"
+                    );
+                    return None;
+                }
+                let level = chain.head_level + pos;
+                match chain_call_binding(member, level, bindings, levels, level_plans) {
+                    Ok(binding) => by_head.push((
+                        chain.head_level,
+                        ChainCall {
+                            binding,
+                            node_id: Arc::from(member.as_str()),
+                            level,
+                        },
+                    )),
+                    Err(cut) => {
+                        tracing::warn!(
+                            chain_head = %chain.nodes[0],
+                            member = %member,
+                            reason = %cut,
+                            "chain fusion: a census chain is cut at this member; it and \
+                             every member after it fire at their own levels"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        if by_head.is_empty() {
+            let reason = if chains.is_empty() {
+                "the census found no chain"
+            } else {
+                "every census chain is cut at its first member"
+            };
+            tracing::info!(reason = %reason, "chain fusion: this build calls no chain member");
+            return None;
+        }
+        // Stable: chain order survives within one head level.
+        by_head.sort_by_key(|(head, _)| *head);
+        let mut after_level: Vec<std::ops::Range<usize>> = vec![0..0; levels.len()];
+        for (i, (head, _)) in by_head.iter().enumerate() {
+            let r = &mut after_level[*head];
+            if r.start == r.end {
+                *r = i..i + 1;
+            } else {
+                r.end = i + 1;
+            }
+        }
+        let mut binding_is_call = vec![false; bindings.len()];
+        for (_, call) in &by_head {
+            binding_is_call[call.binding] = true;
+        }
+        let calls: Arc<[ChainCall]> = by_head.into_iter().map(|(_, c)| c).collect();
+        let called: Vec<&str> = calls.iter().map(|c| c.node_id.as_ref()).collect();
+        tracing::info!(
+            members = calls.len(),
+            called = ?called,
+            "chain fusion: the chain members this build calls when their chain head's level ends"
+        );
+        Some(Self {
+            calls,
+            after_level: after_level.into_boxed_slice(),
+            binding_is_call: binding_is_call.into_boxed_slice(),
+            #[cfg(feature = "oracle-mutants")]
+            skip_dequeue_mutant: std::env::var_os(super::chain::CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV)
+                .is_some(),
+        })
+    }
+}
+
 /// Mapping from data-trigger topic to scheduler node ID for pre-step drain bridging.
 struct DataTriggerBinding {
     /// Scheduler node ID to signal.
@@ -4063,6 +4275,12 @@ pub struct GraphRuntime {
     /// [`Self::build_live_deterministic_with_manager_and_barrier`]) hits a boundary
     /// timeout. Observe it via [`Self::is_barrier_failed`] (the host contract).
     barrier_failed: bool,
+    /// The chain calls this build makes when `CERULION_FUSE_CHAINS=1`; `None`
+    /// when the seam is off or the census found no callable member.
+    chain_calls: Option<ChainCalls>,
+    /// Whether the step in progress makes chain calls (decided at the top of
+    /// every step: never under a barrier, a replay plan or an armed read gate).
+    chain_calls_engaged: bool,
     /// The run's PAUSE PAGE, when `cerulion graph pause` can reach this run
     /// ([`Self::attach_pause`]). `None` on every other build, which is every build
     /// but a live `graph run` of a Unix host.
@@ -5704,21 +5922,26 @@ impl GraphRuntime {
             }
         }
 
-        // CHAIN FUSION, resolved once and logged once. The decision combines
-        // the `CERULION_FUSE_CHAINS` seam with the per-node `fuse: false`
-        // opt-out; the census beside it says which edges the graph's
-        // declarations would allow and, for every other consumer edge, the
-        // reason it keeps the queued path.
-        //
-        // NOTHING BELOW READS EITHER. The pair is logged and dropped, so this
-        // build is byte-identical to one made before either existed. It is
-        // resolved HERE, beside the other build-time seams, because a decision
-        // read twice in one build could disagree with itself and a fusion set
-        // that varied within a build would make a replay a different program.
+        // CHAIN FUSION, resolved once and logged once. The decision is the
+        // `CERULION_FUSE_CHAINS` seam; the census beside it says which edges
+        // the graph's declarations allow and, for every other consumer edge,
+        // the reason it keeps the queued path. With the seam on, the census
+        // chains become this build's chain calls (`ChainCalls::from_census`,
+        // which logs each member a chain is cut at and the members it calls);
+        // with it off `called_chains` stays `None`, nothing below reads the
+        // census and no chain call is formed or logged, so the build is
+        // byte-identical to one made before either existed. It is resolved
+        // HERE, beside the other build-time seams, because a decision read
+        // twice in one build could disagree with itself and a fusion set that
+        // varied within a build would make a replay a different program.
         //
         // The census is judged against the graph's DECLARED colocation, the
         // same shape `cerulion graph levels` reports and every run records, so
-        // one graph reads the same way from all three.
+        // one graph reads the same way from all three. An executor unit's
+        // runtime is built from its own subgraph, where an input fed from
+        // another unit names an absolute topic no node of the build produces:
+        // that edge is no chain link, so a chain call never leaves its unit.
+        let mut called_chains: Option<Vec<super::chain::FusedChain>> = None;
         {
             let decision = super::chain::resolve_fusion();
             let colocation = if config.has_process_groups() {
@@ -5735,6 +5958,9 @@ impl GraphRuntime {
                 colocation,
             );
             super::chain::log_fusion_decision(&decision, &census);
+            if decision.enabled() {
+                called_chains = Some(census.chains().to_vec());
+            }
         }
         // Take ownership of the full `Levels` struct for the
         // drain-between-levels executor in `step`. Wrap in an `Arc` so `step`
@@ -9888,6 +10114,22 @@ impl GraphRuntime {
             None
         };
 
+        let chain_calls = called_chains.as_deref().and_then(|chains| {
+            ChainCalls::from_census(
+                chains,
+                &data_trigger_bindings,
+                &levels,
+                &level_plans,
+                &nodes,
+            )
+        });
+        if let Some(calls) = chain_calls.as_ref() {
+            for call in calls.calls.iter() {
+                let marked = scheduler.mark_chain_member(&call.node_id);
+                debug_assert!(marked, "chain member {} not in the scheduler", call.node_id);
+            }
+        }
+
         Ok(Self {
             config,
             scheduler,
@@ -10007,6 +10249,8 @@ impl GraphRuntime {
             // Never poisoned at build (poison requires a participant + a boundary
             // timeout, both post-build).
             barrier_failed: false,
+            chain_calls,
+            chain_calls_engaged: false,
             #[cfg(unix)]
             pause: None,
             #[cfg(unix)]
@@ -15851,6 +16095,15 @@ impl GraphRuntime {
         // so BOTH the polled (run_until_shutdown) and live (live_step) paths
         // get it identically — the replay-determinism firewall holds.
         let new_time = self.scheduler.begin_step(gating.0);
+        // CHAIN CALLS, decided once per step. Under a barrier participant, a
+        // replay fire plan, replay pauses or an armed read gate the step runs
+        // every member at its own level through the ordinary level pass.
+        self.chain_calls_engaged = self.chain_calls.is_some()
+            && self.barrier_participant.is_none()
+            && !self.replay_read_armed
+            && !self.scheduler.replay_drives_fires();
+        self.scheduler
+            .set_chain_calls_engaged(self.chain_calls_engaged);
         // The 0-based logical-step index, read ONCE here
         // (right after `begin_step` bumped it) — `step` is per-STEP, not
         // per-level, so it is constant for every level/fire below. Stamped onto
@@ -15992,6 +16245,9 @@ impl GraphRuntime {
             for level_idx in 0..levels.len() {
                 // Monolith: local level == global level.
                 self.run_level(level_idx, &levels, new_time, level_idx, step);
+                if self.chain_calls_engaged {
+                    self.run_chain_calls(level_idx, new_time, step);
+                }
             }
         }
         // END OF STEP for the READ GATE. `step_live` drains level L then fires
@@ -16071,6 +16327,74 @@ impl GraphRuntime {
         // notifier SO_SNDBUF sweep that used to run here (a mitigation for the
         // undrained-listener failure iceoryx2 0.10 later removed outright) is
         // gone with it.
+    }
+
+    /// Call every chain member whose chain head sits on level `done`, in chain
+    /// order: drain the member's trigger input with the level drain's own
+    /// per-binding body, then decide, freeze and fire it through
+    /// [`Scheduler::call_chain_member`]. Each member's publish is the ordinary
+    /// one, so the next member's drain finds the frame on its own queue. The
+    /// members' event queues are emptied after the last call of the walk.
+    fn run_chain_calls(&mut self, done: usize, new_time: u64, step: u64) {
+        let Some(calls) = self.chain_calls.as_ref() else {
+            return;
+        };
+        let Some(range) = calls.after_level.get(done).cloned() else {
+            return;
+        };
+        if range.is_empty() {
+            return;
+        }
+        let calls_now = Arc::clone(&calls.calls);
+        #[cfg(feature = "oracle-mutants")]
+        let skip_dequeue = calls.skip_dequeue_mutant;
+        let std::ops::Range { start, end } = range;
+        let mut timestamps = std::mem::take(&mut self.drain_timestamps);
+        for call in &calls_now[start..end] {
+            #[cfg(feature = "oracle-mutants")]
+            {
+                if skip_dequeue {
+                    let _ = self.scheduler.signal_data(&call.node_id);
+                } else {
+                    self.drain_data_binding(call.binding, &mut timestamps, false);
+                }
+            }
+            #[cfg(not(feature = "oracle-mutants"))]
+            self.drain_data_binding(call.binding, &mut timestamps, false);
+            timestamps.clear();
+            let nodes = &self.nodes;
+            let snapshot_input_names = &self.snapshot_input_names;
+            let mut snapshot =
+                |node_id: &str| Self::snapshot_node_inputs(nodes, snapshot_input_names, node_id);
+            self.scheduler.call_chain_member(
+                &call.node_id,
+                new_time,
+                call.level,
+                step,
+                &mut snapshot,
+            );
+        }
+        // The members' event queues are emptied once every member of this
+        // walk has fired, still inside the step; each fire read the frame its
+        // drain froze. A frame a publisher outside the graph puts on a
+        // member's queue after that member's drain loses its wake event here:
+        // it stays queued until a wake from another source starts a step, and
+        // that step's call of the member drains it.
+        for call in &calls_now[start..end] {
+            if let DrainSource::Unified { listener_idx } =
+                self.data_trigger_bindings[call.binding].drain
+            {
+                self.empty_unified_listener(listener_idx);
+            }
+        }
+        self.drain_timestamps = timestamps;
+    }
+
+    /// How many chain calls this runtime has made since build: one per member
+    /// per step that calls chains, due or not.
+    #[doc(hidden)]
+    pub fn chain_calls_made(&self) -> u64 {
+        self.scheduler.chain_calls_made()
     }
 
     /// Run ONE DAG level — drain its trigger inputs,
@@ -16232,7 +16556,7 @@ impl GraphRuntime {
 
         // (3) Snapshot the firing NON-BLOCK nodes' inputs (PRIOR-step
         // values — block producers have not ticked yet).
-        for d in &decisions {
+        for d in decisions.iter().filter(|d| !d.prefired) {
             Self::snapshot_node_inputs(nodes, snapshot_input_names, d.node_id.as_ref());
         }
 
@@ -18864,6 +19188,359 @@ fn log_drain_failure(
 }
 
 impl GraphRuntime {
+    /// Drain data-trigger binding `i` once: the body of [`Self::drain_level`]'s
+    /// per-binding pass, shared with the chain call
+    /// ([`Self::run_chain_calls`]) so a called member takes its frame off its
+    /// own queue exactly as its level's drain would. `timestamps` is the
+    /// reused scratch the separate discipline fills. With `empty_listener`
+    /// false a unified binding's event queue is left for the caller to empty
+    /// with [`Self::empty_unified_listener`].
+    fn drain_data_binding(&mut self, i: usize, timestamps: &mut Vec<u64>, empty_listener: bool) {
+        // Cheap clone: Arc<str> is a single atomic increment.
+        let node_id = Arc::clone(&self.data_trigger_bindings[i].node_id);
+        // Borrow `input_name` (Option<Arc<str>>) for
+        // structured logging across this iteration. Cheap clone
+        // (atomic increment for Some, no-op for None).
+        // hot-path-alloc-ok: not a heap allocation: cloning an `Arc`/`Option<Arc>` is a
+        // refcount bump, the comment above says so, and `input_name` is an `Option<Arc<str>>`
+        let input_name = self.data_trigger_bindings[i].input_name.clone();
+        let consume_latest = self.data_trigger_bindings[i].consume_latest;
+
+        // Dispatch on the binding's `DrainSource`, the two
+        // drain disciplines are mutually exclusive in the type system, so the
+        // SEPARATE path can no longer reach a `ListenerOnly` (it indexes an
+        // `Ipc` by construction; the never-drain contract now lives once in
+        // `TriggerSubscriber::try_receive_timestamps`).
+        //   `Separate`, legacy dual-subscriber: drain the dedicated
+        //             trigger-drain subscriber (`trigger_subscribers[sub_idx]`,
+        //             a `TriggerSubscriber::Ipc`) via `try_receive` (UNCHANGED
+        //             path, timestamps scratch, warn-suppression, per-ts
+        //             `signal_input_received` + `signal_data`).
+        //   `Unified`, drain the node's BODY subscriber through the node
+        //             lock (`drain_trigger_input`), which freezes the
+        //             surviving sample for the tick's later `try_view` (one
+        //             receive per hop instead of two), and returns
+        //             `(popped, latest_ts)` to drive `signal_data` /
+        //             `signal_input_received`, exactly mirroring the
+        //             separate path's per-arrival firing + watchdog reset.
+        //             `listener_idx` points at a
+        //             `TriggerSubscriber::ListenerOnly` (the WaitSet wake
+        //             source) which is NEVER `try_receive`d.
+        match self.data_trigger_bindings[i].drain {
+            DrainSource::Separate { sub_idx } => {
+                // Reuse the scratch buffer, clear (capacity
+                // retained), not reallocate. Same observable result as the old
+                // per-binding `Vec::new()`: each binding starts with an empty
+                // timestamp list (`try_receive_timestamps` clears it). The
+                // `timestamps` scratch + `warn_suppressed` flag are touched
+                // ONLY on this (separate) path.
+                let mut try_receive_failed = false;
+                if let Err(e) = self.trigger_subscribers[sub_idx]
+                    .try_receive_timestamps(&node_id, sub_idx, timestamps)
+                {
+                    try_receive_failed = true;
+                    log_drain_failure(
+                        self.data_trigger_bindings[i].warn_suppressed,
+                        &node_id,
+                        sub_idx,
+                        input_name.as_deref(),
+                        "Ipc",
+                        &e,
+                    );
+                }
+
+                // Update suppression flag: latch on first try_receive failure;
+                // clear on any successful receive (whether or not it produced
+                // a msg). The recovery message is scoped to the TRANSPORT
+                // try_receive layer, it does NOT assert that the downstream
+                // scheduler.signal_data calls below also succeeded. A
+                // recovered transport with a still-failing scheduler is a
+                // legitimate state and the per-timestamp signal_data warns
+                // below will continue to fire on each affected tick.
+                if try_receive_failed {
+                    self.data_trigger_bindings[i].warn_suppressed = true;
+                } else if self.data_trigger_bindings[i].warn_suppressed {
+                    self.data_trigger_bindings[i].warn_suppressed = false;
+                    tracing::info!(
+                        node_id = %node_id,
+                        subscriber_idx = sub_idx,
+                        input_name = ?input_name.as_deref(),
+                        "transport try_receive recovered after prior failures"
+                    );
+                }
+
+                // `consume = latest` on two subscribers: the trigger
+                // subscriber's pops above include any frame that landed
+                // after the previous boundary drain and before that
+                // fire's read, which drained it off the BODY subscriber.
+                // So ask the body whether a read now finds a frame, and
+                // mint only if it does: `Empty` mints nothing and carries
+                // the arrival, so the next boundary asks again even if it
+                // pops nothing; `Unread` mints, one signal for a carried
+                // arrival alone; `Unknown` mints as an unprobed binding
+                // does. The watchdog reset below runs for every popped
+                // frame either way.
+                let (mint_arrivals, mint_carried) = if self.data_trigger_bindings[i].probes_body
+                    && (!timestamps.is_empty() || self.data_trigger_bindings[i].unconfirmed_arrival)
+                {
+                    let probe = match input_name.as_deref() {
+                        Some(name) => probe_trigger_body(&self.nodes, &node_id, name),
+                        None => TriggerProbe::Unknown,
+                    };
+                    self.data_trigger_bindings[i].unconfirmed_arrival =
+                        probe == TriggerProbe::Empty;
+                    let mint = probe != TriggerProbe::Empty;
+                    (mint, mint && timestamps.is_empty())
+                } else {
+                    (true, false)
+                };
+
+                // Iterate by ref (`&ts`), the buffer is reused
+                // across bindings, not consumed. `ts` stays `u64` (Copy), so
+                // the body is unchanged.
+                for &ts in timestamps.iter() {
+                    // Reset this trigger input's
+                    // `expect_within_ms` watchdog same-step, `drain_level`
+                    // runs BEFORE that level fires (and thus before the
+                    // scheduler's per-node `step()` watchdog check), so a
+                    // trigger input that received data this tick is not
+                    // falsely counted as a miss. No-op unless this input has a
+                    // watchdog wired (the scheduler's `get` misses for
+                    // un-watched inputs).
+                    //
+                    // This is the SAME-STEP (zero-lag) reset. The node's tick
+                    // body ALSO resets the anchor when it reads the input via
+                    // `try_view` (subscriber.rs), but that fires inside
+                    // `fire_node` AFTER this step's watchdog check, a
+                    // one-step-lagged reset. For a sane window (W >> step
+                    // size) the body read alone suffices, so the two paths are
+                    // largely redundant under `VirtualClock`; this same-step
+                    // reset removes the one-step lag, which matters for a tight
+                    // window, a hand-written `NodeEntry` that does not read its
+                    // trigger input, and the future event-driven RealClock loop
+                    // (where "step" lag becomes real wakeup latency). The reset
+                    // MECHANISM (signal_input_received advancing the window) is
+                    // pinned directly in `deadline_qos_test::expect_within_miss_*`;
+                    // we deliberately do not add a
+                    // step-aligned e2e differential test (it would be fragile),
+                    // the scheduler-direct pin + this contract is the coverage.
+                    if let Some(input) = input_name.as_deref() {
+                        if let Err(e) = self.scheduler.signal_input_received(&node_id, input, ts) {
+                            tracing::debug!(
+                                node_id = %node_id,
+                                input = %input,
+                                timestamp_ns = ts,
+                                error = %e,
+                                "scheduler.signal_input_received failed; expect_within \
+                                 watchdog not reset for this timestamp"
+                            );
+                        }
+                    }
+                    if !mint_arrivals {
+                        continue;
+                    }
+                    if let Err(e) = self.scheduler.signal_data(&node_id) {
+                        tracing::warn!(
+                            node_id = %node_id,
+                            input_name = ?input_name.as_deref(),
+                            timestamp_ns = ts,
+                            error = %e,
+                            "scheduler.signal_data failed; data-trigger fire is dropped \
+                             for this timestamp"
+                        );
+                    }
+                }
+                if mint_carried {
+                    if let Err(e) = self.scheduler.signal_data(&node_id) {
+                        tracing::warn!(
+                            node_id = %node_id,
+                            input_name = ?input_name.as_deref(),
+                            error = %e,
+                            "scheduler.signal_data failed; the carried consume = latest \
+                             arrival's fire is dropped"
+                        );
+                    }
+                }
+            }
+            DrainSource::Unified { listener_idx } => {
+                // The multi-process free-run fix: drain the standalone
+                // `ListenerOnly`'s NOTIFICATION queue here (or in the caller,
+                // when `empty_listener` is false), INSIDE the step,
+                // exact parity with the Separate arm, whose
+                // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
+                // runs the listener policy on ITS listener after a drain that
+                // removed frames.
+                // Without this, each publish's `SentSample` event SURVIVES the
+                // step (the FFI/body drain below clears only the BODY
+                // subscriber's own listener), and the next `live_step`'s idle
+                // polls (`spin_sources` / `monitor_wait_block`'s recheck) read
+                // the STALE event as "data pending", one spurious wake+step
+                // per publish. Under the multi-process split that
+                // runaway is SELF-SUSTAINING: the spurious step crosses every
+                // barrier boundary (waking peers via the predicate)
+                // and advances the handed-quantum gating clock, so the Period
+                // producer re-fires and re-arms the stale event (measured on a Jetson: the
+                // data worker parked ONCE in 40s; the 1kHz ticker free-ran at
+                // ~7.5kHz wall).
+                //
+                // RECORD-ONLY + firewall-safe: notification queue only, never
+                // the SHM message queue, never a scheduler mutation, it
+                // changes only WHEN the idle path wakes (removes STALE wakes;
+                // Principle #7).
+                //
+                // This block used to claim that "an
+                // event can never be consumed while its data escapes this
+                // step's drain", because our publisher sends the sample
+                // before the notify. That was written when the drain below
+                // consumed the whole queue. Under per-message FIFO the drain
+                // pops ONE frame, so the events for frames 2..N ARE consumed
+                // here while their data is still queued, this drain-all is
+                // exactly what leaves the remainder unannounced.
+                //
+                // It stays drain-all, and the remainder is served WITHIN THE
+                // STEP instead: the events carry no reliable count (elision
+                // makes them fewer than samples; connect/disconnect/history
+                // ids make them more), so a partial drain would either
+                // re-open the free-run or strand frames anyway,
+                // while the Data fire loop REFILLS from this same input
+                // between fires and serves the whole queued burst before the
+                // step ends (see `Scheduler::set_trigger_refill`). Anything
+                // past the per-step cap carries and reports due-NOW, so the
+                // live loop comes straight back for it.
+                if empty_listener {
+                    self.empty_unified_listener(listener_idx);
+                }
+                // UNIFIED data-trigger input. Lock the node,
+                // drain its body subscriber ONCE (which freezes the surviving
+                // sample so the tick's later `try_view` serves it with NO
+                // second receive, accounting-once), and read `(popped,
+                // latest_ts)`. `self.nodes` is a DIFFERENT field from
+                // `self.scheduler`, and the lock guard drops at the end of its
+                // block BEFORE the `signal_*` calls below, so the
+                // `&self.nodes` borrow and the `&mut self.scheduler` borrows
+                // are sequential (no aliasing).
+                let input = input_name.as_deref(); // Some for any DataTrigger binding.
+                let (popped, latest_ts) = match input {
+                    Some(name) => match self.nodes.get(node_id.as_ref()) {
+                        Some(arc) => match arc.lock() {
+                            Ok(mut g) => g.drain_trigger_input(name),
+                            Err(_) => {
+                                tracing::error!(
+                                    node_id = %node_id,
+                                    "node mutex poisoned; unified trigger drain skipped"
+                                );
+                                (0, None)
+                            }
+                        },
+                        None => {
+                            debug_assert!(
+                                false,
+                                "unified trigger binding node '{node_id}' absent from self.nodes"
+                            );
+                            tracing::error!(
+                                node_id = %node_id,
+                                "unified trigger node absent; not drained"
+                            );
+                            (0, None)
+                        }
+                    },
+                    // A DataTrigger binding always carries `input_name`;
+                    // defensive `(0, None)` for the unreachable None.
+                    None => (0, None),
+                };
+
+                // Same-step watchdog reset to the latest delivered timestamp
+                // (mirrors the separate path's per-ts `signal_input_received`;
+                // last-write-wins, so resetting once to `latest_ts` is
+                // equivalent). No-op unless this input has a watchdog wired.
+                if let (Some(name), Some(ts)) = (input, latest_ts) {
+                    if let Err(e) = self.scheduler.signal_input_received(&node_id, name, ts) {
+                        tracing::debug!(
+                            node_id = %node_id,
+                            input = %name,
+                            error = %e,
+                            "signal_input_received failed (unified)"
+                        );
+                    }
+                }
+
+                // One `signal_data` per popped frame, identical to the
+                // separate path's per-ts `signal_data`. Per-message FIFO
+                // firing: `decide_node` consumes ONE pending arrival per
+                // step and carries the remainder, so each popped frame
+                // gets its own fire.
+                //
+                // Gated on the node's CURRENT pending count,
+                // because on THIS path a pop is not the same thing as an
+                // arrival. `drain_trigger_input` returns `(1, head_ts)` for
+                // a RE-OFFER of a head no tick has taken yet (Principle #6,
+                // a fire that was deferred, or whose tick collapsed
+                // before reaching the read, must not lose its signal), and
+                // a deferred node consumes nothing: `decide_node` runs its
+                // `throttle_ms` / `block` pre-fire check at the TOP and
+                // returns `None`. So an ungated mint added one signal per
+                // DEFERRED STEP for the SAME single held frame, saturating
+                // `pending_data_count` at `DATA_PENDING_CARRY_CLAMP` (64)
+                // and draining at one per throttle period, which made the
+                // count report a step tally rather than a queue depth, and
+                // suppressed the input's `expect_within_ms` watchdog for up
+                // to 64 throttle periods after its producer died (6.4 s at
+                // 100 ms, 64 s at 1000 ms) against the "plus at most one
+                // more window" bound `NodeHandle` documents.
+                //
+                // The mint exists to keep the node FIREABLE, and that is
+                // all it is gated on: if `pending == 0` the node has no
+                // reason to fire and the signal is what gives it one (the
+                // collapsed-tick shape, where the fire CONSUMED the
+                // count but the tick never took the head, an un-minted
+                // re-offer wedges the node permanently). If `pending > 0`
+                // the node is already due, `ns_until_next_fire` already
+                // reports 0, and `tick_data_burst` REFILLS from this very
+                // input between fires, so the frame is served this step or
+                // the next without a signal of its own. The invariant the
+                // gate maintains is exactly the wedge-freedom one: after
+                // this loop, `popped >= 1` implies `pending >= 1`.
+                //
+                // Deliberately NOT gated on which SITE the drain was: the
+                // subscriber can tell a re-offer from a fresh pop, but that
+                // answer is behind the `(u64, Option<u64>)` FFI return the
+                // cdylib drain shares, so keying on it is an ABI change for
+                // a decision the pending count already makes correctly.
+                // The SEPARATE discipline takes no such gate: it drains a
+                // dedicated subscriber that never re-offers, so its
+                // per-frame signals are per-frame truth. (A `consume =
+                // latest` input there mints only while its body subscriber
+                // still holds a frame; see `DataTriggerBinding::probes_body`.)
+                // A `consume = latest` drain pops the whole queue, so its
+                // count may exceed one; the gate below mints at most one
+                // signal either way, which is the one fire a latest input
+                // gets per step.
+                debug_assert!(
+                    popped <= 1 || consume_latest,
+                    "unified trigger drain popped {popped} frames for node '{node_id}'; \
+                     the mint gate below assumes the EachFifo pop-one contract \
+                     (every fifo data-trigger input is marked `mark_fifo_consume`)"
+                );
+                if popped > 0 && self.scheduler.pending_data_count(&node_id) == 0 {
+                    if let Err(e) = self.scheduler.signal_data(&node_id) {
+                        tracing::warn!(
+                            node_id = %node_id,
+                            error = %e,
+                            "scheduler.signal_data failed (unified); fire dropped"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Empty the event queue of the unified listener at `listener_idx`
+    /// (iceoryx2 0.10: one `try_wait` empties it).
+    fn empty_unified_listener(&mut self, listener_idx: usize) {
+        let wake_listener = self.trigger_subscribers[listener_idx].listener();
+        let _ = wake_listener.try_wait(|_activation| {});
+    }
+
     /// Drain the trigger inputs for ONE DAG level.
     ///
     /// Runs the same two binding-loop passes (data-trigger then sync) the
@@ -18928,346 +19605,17 @@ impl GraphRuntime {
             if levels.level_of(node_id.as_ref()) != Some(level_idx) {
                 continue;
             }
-            // Borrow `input_name` (Option<Arc<str>>) for
-            // structured logging across this iteration. Cheap clone
-            // (atomic increment for Some, no-op for None).
-            // hot-path-alloc-ok: not a heap allocation: cloning an `Arc`/`Option<Arc>` is a
-            // refcount bump — the comment above says so, and `input_name` is an `Option<Arc<str>>`
-            let input_name = self.data_trigger_bindings[i].input_name.clone();
-            let consume_latest = self.data_trigger_bindings[i].consume_latest;
-
-            // Dispatch on the binding's `DrainSource` — the two
-            // drain disciplines are mutually exclusive in the type system, so the
-            // SEPARATE path can no longer reach a `ListenerOnly` (it indexes an
-            // `Ipc` by construction; the never-drain contract now lives once in
-            // `TriggerSubscriber::try_receive_timestamps`).
-            //   `Separate` — legacy dual-subscriber: drain the dedicated
-            //             trigger-drain subscriber (`trigger_subscribers[sub_idx]`,
-            //             a `TriggerSubscriber::Ipc`) via `try_receive` (UNCHANGED
-            //             path — timestamps scratch, warn-suppression, per-ts
-            //             `signal_input_received` + `signal_data`).
-            //   `Unified`  — drain the node's BODY subscriber through the node
-            //             lock (`drain_trigger_input`), which freezes the
-            //             surviving sample for the tick's later `try_view` (one
-            //             receive per hop instead of two), and returns
-            //             `(popped, latest_ts)` to drive `signal_data` /
-            //             `signal_input_received` — exactly mirroring the
-            //             separate path's per-arrival firing + watchdog reset.
-            //             `listener_idx` points at a
-            //             `TriggerSubscriber::ListenerOnly` (the WaitSet wake
-            //             source) which is NEVER `try_receive`d.
-            match self.data_trigger_bindings[i].drain {
-                DrainSource::Separate { sub_idx } => {
-                    // Reuse the scratch buffer — clear (capacity
-                    // retained), not reallocate. Same observable result as the old
-                    // per-binding `Vec::new()`: each binding starts with an empty
-                    // timestamp list (`try_receive_timestamps` clears it). The
-                    // `timestamps` scratch + `warn_suppressed` flag are touched
-                    // ONLY on this (separate) path.
-                    let mut try_receive_failed = false;
-                    if let Err(e) = self.trigger_subscribers[sub_idx].try_receive_timestamps(
-                        &node_id,
-                        sub_idx,
-                        &mut timestamps,
-                    ) {
-                        try_receive_failed = true;
-                        log_drain_failure(
-                            self.data_trigger_bindings[i].warn_suppressed,
-                            &node_id,
-                            sub_idx,
-                            input_name.as_deref(),
-                            "Ipc",
-                            &e,
-                        );
-                    }
-
-                    // Update suppression flag: latch on first try_receive failure;
-                    // clear on any successful receive (whether or not it produced
-                    // a msg). The recovery message is scoped to the TRANSPORT
-                    // try_receive layer — it does NOT assert that the downstream
-                    // scheduler.signal_data calls below also succeeded. A
-                    // recovered transport with a still-failing scheduler is a
-                    // legitimate state and the per-timestamp signal_data warns
-                    // below will continue to fire on each affected tick.
-                    if try_receive_failed {
-                        self.data_trigger_bindings[i].warn_suppressed = true;
-                    } else if self.data_trigger_bindings[i].warn_suppressed {
-                        self.data_trigger_bindings[i].warn_suppressed = false;
-                        tracing::info!(
-                            node_id = %node_id,
-                            subscriber_idx = sub_idx,
-                            input_name = ?input_name.as_deref(),
-                            "transport try_receive recovered after prior failures"
-                        );
-                    }
-
-                    // `consume = latest` on two subscribers: the trigger
-                    // subscriber's pops above include any frame that landed
-                    // after the previous boundary drain and before that
-                    // fire's read, which drained it off the BODY subscriber.
-                    // So ask the body whether a read now finds a frame, and
-                    // mint only if it does: `Empty` mints nothing and carries
-                    // the arrival, so the next boundary asks again even if it
-                    // pops nothing; `Unread` mints, one signal for a carried
-                    // arrival alone; `Unknown` mints as an unprobed binding
-                    // does. The watchdog reset below runs for every popped
-                    // frame either way.
-                    let (mint_arrivals, mint_carried) = if self.data_trigger_bindings[i].probes_body
-                        && (!timestamps.is_empty()
-                            || self.data_trigger_bindings[i].unconfirmed_arrival)
-                    {
-                        let probe = match input_name.as_deref() {
-                            Some(name) => probe_trigger_body(&self.nodes, &node_id, name),
-                            None => TriggerProbe::Unknown,
-                        };
-                        self.data_trigger_bindings[i].unconfirmed_arrival =
-                            probe == TriggerProbe::Empty;
-                        let mint = probe != TriggerProbe::Empty;
-                        (mint, mint && timestamps.is_empty())
-                    } else {
-                        (true, false)
-                    };
-
-                    // Iterate by ref (`&ts`) — the buffer is reused
-                    // across bindings, not consumed. `ts` stays `u64` (Copy), so
-                    // the body is unchanged.
-                    for &ts in &timestamps {
-                        // Reset this trigger input's
-                        // `expect_within_ms` watchdog same-step — `drain_level`
-                        // runs BEFORE that level fires (and thus before the
-                        // scheduler's per-node `step()` watchdog check), so a
-                        // trigger input that received data this tick is not
-                        // falsely counted as a miss. No-op unless this input has a
-                        // watchdog wired (the scheduler's `get` misses for
-                        // un-watched inputs).
-                        //
-                        // This is the SAME-STEP (zero-lag) reset. The node's tick
-                        // body ALSO resets the anchor when it reads the input via
-                        // `try_view` (subscriber.rs), but that fires inside
-                        // `fire_node` AFTER this step's watchdog check — a
-                        // one-step-lagged reset. For a sane window (W >> step
-                        // size) the body read alone suffices, so the two paths are
-                        // largely redundant under `VirtualClock`; this same-step
-                        // reset removes the one-step lag, which matters for a tight
-                        // window, a hand-written `NodeEntry` that does not read its
-                        // trigger input, and the future event-driven RealClock loop
-                        // (where "step" lag becomes real wakeup latency). The reset
-                        // MECHANISM (signal_input_received advancing the window) is
-                        // pinned directly in `deadline_qos_test::expect_within_miss_*`;
-                        // we deliberately do not add a
-                        // step-aligned e2e differential test (it would be fragile) —
-                        // the scheduler-direct pin + this contract is the coverage.
-                        if let Some(input) = input_name.as_deref() {
-                            if let Err(e) =
-                                self.scheduler.signal_input_received(&node_id, input, ts)
-                            {
-                                tracing::debug!(
-                                    node_id = %node_id,
-                                    input = %input,
-                                    timestamp_ns = ts,
-                                    error = %e,
-                                    "scheduler.signal_input_received failed; expect_within \
-                                     watchdog not reset for this timestamp"
-                                );
-                            }
-                        }
-                        if !mint_arrivals {
-                            continue;
-                        }
-                        if let Err(e) = self.scheduler.signal_data(&node_id) {
-                            tracing::warn!(
-                                node_id = %node_id,
-                                input_name = ?input_name.as_deref(),
-                                timestamp_ns = ts,
-                                error = %e,
-                                "scheduler.signal_data failed; data-trigger fire is dropped \
-                                 for this timestamp"
-                            );
-                        }
-                    }
-                    if mint_carried {
-                        if let Err(e) = self.scheduler.signal_data(&node_id) {
-                            tracing::warn!(
-                                node_id = %node_id,
-                                input_name = ?input_name.as_deref(),
-                                error = %e,
-                                "scheduler.signal_data failed; the carried consume = latest \
-                                 arrival's fire is dropped"
-                            );
-                        }
-                    }
-                }
-                DrainSource::Unified { listener_idx } => {
-                    // The multi-process free-run fix: drain the standalone
-                    // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step —
-                    // exact parity with the Separate arm, whose
-                    // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
-                    // runs the listener policy on ITS listener after a drain that
-                    // removed frames.
-                    // Without this, each publish's `SentSample` event SURVIVES the
-                    // step (the FFI/body drain below clears only the BODY
-                    // subscriber's own listener), and the next `live_step`'s idle
-                    // polls (`spin_sources` / `monitor_wait_block`'s recheck) read
-                    // the STALE event as "data pending" — one spurious wake+step
-                    // per publish. Under the multi-process split that
-                    // runaway is SELF-SUSTAINING: the spurious step crosses every
-                    // barrier boundary (waking peers via the predicate)
-                    // and advances the handed-quantum gating clock, so the Period
-                    // producer re-fires and re-arms the stale event (measured on a Jetson: the
-                    // data worker parked ONCE in 40s; the 1kHz ticker free-ran at
-                    // ~7.5kHz wall).
-                    //
-                    // RECORD-ONLY + firewall-safe: notification queue only, never
-                    // the SHM message queue, never a scheduler mutation — it
-                    // changes only WHEN the idle path wakes (removes STALE wakes;
-                    // Principle #7).
-                    //
-                    // This block used to claim that "an
-                    // event can never be consumed while its data escapes this
-                    // step's drain", because our publisher sends the sample
-                    // before the notify. That was written when the drain below
-                    // consumed the whole queue. Under per-message FIFO the drain
-                    // pops ONE frame, so the events for frames 2..N ARE consumed
-                    // here while their data is still queued — this drain-all is
-                    // exactly what leaves the remainder unannounced.
-                    //
-                    // It stays drain-all, and the remainder is served WITHIN THE
-                    // STEP instead: the events carry no reliable count (elision
-                    // makes them fewer than samples; connect/disconnect/history
-                    // ids make them more), so a partial drain would either
-                    // re-open the free-run or strand frames anyway,
-                    // while the Data fire loop REFILLS from this same input
-                    // between fires and serves the whole queued burst before the
-                    // step ends (see `Scheduler::set_trigger_refill`). Anything
-                    // past the per-step cap carries and reports due-NOW, so the
-                    // live loop comes straight back for it.
-                    {
-                        let wake_listener = self.trigger_subscribers[listener_idx].listener();
-                        // iceoryx2 0.10: one `try_wait` empties the queue.
-                        let _ = wake_listener.try_wait(|_activation| {});
-                    }
-                    // UNIFIED data-trigger input. Lock the node,
-                    // drain its body subscriber ONCE (which freezes the surviving
-                    // sample so the tick's later `try_view` serves it with NO
-                    // second receive — accounting-once), and read `(popped,
-                    // latest_ts)`. `self.nodes` is a DIFFERENT field from
-                    // `self.scheduler`, and the lock guard drops at the end of its
-                    // block BEFORE the `signal_*` calls below, so the
-                    // `&self.nodes` borrow and the `&mut self.scheduler` borrows
-                    // are sequential (no aliasing).
-                    let input = input_name.as_deref(); // Some for any DataTrigger binding.
-                    let (popped, latest_ts) = match input {
-                        Some(name) => match self.nodes.get(node_id.as_ref()) {
-                            Some(arc) => match arc.lock() {
-                                Ok(mut g) => g.drain_trigger_input(name),
-                                Err(_) => {
-                                    tracing::error!(
-                                        node_id = %node_id,
-                                        "node mutex poisoned; unified trigger drain skipped"
-                                    );
-                                    (0, None)
-                                }
-                            },
-                            None => {
-                                debug_assert!(
-                                    false,
-                                    "unified trigger binding node '{node_id}' absent from self.nodes"
-                                );
-                                tracing::error!(
-                                    node_id = %node_id,
-                                    "unified trigger node absent; not drained"
-                                );
-                                (0, None)
-                            }
-                        },
-                        // A DataTrigger binding always carries `input_name`;
-                        // defensive `(0, None)` for the unreachable None.
-                        None => (0, None),
-                    };
-
-                    // Same-step watchdog reset to the latest delivered timestamp
-                    // (mirrors the separate path's per-ts `signal_input_received`;
-                    // last-write-wins, so resetting once to `latest_ts` is
-                    // equivalent). No-op unless this input has a watchdog wired.
-                    if let (Some(name), Some(ts)) = (input, latest_ts) {
-                        if let Err(e) = self.scheduler.signal_input_received(&node_id, name, ts) {
-                            tracing::debug!(
-                                node_id = %node_id,
-                                input = %name,
-                                error = %e,
-                                "signal_input_received failed (unified)"
-                            );
-                        }
-                    }
-
-                    // One `signal_data` per popped frame — identical to the
-                    // separate path's per-ts `signal_data`. Per-message FIFO
-                    // firing: `decide_node` consumes ONE pending arrival per
-                    // step and carries the remainder, so each popped frame
-                    // gets its own fire.
-                    //
-                    // Gated on the node's CURRENT pending count,
-                    // because on THIS path a pop is not the same thing as an
-                    // arrival. `drain_trigger_input` returns `(1, head_ts)` for
-                    // a RE-OFFER of a head no tick has taken yet (Principle #6
-                    // — a fire that was deferred, or whose tick collapsed
-                    // before reaching the read, must not lose its signal), and
-                    // a deferred node consumes nothing: `decide_node` runs its
-                    // `throttle_ms` / `block` pre-fire check at the TOP and
-                    // returns `None`. So an ungated mint added one signal per
-                    // DEFERRED STEP for the SAME single held frame, saturating
-                    // `pending_data_count` at `DATA_PENDING_CARRY_CLAMP` (64)
-                    // and draining at one per throttle period — which made the
-                    // count report a step tally rather than a queue depth, and
-                    // suppressed the input's `expect_within_ms` watchdog for up
-                    // to 64 throttle periods after its producer died (6.4 s at
-                    // 100 ms, 64 s at 1000 ms) against the "plus at most one
-                    // more window" bound `NodeHandle` documents.
-                    //
-                    // The mint exists to keep the node FIREABLE, and that is
-                    // all it is gated on: if `pending == 0` the node has no
-                    // reason to fire and the signal is what gives it one (the
-                    // collapsed-tick shape, where the fire CONSUMED the
-                    // count but the tick never took the head — an un-minted
-                    // re-offer wedges the node permanently). If `pending > 0`
-                    // the node is already due, `ns_until_next_fire` already
-                    // reports 0, and `tick_data_burst` REFILLS from this very
-                    // input between fires — so the frame is served this step or
-                    // the next without a signal of its own. The invariant the
-                    // gate maintains is exactly the wedge-freedom one: after
-                    // this loop, `popped >= 1` implies `pending >= 1`.
-                    //
-                    // Deliberately NOT gated on which SITE the drain was: the
-                    // subscriber can tell a re-offer from a fresh pop, but that
-                    // answer is behind the `(u64, Option<u64>)` FFI return the
-                    // cdylib drain shares, so keying on it is an ABI change for
-                    // a decision the pending count already makes correctly.
-                    // The SEPARATE discipline takes no such gate: it drains a
-                    // dedicated subscriber that never re-offers, so its
-                    // per-frame signals are per-frame truth. (A `consume =
-                    // latest` input there mints only while its body subscriber
-                    // still holds a frame; see `DataTriggerBinding::probes_body`.)
-                    // A `consume = latest` drain pops the whole queue, so its
-                    // count may exceed one; the gate below mints at most one
-                    // signal either way, which is the one fire a latest input
-                    // gets per step.
-                    debug_assert!(
-                        popped <= 1 || consume_latest,
-                        "unified trigger drain popped {popped} frames for node '{node_id}'; \
-                         the mint gate below assumes the EachFifo pop-one contract \
-                         (every fifo data-trigger input is marked `mark_fifo_consume`)"
-                    );
-                    if popped > 0 && self.scheduler.pending_data_count(&node_id) == 0 {
-                        if let Err(e) = self.scheduler.signal_data(&node_id) {
-                            tracing::warn!(
-                                node_id = %node_id,
-                                error = %e,
-                                "scheduler.signal_data failed (unified); fire dropped"
-                            );
-                        }
-                    }
-                }
+            // A chain member's input is drained by its chain call, earlier
+            // in this step, while chain calls are engaged.
+            if self.chain_calls_engaged
+                && self
+                    .chain_calls
+                    .as_ref()
+                    .is_some_and(|c| c.binding_is_call[i])
+            {
+                continue;
             }
+            self.drain_data_binding(i, &mut timestamps, true);
         }
         // Give the scratch buffer (capacity preserved) back to the
         // runtime so the next tick's drain reuses the allocation. Placed after
@@ -20191,6 +20539,258 @@ fn validate_no_silent_data_trigger(
             trigger_inputs.join(", ")
         ),
     })
+}
+
+#[cfg(test)]
+mod chain_call_cut_tests {
+    use super::{build_trigger_edges, ChainCalls, DataTriggerBinding, DrainSource, LevelPlan};
+    use crate::graph::chain::FusedChain;
+    use crate::graph::node::{NodeContext, NodeEntry, NodeInfo};
+    use crate::graph::topology::{GraphTopology, Levels};
+    use crate::scheduler::RestWalk;
+    use crate::ClosureNodeEntry;
+    use indexmap::IndexMap;
+    use std::sync::{Arc, Mutex};
+    use tracing_test::traced_test;
+
+    /// `a -> b -> c`. With no node infos every input is a trigger edge, so
+    /// the derived levels are 0, 1 and 2.
+    const GRAPH: &str = "prefix: t\nnodes:\n  \
+        - id: a\n    type: a\n    outputs:\n      - name: out\n        schema: std_msgs/Int32\n  \
+        - id: b\n    type: b\n    inputs:\n      - name: inp\n        source: a/out\n    \
+          outputs:\n      - name: out\n        schema: std_msgs/Int32\n  \
+        - id: c\n    type: c\n    inputs:\n      - name: inp\n        source: b/out\n";
+
+    fn levels() -> Levels {
+        let config = crate::graph::parse_graph_raw(GRAPH).expect("the graph parses");
+        let infos = IndexMap::new();
+        let topology = GraphTopology::build(&config, &infos).expect("the topology builds");
+        let levels = topology
+            .derive_levels(&build_trigger_edges(&config, &infos))
+            .expect("the graph is acyclic");
+        for (node, level) in [("a", 0), ("b", 1), ("c", 2)] {
+            assert_eq!(levels.level_of(node), Some(level), "{node}'s level");
+        }
+        levels
+    }
+
+    /// One plan per level: `block` names the nodes outside the non-block set.
+    fn plans(block: &[&str]) -> Vec<LevelPlan> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                let (other_ids, block_ids) = if block.contains(&id) {
+                    (Vec::new(), vec![id.to_string()])
+                } else {
+                    (vec![id.to_string()], Vec::new())
+                };
+                LevelPlan {
+                    other_ids,
+                    block_ids,
+                    rest_walk: RestWalk::Unconstrained,
+                }
+            })
+            .collect()
+    }
+
+    fn nodes() -> IndexMap<String, Arc<Mutex<Box<dyn NodeEntry>>>> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                let entry: Box<dyn NodeEntry> = Box::new(ClosureNodeEntry::new(
+                    NodeInfo::from_names(vec!["inp".to_string()], vec!["out".to_string()]),
+                    |_ctx: &mut NodeContext| Ok(()),
+                ));
+                (id.to_string(), Arc::new(Mutex::new(entry)))
+            })
+            .collect()
+    }
+
+    /// A binding of `node`'s `inp`, unified on listener `idx` or separate on
+    /// subscriber `idx`.
+    fn binding(node: &str, unified: bool, idx: usize) -> DataTriggerBinding {
+        DataTriggerBinding {
+            node_id: Arc::from(node),
+            drain: if unified {
+                DrainSource::Unified { listener_idx: idx }
+            } else {
+                DrainSource::Separate { sub_idx: idx }
+            },
+            input_name: Some(Arc::from("inp")),
+            warn_suppressed: false,
+            topic: Arc::from(format!("t/{node}/inp").as_str()),
+            consume_latest: false,
+            probes_body: false,
+            unconfirmed_arrival: false,
+        }
+    }
+
+    fn chain(head_level: usize) -> FusedChain {
+        FusedChain {
+            nodes: vec!["a".into(), "b".into(), "c".into()],
+            topics: vec!["t/a/out".into(), "t/b/out".into()],
+            head_level,
+        }
+    }
+
+    /// The lines of the captured log that carry `needle`.
+    fn lines_with<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+
+    const CUT: &str = "chain fusion: a census chain is cut at this member";
+    const NONE_CALLED: &str = "chain fusion: this build calls no chain member";
+    const CALLED: &str = "chain fusion: the chain members this build calls";
+
+    /// One census chain `a -> b -> c` with its head on `head_level`, judged
+    /// over `bindings` with the `block` nodes outside their level's non-block
+    /// set: the chain must be cut at `member` for `reason`, after `called`
+    /// members are called.
+    struct Case {
+        bindings: Vec<DataTriggerBinding>,
+        block: &'static [&'static str],
+        head_level: usize,
+        member: &'static str,
+        reason: &'static str,
+        called: usize,
+    }
+
+    /// Each way a census chain member cannot be called cuts the chain there,
+    /// and the build says so once, naming the chain head, the member and the
+    /// reason, then names the members it calls, or none and why.
+    #[test]
+    #[traced_test]
+    fn a_chain_is_cut_at_the_first_member_a_call_cannot_drain_and_the_build_says_why() {
+        let levels = levels();
+        let nodes = nodes();
+        let cases = [
+            Case {
+                bindings: vec![
+                    binding("b", true, 0),
+                    binding("b", true, 1),
+                    binding("c", true, 2),
+                ],
+                block: &[],
+                head_level: 0,
+                member: "b",
+                reason: "reason=2 data-trigger bindings, not one",
+                called: 0,
+            },
+            Case {
+                bindings: vec![binding("c", true, 0)],
+                block: &[],
+                head_level: 0,
+                member: "b",
+                reason: "reason=no data-trigger binding",
+                called: 0,
+            },
+            Case {
+                bindings: vec![binding("b", true, 0), binding("c", false, 0)],
+                block: &[],
+                head_level: 0,
+                member: "c",
+                reason: "reason=its trigger input drains on the separate discipline",
+                called: 1,
+            },
+            Case {
+                bindings: vec![binding("b", true, 0), binding("c", true, 1)],
+                block: &["b"],
+                head_level: 0,
+                member: "b",
+                reason: "reason=outside its level's non-block set",
+                called: 0,
+            },
+            Case {
+                bindings: vec![binding("b", true, 0), binding("c", true, 1)],
+                block: &[],
+                head_level: 1,
+                member: "b",
+                reason: "reason=on level 1, while its chain position names level 2",
+                called: 0,
+            },
+        ];
+        for case in &cases {
+            let calls = ChainCalls::from_census(
+                &[chain(case.head_level)],
+                &case.bindings,
+                &levels,
+                &plans(case.block),
+                &nodes,
+            );
+            assert_eq!(
+                calls.as_ref().map_or(0, |c| c.calls.len()),
+                case.called,
+                "members called when the chain is cut at {} ({})",
+                case.member,
+                case.reason
+            );
+        }
+        logs_assert(|lines: &[&str]| {
+            let cuts = lines_with(lines, CUT);
+            if cuts.len() != cases.len() {
+                return Err(format!(
+                    "{} cut lines for {} cuts: {cuts:#?}",
+                    cuts.len(),
+                    cases.len()
+                ));
+            }
+            for case in &cases {
+                let hits = lines_with(&cuts, case.reason);
+                let [line] = hits.as_slice() else {
+                    return Err(format!(
+                        "one cut line must carry {:?}: {hits:#?}",
+                        case.reason
+                    ));
+                };
+                let member_field = format!("member={}", case.member);
+                for want in ["WARN", "chain_head=a", member_field.as_str()] {
+                    if !line.contains(want) {
+                        return Err(format!("the cut line lacks {want:?}: {line}"));
+                    }
+                }
+            }
+            let none = lines_with(lines, NONE_CALLED);
+            let cut_first = lines_with(
+                &none,
+                "reason=every census chain is cut at its first member",
+            );
+            if none.len() != 4 || cut_first.len() != 4 {
+                return Err(format!(
+                    "four builds call no member, each saying why: {none:#?}"
+                ));
+            }
+            let called = lines_with(lines, CALLED);
+            let [line] = called.as_slice() else {
+                return Err(format!("one build calls a member: {called:#?}"));
+            };
+            if !line.contains("members=1") || !line.contains(r#"called=["b"]"#) {
+                return Err(format!("the called line names the members called: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// A build with the seam on whose census found no chain says it calls no
+    /// member, and why.
+    #[test]
+    #[traced_test]
+    fn a_census_with_no_chain_calls_no_member_and_says_so() {
+        let calls = ChainCalls::from_census(&[], &[], &levels(), &plans(&[]), &nodes());
+        assert!(calls.is_none());
+        logs_assert(|lines: &[&str]| {
+            let none = lines_with(lines, NONE_CALLED);
+            match none.as_slice() {
+                [line] if line.contains("reason=the census found no chain") => Ok(()),
+                _ => Err(format!(
+                    "one line says no member is called, and why: {none:#?}"
+                )),
+            }
+        });
+    }
 }
 
 #[cfg(test)]

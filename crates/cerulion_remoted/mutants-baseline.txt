@@ -1,7 +1,9 @@
-# Mutation baseline for cerulion_remoted: the e-stop policy's pure decisions.
+# Mutation baseline for cerulion_remoted: the pure decisions of the e-stop policy and of the stop.
 #
-# Scope: the one pure policy file. The rest of the crate holds the lease,
-# transport and file paths that the mutation rule does not cover.
+# Scope: two pure scopes, the e-stop policy file below and the stop's
+# exit-status and deadline decisions in the second section. The rest of the
+# crate holds the lease, transport and file paths that the mutation rule does
+# not cover.
 #
 # Run:     cargo mutants -p cerulion_remoted \
 #            -f crates/cerulion_remoted/src/estop_policy.rs -- --lib
@@ -18,5 +20,30 @@
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.
+
+(none)
+
+# Second scope: the pure decision functions of the stop.
+#
+# Scope: `exit_status` (src/main.rs), the exit status for what serving returned,
+# and `parse_hard_exit` (src/shutdown.rs), the hard-exit deadline a knob value
+# names. The rest of the stop (the signals, the stop thread, the shutdown stage
+# and the exits) is a live path the mutation rule does not cover; the
+# real-binary tests in tests/daemon_stop_signal_test.rs gate it.
+#
+# Run:     cargo mutants -p cerulion_remoted \
+#            -f crates/cerulion_remoted/src/main.rs \
+#            -f crates/cerulion_remoted/src/shutdown.rs \
+#            --re 'exit_status|parse_hard_exit' -- --lib --bins
+# Result:  9 mutants: 5 caught, 4 unviable (do not compile), 0 missed.
+#
+# The four unviable mutants replace a whole body with a constant, which leaves
+# an argument or a constant unused under the crate's deny lints. None of them
+# reaches an arm of `exit_status`; its `RemotedError::Shutdown(_) => 3` arm,
+# changed to return 0, fails
+# `tests::an_incomplete_shutdown_stage_exits_3_and_other_errors_exit_1`.
+#
+# Every mutant of this scope that survives the test suite is listed below with
+# the reason it is not killed, as for the scope above.
 
 (none)

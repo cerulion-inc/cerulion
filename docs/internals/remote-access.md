@@ -56,6 +56,61 @@ the same entry instead of running the daemon.
   whether to serve), and still runs the epoch poll on its state root. Pinned by
   `remote_plane_library_test.rs` and the verb-name pin in `ops.rs`.
 
+- **Stopping** (`main.rs`, `shutdown.rs`). Before it binds, the binary installs
+  its SIGINT (Ctrl-C) and SIGTERM handlers on a thread with a tokio runtime of
+  its own, so they still answer while the serving runtime tears down. On the
+  first stop signal that thread arms the deadline, then hands serving the
+  signal's name; serving logs one info line naming it (`signal`), and the
+  accept loop stops. The stop thread logs nothing itself: its deadline and
+  second-signal lines are written from a short-lived thread, and the exit waits
+  at most 100 ms for that line. Serving writes its own stop lines to stderr
+  before it acts on the request, so a stderr that stays full holds the graceful
+  stop until the deadline ends it with status 4; a full stderr cannot delay the
+  hard exit past the deadline and that 100 ms. The accept loop also stops when
+  the endpoint closes on its own. Either way `serve_planes` drops its shutdown
+  future before it logs anything, which arms the deadline when no signal did,
+  so a blocked log write cannot hold it back, then runs the ops plane's
+  `ShutdownStage` (`OpsServing::shutdown_stage`) before it returns, so every
+  serving entry runs it once. Each registered `ShutdownParticipant` is driven
+  to settlement on a task of its own, one after another in registration order,
+  with no timeout, while the receipt sink is alive; after a stop signal the
+  endpoint and its connections are alive too and keep serving while the stage
+  runs, and when the endpoint closed on its own they are already gone. The
+  participants are the ones the host registered on the ops serving's stage. A
+  participant that returns an error, panics or is cancelled never stops a later
+  one; `serve_planes` returns `RemotedError::Shutdown` naming each. `serve_core`
+  then ends the rcpd e-stop delivery in flight (at most 5 s) and stops the
+  epoch poller, failed stage or not, and logs that it did; the entry closes the
+  endpoint (about 3 s with default parameters, longer on a high round-trip
+  path), and the runtime teardown waits for the work left on the blocking pool,
+  such as a running ops verb. The exit status is 0, also when the stop started
+  because the accept loop stopped on its own, or 3 with one error line per
+  participant (`participant`, `kind`) that failed, panicked or was cancelled;
+  `cerulion-remoted` registers none of its own.
+  `CERULION_REMOTED_HARD_EXIT_MS` (default 30000 ms) bounds all of it from the
+  first stop signal, or from the moment serving dropped its shutdown future
+  without one: past it an error line is logged and the process ends with
+  `_exit(4)`, the explicit failure exit. A second stop signal during the stop
+  also ends it with status 4, after the same wait of at most 100 ms for its
+  line; after the accept loop stopped on its own, the first stop signal
+  already counts as that second one. The default was chosen as a sum of
+  nominal shares: 18 s reserved for the participants the host registers, 5 s for
+  the wait for the task of an rcpd delivery that the stop has already ended,
+  which gives the delivery no more time, about 3 s for the endpoint close and
+  4 s of scheduling. The shares bound no real work: a
+  participant may keep awaiting work past its share, and that work stays
+  pending until the process exits; a participant that needs more than its share
+  needs the deadline raised with it. The deadline is a separate failure policy:
+  it ends the process and proves nothing finished. The daemon's own work ends
+  with the process, except a thread in an uninterruptible kernel wait, such as
+  an fsync on a stalled disk, which holds the exit until that wait returns; a
+  child process keeps running. An ops request still running past the deadline
+  (its own limit is 120 s) is cut by the hard exit. SIGKILL runs none of this
+  and logs nothing. Under `cerulion-netd`'s robot supervisor, a netd stop ends
+  `cerulion-remoted` with SIGKILL unless it has already exited, so its
+  graceful stop can be cut short there. Pinned by `daemon_stop_signal_test.rs`,
+  `shutdown_stage_test.rs` and the stage tests in `shutdown.rs`.
+
 - **Always-on from boot.** Ops + pairing must be reachable when NO graph is
   running, so the endpoint host is a robot-level service, not the per-run
   gateway. *This is a deployment requirement, not a runtime check: no test
@@ -926,6 +981,8 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/device_index_test.rs` | Side-map MAC integrity: no forged key→owner binding |
 | `crates/cerulion_remoted/tests/beacon_facts_test.rs` | Beacon-facts atomic write/round-trip/claimable flip |
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
+| `crates/cerulion_remoted/tests/daemon_stop_signal_test.rs` | The real binary: SIGTERM and Ctrl-C stop it gracefully with exit 0 and the teardown line; a test-seam stage participant that never finishes is ended by `CERULION_REMOTED_HARD_EXIT_MS` with status 4, also when the endpoint's own close (a test seam) started the stop with no signal; a second signal during the stop exits 4 long before the deadline; after the endpoint's own close, the first stop signal exits 4 as a second one does; a participant that fails exits 3 after the teardown ran; the stage runs before the rcpd e-stop sender is stopped; with stderr full the deadline still exits 4 |
+| `crates/cerulion_remoted/tests/shutdown_stage_test.rs` | `serve_planes` drops its shutdown future before the stage, on a stop request (endpoint open during the stage) and when the endpoint closes on its own (endpoint closed), and before the line that says the loop stopped; `run` under the kill switch drops it before its warn line; the drop before the endpoint-closed stop line and before the kill-switch warn is pinned against a log writer that blocks |
 | `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
 | `crates/cerulion_connectd/tests/act_network_switch_test.rs` | The real `cerulion-connectd act` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same call dials it |
 | `crates/cerulion_connectd/tests/rcp_network_switch_test.rs` | The real `cerulion-connectd rcp` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same command dials it |

@@ -58,6 +58,8 @@ pub use chain::{
     ChainCensus, Colocation, ConsumerEdgeVerdict, ConsumerFireClass, FusedChain, FusionDecision,
     FusionSource, FUSE_CHAINS_ENV, MAX_FUSED_CHAIN_NODES,
 };
+#[cfg(feature = "oracle-mutants")]
+pub use chain::{CHAIN_CALL_INLINE_TRACE_MUTANT_ENV, CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV};
 pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
 };
