@@ -745,8 +745,10 @@ pub const REMEDY_SINGLE_PROCESS: &str = "running `--single-process`";
 /// edge lossless, and the supervisor mints one for every CREDITABLE topic
 /// (exactly one in-graph producer and at least one `block` consumer:
 /// [`crate::graph::topology::TopicFlow::credit_bar`]). A hand-written `process_groups:` splitting such
-/// an edge is therefore ACCEPTED; splitting a multi-producer `block` edge is
-/// still refused pre-spawn, naming the bar it hit.
+/// an edge therefore passes this check, and the run accepts it unless its
+/// `block` input sets `block_timeout_ms`, which the supervisor refuses before
+/// any worker spawns; splitting a multi-producer `block` edge is still
+/// refused pre-spawn, naming the bar it hit.
 ///
 /// The derivation co-locates the WHOLE flow (producers AND every consumer,
 /// `block` or not) to keep the hop off the edge; a non-`block` consumer in

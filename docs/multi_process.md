@@ -812,8 +812,9 @@ each driven to its own recorded boundary targets:
   WOULD read cross-rank occupancy at instants nothing records, so an
   independently re-derived schedule could legally differ from the recorded one
   and report a fire-schedule divergence on a candidate that changed nothing.
-  (Such a bag CAN exist: plan time admits a creditable split,
-  so `graph run --record` of one produces a bag carrying a cross-process
+  (Such a bag CAN exist: plan time admits a creditable split whose `block`
+  input sets no `block_timeout_ms`, so `graph run --record` of one produces
+  a bag carrying a cross-process
   `block` edge. Replay does not accept it: `replay_engine` builds no
   credited-edge set, so the consumer's rank sees a producer-less `block` topic
   and refuses at exit 5.) In replay that
