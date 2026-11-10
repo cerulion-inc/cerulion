@@ -466,7 +466,10 @@ woken entities first and then probes, as an entry pass does, and its ready retur
 drained whatever notification the woken entities held at that drain (a notification that
 lands after a bell wake's drain stays readable for the next call's entry pass). Nothing is
 lost that way: every producer commits before it notifies, so the probe after the drain sees
-what the drained notification announced.
+what the drained notification announced. Every drain empties the listener's trigger before it
+re-arms the listener (the iceoryx2 fork pinned in the root `Cargo.toml`), so a notify that
+lands inside a drain is delivered by it or leaves the fd readable, and the next publish still
+wakes a listener a take left for the next wait.
 `poll(2)` rather than the iceoryx2 WaitSet: fd snapshots need no `&Listener` borrow pinned
 across the block (lock, snapshot an integer, UNLOCK, block; no entity mutex is held while
 parked), poll has no FD_SETSIZE fd-number ceiling (the select path aborts on fd ≥ 1024 on
