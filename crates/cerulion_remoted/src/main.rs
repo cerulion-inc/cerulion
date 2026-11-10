@@ -16,6 +16,11 @@
 //! the hard-exit deadline or a second stop signal ends a stop that has not
 //! finished, as the first stop signal does after the accept loop stopped on
 //! its own.
+//!
+//! Log lines go to stderr through the bounded queue of
+//! [`cerulion_remoted::log_writer`]: a full stderr drops and counts them and
+//! holds no thread that logs. Each exit waits at most [`EXIT_LOG_GRACE`] for
+//! that queue.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -25,6 +30,7 @@ use clap::Parser;
 use tokio::sync::oneshot;
 
 use cerulion_link::RelayConfig;
+use cerulion_remoted::log_writer::{self, Limits, LogWriter};
 use cerulion_remoted::shutdown::ShutdownStageError;
 use cerulion_remoted::{resolve_network_disabled_loud, run, RemotedConfig, RemotedError};
 
@@ -149,23 +155,80 @@ fn resolve_relay(
         .map_err(|e| RemotedError::Config(e.to_string()))
 }
 
-fn init_tracing() {
+/// Install the subscriber: fmt over stderr, through the log writer's queue
+/// ([`log_writer::start`]). When the writer thread cannot start, one error
+/// line is written straight to stderr and the daemon exits 1, as it does when
+/// the stop thread cannot start.
+fn init_tracing() -> Result<LogWriter, ExitCode> {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     // Log to STDERR (a daemon's stdout stays clean); mirrors the workspace's
     // stdout↔stderr discipline (MEMORY: fmt::layer defaults to stdout).
     // A failed write is dropped: reporting it goes through `eprintln!`, which
     // panics when stderr cannot be written.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .log_internal_errors(false)
-        .init();
+    match log_writer::start(queue_limits()) {
+        Ok(log) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(log.clone())
+                .log_internal_errors(false)
+                .init();
+            Ok(log)
+        }
+        Err(e) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .log_internal_errors(false)
+                .init();
+            tracing::error!(error = %e, "cerulion_remoted: the log writer thread could not start");
+            Err(ExitCode::FAILURE)
+        }
+    }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    init_tracing();
+/// The log queue's bounds: [`Limits::DEFAULT`], or, in a build with the test
+/// seam, the positive line bound its override variable holds.
+fn queue_limits() -> Limits {
+    #[cfg(feature = "test-seam")]
+    {
+        let lines = std::env::var(log_writer::QUEUE_LINES_FOR_TEST_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|lines| *lines > 0);
+        if let Some(lines) = lines {
+            return Limits {
+                lines,
+                ..Limits::DEFAULT
+            };
+        }
+    }
+    Limits::DEFAULT
+}
+
+fn main() -> ExitCode {
+    let log = match init_tracing() {
+        Ok(log) => log,
+        Err(status) => return status,
+    };
+    let status = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        // The runtime is dropped before the drain below, so the lines its
+        // tasks write as they are dropped are queued by then.
+        Ok(runtime) => runtime.block_on(serve(log.clone())),
+        Err(e) => {
+            tracing::error!(error = %e, "cerulion_remoted: the runtime could not start");
+            ExitCode::FAILURE
+        }
+    };
+    let _ = log.drain(exit_log_grace());
+    status
+}
+
+/// Resolve the configuration and serve until a stop.
+async fn serve(log: LogWriter) -> ExitCode {
     // Apply `IOX2_LOG_LEVEL` to THIS binary's `iceoryx2-log` static
     // (a per-linked-copy static — see `init_iceoryx_log_level`), before the SHM
     // tap path can touch iceoryx2.
@@ -186,7 +249,7 @@ async fn main() -> ExitCode {
         }
     };
     let deadline = cerulion_remoted::shutdown::hard_exit_from_env();
-    let (requested, serving_ended) = match start_stop_thread(deadline) {
+    let (requested, serving_ended) = match start_stop_thread(deadline, log) {
         Ok(handles) => handles,
         Err(e) => {
             tracing::error!(error = %e, "cerulion_remoted: the stop signals could not be installed");
@@ -307,6 +370,7 @@ impl StopSignals {
 /// ended.
 fn start_stop_thread(
     deadline: Duration,
+    log: LogWriter,
 ) -> std::io::Result<(oneshot::Receiver<&'static str>, oneshot::Sender<()>)> {
     let (request, requested) = oneshot::channel();
     let (serving_ended, ended) = oneshot::channel();
@@ -324,7 +388,7 @@ fn start_stop_thread(
             match setup {
                 Ok((runtime, signals)) => {
                     let _ = ready.send(Ok(()));
-                    runtime.block_on(stop_sequence(signals, deadline, request, ended));
+                    runtime.block_on(stop_sequence(signals, deadline, request, ended, log));
                 }
                 Err(e) => {
                     let _ = ready.send(Err(e));
@@ -341,15 +405,15 @@ fn start_stop_thread(
 /// On the first stop signal, arm the deadline, then send serving the signal's
 /// name, which serving logs. Without one, arm it when serving drops its
 /// shutdown future. From then a stop signal ends the process, after at most
-/// [`exit_log_grace`] for its line, and the deadline ends it if it is still
-/// running. This thread logs nothing itself: its two lines go through
-/// [`log_aside`], so a full or locked stderr can delay a line, never the stop
-/// request or the exit.
+/// [`exit_log_grace`] for the log queue, and the deadline ends it if it is
+/// still running. Its two lines are queued for the log writer, so a full
+/// stderr can delay a line, never the stop request or the exit.
 async fn stop_sequence(
     mut signals: StopSignals,
     deadline: Duration,
     request: oneshot::Sender<&'static str>,
     ended: oneshot::Receiver<()>,
+    log: LogWriter,
 ) {
     let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
     let expired = tokio::select! {
@@ -366,23 +430,21 @@ async fn stop_sequence(
         }
     };
     tokio::pin!(expired);
-    let logged = tokio::select! {
-        Some(second) = signals.next() => log_aside(move || {
-            tracing::warn!(
-                signal = second,
-                status = EXIT_STOP_UNFINISHED,
-                "cerulion_remoted: a second stop signal during the stop; exiting now"
-            );
-        }),
-        () = &mut expired => log_aside(move || {
-            tracing::error!(
-                deadline_ms,
-                status = EXIT_STOP_UNFINISHED,
-                "cerulion_remoted: the stop did not finish within the hard-exit deadline; exiting now"
-            );
-        }),
-    };
-    let _ = tokio::time::timeout(exit_log_grace(), logged).await;
+    tokio::select! {
+        Some(second) = signals.next() => tracing::warn!(
+            signal = second,
+            status = EXIT_STOP_UNFINISHED,
+            "cerulion_remoted: a second stop signal during the stop; exiting now"
+        ),
+        () = &mut expired => tracing::error!(
+            deadline_ms,
+            status = EXIT_STOP_UNFINISHED,
+            "cerulion_remoted: the stop did not finish within the hard-exit deadline; exiting now"
+        ),
+    }
+    // A blocking wait on this thread's own runtime, which has nothing else
+    // left to run.
+    let _ = log.drain(exit_log_grace());
     // `_exit` ends the process at once: it runs no atexit handler, flushes no
     // stdio buffer and runs no destructor, so no exit-time cleanup can block it.
     // SAFETY: `_exit` takes a status and terminates the process; it touches no
@@ -390,15 +452,18 @@ async fn stop_sequence(
     unsafe { libc::_exit(EXIT_STOP_UNFINISHED) }
 }
 
-/// How long the exit waits for its own log line before `_exit`: 100 ms. The
-/// exit goes on as soon as the line is written, and a full or locked stderr
-/// delays it by no more than this. Not tunable: the hard-exit deadline is the
-/// operator's knob, and this only gives a free stderr time for one line. Only
-/// a build with the test seam reads an override, from
-/// `CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST`.
+/// How long an exit waits for the log writer to write the lines still queued:
+/// 100 ms, after the serving runtime is dropped on the return from `main`, and
+/// before `_exit` in the stop thread ([`LogWriter::drain`]). The exit goes on
+/// as soon as no line is queued and none is being written. Lines still queued
+/// at four fifths of it are discarded, and one error line names how many; a
+/// full stderr delays the exit by no more than this. Not tunable: the
+/// hard-exit deadline is the operator's knob, and this only gives a free
+/// stderr time for the last lines. Only a build with the test seam reads an
+/// override, from `CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST`.
 const EXIT_LOG_GRACE: Duration = Duration::from_millis(100);
 
-/// The exit's wait for its log line: [`EXIT_LOG_GRACE`], or, in a build with
+/// The exit's wait for the log queue: [`EXIT_LOG_GRACE`], or, in a build with
 /// the test seam, the positive whole number of milliseconds its override
 /// variable holds.
 fn exit_log_grace() -> Duration {
@@ -413,20 +478,6 @@ fn exit_log_grace() -> Duration {
         }
     }
     EXIT_LOG_GRACE
-}
-
-/// Run `log` on a short-lived thread of its own, so a write to a full or
-/// locked stderr blocks only that thread. The receiver resolves once `log` has
-/// returned, or at once when the thread could not start.
-fn log_aside(log: impl FnOnce() + Send + 'static) -> oneshot::Receiver<()> {
-    let (written, logged) = oneshot::channel();
-    let _detached = std::thread::Builder::new()
-        .name("remoted-stop-log".into())
-        .spawn(move || {
-            log();
-            let _ = written.send(());
-        });
-    logged
 }
 
 fn provision_registered_robot(state_root: PathBuf, registration_bundle: PathBuf) -> ExitCode {

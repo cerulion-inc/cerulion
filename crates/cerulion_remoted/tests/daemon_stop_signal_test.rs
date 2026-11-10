@@ -11,16 +11,18 @@
 //!   the deadline with status 4;
 //! - after the endpoint's own close, the first stop signal counts as a second
 //!   one and exits with status 4, after its warn line;
-//! - with stderr full the graceful stop stalls on serving's own log lines, and
-//!   the deadline still ends it with status 4, within a bound of the deadline
-//!   plus 5 s.
+//! - with stderr full and a stage that never finishes, the deadline still
+//!   ends the stop with status 4, within a bound of the deadline plus 5 s;
+//! - with stderr full, a graceful stop exits 0 long before the deadline: no
+//!   log line holds it, and the exit waits at most its grace for the log
+//!   queue.
 //!
 //! The stage's participant is the test seam's probe, which logs whether the
 //! rcpd e-stop sender was already stopped when the stage ran it. A test that
 //! asserts the line the exit writes just before `_exit` sets the exit's wait
-//! for that line to 5 s through the test seam (the exit goes on once the line
-//! is written); the full-stderr test keeps the 100 ms a build without the test
-//! seam waits.
+//! for the log queue to 5 s through the test seam (the exit goes on once the
+//! line is written); the full-stderr tests keep the 100 ms a build without the
+//! test seam waits.
 //!
 //! Each daemon serves its own temp state root and device key, relays disabled;
 //! no peer connects, so the lazy wire plane never starts iceoryx2. The child
@@ -562,6 +564,23 @@ fn the_hard_exit_does_not_wait_for_a_full_stderr() {
             .line_with(&["did not finish within the hard-exit deadline"])
             .is_none(),
         "the deadline's line reached stderr, so stderr was not full at the exit; log:\n{}",
+        daemon.dump()
+    );
+}
+
+#[test]
+fn a_graceful_stop_exits_0_while_stderr_is_full() {
+    // Far past the bound, so a stop held by a log line ends at the deadline
+    // with 4 and fails here.
+    let (mut daemon, filler) = Daemon::start_holding(0x59, &[(HARD_EXIT_ENV, "600000")]);
+    fill(&filler);
+    drop(filler);
+    let sent = daemon.signal(libc::SIGTERM);
+    let (status, took) = daemon.wait_exit(sent, STOP_BOUND);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the graceful stop exits 0 while stderr is full, got {status:?} after {took:?}; log:\n{}",
         daemon.dump()
     );
 }

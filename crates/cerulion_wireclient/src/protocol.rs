@@ -116,13 +116,19 @@ pub enum WireResponse {
     },
 }
 
-/// The `status` reply payload: one row per demanded topic.
+/// The `status` reply payload: one row per demanded topic, and the robot
+/// daemon's count of dropped log lines.
 ///
 /// Mirror of `cerulion_remoted::StatusReply`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReply {
     /// Per-topic WAN counter rows, sorted by topic.
     pub topics: Vec<TopicStatus>,
+    /// The log lines the robot's `cerulion-remoted` dropped since it started:
+    /// lines its log queue refused or its writes to stderr lost. `None` from a
+    /// robot or host that does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_lines_dropped: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
