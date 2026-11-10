@@ -4204,6 +4204,34 @@ mod tests {
         );
     }
 
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_delivery_rcpd_answered_logs_no_early_end_when_its_runtime_drops_during_its_delete() {
+        use Turn::{Answer, Hold};
+        let stand_in_runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stand_in =
+            stand_in_runtime.block_on(ScriptedRcpd::start(vec![Answer, Answer, Answer, Hold]));
+        let delivery_runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let link = link_to(dir.path(), stand_in.addr, 0o600);
+        let rcpd = RcpdEstop::new(&link, bare_trust(), delivery_runtime.handle().clone());
+        assert!(rcpd.send(&[1; 32]));
+        // rcpd answers the estop call, then holds the session's `DELETE`.
+        for kind in attempt() {
+            assert_eq!(stand_in_runtime.block_on(stand_in.next()).0, kind);
+        }
+        drop(delivery_runtime);
+        assert_eq!(rcpd.owing.running.load(Ordering::Acquire), 0);
+        assert!(
+            !logs_contain(LATCH_CLOSED),
+            "the delivery got past its DELETE before the runtime dropped"
+        );
+        assert!(
+            !logs_contain(ENDED_EARLY),
+            "a delivery rcpd answered logged an early end during its DELETE"
+        );
+    }
+
     /// Blocking tasks that hold threads of a runtime's blocking pool until
     /// [`HeldPool::release`], which its drop also calls, so a failed test
     /// still lets the runtime shut down.
