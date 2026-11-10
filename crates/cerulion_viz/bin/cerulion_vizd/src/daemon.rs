@@ -1086,6 +1086,116 @@ fn hint_refresh_target(
 /// the TTL is ever raised.
 pub const PROVENANCE_CACHE_TTL: Duration = Duration::from_secs(3);
 
+/// The gate every mirror-provenance gather passes between its registry read and
+/// the store of its answer, in builds with the test seams only.
+///
+/// Unheld, [`Self::pass`] returns at once. A test holds it through
+/// [`RunningDaemon::hold_provenance_gather_for_test`]; a gather that reaches it
+/// then parks until the hold is released, and the request that started that
+/// gather waits with it.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Default)]
+struct ProvenanceGate {
+    state: Mutex<ProvenanceGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Default)]
+struct ProvenanceGateState {
+    /// A gather reaching [`ProvenanceGate::pass`] waits while this is set.
+    held: bool,
+    /// Gathers waiting in [`ProvenanceGate::pass`] right now.
+    parked: u64,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ProvenanceGate {
+    /// Return at once when the gate is not held; otherwise wait until it is
+    /// released.
+    fn pass(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.held {
+            return;
+        }
+        st.parked += 1;
+        self.changed.notify_all();
+        let mut st = self
+            .changed
+            .wait_while(st, |s| s.held)
+            .unwrap_or_else(|e| e.into_inner());
+        st.parked -= 1;
+    }
+
+    /// Hold or release the gate, returning whether it was held. A release wakes
+    /// every parked gather.
+    fn set_held(&self, held: bool) -> bool {
+        let was = std::mem::replace(
+            &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).held,
+            held,
+        );
+        self.changed.notify_all();
+        was
+    }
+
+    /// Wait at most `bound` until at least `n` gathers are parked. Returns
+    /// whether they are.
+    fn wait_parked(&self, n: u64, bound: Duration) -> bool {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, _) = self
+            .changed
+            .wait_timeout_while(st, bound, |s| s.parked < n)
+            .unwrap_or_else(|e| e.into_inner());
+        st.parked >= n
+    }
+}
+
+/// Take one unit from `counter` when any remain; returns whether one was taken.
+/// Never wraps below zero, however many callers race it.
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_one_fault(counter: &AtomicU64) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(seen) => current = seen,
+        }
+    }
+    false
+}
+
+/// A test's hold on the mirror-provenance gate (see
+/// [`RunningDaemon::hold_provenance_gather_for_test`]). While it lives, every
+/// gather that has read the registry waits before storing its answer. Dropping it
+/// releases them all.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug)]
+#[must_use = "dropping the hold releases the gate at once"]
+pub struct ProvenanceGatherHold {
+    gate: Arc<ProvenanceGate>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ProvenanceGatherHold {
+    /// Wait at most `bound` until at least `n` gathers are parked at the gate.
+    /// Returns whether they are.
+    pub fn wait_parked(&self, n: u64, bound: Duration) -> bool {
+        self.gate.wait_parked(n, bound)
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for ProvenanceGatherHold {
+    fn drop(&mut self) {
+        self.gate.set_held(false);
+    }
+}
+
 /// The daemon's growable schema universe (remote arm). A schema-less (or
 /// pinned-but-unknown-custom-type) remote attach fetches the type's `.msg` closure
 /// from the robot over the daemon's zenoh session and folds it in here, rebuilding
@@ -1411,6 +1521,18 @@ struct Ctx {
     /// nanoseconds (`0` = off, the production value — nothing in the daemon ever
     /// writes it). See [`RunningDaemon::inject_runs_local_delay_for_test`].
     runs_local_delay_ns: Arc<AtomicU64>,
+    /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_started`].
+    provenance_gathers_started: Arc<AtomicU64>,
+    /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_discarded`].
+    provenance_gathers_discarded: Arc<AtomicU64>,
+    /// TEST-ONLY gate between a provenance gather and the store of its answer.
+    /// See [`RunningDaemon::hold_provenance_gather_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gate: Arc<ProvenanceGate>,
+    /// TEST-ONLY count of provenance gathers still to fail (`0` = off). See
+    /// [`RunningDaemon::fail_next_provenance_gathers_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gather_faults: Arc<AtomicU64>,
     /// Principle #3 observable: passes that spent their wait BLOCKED ON A
     /// WAKE SET rather than on `thread::sleep`.
     ///
@@ -4652,6 +4774,30 @@ impl Ctx {
         })
     }
 
+    /// One read of the desk's `/__cerulion/mirrors` registry over THIS daemon's
+    /// transport node. It opens the registry service, a reader port and the gather
+    /// doorbell, which carry no timeout of their own, and then listens for the live
+    /// writers' records for at most
+    /// [`MIRROR_GATHER_WINDOW`](cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW).
+    /// In builds with the test seams, a fault armed by
+    /// [`RunningDaemon::fail_next_provenance_gathers_for_test`] fails it instead.
+    fn gather_mirror_provenance_uncached(
+        &self,
+    ) -> cerulion_core::TransportResult<Vec<cerulion_core::transport::mirror_registry::MirrorRecord>>
+    {
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            if take_one_fault(&self.provenance_gather_faults) {
+                return Err(cerulion_core::TransportError::Internal {
+                    reason: "mirror registry: gather refused by an injected fault".to_string(),
+                });
+            }
+        }
+        self.manager.gather_mirror_provenance(
+            cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW,
+        )
+    }
+
     /// The CURRENT mirror-provenance snapshot as a `topic → origin robot`
     /// map, served from a short-TTL CACHE ([`DaemonState::mirror_provenance`]) so a live
     /// mirror does not cost `discover` a 150-600 ms gather on every poll. On a cache
@@ -4676,23 +4822,25 @@ impl Ctx {
             }
         }
         // Cache miss — gather OUTSIDE the lock (the drain can block up to the window).
-        let fresh: std::collections::BTreeMap<String, String> =
-            match self.manager.gather_mirror_provenance(
-                cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW,
-            ) {
-                Ok(records) => records
-                    .into_iter()
-                    .map(|r| (r.topic, r.origin_robot))
-                    .collect(),
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "cerulion-vizd discover: mirror-provenance gather failed — treating as no \
-                         mirrors (any mirrored topics show as LOCAL this sweep)"
-                    );
-                    std::collections::BTreeMap::new()
-                }
-            };
+        self.provenance_gathers_started
+            .fetch_add(1, Ordering::Relaxed);
+        let gathered = self.gather_mirror_provenance_uncached();
+        let fresh: std::collections::BTreeMap<String, String> = match gathered {
+            Ok(records) => records
+                .into_iter()
+                .map(|r| (r.topic, r.origin_robot))
+                .collect(),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "cerulion-vizd discover: mirror-provenance gather failed — treating as no \
+                     mirrors (any mirrored topics show as LOCAL this sweep)"
+                );
+                std::collections::BTreeMap::new()
+            }
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.provenance_gate.pass();
         let mut st = self.state.lock().unwrap();
         st.mirror_provenance = Some((Instant::now(), fresh.clone()));
         fresh
@@ -7059,6 +7207,24 @@ pub struct RunningDaemon {
     /// same `dead_code = "deny"` reason as the field above.
     #[cfg(any(test, feature = "test-helpers"))]
     runs_local_delay_ns: Arc<AtomicU64>,
+    /// Mirror-provenance gathers started; see
+    /// [`Self::provenance_gathers_started`].
+    provenance_gathers_started: Arc<AtomicU64>,
+    /// Mirror-provenance answers refused at store time; see
+    /// [`Self::provenance_gathers_discarded`].
+    provenance_gathers_discarded: Arc<AtomicU64>,
+    /// See [`Self::hold_provenance_gather_for_test`]; also released by
+    /// [`Self::shutdown`]. Gated for the same `dead_code = "deny"` reason as
+    /// `poll_injected_work_ns` above.
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gate: Arc<ProvenanceGate>,
+    /// See [`Self::fail_next_provenance_gathers_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gather_faults: Arc<AtomicU64>,
+    /// See [`Self::age_provenance_snapshot_for_test`]. WEAK, so the seam never keeps
+    /// the taps and stats alive past [`Self::shutdown`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_state: std::sync::Weak<Mutex<DaemonState>>,
 }
 
 impl RunningDaemon {
@@ -7347,6 +7513,77 @@ impl RunningDaemon {
         self.runs_local_delay_ns.store(nanos, Ordering::Relaxed);
     }
 
+    /// Principle #3 observable: mirror-provenance gathers STARTED since this
+    /// daemon started, one per request that found no fresh snapshot and went to
+    /// the `/__cerulion/mirrors` registry, whether the read then succeeded or
+    /// failed (a fault injected by a test seam counts too). A request answered
+    /// from the stored snapshot does not count, so a ceiling on this is the oracle
+    /// that a verb never gathers.
+    pub fn provenance_gathers_started(&self) -> u64 {
+        self.provenance_gathers_started.load(Ordering::Relaxed)
+    }
+
+    /// Principle #3 observable: gathers whose answer was NOT stored because the
+    /// snapshot was invalidated while they ran (a `detach` or a remote `attach`
+    /// landed between the gather's start and its store). The request that ran the
+    /// gather still answers from it; only the stored snapshot refuses it.
+    pub fn provenance_gathers_discarded(&self) -> u64 {
+        self.provenance_gathers_discarded.load(Ordering::Relaxed)
+    }
+
+    /// Hold every mirror-provenance gather between its registry read and the
+    /// store of its answer, until the returned hold is dropped.
+    ///
+    /// A real gather resists being made slow on demand (it returns the moment it
+    /// has heard every live writer), and a sleep proves only that a clock moved.
+    /// The hold keeps a gather in flight for exactly as long as a test needs, so the
+    /// test can show which other requests wait for it and which do not. Dropping
+    /// the hold, or [`Self::shutdown`], releases every parked gather.
+    ///
+    /// CFG-GATED for the same reason as [`Self::inject_poll_work_for_test`]: it
+    /// parks a handler thread for as long as the caller likes.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn hold_provenance_gather_for_test(&self) -> ProvenanceGatherHold {
+        let already = self.provenance_gate.set_held(true);
+        assert!(
+            !already,
+            "one provenance hold at a time: dropping either of two would release both"
+        );
+        ProvenanceGatherHold {
+            gate: Arc::clone(&self.provenance_gate),
+        }
+    }
+
+    /// Move the stored mirror-provenance snapshot's gather stamp `by` into the
+    /// past, so it reads as older than [`PROVENANCE_CACHE_TTL`] without a sleep.
+    ///
+    /// Returns `false`, and changes nothing, when the daemon has stopped, no
+    /// gather has stamped a snapshot, or the monotonic clock cannot represent
+    /// the earlier instant.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn age_provenance_snapshot_for_test(&self, by: Duration) -> bool {
+        let Some(state) = self.provenance_state.upgrade() else {
+            return false;
+        };
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((at, _)) = st.mirror_provenance.as_mut() else {
+            return false;
+        };
+        let Some(earlier) = at.checked_sub(by) else {
+            return false;
+        };
+        *at = earlier;
+        true
+    }
+
+    /// Fail the next `n` mirror-provenance gathers with
+    /// `TransportError::Internal`, the error a registry refusal returns, instead
+    /// of reading the registry. `0` restores production behaviour.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn fail_next_provenance_gathers_for_test(&self, n: u64) {
+        self.provenance_gather_faults.store(n, Ordering::Relaxed);
+    }
+
     /// The bound control-socket path (for logging / the verb to connect to).
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -7413,6 +7650,11 @@ impl RunningDaemon {
         // worker-drop join would spin to its 6 s detach on every shutdown.
         self.worker_control.close();
         self.shutdown.store(true, Ordering::SeqCst);
+        // A test's provenance hold can outlive the requests it parked. Releasing it
+        // here, before the connection join below, means a hold still in scope
+        // cannot keep that join waiting.
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.provenance_gate.set_held(false);
         if let Some(h) = self.accept_handle.take() {
             let _ = h.join();
         }
@@ -7585,6 +7827,12 @@ pub fn start_on_socket(
         poll_late_passes: Arc::new(AtomicU64::new(0)),
         poll_injected_work_ns: Arc::new(AtomicU64::new(0)),
         runs_local_delay_ns: Arc::new(AtomicU64::new(0)),
+        provenance_gathers_started: Arc::new(AtomicU64::new(0)),
+        provenance_gathers_discarded: Arc::new(AtomicU64::new(0)),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gate: Arc::new(ProvenanceGate::default()),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gather_faults: Arc::new(AtomicU64::new(0)),
         poll_wake_waits: Arc::new(AtomicU64::new(0)),
         poll_wake_fires: Arc::new(AtomicU64::new(0)),
         poll_layout_signal_reflows: Arc::new(AtomicU64::new(0)),
@@ -7696,6 +7944,14 @@ pub fn start_on_socket(
         poll_injected_work_ns: Arc::clone(&ctx.poll_injected_work_ns),
         #[cfg(any(test, feature = "test-helpers"))]
         runs_local_delay_ns: Arc::clone(&ctx.runs_local_delay_ns),
+        provenance_gathers_started: Arc::clone(&ctx.provenance_gathers_started),
+        provenance_gathers_discarded: Arc::clone(&ctx.provenance_gathers_discarded),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gate: Arc::clone(&ctx.provenance_gate),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gather_faults: Arc::clone(&ctx.provenance_gather_faults),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_state: Arc::downgrade(&ctx.state),
         conns,
         worker_control,
         guard: Some(guard),
@@ -12428,6 +12684,20 @@ mod tests {
             rows[0].samples, learned,
             "…with everything it had learned: {rows:?}"
         );
+    }
+
+    /// The injected-fault counter hands out exactly as many faults as were armed
+    /// and never wraps below zero.
+    #[test]
+    fn take_one_fault_hands_out_exactly_the_armed_faults() {
+        let faults = AtomicU64::new(0);
+        assert!(!take_one_fault(&faults), "nothing armed, nothing taken");
+        assert_eq!(faults.load(Ordering::Relaxed), 0);
+        faults.store(2, Ordering::Relaxed);
+        assert!(take_one_fault(&faults));
+        assert!(take_one_fault(&faults));
+        assert!(!take_one_fault(&faults), "two armed, two taken");
+        assert_eq!(faults.load(Ordering::Relaxed), 0, "and no wrap below zero");
     }
 
     /// Monitors: a HINTED record TRACKS the live map — set, re-pointed and
