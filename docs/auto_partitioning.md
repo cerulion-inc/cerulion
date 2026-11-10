@@ -285,7 +285,12 @@ One residual applies to a split edge exactly as to a co-located one: on a
 `multi_publisher_topics:` topic the credit word counts IN-GRAPH publishes only, so an out-of-graph
 writer can fill the consumer's queue without raising `outstanding`; the defer
 then arrives late and the queue can evict. That is a property of `block` on a
-listed topic, co-located or split, and there is no detector for it.
+listed topic, co-located or split. A consumer drain that finds `outstanding`
+already at zero warns
+`block credit drain removed frames its word never counted`, naming the topic,
+once per run of such drains, so the outside writer shows in the log; the
+[topic naming](user-api.md#topic-naming) table says what it reports and what
+it misses.
 
 ### The verb: `cerulion graph partition <NAME>`
 

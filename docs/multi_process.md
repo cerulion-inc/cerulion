@@ -70,8 +70,12 @@ recording's per-edge read log offline).
   `multi_publisher_topics:`-listed topic the credit word counts IN-GRAPH
   publishes only, so an out-of-graph writer can fill the consumer's queue
   without raising `outstanding`; the defer then arrives late and the queue can
-  evict. That is a property of `block` on a listed topic, co-located or split,
-  and there is no detector for it. See
+  evict. That is a property of `block` on a listed topic, co-located or split.
+  A consumer drain that finds `outstanding` already at zero warns
+  `block credit drain removed frames its word never counted`, naming the
+  topic, once per run of such drains, so the outside writer shows in the log;
+  the [topic naming](user-api.md#topic-naming) table says what it reports and
+  what it misses. See
   [Hard constraints](auto_partitioning.md#hard-constraints-block-edges-are-not-a-cost-input).
 - A crashed worker does NOT (by default) kill the deployment: the supervisor
   drops it from the barrier cohort (under the `lockstep` opt-out; a free-run
