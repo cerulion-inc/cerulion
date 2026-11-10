@@ -2158,16 +2158,18 @@ pub(crate) struct RcpdEstop {
     /// `true` once the daemon stops; a delivery ends when it reads `true` or
     /// this sender is dropped.
     stop: watch::Sender<bool>,
-    /// The latest delivery's task, awaited by [`RcpdEstop::shut_down`]. Its
-    /// lock is taken after `Owing::period`, never before it.
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The latest delivery's id and task, awaited by
+    /// [`RcpdEstop::shut_down`]. Its lock is never taken while
+    /// `Owing::period` is held.
+    task: Mutex<Option<(u64, tokio::task::JoinHandle<()>)>>,
 }
 
 /// The engages an [`RcpdEstop`] has counted and its running delivery,
 /// shared with that delivery.
 struct Owing {
     /// Serializes the engage count with the start and the end of a
-    /// delivery. Held for those steps only, never across an `.await`.
+    /// delivery. Held for those steps only, never across an `.await`, and
+    /// no log line is written while it is held.
     period: Mutex<Period>,
     /// One more for each engage, added under `period`; each attempt reads it
     /// without the lock as it begins.
@@ -2191,7 +2193,9 @@ impl Owing {
     /// the engage count read `engages_at_start`, under `period`. On
     /// [`AfterAnswer::Done`] the period ends and `running` is cleared while
     /// it still holds `id`, so the next engage starts a delivery; on
-    /// [`AfterAnswer::Again`] nothing changes.
+    /// [`AfterAnswer::Again`] nothing changes. It writes no log line:
+    /// `Delivery::run` writes the closed-latch line before calling it and,
+    /// on `Again`, the resend line after it.
     fn finish(&self, id: u64, engages_at_start: u64) -> AfterAnswer {
         let mut period = self.period.lock().unwrap_or_else(PoisonError::into_inner);
         let decision = after_answer(engages_at_start, self.engages.load(Ordering::Acquire));
@@ -2237,12 +2241,16 @@ impl RcpdEstop {
     }
 
     /// Count an engage by the device key `engager` and return at once:
-    /// `true` when it started a delivery, `false` when one runs, which covers
-    /// this engage. Under `Owing::period`, the first engage of a period names
-    /// its engager, each engage adds one to the count, and a delivery starts
-    /// on a task of its own, in the caller's span, when none runs; the line
-    /// for a covered engage is written after the lock is released.
+    /// `true` when it marked a delivery running (on a runtime that has shut
+    /// down, the delivery is dropped at once and logs its early end), `false`
+    /// when one runs, which covers this engage. Under `Owing::period`, the
+    /// first engage of a period names its engager, each engage adds one to
+    /// the count, and, when none runs, a delivery is marked running and
+    /// built; it is spawned on a task of its own, in the caller's span, once
+    /// the lock is released; a covered engage's line is likewise written
+    /// after the release.
     pub(crate) fn send(&self, engager: &[u8; 32]) -> bool {
+        let span = tracing::Span::current();
         let mut period = self
             .owing
             .period
@@ -2277,8 +2285,26 @@ impl RcpdEstop {
             retry_cap: self.retry_cap,
             stop: self.stop.subscribe(),
         };
-        let task = self.runtime.spawn(delivery.run().in_current_span());
-        *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+        // `running` holds `id` from here, so a `send` while it runs is covered.
+        // Its engage is counted either before an attempt reads `engages`, so
+        // that attempt covers it, or after the read of the attempt rcpd
+        // answers, so `finish` reads the larger count and answers `Again`.
+        // Only this delivery's task calls `finish` for `id`, and it runs only
+        // after the spawn, so nothing ends the period before the spawn. A
+        // `shut_down` before the store below does not find this delivery's
+        // handle; the `stop` receiver subscribed above reads the stop, so the
+        // delivery ends as on any stop and its mark writes the early-end line.
+        // On a runtime that has shut down, `spawn` drops the delivery and its
+        // mark writes that line on this thread. Both lines are written with
+        // `period` released.
+        drop(period);
+        let task = self.runtime.spawn(delivery.run().instrument(span));
+        // A delivery can end and a later one store its handle before this
+        // store runs; the slot keeps the handle with the larger id.
+        let mut latest = self.task.lock().unwrap_or_else(PoisonError::into_inner);
+        if latest.as_ref().is_none_or(|(stored, _)| *stored < id) {
+            *latest = Some((id, task));
+        }
         true
     }
 
@@ -2292,7 +2318,8 @@ impl RcpdEstop {
     /// for the delivery's task, within [`CONNECT_TIMEOUT`]. A delivery stopped
     /// during an attempt deletes the MCP session rcpd issued it, within
     /// [`OPS_ESTOP_DELETE`]; a delivery that rcpd had not answered logs at
-    /// error.
+    /// error. A delivery whose `send` has not yet stored its handle is not
+    /// awaited; it reads the stop and ends as on any stop.
     pub(crate) async fn shut_down(&self) {
         self.stop.send_replace(true);
         let task = self
@@ -2300,7 +2327,7 @@ impl RcpdEstop {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(task) = task {
+        if let Some((_, task)) = task {
             let _ = tokio::time::timeout(CONNECT_TIMEOUT, task).await;
         }
     }
@@ -2352,7 +2379,7 @@ struct Delivery {
 
 impl Delivery {
     /// Attempt until rcpd answers that its latch closed, logged at warn, and
-    /// [`Owing::finish`] answers [`AfterAnswer::Done`] on a blocking thread;
+    /// [`Owing::finish`], called on this task, answers [`AfterAnswer::Done`];
     /// on [`AfterAnswer::Again`] it sends at once again. Each attempt reads
     /// the token, then sends `initialize`, `notifications/initialized` and the
     /// [`ESTOP_TOOL`] call with [`OPS_ESTOP_REASON`] ([`estop_session`]) and
@@ -2399,16 +2426,9 @@ impl Delivery {
                         "cerulion_remoted: rcpd's e-stop latch closed by an ops engage-estop"
                     );
                     self.guard.answered = true;
-                    let owing = self.guard.owing.clone();
-                    let id = self.guard.id;
-                    let span = tracing::Span::current();
-                    let finished = tokio::task::spawn_blocking(move || {
-                        span.in_scope(|| owing.finish(id, engages_at_start))
-                    })
-                    .await;
-                    match finished {
-                        Ok(AfterAnswer::Done) => return,
-                        Ok(AfterAnswer::Again) => {
+                    match self.guard.owing.finish(self.guard.id, engages_at_start) {
+                        AfterAnswer::Done => return,
+                        AfterAnswer::Again => {
                             tracing::debug!(
                                 by = %self.guard.by,
                                 attempts = self.guard.attempts,
@@ -2418,14 +2438,6 @@ impl Delivery {
                             self.guard.answered = false;
                             retry_in = self.retry_first;
                             continue;
-                        }
-                        Err(_) => {
-                            tracing::error!(
-                                by = %self.guard.by,
-                                "cerulion_remoted: recording rcpd's answer to an ops estop \
-                                 failed; the next engage-estop sends the estop again"
-                            );
-                            return;
                         }
                     }
                 }
@@ -4171,20 +4183,126 @@ mod tests {
         for kind in &attempt()[..3] {
             assert_eq!(stand_in_runtime.block_on(stand_in.next()).0, *kind);
         }
-        // `finish` waits for this lock once rcpd has answered.
+        // `finish` waits for this lock once rcpd has answered, on a worker
+        // of the delivery's runtime; the runtime's drop waits for that
+        // worker.
         let held = rcpd.owing.period.lock().unwrap();
         stand_in.release.notify_one();
         until_blocking("rcpd's answer is logged", || logs_contain(LATCH_CLOSED));
         let dropping = std::thread::spawn(move || drop(delivery_runtime));
-        until_blocking("the dropped delivery clears its mark", || {
-            rcpd.owing.running.load(Ordering::Acquire) == 0
-        });
+        assert_ne!(
+            rcpd.owing.running.load(Ordering::Acquire),
+            0,
+            "the delivery's mark cleared before finish took the lock"
+        );
+        drop(held);
+        dropping.join().unwrap();
+        assert_eq!(rcpd.owing.running.load(Ordering::Acquire), 0);
         assert!(
             !logs_contain(ENDED_EARLY),
             "an answered delivery logged an early end"
         );
-        drop(held);
-        dropping.join().unwrap();
+    }
+
+    /// Blocking tasks that hold threads of a runtime's blocking pool until
+    /// [`HeldPool::release`], which its drop also calls, so a failed test
+    /// still lets the runtime shut down.
+    struct HeldPool {
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl HeldPool {
+        fn release(&self) {
+            let (released, wake) = &*self.release;
+            *released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+    }
+
+    impl Drop for HeldPool {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_engage_after_rcpd_answered_reaches_rcpd_while_the_blocking_pool_is_full() {
+        let stand_in_runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stand_in = stand_in_runtime.block_on(ScriptedRcpd::start(vec![]));
+        let delivery_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let link = link_to(dir.path(), stand_in.addr, 0o600);
+        let rcpd = RcpdEstop::new(&link, bare_trust(), delivery_runtime.handle().clone());
+        let pool = HeldPool {
+            release: Arc::default(),
+        };
+        let started = Arc::new(AtomicU64::new(0));
+        let holders: Vec<_> = (0..2)
+            .map(|_| {
+                let release = pool.release.clone();
+                let started = started.clone();
+                delivery_runtime.spawn_blocking(move || {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    let (released, wake) = &*release;
+                    let released = released.lock().unwrap_or_else(PoisonError::into_inner);
+                    let (_released, _) = wake
+                        .wait_timeout_while(released, Duration::from_secs(60), |r| !*r)
+                        .unwrap_or_else(PoisonError::into_inner);
+                })
+            })
+            .collect();
+        until_blocking("both blocking threads are held", || {
+            started.load(Ordering::Acquire) == 2
+        });
+        // Queued behind the two held threads, it runs once they are released.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = {
+            let ran = ran.clone();
+            delivery_runtime.spawn_blocking(move || ran.store(true, Ordering::Release))
+        };
+        assert!(rcpd.send(&[1; 32]));
+        for kind in attempt() {
+            assert_eq!(stand_in_runtime.block_on(stand_in.next()).0, kind);
+        }
+        until_blocking("rcpd's answer is logged", || logs_contain(LATCH_CLOSED));
+        // rcpd has answered the first delivery, and the pool is still full.
+        rcpd.send(&[2; 32]);
+        let second = stand_in_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut kinds = Vec::new();
+                    while kinds.last().map(String::as_str) != Some("tools/call") {
+                        kinds.push(stand_in.next().await.0);
+                    }
+                    kinds
+                })
+                .await
+            })
+            .expect("the second engage's estop reached rcpd within 5 s");
+        assert_eq!(second, attempt()[..3]);
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "the blocking pool was not full when the estop reached rcpd"
+        );
+        pool.release();
+        delivery_runtime.block_on(async {
+            for holder in holders {
+                within("a held blocking task ends", holder).await.unwrap();
+            }
+            within("the queued blocking task runs", probe)
+                .await
+                .unwrap();
+        });
+        assert!(ran.load(Ordering::Acquire));
+        until_blocking("the second delivery ends", || {
+            rcpd.owing.running.load(Ordering::Acquire) == 0
+        });
         assert!(
             !logs_contain(ENDED_EARLY),
             "an answered delivery logged an early end"
@@ -4245,6 +4363,169 @@ mod tests {
         owing.running.store(6, Ordering::Release);
         assert_eq!(owing.finish(5, 3), AfterAnswer::Done);
         assert_eq!(owing.running.load(Ordering::Acquire), 6);
+    }
+
+    /// A subscriber that counts every event, at any level.
+    struct CountsEvents(Arc<AtomicU64>);
+
+    impl tracing::Subscriber for CountsEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn finish_writes_no_log_line_while_it_holds_the_period_lock() {
+        // A second live dispatcher: each callsite's interest is asked of
+        // every dispatcher, so it is never cached as never.
+        let _keep = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let events = Arc::new(AtomicU64::new(0));
+        tracing::subscriber::with_default(CountsEvents(events.clone()), || {
+            tracing::warn!("cerulion_remoted: a counted line");
+            assert_eq!(events.load(Ordering::Acquire), 1, "the subscriber counts");
+            let owing = Owing {
+                period: Mutex::new(Period {
+                    engager: Some([1; 32]),
+                    last_id: 5,
+                }),
+                engages: AtomicU64::new(3),
+                running: AtomicU64::new(5),
+            };
+            assert_eq!(owing.finish(5, 2), AfterAnswer::Again);
+            assert_eq!(owing.finish(5, 3), AfterAnswer::Done);
+            assert_eq!(owing.running.load(Ordering::Acquire), 0);
+        });
+        assert_eq!(events.load(Ordering::Acquire), 1, "finish wrote a line");
+    }
+
+    /// A subscriber that counts every event, at any level, and each event
+    /// written while `owing`'s `period` lock is held.
+    struct WatchesPeriod {
+        owing: Arc<Owing>,
+        events: Arc<AtomicU64>,
+        under_lock: Arc<AtomicU64>,
+    }
+
+    impl tracing::Subscriber for WatchesPeriod {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.events.fetch_add(1, Ordering::AcqRel);
+            if matches!(
+                self.owing.period.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                self.under_lock.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Run `send(engager)` on `rcpd` under a [`WatchesPeriod`] and return
+    /// its answer, the events written on this thread and how many of them
+    /// were written while `period` was held.
+    fn send_watched(rcpd: &RcpdEstop, engager: [u8; 32]) -> (bool, u64, u64) {
+        let events = Arc::new(AtomicU64::new(0));
+        let under_lock = Arc::new(AtomicU64::new(0));
+        let watch = WatchesPeriod {
+            owing: rcpd.owing.clone(),
+            events: events.clone(),
+            under_lock: under_lock.clone(),
+        };
+        let started = tracing::subscriber::with_default(watch, || rcpd.send(&engager));
+        (
+            started,
+            events.load(Ordering::Acquire),
+            under_lock.load(Ordering::Acquire),
+        )
+    }
+
+    #[test]
+    fn a_late_handle_store_from_an_older_delivery_leaves_the_newer_handle_in_the_slot() {
+        let stand_in_runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stand_in = stand_in_runtime.block_on(ScriptedRcpd::start(vec![]));
+        let delivery_runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let link = link_to(dir.path(), stand_in.addr, 0o600);
+        let rcpd = RcpdEstop::new(&link, bare_trust(), delivery_runtime.handle().clone());
+        let mut held = rcpd.task.lock().unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| rcpd.send(&[1; 32]));
+            // The stand-in reads `initialize` only once the spawn has run, so
+            // `send` is past the spawn and waits for the slot's lock.
+            let first = stand_in_runtime.block_on(within("the first request", stand_in.next()));
+            assert_eq!(first.0, "initialize");
+            *held = Some((2, delivery_runtime.spawn(async {})));
+            drop(held);
+            assert!(sending.join().unwrap());
+        });
+        assert_eq!(
+            rcpd.task.lock().unwrap().as_ref().map(|(id, _)| *id),
+            Some(2),
+            "a late store from delivery 1 replaced delivery 2's handle"
+        );
+        for kind in &attempt()[1..] {
+            assert_eq!(
+                stand_in_runtime
+                    .block_on(within("a request", stand_in.next()))
+                    .0,
+                *kind
+            );
+        }
+        until_blocking("the delivery ends", || {
+            rcpd.owing.running.load(Ordering::Acquire) == 0
+        });
+    }
+
+    #[test]
+    fn send_writes_no_log_line_while_it_holds_the_period_lock() {
+        // A second live dispatcher: each callsite's interest is asked of
+        // every dispatcher, so it is never cached as never.
+        let _keep = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stand_in = runtime.block_on(ScriptedRcpd::start(vec![Turn::AnswerOnRelease]));
+        let dir = tempfile::tempdir().unwrap();
+        let link = link_to(dir.path(), stand_in.addr, 0o600);
+        let rcpd = RcpdEstop::new(&link, bare_trust(), runtime.handle().clone());
+        // A started delivery writes nothing on the engaging thread.
+        assert_eq!(send_watched(&rcpd, [1; 32]), (true, 0, 0));
+        assert_eq!(runtime.block_on(stand_in.next()).0, "initialize");
+        // rcpd holds its answer, so the delivery still runs: the covered
+        // engage writes its line once the lock is released.
+        assert_eq!(send_watched(&rcpd, [2; 32]), (false, 1, 0));
+        stand_in.release.notify_one();
+        runtime.block_on(until_delivered(&rcpd));
+        // On a runtime that has shut down, the spawn drops the delivery,
+        // whose mark writes its early-end line on this thread.
+        let gone = tokio::runtime::Runtime::new().unwrap();
+        let handle = gone.handle().clone();
+        drop(gone);
+        let late = RcpdEstop::new(&link, bare_trust(), handle);
+        assert_eq!(send_watched(&late, [3; 32]), (true, 1, 0));
+        assert_eq!(late.owing.running.load(Ordering::Acquire), 0);
     }
 
     struct NoCapture;
