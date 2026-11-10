@@ -1,6 +1,7 @@
 # Mutation baseline for cerulion_core: the ROS IDL parser decision functions.
 #
-# Scope: the two pure parser files. The rest of the crate holds transport and
+# Scope: the two pure parser files, and the oracle mutants listed below, each
+# on one pure decision function. The rest of the crate holds transport and
 # scheduler paths that the mutation rule does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
@@ -15,6 +16,17 @@
 #
 # First-`#` comment cut, re-run on the changed lines only (--in-diff): 7
 # mutants, 1 caught, 6 unviable, 0 missed.
+#
+# Oracle mutants: seeded faults built with `--features oracle-mutants` and
+# armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
+# each test named here, and a run without it must pass that test.
+#
+#   block_forgiven_hold_counted: `transport::subscriber::survivor_forgiven`
+#     answers false, so a frame a `block_timeout_ms` release forgave is counted
+#     against depth again when the matcher moves it into a slot. Caught by
+#     `transport::subscriber::tests::the_survivor_is_forgiven_only_when_every_removed_frame_was`
+#     (--lib) and by `block_slot_release_iox2_test`'s
+#     `a_forgiven_frame_the_trigger_refill_holds_leaves_the_producer_its_depth`.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

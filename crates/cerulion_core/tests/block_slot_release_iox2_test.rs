@@ -10,6 +10,12 @@
 //!   resumes, and the release touches that slot only;
 //! - after a timeout release, a FIFO consumer that resumes between two
 //!   publishes receives every frame published after the release;
+//! - after a timeout release, a frame the release forgave that the per-set
+//!   Sync matcher moves into a slot (the trigger fill or refill, the
+//!   descent's peek) stays forgiven, a skipped forgiven head refilled with a
+//!   frame published after the release leaves that frame counted, an errored
+//!   refill holds nothing, and each walk equals its hand oracle row for row,
+//!   twice; on a cross-process word a refilled head counts as held;
 //! - a multi-process worker refuses `block_timeout_ms` on a consumer input
 //!   its plan binds to a credit word shared with a producer in another
 //!   process, and builds the same input without the key; a worker whose
@@ -43,8 +49,9 @@
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
 //! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off`,
 //! `block_accumulate_refusal_off`, `block_forgiven_drain_spends_credit`,
-//! `block_empty_resync_off`, `block_shared_timeout_refusal_off` and
-//! `block_split_timeout_refusal_off` each make a row here fail.
+//! `block_empty_resync_off`, `block_shared_timeout_refusal_off`,
+//! `block_split_timeout_refusal_off` and `block_forgiven_hold_counted` each
+//! make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -856,6 +863,358 @@ fn frames_published_after_a_timeout_release_are_never_evicted() {
         "every frame published after the release is received"
     );
     assert_eq!(local.outstanding(), 0, "the drains emptied the slot");
+}
+
+/// One operation of a hand-driven walk over the two slots of a per-set Sync
+/// `block` trigger input, as the matcher's ops and the node's read move it.
+#[derive(Clone, Copy)]
+enum SlotOp {
+    /// Publish the next frame when the producer's gate has room.
+    Publish,
+    /// The `block_timeout_ms` release of the slot.
+    Release,
+    /// The boundary fill of the head slot (`FillBoundary`).
+    Fill,
+    /// The refill of the head slot after a fire (`FillRefill`).
+    Refill,
+    /// The descent's pop of the next frame into the second slot (`NeedStamp`).
+    Peek,
+    /// `Advance` or `DiscardTie`: the head is skipped and refilled.
+    Discard,
+    /// The node's read.
+    Serve,
+    /// The next read of the queue fails.
+    FailNextReceive,
+}
+
+/// One row of a slot walk, read after its operation: what the operation did,
+/// the frames counted against depth, the forgiven frames the consumer still
+/// holds, the frames the input's slots hold, and whether the producer may
+/// publish.
+type SlotRow<'a> = (&'a str, u64, u64, u8, bool);
+
+/// A [`SlotRow`] as [`slot_walk`] records it.
+type WalkRow = (String, u64, u64, u8, bool);
+
+/// Run `ops` on a fresh `block` FIFO input over a real depth-2 iceoryx2
+/// queue whose probe counts on `word`, the word the producer's gate reads and
+/// its publish counts on. Frames carry `x = 1, 2, ...` in publish order.
+fn slot_walk(tag: &str, word: CreditWord, ops: &[SlotOp]) -> Vec<WalkRow> {
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("bsr_slot_{tag}"),
+            clock: Arc::new(cerulion_core::clock::RealClock),
+            subscriber_buffer_size: 2,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = format!("bsr_slot_{tag}");
+    let mut publisher = mgr
+        .create_publisher(&topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("publisher");
+    let mut sub = mgr.create_subscriber(&topic).expect("subscriber");
+    sub.register_block_probe_for_test(
+        word.clone(),
+        2,
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        2,
+    );
+    sub.mark_fifo_consume_for_test();
+    let site = cerulion_core::SyncAlignSite::Boundary;
+    let mut next = 1u32;
+    let mut rows = Vec::new();
+    for op in ops {
+        let what = match op {
+            SlotOp::Publish if word.try_claim() => {
+                publish_counted(&mut publisher, &word, next);
+                next += 1;
+                format!("publish {}", next - 1)
+            }
+            SlotOp::Publish => format!("held at {next}"),
+            SlotOp::Release => format!("release -> {}", word.forgive_outstanding()),
+            SlotOp::Fill => format!("fill -> {}", sub.snapshot_latest_for_trigger().0),
+            SlotOp::Refill => format!("refill -> {}", sub.refill_for_trigger().0),
+            SlotOp::Peek => format!(
+                "peek -> {}",
+                sub.sync_peek_next_stamp_for_test(site)
+                    .expect("the peek does not fail")
+                    .is_some()
+            ),
+            SlotOp::Discard => format!(
+                "discard -> {}",
+                sub.sync_discard_head_for_test(site)
+                    .expect("a discard never fails")
+                    .is_some()
+            ),
+            SlotOp::Serve => format!(
+                "serve -> {:?}",
+                sub.try_view::<Vector3, u32>(|v| v.x as u32)
+                    .expect("the read does not fail")
+            ),
+            SlotOp::FailNextReceive => {
+                sub.fault_inject_receive_after_for_test(0);
+                "fail next receive".to_string()
+            }
+        };
+        rows.push((
+            what,
+            word.outstanding(),
+            word.forgiven(),
+            sub.block_slot_debt_for_test(),
+            word.try_claim(),
+        ));
+    }
+    rows
+}
+
+/// Every row of a slot walk equals its hand-written oracle row.
+fn assert_slot_walk(rows: &[WalkRow], oracle: &[SlotRow<'_>]) {
+    for (i, (row, want)) in rows.iter().zip(oracle).enumerate() {
+        let got: SlotRow<'_> = (row.0.as_str(), row.1, row.2, row.3, row.4);
+        assert_eq!(
+            got, *want,
+            "row {i}: (operation, counted, forgiven, held slots, producer room)"
+        );
+    }
+    assert_eq!(rows.len(), oracle.len(), "one row per operation");
+}
+
+/// The trigger refill after a timeout release holds frame 2, which the
+/// release forgave, and frames 3 and 4 are the two published after it.
+const A_FORGIVEN_REFILL: [SlotOp; 13] = [
+    SlotOp::Publish,
+    SlotOp::Fill,
+    SlotOp::Publish,
+    SlotOp::Release,
+    SlotOp::Publish,
+    SlotOp::Serve,
+    SlotOp::Refill,
+    SlotOp::Publish,
+    SlotOp::Publish,
+    SlotOp::Serve,
+    SlotOp::Serve,
+    SlotOp::Serve,
+    SlotOp::Serve,
+];
+
+/// The hand oracle of [`A_FORGIVEN_REFILL`] at depth 2. The release forgives
+/// frame 1 (held) and frame 2 (queued). The refill pops frame 2 and pays the
+/// forgiven backlog, so frame 2 sits in the slot forgiven: the producer has
+/// room for frame 4 and is held at frame 5, when frames 3 and 4 are unread.
+const A_FORGIVEN_REFILL_ORACLE: [SlotRow<'static>; 13] = [
+    ("publish 1", 1, 0, 0, true),
+    ("fill -> 1", 1, 0, 1, true),
+    ("publish 2", 2, 0, 1, false),
+    ("release -> 2", 0, 2, 1, true),
+    ("publish 3", 1, 2, 1, true),
+    ("serve -> Some(1)", 1, 1, 0, true),
+    ("refill -> 1", 1, 1, 1, true),
+    ("publish 4", 2, 1, 1, false),
+    ("held at 5", 2, 1, 1, false),
+    ("serve -> Some(2)", 2, 0, 0, false),
+    ("serve -> Some(3)", 1, 0, 0, true),
+    ("serve -> Some(4)", 0, 0, 0, true),
+    ("serve -> None", 0, 0, 0, true),
+];
+
+/// After a timeout release, a frame the release forgave stays forgiven when
+/// the trigger refill moves it from the queue into the head slot: the
+/// producer may publish `depth` frames after the release before it is held,
+/// and the consumer reads every one.
+#[test]
+fn a_forgiven_frame_the_trigger_refill_holds_leaves_the_producer_its_depth() {
+    let rows = slot_walk("refill", CreditWord::local(2), &A_FORGIVEN_REFILL);
+    assert_slot_walk(&rows, &A_FORGIVEN_REFILL_ORACLE);
+}
+
+/// Both slots hold frames the release forgave: the fill holds frame 1 and
+/// the descent's peek frame 2, each forgiven, so the producer publishes
+/// frames 3 and 4 and is held at 5. Skipping the head frees one forgiven
+/// frame and leaves frames 3 and 4 counted.
+#[test]
+fn two_forgiven_frames_the_matcher_holds_do_not_hold_the_producer() {
+    let rows = slot_walk(
+        "both",
+        CreditWord::local(2),
+        &[
+            SlotOp::Publish,
+            SlotOp::Publish,
+            SlotOp::Release,
+            SlotOp::Fill,
+            SlotOp::Peek,
+            SlotOp::Publish,
+            SlotOp::Publish,
+            SlotOp::Publish,
+            SlotOp::Discard,
+            SlotOp::Serve,
+            SlotOp::Serve,
+            SlotOp::Serve,
+            SlotOp::Serve,
+        ],
+    );
+    assert_slot_walk(
+        &rows,
+        &[
+            ("publish 1", 1, 0, 0, true),
+            ("publish 2", 2, 0, 0, false),
+            ("release -> 2", 0, 2, 0, true),
+            ("fill -> 1", 0, 2, 1, true),
+            ("peek -> true", 0, 2, 2, true),
+            ("publish 3", 1, 2, 2, true),
+            ("publish 4", 2, 2, 2, false),
+            ("held at 5", 2, 2, 2, false),
+            ("discard -> true", 2, 1, 1, false),
+            ("serve -> Some(2)", 2, 0, 0, false),
+            ("serve -> Some(3)", 1, 0, 0, true),
+            ("serve -> Some(4)", 0, 0, 0, true),
+            ("serve -> None", 0, 0, 0, true),
+        ],
+    );
+}
+
+/// The matcher skips a head the release forgave and refills it from the
+/// queue with frame 3, published after the release (frame 4 evicted the
+/// forgiven frame 2): the skipped frame leaves forgiven and frame 3 enters
+/// counted, so frames 3 and 4 hold the producer and both are read.
+#[test]
+fn a_skipped_forgiven_head_refilled_with_a_new_frame_keeps_that_frame_counted() {
+    let rows = slot_walk(
+        "skip",
+        CreditWord::local(2),
+        &[
+            SlotOp::Publish,
+            SlotOp::Fill,
+            SlotOp::Publish,
+            SlotOp::Release,
+            SlotOp::Publish,
+            SlotOp::Publish,
+            SlotOp::Discard,
+            SlotOp::Publish,
+            SlotOp::Serve,
+            SlotOp::Serve,
+            SlotOp::Serve,
+        ],
+    );
+    assert_slot_walk(
+        &rows,
+        &[
+            ("publish 1", 1, 0, 0, true),
+            ("fill -> 1", 1, 0, 1, true),
+            ("publish 2", 2, 0, 1, false),
+            ("release -> 2", 0, 2, 1, true),
+            ("publish 3", 1, 2, 1, true),
+            ("publish 4", 2, 1, 1, false),
+            ("discard -> true", 2, 0, 1, false),
+            ("held at 5", 2, 0, 1, false),
+            ("serve -> Some(3)", 1, 0, 0, true),
+            ("serve -> Some(4)", 0, 0, 0, true),
+            ("serve -> None", 0, 0, 0, true),
+        ],
+    );
+}
+
+/// After a release, a refill whose queue read fails holds nothing and
+/// changes no count; the next boundary fill pops frame 2, which the release
+/// forgave, and holds it forgiven.
+#[test]
+fn an_errored_refill_after_a_release_holds_nothing_and_the_next_fill_holds_its_frame_forgiven() {
+    let rows = slot_walk(
+        "err",
+        CreditWord::local(2),
+        &[
+            SlotOp::Publish,
+            SlotOp::Fill,
+            SlotOp::Publish,
+            SlotOp::Release,
+            SlotOp::Publish,
+            SlotOp::Serve,
+            SlotOp::FailNextReceive,
+            SlotOp::Refill,
+            SlotOp::Fill,
+            SlotOp::Publish,
+            SlotOp::Publish,
+            SlotOp::Serve,
+            SlotOp::Serve,
+            SlotOp::Serve,
+            SlotOp::Serve,
+        ],
+    );
+    assert_slot_walk(
+        &rows,
+        &[
+            ("publish 1", 1, 0, 0, true),
+            ("fill -> 1", 1, 0, 1, true),
+            ("publish 2", 2, 0, 1, false),
+            ("release -> 2", 0, 2, 1, true),
+            ("publish 3", 1, 2, 1, true),
+            ("serve -> Some(1)", 1, 1, 0, true),
+            ("fail next receive", 1, 1, 0, true),
+            ("refill -> 0", 1, 1, 0, true),
+            ("fill -> 1", 1, 1, 1, true),
+            ("publish 4", 2, 1, 1, false),
+            ("held at 5", 2, 1, 1, false),
+            ("serve -> Some(2)", 2, 0, 0, false),
+            ("serve -> Some(3)", 1, 0, 0, true),
+            ("serve -> Some(4)", 0, 0, 0, true),
+            ("serve -> None", 0, 0, 0, true),
+        ],
+    );
+}
+
+/// Two runs of the forgiven-refill walk on fresh transports each equal the
+/// hand oracle, so they equal each other row for row.
+#[test]
+fn a_forgiven_hold_walk_matches_its_oracle_on_two_runs() {
+    let first = slot_walk("det_a", CreditWord::local(2), &A_FORGIVEN_REFILL);
+    let second = slot_walk("det_b", CreditWord::local(2), &A_FORGIVEN_REFILL);
+    assert_slot_walk(&first, &A_FORGIVEN_REFILL_ORACLE);
+    assert_slot_walk(&second, &A_FORGIVEN_REFILL_ORACLE);
+    assert_eq!(first, second, "the two runs are row-for-row identical");
+}
+
+/// On a cross-process word, which no release forgives, a skipped head the
+/// matcher refills from the queue keeps the counts a held frame always had:
+/// frame 2 replaces frame 1 in the head slot and the word counts it alone.
+#[test]
+fn a_mapped_word_counts_a_refilled_head_as_held() {
+    let ns = format!("bsr_{}_slot_mapped", std::process::id());
+    let id = credit_edge_id("/bsr/slot/mapped", "consumer", "inp");
+    let _owner = MappedCredit::create_owned(&ns, &id, 2).expect("the supervisor's word");
+    let word = CreditWord::mapped(Arc::new(
+        MappedCredit::open_unowned(&ns, &id).expect("the consumer's mapping"),
+    ));
+    let rows = slot_walk(
+        "mapped",
+        word,
+        &[
+            SlotOp::Publish,
+            SlotOp::Fill,
+            SlotOp::Publish,
+            SlotOp::Publish,
+            SlotOp::Discard,
+            SlotOp::Publish,
+            SlotOp::Serve,
+            SlotOp::Serve,
+            SlotOp::Serve,
+        ],
+    );
+    assert_slot_walk(
+        &rows,
+        &[
+            ("publish 1", 1, 0, 0, true),
+            ("fill -> 1", 1, 0, 1, true),
+            ("publish 2", 2, 0, 1, false),
+            ("held at 3", 2, 0, 1, false),
+            ("discard -> true", 1, 0, 1, true),
+            ("publish 3", 2, 0, 1, false),
+            ("serve -> Some(2)", 1, 0, 0, true),
+            ("serve -> Some(3)", 0, 0, 0, true),
+            ("serve -> None", 0, 0, 0, true),
+        ],
+    );
 }
 
 /// The refusal of `block_timeout_ms` on `consumer.inp` of `topic` that a
