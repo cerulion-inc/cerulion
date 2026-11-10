@@ -23,11 +23,11 @@ User reference: docs/rcp.md.
   `intent`, deletes the file and opens the latch; then it journals a
   LATCH-GATED frame, so an `estop` that lands first stays the graph's last
   frame (`estop_overtaken`). `estop` re-closes the latch, writes its file and
-  `intent`, and queues its urgent frame inside `latch_io`, so the receipt log
-  and the calls topic order engages and clears as they took effect (the
-  journal publishes every queued urgent frame before a normal one). An
-  undeletable file leaves the latch closed (`clear_failed`); an unreadable
-  one at start counts as present.
+  `intent`, and queues its urgent frame inside `latch_io` (a failed write is
+  logged outside it), so the receipt log and the calls topic order engages and
+  clears as they took effect (the journal publishes every queued urgent frame
+  before a normal one). An undeletable file leaves the latch closed
+  (`clear_failed`); an unreadable one at start counts as present.
 - The journal's `gate` reads the latch, then drops a latch-gated request whose
   caller dropped its reply (a cancelled MCP request); estop and read frames
   always publish.
