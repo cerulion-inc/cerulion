@@ -2550,6 +2550,9 @@ impl CerulionSubscriber {
     /// word counted: drains of frames the word never counted (see
     /// [`crate::credit::CreditShared::record_drained`]). A
     /// running total, never reset. `0` unless this input is wired `block`.
+    /// Hidden from the documented API: tests and the runtime read it, and a
+    /// user sees the same condition through the clip report's warning lines.
+    #[doc(hidden)]
     pub fn block_drains_clipped(&self) -> u64 {
         self.block_probe()
             .map_or(0, |probe| probe.drain_clips.borrow().total_failures())
