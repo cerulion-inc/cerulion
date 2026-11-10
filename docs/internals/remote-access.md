@@ -633,9 +633,10 @@ engager), its response head within `estop_policy::estop_head_bound` of
 answer within `OPS_ESTOP_ANSWER` (10 s) after it, then a `DELETE` of the
 session rcpd issued it, within `OPS_ESTOP_DELETE` (2 s), also after a
 stop by Ctrl-C or SIGTERM. It succeeds only when the call's result says
-`"estopped": true` (`estop_outcome`); the delivery logs that at
-warn with `failed_attempts`, then calls `Owing::finish` on its
-own task. `finish`, under `period`, writes no log line and asks
+`"estopped": true` (`estop_outcome`); the delivery records the answer on
+its `Running` guard as soon as the call returns, before the `DELETE`, logs
+it at warn with `failed_attempts` after the `DELETE`, then calls
+`Owing::finish` on its own task. `finish`, under `period`, writes no log line and asks
 `estop_policy::after_answer` of the count at the attempt's start and
 now: `Done` ends the period and clears `running` while it still holds
 the delivery's id, so the next engage starts a delivery, and `Again`
@@ -651,15 +652,18 @@ waits for the task within `CONNECT_TIMEOUT`; a delivery whose `send` has
 not yet stored its handle is not awaited, and it reads the stop and ends
 as on any stop. A `Running` guard in the delivery clears `running` on
 any other end, by compare-and-swap of its own id, and logs at error unless
-rcpd had answered: a stop by Ctrl-C or SIGTERM (`serve_core`'s teardown
-calls `RcpdEstop::shut_down`), a panic, or a runtime dropped with the task.
+rcpd had answered the attempt in flight: a stop by Ctrl-C or SIGTERM
+(`serve_core`'s teardown calls `RcpdEstop::shut_down`), a panic, or a runtime
+dropped with the task. A delivery ended during the `DELETE` of an attempt rcpd
+answered logs nothing; one that reaches `finish`'s `Done` has its mark cleared
+there, so its guard reads no flag. An error answer leaves `answered` unset.
 A `cerulion-remoted` that is killed (SIGKILL), crashes, or ends at the
 hard-exit deadline or a second stop signal (`_exit(4)`) runs no destructor,
 so it may end with no line and no `DELETE`. A `send` that reads `running`
 just before an ending delivery's guard clears it logs the engage as covered
-and starts nothing; unless rcpd had answered the attempt, the guard logs
-its error line as well. A delivery that ends without rcpd's answer leaves
-its period open, so the next delivery still names the period's first engager
+and starts nothing; unless rcpd had answered the attempt in flight, the guard logs
+its error line as well. A delivery that ends before `finish` answers
+`Done`, answered or not, leaves its period open, so the next delivery still names the period's first engager
 and rcpd's journal can name an earlier device for a later engage. Every
 delivery line names the engager as `by` (the device key, hex); the warn
 failure lines and the closed-latch line also carry rcpd's caller identity as

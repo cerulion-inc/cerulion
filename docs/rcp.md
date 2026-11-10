@@ -469,7 +469,9 @@ warn once rcpd's latch closes. One such delivery runs at a time, under the
 identity of the first engager since rcpd last answered one: an `engage-estop`
 while one runs starts none, since the one running keeps sending, and when that
 `engage-estop` came after the attempt rcpd answers began, the delivery sends
-the `estop` once more. A delivery that ends before rcpd answers logs at error.
+the `estop` once more. A delivery that ends before rcpd answers logs at error;
+one that ends after rcpd answered that its latch closed, while it deletes
+its MCP session, logs nothing.
 When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
 the middle of an attempt first deletes the MCP session rcpd issued it, within
 2 s, inside the 5 s the stop waits for the delivery's task. A stop the
