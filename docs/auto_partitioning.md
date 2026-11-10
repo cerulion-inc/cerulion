@@ -251,14 +251,16 @@ worth knowing:
 
 A **hand-written** `process_groups:` that splits a `block` edge is ACCEPTED
 when the edge can be credited (exactly one in-graph producer, one word per
-split `block` consumer) and refused at plan time otherwise, by `graph run` before any
+split `block` consumer) and its `block` input sets no `block_timeout_ms`, and
+refused at plan time otherwise, by `graph run` before any
 worker spawns and by `graph levels`. The refusal names the topic, the
 producer, the consumer and its input, both groups, the fix, and **which bar it
 hit**:
 
 | Shape of the SPLIT topic | Verdict | Why |
 |---|---|---|
-| exactly one in-graph producer | **accepted** | the supervisor mints each split `block` consumer its own credit word; the topic's other consumers need none |
+| exactly one in-graph producer, no `block_timeout_ms` on the split `block` input | **accepted** | the supervisor mints each split `block` consumer its own credit word; the topic's other consumers need none |
+| exactly one in-graph producer, the split `block` input sets `block_timeout_ms` | refused | the producer and the consumer fire on different threads, so after a timeout release a read and a publish can interleave and the word can count a frame that is gone, or miss one; put both nodes in one group, or remove the key |
 | two or more in-graph producers | refused | the word counts ONE producer's outstanding frames; two writers would each spend the other's credit |
 
 A topic's non-`block` consumers are never constrained: they hold no credit and
