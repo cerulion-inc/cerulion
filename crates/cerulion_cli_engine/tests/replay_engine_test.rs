@@ -24704,6 +24704,452 @@ fn two_resims_of_a_one_rank_free_run_mid_run_bag_are_byte_identical() {
     );
 }
 
+// ===========================================================================
+// A `consume = latest` node stopped before a resumed pass's anchor
+//
+// Real recordings of a node that returns `NodeError::Fatal`: before the
+// anchor of a one-rank free-run resume, and inside the resumed slice. The
+// bag records no stop, so a resumed pass whose slice never shows the node
+// running stands the unread-frame rule down by name, and a pass whose slice
+// shows it running still convicts the fire it misses.
+// ===========================================================================
+
+/// How a [`StoppingLatestSinkNode`] build fails on a frame at or past a
+/// value. Either way that fire publishes nothing.
+#[derive(Debug, Clone, Copy)]
+enum SinkFailure {
+    /// `NodeError::Fatal`, which stops the node.
+    Fatal(f64),
+    /// `NodeError::Logic`, which the node keeps firing past.
+    Logic(f64),
+}
+
+/// A `consume = latest` sink whose trigger input is read through a second
+/// subscriber: a `sample(N)` input never shares the boundary drain's
+/// subscriber, and `sample(1)` at the reference run's 5 ms step decimates
+/// nothing. Each fire publishes the served frame plus 100, except a fire
+/// whose frame the build's [`SinkFailure`] fails on.
+#[cerulion_node]
+#[derive(Default)]
+struct StoppingLatestSinkNode {
+    #[input(trigger, consume = latest, backpressure = sample(1), depth = 1)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    /// How this build fails, if at all. Set by the factory; a restore leaves
+    /// it as built, so a resumed candidate keeps its own.
+    #[cerulion(reconstruct)]
+    fails: Option<SinkFailure>,
+}
+
+#[cerulion_node_impl]
+impl StoppingLatestSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        match self.fails {
+            Some(SinkFailure::Fatal(at)) if self.inp.x >= at => {
+                return Err(NodeError::Fatal("the sink stops at this frame".to_string()));
+            }
+            Some(SinkFailure::Logic(at)) if self.inp.x >= at => {
+                return Err(NodeError::Logic("the sink skips this frame".to_string()));
+            }
+            _ => {}
+        }
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// The stopping sink's node id, at ring index 1 after the counter.
+const LS_SINK: &str = "sink";
+/// Its output topic.
+const LS_SINK_TOPIC: &str = "/stop/sink/out";
+/// The steps every stopping-sink recording runs.
+const LS_STEPS: usize = 12;
+/// The step a resumed bag of it begins at; its anchor is the step before.
+const LS_FIRST_STEP: u64 = 4;
+
+/// The [`CounterEntry`] counter, publishing `0, 1, 2, ...` one per step, read
+/// by the [`StoppingLatestSinkNode`] sink.
+fn ls_yaml() -> &'static str {
+    "name: stop\nprefix: stop\nnodes:\n\
+     \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: stopping_latest_sink_node\n    inputs:\n      - name: inp\n        source: /stop/counter/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn ls_factories(fails: SinkFailure) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (CP_NODE, Box::new(CounterEntry::new()) as Box<dyn NodeEntry>),
+        (
+            LS_SINK,
+            Box::new(StoppingLatestSinkNodeEntry::with_state(
+                StoppingLatestSinkNode {
+                    fails: Some(fails),
+                    ..Default::default()
+                },
+            )),
+        ),
+    ])
+}
+
+/// The steps at which `rec` holds a FIRE of the sink, and the steps at which
+/// it holds a read of the sink's input with `kind` minted at `role`.
+fn ls_sink_records(
+    rec: &Recording,
+    kind: cerulion_core::read_outcome::ReadOutcomeKind,
+    role: ReadSiteRole,
+) -> (Vec<u64>, Vec<u64>) {
+    let sink = rec
+        .node_ids
+        .iter()
+        .position(|id| id == LS_SINK)
+        .expect("the sink is in the manifest") as u32;
+    let fires = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == sink)
+        .map(|r| r.step)
+        .collect();
+    let reads = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink)
+        .filter(|r| {
+            let (_, k, ro) =
+                cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+            k == kind.wire() && ro == role
+        })
+        .map(|r| r.step)
+        .collect();
+    (fires, reads)
+}
+
+/// Record the stopping-sink graph with its read log, the sink stopping at the
+/// frame `stop_at`, and check the recording against the hand oracle: the
+/// counter publishes `0..LS_STEPS`, the sink fires at steps `0..=stop_at` and
+/// publishes the frame plus 100 at every fire but the stopping one, its body
+/// served a frame at every fire, and its boundary drain counted one frame at
+/// every step, the steps after the stop included. That last fact is what a
+/// stopped node leaves in a bag.
+fn ls_reference(stop_at: u64) -> Recording {
+    let rec = record_uniform_with_read_log(
+        ls_yaml(),
+        || ls_factories(SinkFailure::Fatal(stop_at as f64)),
+        &[],
+        LS_STEPS,
+    );
+    let counter: Vec<f64> = rec.messages["/stop/counter/out"]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        counter,
+        (0..LS_STEPS).map(|k| k as f64).collect::<Vec<_>>(),
+        "the counter publishes one frame per step"
+    );
+    let sink: Vec<f64> = rec.messages[LS_SINK_TOPIC]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        sink,
+        (0..stop_at).map(|k| k as f64 + 100.0).collect::<Vec<_>>(),
+        "the sink publishes the frame plus 100 until the frame it stops at"
+    );
+    let (fires, served) = ls_sink_records(
+        &rec,
+        cerulion_core::read_outcome::ReadOutcomeKind::Served,
+        ReadSiteRole::Body,
+    );
+    assert_eq!(fires, (0..=stop_at).collect::<Vec<_>>(), "the sink's fires");
+    assert_eq!(served, fires, "the sink's body read a frame at every fire");
+    let (_, drained) = ls_sink_records(
+        &rec,
+        cerulion_core::read_outcome::ReadOutcomeKind::DrainedBatch,
+        ReadSiteRole::Drain,
+    );
+    assert_eq!(
+        drained,
+        (0..LS_STEPS as u64).collect::<Vec<_>>(),
+        "the boundary drain counts the sink's input at every step, after the stop too"
+    );
+    rec
+}
+
+/// A one-rank free-run bag of `rec` that begins at [`LS_FIRST_STEP`], with
+/// the counter's anchor at the step before it and, when `sink_anchor` is set,
+/// the sink's: a node the resumed pass executes needs its anchor, and one it
+/// never executes needs none.
+fn write_ls_resumed_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sink_anchor: bool,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, LS_FIRST_STEP);
+    let bag = dir.path().join(name);
+    // The counter published `0..LS_FIRST_STEP` up to the anchor step.
+    let mut records = state_records(
+        CHECKPOINT_RUN,
+        LS_FIRST_STEP - 1,
+        0,
+        &anchor_blob(CHECKPOINT_SHAPE, LS_FIRST_STEP),
+    );
+    let mut named: Vec<(&str, u32)> = vec![(CP_NODE, 0)];
+    if sink_anchor {
+        let mut blob = cerulion_core::state::VecSink::new();
+        cerulion_core::state_restore::capture_anchor_blob(
+            &StoppingLatestSinkNode::default(),
+            &mut blob,
+        )
+        .expect("the sink's state fits an unbounded sink");
+        records.extend(state_records(
+            CHECKPOINT_RUN,
+            LS_FIRST_STEP - 1,
+            1,
+            &blob.into_inner(),
+        ));
+        named.push((LS_SINK, 1));
+    }
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&named)),
+        None,
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+    );
+    bag
+}
+
+/// Every `rederivation_notes` entry of a `--report` JSON, as `(kind, subject,
+/// code)`.
+fn report_rederivation_notes(report: &std::path::Path) -> Vec<(String, String, Option<String>)> {
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report).expect("the report was written"))
+            .expect("the report is JSON");
+    json["rederivation_notes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .map(|n| {
+                    (
+                        n["kind"].as_str().unwrap_or_default().to_string(),
+                        n["subject"].as_str().unwrap_or_default().to_string(),
+                        n["code"].as_str().map(str::to_string),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The CLI's own `--verify` exit code for `outcome`.
+fn verify_exit_code(outcome: &ReplayOutcome) -> u8 {
+    cerulion_cli_engine::resim_cmd::resim_exit_code(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+        true,
+    )
+}
+
+/// A sink stopped at its third frame (step 2), the step before a resumed pass's
+/// anchor, fires nothing and reads nothing in the slice while its boundary
+/// drain counts one frame per step. The bag records no stop, so the resumed
+/// pass cannot tell it from a node the scheduler never fired: at depth 1 and
+/// one writer the fourth count in the slice (step 7) passes the reads, two
+/// frames in delivery and the one queue excused before a first fire, and the
+/// unread-frame rule stands down by name. `--verify` exits 0 on it, and the
+/// stand-down is not silent: it is a `stand_down` entry with its code in the
+/// `--report` JSON, beside the judged `latest_before_first_fire` note, and one
+/// WARN line on stderr names the node and the code. The same recording
+/// re-executed from its start reproduces the stop, so nothing stands down and
+/// nothing warns.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = ls_reference(2);
+    let bag = write_ls_resumed_bag(&dir, "ls_stopped_before.mcap", &rec, false);
+    let report = dir.path().join("ls_stopped_before.json");
+    let outcome = replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        None,
+        Some(report.clone()),
+    )
+    .expect("the resumed replay runs");
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(resume.first_replay_step, LS_FIRST_STEP);
+    assert_eq!(
+        resume.restored_nodes,
+        vec![CP_NODE.to_string()],
+        "the stopped sink executes nothing in the slice, so it needs no anchor"
+    );
+    assert_eq!(outcome.ticks_replayed, LS_STEPS - LS_FIRST_STEP as usize);
+    assert!(outcome.passed, "{outcome:?}");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert_eq!(verify_exit_code(&outcome), 0, "{outcome:?}");
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(verdict.contains("replay PASS: "), "{verdict}");
+
+    assert_eq!(
+        report_rederivation_notes(&report),
+        vec![
+            (
+                "stand_down".to_string(),
+                LS_SINK.to_string(),
+                Some("latest_unfired_since_anchor".to_string()),
+            ),
+            (
+                "latest_before_first_fire".to_string(),
+                LS_SINK.to_string(),
+                None,
+            ),
+        ],
+        "the --report JSON names the stand-down by its code beside the judged note"
+    );
+    assert!(
+        has_stand_down(
+            &outcome,
+            LS_SINK,
+            replay_rederive::StandDownReason::LatestUnfiredSinceAnchor
+        ),
+        "{:?}",
+        stand_down_details(&outcome)
+    );
+    let details = stand_down_details(&outcome);
+    assert!(
+        details[0]
+            .1
+            .starts_with("not verified: node 'sink' consume = latest fire count"),
+        "{details:?}"
+    );
+
+    let from_start = dir.path().join("ls_stopped_from_start.mcap");
+    write_bag_with_coordination(&rec, &from_start, replay_engine::CoordinationMode::FreeRun);
+    let replayed = replay(
+        &from_start,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        None,
+        None,
+    )
+    .expect("the from-start replay runs");
+    assert!(replayed.passed, "{replayed:?}");
+    assert_eq!(verify_exit_code(&replayed), 0);
+    assert!(
+        replayed.rederivation_notes.is_empty(),
+        "the from-start pass re-executes the stop, so the rule judged the sink in full: {:?}",
+        replayed.rederivation_notes
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let loud: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                l.split_whitespace().any(|t| t == "WARN")
+                    && l.contains("code=\"latest_unfired_since_anchor\"")
+            })
+            .collect();
+        match loud.as_slice() {
+            [line] if line.contains("node_id=sink") => Ok(()),
+            _ => Err(format!(
+                "expected exactly one WARN naming the sink and the code, got {}: {loud:?}",
+                loud.len()
+            )),
+        }
+    });
+}
+
+/// A sink that fires inside a resumed pass and stops itself there, at its
+/// seventh frame (step 6), replayed by a build that returns a recoverable error
+/// on that frame instead: the replay re-executes the recorded fires, the fire
+/// at step 6 publishes nothing in either build, the candidate is not stopped
+/// there, and the recording holds no fire after it while the boundary drain
+/// keeps counting. The slice shows the node running, so the unread-frame rule
+/// judges it: the fourth count after the fire at step 6 (step 10) passes the
+/// frame that fire's read took and two in delivery, and is the exit-6
+/// fire-schedule divergence under `--verify`, with nothing stood down. The
+/// build the recording ran re-executes the stop at step 6 and re-derives clean,
+/// exit 0, with nothing stood down either.
+#[test]
+#[serial]
+fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_the_exit_6_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = ls_reference(6);
+    let bag = write_ls_resumed_bag(&dir, "ls_stops_inside.mcap", &rec, true);
+
+    let candidate = replay(&bag, || ls_factories(SinkFailure::Logic(6.0)), None, None)
+        .expect("the resumed replay runs");
+    let resume = candidate
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(
+        resume.restored_nodes,
+        vec![CP_NODE.to_string(), LS_SINK.to_string()]
+    );
+    assert!(
+        candidate.violations.is_empty(),
+        "{:?}",
+        candidate.violations
+    );
+    let d = candidate
+        .trace_divergence
+        .as_ref()
+        .expect("the missed fire is a fire-schedule divergence");
+    for part in [
+        "fire-schedule divergence: rank 0",
+        "node 'sink' step 10 consume = latest fire count",
+        "re-derived 1 fire(s), recorded 0 fire(s)",
+        "the trigger drain counted 4 frame(s) after the fire at step 6",
+        "reads took 1 and its writers can still have been delivering 2",
+    ] {
+        assert!(
+            d.detail.contains(part),
+            "{part:?} missing from: {}",
+            d.detail
+        );
+    }
+    assert!(!candidate.passed);
+    assert_eq!(verify_exit_code(&candidate), 6, "{candidate:?}");
+    assert!(
+        replay_engine::render_verdict(&candidate, &bag).contains("FIRE-SCHEDULE DIVERGENCE"),
+        "{}",
+        replay_engine::render_verdict(&candidate, &bag)
+    );
+    assert!(
+        stand_down_details(&candidate).is_empty(),
+        "a node the slice shows running is judged, never stood down: {:?}",
+        stand_down_details(&candidate)
+    );
+
+    let recorded_build = replay(&bag, || ls_factories(SinkFailure::Fatal(6.0)), None, None)
+        .expect("the resumed replay runs");
+    assert!(recorded_build.passed, "{recorded_build:?}");
+    assert!(
+        recorded_build.trace_divergence.is_none(),
+        "{:?}",
+        recorded_build.trace_divergence
+    );
+    assert_eq!(verify_exit_code(&recorded_build), 0);
+    assert!(
+        recorded_build.rederivation_notes.is_empty(),
+        "the re-executed stop explains every count after it: {:?}",
+        recorded_build.rederivation_notes
+    );
+}
+
 #[test]
 #[serial]
 fn a_multi_rank_free_run_mid_run_bag_is_refused_by_name() {
@@ -32451,7 +32897,9 @@ fn an_impossible_read_shape_is_reported_and_is_the_exit_6_verdict() {
 /// been written by any recorder" is not the same statement as "we declined to
 /// judge this decider". A healthy multi-rank replay legitimately declines
 /// several deciders per rank, so the generic loop STAYS `debug!`; the
-/// corrupt-recording arm alone is `warn!`.
+/// corrupt-recording arm is `warn!`, and so is the unfired-since-anchor one
+/// (pinned by
+/// `a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_silent`).
 ///
 /// Both halves in ONE body, over ONE recording shape, because neither means
 /// anything alone: a suite that only asserted the loud head would pass an

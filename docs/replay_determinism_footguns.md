@@ -292,8 +292,10 @@ writer) is excused, and the `--report` JSON names it once as a judged note (a
 before the recording starts its read log and a resumed pass starts after reads
 its bag does not keep; a count past that queue is judged as one after a fire
 is, on a resumed pass too. A resumed pass that holds no fire of the node and no
-read its body made stands down by name once a count passes that queue, because
-a node that returned `NodeError::Fatal` before the pass's anchor records exactly
+read its body made stands down by name once a count passes that queue (a
+`stand_down` entry of code `latest_unfired_since_anchor` in the `--report` JSON
+and a warning on stderr; `--verify` still exits 0 on it), because a node that
+returned `NodeError::Fatal` before the pass's anchor records exactly
 that, and so does a running node the scheduler never fired in the pass: the bag
 records no stop and the anchor does not stamp each node's stopped state. A
 from-start pass re-executes the stop, and a node that fires or reads in its

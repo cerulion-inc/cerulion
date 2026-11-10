@@ -14986,13 +14986,18 @@ fn run_rank_pass(
                 &rederive_stops,
             );
             for sd in &report.stand_downs {
-                // The corrupt-recording stand-down
-                // is the ONE arm here that is not "we declined to judge" but
-                // "this bag cannot have been written by any recorder". It says
-                // so at `warn!`, so it survives the default filter an operator
-                // actually runs under; the generic loop stays `debug!` because
-                // a healthy multi-rank replay legitimately declines several
-                // deciders per rank and a warn per decline is the flood class.
+                // Two arms here are `warn!`, so they survive the default
+                // filter an operator actually runs under. The corrupt-recording
+                // stand-down is not "we declined to judge" but "this bag cannot
+                // have been written by any recorder". The unfired-since-anchor
+                // one leaves a whole node's unread-frame rule unjudged on a
+                // `--verify` that still passes, and a node the scheduler never
+                // fired records the same resumed slice as a stopped one; it is
+                // raised at most once per node per pass, and only on a resumed
+                // pass, which has one rank. The generic loop stays `debug!`
+                // because a healthy multi-rank replay legitimately declines
+                // several deciders per rank and a warn per decline is the flood
+                // class.
                 if sd.reason == replay_rederive::StandDownReason::ImpossibleReadShape {
                     tracing::warn!(
                         rank = plan.rank(),
@@ -15002,6 +15007,16 @@ fn run_rank_pass(
                         "replay: this bag's read log carries a shape no recorder can produce \
                          (corrupt recording — re-record the bag; report-only, the verdict is \
                          unchanged. See `detail`)"
+                    );
+                } else if sd.reason == replay_rederive::StandDownReason::LatestUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this \
+                         consume = latest node, so its unread-frame rule was not verified \
+                         (report-only, the verdict is unchanged. See `detail`)"
                     );
                 } else {
                     tracing::debug!(
