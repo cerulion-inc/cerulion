@@ -6,9 +6,12 @@
 //! Each test calls `estop` on a thread of its own under a scoped subscriber
 //! whose writer holds one line, and keeps a second dispatcher alive, so
 //! tracing-core computes each callsite's interest over every live dispatcher
-//! rather than one thread's default. Transport isolation is per test
-//! (`init_for_test` SHM roots, unique topics), so the tests run in parallel.
-//! Every wait is bounded.
+//! rather than one thread's default. While the line is held a second `estop`,
+//! which takes `latch_io` and the receipt log's lock, runs to its answer.
+//! Unix only: the latch file is made unwritable with a symlink. Transport
+//! isolation is per test (`init_for_test` SHM roots, unique topics), so the
+//! tests run in parallel. Every wait is bounded.
+#![cfg(unix)]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,8 +34,8 @@ use serde_json::{json, Value};
 const OBSERVE: Duration = Duration::from_secs(5);
 
 /// How long the writer holds its line if the test never releases it: longer
-/// than both [`OBSERVE`] waits, so the frame is observed while it is held.
-const HOLD_BOUND: Duration = Duration::from_secs(30);
+/// than the four [`OBSERVE`] waits made while it is held.
+const HOLD_BOUND: Duration = Duration::from_secs(60);
 
 /// How long `estop` gets to answer after the release: the graph answers at
 /// once, and `estop` waits at most 2 s for it.
@@ -119,7 +122,6 @@ impl Write for HeldLine {
 
 /// Make `<receipts>.estop` a symlink into a directory that does not exist:
 /// the latch file reads absent and cannot be created.
-#[cfg(unix)]
 fn break_latch_file(receipts: &Path) {
     let missing = receipts
         .parent()
@@ -172,27 +174,31 @@ fn spawn_graph(
     handle
 }
 
-/// Call `estop` on a thread of its own, every line it logs written to
-/// `line`. The receiver yields its answer's JSON body.
-fn spawn_estop(
-    host: Arc<ToolHost>,
-    line: HeldLine,
-) -> (mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+/// An `estop` call's answer receiver and thread.
+type Estop = (mpsc::Receiver<Value>, std::thread::JoinHandle<()>);
+
+/// Call `estop` on a thread of its own, every line it logs written to `line`
+/// (to no subscriber when `None`). The receiver yields its answer's body.
+fn spawn_estop(host: Arc<ToolHost>, line: Option<HeldLine>) -> Estop {
     let (done_tx, done_rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || line.clone())
-            .finish();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         let args = json!({ "reason": REASON }).as_object().cloned();
-        let result = tracing::subscriber::with_default(subscriber, || {
-            runtime.block_on(host.call(ESTOP_TOOL, args))
-        });
+        let call = || runtime.block_on(host.call(ESTOP_TOOL, args));
+        let result = match line {
+            Some(line) => {
+                let subscriber = tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(move || line.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, call)
+            }
+            None => call(),
+        };
         let text = result
             .content
             .first()
@@ -204,25 +210,59 @@ fn spawn_estop(
     (done_rx, handle)
 }
 
-/// What one `estop` under a held line showed.
+/// Releases the held line and stops the stand-in graph when dropped, so a
+/// failed assert leaves no thread holding or polling.
+struct Cleanup {
+    line: HeldLine,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.line.release();
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `(verb, outcome)` of every receipt in the log, oldest first.
+fn outcomes(receipts: &Path) -> Vec<(String, String)> {
+    cerud::receipt::read_all(receipts)
+        .expect("read receipts")
+        .iter()
+        .map(|r| {
+            let outcome = serde_json::to_value(&r.outcome).expect("outcome");
+            let tag = match outcome.get("detail").and_then(Value::as_str) {
+                Some(detail) => format!("error:{detail}"),
+                None => outcome["outcome"].as_str().unwrap_or("").to_string(),
+            };
+            (r.verb.clone(), tag)
+        })
+        .collect()
+}
+
+/// What one `estop` under a held line showed. `_while_held` fields were read
+/// after its frame reached the graph and before the release.
 struct Observed {
     receipts: PathBuf,
     reached: bool,
-    /// The frame the graph received while the line was held.
     frame: Option<Value>,
     latched_while_held: bool,
+    outcomes_while_held: Vec<(String, String)>,
+    /// The latch file's text; `None` when it cannot be read.
+    latch_file_while_held: Option<String>,
+    /// The second `estop`'s frame and answer, both while the line was held.
+    second_frame: Option<Value>,
+    second_answer: Option<Value>,
     ended_by_release: Option<bool>,
     answer: Value,
     lines: Vec<String>,
-    /// `(verb, outcome)` of every receipt, oldest first.
     outcomes: Vec<(String, String)>,
-    /// The latch file's text; `None` when it cannot be read.
-    latch_file: Option<String>,
 }
 
 /// Open a host on topics private to `tag` (after `prepare` ran on the receipt
 /// log's path), arm a failed intent receipt when `fail_intent`, call `estop`
-/// with the line containing `needle` held, then release it.
+/// with the line containing `needle` held and a second `estop` once its frame
+/// arrived, then release the line.
 fn estop_with_held_line(
     tag: &str,
     needle: &'static str,
@@ -263,7 +303,11 @@ fn estop_with_held_line(
     }
 
     let line = HeldLine::new(needle);
-    let (done, estop) = spawn_estop(host.clone(), line.clone());
+    let _cleanup = Cleanup {
+        line: line.clone(),
+        stop: stop.clone(),
+    };
+    let (done, estop) = spawn_estop(host.clone(), Some(line.clone()));
     let reached = line.wait_reached();
     let frame = if reached {
         frames.recv_timeout(OBSERVE).ok()
@@ -271,35 +315,41 @@ fn estop_with_held_line(
         None
     };
     let latched_while_held = host.estopped();
+    let outcomes_while_held = outcomes(&receipts);
+    let latch_file_while_held = std::fs::read_to_string(latch_path(&receipts)).ok();
+    let second = frame.is_some().then(|| spawn_estop(host.clone(), None));
+    let second_frame = second
+        .as_ref()
+        .and_then(|_| frames.recv_timeout(OBSERVE).ok());
+    let second_answer = second
+        .as_ref()
+        .and_then(|(done, _)| done.recv_timeout(OBSERVE).ok());
     line.release();
     let answer = done.recv_timeout(ANSWER).expect("estop answered");
     estop.join().expect("estop thread");
+    if let Some((done, handle)) = second {
+        if second_answer.is_none() {
+            done.recv_timeout(ANSWER).expect("second estop answered");
+        }
+        handle.join().expect("second estop thread");
+    }
     stop.store(true, Ordering::Relaxed);
     graph.join().expect("graph thread");
-
     cerulion_rcpd::audit::verify_log(&receipts).expect("chain intact");
-    let outcomes = cerud::receipt::read_all(&receipts)
-        .expect("read receipts")
-        .iter()
-        .map(|r| {
-            let outcome = serde_json::to_value(&r.outcome).expect("outcome");
-            let tag = match outcome.get("detail").and_then(Value::as_str) {
-                Some(detail) => format!("error:{detail}"),
-                None => outcome["outcome"].as_str().unwrap_or("").to_string(),
-            };
-            (r.verb.clone(), tag)
-        })
-        .collect();
+
     let observed = Observed {
         receipts: receipts.clone(),
         reached,
         frame,
         latched_while_held,
+        outcomes_while_held,
+        latch_file_while_held,
+        second_frame,
+        second_answer,
         ended_by_release: line.ended_by_release(),
         answer,
         lines: line.lines(),
-        outcomes,
-        latch_file: std::fs::read_to_string(latch_path(&receipts)).ok(),
+        outcomes: outcomes(&receipts),
     };
     drop(host);
     drop(dir);
@@ -307,7 +357,8 @@ fn estop_with_held_line(
 }
 
 /// The asserts every case shares: the line was held, the frame reached the
-/// graph while it was, and `estop` answered once it was released.
+/// graph while it was, a second `estop` ran to its answer while it was, and
+/// the first answered once it was released.
 fn assert_frame_while_held(o: &Observed) {
     assert!(o.reached, "the held line was never written: {:?}", o.lines);
     assert_eq!(
@@ -325,6 +376,16 @@ fn assert_frame_while_held(o: &Observed) {
     assert_eq!(frame["args"], json!({ "reason": REASON }));
     assert_eq!(frame["call_id"], o.answer["call_id"]);
     assert!(o.latched_while_held, "the latch read closed while held");
+    let Some(second) = o.second_frame.as_ref() else {
+        panic!("a second estop's frame did not reach the graph while the line was held");
+    };
+    let second_answer = o
+        .second_answer
+        .as_ref()
+        .expect("a second estop answered while the line was held");
+    assert_eq!(second["tool"], json!(ESTOP_TOOL));
+    assert_eq!(second["call_id"], second_answer["call_id"]);
+    assert_eq!(second_answer["graph_acknowledged"], json!(true));
     assert_eq!(o.answer["estopped"], json!(true));
     assert_eq!(o.answer["graph_acknowledged"], json!(true), "{}", o.answer);
 }
@@ -349,18 +410,27 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn a_held_latch_file_error_line_does_not_hold_the_estop_frame() {
     let o = estop_with_held_line("latch", "latch file not written", break_latch_file, false);
     assert_frame_while_held(&o);
     assert_eq!(o.lines, [latch_line(&o.receipts), ENGAGED_LINE.to_string()]);
     assert!(o.answer["receipt"]["seq"].is_u64(), "{}", o.answer);
+    assert_eq!(o.outcomes_while_held, pairs(&[(ESTOP_TOOL, "intent")]));
+    assert_eq!(
+        o.latch_file_while_held, None,
+        "the latch file was not written"
+    );
+    // The first intent, the second estop's intent and ok, the first's ok.
     assert_eq!(
         o.outcomes,
-        pairs(&[(ESTOP_TOOL, "intent"), (ESTOP_TOOL, "ok")])
+        pairs(&[
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            (ESTOP_TOOL, "ok")
+        ])
     );
-    assert_eq!(o.latch_file, None, "the latch file was not written");
 }
 
 #[test]
@@ -373,15 +443,23 @@ fn a_held_receipt_error_line_does_not_hold_the_estop_frame() {
         Value::Null,
         "the intent was not written"
     );
-    assert_eq!(o.outcomes, pairs(&[(ESTOP_TOOL, "ok")]));
+    assert!(
+        o.outcomes_while_held.is_empty(),
+        "{:?}",
+        o.outcomes_while_held
+    );
+    assert_eq!(o.latch_file_while_held.as_deref(), Some("held\n"));
+    // The second estop's intent and ok, the first's ok.
     assert_eq!(
-        o.latch_file.as_deref(),
-        Some("held\n"),
-        "the latch file was written"
+        o.outcomes,
+        pairs(&[
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            (ESTOP_TOOL, "ok")
+        ])
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn with_both_writes_failed_the_error_lines_follow_the_frame_in_order() {
     let o = estop_with_held_line("both", "latch file not written", break_latch_file, true);
@@ -394,6 +472,18 @@ fn with_both_writes_failed_the_error_lines_follow_the_frame_in_order() {
             ENGAGED_LINE.to_string()
         ]
     );
-    assert_eq!(o.outcomes, pairs(&[(ESTOP_TOOL, "ok")]));
-    assert_eq!(o.latch_file, None, "the latch file was not written");
+    assert!(
+        o.outcomes_while_held.is_empty(),
+        "{:?}",
+        o.outcomes_while_held
+    );
+    assert_eq!(o.latch_file_while_held, None);
+    assert_eq!(
+        o.outcomes,
+        pairs(&[
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            (ESTOP_TOOL, "ok")
+        ])
+    );
 }
