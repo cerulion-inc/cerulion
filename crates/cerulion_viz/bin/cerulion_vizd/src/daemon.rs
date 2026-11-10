@@ -882,17 +882,19 @@ struct DaemonState {
     /// survives the mirror's whole lifecycle; it is only overwritten by a later remote
     /// attach of the same topic (a different origin robot re-points it).
     remote_provenance: BTreeMap<String, String>,
-    /// A short-TTL CACHE of the mirror-provenance snapshot (topic → origin
-    /// robot) so `discover` does not pay a 150-600 ms `/__cerulion/mirrors` gather on
-    /// EVERY ~2 s sidebar poll while a mirror is live (the cerulion_core registry fast
-    /// path only short-circuits a registry-LESS desk — exactly NOT the fixed scenario).
-    /// Refreshed on a cache MISS (`None`, or older than [`PROVENANCE_CACHE_TTL`]) and
-    /// INVALIDATED on the mutation points vizd itself drives (`attach_remote` / `detach`,
-    /// which demand/release the mirror), so the user's own check/uncheck reflects on the
-    /// very next discover. A stale entry only mis-groups a row for at most ONE poll cycle
-    /// before the TTL forces a re-gather — acceptable (the defect to avoid is a PERSISTENT
-    /// mis-group, not a one-cycle transient).
-    mirror_provenance: Option<(Instant, BTreeMap<String, String>)>,
+    /// A short-TTL CACHE of the mirror-provenance snapshot (topic to origin
+    /// robot), with its gather stamp and invalidation generation (see
+    /// [`ProvenanceCache`]), so `discover` does not pay a 150-600 ms
+    /// `/__cerulion/mirrors` gather on EVERY ~2 s sidebar poll while a mirror is live
+    /// (the cerulion_core registry fast path only short-circuits a desk with no
+    /// registry writer). Refreshed on a cache MISS (never filled, invalidated, or
+    /// older than [`PROVENANCE_CACHE_TTL`]). INVALIDATED per topic on the mutation
+    /// points vizd itself drives (`attach_remote` / `detach`, which demand/release
+    /// the mirror), so the user's own check/uncheck reflects on the very next read,
+    /// and a gather already in flight cannot store the pre-mutation map over it. A
+    /// stale entry only mis-groups a row for at most ONE poll cycle before the TTL
+    /// forces a re-gather.
+    mirror_provenance: ProvenanceCache,
     /// The operator's per-TOPIC representation choice, for topics they
     /// overrode. Absent means [`Representation::Auto`].
     ///
@@ -1027,10 +1029,8 @@ impl DaemonState {
         // MOVED OUT rather than cloned: the loop below mutates `self.stats` and
         // `self.monitors`, so it cannot hold a borrow of `self.mirror_provenance`.
         // Put back before returning, so this is a read of the cache and nothing more.
-        let Some((at, mirrors)) = self.mirror_provenance.take() else {
-            return;
-        };
-        if at.elapsed() < PROVENANCE_CACHE_TTL {
+        let cache = std::mem::take(&mut self.mirror_provenance);
+        if let Some(mirrors) = cache.fresh(Instant::now()) {
             for topic in self.taps.list() {
                 let Some(stat) = self.stats.get(&topic) else {
                     continue;
@@ -1044,7 +1044,7 @@ impl DaemonState {
                 }
             }
         }
-        self.mirror_provenance = Some((at, mirrors));
+        self.mirror_provenance = cache;
     }
 }
 
@@ -1085,6 +1085,84 @@ fn hint_refresh_target(
 /// written as a multiple of this constant cannot silently fall under it again if
 /// the TTL is ever raised.
 pub const PROVENANCE_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// The stored mirror-provenance snapshot: the last gathered `topic -> origin
+/// robot` map, when it was gathered, and an invalidation GENERATION.
+///
+/// The map is FRESH while it was gathered less than [`PROVENANCE_CACHE_TTL`] ago
+/// and nothing has invalidated it since; [`Self::fresh`] serves only that. An
+/// invalidation drops one topic and marks the rest stale, keeping them stored.
+///
+/// The generation orders gathers against invalidations. A gather reads it before
+/// it starts, and [`Self::store`] refuses the answer when an [`Self::invalidate`]
+/// has landed since, so a gather that read the registry before a `detach` cannot
+/// put the detached topic's robot back.
+///
+/// No clock read happens in here: every instant is a parameter.
+#[derive(Debug, Default, PartialEq)]
+struct ProvenanceCache {
+    /// The last stored map; `None` until the first store.
+    snapshot: Option<BTreeMap<String, String>>,
+    /// When the stored map was gathered; `None` before the first store and after
+    /// every invalidation.
+    gathered_at: Option<Instant>,
+    /// Bumped by every [`Self::invalidate`].
+    generation: u64,
+}
+
+impl ProvenanceCache {
+    /// The stored map while it is fresh at `now`: gathered strictly less than
+    /// [`PROVENANCE_CACHE_TTL`] before `now`, and not invalidated since.
+    fn fresh(&self, now: Instant) -> Option<&BTreeMap<String, String>> {
+        let at = self.gathered_at?;
+        if now.saturating_duration_since(at) < PROVENANCE_CACHE_TTL {
+            self.snapshot.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The generation a gather reads before it starts and hands back to
+    /// [`Self::store`].
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Store `map`, gathered at `at` by a gather that read `generation` before it
+    /// started. Refused, changing nothing, when an invalidation has landed since;
+    /// returns whether the map was stored.
+    fn store(&mut self, map: BTreeMap<String, String>, generation: u64, at: Instant) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.snapshot = Some(map);
+        self.gathered_at = Some(at);
+        true
+    }
+
+    /// Drop `topic` from the stored map, mark the rest stale, and move the
+    /// generation so a gather already in flight cannot store over it.
+    fn invalidate(&mut self, topic: &str) {
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            snapshot.remove(topic);
+        }
+        self.gathered_at = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Move the gather stamp `by` into the past. `false` when there is no stamp
+    /// or the clock cannot represent the earlier instant.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn age_by(&mut self, by: Duration) -> bool {
+        match self.gathered_at.and_then(|at| at.checked_sub(by)) {
+            Some(earlier) => {
+                self.gathered_at = Some(earlier);
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// The gate every mirror-provenance gather passes between its registry read and
 /// the store of its answer, in builds with the test seams only.
@@ -1525,6 +1603,8 @@ struct Ctx {
     provenance_gathers_started: Arc<AtomicU64>,
     /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_discarded`].
     provenance_gathers_discarded: Arc<AtomicU64>,
+    /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_failed`].
+    provenance_gathers_failed: Arc<AtomicU64>,
     /// TEST-ONLY gate between a provenance gather and the store of its answer.
     /// See [`RunningDaemon::hold_provenance_gather_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
@@ -4365,9 +4445,10 @@ impl Ctx {
             .remote_provenance
             .insert(topic.clone(), robot.clone());
         // This attach DEMANDED a mirror from netd (which registers its
-        // provenance), so the cached snapshot is now stale — drop it so the next
-        // discover re-gathers and folds the new mirror to its robot promptly.
-        self.invalidate_mirror_provenance_cache();
+        // provenance), so the stored snapshot's answer for this topic is stale: drop
+        // it, so the next read that refreshes gathers again and folds the new mirror
+        // to its robot, and a gather already in flight cannot store over it.
+        self.invalidate_mirror_provenance_cache(&topic);
         // Keep the reapply-warn snapshot current (a new remote tap changes the set).
         self.refresh_attached_snapshot();
         // Decision: a checked-but-unmappable REMOTE topic is LOUD too — its
@@ -4483,9 +4564,11 @@ impl Ctx {
             );
         }
         // The release tears the mirror down (netd refcount-0), so its
-        // provenance is about to disappear — drop the cached snapshot so the next
-        // discover re-gathers and the topic returns to its robot row promptly.
-        self.invalidate_mirror_provenance_cache();
+        // provenance is about to disappear: drop this topic from the stored
+        // snapshot, so the next read that refreshes gathers again and the topic
+        // returns to its robot row promptly, and a gather already in flight cannot
+        // store the pre-detach answer over it.
+        self.invalidate_mirror_provenance_cache(&topic);
         // Keep the reapply-warn snapshot current (the detached topic left the set —
         // a reconnect re-applying a layout rooted only at it now warns it's empty).
         self.refresh_attached_snapshot();
@@ -4801,26 +4884,32 @@ impl Ctx {
     /// The CURRENT mirror-provenance snapshot as a `topic → origin robot`
     /// map, served from a short-TTL CACHE ([`DaemonState::mirror_provenance`]) so a live
     /// mirror does not cost `discover` a 150-600 ms gather on every poll. On a cache
-    /// MISS (`None` or older than [`PROVENANCE_CACHE_TTL`]) it re-gathers from the desk's
+    /// MISS (never filled, invalidated, or older than [`PROVENANCE_CACHE_TTL`]) it
+    /// re-gathers from the desk's
     /// `/__cerulion/mirrors` registry over THIS daemon's transport node (the parity of
-    /// the CLI's `topic_cmd::gather_mirror_provenance`) and stores the fresh snapshot.
-    /// The gather runs OUTSIDE the state lock (it can block up to the window); a
-    /// concurrent double-gather just overwrites (harmless, last-write-wins). BEST-EFFORT
+    /// the CLI's `topic_cmd::gather_mirror_provenance`) and stores the fresh snapshot,
+    /// unless an invalidation landed after the gather read the generation: that store
+    /// is refused and counted ([`RunningDaemon::provenance_gathers_discarded`]), and
+    /// the caller still answers from its own gather.
+    /// The gather runs OUTSIDE the state lock (it opens the registry, then listens
+    /// for up to the window); two
+    /// concurrent gathers that read the same generation both store, and the later
+    /// store wins. BEST-EFFORT
     /// and network-free: a registry-less desk returns empty INSTANTLY (the no-publisher
     /// fast path in cerulion_core), and ANY gather error is treated as "no provenance" (a
     /// `debug!` breadcrumb, cached like a real snapshot so a transient registry error
     /// does not re-storm the gather) so `discover` never fails on the registry — the
     /// stated fallback is that a mirrored topic shows as LOCAL (pre-fold).
     fn gather_mirror_provenance(&self) -> std::collections::BTreeMap<String, String> {
-        // Fast path: a fresh cached snapshot (the common steady-state poll).
-        {
-            let st = self.state.lock().unwrap();
-            if let Some((at, snapshot)) = st.mirror_provenance.as_ref() {
-                if at.elapsed() < PROVENANCE_CACHE_TTL {
-                    return snapshot.clone();
-                }
+        // Fast path: a fresh snapshot (the common steady-state poll). A miss reads the
+        // generation under the same lock, so an invalidation after it refuses the store.
+        let generation = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(snapshot) = st.mirror_provenance.fresh(Instant::now()) {
+                return snapshot.clone();
             }
-        }
+            st.mirror_provenance.generation()
+        };
         // Cache miss — gather OUTSIDE the lock (the drain can block up to the window).
         self.provenance_gathers_started
             .fetch_add(1, Ordering::Relaxed);
@@ -4831,18 +4920,29 @@ impl Ctx {
                 .map(|r| (r.topic, r.origin_robot))
                 .collect(),
             Err(e) => {
+                self.provenance_gathers_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     error = %e,
-                    "cerulion-vizd discover: mirror-provenance gather failed — treating as no \
-                     mirrors (any mirrored topics show as LOCAL this sweep)"
+                    "cerulion-vizd: mirror-provenance gather failed, treating as no mirrors \
+                     (any mirrored topics show as LOCAL until the next refresh)"
                 );
                 std::collections::BTreeMap::new()
             }
         };
         #[cfg(any(test, feature = "test-helpers"))]
         self.provenance_gate.pass();
-        let mut st = self.state.lock().unwrap();
-        st.mirror_provenance = Some((Instant::now(), fresh.clone()));
+        // Stamped at completion, so the TTL runs from when the answer was known.
+        let stored = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mirror_provenance
+            .store(fresh.clone(), generation, Instant::now());
+        if !stored {
+            self.provenance_gathers_discarded
+                .fetch_add(1, Ordering::Relaxed);
+        }
         fresh
     }
 
@@ -4869,11 +4969,12 @@ impl Ctx {
     /// genuine desk producer taking the name; the tap's own record dies with the
     /// tap, so it can only ever describe the generation that earned it.
     ///
-    /// COST: a cache MISS pays the `/__cerulion/mirrors` gather (up to
+    /// COST: a cache MISS pays the `/__cerulion/mirrors` gather (the registry open,
+    /// then up to
     /// [`MIRROR_GATHER_WINDOW`](cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW),
     /// ~600 ms, and instant on a desk with no live mirror), so `list`/`status` are
     /// not unconditionally O(1). The [`PROVENANCE_CACHE_TTL`] cache means at most
-    /// one such gather per 3 s across all three verbs.
+    /// one such gather per 3 s across all three verbs while nothing invalidates.
     ///
     /// Takes the state lock, so callers must NOT already hold it.
     fn attribution_snapshot(&self) -> std::collections::BTreeMap<String, String> {
@@ -4958,12 +5059,19 @@ impl Ctx {
             .collect()
     }
 
-    /// Drop the cached mirror-provenance snapshot so the NEXT `discover`
-    /// re-gathers fresh. Called on the mutation points vizd itself drives (`attach_remote`
-    /// demands a mirror, `detach` releases one), so the user's own check/uncheck is
-    /// reflected on the very next discover instead of waiting out the TTL.
-    fn invalidate_mirror_provenance_cache(&self) {
-        self.state.lock().unwrap().mirror_provenance = None;
+    /// Drop `topic` from the stored mirror-provenance snapshot, mark the rest
+    /// stale so the NEXT read that refreshes gathers again, and refuse the store of
+    /// any gather already in flight. Called on the mutation points vizd itself
+    /// drives (`attach_remote` demands a mirror, `detach` releases one), so the
+    /// user's own check/uncheck is reflected on the very next read instead of
+    /// waiting out the TTL, and a gather that read the registry before the
+    /// mutation cannot store the old answer over it.
+    fn invalidate_mirror_provenance_cache(&self, topic: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mirror_provenance
+            .invalidate(topic);
     }
 
     /// `discover`: every attachable local topic + a best-effort resolved schema.
@@ -7213,6 +7321,9 @@ pub struct RunningDaemon {
     /// Mirror-provenance answers refused at store time; see
     /// [`Self::provenance_gathers_discarded`].
     provenance_gathers_discarded: Arc<AtomicU64>,
+    /// Mirror-provenance gathers that failed; see
+    /// [`Self::provenance_gathers_failed`].
+    provenance_gathers_failed: Arc<AtomicU64>,
     /// See [`Self::hold_provenance_gather_for_test`]; also released by
     /// [`Self::shutdown`]. Gated for the same `dead_code = "deny"` reason as
     /// `poll_injected_work_ns` above.
@@ -7531,6 +7642,16 @@ impl RunningDaemon {
         self.provenance_gathers_discarded.load(Ordering::Relaxed)
     }
 
+    /// Principle #3 observable: gathers whose registry read FAILED. Each one's
+    /// empty map is stored like a real answer (unless an invalidation refuses the
+    /// store, see [`Self::provenance_gathers_discarded`]), so until the next
+    /// refresh no topic is attributed from the name-keyed half. It only grows, so a
+    /// rise across a read means that read's empty answer came from an error, not
+    /// from the registry.
+    pub fn provenance_gathers_failed(&self) -> u64 {
+        self.provenance_gathers_failed.load(Ordering::Relaxed)
+    }
+
     /// Hold every mirror-provenance gather between its registry read and the
     /// store of its answer, until the returned hold is dropped.
     ///
@@ -7557,23 +7678,16 @@ impl RunningDaemon {
     /// Move the stored mirror-provenance snapshot's gather stamp `by` into the
     /// past, so it reads as older than [`PROVENANCE_CACHE_TTL`] without a sleep.
     ///
-    /// Returns `false`, and changes nothing, when the daemon has stopped, no
-    /// gather has stamped a snapshot, or the monotonic clock cannot represent
-    /// the earlier instant.
+    /// Returns `false`, and changes nothing, when the daemon state is gone, the
+    /// snapshot carries no stamp (nothing stored yet, or invalidated since), or
+    /// the monotonic clock cannot represent the earlier instant.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn age_provenance_snapshot_for_test(&self, by: Duration) -> bool {
         let Some(state) = self.provenance_state.upgrade() else {
             return false;
         };
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((at, _)) = st.mirror_provenance.as_mut() else {
-            return false;
-        };
-        let Some(earlier) = at.checked_sub(by) else {
-            return false;
-        };
-        *at = earlier;
-        true
+        st.mirror_provenance.age_by(by)
     }
 
     /// Fail the next `n` mirror-provenance gathers with
@@ -7829,6 +7943,7 @@ pub fn start_on_socket(
         runs_local_delay_ns: Arc::new(AtomicU64::new(0)),
         provenance_gathers_started: Arc::new(AtomicU64::new(0)),
         provenance_gathers_discarded: Arc::new(AtomicU64::new(0)),
+        provenance_gathers_failed: Arc::new(AtomicU64::new(0)),
         #[cfg(any(test, feature = "test-helpers"))]
         provenance_gate: Arc::new(ProvenanceGate::default()),
         #[cfg(any(test, feature = "test-helpers"))]
@@ -7946,6 +8061,7 @@ pub fn start_on_socket(
         runs_local_delay_ns: Arc::clone(&ctx.runs_local_delay_ns),
         provenance_gathers_started: Arc::clone(&ctx.provenance_gathers_started),
         provenance_gathers_discarded: Arc::clone(&ctx.provenance_gathers_discarded),
+        provenance_gathers_failed: Arc::clone(&ctx.provenance_gathers_failed),
         #[cfg(any(test, feature = "test-helpers"))]
         provenance_gate: Arc::clone(&ctx.provenance_gate),
         #[cfg(any(test, feature = "test-helpers"))]
@@ -12684,6 +12800,92 @@ mod tests {
             rows[0].samples, learned,
             "…with everything it had learned: {rows:?}"
         );
+    }
+
+    /// The provenance cache against hand-written vectors: never filled, fresh
+    /// strictly inside the TTL, a per-topic invalidation that keeps the rest of the
+    /// map, and a store refused for a gather that read an older generation.
+    #[test]
+    fn provenance_cache_keeps_its_map_at_any_age_and_refuses_a_store_from_an_older_generation() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(topic, robot)| (topic.to_string(), robot.to_string()))
+                .collect()
+        };
+        let state = |pairs: Option<&[(&str, &str)]>, at: Option<Instant>, generation: u64| {
+            ProvenanceCache {
+                snapshot: pairs.map(map),
+                gathered_at: at,
+                generation,
+            }
+        };
+        let ab: &[(&str, &str)] = &[("/a", "r1"), ("/b", "r2")];
+        let run = |t0: Instant| -> (ProvenanceCache, ProvenanceCache) {
+            let t1 = t0 + Duration::from_secs(1);
+            let mut cache = ProvenanceCache::default();
+            assert_eq!(cache.fresh(t0), None, "never filled: nothing is fresh");
+            assert_eq!(cache.generation(), 0);
+
+            assert!(cache.store(map(ab), 0, t1));
+            assert_eq!(
+                cache.fresh(t0),
+                Some(&map(ab)),
+                "a `now` before the stamp counts as no time elapsed"
+            );
+            assert_eq!(
+                cache.fresh(t1 + PROVENANCE_CACHE_TTL - Duration::from_nanos(1)),
+                Some(&map(ab)),
+                "fresh one nanosecond inside the TTL"
+            );
+            assert_eq!(
+                cache.fresh(t1 + PROVENANCE_CACHE_TTL),
+                None,
+                "stale at exactly the TTL"
+            );
+            assert_eq!(cache, state(Some(ab), Some(t1), 0), "stale, yet kept");
+
+            cache.invalidate("/a");
+            assert_eq!(
+                cache,
+                state(Some(&[("/b", "r2")]), None, 1),
+                "an invalidation drops only its own topic and marks the rest stale"
+            );
+            assert_eq!(cache.fresh(t1), None);
+            let mut aged = state(Some(&[("/b", "r2")]), None, 1);
+            assert!(
+                !aged.age_by(Duration::from_secs(1)),
+                "no stamp, nothing to age"
+            );
+
+            assert!(
+                !cache.store(map(&[("/a", "r1")]), 0, t1),
+                "a gather that read generation 0 is refused"
+            );
+            assert_eq!(
+                cache,
+                state(Some(&[("/b", "r2")]), None, 1),
+                "a refused store changes nothing"
+            );
+
+            assert!(cache.store(map(&[("/c", "r3")]), 1, t1));
+            assert_eq!(cache.fresh(t1), Some(&map(&[("/c", "r3")])));
+
+            let mut cold = ProvenanceCache::default();
+            cold.invalidate("/a");
+            assert_eq!(
+                cold,
+                state(None, None, 1),
+                "invalidating a never-filled cache keeps it never filled"
+            );
+            (cache, cold)
+        };
+        let t0 = Instant::now();
+        assert_eq!(run(t0), run(t0), "two runs of one sequence agree");
+
+        let mut wrapped = state(None, None, u64::MAX);
+        wrapped.invalidate("/a");
+        assert_eq!(wrapped.generation(), 0, "the generation wraps");
     }
 
     /// The injected-fault counter hands out exactly as many faults as were armed
