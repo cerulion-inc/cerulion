@@ -33,6 +33,10 @@
 //!   take, is drained by the next wait's entry pass: every round wakes on its
 //!   publish, no notification fires a later block, and an idle wait after the
 //!   last round times out with no fd wake;
+//! * a woken pass on which the publisher-event pump runs drains the woken
+//!   listener before its probe and still returns the message: exactly that
+//!   subscription is ready, the drained notification fires no later block, and
+//!   the next publish still wakes one;
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
 //!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
 //!   block parks while a bell is mapped, and every later block of the call
@@ -423,6 +427,38 @@ unsafe fn wait_on_sub_in_thread(
             &t,
         );
         (ret, !sub_ptrs[0].is_null())
+    })
+}
+
+/// Run `rmw_wait` on TWO subscriptions in a thread; returns (ret, ready per
+/// subscription).
+unsafe fn wait_on_two_subs_in_thread(
+    sub_datas: [*mut c_void; 2],
+    ws: *mut ffi::rmw_wait_set_t,
+    timeout: Duration,
+) -> std::thread::JoinHandle<(ffi::rmw_ret_t, [bool; 2])> {
+    let sub_addrs = sub_datas.map(|d| d as usize);
+    let ws_addr = ws as usize;
+    std::thread::spawn(move || unsafe {
+        let mut sub_ptrs = sub_addrs.map(|a| a as *mut c_void);
+        let mut subs = ffi::rmw_subscriptions_t {
+            subscriber_count: 2,
+            subscribers: sub_ptrs.as_mut_ptr(),
+        };
+        let t = ffi::rmw_time_t {
+            sec: timeout.as_secs(),
+            nsec: u64::from(timeout.subsec_nanos()),
+        };
+        let ret = rmw_wait(
+            &mut subs,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            ws_addr as *mut ffi::rmw_wait_set_t,
+            &t,
+        );
+        (ret, sub_ptrs.map(|p| !p.is_null()))
     })
 }
 
@@ -3291,6 +3327,45 @@ fn claim_pump_interval() -> u64 {
     rt.last_pump_ms.load(Ordering::Relaxed)
 }
 
+/// Holds the process-wide publisher-event pump off: `last_pump_ms` at `u64::MAX`
+/// leaves the throttle no elapsed time (`now.saturating_sub(MAX)` is 0), so no
+/// `rmw_wait` pass pumps until [`PumpHeldOff::release`] stores 0, which makes the
+/// pump due on the next pass. A guard dropped unreleased (a panicking test) stores
+/// 0 as well, so the hold never outlives the test that took it.
+struct PumpHeldOff {
+    rt: &'static rmw_cerulion::runtime::Runtime,
+}
+
+impl PumpHeldOff {
+    fn new() -> Self {
+        let rt = rmw_cerulion::runtime::runtime().expect("the rmw runtime is up");
+        rt.last_pump_ms.store(u64::MAX, Ordering::Relaxed);
+        Self { rt }
+    }
+
+    /// Make the pump due on the next `rmw_wait` pass. A 0 stamp is due only
+    /// once the runtime is 20 ms old.
+    fn release(self) {
+        assert!(
+            self.rt.started.elapsed() >= Duration::from_millis(20),
+            "a 0 pump stamp is due only once the runtime is 20 ms old"
+        );
+        self.rt.last_pump_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Drop for PumpHeldOff {
+    fn drop(&mut self) {
+        // A released hold's stamp is no longer MAX, so this is a no-op then.
+        let _ = self.rt.last_pump_ms.compare_exchange(
+            u64::MAX,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 /// One deferred-drain round on `subscription`: a waiter blocks, one message is
 /// published into its block, and the test takes it. Every attempt checks that
 /// the wait returns OK with the subscription ready and that the take delivers
@@ -3561,6 +3636,190 @@ unsafe fn deferred_drain_rounds(tier: &str) {
     assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
     assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
     assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+}
+
+/// A woken pass on which the publisher-event pump runs probes every attached
+/// entity, so it drains the woken listener BEFORE its probe, and it still returns
+/// the message. The wait set holds the published subscription A and an idle
+/// subscription B, which turns the pass's scope into a counter: a woken pass that
+/// probes every entity runs two post-wake probes, one that probes only what fired
+/// runs one. The pump is held off (`PumpHeldOff`) while the waiter climbs to the
+/// 20 ms cap rung and enters a fresh block; then it is made due and a message is
+/// published into that block, so the pass the block's wake starts is the one that
+/// pumps. An attempt counts only if the block ended on the publish and its pass
+/// probed both subscriptions (no new block, one fd wake, no timed-out block, two
+/// post-wake probes); an attempt whose block timed out around the release is run
+/// again, up to `PUMP_ATTEMPTS` times, and then the test fails naming each
+/// attempt's deltas. On the counted attempt exactly A is ready, the pass drained
+/// one listener and left A's listener unreadable, the pump stamp moved off the
+/// release value, and the take delivers the value with no drain of its own and
+/// leaves nothing for the next take. A 100 ms wait after it times out with no fd
+/// wake (the drained notification fires nothing), and a deferred-drain round on A
+/// then wakes on its publish and leaves the listener readable, so the drained
+/// listener still wakes a block. Fd tier on every platform
+/// (`CERULION_MONITOR_WAIT=0`, which also turns the period-park prediction off),
+/// spin off.
+#[test]
+#[serial]
+fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
+    use cerulion_core::transport::subscriber::listener_drain_count;
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "0");
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevPw{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_pw_{suffix}"));
+        let topic_a = CString::new(format!("/rmw_wev/pw_a/{suffix}")).expect("topic");
+        let topic_b = CString::new(format!("/rmw_wev/pw_b/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let sub_a = rmw_create_subscription(node, ts, topic_a.as_ptr(), &qos, &sub_opts);
+        let sub_b = rmw_create_subscription(node, ts, topic_b.as_ptr(), &qos, &sub_opts);
+        assert!(!sub_a.is_null() && !sub_b.is_null());
+        let pub_a = rmw_create_publisher(node, ts, topic_a.as_ptr(), &qos, &pub_opts);
+        assert!(!pub_a.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+        let data = &*((*ws).data as *const WaitSetData);
+        let rt = rmw_cerulion::runtime::runtime().expect("the rmw runtime is up");
+        let listener = listener_fd_of(sub_a);
+        let subs = [(*sub_a).data, (*sub_b).data];
+        let take_a = |out: &mut CPoint| -> bool {
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    sub_a,
+                    out as *mut CPoint as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            taken
+        };
+
+        // (blocks entered, fd wakes, timed-out blocks, post-wake probes) after the
+        // release: the counted shape is (0, 1, 0, 2).
+        let mut misses = Vec::new();
+        let mut counted = None;
+        for attempt in 0..PUMP_ATTEMPTS {
+            let sent = CPoint {
+                x: 7.0,
+                y: -3.0,
+                z: f64::from(attempt),
+            };
+            let hold = PumpHeldOff::new();
+            let handle = wait_on_two_subs_in_thread(subs, ws, Duration::from_secs(5));
+            await_cap_rung(ws);
+            let block = await_fresh_block(ws, blocks_entered(ws));
+            let fd_wakes0 = data.fd_wakes.load(Ordering::Relaxed);
+            let timeouts0 = data.timeout_wakes.load(Ordering::Relaxed);
+            let drains0 = data.drain_calls.load(Ordering::Relaxed);
+            let probes0 = data.probes_wake.load(Ordering::Relaxed);
+            hold.release();
+            assert_eq!(
+                rmw_publish(
+                    pub_a,
+                    &sent as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            let (ret, ready) = handle.join().expect("wait thread");
+            let deltas = (
+                blocks_entered(ws) - block,
+                data.fd_wakes.load(Ordering::Relaxed) - fd_wakes0,
+                data.timeout_wakes.load(Ordering::Relaxed) - timeouts0,
+                data.probes_wake.load(Ordering::Relaxed) - probes0,
+            );
+            // Both read before any take, so neither can be the take's doing.
+            let drained = data.drain_calls.load(Ordering::Relaxed) - drains0;
+            let readable = fd_readable_within(listener, Duration::ZERO);
+            if deltas == (0, 1, 0, 2) {
+                counted = Some((ret, ready, drained, readable, sent));
+                break;
+            }
+            let mut out = CPoint::default();
+            assert!(
+                take_a(&mut out) && out == sent,
+                "attempt {attempt}: an attempt that does not count still delivers its message"
+            );
+            misses.push(deltas);
+        }
+        let Some((ret, ready, drained, readable, sent)) = counted else {
+            panic!(
+                "no attempt of {PUMP_ATTEMPTS} ran the pump on the pass its publish woke \
+                 ((blocks entered, fd wakes, timed-out blocks, post-wake probes) after the \
+                 release, (0, 1, 0, 2) counts): {misses:?}"
+            );
+        };
+        eprintln!(
+            "pumped-wake: attempts={} uncounted={misses:?} drain_calls_delta={drained}",
+            misses.len() + 1
+        );
+        assert_eq!(ret, RMW_RET_OK, "the pumped woken pass returns");
+        assert_eq!(
+            ready,
+            [true, false],
+            "exactly the published subscription is ready"
+        );
+        assert_eq!(
+            (drained, readable),
+            (1, false),
+            "the pumped woken pass drains the woken listener before its probe \
+             (drain_calls delta, listener readable)"
+        );
+        let stamp = rt.last_pump_ms.load(Ordering::Relaxed);
+        assert!(
+            stamp != 0 && stamp != u64::MAX,
+            "the woken pass ran the pump, which stamps the time (last_pump_ms {stamp})"
+        );
+        let drains_before_take = listener_drain_count();
+        let mut out = CPoint::default();
+        assert!(take_a(&mut out), "the take delivers");
+        assert_eq!(out, sent, "the published value");
+        assert_eq!(
+            listener_drain_count(),
+            drains_before_take,
+            "the take runs no listener drain"
+        );
+        let mut again = CPoint::default();
+        assert!(!take_a(&mut again), "one message, one take");
+
+        let fd_wakes_idle = data.fd_wakes.load(Ordering::Relaxed);
+        let handle = wait_on_two_subs_in_thread(subs, ws, Duration::from_millis(100));
+        let (ret, ready) = handle.join().expect("idle wait thread");
+        assert_eq!(ret, ffi::RMW_RET_TIMEOUT, "nothing published, so a timeout");
+        assert_eq!(ready, [false, false], "nothing is ready");
+        assert_eq!(
+            data.fd_wakes.load(Ordering::Relaxed) - fd_wakes_idle,
+            0,
+            "the drained notification fires no later block"
+        );
+        assert!(
+            !fd_readable_within(listener, Duration::ZERO),
+            "the listener stays drained"
+        );
+
+        deferred_round(
+            "after the pumped wake",
+            sub_a,
+            pub_a,
+            ws,
+            listener,
+            CPoint {
+                x: 8.0,
+                y: -3.0,
+                z: 0.0,
+            },
+        );
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, pub_a), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, sub_a), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, sub_b), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
 }
 
 /// System-call probe for one wait-then-take per message, for an external
