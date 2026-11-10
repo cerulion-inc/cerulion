@@ -2038,6 +2038,75 @@ mod tests {
         assert_eq!(w.outstanding(), 0);
     }
 
+    /// `record_unpublished` takes back one count and returns the count it
+    /// left. Oracle, by hand, on a depth-4 word: three counts read 3, a
+    /// take-back leaves 2, two more leave 1 and 0, and a take-back on the word
+    /// at 0 leaves it at 0 and returns 0. A wrapping subtraction there would
+    /// read `u64::MAX`, which no drain brings back below the depth.
+    #[test]
+    fn a_take_back_removes_one_count_and_stops_at_zero() {
+        let w = CreditShared::new(4);
+        assert_eq!(w.record_published_n(3), 3);
+        assert_eq!(w.record_unpublished(), 2, "3 -> 2");
+        assert_eq!(w.outstanding(), 2);
+        assert_eq!(w.record_unpublished(), 1, "2 -> 1");
+        assert_eq!(w.record_unpublished(), 0, "1 -> 0");
+        assert_eq!(w.outstanding(), 0);
+        assert_eq!(w.record_unpublished(), 0, "a take-back on a word at 0");
+        assert_eq!(w.outstanding(), 0, "leaves the word at 0, never u64::MAX");
+        assert!(w.try_claim(), "so the producer is admitted");
+    }
+
+    /// A take-back rings no wake: the frame never reached a queue, so it freed
+    /// no room a parked producer waits for. Oracle: `wake_seq` reads the same
+    /// before and after, where a drain of the same count bumps it by one.
+    #[test]
+    fn a_take_back_rings_no_wake() {
+        let w = CreditShared::new(2);
+        w.record_published();
+        let before = w.wake_seq_snapshot();
+        assert_eq!(w.record_unpublished(), 0);
+        assert_eq!(w.wake_seq_snapshot(), before, "no ring on a take-back");
+        w.record_published();
+        assert_eq!(w.record_drained(1), 0);
+        assert_eq!(
+            w.wake_seq_snapshot(),
+            before.wrapping_add(1),
+            "the control: a drain of the same count rings once"
+        );
+    }
+
+    /// `record_drained` returns the frames its subtraction could not take off
+    /// because the word reached 0. Oracle vectors, by hand, as `(word before,
+    /// removed) -> (returned, word after)`: `(2, 1) -> (0, 1)`, `(1, 1) -> (0,
+    /// 0)`, `(1, 99) -> (98, 0)`, `(0, 1) -> (1, 0)`, `(3, 0) -> (0, 3)`, and
+    /// the force-release `(3, u64::MAX) -> (u64::MAX - 3, 0)`.
+    #[test]
+    fn a_drain_returns_the_frames_it_could_not_take_off() {
+        let vectors: [(u64, u64, u64, u64); 6] = [
+            (2, 1, 0, 1),
+            (1, 1, 0, 0),
+            (1, 99, 98, 0),
+            (0, 1, 1, 0),
+            (3, 0, 0, 3),
+            (3, u64::MAX, u64::MAX - 3, 0),
+        ];
+        for (before, removed, clipped, after) in vectors {
+            let w = CreditShared::new(4);
+            assert_eq!(w.record_published_n(before), before);
+            assert_eq!(
+                w.record_drained(removed),
+                clipped,
+                "a drain of {removed} on a word at {before} clips {clipped}"
+            );
+            assert_eq!(
+                w.outstanding(),
+                after,
+                "and leaves the word at {after} (drain of {removed} on {before})"
+            );
+        }
+    }
+
     /// Two clones of one LOCAL word are one word — the property every wiring
     /// site depends on (the publisher's increment and the subscriber's drain
     /// hold separate clones of the same handle).
