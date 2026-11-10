@@ -78,6 +78,9 @@
 //!   deadline.
 //! - [`clock`]: the robot's TRUSTED clock for pairing verification (never a
 //!   client-supplied time).
+//! - [`log_writer`]: the binary's log writer, a bounded queue in front of
+//!   stderr written by a thread of its own; it drops and counts a line it
+//!   cannot queue.
 //!
 //! Linking `cerulion_core` (for the SHM tap, the wire format and the `cerulion_q`
 //! vocabulary) makes `remoted` AGPL; it is robot-side, so that is correct. Design
@@ -106,6 +109,7 @@ pub mod flashback;
 pub mod forward;
 pub mod host;
 mod local_schema;
+pub mod log_writer;
 pub mod ops;
 pub mod pairing_verbs;
 mod private_file;

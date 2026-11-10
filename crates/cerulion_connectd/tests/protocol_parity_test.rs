@@ -144,7 +144,29 @@ fn wire_response_parity() {
             hz: 99.5,
             stream_alive: true,
         }],
+        log_lines_dropped: Some(7),
     }));
+    // A host with no daemon log writer sends no count, and an older robot's
+    // reply, which has no such field, reads as `None`.
+    cross::<_, robot::WireResponse>(&desk::WireResponse::Status(desk::StatusReply {
+        topics: vec![],
+        log_lines_dropped: None,
+    }));
+    let older = r#"{"reply":"status","topics":[]}"#;
+    assert_eq!(
+        serde_json::from_str::<robot::WireResponse>(older).unwrap(),
+        robot::WireResponse::Status(robot::StatusReply {
+            topics: vec![],
+            log_lines_dropped: None,
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<desk::WireResponse>(older).unwrap(),
+        desk::WireResponse::Status(desk::StatusReply {
+            topics: vec![],
+            log_lines_dropped: None,
+        })
+    );
     cross::<_, robot::WireResponse>(&desk::WireResponse::Error {
         topic: Some("/imu".to_string()),
         message: "boom".to_string(),

@@ -61,12 +61,13 @@ the same entry instead of running the daemon.
   its own, so they still answer while the serving runtime tears down. On the
   first stop signal that thread arms the deadline, then hands serving the
   signal's name; serving logs one info line naming it (`signal`), and the
-  accept loop stops. The stop thread logs nothing itself: its deadline and
-  second-signal lines are written from a short-lived thread, and the exit waits
-  at most 100 ms for that line. Serving writes its own stop lines to stderr
-  before it acts on the request, so a stderr that stays full holds the graceful
-  stop until the deadline ends it with status 4; a full stderr cannot delay the
-  hard exit past the deadline and that 100 ms. The accept loop also stops when
+  accept loop stops. Every `tracing` line is queued for the log writer
+  (below), so no such line holds the stop thread or serving: the stop thread
+  queues its deadline or second-signal line and waits at most
+  `EXIT_LOG_GRACE` (100 ms) for the queue before `_exit(4)`, and `main` waits
+  as long for it once the serving runtime is dropped. A stderr that stays full
+  delays neither the graceful stop nor the hard exit past the deadline and
+  that 100 ms. The accept loop also stops when
   the endpoint closes on its own. Either way `serve_planes` drops its shutdown
   future before it logs anything, which arms the deadline when no signal did,
   so a blocked log write cannot hold it back, then runs the ops plane's
@@ -91,8 +92,8 @@ the same entry instead of running the daemon.
   first stop signal, or from the moment serving dropped its shutdown future
   without one: past it an error line is logged and the process ends with
   `_exit(4)`, the explicit failure exit. A second stop signal during the stop
-  also ends it with status 4, after the same wait of at most 100 ms for its
-  line; after the accept loop stopped on its own, the first stop signal
+  also ends it with status 4, after the same wait of at most 100 ms for the
+  log queue; after the accept loop stopped on its own, the first stop signal
   already counts as that second one. The default was chosen as a sum of
   nominal shares: 18 s reserved for the participants the host registers, 5 s for
   the wait for the task of an rcpd delivery that the stop has already ended,
@@ -110,6 +111,50 @@ the same entry instead of running the daemon.
   `cerulion-remoted` with SIGKILL unless it has already exited, so its
   graceful stop can be cut short there. Pinned by `daemon_stop_signal_test.rs`,
   `shutdown_stage_test.rs` and the stage tests in `shutdown.rs`.
+
+- **Logging** (`log_writer.rs`, `main.rs`). The binary's fmt subscriber writes
+  through a `LogWriter`: fmt formats each event on the thread that logs it,
+  with that event's timestamp; the writer (`EventLine`) gathers the bytes and,
+  when fmt drops it, hands them to a queue as one owned line, under the
+  queue's lock for one push. One thread, `remoted-log`, pops each line in
+  order and does the blocking `write_all` to stderr with the lock released;
+  that lock is the only one the `tracing` path shares with it. The iceoryx2
+  console logger (remoted installs no tracing bridge for it) and the default
+  panic hook still write to stderr directly. A line that `admits` refuses
+  (`QUEUE_LINES` 4096 lines, `QUEUE_BYTES` 1 MiB) is dropped and counted, as
+  is a line whose write fails; `log_writer::lines_dropped` reads the count
+  since the start, and the wire plane's `status` reply sends it as
+  `log_lines_dropped` (`None`, not serialized, without an installed writer:
+  a library host keeps its own subscriber). After each write, and when a drop
+  wakes it while it waits for a line, the writer thread feeds the drops since
+  its last report to one `FailureRegimeLatch`, one failure per line
+  (`drop_report`): a batch that opens the regime or crosses a decade of the
+  total logs at warn (`dropped`, `total_dropped`), any other at debug; with
+  the queue empty and no drop since that report, `on_success` ends an open
+  regime with one info line (the regime's `dropped`, `total_dropped`), silent
+  for a regime of one line. `writing` stays set until the report is written,
+  and the queue's `reported` count, which only the writer thread stores,
+  shows a drop it has not reported yet, so a drain waits for both.
+  The writer thread formats those lines through the same subscriber, and a
+  thread-local makes its `EventLine` write them straight to stderr, never
+  into the queue; a report line whose write fails is not counted.
+  `LogWriter::drain` is each exit's wait: until the queue is empty, no write
+  or report is in flight and no drop is left unreported, for at most four
+  fifths of the grace; then
+  all but the newest `KEPT_AT_EXIT` (8) queued lines are discarded, one error
+  line (`discarded`) is queued after them when there are any, and it waits
+  for the rest of the grace or until the queue is written. A line the stop
+  thread queues behind a full queue is dropped like any other. A writer
+  thread that cannot start, or a runtime that cannot be built, exits the
+  binary 1 after one error line. In a build with the test seam only,
+  `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a smaller line bound
+  (`test_queue_lines`: a positive whole number, at most `QUEUE_LINES`), as
+  the crate's other `_FOR_TEST` variables set their seams; it takes effect
+  once the daemon has logged that it listens (`shrink_queue_for_test`,
+  called right after that line), so the lines before it are queued under the
+  full bound. Pinned by the
+  unit tests in `log_writer.rs`, `estop_full_stderr_test.rs` and
+  `daemon_stop_signal_test.rs`.
 
 - **Always-on from boot.** Ops + pairing must be reachable when NO graph is
   running, so the endpoint host is a robot-level service, not the per-run
@@ -609,9 +654,9 @@ sent to rcpd is stopped by rcpd's own latch, which an rcp `estop` closes in
 its stream and an ops `engage-estop` closes through `RcpdEstop::send`:
 right after `EstopLease::engage`, and before its `e-stop ENGAGED` warning,
 the verb decodes the caller's device key and calls `send`, which returns
-at once, so a blocked write of that warning holds back no first attempt
-(the delivery writes its failure line before a retry and its closed-latch
-line before an `Again` resend, on its own task); a caller id that is not
+at once (in the daemon every `tracing` line, the delivery's failure and
+closed-latch lines included, is queued for the log writer, so a full stderr
+holds neither the verb nor an attempt); a caller id that is not
 a device key sends nothing and logs that at warn. `RcpdEstop` shares an
 `Owing` with its delivery: a `period` mutex over the period's first engager
 and the last delivery id, an `engages` count and the `running` delivery
@@ -1022,7 +1067,8 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/device_index_test.rs` | Side-map MAC integrity: no forged key→owner binding |
 | `crates/cerulion_remoted/tests/beacon_facts_test.rs` | Beacon-facts atomic write/round-trip/claimable flip |
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
-| `crates/cerulion_remoted/tests/daemon_stop_signal_test.rs` | The real binary: SIGTERM and Ctrl-C stop it gracefully with exit 0 and the teardown line; a test-seam stage participant that never finishes is ended by `CERULION_REMOTED_HARD_EXIT_MS` with status 4, also when the endpoint's own close (a test seam) started the stop with no signal; a second signal during the stop exits 4 long before the deadline; after the endpoint's own close, the first stop signal exits 4 as a second one does; a participant that fails exits 3 after the teardown ran; the stage runs before the rcpd e-stop sender is stopped; with stderr full the deadline still exits 4 |
+| `crates/cerulion_remoted/tests/daemon_stop_signal_test.rs` | The real binary: SIGTERM and Ctrl-C stop it gracefully with exit 0 and the teardown line; a test-seam stage participant that never finishes is ended by `CERULION_REMOTED_HARD_EXIT_MS` with status 4, also when the endpoint's own close (a test seam) started the stop with no signal; a second signal during the stop exits 4 long before the deadline; after the endpoint's own close, the first stop signal exits 4 as a second one does; a participant that fails exits 3 after the teardown ran; the stage runs before the rcpd e-stop sender is stopped; with stderr full the deadline still exits 4, a graceful stop exits 0, and a graceful stop waits for its queued lines until the pipe drains |
+| `crates/cerulion_remoted/tests/estop_full_stderr_test.rs` | The real binary with its stderr pipe full and a log queue of one line (test seam): an rcp `estop` and an ops `engage-estop` each reach a stand-in rcpd within 5 s, with the desk's caller; `status` counts two or more dropped lines while the pipe is full; once it drains, the warn drop line and the info caught-up line are written, and every line `status` then counts is named by them or by a later drop or caught-up line |
 | `crates/cerulion_remoted/tests/shutdown_stage_test.rs` | `serve_planes` drops its shutdown future before the stage, on a stop request (endpoint open during the stage) and when the endpoint closes on its own (endpoint closed), and before the line that says the loop stopped; `run` under the kill switch drops it before its warn line; the drop before the endpoint-closed stop line and before the kill-switch warn is pinned against a log writer that blocks |
 | `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
 | `crates/cerulion_connectd/tests/act_network_switch_test.rs` | The real `cerulion-connectd act` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same call dials it |

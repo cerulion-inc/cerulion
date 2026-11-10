@@ -744,6 +744,10 @@ async fn status_counters_match_oracle() {
                 WireResponse::Status(s) => s,
                 other => panic!("expected Status, got {other:?}"),
             };
+            assert_eq!(
+                status.log_lines_dropped, None,
+                "a host that runs no daemon log writer reports no count"
+            );
             let row = status
                 .topics
                 .iter()

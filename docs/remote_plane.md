@@ -70,7 +70,8 @@ access can:
   the robot publishes it (`cerulion connect` brings these into the desk's own
   shared memory);
 - fetch a topic's schema, so a desk that has never seen the type can decode it;
-- read the per-topic counters (`status`);
+- read the per-topic counters, and the count of log lines the robot's
+  `cerulion-remoted` dropped (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
 A desk cannot write a topic on the robot or send it teleop commands over
@@ -162,6 +163,24 @@ the audit log. Its reply then waits for the receipt append, a brief lock held
 across one write and sync of the receipt file. Hash-chain integrity survives:
 each append is one atomic critical section, so concurrent appends form one valid
 tamper-evident chain.
+
+**A blocked log does not hold an e-stop.** `cerulion-remoted` writes its log
+lines to stderr from a thread of its own, through a queue of at most 4096
+lines and 1 MiB. While stderr takes no more lines, as with a full pipe or a
+stalled journald, no part of the daemon waits on one of those lines: a line
+that does not fit in the queue, or whose write fails, is dropped and counted.
+So an `estop` over `cerulion/rcp/1` and an ops `engage-estop` still reach the
+robot's `cerulion-rcpd`, and a graceful stop still ends. Two writers bypass
+the queue and still write to stderr directly: the iceoryx2 console logger and
+the message of a panic. Once stderr takes lines again, a warning names how
+many were dropped and, when more than one was, an info line says the log
+caught up. The count since the daemon started is `log_lines_dropped` in the
+`cerulion/wire/2` `status` reply; it leaves out the writer's own report lines
+and the lines an exit discards. A host that embeds the remote plane logs
+through its own subscriber and sends no such count. Each exit waits at most
+100 ms for the lines still queued; past four fifths of that, all but the
+newest 8 are discarded, and one error line counts them if stderr takes it in
+time.
 
 **What this rules out is serialization, not unavailability.** Resource
 exhaustion and network delivery still decide whether a remote `engage-estop`

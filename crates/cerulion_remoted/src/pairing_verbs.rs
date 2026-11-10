@@ -729,11 +729,11 @@ impl VerbHandler for EngageEstopVerb {
         let safe = self.lease.engage(&caller.id);
         // rcpd's own latch closes on an `estop` tool call. The delivery runs
         // on a task of its own and `send` returns at once, after the lease
-        // has flipped and before the ENGAGED line below is written, so a
-        // blocked write of that line holds back no first attempt. The
-        // delivery writes its failure line before a retry and its
-        // closed-latch line before a resend, on its own task. Nothing the
-        // delivery does reaches this verb's answer.
+        // has flipped and before the ENGAGED line below is written. In the
+        // daemon every `tracing` line is queued for the log writer's own
+        // thread (`crate::log_writer`), so a full stderr holds neither this
+        // verb nor an attempt of the delivery. Nothing the delivery does
+        // reaches this verb's answer.
         if let Some(rcpd) = &self.rcpd {
             match caller_device_key(caller) {
                 Ok(engager) => {
