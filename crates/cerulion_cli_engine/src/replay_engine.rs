@@ -8035,8 +8035,9 @@ fn pass_wiring<'a>(
     depth_floors: &'a BTreeMap<(String, String), usize>,
 ) -> cerulion_core::graph::CrossProcessWiring<'a> {
     let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
-    // A replay takes its fires from the recording, so no producer defers on a
-    // `block` slot and the pass logs no paced-topic warning.
+    // A pass logs no paced-topic warning. A lockstep pass re-executes the
+    // `block` gate; a free-run pass takes its fires from the recording and
+    // bypasses the gate (`run_rank_pass`).
     let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning)
         .with_paced_topic_warnings(&[]);
     if depth_floors.is_empty() {

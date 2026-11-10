@@ -388,8 +388,7 @@ impl<'a> CrossProcessWiring<'a> {
     /// Log exactly `warnings` as this build's paced-topic warnings, in place of
     /// the ones its own topology would give. Chained onto one of the
     /// constructors above: a multi-process worker passes its plan's list, and
-    /// a replay pass passes an empty one, because a replay takes its fires
-    /// from the recording and no producer defers.
+    /// a replay pass passes an empty one, so a replay logs none.
     pub fn with_paced_topic_warnings(
         mut self,
         warnings: &'a [super::topology::PacedTopicWarning],

@@ -2629,6 +2629,163 @@ fn two_replays_of_same_bag_are_byte_identical() {
     );
 }
 
+/// A `block` consumer (depth 2) that never drains in a short run: its 1 s
+/// period puts its first fire past the last step, so its producer is held
+/// whenever the slot is full.
+#[cerulion_node(period_ms = 1000)]
+#[derive(Default)]
+struct StalledBlockNode {
+    #[input(backpressure = block, depth = 2)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl StalledBlockNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        Ok(())
+    }
+}
+
+/// `holder` (5 ms period) publishes the mixed topic `/bt/holder/out`: `gate`
+/// reads it `block` with `block_timeout_ms: 50` and never drains, and `tap`
+/// reads it `drop_oldest` and relays each frame to `/bt/tap/out`.
+fn block_timeout_yaml() -> &'static str {
+    "name: btgraph\nprefix: bt\nnodes:\n\
+     \x20 - id: holder\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: gate\n    type: stalled_block_node\n    inputs:\n      - name: inp\n        source: holder/out\n        block_timeout_ms: 50\n\
+     \x20 - id: tap\n    type: relay_node\n    inputs:\n      - name: inp\n        source: holder/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn block_timeout_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("holder", Box::new(SourceNodeEntry::new())),
+        ("gate", Box::new(StalledBlockNodeEntry::new())),
+        ("tap", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// Every `block` slot release event in `lines` for `gate.inp`, in log order,
+/// as `(releases, held_ms)`; `held_ms` rides only the loud first-of-regime
+/// line (`releases` a power of ten).
+fn gate_release_events(lines: &[&str]) -> Vec<(u64, Option<u64>)> {
+    let field = |line: &str, key: &str| -> Option<u64> {
+        let at = line.find(key)? + key.len();
+        let digits: String = line[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    };
+    lines
+        .iter()
+        .filter(|l| l.contains("`block` slot released") && l.contains("consumer_node=gate"))
+        .map(|l| {
+            (
+                field(l, " releases=").expect("a release event carries its count"),
+                field(l, " held_ms="),
+            )
+        })
+        .collect()
+}
+
+/// A lockstep replay re-executes `block`: a producer held on a mixed topic and
+/// a `block_timeout_ms` release on its one-producer local edge come out of the
+/// replay exactly as live, and two replays are identical.
+///
+/// The hand oracle. Step `k` moves the clock to `5(k+1)` ms. `holder` fires
+/// at 5 and 10 ms (steps 0 and 1) and fills `gate`'s slot; from step 2 (15
+/// ms) the slot reads full and `holder` is held. At step 12 (65 ms) the slot
+/// has been full for 50 ms: it is released once, and `holder` fires its two
+/// oldest missed periods (15 and 20 ms) before the slot reads full again at
+/// 65 ms, which starts the next 50 ms stretch. So the releases fall at steps
+/// 12, 22 and 32, and `holder` publishes `x = 1..=8` over 35 steps. `tap`
+/// relays each frame in the step it is published, at that step's clock.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_lockstep_replay_holds_and_releases_a_block_producer_exactly_as_live() {
+    const STEPS: usize = 35;
+    let ms = |t: u64| t * 1_000_000;
+    let fire = |step: u64, level: usize, node: &str, t: u64| (step, level, node.to_string(), ms(t));
+    let expected_fires = vec![
+        fire(0, 0, "holder", 5),
+        fire(0, 1, "tap", 5),
+        fire(1, 0, "holder", 10),
+        fire(1, 1, "tap", 10),
+        fire(12, 0, "holder", 15),
+        fire(12, 0, "holder", 20),
+        fire(12, 1, "tap", 65),
+        fire(12, 1, "tap", 65),
+        fire(22, 0, "holder", 25),
+        fire(22, 0, "holder", 30),
+        fire(22, 1, "tap", 115),
+        fire(22, 1, "tap", 115),
+        fire(32, 0, "holder", 35),
+        fire(32, 0, "holder", 40),
+        fire(32, 1, "tap", 165),
+        fire(32, 1, "tap", 165),
+    ];
+    let expected_x: Vec<f64> = (1..=8).map(f64::from).collect();
+    // One run's releases: counts 1, 2 and 3, each after 50 ms held.
+    let one_run = vec![(1, Some(50)), (2, None), (3, None)];
+
+    let rec = record_uniform(block_timeout_yaml(), block_timeout_factories, &[], STEPS);
+    assert_eq!(resolved_fire_oracle(&rec), expected_fires, "the live fires");
+    for topic in ["/bt/holder/out", "/bt/tap/out"] {
+        let xs: Vec<f64> = rec.messages[topic].iter().map(|f| frame_x(f)).collect();
+        assert_eq!(xs, expected_x, "the live frames on {topic}");
+    }
+    logs_assert(|lines: &[&str]| match gate_release_events(lines) {
+        got if got == one_run => Ok(()),
+        got => Err(format!("live releases {got:?}, expected {one_run:?}")),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("block_timeout.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::Lockstep);
+    let (a, fires_a) = replay_with_tap(&bag, block_timeout_factories);
+    let (b, fires_b) = replay_with_tap(&bag, block_timeout_factories);
+    let (a, b) = (a.expect("replay runs"), b.expect("replay runs"));
+    for outcome in [&a, &b] {
+        assert_eq!(
+            outcome.coordination,
+            replay_engine::CoordinationReport {
+                mode: replay_engine::CoordinationMode::Lockstep,
+                inferred: false,
+            },
+            "the bag replays under the lockstep contract"
+        );
+        // Every frame of both topics byte for byte as live, and the same
+        // fires: the replay re-ran the hold and the release itself.
+        assert!(outcome.passed, "byte-exact: {:?}", outcome.violations);
+        assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 2));
+        assert!(
+            outcome.trace_divergence.is_none(),
+            "{:?}",
+            outcome.trace_divergence
+        );
+        assert_eq!(outcome.ticks_replayed, STEPS);
+    }
+    for fires in [&fires_a, &fires_b] {
+        let (recorded_side, replayed_side) = tap_sides(fires);
+        assert_eq!(recorded_side, expected_fires, "recorded side, in order");
+        assert_eq!(replayed_side, expected_fires, "replayed side, in order");
+    }
+    // Live, then each replay, released the slot at the same counts.
+    let three_runs: Vec<(u64, Option<u64>)> = one_run.repeat(3);
+    logs_assert(|lines: &[&str]| match gate_release_events(lines) {
+        got if got == three_runs => Ok(()),
+        got => Err(format!("releases {got:?}, expected {three_runs:?}")),
+    });
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap(),
+        "two replays produce byte-identical outcomes"
+    );
+    assert_eq!(fires_a, fires_b, "two replays fire identically");
+}
+
 // ===========================================================================
 // 3. Perturbation — a flipped payload byte in the bag
 // ===========================================================================

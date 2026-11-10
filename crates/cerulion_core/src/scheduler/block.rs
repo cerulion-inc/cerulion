@@ -48,8 +48,9 @@
 //!
 //! # Replay
 //!
-//! None of this runs in a replay: the runtime's replay bypass skips the block
-//! gate entirely, and the fires come from the recording.
+//! A lockstep replay re-executes the gate on its virtual clock, timeout
+//! releases included. A free-run replay sets the runtime's replay bypass,
+//! which skips the gate, and takes its fires from the recording.
 
 use crate::credit::CreditShared;
 use std::sync::Mutex;
