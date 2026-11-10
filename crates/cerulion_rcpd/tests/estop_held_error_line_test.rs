@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `estop` and `estop_clear` write the error line of a latch file or a
-//! receipt they could not write after `latch_io` is released, and `estop`
-//! after its frame is queued, so a log writer that holds that line does not
-//! hold the frame the graph is stopped with.
+//! A tool call writes the error line of a latch file or a receipt it could
+//! not write after `latch_io` and the receipt log's lock are released, and
+//! `estop` after its frame is queued, so a log writer that holds that line
+//! does not hold the frame the graph is stopped with.
 //!
-//! Each test calls `estop` or `estop_clear` on a thread of its own under a
-//! scoped subscriber whose writer holds one line, and keeps a second
+//! Each test makes one tool call on a thread of its own under a scoped
+//! subscriber whose writer holds one line, and keeps a second
 //! dispatcher alive, so tracing-core computes each callsite's interest over
 //! every live dispatcher rather than one thread's default. While the line is
 //! held a second `estop`, which takes `latch_io` and the receipt log's lock,
@@ -37,11 +37,12 @@ use serde_json::{json, Value};
 const OBSERVE: Duration = Duration::from_secs(5);
 
 /// How long the writer holds its line if the test never releases it: longer
-/// than the three [`OBSERVE`] waits made while it is held.
+/// than the at most three [`OBSERVE`] waits made while it is held.
 const HOLD_BOUND: Duration = Duration::from_secs(60);
 
-/// How long the held call gets to answer after the release: the graph
-/// answers at once, and `estop` and `estop_clear` wait at most 2 s for it.
+/// How long the held call, and a second `estop` that did not answer while
+/// the line was held, get to answer after the release: the graph answers at
+/// once, and `estop` and `estop_clear` wait at most 2 s for it.
 const ANSWER: Duration = Duration::from_secs(10);
 
 /// The `reason` every call passes.
@@ -142,6 +143,7 @@ fn spawn_graph(
     frames: mpsc::Sender<Value>,
 ) -> std::thread::JoinHandle<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
+    let stop_unready = stop.clone();
     let handle = std::thread::spawn(move || {
         let calls = mgr
             .create_subscriber(&config.calls_topic)
@@ -173,7 +175,10 @@ fn spawn_graph(
             }
         }
     });
-    ready_rx.recv_timeout(OBSERVE).expect("graph thread ready");
+    if ready_rx.recv_timeout(OBSERVE).is_err() {
+        stop_unready.store(true, Ordering::Relaxed);
+        panic!("the stand-in graph did not start");
+    }
     handle
 }
 
@@ -227,14 +232,19 @@ impl Drop for Cleanup {
     }
 }
 
-/// `<verb>:<outcome>` of every receipt in the log, oldest first.
+/// `<verb>:<outcome>`, then `:<detail>` when it has one, of every receipt in
+/// the log, oldest first.
 fn outcomes(receipts: &Path) -> Vec<String> {
     cerud::receipt::read_all(receipts)
         .expect("read receipts")
         .iter()
         .map(|r| {
             let outcome = serde_json::to_value(&r.outcome).expect("outcome");
-            format!("{}:{}", r.verb, outcome["outcome"].as_str().unwrap_or(""))
+            let tag = outcome["outcome"].as_str().unwrap_or("");
+            match outcome.get("detail").and_then(Value::as_str) {
+                Some(detail) => format!("{}:{tag}:{detail}", r.verb),
+                None => format!("{}:{tag}", r.verb),
+            }
         })
         .collect()
 }
@@ -245,8 +255,7 @@ fn outcomes(receipts: &Path) -> Vec<String> {
 struct Observed {
     receipts: PathBuf,
     reached: bool,
-    /// The held `estop`'s frame; `None` for `estop_clear`, which publishes
-    /// none here.
+    /// The held `estop`'s frame; not read for any other tool.
     frame: Option<Value>,
     outcomes_while_held: Vec<String>,
     /// The latch file's text; `None` when it cannot be read.
@@ -404,8 +413,13 @@ fn latch_line(receipts: &Path) -> String {
     )
 }
 
-const RECEIPT_LINE: &str = "ERROR cerulion_rcpd::tools: receipt not written verb=\"estop\" \
-                            error=receipt log error: injected sync_data failure (test seam)\n";
+/// The line for a receipt of `verb` whose `sync_data` the seam failed.
+fn receipt_line(verb: &str) -> String {
+    format!(
+        "ERROR cerulion_rcpd::tools: receipt not written verb=\"{verb}\" \
+         error=receipt log error: injected sync_data failure (test seam)\n"
+    )
+}
 
 const ENGAGED_LINE: &str = " WARN cerulion_rcpd::tools: e-stop engaged reason=held\n";
 
@@ -432,7 +446,10 @@ fn a_held_latch_file_error_line_does_not_hold_the_estop_frame() {
 fn a_held_receipt_error_line_does_not_hold_the_estop_frame() {
     let o = held_call("receipt", ESTOP_TOOL, "receipt not written", |_| {}, true);
     assert_frame_while_held(&o);
-    assert_eq!(o.lines, [RECEIPT_LINE, ENGAGED_LINE]);
+    assert_eq!(
+        o.lines,
+        [receipt_line(ESTOP_TOOL), ENGAGED_LINE.to_string()]
+    );
     assert_eq!(
         o.answer["receipt"],
         Value::Null,
@@ -458,7 +475,7 @@ fn with_both_writes_failed_the_error_lines_follow_the_frame_in_order() {
         o.lines,
         [
             latch_line(&o.receipts),
-            RECEIPT_LINE.to_string(),
+            receipt_line(ESTOP_TOOL),
             ENGAGED_LINE.to_string()
         ]
     );
@@ -477,14 +494,7 @@ fn a_held_clear_receipt_error_line_does_not_hold_an_estop_frame() {
         true,
     );
     assert_second_estop_while_held(&o);
-    assert_eq!(o.frame, None);
-    assert_eq!(
-        o.lines,
-        [
-            "ERROR cerulion_rcpd::tools: receipt not written verb=\"estop_clear\" \
-          error=receipt log error: injected sync_data failure (test seam)\n"
-        ]
-    );
+    assert_eq!(o.lines, [receipt_line(ESTOP_CLEAR_TOOL)]);
     assert_eq!(
         o.answer["error"]["code"],
         json!("receipt_failed"),
@@ -494,5 +504,27 @@ fn a_held_clear_receipt_error_line_does_not_hold_an_estop_frame() {
     assert_eq!(o.outcomes_while_held, Vec::<String>::new());
     assert_eq!(o.latch_file_while_held, None);
     // The clear's intent was not written; the second estop's intent and ok.
+    assert_eq!(o.outcomes, ["estop:intent", "estop:ok"]);
+}
+
+#[test]
+fn a_held_denied_call_receipt_error_line_does_not_hold_an_estop_frame() {
+    let o = held_call(
+        "denied",
+        "no_such_tool",
+        "receipt not written",
+        |_| {},
+        true,
+    );
+    assert_second_estop_while_held(&o);
+    assert_eq!(o.lines, [receipt_line("no_such_tool")]);
+    assert_eq!(
+        o.answer["error"]["code"],
+        json!("not_in_manifest"),
+        "{}",
+        o.answer
+    );
+    assert_eq!(o.outcomes_while_held, Vec::<String>::new());
+    // The denied call's receipt was not written; the second estop's intent and ok.
     assert_eq!(o.outcomes, ["estop:intent", "estop:ok"]);
 }
