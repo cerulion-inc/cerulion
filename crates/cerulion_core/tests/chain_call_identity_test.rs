@@ -50,10 +50,12 @@
 //! A fourth graph gives a chain member an output topic that a node on no chain
 //! publishes too: `head -> relay -> member` sits on levels 0 to 2, and `other`
 //! publishes `member`'s topic at level 1. Queued, `other` publishes first;
-//! called, `member` does. A subscriber holds one queue per publisher and a
-//! read takes the next frame of the first queue, in connection order, that
-//! holds one, so a FIFO reader and a `consume = latest` reader of the topic at
-//! level 3 read the same frames in the same order in both runs.
+//! called, `member` does. The frames log shows both orders in every step: a
+//! node notes its frame in its tick, and the frame publishes when the tick
+//! returns. A subscriber holds one queue per publisher and a read takes the
+//! next frame of the first queue, in connection order, that holds one, so a
+//! FIFO reader and a `consume = latest` reader of the topic at level 3 read
+//! the same frames in the same order in both runs.
 //!
 //! The build's log is checked as well. With the seam on, a chain is cut at
 //! the first member a call cannot drain, and the build logs one warning per
@@ -476,6 +478,9 @@ struct Run {
     trace: Vec<TraceRow>,
     reads: Vec<MergedReadOutcome>,
     frames: Vec<(&'static str, i32)>,
+    /// The length of `frames` as each step returned: step `s` noted the
+    /// entries from `step_ends[s - 1]` (0 for step 0) up to `step_ends[s]`.
+    step_ends: Vec<usize>,
     calls: u64,
 }
 
@@ -489,9 +494,11 @@ fn step_through(mut runtime: GraphRuntime) -> Run {
     runtime.set_trace_limit(usize::MAX);
     runtime.enable_read_outcome_memory_sink();
     let mut reads = Vec::new();
+    let mut step_ends = Vec::with_capacity(STEPS);
     for i in 0..STEPS {
         runtime.step(Duration::from_millis(DELTAS_MS[i % DELTAS_MS.len()]));
         reads.extend(runtime.take_read_outcomes());
+        step_ends.push(FRAMES.lock().expect("not poisoned").len());
     }
     let reads = resolve_producer_tokens(&runtime, reads);
     let trace = trace_rows(runtime.trace());
@@ -501,6 +508,7 @@ fn step_through(mut runtime: GraphRuntime) -> Run {
         trace,
         reads,
         frames,
+        step_ends,
         calls,
     }
 }
@@ -1460,7 +1468,8 @@ fn with_the_seam_off_the_build_says_nothing_about_chain_calls() {
 // chain: `beat/out` also feeds `tap`, so `beat -> other` is a fan-out. `fifo`
 // reads every frame of the shared topic and `newest` the newest of each step,
 // both at level 3. Queued, `other` publishes at level 1 and `member` at level
-// 2; called, `member` publishes when level 0 ends, before `other` fires.
+// 2; called, `member` publishes when level 0 ends, before `other` fires. The
+// test reads both orders off the frames log, step by step.
 //
 // A subscriber holds one queue per publisher and a read takes the next frame
 // of the first queue, in connection order, that holds one. So `fifo` reads a
@@ -1730,6 +1739,54 @@ fn assert_shared_oracle(run: &Run, label: &str) -> Vec<bool> {
     member_first
 }
 
+/// The order `member` and `other` publish the shared topic in, step by step,
+/// read off the tick order in `run.frames`: each notes its frame in its tick,
+/// and the frame the tick writes is published when the tick returns. In every
+/// step of `run`, every `member` note comes before the step's first `other`
+/// note when `member_first` holds, and after its last one otherwise.
+fn assert_publish_order(run: &Run, label: &str, member_first: bool) {
+    assert_eq!(
+        run.step_ends.len(),
+        STEPS,
+        "{label}: one frame boundary per step"
+    );
+    let mut start = 0;
+    for (s, &end) in run.step_ends.iter().enumerate() {
+        let notes = &run.frames[start..end];
+        start = end;
+        let at = |tag: &str| -> Vec<usize> {
+            notes
+                .iter()
+                .enumerate()
+                .filter(|(_, (t, _))| *t == tag)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let (member, other) = (at("member"), at("other"));
+        let (Some(m_first), Some(m_last), Some(o_first), Some(o_last)) =
+            (member.first(), member.last(), other.first(), other.last())
+        else {
+            panic!(
+                "{label}: at step {s} member noted {} frames and other {}; both tick every step",
+                member.len(),
+                other.len()
+            );
+        };
+        let ordered = if member_first {
+            m_last < o_first
+        } else {
+            o_last < m_first
+        };
+        assert!(
+            ordered,
+            "{label}: at step {s} member noted at {member:?} and other at {other:?} of the \
+             step's {} notes; member must publish {} other",
+            notes.len(),
+            if member_first { "before" } else { "after" }
+        );
+    }
+}
+
 /// The census this graph's declarations give.
 fn shared_census_chains() -> Vec<Vec<String>> {
     let config = parse_graph(SHARED_GRAPH).expect("the shared graph must parse");
@@ -1785,6 +1842,10 @@ fn a_member_publishing_a_topic_another_node_publishes_is_read_as_it_is_queued() 
     if let Err(e) = compare(&queued, &fused) {
         panic!("{e}");
     }
+    // The two runs publish the topic in opposite orders in every step, so the
+    // read order above is the same although the publish order is not.
+    assert_publish_order(&queued, "queued", false);
+    assert_publish_order(&fused, "fused", true);
 }
 
 /// The mutants: each breaks one obligation of the chain call, and the
