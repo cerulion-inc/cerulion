@@ -1242,18 +1242,18 @@ pub enum StandDownReason {
     /// A resumed pass holds no fire of a `consume = latest` node read
     /// through two subscribers and no read its body made, while the node's
     /// trigger drain counted more frames than the reads and the frames in
-    /// delivery explain. A node stopped before the pass's anchor (a
-    /// `NodeError::Fatal` return, or the consecutive-panic breaker) records
-    /// exactly that: a stopped node never fires, and the boundary drain keeps
-    /// counting its trigger input. The bag records no stop, and the resumed
-    /// re-execution fires only what the recording fired, so it never stops
-    /// the node either (the pass's `PassStops` hold no stop of it). The unread-frame
-    /// rule stops for the node; the one-fire bound still holds. A from-start
-    /// pass re-executes the stopping fire, and a resumed pass holding any
-    /// fire or body read of the node shows it ran in the pass, so both are
-    /// still judged. An anchor that stated each node's stopped state would
-    /// let a resumed pass start with the stop and judge such a node as a
-    /// from-start pass does.
+    /// delivery explain. A node a `NodeError::Fatal` return stopped before the
+    /// pass's anchor records exactly that: a stopped node never fires, and the
+    /// boundary drain keeps counting its trigger input. A running node the
+    /// scheduler never fired in the pass records the same. The bag records
+    /// no stop, and the resumed re-execution fires only what the recording
+    /// fired, so it never stops the node either (the pass's `PassStops` hold
+    /// no stop of it). The unread-frame rule stops for the node; the one-fire
+    /// bound still holds. A from-start pass re-executes the stopping fire, and
+    /// a resumed pass holding any fire or body read of the node shows it ran
+    /// in the pass, so both are still judged. An anchor that stamped each
+    /// node's stopped state would tell the two shapes apart and let a resumed
+    /// pass judge such a node as a from-start pass does.
     LatestUnfiredSinceAnchor,
 }
 
@@ -1308,8 +1308,9 @@ impl StandDownReason {
             }
             Self::LatestUnfiredSinceAnchor => {
                 "the resumed pass holds no fire of the node and no read its body made while its \
-                 trigger drain counted frames, which a node stopped before the pass's anchor \
-                 records, and the bag records no stop"
+                 trigger drain counted frames, which a node stopped before the pass's anchor and \
+                 a running node the scheduler never fired in the pass both record; the anchor \
+                 does not stamp each node's stopped state, which is what would tell the two apart"
             }
         }
     }
@@ -1510,12 +1511,18 @@ impl fmt::Display for CarriedHeadsNote {
 /// ([`UnreadFrames::unlogged`]), and that fire ends the allowance.
 ///
 /// It is NOT a [`StandDown`], for the reason a [`CarriedHeadsNote`] is not:
-/// the rule judged every step, on an allowance that can only drop a finding,
-/// and a count past it is a finding. Report-only and never a gate:
-/// [`RederivationReport::is_clean`] ignores it. Emitted at most once per node
-/// and input, at the first count that needs the allowance, and withdrawn when
-/// a read-log stand-down (a truncated or decimated read, or a read shape no
-/// recorder produces) then stops the rule for the node.
+/// the rule judged the steps the allowance covers, on an allowance that can
+/// only drop a finding. A count past the queue is judged as one after a fire
+/// is: a finding, unless a stand-down of the same node reported beside the
+/// note names why not ([`StandDownReason::LatestWritersUnnamed`] excuses the
+/// count; [`StandDownReason::LatestWritersUncapped`],
+/// [`StandDownReason::LatestBlockHeld`] and
+/// [`StandDownReason::LatestUnfiredSinceAnchor`] stop the rule for the node).
+/// Report-only and never a gate: [`RederivationReport::is_clean`] ignores it.
+/// Emitted at most once per node and input, at the first count that needs the
+/// allowance, and withdrawn when a read-log stand-down (a truncated or
+/// decimated read, or a read shape no recorder produces) then stops the rule
+/// for the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestBeforeFirstFireNote {
     /// The `consume = latest` node.
@@ -1531,7 +1538,8 @@ impl fmt::Display for LatestBeforeFirstFireNote {
             "node '{}' {}: input '{}' judged with one queue excused before the node's first \
              fire in the pass, since a read the read log does not hold (in the node's init, or \
              before a resumed pass's first retained step) can have taken that many of the \
-             frames its trigger drain counted; a count past it is still a finding (report-only; \
+             frames its trigger drain counted; a count past that queue is judged as one after a \
+             fire is, a finding unless a stand-down of this node names why not (report-only; \
              the excuse can only drop a finding, never invent one)",
             self.node_id,
             Decider::LatestFire,
@@ -3910,7 +3918,8 @@ enum LatestUnreadVerdict {
     /// before the node's first fire in the pass, up to one queue of the input
     /// past the reads and the frames in delivery
     /// ([`LatestBeforeFirstFireNote`]). The rule judged the step on that
-    /// allowance and the carry stays, so a later count past it is a finding.
+    /// allowance and the carry stays, so a later count past it is judged as
+    /// one after a fire is.
     ExcusedBeforeFirstFire,
     /// Counted frames that only a writer the read log does not name can
     /// explain ([`StandDownReason::LatestWritersUnnamed`]). The step is not
@@ -7316,7 +7325,10 @@ mod tests {
     /// with nothing stood down. A read-log stand-down that then stops the
     /// rule for the node withdraws the note, as a Sync node's carried-heads
     /// note is withdrawn; a stand-down of the unread-frame rule alone keeps
-    /// it.
+    /// it, because the steps before it were judged on the allowance, and the
+    /// note's text says a count past the queue is a finding unless a
+    /// stand-down of the node names why not, which is true beside that
+    /// stand-down too.
     #[test]
     fn the_queue_excused_before_a_first_fire_is_reported_as_judged_not_as_not_verified() {
         let deep = latest_node_with(LatestDrain::Separate, Some(1), 4);
@@ -7343,14 +7355,17 @@ mod tests {
         );
         assert_eq!(report.before_first_fire, excused_before_first_fire());
         let rendered = report.before_first_fire[0].to_string();
+        assert_eq!(
+            rendered,
+            "node 'sink' consume = latest fire count: input 'inp' judged with one queue \
+             excused before the node's first fire in the pass, since a read the read log \
+             does not hold (in the node's init, or before a resumed pass's first retained \
+             step) can have taken that many of the frames its trigger drain counted; a count \
+             past that queue is judged as one after a fire is, a finding unless a stand-down \
+             of this node names why not (report-only; the excuse can only drop a finding, \
+             never invent one)"
+        );
         assert!(!rendered.contains("not verified"), "{rendered}");
-        for part in [
-            "node 'sink' consume = latest fire count",
-            "input 'inp' judged with one queue excused",
-            "a count past it is still a finding",
-        ] {
-            assert!(rendered.contains(part), "{part:?} missing from: {rendered}");
-        }
 
         let mut past_one_queue = vec![init_copies];
         past_one_queue
@@ -7402,6 +7417,7 @@ mod tests {
             }]
         );
         assert_eq!(held.before_first_fire, excused_before_first_fire());
+        assert_eq!(held.before_first_fire[0].to_string(), rendered);
     }
 
     /// The excuse before a node's first fire is one queue, not the rest of
@@ -7511,13 +7527,28 @@ mod tests {
         assert_eq!(report.stand_downs, vec![unfired.clone()]);
         assert_eq!(report.before_first_fire, excused_before_first_fire());
         assert_eq!(unfired.reason.code(), "latest_unfired_since_anchor");
+        assert_eq!(
+            unfired.reason.label(),
+            "the resumed pass holds no fire of the node and no read its body made while its \
+             trigger drain counted frames, which a node stopped before the pass's anchor and a \
+             running node the scheduler never fired in the pass both record; the anchor does \
+             not stamp each node's stopped state, which is what would tell the two apart"
+        );
         let rendered = unfired.to_string();
-        for part in [
-            "not verified: node 'sink'",
-            "stopped before the pass's anchor",
-        ] {
-            assert!(rendered.contains(part), "{part:?} missing from: {rendered}");
-        }
+        assert!(
+            rendered.starts_with("not verified: node 'sink' consume = latest fire count ")
+                && rendered.ends_with(unfired.reason.label()),
+            "{rendered}"
+        );
+        // The judged note beside it does not claim the count past the queue
+        // was a finding: it names the stand-down as the exception.
+        assert!(
+            report.before_first_fire[0]
+                .to_string()
+                .contains("a finding unless a stand-down of this node names why not"),
+            "{}",
+            report.before_first_fire[0]
+        );
         assert_eq!(report, judge(&stopped, &resumed), "two runs agree");
 
         let archived = verify(

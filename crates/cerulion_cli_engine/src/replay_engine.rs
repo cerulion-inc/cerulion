@@ -439,16 +439,21 @@ pub struct ReplayOutcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injection_coverage: Vec<InjectionCoverageNote>,
     /// What the rank-local RE-DERIVATION verifier
-    /// declined to judge, and every credit-conservation breach it observed.
+    /// declined to judge, every credit-conservation breach it observed, and
+    /// the evidence its judgments rested on.
     ///
     /// A schedule MISMATCH is not here — it is a
     /// [`DivergenceClass::FireSchedule`] divergence and rides
     /// [`Self::trace_divergence`] (exit 6). What lands here is the loud-but-
     /// never-verdicted half: a decider the verifier stood down on (naming the
     /// node and the reason, so "compared clean" never covers a node nobody
-    /// looked at) and a conservation breach (evidence about the RECORDING's
+    /// looked at), a conservation breach (evidence about the RECORDING's
     /// credit accounting, which `RederivationReport::is_clean` deliberately
-    /// ignores). Additive + skipped when empty.
+    /// ignores), and the evidence notes: a read-site census, a producer-label
+    /// fault, a carried-heads note, and the queue a `consume = latest` input
+    /// was judged with before its node's first fire
+    /// (`latest_before_first_fire`). [`RederivationNoteKind`] is the closed set
+    /// of kinds. Additive + skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rederivation_notes: Vec<RederivationNote>,
     /// Every node whose trace-driven burst was UNDER-FED by the
@@ -1260,11 +1265,13 @@ pub enum RederivationNoteKind {
     /// of the frames its trigger drain counted. The subject is the node.
     ///
     /// NOT a [`RederivationNoteKind::StandDown`], for the reason
-    /// [`RederivationNoteKind::CarriedHeads`] is not: the rule judged every
-    /// step on an allowance that can only drop a finding, and a count past it
-    /// is a finding, so a `stand_down` would tell a reader the node went
-    /// unjudged. See [`replay_rederive::LatestBeforeFirstFireNote`]. Additive
-    /// on the wire, as the third to fifth variants are.
+    /// [`RederivationNoteKind::CarriedHeads`] is not: the rule judged the
+    /// steps the allowance covers, on an allowance that can only drop a
+    /// finding, so a `stand_down` would tell a reader those steps went
+    /// unjudged. A count past the queue is judged as one after a fire is: a
+    /// finding, unless a `stand_down` note of the same node, in the same
+    /// array, names why not. See [`replay_rederive::LatestBeforeFirstFireNote`].
+    /// Additive on the wire, as the third to fifth variants are.
     LatestBeforeFirstFire,
 }
 
