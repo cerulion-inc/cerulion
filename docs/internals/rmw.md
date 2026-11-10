@@ -457,7 +457,10 @@ is a SIGNAL, never a count; an undrained level-readable fd re-fires every block)
 block's wake the probe runs first: a ready return leaves the listeners of the woken entities
 it found ready readable, and a subscription take (`ListenerDrain::ByNextWait`) leaves its
 listener the same way, for the next call's entry pass, which drains every readable fd before
-its full probe. Woken entities found not ready are drained before the return, and a wake
+its full probe. Every drain empties the listener's trigger before it re-arms the listener (the
+iceoryx2 fork pinned in the root `Cargo.toml`), so a notify that lands inside a drain is
+delivered by it or leaves the fd readable, and the next publish still wakes a listener a take
+left for the next wait. Woken entities found not ready are drained before the return, and a wake
 that finds nothing ready drains, then probes again.
 `poll(2)` rather than the iceoryx2 WaitSet: fd snapshots need no `&Listener` borrow pinned
 across the block (lock, snapshot an integer, UNLOCK, block; no entity mutex is held while
