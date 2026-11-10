@@ -695,7 +695,7 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # descriptor never became readable again and its subscription stopped waking on
 # publishes. The fork empties the trigger, then stores the idle state, then
 # drains the event bits, so a notify that lands during a drain is delivered by
-# that drain or leaves its byte for the next wait.
+# that drain or leaves the trigger holding a byte for the next wait.
 #
 # The same revision also adds Android support: filesystem paths, file-backed
 # named shared memory with private-directory checks, abstract-namespace Unix
