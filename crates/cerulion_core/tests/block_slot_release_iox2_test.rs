@@ -11,6 +11,10 @@
 //! - after a timeout release, a FIFO consumer that resumes between two
 //!   publishes receives every frame published after the release, on a local
 //!   and on a split word;
+//! - on a topic two producers share, a read that finds the queue empty clears
+//!   the count a release left high: a FIFO read over real queues leaves the
+//!   slot with room, and a consumer that keeps up after a release is not
+//!   released again;
 //! - a consumer node that stops with a fatal error has its slot released;
 //! - the live loop's wait sizing holds a deferred producer until its slot's
 //!   `block_timeout_ms` deadline, or until the drain that frees it, instead of
@@ -28,8 +32,8 @@
 //!
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
 //! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off`,
-//! `block_accumulate_refusal_off` and `block_forgiven_drain_spends_credit`
-//! each make a row here fail.
+//! `block_accumulate_refusal_off`, `block_forgiven_drain_spends_credit` and
+//! `block_empty_resync_off` each make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -251,6 +255,26 @@ impl IdleBlock {
     }
 }
 
+/// An `external` producer the test never triggers: the second producer of a
+/// shared topic, whose connection into the consumer stays empty.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct QuietProducer {
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl QuietProducer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
 fn output(name: &str) -> OutputDef {
     OutputDef {
         name: name.to_string(),
@@ -258,6 +282,14 @@ fn output(name: &str) -> OutputDef {
         max_slice_len: None,
         history_size: 0,
         topic: None,
+    }
+}
+
+/// An output that publishes on the absolute `topic`.
+fn output_on(name: &str, topic: &str) -> OutputDef {
+    OutputDef {
+        topic: Some(topic.to_string()),
+        ..output(name)
     }
 }
 
@@ -305,6 +337,7 @@ fn entry(ty: &str) -> Box<dyn NodeEntry> {
         "fast_drop_oldest" => Box::new(FastDropOldestEntry::new()),
         "relay" => Box::new(RelayEntry::new()),
         "host_accumulate" => Box::new(HostAccumulateEntry::new()),
+        "quiet_producer" => Box::new(QuietProducerEntry::new()),
         other => panic!("no entry for {other}"),
     }
 }
@@ -660,6 +693,153 @@ fn frames_published_after_a_timeout_release_on_a_split_edge_are_never_evicted() 
         "every frame published after the release is received"
     );
     assert_eq!(producer.outstanding(), 0, "the drains emptied the slot");
+}
+
+/// One `block` FIFO input fed by two publishers over real depth-2 iceoryx2
+/// queues, one per connection, so the word is stamped two connections and
+/// four queue places. Only the first publisher publishes. Its frames 1 and 2
+/// fill the slot and a timeout release forgives them; its frames 3 and 4 then
+/// evict 1 and 2 from its own queue, which the backlog bound (four places)
+/// cannot see. The consumer reads 3 and 4, whose drains pay the stale
+/// backlog, and a third read finds the queue empty: that read must leave the
+/// slot with room, and the producer and the consumer then keep pace.
+#[test]
+fn a_fifo_read_that_finds_the_queue_empty_clears_a_count_a_release_left_high() {
+    let word = CreditWord::local(2);
+    word.set_connections(2);
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "bsr_resync_fifo".to_string(),
+            clock: Arc::new(cerulion_core::clock::RealClock),
+            subscriber_buffer_size: 2,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = "bsr_resync_fifo_topic";
+    let len = MaxSliceLen::try_new(1024).expect("len");
+    let mut first = mgr
+        .create_publisher(topic, len, 0)
+        .expect("first publisher");
+    let _second = mgr
+        .create_publisher(topic, len, 0)
+        .expect("second publisher");
+    let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+    sub.register_block_probe_for_test(
+        word.clone(),
+        2,
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        2,
+    );
+    sub.mark_fifo_consume_for_test();
+    let read = |sub: &mut CerulionSubscriber| {
+        sub.try_view::<Vector3, u32>(|v| v.x as u32)
+            .expect("the FIFO read does not fail")
+    };
+
+    for x in 1..=2 {
+        publish_counted(&mut first, &word, x);
+    }
+    assert_eq!(word.forgive_outstanding(), 2, "both frames are forgiven");
+    for x in 3..=4 {
+        assert!(word.try_claim(), "frame {x} fits after the release");
+        publish_counted(&mut first, &word, x);
+    }
+    assert!(!word.try_claim(), "frames 3 and 4 hold the producer");
+    assert_eq!(read(&mut sub), Some(3), "frames 1 and 2 were evicted");
+    assert_eq!(read(&mut sub), Some(4));
+    assert_eq!(read(&mut sub), None, "the queue is empty");
+    assert_eq!(
+        (word.outstanding(), word.forgiven()),
+        (0, 0),
+        "the read that found the queue empty leaves no count behind"
+    );
+    for x in 5..=10 {
+        assert!(
+            word.try_claim(),
+            "frame {x}: a consumer that keeps up never leaves the slot full"
+        );
+        publish_counted(&mut first, &word, x);
+        assert_eq!(read(&mut sub), Some(x), "frame {x} is received");
+        assert_eq!(read(&mut sub), None);
+    }
+    assert_eq!(word.outstanding(), 0);
+}
+
+/// A `block` consumer, depth 2 with a 50 ms timeout, of a topic two producers
+/// share: its input has two connections and four queue places. Only `first`
+/// publishes (`quiet` is never triggered).
+fn shared_topic(prefix: &str) -> GraphConfig {
+    let topic = format!("/{prefix}/shared");
+    let mut cfg = config(
+        prefix,
+        vec![
+            node("first", "producer", vec![], vec![output_on("out", &topic)]),
+            node(
+                "quiet",
+                "quiet_producer",
+                vec![],
+                vec![output_on("out", &topic)],
+            ),
+            node(
+                "consumer",
+                "host_block",
+                vec![with_timeout(input(&topic), 50)],
+                vec![],
+            ),
+        ],
+    );
+    cfg.multi_publisher_topics = vec![topic];
+    cfg
+}
+
+/// The consumer stalls until one timeout release, then is triggered on
+/// every step. The release forgives `first`'s two queued frames, which its
+/// next two frames evict from its own connection's queue while the backlog
+/// bound sees four places. Once the consumer drains, the slot must have room
+/// again, `first` must fire on every step, and no second release may follow
+/// over a window of six `block_timeout_ms`.
+#[test]
+fn a_release_on_a_shared_topic_is_not_repeated_while_the_consumer_keeps_up() {
+    const WINDOW: u64 = 30;
+    let mut rt = build(shared_topic("bsr_shared")).expect("build");
+    let mut stalled_steps = 0u64;
+    while releases(&rt, "consumer") == 0 {
+        assert!(stalled_steps < 30, "no timeout release within 300 ms");
+        rt.step(Duration::from_millis(10));
+        stalled_steps += 1;
+    }
+    assert_eq!(releases(&rt, "consumer"), 1, "precondition: one release");
+    let fired_before = fires(&rt, "first");
+    // The window steps after which the slot read full although the consumer
+    // had just drained its queue.
+    let mut full_after_drain = Vec::new();
+    for step in 0..WINDOW {
+        rt.trigger_external("consumer").expect("trigger");
+        rt.step(Duration::from_millis(10));
+        if outstanding(&rt, "consumer") >= 2 {
+            full_after_drain.push(step);
+        }
+    }
+    let fired = fires(&rt, "first") - fired_before;
+    assert_eq!(
+        releases(&rt, "consumer"),
+        1,
+        "a consumer that keeps up is never released again (the slot read full after a drain \
+         at window steps {full_after_drain:?}; first fired {fired} times in {WINDOW} steps)"
+    );
+    assert!(
+        full_after_drain.is_empty(),
+        "the consumer drained its queue, so its slot has room after every step: full at \
+         window steps {full_after_drain:?}"
+    );
+    assert!(
+        fired >= WINDOW,
+        "first fires {fired} times in {WINDOW} steps: the slot never holds it"
+    );
+    assert_eq!(fires(&rt, "quiet"), 0, "the second producer never fires");
 }
 
 #[test]

@@ -2445,13 +2445,22 @@ impl CerulionSubscriber {
 
     /// `block`: decrement the outstanding mirror by the number of
     /// samples just removed from the iceoryx2 queue (saturating — the
-    /// mirror must never underflow). No-op unless `block` is wired.
+    /// mirror must never underflow). `emptied` when the drain's last
+    /// `receive()` returned no sample, so the queue is empty on every
+    /// connection: the drain then goes through
+    /// [`CreditWord::record_drained_to_empty`](crate::credit::CreditWord::record_drained_to_empty),
+    /// which also zeroes a local word's queued count and backlog. No-op
+    /// unless `block` is wired.
     #[inline]
-    fn record_block_drained(&self, removed: u64) {
-        if removed == 0 {
+    fn record_block_drained(&self, removed: u64, emptied: bool) {
+        if removed == 0 && !emptied {
             return;
         }
         if let Some(counter) = self.block_probe().map(|p| &p.outstanding) {
+            if emptied {
+                counter.record_drained_to_empty(removed);
+                return;
+            }
             // Saturating: an interleaving non-drain removal (history
             // replay on a late joiner) could otherwise drive the mirror
             // below zero. Clamping keeps "outstanding == 0" the floor.
@@ -3327,6 +3336,10 @@ impl CerulionSubscriber {
         let removals = std::cell::Cell::new(0u64);
         let mut newest_seq: Option<u32> = None;
         let mut newest_origin: Option<UniquePublisherId> = None;
+        // Set by each real `receive()`: whether it returned no sample. A stop
+        // at the pop bound does not touch it, so it reads `true` at the end
+        // only when the queue was seen empty.
+        let emptied = std::cell::Cell::new(false);
         // The `block` mirror MUST be decremented for every popped sample even
         // if `receive()` errors mid-drain — `drain_with_block_accounting`
         // guarantees that, then propagates the error below (AFTER the staging,
@@ -3352,10 +3365,12 @@ impl CerulionSubscriber {
                     }
                     self.fault_inject_receive_after.set(Some(remaining - 1));
                 }
-                sub.receive().map_err(|e| TransportError::Receive {
+                let received = sub.receive().map_err(|e| TransportError::Receive {
                     topic: topic.clone(),
                     reason: format!("{}", e),
-                })
+                })?;
+                emptied.set(received.is_none());
+                Ok(received)
             },
             // Every received sample is removed from the iceoryx2 queue
             // (whether or not it survives `deliver_raw_frame`'s filter) — the
@@ -3411,7 +3426,7 @@ impl CerulionSubscriber {
                     self.record_service_cursor_from(&header);
                 }
             },
-            |removed| self.record_block_drained(removed),
+            |removed| self.record_block_drained(removed, emptied.get()),
         );
         // Stage the PARTIAL batch BEFORE propagating
         // a mid-drain Err — the frames delivered so far really reached the
@@ -4010,6 +4025,10 @@ impl CerulionSubscriber {
         // fire, so the returned `popped` (the trigger's signal count)
         // excludes them. Always 0 on the latest-wins drain.
         let junk_skipped = std::cell::Cell::new(0u64);
+        // Set by each real `receive()`: whether it returned no sample. A stop
+        // at the pop bound does not touch it, so it reads `true` at the end
+        // only when the queue was seen empty.
+        let emptied = std::cell::Cell::new(false);
         // The pop position of the next probed frame, the index into `fed`.
         let mut probed = 0usize;
         let drain_result = drain_with_block_accounting(
@@ -4030,10 +4049,12 @@ impl CerulionSubscriber {
                     }
                     fault_inject = Some(remaining - 1);
                 }
-                sub.receive().map_err(|e| TransportError::Receive {
+                let received = sub.receive().map_err(|e| TransportError::Receive {
                     topic: topic.clone(),
                     reason: format!("{}", e),
-                })
+                })?;
+                emptied.set(received.is_none());
+                Ok(received)
             },
             |sample| {
                 if probing {
@@ -4106,7 +4127,7 @@ impl CerulionSubscriber {
             },
             |removed| {
                 removed_in_drain.set(removed);
-                self.record_block_drained(removed);
+                self.record_block_drained(removed, emptied.get());
             },
         );
         self.fault_inject_receive_after.set(fault_inject);
