@@ -1515,10 +1515,11 @@ impl fmt::Display for CarriedHeadsNote {
 /// only drop a finding. A count past the queue is judged as one after a fire
 /// is: a finding, unless a stand-down of the same node reported beside the
 /// note names why not ([`StandDownReason::LatestWritersUnnamed`] excuses the
-/// count; [`StandDownReason::LatestWritersUncapped`],
-/// [`StandDownReason::LatestBlockHeld`] and
+/// count; [`StandDownReason::LatestBlockHeld`] and
 /// [`StandDownReason::LatestUnfiredSinceAnchor`] stop the rule for the node).
-/// Report-only and never a gate: [`RederivationReport::is_clean`] ignores it.
+/// A node with no writer cap never gets the note: a count past its reads
+/// stands the rule down as [`StandDownReason::LatestWritersUncapped`] before
+/// the allowance is reached. Report-only and never a gate: [`RederivationReport::is_clean`] ignores it.
 /// Emitted at most once per node and input, at the first count that needs the
 /// allowance, and withdrawn when a read-log stand-down (a truncated or
 /// decimated read, or a read shape no recorder produces) then stops the rule

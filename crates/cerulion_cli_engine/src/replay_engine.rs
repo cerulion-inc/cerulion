@@ -1321,10 +1321,14 @@ pub struct RederivationNote {
     /// a CI job asking "did any bag report an impossible read shape this
     /// week?" has to substring-match a REWORDABLE sentence out of `detail`.
     ///
-    /// Still `None` for a conservation breach and a read-site census: those are
+    /// Still `None` for a conservation breach, a read-site census, a
+    /// carried-heads note and a `latest_before_first_fire` note: those are
     /// addressed by [`Self::subject`] and carry no enum-valued cause, so a
-    /// token there would be one this module invented. Additive + skipped when
-    /// absent, so a report carrying neither is byte-identical.
+    /// token there would be one this module invented. `None` too on the two
+    /// stand-downs whose cause is no closed set: a node whose declared
+    /// metadata could not be read, and a block edge's conservation claim that
+    /// a `--duration` bound stood down. Additive + skipped when absent, so a
+    /// report carrying neither is byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
