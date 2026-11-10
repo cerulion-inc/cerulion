@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! How a `block` input reports the drains its credit word clipped at 0.
 //!
-//! A drain that finds the word already at 0 removed frames the word never
-//! counted ([`crate::credit::CreditShared::record_drained`] returns how many).
-//! Each such drain is one failure of a [`FailureRegimeLatch`]: the head of a
-//! regime is loud, repeats are counted, and each decade of the running total
-//! is loud again.
+//! A drain that removes more frames than its word counts removed frames the
+//! word never counted ([`crate::credit::CreditShared::record_drained`] returns
+//! how many it could not take off). Each such drain is one failure of a
+//! [`FailureRegimeLatch`]: the head of a regime is loud, repeats are counted,
+//! and each decade of the running total is loud again.
 //!
 //! # What closes a regime
 //!
@@ -15,23 +15,37 @@
 //! therefore says nothing about whether the outside writer has stopped, and a
 //! regime that closed at every clean drain would open a new loud head at
 //! every outside frame. So a regime closes only after a run of consecutive
-//! clean drains, and every close doubles the run the next regime needs: 1,
-//! then 2, 4, 8 and so on, saturating at `u64::MAX`.
+//! clean drains, and every close doubles the run the next regime needs, up to
+//! [`CLOSE_AFTER_MAX`]: 1, then 2, 4, 8 and so on to 65_536, where it stays.
 //!
-//! With outside frames at most `G >= 1` clean drains apart, at most
-//! `floor(log2(G)) + 1` regimes close, so at most `floor(log2(G)) + 2` loud
-//! heads are logged, and the one regime left open keeps reporting through the
-//! decade lines. Once the outside frames stop, that regime closes after `2^c`
-//! clean drains, `c` being the number of regimes closed before it (at most
-//! `2G` when the interleave opened them all), and logs its recovery line if
-//! it counted a repeat. A burst of uncounted frames with nothing interleaved
-//! (native history to a late joiner) is one regime; when it is the input's
-//! first, the first clean drain closes it.
+//! Two bounds follow, both counted in drains of this input:
+//!
+//! - **Flood.** With outside frames at most `G` clean drains apart and `G`
+//!   below the cap, at most `floor(log2(G)) + 1` regimes close, so at most
+//!   `floor(log2(G)) + 2` loud heads are logged, and the one regime left open
+//!   keeps reporting through the decade lines. Sixteen closes take the run to
+//!   the cap, and every close after them took 65_536 clean drains, so however
+//!   far apart the outside frames are, an input logs at most 17 loud heads
+//!   plus one per 65_536 clean drains.
+//! - **Re-arm.** The open regime closes after at most 65_536 consecutive clean
+//!   drains, however many regimes closed before it, so the first clip after a
+//!   quiet spell that long opens a new regime and is loud.
+//!
+//! Once the outside frames stop, the open regime closes after
+//! `min(2^c, 65_536)` clean drains, `c` being the number of regimes closed
+//! before it (`2^c` is at most `2G` when the interleave opened them all), and
+//! logs its recovery line if it counted a repeat. A burst of uncounted frames
+//! with nothing interleaved (native history to a late joiner) is one regime;
+//! when it is the input's first, the first clean drain closes it.
 //!
 //! The decision reads only the stream of drains, never a clock, so a replay
 //! of the same drains logs the same lines.
 
 use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+
+/// The longest run of consecutive clean drains a regime ever needs to close:
+/// the doubling stops here (see the module docs' two bounds).
+pub(crate) const CLOSE_AFTER_MAX: u64 = 1 << 16;
 
 /// What one drain's report logs, as [`DrainClipLatch::observe`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +73,7 @@ pub(crate) struct DrainClipLatch {
     /// regime is open.
     clean_run: u64,
     /// The clean run that closes the open regime: 1 at first, doubled at every
-    /// close.
+    /// close up to [`CLOSE_AFTER_MAX`].
     close_after: u64,
 }
 
@@ -89,7 +103,7 @@ impl DrainClipLatch {
         if self.clean_run < self.close_after {
             return DrainClipReport::Quiet;
         }
-        self.close_after = self.close_after.saturating_mul(2);
+        self.close_after = next_close_after(self.close_after);
         match self.latch.on_success() {
             Some(suppressed) => DrainClipReport::Recovered { suppressed },
             None => DrainClipReport::Quiet,
@@ -100,6 +114,47 @@ impl DrainClipLatch {
     #[inline]
     pub(crate) fn total_failures(&self) -> u64 {
         self.latch.total_failures()
+    }
+}
+
+/// The clean run the next regime needs after one closed at a run of
+/// `close_after`: twice as long, at most [`CLOSE_AFTER_MAX`].
+#[inline]
+fn next_close_after(close_after: u64) -> u64 {
+    #[cfg(all(feature = "oracle-mutants", test))]
+    if mutants::uncapped_armed() {
+        return close_after.saturating_mul(2);
+    }
+    close_after.saturating_mul(2).min(CLOSE_AFTER_MAX)
+}
+
+/// The seeded fault the cap's vectors must catch, compiled only into this
+/// crate's unit tests with the `oracle-mutants` feature. Thread-local, so it
+/// cannot reach a test running on another thread.
+#[cfg(all(feature = "oracle-mutants", test))]
+mod mutants {
+    use std::cell::Cell;
+
+    thread_local! { static UNCAPPED: Cell<bool> = const { Cell::new(false) }; }
+
+    /// Arms the fault until dropped: the run a regime needs doubles past
+    /// [`super::CLOSE_AFTER_MAX`].
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            UNCAPPED.with(|armed| armed.set(false));
+        }
+    }
+
+    #[must_use]
+    pub(super) fn uncapped() -> Guard {
+        UNCAPPED.with(|armed| armed.set(true));
+        Guard
+    }
+
+    pub(super) fn uncapped_armed() -> bool {
+        UNCAPPED.with(Cell::get)
     }
 }
 
@@ -127,6 +182,22 @@ mod tests {
     fn reports(drains: &[u64]) -> Vec<DrainClipReport> {
         let mut latch = DrainClipLatch::new();
         drains.iter().map(|&c| latch.observe(c)).collect()
+    }
+
+    /// The reports that log something, in order, for a script of runs: each
+    /// `(clipped, count)` is `count` drains that each clipped `clipped`.
+    fn logged_runs(script: &[(u64, u64)]) -> Vec<DrainClipReport> {
+        let mut latch = DrainClipLatch::new();
+        let mut out = Vec::new();
+        for &(clipped, count) in script {
+            for _ in 0..count {
+                let report = latch.observe(clipped);
+                if report != Quiet {
+                    out.push(report);
+                }
+            }
+        }
+        out
     }
 
     /// The reports that log something, with their index into `drains`.
@@ -231,5 +302,100 @@ mod tests {
                 (32, Recovered { suppressed: 1 }),
             ]
         );
+    }
+
+    /// The run a regime needs doubles to 65_536 and stays there. Oracle, by
+    /// hand: seventeen regimes, each a clip and then the run it needs (1, 2, 4
+    /// and so on to 65_536), each close silent because no regime counted a
+    /// repeat; an 18th that 65_536 clean drains close again, not 131_072; a
+    /// 19th whose run of 65_535 does not close it, so its next clip is repeat
+    /// 1, and whose run of 65_536 then logs the recovery line carrying 1; and a
+    /// 20th head, loud. The 10th clip is a head, so it spends the decade at
+    /// 10, and 21 clips never reach 100.
+    #[test]
+    fn the_run_a_regime_needs_doubles_to_the_cap_and_stays_there() {
+        let mut script = Vec::new();
+        for k in 0..=16 {
+            script.extend([(1, 1), (0, 1 << k)]);
+        }
+        script.extend([(1, 1), (0, 65_536)]);
+        script.extend([(1, 1), (0, 65_535), (1, 1), (0, 65_536)]);
+        script.push((1, 1));
+        let mut want = vec![Clipped(Loud); 19];
+        want.extend([
+            Clipped(Suppressed { suppressed: 1 }),
+            Recovered { suppressed: 1 },
+            Clipped(Loud),
+        ]);
+        assert_eq!(logged_runs(&script), want);
+    }
+
+    /// Twenty sessions of an outside writer, each twenty cycles of `[0, 1]`
+    /// (every outside frame one clean drain after the last) and then a quiet
+    /// spell of 65_536 clean drains. Oracle, by hand: session 1 logs two heads
+    /// (its first regime closes at a run of 1), repeats 1 to 7, the decade
+    /// line at a total of 10, repeats 8 to 17 and a recovery line carrying 17.
+    /// Every later session finds a run of at least 4 needed, so its cycles are
+    /// one regime: a head, repeats 1 to 19 and a recovery line carrying 19,
+    /// except session 5, whose 20th clip is the decade line at a total of 100
+    /// (repeats 1 to 18, recovery 18). From session 16 on the run is at the
+    /// cap, and each quiet spell still closes the regime, so session 20's
+    /// first clip is as loud as session 2's. Two runs report the same.
+    #[test]
+    fn a_new_incident_after_a_quiet_spell_at_the_cap_is_loud_however_many_regimes_closed() {
+        let mut script = Vec::new();
+        for _ in 0..20 {
+            for _ in 0..20 {
+                script.extend([(0, 1), (1, 1)]);
+            }
+            script.push((0, 65_536));
+        }
+        let repeats = |range: std::ops::RangeInclusive<u64>| {
+            range.map(|suppressed| Clipped(Suppressed { suppressed }))
+        };
+        let mut want = vec![Clipped(Loud), Clipped(Loud)];
+        want.extend(repeats(1..=7));
+        want.push(Clipped(StillFailing {
+            total: 10,
+            suppressed: 7,
+        }));
+        want.extend(repeats(8..=17));
+        want.push(Recovered { suppressed: 17 });
+        for session in 2..=20 {
+            want.push(Clipped(Loud));
+            if session == 5 {
+                want.extend(repeats(1..=18));
+                want.push(Clipped(StillFailing {
+                    total: 100,
+                    suppressed: 18,
+                }));
+                want.push(Recovered { suppressed: 18 });
+            } else {
+                want.extend(repeats(1..=19));
+                want.push(Recovered { suppressed: 19 });
+            }
+        }
+        let first = logged_runs(&script);
+        assert_eq!(first, want, "the reports equal the hand oracle");
+        assert_eq!(
+            logged_runs(&script),
+            first,
+            "and a second run equals the first"
+        );
+    }
+
+    /// MUTANT (`oracle-mutants`): a run that doubles past the cap fails both
+    /// cap vectors.
+    #[cfg(feature = "oracle-mutants")]
+    #[test]
+    fn the_cap_vectors_catch_a_run_that_doubles_past_the_cap() {
+        let _armed = mutants::uncapped();
+        let caught =
+            std::panic::catch_unwind(the_run_a_regime_needs_doubles_to_the_cap_and_stays_there);
+        assert!(caught.is_err(), "the cap vector passed with no cap");
+        let caught = std::panic::catch_unwind(
+            a_new_incident_after_a_quiet_spell_at_the_cap_is_loud_however_many_regimes_closed,
+        );
+        assert!(caught.is_err(), "the quiet spell vector passed with no cap");
     }
 }
