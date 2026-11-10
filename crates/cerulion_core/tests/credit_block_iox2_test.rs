@@ -3979,9 +3979,12 @@ fn an_interleaved_outside_writer_does_not_repeat_the_loud_line_per_frame() {
     }
     assert_eq!(
         (count(CLIP_LOUD), count(CLIP_STILL), count(CLIP_REPEAT)),
-        (2, 1, 17),
-        "two loud heads, one decade line and 17 counted repeats for 20 clipped drains"
+        (2, 1, cerulion_core::testing::debug_lines_expected(17)),
+        "two loud heads, one decade line and 17 counted repeats for 20 clipped drains \
+         (the repeats are `debug!`, so a release build counts none)"
     );
+    // The level-free twin: in every build, no repeat line was emitted loud.
+    logs_assert(|lines: &[&str]| cerulion_core::testing::never_loud(lines, CLIP_REPEAT));
 
     publish(&mut producer, 100.0);
     assert_eq!(read(&mut sub), Some(100.0));
