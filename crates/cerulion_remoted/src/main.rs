@@ -440,13 +440,13 @@ async fn stop_sequence(
 /// How long an exit waits for the log writer to write the lines still queued:
 /// 100 ms, after the serving runtime is dropped on the return from `main`, and
 /// before `_exit` in the stop thread ([`LogWriter::drain`]). The exit goes on
-/// as soon as no line is queued and none is being written. At four fifths of
-/// it, all but the newest [`log_writer::KEPT_AT_EXIT`] queued lines are
-/// discarded, and one error line names how many; a full stderr delays the
-/// exit by no more than this. Not tunable: the
-/// hard-exit deadline is the operator's knob, and this only gives a free
-/// stderr time for the last lines. Only a build with the test seam reads an
-/// override, from `CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST`.
+/// as soon as no line is queued, none is being written and no dropped line is
+/// left unreported. At four fifths of it, all but the newest
+/// [`log_writer::KEPT_AT_EXIT`] queued lines are discarded, and one error line
+/// names how many; a full stderr delays the exit by no more than this. Not
+/// tunable: the hard-exit deadline is the operator's knob, and this only gives
+/// a free stderr time for the last lines. Only a build with the test seam reads
+/// an override, from `CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST`.
 const EXIT_LOG_GRACE: Duration = Duration::from_millis(100);
 
 /// The exit's wait for the log queue: [`EXIT_LOG_GRACE`], or, in a build with

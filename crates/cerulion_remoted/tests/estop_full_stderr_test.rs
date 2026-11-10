@@ -439,7 +439,12 @@ async fn drops_are_counted_then_reported(daemon: &mut Daemon, observer: &Endpoin
         .as_u64()
         .unwrap_or_else(|| panic!("no log_lines_dropped count in {held}"));
     // A regime of one dropped line ends silently, as the regime latch
-    // decides, so the caught-up line needs two.
+    // decides, so the caught-up line needs two. After `fill`, the daemon logs
+    // at least these four lines at info or above before this `status`
+    // answers: the accept line of the rcp or ops connection that carried the
+    // e-stop, its e-stop ENGAGED line, and this wire connection's accept line
+    // and control-stream-open line. With one line being written and one
+    // queued, at least two of the four are dropped.
     assert!(
         while_held >= 2,
         "with stderr full and a queue of one line, at least two lines were dropped: {held}"

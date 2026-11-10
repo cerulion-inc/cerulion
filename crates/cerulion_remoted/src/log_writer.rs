@@ -58,8 +58,8 @@ pub const QUEUE_BYTES: usize = 1 << 20;
 
 /// Test-only: the environment variable that, in a build with the test seam,
 /// sets a smaller line bound for the binary's log queue
-/// ([`test_queue_lines`]), from the moment the daemon has logged that it
-/// listens ([`shrink_queue_for_test`]); the lines before that are queued under
+/// (`test_queue_lines`), from the moment the daemon has logged that it
+/// listens (`shrink_queue_for_test`); the lines before that are queued under
 /// the full bound. A build without the test seam never reads it.
 #[cfg(feature = "test-seam")]
 #[doc(hidden)]
@@ -70,8 +70,7 @@ pub const QUEUE_LINES_FOR_TEST_ENV: &str = "CERULION_REMOTED_LOG_QUEUE_LINES_FOR
 /// Any other value sets none, so the queue keeps [`QUEUE_LINES`]; no value
 /// leaves it unbounded or with no room. Pure.
 #[cfg(feature = "test-seam")]
-#[doc(hidden)]
-pub fn test_queue_lines(value: &str) -> Option<usize> {
+pub(crate) fn test_queue_lines(value: &str) -> Option<usize> {
     let lines = value.trim().parse::<usize>().ok()?;
     (lines > 0).then(|| lines.min(QUEUE_LINES))
 }
@@ -81,8 +80,7 @@ pub fn test_queue_lines(value: &str) -> Option<usize> {
 /// after it logs that it listens, so a test that waits for that line never
 /// loses it to the smaller bound.
 #[cfg(feature = "test-seam")]
-#[doc(hidden)]
-pub fn shrink_queue_for_test() {
+pub(crate) fn shrink_queue_for_test() {
     let lines = std::env::var(QUEUE_LINES_FOR_TEST_ENV)
         .ok()
         .and_then(|value| test_queue_lines(&value));
@@ -353,12 +351,13 @@ impl LogWriter {
 
     /// Wait for the queue to be written, for at most `grace`: until no line is
     /// queued, none is being written or reported and no dropped line is left
-    /// unreported, for at most four fifths of `grace`. Then all but the newest [`KEPT_AT_EXIT`] queued lines are
-    /// discarded, one error line naming how many (`discarded`), when there
-    /// are any, is queued after those, and the wait goes on for the rest of
-    /// `grace` or until the queue is written. Discarded lines are
-    /// named in that line only, not in [`LogWriter::dropped`]. A write blocked
-    /// in stderr holds the writer thread, not this wait.
+    /// unreported, for at most four fifths of `grace`. Then all but the newest
+    /// [`KEPT_AT_EXIT`] queued lines are discarded, one error line naming how
+    /// many (`discarded`), when there are any, is queued after those, and the
+    /// wait goes on for the rest of `grace` or until the queue is written.
+    /// Discarded lines are named in that line only, not in
+    /// [`LogWriter::dropped`]. A write blocked in stderr holds the writer
+    /// thread, not this wait.
     pub fn drain(&self, grace: Duration) -> Drained {
         let since = Instant::now();
         let queue = &self.inner.queue;
@@ -388,10 +387,12 @@ impl LogWriter {
 /// How [`LogWriter::drain`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drained {
-    /// No line was queued and none was being written.
+    /// No line was queued, none was being written and no dropped line was
+    /// left unreported.
     Written,
-    /// At four fifths of the grace, a write had not returned or lines were
-    /// still queued; the `discarded` oldest queued lines were discarded.
+    /// At four fifths of the grace, a write had not returned, lines were
+    /// still queued or a dropped line was not yet reported; the `discarded`
+    /// oldest queued lines were discarded.
     Discarded {
         /// The queued lines discarded.
         discarded: u64,
@@ -848,10 +849,11 @@ mod tests {
         let grace = Duration::from_millis(300);
         let since = Instant::now();
         assert_eq!(writer.drain(grace), Drained::Discarded { discarded: 0 });
+        let took = since.elapsed();
+        assert!(took >= grace, "returned after {took:?}, before its grace");
         assert!(
-            since.elapsed() >= grace,
-            "returned after {:?}",
-            since.elapsed()
+            took < grace + Duration::from_secs(5),
+            "took {took:?}, past its grace {grace:?} plus 5 s"
         );
     }
 
