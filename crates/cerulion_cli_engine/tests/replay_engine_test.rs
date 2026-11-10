@@ -2689,9 +2689,10 @@ fn gate_release_events(lines: &[&str]) -> Vec<(u64, Option<u64>)> {
         .collect()
 }
 
-/// A lockstep replay re-executes `block`: a producer held on a mixed topic and
-/// a `block_timeout_ms` release on its one-producer local edge come out of the
-/// replay exactly as live, and two replays are identical.
+/// A whole-run replay of a lockstep recording re-executes `block`: a producer
+/// held on a mixed topic and a `block_timeout_ms` release on its one-producer
+/// local edge come out of the replay exactly as live, and two replays are
+/// identical.
 ///
 /// The hand oracle. Step `k` moves the clock to `5(k+1)` ms. `holder` fires
 /// at 5 and 10 ms (steps 0 and 1) and fills `gate`'s slot; from step 2 (15
