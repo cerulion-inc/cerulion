@@ -810,7 +810,7 @@ impl BlockColocationSeed {
 
 /// Every co-location constraint this graph's topology carries.
 ///
-/// # The predicate is `has_block_consumer()`
+/// # The predicate is `TopicFlow::holds_its_producers()`
 ///
 /// A flow seeds when it carries at least one `block` consumer and an in-graph
 /// producer. The seed takes EVERY consumer of that flow, `block` or not, so
@@ -827,7 +827,7 @@ impl BlockColocationSeed {
 pub fn block_colocation_seeds(topo: &GraphTopology) -> Vec<BlockColocationSeed> {
     let mut seeds = Vec::new();
     for flow in topo.topics() {
-        if flow.producers.is_empty() || !flow.has_block_consumer() {
+        if !flow.holds_its_producers() {
             continue;
         }
         let (block_consumers, other_consumers) = flow

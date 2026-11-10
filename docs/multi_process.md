@@ -631,13 +631,14 @@ second at 1 kHz, about a minute and a half at 10 Hz. That is acceptable because 
 is permanent: a stalled consumer does not resume on its own, so the warn is
 late, never wrong.
 
-This warn only reports. To bound how long an alive-but-idle consumer can hold its
-producer, set `block_timeout_ms` on the consumer input: the producer's worker forgives that
-consumer's slot once it has been full and unmoved for that long, with a `warn!` naming the
-producer, the consumer, the edge and `reason="block_timeout"`. Graph load refuses the key on a
-topic with more than one in-graph producer or listed in `multi_publisher_topics:`, before any
-worker starts. A consumer whose PROCESS DIED needs no timeout: the supervisor's
-`CreditDeathWatch` above releases its slot.
+This warn only reports. `block_timeout_ms` cannot bound it on a split edge: the supervisor
+refuses the key, before any worker starts, on every edge it mints a credit word for, naming the
+edge and both process groups or executor units. The producer and the consumer fire on different
+threads there, so after a timeout release a read and a publish can interleave and the shared
+word can count a frame that is gone, or miss one and let a frame published after the release be
+evicted. To bound how long an alive-but-idle consumer can hold its producer, put both nodes in
+one process group (or run `--single-process`) and set the key there. A consumer whose PROCESS
+DIED needs no timeout: the supervisor's `CreditDeathWatch` above releases its slot.
 
 Pinned end to end over REAL processes by `crates/cerulion_cli/tests/credit_death_e2e_test.rs`: the
 loud head and its fields, the ABSENCE of a repeat, the retraction, the free-run `groups=`. The

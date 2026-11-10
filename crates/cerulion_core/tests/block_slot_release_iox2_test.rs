@@ -9,8 +9,10 @@
 //! - `block_timeout_ms` releases the stalled consumer's slot and the producer
 //!   resumes, and the release touches that slot only;
 //! - after a timeout release, a FIFO consumer that resumes between two
-//!   publishes receives every frame published after the release, on a local
-//!   and on a split word;
+//!   publishes receives every frame published after the release;
+//! - a multi-process worker refuses `block_timeout_ms` on a consumer input
+//!   its plan binds to a credit word shared with a producer in another
+//!   process, and builds the same input without the key;
 //! - a single-producer edge with `block_timeout_ms` loads, is released once,
 //!   and its consumer then receives every frame published after the release
 //!   with the slot's count equal to the frames still queued;
@@ -39,8 +41,8 @@
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
 //! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off`,
 //! `block_accumulate_refusal_off`, `block_forgiven_drain_spends_credit`,
-//! `block_empty_resync_off` and `block_shared_timeout_refusal_off` each make a
-//! row here fail.
+//! `block_empty_resync_off`, `block_shared_timeout_refusal_off` and
+//! `block_split_timeout_refusal_off` each make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -758,19 +760,15 @@ fn publish_counted(publisher: &mut CerulionPublisher, word: &CreditShared, x: u3
 /// One `block` FIFO input over a real depth-2 iceoryx2 queue, released by a
 /// timeout while it holds two frames, then resumed between two publishes.
 ///
-/// `consumer` is the word the input's probe drains through and `producer` the
-/// word the producer's gate reads and its publish counts on: one word on a
-/// local edge, two mappings of one page on a split edge. Frames carry
-/// `x = 1, 2, ...` in publish order. The consumer drains one frame after the
+/// `word` is the local word the input's probe drains through, the producer's
+/// gate reads and its publish counts on. Frames carry `x = 1, 2, ...` in
+/// publish order. The consumer drains one frame after the
 /// first publish that follows the release, then the producer publishes while
 /// its gate allows (at most 4 more), then the consumer drains what is queued.
 /// Returns the frames published after the release and the frames the consumer
 /// received after the release.
-fn resume_after_a_timeout_release(
-    tag: &str,
-    consumer: CreditWord,
-    producer: &CreditShared,
-) -> (Vec<u32>, Vec<u32>) {
+fn resume_after_a_timeout_release(tag: &str, word: CreditWord) -> (Vec<u32>, Vec<u32>) {
+    let producer: &CreditShared = &word;
     let mgr = TransportManager::init_for_test(
         TransportConfig {
             node_name: format!("bsr_{tag}"),
@@ -787,7 +785,7 @@ fn resume_after_a_timeout_release(
         .expect("publisher");
     let mut sub = mgr.create_subscriber(&topic).expect("subscriber");
     sub.register_block_probe_for_test(
-        consumer,
+        word.clone(),
         2,
         Arc::new(BackpressureCounters::new()),
         Arc::from("inp"),
@@ -845,8 +843,7 @@ fn resume_after_a_timeout_release(
 #[test]
 fn frames_published_after_a_timeout_release_are_never_evicted() {
     let local = CreditWord::local(2);
-    let (published, received) =
-        resume_after_a_timeout_release("forgive_local", local.clone(), &local);
+    let (published, received) = resume_after_a_timeout_release("forgive_local", local.clone());
     assert_eq!(
         published,
         vec![3, 4],
@@ -859,30 +856,86 @@ fn frames_published_after_a_timeout_release_are_never_evicted() {
     assert_eq!(local.outstanding(), 0, "the drains emptied the slot");
 }
 
-/// The same release on a split edge: the consumer's process drains through
-/// its own mapping of the page and the producer's gate reads another.
-#[test]
-fn frames_published_after_a_timeout_release_on_a_split_edge_are_never_evicted() {
-    let ns = format!("bsr_{}_forgive", std::process::id());
-    let id = credit_edge_id("/bsr/forgive", "consumer", "inp");
+/// The refusal of `block_timeout_ms` on `consumer.inp` of `topic` that a
+/// multi-process worker's build gives when its plan binds the input to a
+/// credit word whose producer `producer` runs in another process.
+fn split_timeout_refusal(topic: &str, producer: &str) -> String {
+    format!(
+        "Graph validation error: input 'consumer.inp' on topic '{topic}' sets \
+         `block_timeout_ms`, but the input runs in this process and its producer \
+         '{producer}' in another process, so the two fire on different threads and count the \
+         edge on one shared credit word. A timeout release keeps that count exact only when \
+         the producer and the consumer fire one at a time on one thread: here a read and a \
+         publish can interleave after a release, so the slot can count a frame that is gone \
+         and hold the producer with nothing queued, or miss one and let a frame published \
+         after the release be evicted. Put both nodes in ONE `process_groups:` group, or run \
+         `--single-process`, to keep the timeout; or remove `block_timeout_ms`, and the slot \
+         is still released when the consumer stops for good (a fatal error, a tick panic, or \
+         its process dying)"
+    )
+}
+
+/// Build the graph of a multi-process worker that runs only `consumer`, whose
+/// `block` input `inp` reads `/{prefix}/producer/out` with `timeout` as its
+/// `block_timeout_ms`, with the plan's binding of that input to a mapped
+/// credit word whose producer `producer` runs in another process.
+fn build_split_consumer(prefix: &str, timeout: Option<u64>) -> Result<GraphRuntime, String> {
+    let topic = format!("/{prefix}/producer/out");
+    let mut inp = input(&topic);
+    inp.block_timeout_ms = timeout;
+    let cfg = config(
+        prefix,
+        vec![node("consumer", "host_block", vec![inp], vec![])],
+    );
+    let ns = format!("bsr_{}_{prefix}", std::process::id());
+    let id = credit_edge_id(&topic, "consumer", "inp");
     let _owner = MappedCredit::create_owned(&ns, &id, 2).expect("the supervisor's word");
-    let consumer = Arc::new(MappedCredit::open_unowned(&ns, &id).expect("consumer mapping"));
-    let producer = MappedCredit::open_unowned(&ns, &id).expect("producer mapping");
-    let (published, received) = resume_after_a_timeout_release(
-        "forgive_mapped",
-        CreditWord::mapped(Arc::clone(&consumer)),
-        &producer,
-    );
+    let word = Arc::new(MappedCredit::open_unowned(&ns, &id).expect("the consumer's mapping"));
+    let bind = [cerulion_core::graph::CreditBinding {
+        topic: topic.clone(),
+        consumer_node: "consumer".to_string(),
+        consumer_input: "inp".to_string(),
+        depth: 2,
+        role: cerulion_core::graph::CreditRole::Consumer,
+        word: CreditWord::mapped(word),
+        producer_slot: None,
+        producer_nodes: vec!["producer".to_string()],
+    }];
+    let factories = factories_for(&cfg);
+    GraphRuntime::build_for_test_with_policy_and_wiring(
+        cfg,
+        factories,
+        Arc::new(VirtualClock::new()),
+        64,
+        cerulion_core::MonitorWaitPolicy::off(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A multi-process worker refuses `block_timeout_ms` on a `block` input its
+/// plan binds to a mapped credit word, the word whose producer runs in
+/// another process, naming the edge, both sides and the remedies. The same
+/// input without the key builds on the same binding.
+#[test]
+fn block_timeout_on_a_split_edge_is_refused_at_the_consumers_build() {
+    let err = build_split_consumer("bsr_split_to", Some(50))
+        .err()
+        .expect("the consumer's worker must refuse a timeout on a mapped word");
     assert_eq!(
-        published,
-        vec![3, 4],
-        "the producer is held once frames 3 and 4 fill the slot (received {received:?})"
+        err,
+        split_timeout_refusal("/bsr_split_to/producer/out", "producer")
     );
-    assert_eq!(
-        received, published,
-        "every frame published after the release is received"
+    let rt = build_split_consumer("bsr_split_plain", None)
+        .expect("the same input without block_timeout_ms builds on the mapped word");
+    let credit = rt
+        .block_credits()
+        .find(|c| c.consumer_node == "consumer")
+        .expect("the bound input reports its credit");
+    assert!(
+        credit.mapped && !credit.block_timeout,
+        "the input counts on the mapped word and carries no timeout: {credit:?}"
     );
-    assert_eq!(producer.outstanding(), 0, "the drains emptied the slot");
 }
 
 /// One `block` FIFO input fed by two publishers over real depth-2 iceoryx2
@@ -1001,8 +1054,7 @@ fn shared_timeout_refusal(topic: &str, producers: &str) -> String {
          slot's count high and release a consumer that keeps up again and again. Keep one \
          producer on the topic and take it out of `multi_publisher_topics:`; or remove \
          `block_timeout_ms`, and the slot is still released when the consumer stops for good \
-         (a fatal error, a tick panic, or its process dying); or wait for the version that \
-         counts each producer's queue on its own, which lifts this limit"
+         (a fatal error, a tick panic, or its process dying)"
     )
 }
 

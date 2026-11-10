@@ -103,7 +103,9 @@ pub struct ConsumerEdge {
 
 /// The set of `(topic, consumer node, consumer input)` edges a
 /// build carries a CROSS-PROCESS CREDIT WORD for — the one exemption
-/// [`GraphTopology::validate`]'s producer-less-`block` arm honours.
+/// [`GraphTopology::validate`]'s producer-less-`block` arm honours, and the
+/// edges on which it refuses `block_timeout_ms`. Each edge keeps the producer
+/// node ids its binding names, for that refusal's text.
 ///
 /// # Why a newtype rather than a bare `HashSet<(&str, &str, &str)>`
 ///
@@ -125,7 +127,7 @@ pub struct ConsumerEdge {
 /// really did `open_unowned` a shared page for.
 #[derive(Debug, Default)]
 pub struct CreditedEdges<'a> {
-    edges: HashSet<(&'a str, &'a str, &'a str)>,
+    edges: HashMap<(&'a str, &'a str, &'a str), &'a [String]>,
 }
 
 impl<'a> CreditedEdges<'a> {
@@ -133,7 +135,7 @@ impl<'a> CreditedEdges<'a> {
     /// ordinary producer-less rule. The single-process default.
     pub fn none() -> Self {
         Self {
-            edges: HashSet::new(),
+            edges: HashMap::new(),
         }
     }
 
@@ -149,9 +151,12 @@ impl<'a> CreditedEdges<'a> {
                 .filter(|b| b.word.is_mapped())
                 .map(|b| {
                     (
-                        b.topic.as_str(),
-                        b.consumer_node.as_str(),
-                        b.consumer_input.as_str(),
+                        (
+                            b.topic.as_str(),
+                            b.consumer_node.as_str(),
+                            b.consumer_input.as_str(),
+                        ),
+                        b.producer_nodes.as_slice(),
                     )
                 })
                 .collect(),
@@ -160,7 +165,13 @@ impl<'a> CreditedEdges<'a> {
 
     /// Is this `(topic, node, input)` edge credited?
     pub(crate) fn contains(&self, topic: &str, node: &str, input: &str) -> bool {
-        self.edges.contains(&(topic, node, input))
+        self.edges.contains_key(&(topic, node, input))
+    }
+
+    /// The producer node ids the binding of this `(topic, node, input)` edge
+    /// names, or `None` when the edge is not credited.
+    pub(crate) fn producers(&self, topic: &str, node: &str, input: &str) -> Option<&'a [String]> {
+        self.edges.get(&(topic, node, input)).copied()
     }
 }
 
@@ -323,6 +334,19 @@ impl TopicFlow {
         self.consumers
             .iter()
             .any(|c| matches!(c.policy, BackpressurePolicy::Block))
+    }
+
+    /// Do this topic's `block` consumers hold its in-graph producers? True
+    /// when the topic has an in-graph producer and at least one `block`
+    /// consumer, whatever its other consumers declare: every in-graph producer
+    /// then carries each `block` consumer's slot in its pre-fire check.
+    ///
+    /// The one rule for that set: the runtime wires the producers' slots by
+    /// it, replay's re-derivation reads by it which producers a fire can be
+    /// held on, and the derived partition and the executor units keep such a
+    /// topic's producers and consumers together by it.
+    pub fn holds_its_producers(&self) -> bool {
+        !self.producers.is_empty() && self.has_block_consumer()
     }
 
     /// Sum of every consumer's declared depth — the lower bound on the
@@ -808,6 +832,25 @@ impl GraphTopology {
                                 self.multi_publisher_topics.contains(&flow.topic),
                             ),
                         });
+                    }
+                    // A credited edge counts on its cross-process word
+                    // (`credited` is the token the wiring loop skips by), so
+                    // its producer fires on another thread.
+                    Some(_) if !crate::oracle_mutant::active("block_split_timeout_refusal_off") => {
+                        if let Some(producers) =
+                            credited.producers(&flow.topic, &c.node_id, &c.input)
+                        {
+                            return Err(TransportError::GraphError {
+                                reason: split_edge_timeout_refusal(
+                                    &flow.topic,
+                                    &c.node_id,
+                                    &c.input,
+                                    producers,
+                                    "this process",
+                                    "another process",
+                                ),
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -2425,6 +2468,55 @@ pub enum MissingInputMeta {
     Skip,
 }
 
+/// The refusal of `block_timeout_ms` on the `block` input
+/// `consumer_node.consumer_input` of `topic` when the edge counts on a credit
+/// word shared with `producers` in another process or executor unit: the
+/// input runs in `consumer_place` and its producer in `producer_place`.
+///
+/// A timeout release forgives the slot's counted frames, and the word then
+/// tells which later drains pay those frames and which publishes evict them
+/// from its counts alone. That is exact only while the producer and the
+/// consumer fire one at a time on one thread. A publish counts its frame
+/// after sending it and a drain records a pop after making it, so across
+/// threads a read can land before its frame is counted, or a publish can be
+/// counted before an earlier pop is recorded: the slot then counts a frame
+/// that is gone and holds the producer with nothing queued, or misses one and
+/// lets the queue evict a frame published after the release. The multi-process supervisor calls this with
+/// both sides' process group or executor unit; a worker, which sees only its
+/// own subgraph, with "this process" and "another process".
+// hot-path-alloc-ok-fn: cold: graph build, once per refused edge
+pub fn split_edge_timeout_refusal(
+    topic: &str,
+    consumer_node: &str,
+    consumer_input: &str,
+    producers: &[String],
+    consumer_place: &str,
+    producer_place: &str,
+) -> String {
+    let named = producers
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let producer = match producers {
+        [] => "its producer".to_string(),
+        [_] => format!("its producer {named}"),
+        _ => format!("its producers {named}"),
+    };
+    format!(
+        "input '{consumer_node}.{consumer_input}' on topic '{topic}' sets `block_timeout_ms`, \
+         but the input runs in {consumer_place} and {producer} in {producer_place}, so the two \
+         fire on different threads and count the edge on one shared credit word. A timeout \
+         release keeps that count exact only when the producer and the consumer fire one at a \
+         time on one thread: here a read and a publish can interleave after a release, so the \
+         slot can count a frame that is gone and hold the producer with nothing queued, or miss \
+         one and let a frame published after the release be evicted. Put both nodes in ONE \
+         `process_groups:` group, or run `--single-process`, to keep the timeout; or remove \
+         `block_timeout_ms`, and the slot is still released when the consumer stops for good \
+         (a fatal error, a tick panic, or its process dying)"
+    )
+}
+
 /// The refusal of `block_timeout_ms` on the `block` edge `c` of a topic that
 /// has more than one in-graph producer or is listed in
 /// `multi_publisher_topics:` (`listed`).
@@ -2468,8 +2560,7 @@ fn shared_topic_timeout_refusal(flow: &TopicFlow, c: &ConsumerEdge, listed: bool
          high and release a consumer that keeps up again and again. Keep one producer on the \
          topic and take it out of `multi_publisher_topics:`; or remove `block_timeout_ms`, and \
          the slot is still released when the consumer stops for good (a fatal error, a tick \
-         panic, or its process dying); or wait for the version that counts each producer's \
-         queue on its own, which lifts this limit",
+         panic, or its process dying)",
         c.node_id,
         c.input,
         flow.topic,
@@ -2831,8 +2922,7 @@ mod tests {
              the slot's count high and release a consumer that keeps up again and again. Keep \
              one producer on the topic and take it out of `multi_publisher_topics:`; or remove \
              `block_timeout_ms`, and the slot is still released when the consumer stops for good \
-             (a fatal error, a tick panic, or its process dying); or wait for the version that \
-             counts each producer's queue on its own, which lifts this limit";
+             (a fatal error, a tick panic, or its process dying)";
         let listing = "is listed in `multi_publisher_topics:`, which lets publishers outside \
              the graph write it";
         let err = shared(&["a", "b"], true, Some(50)).expect_err("two producers");

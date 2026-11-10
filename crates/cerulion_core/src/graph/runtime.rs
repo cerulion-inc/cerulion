@@ -227,12 +227,14 @@ pub struct CreditBinding {
     /// the edge (which ranks produce on it, in what order), and this process's
     /// own subgraph cannot see the other producers at all.
     pub producer_slot: Option<crate::credit::ProducerSlot>,
-    /// The edge's `block_timeout_ms`, applied by the PRODUCER's half: the
-    /// producer process releases the consumer's slot once it has stayed full,
-    /// with nothing drained, this long. `None`: no timeout.
-    pub block_timeout_ms: Option<u64>,
     /// The edge's producer node id(s), named by the consumer half's release
-    /// event when the consumer node stops.
+    /// event when the consumer node stops, and by the refusal of
+    /// `block_timeout_ms` on the bound input.
+    ///
+    /// A binding carries no `block_timeout_ms`: the producer's half builds
+    /// its defer edge with no timeout, so a cross-process word is never
+    /// forgiven, and graph load refuses the key on an input bound to a
+    /// mapped word.
     pub producer_nodes: Vec<String>,
 }
 
@@ -1453,11 +1455,10 @@ struct BlockDeferEdge {
     timeout_ns: Option<u64>,
     /// Whether the wait sizing may hold the producer until this slot's free
     /// wakes the loop ([`crate::scheduler::block::slot_hold`]). `true` on a
-    /// local edge, whose consumer drains on this level loop, and on a mapped
-    /// edge that declares `block_timeout_ms` and is in the credit park's watch
-    /// list, whose peer drain rings the park. `false` on any other mapped
-    /// edge: the producer keeps the floor re-evaluation, which paces the edge's
-    /// `CreditStallWatch` count.
+    /// local edge, whose consumer drains on this level loop. `false` on an
+    /// edge a credit binding wires (a mapped word on every multi-process
+    /// worker): the producer keeps the floor re-evaluation, which paces the
+    /// edge's `CreditStallWatch` count.
     may_wait: bool,
 }
 
@@ -1709,12 +1710,9 @@ struct CreditParkEdge {
     /// because `monitor_wait_block` takes `&self`.
     baseline_seq: std::sync::atomic::AtomicU32,
     /// Was this edge at or over threshold when the live loop sized its wait?
-    /// On an edge that declares `block_timeout_ms` the sizing holds a deferred
-    /// producer until the release deadline ([`crate::scheduler::block::BlockHold`]),
-    /// counting on this edge's drain to wake it sooner, so the park takes this
-    /// into `baseline_full`: a drain landing between the sizing and the park
-    /// entry then wakes the park instead of being absorbed into its baseline.
-    /// Cleared by the park that reads it.
+    /// The park takes this into `baseline_full`, so a drain landing between
+    /// the sizing and the park entry wakes the park instead of being absorbed
+    /// into its baseline. Cleared by the park that reads it.
     sized_full: std::sync::atomic::AtomicBool,
 }
 
@@ -1854,7 +1852,9 @@ fn block_edges_defer(producer: &str, edges: &[BlockDeferEdge], now_ns: u64) -> b
         // producer of the topic shares the cell, so a second producer judges
         // the mark this one stored, never the one it replaced, and one stall
         // releases the slot once. Graph load refuses `block_timeout_ms` on a
-        // topic with several producers, so only a one-producer slot times out.
+        // topic with several producers and on a cross-process edge, and a
+        // mapped defer edge is built with no timeout, so only a one-producer
+        // local slot times out.
         let (reading, verdict, forgiven) = e.stall_clock.update(|mark| {
             let reading = SlotReading::of(&e.outstanding, e.threshold);
             let (verdict, next) = judge_slot(reading, mark, now_ns, e.timeout_ns);
@@ -6846,7 +6846,7 @@ impl GraphRuntime {
             // Every `block` consumer gets its own slot, whatever the topic's
             // other consumers declare: they hold no slot and the producer's
             // deferral never consults them.
-            if !flow.has_block_consumer() || flow.producers.is_empty() {
+            if !flow.holds_its_producers() {
                 continue; // a producer-less `block` edge is refused by validate
             }
             for edge in flow
@@ -7000,11 +7000,11 @@ impl GraphRuntime {
         //
         //   * on the PRODUCER's worker `subgraph_for` dropped the consumer
         //     node, so the topic's flow has producers and NO consumers ⇒
-        //     `is_all_block()` is false ⇒ the whole branch is skipped ⇒ the
-        //     producer never defers;
-        //   * on the CONSUMER's worker the producer is gone, so the flow reads
-        //     all-block with `producers.is_empty()` ⇒ the `continue` above
-        //     skips it ⇒ the drain never decrements.
+        //     `holds_its_producers()` is false ⇒ the whole branch is skipped ⇒
+        //     the producer never defers;
+        //   * on the CONSUMER's worker the producer is gone, so the flow has a
+        //     `block` consumer and no producer ⇒ the `continue` above skips it
+        //     ⇒ the drain never decrements.
         //
         // So each half is INJECTED from the plan the supervisor stamped, never
         // inferred from the local view. The word both halves operate on is the
@@ -7295,10 +7295,11 @@ impl GraphRuntime {
                             stall: stall.clone(),
                             topic: Arc::from(binding.topic.as_str()),
                             stall_clock: Arc::clone(&stall_clock),
-                            timeout_ns: binding
-                                .block_timeout_ms
-                                .map(|ms| ms.saturating_mul(1_000_000)),
-                            may_wait: parks && binding.block_timeout_ms.is_some(),
+                            // A cross-process word is never forgiven: no
+                            // timeout, and the producer is freed only by the
+                            // peer's drain or the slot's release.
+                            timeout_ns: None,
+                            may_wait: false,
                         });
                 }
             }
@@ -7315,7 +7316,7 @@ impl GraphRuntime {
                 consumer_input: binding.consumer_input.clone(),
                 outstanding: word,
                 depth: binding.depth,
-                block_timeout: binding.block_timeout_ms.is_some(),
+                block_timeout: false,
             });
         }
         if !cross_process.credit_bindings.is_empty() {
@@ -15500,9 +15501,9 @@ impl GraphRuntime {
         const LIVELINESS_SWEEP_NS: u64 = 250_000_000;
         const MIN_TIMEOUT_NS: u64 = 1_000_000;
         let now_ns = self.live_deadline_now_ns();
-        // Read BEFORE the `block` holds below: a producer the holds keep
-        // waiting on its mapped edge's drain must not lose a drain that lands
-        // between this read and the park entry (`CreditParkEdge::sized_full`).
+        // Read BEFORE the wait is sized: a drain of a mapped edge that lands
+        // between this read and the park entry must still wake the park
+        // (`CreditParkEdge::sized_full`).
         for e in &self.credit_park_edges {
             e.sized_full
                 .store(e.word.outstanding() >= e.threshold, Ordering::Release);

@@ -11028,10 +11028,9 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 ///
 /// The rank's runtime builds a `GraphTopology` from the same subgraph and node
 /// infos, and installs a block pre-fire check on every in-graph producer of a
-/// topic whose every consumer reads it with `backpressure = block`
-/// (`TopicFlow::is_all_block`). A topic that mixes `block` with another policy
-/// degrades its `block` consumers to `drop_oldest` and installs none. This is
-/// that producer set, read off the same build.
+/// topic that a `block` input reads, whatever the topic's other consumers
+/// declare (`TopicFlow::holds_its_producers`, the predicate its wiring reads).
+/// This is that producer set, read off the same build by the same predicate.
 ///
 /// # Errors
 ///
@@ -11051,7 +11050,7 @@ fn local_block_producers(
         })?;
     Ok(topology
         .topics()
-        .filter(|flow| flow.is_all_block())
+        .filter(|flow| flow.holds_its_producers())
         .flat_map(|flow| flow.producers.iter().cloned())
         .collect())
 }
@@ -32039,13 +32038,16 @@ mod trigger_input_capacity_tests {
         );
     }
 
-    /// A node is a local `block` producer when it produces a topic every
-    /// consumer in the rank reads with `backpressure = block`, the producers the
-    /// runtime installs a block pre-fire check on. `c` feeds `d`'s `block`
-    /// input; `e` feeds a `block` input and a `drop_oldest` one, which degrades
-    /// the `block` one and installs no check; `p` feeds a `drop_oldest` input.
+    /// A node is a local `block` producer when it produces a topic a `block`
+    /// input in the rank reads, whatever the topic's other consumers declare:
+    /// the producers the runtime installs a block pre-fire check on. `p` feeds
+    /// only a `drop_oldest` input (`c.cam`); `c` feeds `d`'s `block` input; `e`
+    /// feeds `f`'s `block` input beside `g`'s `drop_oldest` one, and `h` feeds
+    /// `i`'s `block` input beside `j`'s `sample(20)` one. Hand oracle: `c`,
+    /// `e` and `h` are held, `p` is not; once `f` reads `drop_oldest` too, `e`
+    /// is not held either.
     #[test]
-    fn a_local_block_producer_is_a_producer_of_a_topic_every_rank_consumer_blocks_on() {
+    fn a_local_block_producer_is_a_producer_of_a_topic_a_rank_block_input_reads() {
         use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
         let yaml = "name: lb\nprefix: lb\nnodes:\n\
             \x20 - id: p\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
@@ -32053,7 +32055,10 @@ mod trigger_input_capacity_tests {
             \x20 - id: d\n    type: w\n    inputs:\n      - name: cmd\n        source: c/out\n\
             \x20 - id: e\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
             \x20 - id: f\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n\
-            \x20 - id: g\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n";
+            \x20 - id: g\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n\
+            \x20 - id: h\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+            \x20 - id: i\n    type: w\n    inputs:\n      - name: x\n        source: h/out\n\
+            \x20 - id: j\n    type: w\n    inputs:\n      - name: x\n        source: h/out\n";
         let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
         let reads = |name: &str, backpressure| {
             NodeInfo::with_meta(
@@ -32078,15 +32083,21 @@ mod trigger_input_capacity_tests {
         infos.insert("d".to_string(), reads("cmd", BackpressurePolicy::Block));
         infos.insert("f".to_string(), reads("x", BackpressurePolicy::Block));
         infos.insert("g".to_string(), reads("x", BackpressurePolicy::DropOldest));
-        let producers = local_block_producers(&config, &infos, 0).expect("builds");
-        assert_eq!(producers, BTreeSet::from(["c".to_string()]));
-
-        infos.insert("g".to_string(), reads("x", BackpressurePolicy::Block));
+        infos.insert("i".to_string(), reads("x", BackpressurePolicy::Block));
+        infos.insert("j".to_string(), reads("x", BackpressurePolicy::Sample(20)));
         let producers = local_block_producers(&config, &infos, 0).expect("builds");
         assert_eq!(
             producers,
-            BTreeSet::from(["c".to_string(), "e".to_string()]),
-            "every consumer of e's topic blocks once g does"
+            BTreeSet::from(["c".to_string(), "e".to_string(), "h".to_string()]),
+            "a block input holds its producer on a mixed topic too"
+        );
+
+        infos.insert("f".to_string(), reads("x", BackpressurePolicy::DropOldest));
+        let producers = local_block_producers(&config, &infos, 0).expect("builds");
+        assert_eq!(
+            producers,
+            BTreeSet::from(["c".to_string(), "h".to_string()]),
+            "no block input reads e's topic once f reads it drop_oldest"
         );
     }
 

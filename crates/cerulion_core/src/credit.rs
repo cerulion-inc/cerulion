@@ -112,9 +112,11 @@
 //!   finds the consumer's queue empty also zeroes the queued count and the
 //!   backlog ([`CreditWord::record_drained_to_empty`]), which clears what the
 //!   backlog bound misses on a word with several connections. The
-//!   `block_timeout_ms` release uses it, and graph load refuses that key on a
-//!   topic with several producers, so a graph forgives only a word with one
-//!   connection.
+//!   `block_timeout_ms` release uses it. Graph load refuses that key on a
+//!   topic with several producers and on an edge whose producer runs in
+//!   another process or executor unit, and a cross-process binding carries no
+//!   timeout, so a graph forgives only a local word with one connection,
+//!   whose producer and consumer fire one at a time on one thread.
 //!
 //! Whoever releases emits the loud event; this module only moves the word.
 //!
@@ -683,8 +685,9 @@ impl CreditShared {
     /// ([`CreditWord::record_drained_to_empty`]). The count never reads low,
     /// so the producer never publishes past `depth`. Graph load refuses
     /// `block_timeout_ms` on a topic with more than one in-graph producer or
-    /// listed in `multi_publisher_topics:`, so a graph forgives only a word
-    /// with one connection, where this bound is exact.
+    /// listed in `multi_publisher_topics:`, and on an edge that counts on a
+    /// [`CreditWord::Mapped`] word, so a graph forgives only a local word with
+    /// one connection, where this bound is exact.
     ///
     /// Deliberately issues NO wake: nothing ever parks waiting for the count to
     /// RISE (the release direction is [`record_drained`](Self::record_drained),
@@ -2167,8 +2170,9 @@ impl CreditWord {
     /// On a [`Self::Mapped`] word it is [`CreditShared::record_drained`]. The
     /// producer runs in another process, so a frame can be sent and counted
     /// between the empty `receive` and the RMW, and a zeroing would drop its
-    /// count. A mapped word has one producer (a split edge with several
-    /// producers mints no word), so its backlog bound is exact.
+    /// count. A graph never forgives a mapped word (a cross-process binding
+    /// carries no timeout, and graph load refuses `block_timeout_ms` on such
+    /// an edge), so it holds no backlog for a zeroing to clear.
     pub fn record_drained_to_empty(&self, removed: u64) {
         match self {
             Self::Local(shared) => shared.record_drained_and_emptied(removed),

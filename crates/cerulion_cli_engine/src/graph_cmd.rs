@@ -7621,7 +7621,6 @@ pub fn graph_run_worker(
                 // read — `None` for a pure consumer, which is exactly the role
                 // that never parks.
                 producer_slot: crate::multiprocess::producer_slot_of(e, plan.rank),
-                block_timeout_ms: e.block_timeout_ms,
                 producer_nodes: e.producer_nodes.clone(),
             });
         }
@@ -11513,11 +11512,7 @@ fn graph_run_supervisor(
     // ONE rank map, built from the workers that will actually be spawned, so
     // the mint, the reconciliation and the spawn cannot disagree about who owns
     // what.
-    let credit_node_rank: std::collections::HashMap<&str, usize> = plan
-        .workers
-        .iter()
-        .flat_map(|w| w.subgraph.nodes.iter().map(|n| (n.id.as_str(), w.rank)))
-        .collect();
+    let credit_node_rank = crate::multiprocess::node_ranks(&plan);
     let loaded_topology_for_reconcile =
         cerulion_core::graph::GraphTopology::build(&config, &loaded_entry_infos)
             .map_err(CliError::from)?;
@@ -11554,6 +11549,20 @@ fn graph_run_supervisor(
             config.identity()
         ))
             })?;
+    // Every minted edge counts on a credit word shared across threads, where a
+    // `block_timeout_ms` release cannot keep the count exact: refuse the key on
+    // it before anything is stamped or spawned.
+    crate::multiprocess::refuse_split_edge_timeouts(
+        &loaded_topology_for_reconcile,
+        &credit_edges,
+        &plan,
+    )
+    .map_err(|e| {
+        CliError::Validation(format!(
+            "graph run (multi-process): graph '{}': {e}",
+            config.identity()
+        ))
+    })?;
     // RECONCILE what the plan-time check ACCEPTED
     // with what the supervisor actually MINTED, and refuse pre-spawn if they
     // differ.
@@ -33439,6 +33448,31 @@ process_groups:
         }
     }
 
+    /// The supervisor refuses `block_timeout_ms` on the edges it mints a
+    /// cross-process credit word for, over the mint's own result and before it
+    /// stamps any of them into a plan: one call, ahead of the one stamp.
+    #[test]
+    fn the_supervisor_refuses_split_edge_timeouts_on_the_minted_edges_before_stamping() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body =
+            fn_body(&src, "fn graph_run_supervisor(").expect("the supervisor fn must still exist");
+        assert_eq!(body.matches("refuse_split_edge_timeouts(").count(), 1);
+        assert_eq!(body.matches("stamp_credit_edges(").count(), 1);
+        let refuse = body
+            .find("refuse_split_edge_timeouts(")
+            .expect("the refusal");
+        let mint = body.find("credit_edges_for(").expect("the mint");
+        let stamp = body.find("stamp_credit_edges(").expect("the stamp");
+        assert!(
+            mint < refuse && refuse < stamp,
+            "the refusal reads the mint's result and runs before the stamp"
+        );
+        assert!(
+            body[refuse..stamp].contains("&credit_edges"),
+            "the refusal is handed the minted edges"
+        );
+    }
+
     /// THE HEADLINE PIN: the supervisor stamps trace rings without
     /// asking whether it records.**
     ///
@@ -42632,7 +42666,6 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
 
@@ -42693,7 +42726,6 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
         check_credit_edges_unique("the worker", &[e("gate"), e("other")])
@@ -42776,7 +42808,6 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
         assert_eq!(credit_role_for(&edge, 0), Some(CreditRole::Producer));
@@ -42808,7 +42839,6 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
         check_credit_producer_ranks("p1", &one).expect("exactly one producer rank is the shape");
@@ -43041,7 +43071,6 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: producers.to_vec(),
             consumer_rank,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         }
     }
@@ -44202,7 +44231,6 @@ mod supervisor_tests {
                 depth: 4,
                 producer_ranks: vec![0],
                 consumer_rank: 1,
-                block_timeout_ms: None,
                 producer_nodes: Vec::new(),
             },
             CreditEdgePlan {
@@ -44212,7 +44240,6 @@ mod supervisor_tests {
                 depth: 2,
                 producer_ranks: vec![1],
                 consumer_rank: 0,
-                block_timeout_ms: None,
                 producer_nodes: Vec::new(),
             },
         ];
@@ -44301,7 +44328,6 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
         check_credit_depth("p1", "cerdep_x", &edge, 4).expect("an agreeing pair is accepted");
@@ -44369,7 +44395,6 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
         // PermissionDenied: the directory is refusing this user.
@@ -44509,7 +44534,6 @@ mod supervisor_tests {
             depth: 7,
             producer_ranks: vec![0],
             consumer_rank: 1,
-            block_timeout_ms: None,
             producer_nodes: Vec::new(),
         };
         stamped.workers[1].credit_edges = vec![edge.clone()];

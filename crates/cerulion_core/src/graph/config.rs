@@ -898,7 +898,8 @@ pub fn scalar_param_value(value: &serde_yaml::Value) -> Option<String> {
 /// instead of the node's `#[input(...)]` attribute; each key present wins over
 /// the attribute's value. `block_timeout_ms` is legal only on an edge whose
 /// effective policy is `block`, on a topic with at most one in-graph producer
-/// that `multi_publisher_topics` does not list.
+/// that `multi_publisher_topics` does not list, whose producer runs in the
+/// consumer's process group (or with `--single-process`).
 ///
 /// ```yaml
 /// inputs:
@@ -924,7 +925,8 @@ pub struct InputDef {
     /// with nothing drained, for this many milliseconds. Absent: the producer
     /// stays deferred until the consumer drains or dies. Graph load refuses it
     /// on a topic with more than one in-graph producer or listed in
-    /// `multi_publisher_topics`.
+    /// `multi_publisher_topics`, and on an edge whose producer runs in another
+    /// process group or executor unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_timeout_ms: Option<u64>,
 }
