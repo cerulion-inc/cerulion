@@ -207,7 +207,9 @@ workers operate on, minted per edge by the supervisor) makes a split edge
 lossless, and it is admitted at plan time for exactly the shape it can
 describe: **exactly one in-graph producer**, with one word per split `block`
 consumer. The topic's other consumers hold no word and do not count. Such a
-split is accepted; every other one still meets the refusal above.
+split is accepted when its split `block` input sets no `block_timeout_ms`
+(the key is refused on a split edge, see the table below); every other one
+still meets the refusal above.
 
 The derivation co-locates the whole credited flow regardless: crossing a process
 boundary costs a real

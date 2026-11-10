@@ -2696,8 +2696,10 @@ fn gate_release_events(lines: &[&str]) -> Vec<(u64, Option<u64>)> {
 ///
 /// The hand oracle. Step `k` moves the clock to `5(k+1)` ms. `holder` fires
 /// at 5 and 10 ms (steps 0 and 1) and fills `gate`'s slot; from step 2 (15
-/// ms) the slot reads full and `holder` is held. At step 12 (65 ms) the slot
-/// has been full for 50 ms: it is released once, and `holder` fires its two
+/// ms) the slot reads full and `holder` is held. The `block_timeout_ms` clock
+/// starts at the slot's first full evaluation, at 15 ms, not at the 10 ms
+/// publish that filled it, so at step 12 (65 ms) the slot has read full with
+/// no drain for 50 ms: it is released once, and `holder` fires its two
 /// oldest missed periods (15 and 20 ms) before the slot reads full again at
 /// 65 ms, which starts the next 50 ms stretch. So the releases fall at steps
 /// 12, 22 and 32, and `holder` publishes `x = 1..=8` over 35 steps. `tap`

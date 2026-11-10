@@ -11326,9 +11326,11 @@ fn graph_run_supervisor(
         // plan-time check allowed, and the two being separate is deliberate:
         // if they ever disagree, the reconciliation below refuses and the
         // operator has both halves of the evidence in the log. An edge whose
-        // input sets `block_timeout_ms` is not announced: it gets no word, and
-        // `refuse_split_edge_timeouts` refuses it below, through the same
-        // check.
+        // input sets `block_timeout_ms` is not announced: `credit_edges_for`
+        // below mints it a word like any other creditable split edge, and
+        // `refuse_split_edge_timeouts` then refuses the run over the minted
+        // edges, through the same check, before any word is stamped into a
+        // worker's plan or any worker spawns.
         let source_topology = cerulion_core::graph::GraphTopology::build(&config, &entry_infos)
             .map_err(CliError::from)?;
         for edge in cerulion_core::graph::creditable_split_block_edges(

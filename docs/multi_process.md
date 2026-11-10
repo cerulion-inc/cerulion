@@ -58,7 +58,9 @@ recording's per-edge read log offline).
   can describe: a topic with **exactly one in-graph producer**, one word per
   `block` consumer in another process. A split multi-producer `block` edge is
   still refused PRE-SPAWN (the word counts one producer's outstanding frames),
-  and the refusal names the bar. The topic's non-`block` consumers hold no
+  and so is a split `block` input that sets `block_timeout_ms` (see
+  [The per-edge credit word](#the-per-edge-credit-word)); each refusal names
+  the bar. The topic's non-`block` consumers hold no
   word and may sit in any group. A `block` consumer, split or not, defers the
   producer's whole node, so wherever those `drop_oldest` and `sample(N)`
   consumers sit they receive frames at the pace the `block` consumers allow.
@@ -503,7 +505,8 @@ A `block` edge is lossless because the producer reads the consumer's `outstandin
 before it fires. Split the two across process groups and that read is gone, so such
 a split is accepted only for a **creditable** edge
 (exactly one in-graph producer; the topic's non-`block` consumers hold no word and do
-not count), which gets a shared word to read instead.
+not count) whose `block` input sets no `block_timeout_ms`, which gets a shared word to
+read instead.
 
 **One word per EDGE, not per topic.** The identity is
 `credit_edge_id(topic, consumer_node, consumer_input)`
